@@ -9,6 +9,8 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -490,10 +492,22 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
   }
 };
 
-void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
+void createBarrier(ConversionPatternRewriter &rewriter, Operation *op,
                    int numCTAs) {
+  auto loc = op->getLoc();
   if (numCTAs == 1) {
-    barrier();
+    auto barrierOp = barrier();
+    auto asyncTaskIds = getAsyncTaskIds(op);
+    if (asyncTaskIds.size() == 1) {
+      int asyncTaskId = asyncTaskIds[0];
+      int barId = asyncTaskId + nameBarrierIdBegin;
+      assert(barId < nameBarrierIdEnd);
+      // TODO: Change hard code style of numThreads.
+      const int numThreads = 128;
+      barrierOp->setAttr("bar_id", rewriter.getI64IntegerAttr(barId));
+      barrierOp->setAttr("num_threads",
+                         rewriter.getI64IntegerAttr(numThreads));
+    }
   } else {
     rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
     rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
@@ -606,7 +620,7 @@ struct AtomicCASOpConversion
         st(dstOprStore, valOprStore).predicate(mask);
         auto ASMReturnTy = void_ty(ctx);
         ptxBuilderStore.launch(rewriter, loc, ASMReturnTy);
-        createBarrier(rewriter, loc, numCTAs);
+        createBarrier(rewriter, op, numCTAs);
         Value ret = load(valueElemTy, atomPtr);
         rewriter.replaceOp(op, {ret});
       }
@@ -778,7 +792,7 @@ struct AtomicRMWOpConversion
         auto *valOpr = ptxBuilderStore.newOperand(old, tyId);
         storeShared(ptrOpr, valOpr).predicate(rmwMask);
         ptxBuilderStore.launch(rewriter, loc, void_ty(ctx));
-        createBarrier(rewriter, loc, numCTAs);
+        createBarrier(rewriter, op, numCTAs);
         Value ret = load(valueElemTy, atomPtr);
         rewriter.replaceOp(op, {ret});
       }
@@ -988,6 +1002,13 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     if (rank > 1)
       numCopies = ceil<int>(contigDimSizeInByte, 128);
 
+    auto asyncTaskIds = getAsyncTaskIds(op);
+    int firstThreadId = 0;
+    if (!asyncTaskIds.empty()) {
+      assert(asyncTaskIds.size() == 1 && "only support single async task");
+      firstThreadId = asyncTaskIds[0] * numWarps * warpSize;
+    }
+
     // The bounding box inner dimension must be less than or equal to the
     // swizzle size.
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
@@ -997,8 +1018,9 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
       if (numWarpsToCopy == 1)
         warpID = i32_val(0);
-      Value boxPred =
-          and_(pred, icmp_ult(id, i32_val(numWarpsToCopy * warpSize)));
+      Value boxPred = and_(
+          pred,
+          icmp_ult(id, i32_val(numWarpsToCopy * warpSize + firstThreadId)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
       Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
       Value copyIdxVal = add(warpID, i32_val(copyIdx));
@@ -1036,6 +1058,16 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     return success();
   }
 };
+
+int getWarpOffset(Operation* op, bool gridPartition) {
+  auto asyncTaskIds = getAsyncTaskIds(op);
+  if (asyncTaskIds.size() > 0) {
+    if (!gridPartition)
+      return 4 * *std::min_element(asyncTaskIds.begin(), asyncTaskIds.end());
+    return -1;
+  }
+  return 0;
+}
 
 struct AsyncTMACopyLocalToGlobalOpConversion
     : public ConvertOpToLLVMPattern<
@@ -1078,10 +1110,22 @@ struct AsyncTMACopyLocalToGlobalOpConversion
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
     // We clamp the block size and the codegen will emit multiple copy
     // operations.
+    bool gridPartition = mlir::triton::tools::getBoolEnv("GRID_PARTITION_FA");
     for (int copyIdx = 0; copyIdx < numCopies; copyIdx += numWarps) {
       int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
       if (numWarpsToCopy == 1)
         warpID = i32_val(0);
+      auto warpOffset = getWarpOffset(op, gridPartition);
+      if (gridPartition && warpOffset == -1) {
+        // We have a single IfOp, use warpGroupId instead.
+        Value warpGrpID = udiv(warpID, i32_val(4));
+        Value offset = mul(warpGrpID, i32_val(4));
+        warpID = sub(warpID, offset);
+        id = sub(id, mul(offset, i32_val(warpSize)));
+      } else {
+        warpID = sub(warpID, i32_val(warpOffset));
+        id = sub(id, i32_val(warpOffset * warpSize));
+      }
       Value boxPred =
           and_(pred, icmp_ult(id, i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;

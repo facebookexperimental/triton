@@ -213,7 +213,7 @@ private:
       auto multiDimRepId =
           getMultiDimIndex<unsigned>(repId, numReplicates, outOrd);
       if (repId != 0) {
-        barrier();
+        insertBarrier(rewriter, op);
       }
       auto successful = targetInfo.processReplicaUsingStMatrix(
           rewriter, loc, smemBase, vals, srcTy,
@@ -224,7 +224,7 @@ private:
                        multiDimRepId, inVec, paddedRepShape, origRepShape,
                        outOrd, vals, smemBase);
       }
-      barrier();
+      insertBarrier(rewriter, op);
       processReplica(loc, rewriter, /*stNotRd*/ false, dstTy, outNumCTAsEachRep,
                      multiDimRepId, outVec, paddedRepShape, origRepShape,
                      outOrd, outVals, smemBase);
@@ -581,7 +581,7 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     llvm::MapVector<int, Value> outVals;
     for (int i = 0; i < iterations; i++) {
       if (i != 0)
-        barrier();
+        insertBarrier(rewriter, op);
 
       auto &inRegs = inRegsForIter[i];
       auto &outRegs = outRegsForIter[i];
@@ -605,7 +605,7 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
         }
       }
 
-      barrier();
+      insertBarrier(rewriter, op);
 
       for (int j = 0; j < outSize / iterations; j += scratchConfig.outVec) {
         auto outRegSlice = outRegs[j];

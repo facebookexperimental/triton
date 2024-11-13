@@ -13,6 +13,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallVector.h"
 
 using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
@@ -189,6 +191,15 @@ private:
         auto shapePerCTA = triton::gpu::getShapePerCTA(allocType);
         auto bytes = product<int64_t>(shapePerCTA) *
                      allocType.getElementTypeBitWidth() / 8;
+        if (op->hasAttr("allocation.copy")) {
+          auto copy = cast<IntegerAttr>(op->getAttr("allocation.copy"))
+                          .getValue()
+                          .getZExtValue();
+          op->setAttr(
+              "allocation.size",
+              IntegerAttr::get(IntegerType::get(op->getContext(), 32), bytes));
+          bytes = bytes * copy;
+        }
 
         auto alignment = alloc.getAlignmentOrDefault();
         allocation->addBuffer<BufferT::BufferKind::Explicit>(result, bytes,
@@ -251,6 +262,15 @@ private:
           isa<triton::PointerType>(srcTy.getElementType())
               ? elems * kPtrBitWidth / 8
               : elems * std::max<int>(8, srcTy.getElementTypeBitWidth()) / 8;
+      if (op->hasAttr("allocation.copy")) {
+        auto copy = cast<IntegerAttr>(op->getAttr("allocation.copy"))
+                        .getValue()
+                        .getZExtValue();
+        op->setAttr(
+            "allocation.size",
+            IntegerAttr::get(IntegerType::get(op->getContext(), 32), bytes));
+        bytes = bytes * copy;
+      }
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,
                                                           scratchAlignment);
     } else if (isa<triton::AtomicRMWOp, triton::AtomicCASOp>(op)) {
@@ -370,8 +390,29 @@ private:
         // range.
         auto *op = opScratchIter.first;
         auto *buffer = opScratchIter.second;
-        bufferRange.insert({buffer, Interval(operationId.lookup(op),
-                                             operationId.lookup(op) + 1)});
+        bool dataPartitionFA =
+            mlir::triton::tools::getBoolEnv("DATA_PARTITION_FA");
+        // When DATA_PARTITION_FA is on, extend live ranges only when we have
+        // attributes and asyncTaskId is not empty. Otherwise, extend when
+        // asyncTaskId is not empty.
+        if (getAsyncTaskIds(op).empty() ||
+            (dataPartitionFA && !op->hasAttr("allocation.copy"))) {
+          bufferRange.insert({buffer, Interval(operationId.lookup(op),
+                                               operationId.lookup(op) + 1)});
+        } else {
+          if (!dataPartitionFA)
+            // FIXME: This range makes scratch buffers used in warp-specialized
+            // regions conflict with everything else in the program, which is
+            // too conservative, but safe.  A better approach would make them
+            // conflict with buffers live in other warp-specialized regions.
+            bufferRange.insert(
+                {buffer, Interval<size_t>(0, operationId.size())});
+          else
+            // Extend live interval when there are multiple consumer warp
+            // groups.
+            bufferRange.insert({buffer, Interval<size_t>(operationId.lookup(op),
+                                                         operationId.size())});
+        }
       }
     };
     processScratchMemory(allocation->opScratch);
@@ -408,6 +449,11 @@ private:
       auto maxId = std::numeric_limits<size_t>::min();
       std::for_each(liveOperations.begin(), liveOperations.end(),
                     [&](Operation *liveOp) {
+                      if (!getAsyncTaskIds(liveOp).empty()) {
+                        minId = 0;
+                        maxId = operationId.size();
+                        return;
+                      }
                       if (operationId[liveOp] < minId) {
                         minId = operationId[liveOp];
                       }

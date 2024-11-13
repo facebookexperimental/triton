@@ -32,6 +32,7 @@
 #include "llvm/Support/MathExtras.h"
 
 #include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #define DEBUG_TYPE "triton-loop-pipelining"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -452,8 +453,10 @@ scf::ForOp LoopPipelinerInternal::createKernelLoop(
     Type t = ub.getType();
     Location loc = forOp.getLoc();
     // newUb = ub - maxStage * step
+    // peel last iteration of ops, newUb = ub - step
+    bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER") && peelEpilogue;
     Value maxStageValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIntegerAttr(t, maxStage));
+        loc, rewriter.getIntegerAttr(t, PeelLastIter ? 1 : maxStage));
     Value maxStageByStep =
         rewriter.create<arith::MulIOp>(loc, step, maxStageValue);
     newUb = rewriter.create<arith::SubIOp>(loc, ub, maxStageByStep);
@@ -461,6 +464,7 @@ scf::ForOp LoopPipelinerInternal::createKernelLoop(
   auto newForOp =
       rewriter.create<scf::ForOp>(forOp.getLoc(), forOp.getLowerBound(), newUb,
                                   forOp.getStep(), newLoopArg);
+  newForOp->setAttrs(forOp->getAttrs());
   // When there are no iter args, the loop body terminator will be created.
   // Since we always create it below, remove the terminator if it was created.
   if (!newForOp.getBody()->empty())
@@ -485,11 +489,16 @@ LogicalResult LoopPipelinerInternal::createKernel(
     mapping.map(arg.value(), newForOp.getRegionIterArgs()[arg.index()]);
   }
   SmallVector<Value> predicates(maxStage + 1, nullptr);
-  if (!peelEpilogue) {
+  bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER") && peelEpilogue;
+  if (!peelEpilogue || PeelLastIter) {
     // Create a predicate for each stage except the last stage.
     Location loc = newForOp.getLoc();
     Type t = ub.getType();
-    for (unsigned i = 0; i < maxStage; i++) {
+    // predicates[i] = indVar < c = indVar < ub - (maxStage - i) * step
+    // if peeling last iteration only, S2 should always be executed.
+    // only create predicates for S0 to S1
+    int iEnd = PeelLastIter ? maxStage - 1 : maxStage;
+    for (unsigned i = 0; i < iEnd; i++) {
       // c = ub - (maxStage - i) * step
       Value c = rewriter.create<arith::SubIOp>(
           loc, ub,
@@ -619,12 +628,29 @@ LogicalResult LoopPipelinerInternal::createKernel(
     // If there is a live range spanning across more than 2 stages we need to
     // add extra arg.
     for (unsigned i = 1; i < numVersionReturned; i++) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "set valueMapping3: version " << version
+                     << " lastUseStage " << it.second.lastUseStage
+                     << " defStage " << it.second.defStage << " ";
+        it.first.dump();
+      });
       setValueMapping(it.first, newForOp->getResult(yieldOperands.size()),
                       version++);
       yieldOperands.push_back(
           newForOp.getBody()->getArguments()[yieldOperands.size() + 1 +
                                              newForOp.getNumInductionVars()]);
     }
+    // Map [key, version] to result of newForOp.
+    if (PeelLastIter && it.second.lastUseStage == maxStage) {
+      // we only need version maxStage for ops in stage maxStage
+      version += maxStage - 1; // loop body contains the first epilogue
+    }
+    LLVM_DEBUG({
+      llvm::dbgs() << "set valueMapping: version " << version
+                   << " lastUseStage " << it.second.lastUseStage << " defStage "
+                   << it.second.defStage << " ";
+      it.first.dump();
+    });
     setValueMapping(it.first, newForOp->getResult(yieldOperands.size()),
                     version++);
     yieldOperands.push_back(mapping.lookupOrDefault(it.first));
@@ -640,10 +666,14 @@ LogicalResult LoopPipelinerInternal::createKernel(
       for (unsigned int stage = 1; stage <= maxStage; stage++)
         setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                         retVal.value(), stage);
-    } else if (defStage->second > 0) {
+    } else if (defStage->second > 0 &&
+               (!PeelLastIter || defStage->second > maxStage - 1)) {
+      // If PeelLastIter is false, no change. If it is true, only enter when
+      // defStage->second is bigger than 1.
       setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                       newForOp->getResult(retVal.index()),
-                      maxStage - defStage->second + 1);
+                      maxStage - defStage->second + 1 +
+                          (PeelLastIter ? maxStage - 1 : 0));
     }
   }
   rewriter.create<scf::YieldOp>(forOp.getLoc(), yieldOperands);
@@ -693,17 +723,33 @@ LoopPipelinerInternal::emitEpilogue(RewriterBase &rewriter,
 
   // Emit `maxStage - 1` epilogue part that includes operations from stages
   // [i; maxStage].
-  for (int64_t i = 1; i <= maxStage; i++) {
+  bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER") && peelEpilogue;
+  for (int64_t i = PeelLastIter ? maxStage : 1; i <= maxStage; i++) {
     SmallVector<std::pair<Value, unsigned>> returnMap(returnValues.size());
     for (Operation *op : opOrder) {
       if (stages[op] < i)
         continue;
+      LLVM_DEBUG({
+        llvm::errs() << "clone ";
+        op->dump();
+      });
       unsigned currentVersion = maxStage - stages[op] + i;
       unsigned nextVersion = currentVersion + 1;
       Operation *newOp =
           cloneAndUpdateOperands(rewriter, op, [&](OpOperand *newOperand) {
             auto it = valueMapping.find(newOperand->get());
             if (it != valueMapping.end()) {
+              LLVM_DEBUG({
+                llvm::errs() << "find valueMapping: version "
+                             << (maxStage - stages[op] + i) << " ";
+                newOperand->get().dump();
+                unsigned tmp = 0;
+                for (auto v : it->second) {
+                  llvm::errs() << "idx " << tmp << ": ";
+                  v.dump();
+                  ++tmp;
+                }
+              });
               Value replacement = it->second[currentVersion];
               newOperand->set(replacement);
             }

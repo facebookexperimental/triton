@@ -1,6 +1,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 
 using namespace mlir;
 namespace tt = mlir::triton;
@@ -29,7 +31,7 @@ getTMAStores(scf::ForOp forOp) {
 
 static Value createAlloc(scf::ForOp &forOp,
                          tt::ExperimentalDescriptorStoreOp storeOp) {
-  OpBuilder builder(forOp);
+  OpBuilderWithAsyncTaskIds builder(forOp);
   auto ty = cast<RankedTensorType>(storeOp.getSrc().getType());
   auto order = ttg::getOrder(ty.getEncoding());
   auto ctaLayout = ttg::getCTALayout(ty.getEncoding());
@@ -44,7 +46,7 @@ static Value createAlloc(scf::ForOp &forOp,
   Type memdescType =
       tt::MemDescType::get(ty.getShape(), ty.getElementType(), encoding,
                            sharedMemorySpace, /*mutableMemory*/ true);
-  Value alloc = builder.create<ttg::LocalAllocOp>(storeOp->getLoc(),
+  Value alloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(storeOp->getLoc(),
                                                   memdescType, Value());
   return alloc;
 }
@@ -52,7 +54,7 @@ static Value createAlloc(scf::ForOp &forOp,
 static void createTMAAsyncCopy(scf::ForOp &forOp,
                                tt::ExperimentalDescriptorStoreOp storeOp,
                                Value alloc) {
-  OpBuilder builder(storeOp);
+  OpBuilderWithAsyncTaskIds builder(storeOp);
   auto loc = storeOp.getLoc();
   auto ty = cast<RankedTensorType>(storeOp.getSrc().getType());
   auto order = ttg::getOrder(ty.getEncoding());
@@ -60,10 +62,10 @@ static void createTMAAsyncCopy(scf::ForOp &forOp,
 
   // Put wait before the local_store make the store truly async. We know
   // that we are the only user of the CopyLocalToGlobal.
-  builder.create<ttng::TMAStoreWait>(loc, 0);
-  builder.create<ttg::LocalStoreOp>(loc, storeOp.getSrc(), alloc);
-  builder.create<ttng::FenceAsyncSharedOp>(loc, false);
-  builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
+  builder.createWithAsyncTaskIds<ttng::TMAStoreWait>(loc, 0);
+  builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(loc, storeOp.getSrc(), alloc);
+  builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(loc, false);
+  builder.createWithAsyncTaskIds<ttng::AsyncTMACopyLocalToGlobalOp>(
       loc, storeOp.getDescPtr(), storeOp.getIndices(), alloc);
 
   storeOp->erase();

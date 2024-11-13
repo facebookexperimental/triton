@@ -16,6 +16,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -56,7 +58,8 @@ static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
                             tt::CoarseSchedule &schedule,
                             tt::CoarseSchedule::Cluster prefetchCluster,
                             llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
-                            int numStages) {
+                            int numStages,
+                            DenseMap<Operation *, Operation *> &TMAUserToWait) {
   OpBuilder builder(forOp);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
   // Replace the load with insert/extract slice.
@@ -113,6 +116,7 @@ static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
   loadOffsets[0] = extractIdx;
   auto viewLoad =
       builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, loadOffsets);
+  TMAUserToWait[viewLoad] = wait; // viewLoad will depend on barrierWait
   if (isMMV3Load) {
     auto alloc = cast<ttg::LocalAllocOp>((*loadOp->getUsers().begin()));
     replaceUsesAndPropagateType(builder, alloc, viewLoad.getResult());
@@ -157,7 +161,8 @@ static void createTMAAsyncCopy(
     scf::ForOp &forOp, tt::ExperimentalDescriptorLoadOp loadOp, Value alloc,
     Value insertIdx, Value extractIdx, Value barrier, Operation *waitOp,
     Value phase, tt::CoarseSchedule &schedule,
-    llvm::MapVector<Operation *, LoadInfo> &loadToInfo, int numStages) {
+    llvm::MapVector<Operation *, LoadInfo> &loadToInfo, int numStages,
+    DenseMap<Operation *, Operation *> &TMAUserToWait) {
   assert(phase && "Phase value is required for TMA async copy.");
   OpBuilder builder(forOp);
   Attribute sharedMemorySpace =
@@ -189,6 +194,7 @@ static void createTMAAsyncCopy(
   loadOffsets[0] = extractIdx;
   auto viewLoad =
       builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, loadOffsets);
+  TMAUserToWait[viewLoad] = waitOp; // viewLoad will depend on barrierWait
   if (isMMV3Load) {
     auto alloc = cast<ttg::LocalAllocOp>((*loadOp->getUsers().begin()));
     replaceUsesAndPropagateType(builder, alloc, viewLoad.getResult());
@@ -590,6 +596,156 @@ scheduleLoads(scf::ForOp forOp, tt::CoarseSchedule &schedule,
   return loadToInfo;
 }
 
+// Begin __FACEBOOK__ CompPipe
+static bool loopHasSchedule(scf::ForOp forOp) {
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (op.hasAttr("loop.stage") && op.hasAttr("loop.cluster")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static tt::CoarseSchedule::Cluster
+getLoopSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                /*DenseSet<Operation *> &rootUsers,*/ int numStages,
+                llvm::MapVector<Operation *, LoadInfo> &loadToInfo) {
+  ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
+  tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
+  tt::CoarseSchedule::Cluster afterPrologue = schedule.clusters.begin();
+  auto taskArr = mlir::getAsyncTaskIds(forOp);
+  // We either have a single task Id with a merged IfOp for all consumers
+  // or we have one task Id for each IfOp per consumer.
+  // We should not see a list of task Ids here.
+  bool isConsumerWG = taskArr.size() != 1 ? false : taskArr[0] != 0;
+
+  // Get all loads that are (transitively) used by dot ops and their distance
+  // to the dot op.
+  llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+      loadOpToIndLevelAndUse =
+          mlir::triton::loadOpsToIndirectionLevelAndUse(forOp);
+  LLVM_DEBUG({
+    LDBG("Found " << loadOpToIndLevelAndUse.size() << " loads to pipeline:");
+    for (const auto &[l, i, u] : loadOpToIndLevelAndUse) {
+      LDBG("  - load: " << *l);
+      LDBG("    at indirection level: " << i);
+      LDBG("    used by op: " << *u);
+    }
+  });
+  bool dataPartition = mlir::triton::tools::getBoolEnv("DATA_PARTITION_FA");
+  // When there are no load operations, continue computation pipelining if
+  // dataPartition is true and isConsumerWG is true. Early exit otherwise.
+  if (!(isConsumerWG && dataPartition) && loadOpToIndLevelAndUse.empty())
+    return afterPrologue;
+
+  // Check which loads are good for pipelining, and assign them
+  // memory layouts.
+  llvm::MapVector<Operation *, LoadInfo> loadToInfoT =
+      assignMemoryLayouts(loadOpToIndLevelAndUse, axisInfoAnalysis);
+  loadToInfo = loadToInfoT;
+
+  if (!(isConsumerWG && dataPartition) && loadToInfo.empty())
+    return afterPrologue;
+
+  // reconstrcut schedule from annotations of (stage, cluster)
+  int maxClusterId = 0, minClusterId = 0;
+  bool hasSchedule = false;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (op.hasAttr("loop.stage") && op.hasAttr("loop.cluster")) {
+      auto clusterId = cast<IntegerAttr>(op.getAttr("loop.cluster"))
+                           .getValue()
+                           .getSExtValue();
+      LLVM_DEBUG({
+        LDBG("saw cluster " << clusterId);
+        op.dump();
+      });
+      if (!hasSchedule) {
+        minClusterId = clusterId;
+        maxClusterId = clusterId;
+        hasSchedule = true;
+        continue;
+      }
+      minClusterId = (clusterId < minClusterId) ? clusterId : minClusterId;
+      maxClusterId = (clusterId > maxClusterId) ? clusterId : maxClusterId;
+    }
+  }
+  assert(hasSchedule);
+  LDBG("minCluster " << minClusterId << " max " << maxClusterId);
+  DenseMap<int, tt::CoarseSchedule::Cluster> clusters;
+  for (int i = minClusterId; i < maxClusterId + 1; i++) {
+    clusters.insert({i, schedule.clusters.newAtBack()});
+  }
+  // afterPrologue should be the first cluster after ifOps?
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (op.hasAttr("loop.stage") && op.hasAttr("loop.cluster")) {
+      auto stage =
+          cast<IntegerAttr>(op.getAttr("loop.stage")).getValue().getZExtValue();
+      auto clusterId = cast<IntegerAttr>(op.getAttr("loop.cluster"))
+                           .getValue()
+                           .getSExtValue();
+      schedule.insert(&op, stage, clusters[clusterId]);
+      LLVM_DEBUG({
+        LDBG("insert stage " << stage << " cluster " << clusterId << " "
+                             << *clusters[clusterId]);
+        op.dump();
+      });
+    }
+  }
+
+  // Distance from the load to the use. This needs to be re-worked.
+  if (forOp->hasAttr(tt::kNumStagesAttrName)) {
+    for (auto [loadOp, _, use] : loadOpToIndLevelAndUse) {
+      if (loadToInfo.count(loadOp) == 0)
+        continue;
+      loadToInfo[loadOp].distToUse =
+          schedule[use].first - schedule[loadOp].first;
+    }
+    return clusters[0];
+  }
+
+  // If there is a use chain of load -> dot -> dot, we can ignore the second dot
+  // here.
+  // Start from loadOp, check uses and stop the recursion when hitting a dot.
+  DenseSet<Operation *> seen;
+  llvm::SmallVector<std::tuple<Operation *, Operation *>> loadOpToDirectUses;
+  std::function<void(Operation * op, Operation *)> dfsUse =
+      [&](Operation *op, Operation *use) {
+        if (!seen.insert(use).second)
+          return;
+        if (use->hasTrait<OpTrait::DotLike>()) {
+          loadOpToDirectUses.push_back(std::make_tuple(op, use));
+          return;
+        }
+        for (auto &tUse : use->getUses()) {
+          Operation *useOp = tUse.getOwner();
+          if (useOp && useOp->getBlock() == op->getBlock()) {
+            dfsUse(op, useOp);
+          }
+        }
+      };
+  DenseSet<Operation *> loadOps;
+  for (auto [loadOp, _, use] : loadOpToIndLevelAndUse) {
+    if (loadToInfo.count(loadOp) == 0)
+      continue;
+    if (!loadOps.insert(loadOp).second)
+      continue;
+    seen.clear();
+    dfsUse(loadOp, loadOp);
+  }
+  for (auto [loadOp, use] : loadOpToDirectUses) {
+    LLVM_DEBUG({
+      LDBG("loadOpToDirectUses " << schedule[use].first << " "
+                                 << schedule[loadOp].first);
+      loadOp->dump();
+      use->dump();
+    });
+    loadToInfo[loadOp].distToUse = schedule[use].first - schedule[loadOp].first;
+  }
+
+  return clusters[0];
+}
+// End __FACEBOOK__ CompPipe
+
 // Schedule the prologue and epilogue `if` ops in the loop, pushing them as
 // close to the loop boundaries as possible. Return the cluster after the
 // prologue (or the beginning of the loop if there is no prologue).
@@ -652,8 +808,10 @@ schedulePrologueAndEpilogue(scf::ForOp forOp, tt::CoarseSchedule &schedule,
 
 // Add dependencies of anchor ops to the coarse schedule. Schedule them to
 // the same stage and ordering cluster as the anchor op.
-static void scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule,
-                                 int numStages) {
+static void
+scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                     int numStages,
+                     DenseMap<Operation *, Operation *> &TMAUserToWait) {
   SmallVector<std::tuple<Operation *, int, tt::CoarseSchedule::Cluster>>
       opsInOrder = schedule.getOpsInOrder(forOp);
   // Schedule dependencies stage by stage.
@@ -661,7 +819,7 @@ static void scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule,
     for (auto [op, stage_, cluster] : opsInOrder) {
       if (stage_ != stage)
         continue;
-      schedule.insertDepsOfOp(op, stage, cluster, false);
+      schedule.insertDepsOfOp(op, stage, cluster, false, &TMAUserToWait);
     }
   }
 }
@@ -818,7 +976,7 @@ struct AsyncLoad {
 };
 
 // Create barriers and wait ops for the async loads. Barriers may be shared by
-// multiple loads is the schedule allows it.
+// multiple loads if the schedule allows it.
 static void createTMABarrierAndWait(
     scf::ForOp &forOp, SmallVector<AsyncLoad> &asyncLoads, Value insertIdx,
     Value extractIdx, Value phase, int numBuffers, tt::CoarseSchedule &schedule,
@@ -905,7 +1063,7 @@ static void createTMABarrierAndWait(
     Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
     Operation *expect = builder.create<ttng::BarrierExpectOp>(
         forOp.getLoc(), barrier, sizeInBytes, pred);
-    auto [stage, cluster] = schedule[asyncLoads[0].loadOp];
+    auto [stage, cluster] = schedule[group[0]->loadOp];
     schedule.insert(expect, stage, cluster);
 
     builder.setInsertionPointAfter(group.back()->loadOp);
@@ -926,7 +1084,8 @@ static void createTMABarrierAndWait(
 static SmallVector<Value>
 createAsyncOps(scf::ForOp &forOp, tt::CoarseSchedule &schedule,
                llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
-               SmallVector<Value> &barriers, int numStages) {
+               SmallVector<Value> &barriers, int numStages,
+               DenseMap<Operation *, Operation *> &TMAUserToWait) {
   // Calculate the number of buffers needed for each load.
   // TODO pawel: we could do more fine-grained allocation here and
   // allocate only the number of buffers that specific loads need.
@@ -1017,12 +1176,13 @@ createAsyncOps(scf::ForOp &forOp, tt::CoarseSchedule &schedule,
   for (AsyncLoad &asyncLoad : asyncLoads) {
     if (auto loadOp = dyn_cast<tt::LoadOp>(asyncLoad.loadOp)) {
       createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
-                      schedule, prefetchCluster, loadToInfo, numStages);
+                      schedule, prefetchCluster, loadToInfo, numStages,
+                      TMAUserToWait);
     } else {
       auto descLoad = cast<tt::ExperimentalDescriptorLoadOp>(asyncLoad.loadOp);
       createTMAAsyncCopy(forOp, descLoad, asyncLoad.alloc, insertIdx,
                          extractIdx, asyncLoad.barrier, asyncLoad.waitOp, phase,
-                         schedule, loadToInfo, numStages);
+                         schedule, loadToInfo, numStages, TMAUserToWait);
     }
   }
   SmallVector<Value> newYieldOperands = {insertIdx, extractIdx};
@@ -1060,9 +1220,24 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
   // a scaffold for the final schedule.
   DenseSet<Operation *> rootUsers;
   tt::CoarseSchedule coarseSchedule(numStages);
-  llvm::MapVector<Operation *, LoadInfo> loadToInfo =
-      scheduleLoads(forOp, coarseSchedule, rootUsers, numStages);
-  if (loadToInfo.empty())
+  // Begin __FACEBOOK__ CompPipe
+  bool hasSchedule = loopHasSchedule(forOp);
+  llvm::MapVector<Operation *, LoadInfo> loadToInfo;
+  tt::CoarseSchedule::Cluster afterPrologue;
+  if (!hasSchedule) {
+    loadToInfo = scheduleLoads(forOp, coarseSchedule, rootUsers, numStages);
+  } else {
+    afterPrologue = getLoopSchedule(forOp, coarseSchedule,
+                                    /*rootUsers,*/ numStages, loadToInfo);
+  }
+  // vanilla
+  //  llvm::MapVector<Operation *, LoadInfo> loadToInfo =
+  //      scheduleLoads(forOp, coarseSchedule, rootUsers, numStages);
+  // End __FACEBOOK__ CompPipe
+  auto taskArr = mlir::getAsyncTaskIds(forOp);
+  bool isConsumerWG = taskArr.size() != 1 ? false : taskArr[0] != 0;
+  bool dataPartition = mlir::triton::tools::getBoolEnv("DATA_PARTITION_FA");
+  if (!(isConsumerWG && dataPartition) && loadToInfo.empty())
     return false;
 
   LLVM_DEBUG({
@@ -1070,24 +1245,33 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
     coarseSchedule.dump();
   });
 
-  tt::CoarseSchedule::Cluster afterPrologue =
-      schedulePrologueAndEpilogue(forOp, coarseSchedule, rootUsers, numStages);
+  // Begin __FACEBOOK__ CompPipe
+  if (!hasSchedule) {
+    afterPrologue = schedulePrologueAndEpilogue(forOp, coarseSchedule,
+                                                rootUsers, numStages);
+  }
+  // vanilla
+  //  tt::CoarseSchedule::Cluster afterPrologue =
+  //      schedulePrologueAndEpilogue(forOp, coarseSchedule, rootUsers,
+  //      numStages);
+  // End __FACEBOOK__ CompPipe
   LLVM_DEBUG({
     LDBG("Coarse schedule with prologue and epilogue:");
     coarseSchedule.dump();
   });
 
   SmallVector<Value> barriers;
+  DenseMap<Operation *, Operation *> TMAUserToWait;
   // Convert the loads into async loads and create the allocs.
-  SmallVector<Value> allocs =
-      createAsyncOps(forOp, coarseSchedule, loadToInfo, barriers, numStages);
+  SmallVector<Value> allocs = createAsyncOps(
+      forOp, coarseSchedule, loadToInfo, barriers, numStages, TMAUserToWait);
 
   LLVM_DEBUG({
     LDBG("Coarse schedule with async loads:");
     coarseSchedule.dump();
   });
 
-  scheduleDependencies(forOp, coarseSchedule, numStages);
+  scheduleDependencies(forOp, coarseSchedule, numStages, TMAUserToWait);
   LLVM_DEBUG({
     LDBG("Coarse schedule with dependencies:");
     coarseSchedule.dump();
@@ -1116,7 +1300,10 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
                  std::vector<std::pair<Operation *, unsigned>> &s) {
         s = std::move(schedule);
       };
-  options.peelEpilogue = false;
+  bool hasLoopSchedule = forOp->hasAttr("tt.loop_schedule");
+  bool PeelLastIter =
+      ::triton::tools::getBoolEnv("PEEL_LAST_ITER") && hasLoopSchedule;
+  options.peelEpilogue = PeelLastIter ? true : false;
   options.predicateFn = tt::predicateOp;
   options.supportDynamicLoops = true;
   options.annotateFn = [](Operation *op,
@@ -1464,6 +1651,10 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
         return isa<ttng::WarpGroupDotOp>(use.getOwner()) &&
                use.getOperandNumber() == 2;
       })) {
+    return iterArgIdx;
+  }
+
+  if (::triton::tools::getBoolEnv("HACK_ASYNC_DOT")) {
     return iterArgIdx;
   }
 

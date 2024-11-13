@@ -802,6 +802,20 @@ class CodeGenerator(ast.NodeVisitor):
         ast.USub: '__neg__', ast.UAdd: '__pos__', ast.Not: '__not__', ast.Invert: '__invert__'
     }
 
+    def visit_withitem(self, node):
+        return self.visit(node.context_expr)
+
+    def visit_With(self, node):
+        assert len(node.items) == 1
+        context = node.items[0].context_expr
+        withitemClass = self.visit(context.func)
+        if withitemClass == language.async_task:
+            args = [self.visit(arg) for arg in context.args]
+            with withitemClass(*args, _builder=self.builder):
+                self.visit_compound_statement(node.body)
+        else:
+            self.visit_compound_statement(node.body)
+
     def visit_While(self, node):
         with enter_sub_region(self) as sr:
             liveins, insert_block = sr
@@ -904,6 +918,7 @@ class CodeGenerator(ast.NodeVisitor):
                     ast.NodeVisitor.generic_visit(self, stmt)
             return
         num_stages = None
+        loop_schedule = None
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
@@ -913,6 +928,7 @@ class CodeGenerator(ast.NodeVisitor):
             ub = iterator.end
             step = iterator.step
             num_stages = iterator.num_stages
+            loop_schedule = iterator.loop_schedule
         elif IteratorClass is range:
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -986,6 +1002,8 @@ class CodeGenerator(ast.NodeVisitor):
             for_op = self.builder.create_for_op(lb, ub, step, [arg.handle for arg in init_args])
             if num_stages is not None:
                 for_op.set_attr("tt.num_stages", self.builder.get_int32_attr(num_stages))
+            if loop_schedule is not None:
+                for_op.set_attr("tt.loop_schedule", self.builder.get_string_attr(loop_schedule.value))
 
             self.scf_stack.append(node)
             self.builder.set_insertion_point_to_start(for_op.get_body(0))

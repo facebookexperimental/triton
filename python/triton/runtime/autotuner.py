@@ -35,7 +35,7 @@ class Autotuner(KernelInterface):
             'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
         """
         if not configs:
-            self.configs = [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
+            self.configs = [Config({}, num_warps=4, num_stages=2, num_ctas=1, num_buffers_warp_spec=0, num_consumer_groups=0, reg_dec_producer=0, reg_inc_consumer=0, proton_slots=0)]
         else:
             self.configs = configs
         self.key_idx = [arg_names.index(k) for k in key]
@@ -153,6 +153,17 @@ class Autotuner(KernelInterface):
                 timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                 bench_end = time.time()
                 self.bench_time = bench_end - bench_start
+
+                # __FACEBOOK__ (facebook) begin T203283446
+                if os.getenv("TRITON_PRINT_AUTOTUNING_ALL", None) == "1":
+                    print(
+                        f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:'
+                    )
+                    sorted_configs = builtins.sorted(timings, key=timings.get)
+                    for config in sorted_configs:
+                        print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}')
+                # __FACEBOOK__ (facebook) end T203283446
+
                 self.cache[key] = builtins.min(timings, key=timings.get)
                 self.pre_hook(args, reset_only=True)
                 self.configs_timings = timings
@@ -227,11 +238,16 @@ class Config:
                     function are args.
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=2, num_ctas=1, maxnreg=None, pre_hook=None):
+    def __init__(self, kwargs, num_warps=4, num_stages=2, num_ctas=1, num_buffers_warp_spec=0, num_consumer_groups=0, reg_dec_producer=0, reg_inc_consumer=0, proton_slots = 0, maxnreg=None, pre_hook=None):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
         self.num_stages = num_stages
+        self.num_buffers_warp_spec = num_buffers_warp_spec
+        self.num_consumer_groups = num_consumer_groups
+        self.reg_dec_producer = reg_dec_producer
+        self.reg_inc_consumer = reg_inc_consumer
+        self.proton_slots = proton_slots
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
 
@@ -243,6 +259,11 @@ class Config:
                     ("num_warps", self.num_warps),
                     ("num_ctas", self.num_ctas),
                     ("num_stages", self.num_stages),
+                    ("num_buffers_warp_spec", self.num_buffers_warp_spec),
+                    ("num_consumer_groups", self.num_consumer_groups),
+                    ("reg_dec_producer", self.reg_dec_producer),
+                    ("reg_inc_consumer", self.reg_inc_consumer),
+                    ("proton_slots", self.proton_slots),
                     ("maxnreg", self.maxnreg),
                 ) if v is not None
             }
@@ -255,6 +276,11 @@ class Config:
         res.append(f"num_warps: {self.num_warps}")
         res.append(f"num_ctas: {self.num_ctas}")
         res.append(f"num_stages: {self.num_stages}")
+        res.append(f"num_buffers_warp_spec: {self.num_buffers_warp_spec}")
+        res.append(f"num_consumer_groups: {self.num_consumer_groups}")
+        res.append(f"reg_dec_producer: {self.reg_dec_producer}")
+        res.append(f"reg_inc_consumer: {self.reg_inc_consumer}")
+        res.append(f"proton_slots: {self.proton_slots}")
         res.append(f"maxnreg: {self.maxnreg}")
         return ", ".join(res)
 

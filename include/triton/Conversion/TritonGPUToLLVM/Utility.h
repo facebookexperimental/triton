@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -143,6 +144,20 @@ using namespace mlir::triton;
 
 namespace mlir {
 namespace triton {
+
+static inline void insertBarrier(PatternRewriter &rewriter, Operation *op) {
+  auto barrierOp = rewriter.create<mlir::gpu::BarrierOp>(op->getLoc());
+  auto asyncTaskIds = getAsyncTaskIds(op);
+  if (asyncTaskIds.size() == 1) {
+    int asyncTaskId = asyncTaskIds[0];
+    int barId = asyncTaskId + nameBarrierIdBegin;
+    assert(barId < nameBarrierIdEnd);
+    // TODO: Change hard code style of numThreads. 
+    const int numThreads = 128;
+    barrierOp->setAttr("bar_id", rewriter.getI64IntegerAttr(barId));
+    barrierOp->setAttr("num_threads", rewriter.getI64IntegerAttr(numThreads));
+  }
+}
 
 // Delinearize supposing order is [0, 1, .. , n]
 template <typename T>
@@ -371,6 +386,20 @@ inline Value getStackPointer(RewriterBase &rewriter,
     return funcOp.getArgument(funcOp.getNumArguments() - 1);
 }
 
+static Operation *getWarpGroupId(Operation *op) {
+  auto funcOp = op->getParentOfType<FunctionOpInterface>();
+  Operation *getWarpId = nullptr;
+  funcOp.walk([&](Operation *op) -> void {
+    if (isa<mlir::triton::nvidia_gpu::GetCanonicalWarpIdOp>(op)) {
+      assert(getWarpId == nullptr);
+      getWarpId = op;
+    }
+  });
+  assert(getWarpId);
+  getWarpId->dump();
+  return getWarpId;
+}
+
 inline Value getSharedMemoryBase(Location loc, RewriterBase &rewriter,
                                  Operation *op) {
   auto ptrTy = LLVM::LLVMPointerType::get(rewriter.getContext(), 3);
@@ -381,6 +410,19 @@ inline Value getSharedMemoryBase(Location loc, RewriterBase &rewriter,
                       .getValue()
                       .getZExtValue();
   Value offVal = i32_val(offset);
+  if (op->hasAttr("allocation.copy")) {
+    auto copy = cast<IntegerAttr>(op->getAttr("allocation.copy")).getValue().getZExtValue();
+    if (copy != 1) {
+      Operation *getWarpId = getWarpGroupId(op);
+      Value warpsPerWG = i32_val(4);
+      Value wgId = udiv(getWarpId->getResult(0), warpsPerWG);
+      // (wgId - 1) * allocation.size + offset
+      auto singleSize = cast<IntegerAttr>(op->getAttr("allocation.size")).getValue().getZExtValue();
+      Value sub1 = sub(wgId, i32_val(1));
+      Value temp = mul(sub1, i32_val(singleSize));
+      offVal = add(temp, offVal);
+    }
+  }
   Value base = gep(ptrTy, i8_ty, LLVM::getStackPointer(rewriter, func), offVal);
   return base;
 }

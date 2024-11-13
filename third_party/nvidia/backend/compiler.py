@@ -88,6 +88,11 @@ class CUDAOptions:
     num_warps: int = 4
     num_ctas: int = 1
     num_stages: int = 3
+    num_buffers_warp_spec: int = 0
+    num_consumer_groups: int = 0
+    reg_dec_producer: int = 0
+    reg_inc_consumer: int = 0
+    partition_style: int = 0
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -102,6 +107,7 @@ class CUDAOptions:
     extern_libs: dict = None
     debug: bool = False
     backend_name: str = 'cuda'
+    proton_slots: int = 0
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -205,7 +211,7 @@ class CUDABackend(BaseBackend):
         # TTIR -> TTGIR
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas, opt.proton_slots)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         if capability // 10 >= 8:
@@ -221,7 +227,14 @@ class CUDABackend(BaseBackend):
         if capability // 10 >= 8:
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,
+                                                 opt.reg_dec_producer, opt.reg_inc_consumer)
+            passes.ttgpuir.add_loop_scheduling(pm, opt.num_stages)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages)
+            passes.ttgpuir.add_ping_pong_sync(pm, opt.num_consumer_groups, opt.partition_style)
+            passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
         passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_remove_layout_conversions(pm)
@@ -254,6 +267,8 @@ class CUDABackend(BaseBackend):
             mod.context.printOpOnDiagnostic(True)
         nvidia.passes.ttgpuir.add_decompose_unsupported_conversions(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+        if (options.proton_slots > 0):
+            passes.ttgpuir.add_proton_lowering(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_index_to_llvmir(pm)
         passes.ttgpuir.add_allocate_shared_memory(pm)

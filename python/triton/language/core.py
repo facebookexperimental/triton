@@ -2505,6 +2505,21 @@ class static_range:
         raise RuntimeError("static_range can only be used in @triton.jit'd functions")
 
 
+class async_task:
+    """
+    Context manager to run code fragments asynchronously.
+    """
+    def __init__(self, task_ids, _builder=None):
+        self.task_ids = task_ids
+        self.builder = _builder
+
+    def __enter__(self):
+        self.builder.set_async_task_ids(self.task_ids)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.builder.unset_async_task_ids()
+
+
 class range:
     """
     Iterator that counts upward forever.
@@ -2514,7 +2529,7 @@ class range:
 
         @triton.jit
         def kernel(...):
-            for i in tl.range(10, num_stages=3):
+            for i in tl.range(10, num_stages=3, loop_schedule="Default"):
                 ...
     :note: This is a special iterator used to implement similar semantics to Python's :code:`range` in the context of
         :code:`triton.jit` functions. In addition, it allows user to pass extra attributes to the compiler.
@@ -2528,9 +2543,10 @@ class range:
         kernel argument.  The kernel argument only pipelines loads that feed
         into :code:`dot` operations, while this attribute tries to pipeline most
         (though not all) loads in this loop.
+    :param loop_schedule: specify a scheduling policy for the loop.
     """
 
-    def __init__(self, arg1, arg2=None, step=None, num_stages=None):
+    def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_schedule=None):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -2542,6 +2558,7 @@ class range:
             self.start = arg1
             self.end = arg2
         self.num_stages = num_stages
+        self.loop_schedule = loop_schedule
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")

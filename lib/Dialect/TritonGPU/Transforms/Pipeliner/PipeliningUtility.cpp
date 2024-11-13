@@ -81,6 +81,37 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
 
+  if (isa<ttng::WarpGroupDotOp>(op))
+    return op;
+  if (auto wait = dyn_cast<ttng::WaitBarrierOp>(op)) {
+    rewriter.setInsertionPoint(wait);
+    auto ifOp =
+        rewriter.create<scf::IfOp>(wait->getLoc(), pred, /*else=*/false);
+    rewriter.moveOpBefore(wait, ifOp.thenBlock(), ifOp.thenBlock()->begin());
+    return ifOp;
+  }
+  if (auto wait = dyn_cast<ttng::ConsumerWaitOp>(op)) {
+    rewriter.setInsertionPoint(wait);
+    auto ifOp =
+        rewriter.create<scf::IfOp>(wait->getLoc(), pred, /*else=*/false);
+    rewriter.moveOpBefore(wait, ifOp.thenBlock(), ifOp.thenBlock()->begin());
+    return ifOp;
+  }
+  if (auto release = dyn_cast<ttng::ConsumerReleaseOp>(op)) {
+    rewriter.setInsertionPoint(release);
+    auto ifOp =
+        rewriter.create<scf::IfOp>(release->getLoc(), pred, /*else=*/false);
+    rewriter.moveOpBefore(release, ifOp.thenBlock(), ifOp.thenBlock()->begin());
+    return ifOp;
+  }
+  if (auto arrive = dyn_cast<ttng::MBarrierArriveOp>(op)) {
+    rewriter.setInsertionPoint(arrive);
+    auto ifOp =
+        rewriter.create<scf::IfOp>(arrive->getLoc(), pred, /*else=*/false);
+    rewriter.moveOpBefore(arrive, ifOp.thenBlock(), ifOp.thenBlock()->begin());
+    return ifOp;
+  }
+
   assert("don't know how to predicate this op" && false);
   return op;
 }
@@ -159,6 +190,7 @@ void mlir::triton::replaceUsesAndPropagateType(OpBuilder &builder,
                                                trans.getOrderAttr());
     }
     assert(newVal);
+    newVal.getDefiningOp()->setAttrs(user->getAttrs());
     replaceUsesAndPropagateType(builder, user, newVal);
     opsToDelete.push_back(use.getOwner());
   }
@@ -173,3 +205,49 @@ void mlir::triton::replaceUsesAndPropagateType(OpBuilder &builder,
   for (Operation *op : opsToDelete)
     op->erase();
 }
+
+// Begin __FACEBOOK__ CompPipe
+llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+mlir::triton::loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
+  llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+      loadOpToIndLevelAndUse;
+  DenseSet<Operation *> seen;
+
+  std::function<void(Operation * op, int, Operation *)> dfs =
+      [&](Operation *op, int distance, Operation *use) {
+        if (!seen.insert(op).second)
+          return;
+        if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op)) {
+          // TODO: What if there are multiple uses at different distances?
+          loadOpToIndLevelAndUse.push_back(std::make_tuple(op, distance, use));
+          use = op;
+          distance++;
+        }
+        for (Value operand : op->getOperands()) {
+          Value v = operand;
+          Operation *defOp = v.getDefiningOp();
+          if (defOp && defOp->getBlock() == op->getBlock()) {
+            dfs(defOp, distance, use);
+          }
+        }
+      };
+
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (!op.hasTrait<OpTrait::DotLike>())
+      continue;
+    seen.clear();
+    dfs(&op, 0, &op);
+  }
+
+  // If the loop has numStages attribute, also consider pipelining other loads
+  // that are not directly used by dot ops.
+  if (forOp->hasAttr(tt::kNumStagesAttrName)) {
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      if (!isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op))
+        dfs(&op, 0, &op);
+    }
+  }
+
+  return loadOpToIndLevelAndUse;
+}
+// End __FACEBOOK__ CompPipe

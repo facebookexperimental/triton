@@ -314,10 +314,14 @@ public:
           loadOp.getLoc(), newPtr, newMask, newOther, loadOp.getCache(),
           loadOp.getEvict(), loadOp.getIsVolatile());
       op->getResult(0).replaceAllUsesWith(newResult);
+      if (op->getAttr("async_task_id"))
+        newResult->setAttr("async_task_id", op->getAttr("async_task_id"));
     } else if (auto storeOp = dyn_cast<triton::StoreOp>(op)) {
-      builder.create<triton::StoreOp>(storeOp.getLoc(), newPtr,
+      auto newOp = builder.create<triton::StoreOp>(storeOp.getLoc(), newPtr,
                                       storeOp.getValue(), newMask,
                                       storeOp.getCache(), storeOp.getEvict());
+      if (op->getAttr("async_task_id"))
+        newOp->setAttr("async_task_id", op->getAttr("async_task_id"));
     }
 
     // Erase the original operation
@@ -413,6 +417,7 @@ public:
     auto newForOp = builder.create<scf::ForOp>(op.getLoc(), op.getLowerBound(),
                                                op.getUpperBound(), op.getStep(),
                                                newIterOperands);
+    newForOp->setAttrs(op->getAttrs());
 
     // Create value mapping. Note that for tensor pointers, we use identity
     // mapping. It may refer to a value in the old loop, but we will rewrite it

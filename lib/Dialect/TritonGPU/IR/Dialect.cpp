@@ -43,6 +43,10 @@ static Type getI1SameShapeFromTensorOrTensorPtr(Type type) {
 
 namespace gpu {
 
+const int getWarpGroupSize() { return 4; }
+
+const int getWordsPerProtonEntry() { return 2; }
+
 // TODO: Inheritance of layout attributes
 // so that all distributed layouts implement
 // these utilities
@@ -2717,8 +2721,9 @@ struct CanonicalizeConvertFromAlloc
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert)
       return failure();
-    rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(
+    auto newAlloc = rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(
         op, op->getResult(0).getType(), convert.getSrc());
+    newAlloc->setAttrs(op->getAttrs());
     return mlir::success();
   }
 };
@@ -2734,8 +2739,9 @@ struct CanonicalizeConvertFromLocalStore
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert)
       return failure();
-    rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(op, convert.getSrc(),
-                                                           op.getDst());
+    auto store = rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(op, convert.getSrc(),
+                                                                        op.getDst());
+    store->setAttrs(op->getAttrs());
     return mlir::success();
   }
 };
@@ -2854,8 +2860,10 @@ struct CanonicalizeConvertFromConvert
     // cvt(cvt(x, type1), type2) -> cvt(x, type2)
     if (auto cvt = dyn_cast<ConvertLayoutOp>(arg)) {
       auto srcType = op.getSrc().getType();
-      rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
+      auto origAttrs = op->getAttrs();
+      auto newOp = rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
           op, op->getResultTypes().front(), cvt.getSrc());
+      newOp->setAttrs(origAttrs);
       return success();
     }
 
@@ -2965,6 +2973,58 @@ void LocalStoreOp::getEffects(
         &effects) {
   effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(),
                        mlir::triton::gpu::SharedMemory::get());
+}
+
+// LocalRecordOp
+void LocalRecordOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       SideEffects::DefaultResource::get());
+}
+
+LogicalResult LocalRecordOp::verify() {
+  auto m = getOperation()->getParentOfType<mlir::ModuleOp>();
+  if (!m->hasAttr("triton_gpu.proton-slots"))
+    return emitError("Intra-kernel profiling not enabled");
+
+  int slots = cast<IntegerAttr>(m->getAttr("triton_gpu.proton-slots")).getInt();
+
+  const int warpsPerGroup = getWarpGroupSize();
+  int numWarpgroups = TritonGPUDialect::getNumWarps(m) / warpsPerGroup;
+  if (slots < numWarpgroups)
+    return emitError(
+        "Proton slots must be greater than the number of warpgroups per CTA");
+
+  // Ensure that slots is a power of 2. Otherwise, the profiling circular buffer
+  // index management incurs too much overhead.
+  // Disable for WS hacking. With WS, we just need each warp groups buffer size is a power of 2.
+  //if ((slots & (slots - 1)) != 0)
+  //  return emitError("Proton slots must be power of 2");
+
+  return success();
+}
+
+// ProtonFinalizeOp
+void ProtonFinalizeOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getDataMutable(),
+                       mlir::triton::gpu::SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getIndexPtrMutable(),
+                       mlir::triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getPtrMutable(),
+                       mlir::triton::GlobalMemory::get());
+}
+
+// ProtonInitOp
+void ProtonInitOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Allocate::get(),
+                       mlir::triton::GlobalMemory::get());
 }
 
 // AsyncCopyGlobalToLocalOp
