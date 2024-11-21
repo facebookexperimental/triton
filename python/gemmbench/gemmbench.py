@@ -65,8 +65,23 @@ def aten_matmul(a, b):
 
 
 test_impls = [
-    aten_matmul,    
+    aten_matmul,
+    # cublas_matmul,
+    # inductor_matmul,
+    impls.matmul,
+    impls.matmul_persistent,
+    impls.matmul_persistent_cooperative,
+    impls.matmul_persistent_tma,
     impls.matmul_persistent_tma_ws,
+    impls.matmul_persistent_tma_ws_cooperative,
+    impls.matmul_persistent_tma_ws_cooperative_manual,
+    impls.matmul_persistent_ws,
+    impls.matmul_persistent_ws_cooperative,
+    impls.matmul_persistent_ws_cooperative_manual,
+    impls.matmul_tma_ws,
+    impls.matmul_tma_ws_cooperative,
+    impls.matmul_ws_cooperative,
+    impls.matmul_1d_persistent_swp_tma,
 ]
 
 impl_map = {fn.__name__: fn for fn in test_impls}
@@ -74,9 +89,9 @@ impl_map = {fn.__name__: fn for fn in test_impls}
 
 def test():
     torch.manual_seed(0)
-    m = 8192
-    n = 8192
-    k = 8192
+    m = 4 * 11 * 64
+    n = 12 * 256
+    k = 64 * 4
     a = torch.randn((m, k), device="cuda", dtype=torch.float16)
     b = torch.randn((k, n), device="cuda", dtype=torch.float16)
     torch_output = torch.matmul(a, b)
@@ -95,7 +110,7 @@ def test():
             print(torch_output)
             print("triton output:")
             print(triton_output)
-            #torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=rtol)
+            # torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=rtol)
 
 
 TORCH_HAS_FP8 = False  # hasattr(torch, "float8_e5m2")
@@ -160,7 +175,9 @@ def benchmark(M, N, K, provider, fp8_inputs):
         b = b.to(torch.float8_e5m2)
     quantiles = [0.5, 0.2, 0.8]
     fn = impl_map[provider]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: fn(a, b), quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        lambda: fn(a, b), quantiles=quantiles
+    )
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
