@@ -224,9 +224,7 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   for (unsigned i = 0; i < usedArgs.size(); ++i) {
     auto oldResult = forOp.getResult(usedArgs[i]);
     auto newResult = newForOp.getResult(i);
-    oldResult.replaceUsesWithIf(newResult, [&](OpOperand &operand) -> bool {
-      return hasAsyncTaskId(operand.getOwner(), asyncTaskId);
-    });
+    mapping.map(oldResult, newResult); //p->getResult(i), newOp->getResult(i));
   }
 
   return newForOp;
