@@ -224,7 +224,7 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   for (unsigned i = 0; i < usedArgs.size(); ++i) {
     auto oldResult = forOp.getResult(usedArgs[i]);
     auto newResult = newForOp.getResult(i);
-    mapping.map(oldResult, newResult); //p->getResult(i), newOp->getResult(i));
+    mapping.map(oldResult, newResult);
   }
 
   return newForOp;
