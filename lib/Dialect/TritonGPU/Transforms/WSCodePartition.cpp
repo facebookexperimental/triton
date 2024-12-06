@@ -432,70 +432,6 @@ void getTransitiveUsers(Value root,
   }
 }
 
-// Value findTransitiveProducer(Value root) {
-//   SetVector<Operation *> users;
-//   getTransitiveUsers(root, users);
-//   assert(!users.empty() && "producer op has no consumers");
-//   if (users.size() == 1) {
-//     return root;
-//   }
-
-//   // Reconsile the user list. If there are multiple users, we need to
-//   // find a global producer in the same scope with the outtermost-scoped
-//   user. Region *currentScope = root.getDefiningOp()->getParentRegion();
-//   Region *userScope = nullptr;
-
-//   // check all users have same scope
-//   for (Operation *user : users) {
-//     auto currentScope = user->getParentRegion();
-//     if (userScope)
-
-//       auto parentRegions = getAllParentRegions(user);
-//     if (parentRegions.count(currentScope) == 0) {
-//       llvm::errs() << "user is not in the same scope as the producer\n";
-//       llvm_unreachable("user is not in the same scope as the producer");
-//     }
-
-//     if (userScope->getParentOfType<scf::ForOp>() == nullptr) {
-//       newScope = userScope;
-//     }
-//   }
-
-//   auto getAllParentRegions = [](Operation *op) {
-//     SetVector<Region *> parentRegions;
-//     Region *region = op->getParentRegion();
-//     while (region) {
-//       parentRegions.insert(region);
-//       mlir::Operation *parentOp = region->getParentOp();
-//       if (!parentOp)
-//         break;
-//       region = parentOp->getParentRegion();
-//     }
-
-//     return parentRegions;
-//   };
-
-//   // Find the outtermost-scoped user.
-//   for (Operation *user : users) {
-//     auto parentRegions = getAllParentRegions(user);
-//     if (parentRegions.count(currentScope) == 0) {
-//       llvm::errs() << "user is not in the same scope as the producer\n";
-//       llvm_unreachable("user is not in the same scope as the producer");
-//     }
-
-//     if (userScope->getParentOfType<scf::ForOp>() == nullptr) {
-//       newScope = userScope;
-//     }
-//   }
-
-//   // Find the global producer in the same scope with the outtermost-scoped
-//   user.
-
-//   // Promote producer to the same level as the consumer.
-
-//   return root;
-// }
-
 // Loads will be in producer warp groups. For now, we only allow a single
 // warp group/task for a producer. For each LoadOp, create a channel from it
 // to any direct user which belongs to a different taskId.
@@ -559,12 +495,34 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 }
 
-// Update map, which will be keyed by getDstOp() of the channel. Use mapKeyVec
-// to enforce deterministic order for map.
+// Update map, which will be keyed by getDstOp() of the channel. Use
+// orderedChannels to enforce deterministic order for map.
 void groupChannels(
     SmallVector<Channel *> &channels,
-    DenseMap<Operation *, SmallVector<Channel *>> &groupedChannels,
-    SmallVector<Operation *> &mapKeyVec) {
+    DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
+    DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByConsumers,
+    SmallVector<Channel *> &orderedChannels) {
+
+  // Group channels by producer op.
+  DenseMap<Operation *, SmallVector<Channel *>> producerChannels;
+  for (auto channel : channels) {
+    producerChannels[channel->getSrcOp()].push_back(channel);
+  }
+
+#ifndef NDEBUG
+  // Some sanity checks.
+  for (auto &item : producerChannels) {
+    auto &channels = item.second;
+    unsigned numBuffers = channels.front()->numBuffers;
+    for (auto c : channels) {
+      assert(c->numBuffers == numBuffers && "Unmatched number of buffers");
+    }
+  }
+#endif
+
+  // Group channels by consumer op.
+  DenseMap<Operation *, SmallVector<Channel *>> consumerChannels;
+
   // Two channels can be combined if
   //   src1 and src2 are in the same block and
   //   (dst1 == dst2 or
@@ -579,11 +537,11 @@ void groupChannels(
     return dst1->getBlock() == dst2->getBlock();
   };
   assert(channels.size() > 0 && "channel size is zero");
-  // Compare with existing channels in the groupedChannels to see if it can be
-  // combined.
+  // Compare with existing channels in the consumerChannels to see if
+  // it can be combined.
   for (auto *c0 : channels) {
     bool merged = false;
-    for (auto &kv : groupedChannels) {
+    for (auto &kv : consumerChannels) {
       if (kv.second.size() > 0 && channelCanBeMerged(c0, kv.second.front())) {
         kv.second.push_back(c0);
         merged = true;
@@ -592,15 +550,15 @@ void groupChannels(
     }
     if (!merged) { // Create a new entry.
       auto *keyOp = c0->getDstOp();
-      if (!groupedChannels.count(keyOp))
-        mapKeyVec.push_back(keyOp);
-      groupedChannels[keyOp].push_back(c0);
+      if (!consumerChannels.count(keyOp))
+        orderedChannels.push_back(c0);
+      consumerChannels[keyOp].push_back(c0);
     }
   }
 
   // Reorder channels associated with one entry based on program order of the
   // producers.
-  for (auto &kv : groupedChannels) {
+  for (auto &kv : consumerChannels) {
     if (kv.second.size() > 1) {
       auto &allOps = kv.second.front()->getSrcOp()->getBlock()->getOperations();
       std::sort(
@@ -621,11 +579,38 @@ void groupChannels(
     }
   }
 
+  // Switch to using channel as the key instead of ops as ops can be volatile.
+  for (auto &kv : producerChannels) {
+    channelsGroupedByProducers[kv.second.front()] = kv.second;
+  }
+  for (auto &kv : consumerChannels) {
+    channelsGroupedByConsumers[kv.second.front()] = kv.second;
+  }
+
   LLVM_DEBUG({
-    LDBG("\n\nGrouped channels:");
-    for (auto &kv : groupedChannels) {
-      DBGS() << "consumer op:  ";
-      kv.getFirst()->dump();
+    DBGS() << "\n\n";
+    LDBG("Grouped channels by producer:");
+    unsigned i = 0;
+    for (auto &kv : channelsGroupedByProducers) {
+      DBGS() << "Channel  " << ++i << ":\n";
+      DBGS() << "producer:  ";
+      kv.getFirst()->getSrcOp()->dump();
+      for (auto &channel : kv.second) {
+        DBGS() << "consumer: ";
+        channel->getDstOp()->dump();
+        DBGS() << "] ";
+        LDBG("numBuffers: " << channel->numBuffers);
+        DBGS() << "\n";
+      }
+    }
+
+    DBGS() << "\n\n";
+    LDBG("Grouped channels by consumer:");
+    i = 0;
+    for (auto &kv : channelsGroupedByConsumers) {
+      DBGS() << "Channel  " << ++i << ":\n";
+      DBGS() << "consumer:  ";
+      kv.getFirst()->getDstOp()->dump();
       for (auto &channel : kv.second) {
         DBGS() << "producer: ";
         channel->getSrcOp()->dump();
@@ -633,7 +618,9 @@ void groupChannels(
           DBGS() << asyncTaskId << ", ";
         DBGS() << "] ";
         LDBG("numBuffers: " << channel->numBuffers);
+        DBGS() << "\n";
       }
+      DBGS() << "\n";
     }
   });
 }
@@ -930,11 +917,6 @@ void appendBufferIdxArgs(SmallVector<Operation *> &taskTopOps,
       *asyncTaskLoopForItr = newForOp.getOperation();
     }
   }
-
-  LLVM_DEBUG({
-    LDBG("\n\nafter appendBufferIdxArgs");
-    taskTopOps[0]->getParentOfType<triton::FuncOp>().dump();
-  });
 }
 
 // Create an allocation to hold the mbarriers.
@@ -967,21 +949,22 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   return barrierAlloc;
 }
 
-// groupedChannels: channels are grouped together.
+// channelsGroupedByConsumers: channels are grouped together.
 // Go through each group, check the first channel in the group, create a token
 // for each consumer taskId. Return a map that maps each channel + consumer
 // taskId to a token. Also update barrierAllocMap that maps each channel +
 // consumer taskId to a BarrierAlloc.
-DenseMap<Channel *, DenseMap<int, Value>> createToken(
-    const DenseMap<Operation *, SmallVector<Channel *>> &groupedChannels,
-    const SmallVector<Operation *> &mapKeyVec, triton::FuncOp funcOp,
-    int numConsumerGroups,
-    DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
+DenseMap<Channel *, DenseMap<int, Value>>
+createToken(const DenseMap<Channel *, SmallVector<Channel *>>
+                &channelsGroupedByConsumers,
+            const SmallVector<Channel *> &orderedChannels,
+            triton::FuncOp funcOp, int numConsumerGroups,
+            DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
   DenseMap<Channel *, DenseMap<int, Value>> ret;
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
-  for (auto *key : mapKeyVec) {
-    auto it = groupedChannels.find(key);
+  for (auto *key : orderedChannels) {
+    auto it = channelsGroupedByConsumers.find(key);
     Channel *channel = it->second.front();
     for (auto consumerAsyncTaskId : channel->relation.second) {
       Value v;
@@ -1011,34 +994,17 @@ DenseMap<Channel *, DenseMap<int, Value>> createToken(
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
 // the buffer array will contain numBuffers.
-DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
-                                        triton::FuncOp funcOp,
-                                        int numConsumerGroups) {
-
-  // Group channels by producer op.
-  DenseMap<Value, SmallVector<Channel *>> groupedChannels;
-  for (auto channel : channels) {
-    groupedChannels[channel->getSrcOperand()].push_back(channel);
-  }
-
-#ifndef NDEBUG
-  // Some sanity checks.
-  for (auto &item : groupedChannels) {
-    auto &channels = item.second;
-    unsigned numBuffers = channels.front()->numBuffers;
-    for (auto c : channels) {
-      assert(c->numBuffers == numBuffers && "Unmatched number of buffers");
-    }
-  }
-#endif
+DenseMap<Channel *, Value> createBuffer(
+    DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
+    triton::FuncOp funcOp, int numConsumerGroups) {
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
   OpBuilder builder(funcOp);
-  for (auto &item : groupedChannels) {
+  for (auto &item : channelsGroupedByProducers) {
     auto &channels = item.second;
-    auto srcValue = item.first;
-    auto srcOp = srcValue.getDefiningOp();
+    auto srcValue = item.first->getSrcOperand();
+    auto srcOp = item.first->getSrcOp();
     unsigned numBuffers = channels.front()->numBuffers;
 
     if (auto tensorType = dyn_cast<RankedTensorType>(srcValue.getType())) {
@@ -1146,14 +1112,10 @@ static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
 }
 
 static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
-                            DenseMap<Operation *, Operation *> &producerCopyMap,
                             Channel *channel, Value srcBufferIdx,
                             Value dstBufferIdx) {
   Operation *srcOp = channel->getSrcOp();
   Operation *dstOp = channel->getDstOp();
-  if (producerCopyMap.contains(srcOp))
-    return;
-
   MLIRContext *context = srcOp->getContext();
   auto buffer = bufferMap.find(channel)->second;
 
@@ -1205,7 +1167,6 @@ static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
   // Create local_alloc
   Operation *copy = srcBuilder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       srcOp->getLoc(), srcValue, srcView);
-  producerCopyMap[srcOp] = copy;
 }
 
 static int getTMALoadSize(tt::ExperimentalDescriptorLoadOp &tmaLoad) {
@@ -1325,10 +1286,12 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   return copy;
 }
 
-// Lower producers for channels. Here channels are grouped in "groupedChannels".
-// tokenMap tracks the set of tokens for each channel.
-void buildAsyncComm(
-    const DenseMap<Operation *, SmallVector<Channel *>> &groupedChannels,
+// Lower producers for channels. Here channels are grouped in
+// "channelsGroupedByConsumers". tokenMap tracks the set of tokens for each
+// channel.
+void insertAsyncComm(
+    const DenseMap<Channel *, SmallVector<Channel *>>
+        &channelsGroupedByConsumers,
     const DenseMap<Channel *, DenseMap<int, Value>> &tokenMap,
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
     const DenseMap<Channel *, Value> &bufferMap, int numConsumerGroups) {
@@ -1374,7 +1337,7 @@ void buildAsyncComm(
   };
 
   // Go through each channel group.
-  for (auto kv : groupedChannels) {
+  for (auto kv : channelsGroupedByConsumers) {
     auto headProducer = kv.second.front()->getSrcOp();
     auto tailProducer = kv.second.back()->getSrcOp();
     auto headConsumer = kv.second.front()->getDstOp();
@@ -1448,17 +1411,10 @@ void buildAsyncComm(
     DenseMap<Operation *, Operation *> producerCopyMap;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
-      if (isa<triton::LoadOp>(c->getSrcOp())) {
-        // After createAsyncCopy, c->getSrcOp()/headProducer are no longer
-        // valid.
-        createAsyncCopy(bufferMap, c, c->getSrcOp(), asyncTasksPC, bufferIdx,
-                        bufferIdx);
-      } else if (auto tmaLoad = dyn_cast<tt::ExperimentalDescriptorLoadOp>(
-                     c->getSrcOp())) {
+      if (auto tmaLoad =
+              dyn_cast<tt::ExperimentalDescriptorLoadOp>(c->getSrcOp())) {
         tmaLoads.push_back(tmaLoad);
         buffers.push_back(bufferMap.find(c)->second);
-      } else {
-        createLocalCopy(bufferMap, producerCopyMap, c, bufferIdx, bufferIdx);
       }
     }
 
@@ -1470,6 +1426,85 @@ void buildAsyncComm(
       auto barrierAlloc = barrierAllocs.begin()->second;
       optimizeTMALoads(builder, tmaLoads, buffers, barrierAlloc, bufferIdx,
                        bufferIdx, phase, headProducer, headConsumer);
+    }
+  }
+}
+
+// Lower producers for channels. Here channels are grouped in
+// "channelsGroupedByProducers"
+void insertAsyncCopy(triton::FuncOp funcOp,
+                     const DenseMap<Channel *, SmallVector<Channel *>>
+                         &channelsGroupedByProducers,
+                     const DenseMap<Channel *, Value> &bufferMap) {
+
+  auto getAsyncTasks = [&](Operation *p, Operation *c,
+                           SmallVector<AsyncTaskId> &asyncTaskP,
+                           SmallVector<AsyncTaskId> &asyncTaskC,
+                           SmallVector<AsyncTaskId> &asyncTasksPC) -> void {
+    asyncTaskP = getNestedAsyncTaskIds(p);
+    asyncTaskC = getNestedAsyncTaskIds(c);
+    asyncTasksPC.reserve(asyncTaskP.size() + asyncTaskC.size());
+    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskP.begin(),
+                        asyncTaskP.end());
+    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
+                        asyncTaskC.end());
+  };
+
+  // For each producer op, create a async_copy or local_store from the producer
+  // to the buffer. Create a local_load from the buffer at the dominating
+  // consumer.
+  mlir::DominanceInfo dom(funcOp);
+
+  for (auto kv : channelsGroupedByProducers) {
+    // Finding the dominating channel if possible.
+    std::unordered_set<Channel *> mutuallyNonDominatingChannels;
+    for (auto &c : kv.second) {
+      // check if c is dominating all other previous channels.
+      auto it = mutuallyNonDominatingChannels.begin();
+      while (it != mutuallyNonDominatingChannels.end()) {
+        auto channel = *it;
+        if (dom.properlyDominates(c->getDstOp(), channel->getDstOp())) {
+          it = mutuallyNonDominatingChannels.erase(it);
+        } else if (dom.properlyDominates(channel->getDstOp(), c->getDstOp())) {
+          break;
+        } else {
+          ++it;
+        }
+      }
+      if (it == mutuallyNonDominatingChannels.end())
+        mutuallyNonDominatingChannels.insert(c);
+    }
+
+    auto srcOp = kv.getFirst()->getSrcOp();
+    Value bufferIdx;
+    Value phase = Value();
+    if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
+      // We already added phase, bufferIdx to the ForOp.
+      auto tSize = forOp.getBody()->getArguments().size();
+      assert(tSize >= 2);
+      bufferIdx = forOp.getBody()->getArguments().back();
+      phase = forOp.getBody()->getArgument(tSize - 2); // next to last argument
+    } else {
+      llvm_unreachable("Producer is not in a ForOp");
+    }
+
+    for (auto channel : mutuallyNonDominatingChannels) {
+      // No need to create async copy for TMA load which is handled in
+      // insertAsyncComm.
+      if (auto tmaLoad = dyn_cast<tt::ExperimentalDescriptorLoadOp>(srcOp)) {
+        continue;
+      }
+      if (isa<triton::LoadOp>(srcOp)) {
+        SmallVector<AsyncTaskId> asyncTaskP, asyncTaskC, asyncTasksPC;
+        getAsyncTasks(srcOp, channel->getDstOp(), asyncTaskP, asyncTaskC,
+                      asyncTasksPC);
+        // After createAsyncCopy, c->getSrcOp()/headProducer are no longer
+        // valid.
+        createAsyncCopy(bufferMap, channel, channel->getSrcOp(), asyncTasksPC,
+                        bufferIdx, bufferIdx);
+      } else {
+        createLocalCopy(bufferMap, channel, bufferIdx, bufferIdx);
+      }
     }
   }
 }
@@ -1515,11 +1550,15 @@ public:
       return;
     }
 
-    // Step 2: group channels where each entry of the groupedChannels is keyed
-    // by the dstOp.
-    DenseMap<Operation *, SmallVector<Channel *>> groupedChannels;
-    SmallVector<Operation *> mapKeyVec;
-    groupChannels(channels, groupedChannels, mapKeyVec);
+    // Step 2: group channels
+    // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
+    // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
+    DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
+    DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
+
+    SmallVector<Channel *> orderedChannels;
+    groupChannels(channels, channelsGroupedByProducers,
+                  channelsGroupedByConsumers, orderedChannels);
 
     // Step 3: reorder producer ops and the backward slices of the producer ops.
     reorderProducerOps(channels);
@@ -1538,10 +1577,11 @@ public:
     // Step 5: Create tokens, and buffers. A set of tokens for each group of
     // channels and an array of buffers for each channel.
     DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
-    DenseMap<Channel *, DenseMap<int, Value>> tokenMap = createToken(
-        groupedChannels, mapKeyVec, funcOp, numConsumerGroups, barrierAllocMap);
+    DenseMap<Channel *, DenseMap<int, Value>> tokenMap =
+        createToken(channelsGroupedByConsumers, orderedChannels, funcOp,
+                    numConsumerGroups, barrierAllocMap);
     DenseMap<Channel *, Value> bufferMap =
-        createBuffer(channels, funcOp, numConsumerGroups);
+        createBuffer(channelsGroupedByProducers, funcOp, numConsumerGroups);
     LLVM_DEBUG({
       LDBG("\n\nafter createBuffer");
       funcOp.dump();
@@ -1549,10 +1589,16 @@ public:
 
     // Step 6: add async communication ops (ProducerAcquire etc). Also lower the
     // loads.
-    buildAsyncComm(groupedChannels, tokenMap, barrierAllocMap, bufferMap,
-                   numConsumerGroups);
+    insertAsyncComm(channelsGroupedByConsumers, tokenMap, barrierAllocMap,
+                    bufferMap, numConsumerGroups);
     LLVM_DEBUG({
       LDBG("\n\nwith SyncOps");
+      funcOp.dump();
+    });
+
+    insertAsyncCopy(funcOp, channelsGroupedByProducers, bufferMap);
+    LLVM_DEBUG({
+      LDBG("\n\nwith async copy");
       funcOp.dump();
     });
 
