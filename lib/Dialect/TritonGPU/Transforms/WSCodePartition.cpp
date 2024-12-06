@@ -1145,18 +1145,22 @@ static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
   return copy;
 }
 
-static Operation *createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
-                                  Channel *channel, Value srcBufferIdx,
-                                  Value dstBufferIdx) {
+static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
+                            DenseMap<Operation *, Operation *> &producerCopyMap,
+                            Channel *channel, Value srcBufferIdx,
+                            Value dstBufferIdx) {
   Operation *srcOp = channel->getSrcOp();
   Operation *dstOp = channel->getDstOp();
+  if (producerCopyMap.contains(srcOp))
+    return;
+
   MLIRContext *context = srcOp->getContext();
   auto buffer = bufferMap.find(channel)->second;
 
   Value srcValue = channel->getSrcOperand();
   auto tensorType = dyn_cast<RankedTensorType>(srcValue.getType());
   if (!tensorType)
-    return nullptr;
+    return;
   // Get basic information from tensorType
   auto order = ttg::getOrder(tensorType.getEncoding());
   auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
@@ -1177,7 +1181,7 @@ static Operation *createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
 
   // Consumer part.
   OpBuilderWithAsyncTaskIds dstBuilder(dstOp);
-  dstBuilder.setInsertionPoint(dstOp);
+  dstBuilder.setInsertionPointAfter(srcOp);
   Value zero = dstBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
       srcOp->getLoc(), 0, 32);
   SmallVector<Value> loadOffsets(sliceType.getRank() + 1, zero);
@@ -1188,7 +1192,7 @@ static Operation *createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
       srcOp->getLoc(), srcValue.getType(), dstView);
   srcValue.replaceAllUsesWith(sharedLoad.getResult());
 
-  // Producer part.
+  // Producer part. Create local_store for new producers.
   OpBuilderWithAsyncTaskIds srcBuilder(srcOp);
   srcBuilder.setInsertionPoint(srcOp->getParentOp());
   zero = srcBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
@@ -1201,8 +1205,7 @@ static Operation *createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
   // Create local_alloc
   Operation *copy = srcBuilder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       srcOp->getLoc(), srcValue, srcView);
-
-  return copy;
+  producerCopyMap[srcOp] = copy;
 }
 
 static int getTMALoadSize(tt::ExperimentalDescriptorLoadOp &tmaLoad) {
@@ -1442,6 +1445,7 @@ void buildAsyncComm(
 
     SmallVector<tt::ExperimentalDescriptorLoadOp> tmaLoads;
     SmallVector<Value> buffers;
+    DenseMap<Operation *, Operation *> producerCopyMap;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
       if (isa<triton::LoadOp>(c->getSrcOp())) {
@@ -1454,7 +1458,7 @@ void buildAsyncComm(
         tmaLoads.push_back(tmaLoad);
         buffers.push_back(bufferMap.find(c)->second);
       } else {
-        createLocalCopy(bufferMap, c, bufferIdx, bufferIdx);
+        createLocalCopy(bufferMap, producerCopyMap, c, bufferIdx, bufferIdx);
       }
     }
 
