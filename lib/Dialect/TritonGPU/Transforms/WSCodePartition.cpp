@@ -1338,10 +1338,49 @@ void insertAsyncComm(
 
   // Go through each channel group.
   for (auto kv : channelsGroupedByConsumers) {
-    auto headProducer = kv.second.front()->getSrcOp();
-    auto tailProducer = kv.second.back()->getSrcOp();
-    auto headConsumer = kv.second.front()->getDstOp();
-    auto tailConsumer = kv.second.back()->getDstOp();
+    // Find head and tail ops.
+    DenseSet<Operation *> producerOps;
+    DenseSet<Operation *> consumerOps;
+    for (auto &c : kv.second) {
+      producerOps.insert(c->getSrcOp());
+      consumerOps.insert(c->getDstOp());
+    }
+
+    // Find head producer
+    auto producerBlock = kv.second.front()->getSrcOp()->getBlock();
+    Operation *headProducer = nullptr;
+    for (auto &op : producerBlock->getOperations()) {
+      if (producerOps.count(&op)) {
+        headProducer = &op;
+        break;
+      }
+    }
+    // Find tail producer
+    Operation *tailProducer = nullptr;
+    for (auto &op : reverse(producerBlock->getOperations())) {
+      if (producerOps.count(&op)) {
+        tailProducer = &op;
+        break;
+      }
+    }
+
+    // Find head consumer and tail consumer
+    auto consumerBlock = kv.second.front()->getDstOp()->getBlock();
+    Operation *headConsumer = nullptr;
+    for (auto &op : consumerBlock->getOperations()) {
+      if (consumerOps.count(&op)) {
+        headConsumer = &op;
+        break;
+      }
+    }
+    Operation *tailConsumer = nullptr;
+    for (auto &op : reverse(consumerBlock->getOperations())) {
+      if (consumerOps.count(&op)) {
+        tailConsumer = &op;
+        break;
+      }
+    }
+
     // We have one set of tokens for each channel group.
     auto tokens = tokenMap.find(kv.second.front())->second;
 
