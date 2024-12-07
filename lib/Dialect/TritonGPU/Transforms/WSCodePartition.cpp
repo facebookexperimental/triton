@@ -534,7 +534,12 @@ void groupChannels(
     Operation *dst1 = c1->getDstOp(), *dst2 = c2->getDstOp();
     if (dst1 == dst2)
       return true;
-    return dst1->getBlock() == dst2->getBlock();
+    if (dst1->getBlock() != dst2->getBlock() || !dst1->hasOneUse() ||
+        !dst2->hasOneUse())
+      return false;
+    Operation *dst1User = *(dst1->getUsers().begin());
+    Operation *dst2User = *(dst2->getUsers().begin());
+    return dst1User == dst2User && dst1User->getBlock() == dst1->getBlock();
   };
   assert(channels.size() > 0 && "channel size is zero");
   // Compare with existing channels in the consumerChannels to see if
@@ -1105,7 +1110,6 @@ static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       loadOp.getLoc(), loadOp.getType(), viewLoad /*,wait->getResult(0)*/);
   // Replace all uses of loadResult
-  // TODO: replace the real consumer
   loadResult.replaceAllUsesWith(sharedLoad.getResult());
   loadOp.erase();
   return copy;
@@ -1142,30 +1146,31 @@ static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
                            /*mutableMemory=*/true);
 
   // Consumer part.
-  OpBuilderWithAsyncTaskIds dstBuilder(dstOp);
-  dstBuilder.setInsertionPointAfter(srcOp);
-  Value zero = dstBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      srcOp->getLoc(), 0, 32);
+  OpBuilderWithAsyncTaskIds builder(dstOp);
+  builder.setAsyncTaskIdsFromOp(dstOp);
+  builder.setInsertionPoint(dstOp);
+  Value zero = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      dstOp->getLoc(), 0, 32);
   SmallVector<Value> loadOffsets(sliceType.getRank() + 1, zero);
   loadOffsets[0] = dstBufferIdx;
-  auto dstView = dstBuilder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
-      srcOp->getLoc(), subviewTy, buffer, loadOffsets);
-  auto sharedLoad = dstBuilder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
-      srcOp->getLoc(), srcValue.getType(), dstView);
+  auto dstView = builder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
+      dstOp->getLoc(), subviewTy, buffer, loadOffsets);
+  auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
+      dstOp->getLoc(), srcValue.getType(), dstView);
   srcValue.replaceAllUsesWith(sharedLoad.getResult());
 
   // Producer part. Create local_store for new producers.
-  OpBuilderWithAsyncTaskIds srcBuilder(srcOp);
-  srcBuilder.setInsertionPoint(srcOp->getParentOp());
-  zero = srcBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      srcOp->getLoc(), 0, 32);
+  builder.setAsynTaskIdsFromArray(channel->relation.first);
+  builder.setInsertionPoint(srcOp->getParentOp());
+  zero = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(srcOp->getLoc(),
+                                                              0, 32);
   SmallVector<Value> storeOffsets(sliceType.getRank() + 1, zero);
   storeOffsets[0] = srcBufferIdx;
-  srcBuilder.setInsertionPointAfter(srcOp);
-  auto srcView = srcBuilder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
+  builder.setInsertionPointAfter(srcOp);
+  auto srcView = builder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
       srcOp->getLoc(), subviewTy, buffer, storeOffsets);
   // Create local_alloc
-  Operation *copy = srcBuilder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+  Operation *copy = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       srcOp->getLoc(), srcValue, srcView);
 }
 
@@ -1323,19 +1328,6 @@ void insertAsyncComm(
     return nullptr;
   };
 
-  auto getAsyncTasks = [&](Operation *p, Operation *c,
-                           SmallVector<AsyncTaskId> &asyncTaskP,
-                           SmallVector<AsyncTaskId> &asyncTaskC,
-                           SmallVector<AsyncTaskId> &asyncTasksPC) -> void {
-    asyncTaskP = getNestedAsyncTaskIds(p);
-    asyncTaskC = getNestedAsyncTaskIds(c);
-    asyncTasksPC.reserve(asyncTaskP.size() + asyncTaskC.size());
-    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskP.begin(),
-                        asyncTaskP.end());
-    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
-                        asyncTaskC.end());
-  };
-
   // Go through each channel group.
   for (auto kv : channelsGroupedByConsumers) {
     // Find head and tail ops.
@@ -1383,10 +1375,15 @@ void insertAsyncComm(
 
     // We have one set of tokens for each channel group.
     auto tokens = tokenMap.find(kv.second.front())->second;
+    auto masterChannel = kv.getFirst();
 
-    SmallVector<AsyncTaskId> asyncTaskP, asyncTaskC, asyncTasksPC;
-    getAsyncTasks(headProducer, headConsumer, asyncTaskP, asyncTaskC,
-                  asyncTasksPC);
+    SmallVector<AsyncTaskId> asyncTaskP;
+    asyncTaskP.push_back(masterChannel->relation.first);
+    SmallVector<AsyncTaskId> &asyncTaskC = masterChannel->relation.second;
+    SmallVector<AsyncTaskId> asyncTasksPC = asyncTaskP;
+    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
+                        asyncTaskC.end());
+
     OpBuilderWithAsyncTaskIds builder(headProducer->getContext());
     if (auto funcOp = dyn_cast<triton::FuncOp>(headProducer->getParentOp())) {
       builder.setInsertionPointToStart(&(funcOp.getBody().front()));
@@ -1411,7 +1408,7 @@ void insertAsyncComm(
           headProducer->getLoc(), 0, 1);
     }
 
-    builder.setAsynTaskIdsFromArray(asyncTaskP);
+    builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
     for (auto token : tokens) {
       // Insert ProducerAcquireOp before the producer.
       builder.setInsertionPoint(headProducer);
@@ -1475,20 +1472,6 @@ void insertAsyncCopy(triton::FuncOp funcOp,
                      const DenseMap<Channel *, SmallVector<Channel *>>
                          &channelsGroupedByProducers,
                      const DenseMap<Channel *, Value> &bufferMap) {
-
-  auto getAsyncTasks = [&](Operation *p, Operation *c,
-                           SmallVector<AsyncTaskId> &asyncTaskP,
-                           SmallVector<AsyncTaskId> &asyncTaskC,
-                           SmallVector<AsyncTaskId> &asyncTasksPC) -> void {
-    asyncTaskP = getNestedAsyncTaskIds(p);
-    asyncTaskC = getNestedAsyncTaskIds(c);
-    asyncTasksPC.reserve(asyncTaskP.size() + asyncTaskC.size());
-    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskP.begin(),
-                        asyncTaskP.end());
-    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
-                        asyncTaskC.end());
-  };
-
   // For each producer op, create a async_copy or local_store from the producer
   // to the buffer. Create a local_load from the buffer at the dominating
   // consumer.
@@ -1524,19 +1507,28 @@ void insertAsyncCopy(triton::FuncOp funcOp,
       bufferIdx = forOp.getBody()->getArguments().back();
       phase = forOp.getBody()->getArgument(tSize - 2); // next to last argument
     } else {
-      llvm_unreachable("Producer is not in a ForOp");
+      // Producer is not in a ForOp, create phase and bufferIdx here which will
+      // be used by both producer and consumers.
+      OpBuilderWithAsyncTaskIds builder(srcOp);
+      SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
+      for (auto channel : mutuallyNonDominatingChannels)
+        asyncTasksPC.append(getAsyncTaskIds(channel->getDstOp()));
+      builder.setAsynTaskIdsFromArray(asyncTasksPC);
+      bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          srcOp->getLoc(), 0, 32);
+      phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          srcOp->getLoc(), 0, 1);
     }
 
     for (auto channel : mutuallyNonDominatingChannels) {
       // No need to create async copy for TMA load which is handled in
       // insertAsyncComm.
-      if (auto tmaLoad = dyn_cast<tt::ExperimentalDescriptorLoadOp>(srcOp)) {
+      if (isa<tt::ExperimentalDescriptorLoadOp, ttg::LocalLoadOp>(srcOp)) {
         continue;
       }
       if (isa<triton::LoadOp>(srcOp)) {
-        SmallVector<AsyncTaskId> asyncTaskP, asyncTaskC, asyncTasksPC;
-        getAsyncTasks(srcOp, channel->getDstOp(), asyncTaskP, asyncTaskC,
-                      asyncTasksPC);
+        SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
+        asyncTasksPC.append(getAsyncTaskIds(channel->getDstOp()));
         // After createAsyncCopy, c->getSrcOp()/headProducer are no longer
         // valid.
         createAsyncCopy(bufferMap, channel, channel->getSrcOp(), asyncTasksPC,
@@ -1594,7 +1586,6 @@ public:
     // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
     DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
     DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
-
     SmallVector<Channel *> orderedChannels;
     groupChannels(channels, channelsGroupedByProducers,
                   channelsGroupedByConsumers, orderedChannels);
