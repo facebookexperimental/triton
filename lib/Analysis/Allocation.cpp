@@ -488,7 +488,7 @@ private:
     LDBG("Dump bufferRange ---------");
     for (auto bufferIter : bufferRange) {
       LLVM_DEBUG({
-        llvm::dbgs() << "-- " << bufferIter.first->size << " " << bufferIter.first->offset < " regions ";
+        llvm::dbgs() << "-- " << bufferIter.first->size << " " << bufferIter.first->offset << " regions ";
         for (auto tId : bufferIter.first->regionIds) {
           llvm::dbgs() << tId << " ";
         }
