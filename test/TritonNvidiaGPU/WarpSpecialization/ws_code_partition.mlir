@@ -304,3 +304,132 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
     tt.return
   }
 }
+
+
+// -----
+
+// CHECK-LABEL: @_matmul_layernorm_persistent_one_producer_one_consumer_one_epilog
+// CHECK: %[[#TASKID:]] = triton_nvidia_gpu.get_async_task_id : i32
+// CHECK: %c0_i32_0 = arith.constant 0 : i32
+// CHECK: %[[#WG0:]] = arith.cmpi eq, %[[#TASKID]], %c0_i32_0 : i32
+// CHECK: scf.if %[[#WG0]]
+// CHECK: triton_nvidia_gpu.reg_dealloc 40
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: triton_nvidia_gpu.producer_acquire
+// CHECK: triton_nvidia_gpu.barrier_expect
+// CHECK: triton_nvidia_gpu.async_tma_copy_global_to_local
+// CHECK: triton_nvidia_gpu.async_tma_copy_global_to_local
+// CHECK: %c1_i32 = arith.constant 1 : i32
+// CHECK: %[[#WG1:]] = arith.cmpi eq, %[[#TASKID]], %c1_i32 : i32
+// CHECK: scf.if %[[#WG1]]
+// CHECK: triton_nvidia_gpu.reg_alloc 232
+// CHECK: scf.for
+// CHECK: triton_nvidia_gpu.producer_acquire
+// CHECK: scf.for
+// CHECK: triton_nvidia_gpu.wait_barrier
+// CHECK: triton_gpu.local_load
+// CHECK: triton_gpu.local_load
+// CHECK: triton_nvidia_gpu.warp_group_dot
+// CHECK: triton_nvidia_gpu.consumer_release
+// CHECK: triton_gpu.local_store
+// CHECK: triton_nvidia_gpu.producer_commit
+// CHECK: %c2_i32 = arith.constant 2 : i32
+// CHECK: %[[#WG2:]] = arith.cmpi eq, %[[#TASKID]], %c2_i32 : i32
+// CHECK: scf.if %[[#WG2]]
+// CHECK: triton_nvidia_gpu.reg_alloc 232
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: triton_gpu.local_load
+// CHECK: triton_nvidia_gpu.consumer_wait
+// CHECK: tt.experimental_descriptor_store
+// CHECK: triton_nvidia_gpu.consumer_release
+
+#blocked = #triton_gpu.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #triton_gpu.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#blocked2 = #triton_gpu.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked3 = #triton_gpu.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#mma = #triton_gpu.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #triton_gpu.shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0], hasLeadingOffset = true}>
+module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 : i32, triton_gpu.target = "cuda:90", "triton_gpu.threads-per-warp" = 32 : i32} {
+  tt.func public @_matmul_layernorm_persistent_one_producer_one_consumer_one_epilog(%arg0: !tt.ptr<i8, 0> {tt.nv_tma_desc = 1 : i32}, %arg1: !tt.ptr<i8, 0> {tt.nv_tma_desc = 1 : i32}, %arg2: !tt.ptr<i8, 0> {tt.nv_tma_desc = 1 : i32}, %arg3: !tt.ptr<i8, 0> {tt.nv_tma_desc = 1 : i32}, %arg4: !tt.ptr<i8, 0> {tt.nv_tma_desc = 1 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32 {tt.divisibility = 16 : i32}, %arg9: i32 {tt.divisibility = 16 : i32}, %arg10: i32 {tt.divisibility = 16 : i32}, %arg11: f32) attributes {noinline = false} {
+    %c63_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 63 : i32
+    %c128_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 128 : i32
+    %c0_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 0 : i32
+    %c64_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 64 : i32
+    %c132_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 132 : i32
+    %c1_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 1 : i32
+    %c127_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 127 : i32
+    %c256_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 256 : i32
+    %c255_i32 = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} 255 : i32
+    %cst = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
+    %cst_0 = arith.constant {async_task_id = dense<2> : vector<1xi32>} dense<1.000000e+00> : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+    %0 = arith.addi %arg7, %c63_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %1 = arith.divsi %0, %c64_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %2 = arith.addi %arg5, %c127_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %3 = arith.divsi %2, %c128_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %4 = arith.addi %arg6, %c255_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %5 = arith.divsi %4, %c256_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %6 = arith.muli %3, %5 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %7 = tt.get_program_id x {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+    %8 = arith.sitofp %arg6 {async_task_id = dense<2> : vector<1xi32>} : i32 to f32
+    %9 = tt.splat %8 {async_task_id = dense<2> : vector<1xi32>} : f32 -> tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+    %10 = tt.splat %arg11 {async_task_id = dense<2> : vector<1xi32>} : f32 -> tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+    scf.for %arg12 = %7 to %6 step %c132_i32  : i32 {
+      %11 = arith.muli %arg12, %c128_i32 {async_task_id = dense<[0, 2]> : vector<2xi32>} : i32
+      %true = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} true
+      %false = arith.constant {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} false
+      %12 = scf.for %arg13 = %c0_i32 to %1 step %c1_i32 iter_args(%arg14 = %cst) -> (tensor<128x256xf32, #mma>)  : i32 {
+        %45 = arith.muli %arg13, %c64_i32 {async_task_id = dense<0> : vector<1xi32>} : i32
+        %46 = tt.experimental_descriptor_load %arg0[%11, %45] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8, 0> -> tensor<128x64xf16, #blocked>
+        %47 = triton_gpu.local_alloc %46 {async_task_id = dense<1> : vector<1xi32>} : (tensor<128x64xf16, #blocked>) -> !tt.memdesc<128x64xf16, #shared, #triton_gpu.shared_memory>
+        %48 = tt.experimental_descriptor_load %arg1[%45, %c0_i32] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8, 0> -> tensor<64x256xf16, #blocked1>
+        %49 = triton_gpu.local_alloc %48 {async_task_id = dense<1> : vector<1xi32>} : (tensor<64x256xf16, #blocked1>) -> !tt.memdesc<64x256xf16, #shared, #triton_gpu.shared_memory>
+        %50 = triton_nvidia_gpu.warp_group_dot %47, %49, %arg14 {async_task_id = dense<1> : vector<1xi32>, inputPrecision = 0 : i32} : !tt.memdesc<128x64xf16, #shared, #triton_gpu.shared_memory> * !tt.memdesc<64x256xf16, #shared, #triton_gpu.shared_memory> -> tensor<128x256xf32, #mma>
+        scf.yield {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} %50 : tensor<128x256xf32, #mma>
+      } {async_task_id = dense<[0, 1, 2]> : vector<3xi32>}
+      %13 = "tt.reduce"(%12) <{axis = 1 : i32}> ({
+      ^bb0(%arg13: f32, %arg14: f32):
+        %45 = arith.addf %arg13, %arg14 {async_task_id = dense<2> : vector<1xi32>} : f32
+        tt.reduce.return %45 {async_task_id = dense<2> : vector<1xi32>} : f32
+      }) {async_task_id = dense<2> : vector<1xi32>} : (tensor<128x256xf32, #mma>) -> tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %14 = arith.divf %13, %9 {async_task_id = dense<2> : vector<1xi32>} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %15 = tt.expand_dims %14 {async_task_id = dense<2> : vector<1xi32>, axis = 1 : i32} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>> -> tensor<128x1xf32, #mma>
+      %16 = tt.broadcast %15 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x1xf32, #mma> -> tensor<128x256xf32, #mma>
+      %17 = arith.subf %12, %16 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf32, #mma>
+      %18 = arith.mulf %17, %17 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf32, #mma>
+      %19 = "tt.reduce"(%18) <{axis = 1 : i32}> ({
+      ^bb0(%arg13: f32, %arg14: f32):
+        %45 = arith.addf %arg13, %arg14 {async_task_id = dense<2> : vector<1xi32>} : f32
+        tt.reduce.return %45 {async_task_id = dense<2> : vector<1xi32>} : f32
+      }) {async_task_id = dense<2> : vector<1xi32>} : (tensor<128x256xf32, #mma>) -> tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %20 = arith.divf %19, %9 {async_task_id = dense<2> : vector<1xi32>} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %21 = arith.addf %20, %10 {async_task_id = dense<2> : vector<1xi32>} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %22 = math.sqrt %21 {async_task_id = dense<2> : vector<1xi32>} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %23 = arith.divf %cst_0, %22 {async_task_id = dense<2> : vector<1xi32>} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>>
+      %24 = tt.experimental_descriptor_load %arg3[%c0_i32] {async_task_id = dense<2> : vector<1xi32>} : !tt.ptr<i8, 0> -> tensor<256xf16, #blocked2>
+      %25 = tt.experimental_descriptor_load %arg4[%c0_i32] {async_task_id = dense<2> : vector<1xi32>} : !tt.ptr<i8, 0> -> tensor<256xf16, #blocked2>
+      %26 = tt.expand_dims %23 {async_task_id = dense<2> : vector<1xi32>, axis = 1 : i32} : tensor<128xf32, #triton_gpu.slice<{dim = 1, parent = #mma}>> -> tensor<128x1xf32, #mma>
+      %27 = tt.broadcast %26 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x1xf32, #mma> -> tensor<128x256xf32, #mma>
+      %28 = arith.mulf %17, %27 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf32, #mma>
+      %29 = triton_gpu.convert_layout %24 {async_task_id = dense<2> : vector<1xi32>} : tensor<256xf16, #blocked2> -> tensor<256xf16, #triton_gpu.slice<{dim = 0, parent = #blocked1}>>
+      %30 = tt.expand_dims %29 {async_task_id = dense<2> : vector<1xi32>, axis = 0 : i32} : tensor<256xf16, #triton_gpu.slice<{dim = 0, parent = #blocked1}>> -> tensor<1x256xf16, #blocked1>
+      %31 = triton_gpu.convert_layout %30 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf16, #blocked1> -> tensor<1x256xf16, #blocked3>
+      %32 = arith.extf %31 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf16, #blocked3> to tensor<1x256xf32, #blocked3>
+      %33 = triton_gpu.convert_layout %32 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf32, #blocked3> -> tensor<1x256xf32, #mma>
+      %34 = tt.broadcast %33 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf32, #mma> -> tensor<128x256xf32, #mma>
+      %35 = arith.mulf %28, %34 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf32, #mma>
+      %36 = triton_gpu.convert_layout %25 {async_task_id = dense<2> : vector<1xi32>} : tensor<256xf16, #blocked2> -> tensor<256xf16, #triton_gpu.slice<{dim = 0, parent = #blocked1}>>
+      %37 = tt.expand_dims %36 {async_task_id = dense<2> : vector<1xi32>, axis = 0 : i32} : tensor<256xf16, #triton_gpu.slice<{dim = 0, parent = #blocked1}>> -> tensor<1x256xf16, #blocked1>
+      %38 = triton_gpu.convert_layout %37 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf16, #blocked1> -> tensor<1x256xf16, #blocked3>
+      %39 = arith.extf %38 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf16, #blocked3> to tensor<1x256xf32, #blocked3>
+      %40 = triton_gpu.convert_layout %39 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf32, #blocked3> -> tensor<1x256xf32, #mma>
+      %41 = tt.broadcast %40 {async_task_id = dense<2> : vector<1xi32>} : tensor<1x256xf32, #mma> -> tensor<128x256xf32, #mma>
+      %42 = arith.addf %35, %41 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf32, #mma>
+      %43 = arith.truncf %42 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
+      %44 = triton_gpu.convert_layout %43 {async_task_id = dense<2> : vector<1xi32>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
+      tt.experimental_descriptor_store %arg2[%11, %c0_i32], %44 {async_task_id = dense<2> : vector<1xi32>} : !tt.ptr<i8, 0>, tensor<128x256xf16, #blocked1>
+    } {async_task_id = dense<[0, 1, 2]> : vector<3xi32>}
+    tt.return
+  }
+}
