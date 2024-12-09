@@ -30,6 +30,10 @@ using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 using ::mlir::triton::gpu::SliceEncodingAttr;
 
+#define DEBUG_TYPE "allocation-analysis"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
 namespace mlir {
 
 //===----------------------------------------------------------------------===//
@@ -330,11 +334,12 @@ private:
   /// Computes the liveness range of the allocated value.
   /// Each buffer is allocated only once.
   void resolveExplicitBufferLiveness(
-      function_ref<Interval<size_t>(Value value)> getLiveness) {
+      function_ref<Interval<size_t>(Value value, BufferT *buffer)>
+          getLiveness) {
     for (auto valueBufferIter : allocation->valueBuffer) {
       auto value = valueBufferIter.first;
       auto *buffer = valueBufferIter.second;
-      bufferRange[buffer] = getLiveness(value);
+      bufferRange[buffer] = getLiveness(value, buffer);
     }
   }
 
@@ -342,11 +347,12 @@ private:
   /// values because each allocated buffer could be an alias of others, if block
   /// arguments are involved.
   void resolveAliasBufferLiveness(
-      function_ref<Interval<size_t>(Value value)> getLiveness) {
+      function_ref<Interval<size_t>(Value value, BufferT *buffer)>
+          getLiveness) {
     for (auto aliasBufferIter : allocation->aliasBuffer) {
       auto value = aliasBufferIter.first;
       auto buffers = aliasBufferIter.second;
-      auto range = getLiveness(value);
+      auto range = getLiveness(value, buffers.front());
       for (auto *buffer : buffers) {
         auto minId = range.start();
         auto maxId = range.end();
@@ -378,11 +384,14 @@ private:
           bufferRange.insert({buffer, Interval(operationId.lookup(op),
                                                operationId.lookup(op) + 1)});
         } else {
-          // FIXME: This range makes scratch buffers used in warp-specialized
-          // regions conflict with everything else in the program, which is
-          // too conservative, but safe.  A better approach would make them
-          // conflict with buffers live in other warp-specialized regions.
-          bufferRange.insert({buffer, Interval<size_t>(0, operationId.size())});
+          for (auto tId : getAsyncTaskIds(op))
+            buffer->regionIds.insert(tId);
+          // For warp-specialized code, we can assume each region has its own
+          // copy of a scratch buffer, i.e each region is for a single taskId.
+          // In that case, we don't need to extend the liveness of scratch
+          // buffers.
+          bufferRange.insert({buffer, Interval(operationId.lookup(op),
+                                               operationId.lookup(op) + 1)});
         }
       }
     };
@@ -414,30 +423,90 @@ private:
 
     // Analyze liveness of explicit buffers
     Liveness liveness(operation);
-    auto getValueLivenessRange = [&](Value value) {
+    auto getValueLivenessRange = [&](Value value, BufferT *buffer) {
       auto liveOperations = liveness.resolveLiveness(value);
-      auto minId = std::numeric_limits<size_t>::max();
-      auto maxId = std::numeric_limits<size_t>::min();
+      // Update regions for buffer.
       std::for_each(liveOperations.begin(), liveOperations.end(),
                     [&](Operation *liveOp) {
-                      if (!getAsyncTaskIds(liveOp).empty()) {
-                        minId = 0;
-                        maxId = operationId.size();
-                        return;
-                      }
-                      if (operationId[liveOp] < minId) {
-                        minId = operationId[liveOp];
-                      }
-                      if ((operationId[liveOp] + 1) > maxId) {
-                        maxId = operationId[liveOp] + 1;
+                      for (auto rId : getAsyncTaskIds(liveOp)) {
+                        buffer->regionIds.insert(rId);
                       }
                     });
+      bool isSharedGlobalForWS = false, isPrivateGlobalForWS = false,
+           isLocalForWS = false;
+      // Check regions on buffer.
+      if (buffer->regionIds.size() == 1)
+        isLocalForWS = true;
+      if (buffer->regionIds.size() > 1) {
+        // Assume region 0 is producer.
+        if (buffer->regionIds.count(0) && buffer->regionIds.size() == 2)
+          isPrivateGlobalForWS = true;
+        else
+          isSharedGlobalForWS = true;
+      }
+      auto minId = std::numeric_limits<size_t>::max();
+      auto maxId = std::numeric_limits<size_t>::min();
+      std::for_each(
+          liveOperations.begin(), liveOperations.end(), [&](Operation *liveOp) {
+            if (isSharedGlobalForWS) { //! getAsyncTaskIds(liveOp).empty()) {
+              // For a buffer that is associated with warp specialization, due
+              // to producer-consumer channel:
+              // We differentiate the case of buffers that are shared with
+              // multiple consumers vs. buffers that are private to one
+              // consumer. For the latter, we can start from 0 (due to producer
+              // in a different region) and end at the top-level op within the
+              // region. For the former, we need to cover the whole range of
+              // [0, operationId.size()), since we don't know execution of the
+              // other consumer.
+              // For a buffer that is local to a consumer: we need to make sure
+              // not to overlap with local buffers from another consumer.
+              minId = 0;
+              maxId = operationId.size();
+              return;
+            }
+            if (isPrivateGlobalForWS) {
+              minId = 0;
+              maxId = operationId[liveOp] + 1 > maxId ? operationId[liveOp] + 1
+                                                      : maxId;
+            }
+            if (operationId[liveOp] < minId) {
+              minId = operationId[liveOp];
+            }
+            if ((operationId[liveOp] + 1) > maxId) {
+              maxId = operationId[liveOp] + 1;
+            }
+          });
       return Interval(minId, maxId);
     };
 
     resolveExplicitBufferLiveness(getValueLivenessRange);
     resolveAliasBufferLiveness(getValueLivenessRange);
     resolveScratchBufferLiveness(operationId);
+  }
+
+  void dumpBuffers() {
+    LDBG("Dump bufferRange ---------");
+    for (auto bufferIter : bufferRange) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "-- " << bufferIter.first->size << " " << bufferIter.first->offset < " regions ";
+        for (auto tId : bufferIter.first->regionIds) {
+          llvm::dbgs() << tId << " ";
+        }
+        llvm::dbgs() << " interval " << bufferIter.second.start() << " "
+                     << bufferIter.second.end() << "\n";
+      });
+    }
+  }
+  void printBuffers() {
+    llvm::errs() << "Dump bufferRange ---------" << "\n";
+    for (auto bufferIter : bufferRange) {
+      llvm::errs() << "-- " << bufferIter.first->size << " " << bufferIter.first->offset << " regions ";
+      for (auto tId : bufferIter.first->regionIds) {
+        llvm::errs() << tId << " ";
+      }
+      llvm::errs() << " interval " << bufferIter.second.start() << " "
+                   << bufferIter.second.end() << "\n";
+    }
   }
 
   /// Computes the shared memory offsets for all related values.
@@ -450,6 +519,7 @@ private:
     }
 
     calculateStarts(buffers);
+    dumpBuffers();
 
     // NOTE: The original paper doesn't consider interference between
     // the bumped ranges. Buffers that previously do not interfere with
@@ -462,6 +532,7 @@ private:
     buildInterferenceGraph(buffers, interference);
     do {
       allocate(buffers, interference);
+      dumpBuffers();
       buildInterferenceGraph(buffers, interference);
     } while (!interference.empty());
   }
@@ -531,6 +602,17 @@ private:
   void buildInterferenceGraph(const SmallVector<BufferT *> &buffers,
                               GraphT &interference) {
     // Reset interference graph
+    auto inDifferentRegion = [&](BufferT *A, BufferT *B) {
+      auto tA = A->regionIds;
+      auto tB = B->regionIds;
+      for (auto t1 : tA) {
+        for (auto t2 : tA) {
+          if (t1 != 0 && t2 != 0 && t1 != t2)
+            return true;
+        }
+      }
+      return false;
+    };
     interference.clear();
     for (auto x : buffers) {
       for (auto y : buffers) {
@@ -548,6 +630,9 @@ private:
             xSizeRange.intersects(ySizeRange)) {
           interference[x].insert(y);
         }
+        // if x and y belong to different regions (ignore producer region).
+        if (inDifferentRegion(x, y) && xSizeRange.intersects(yOpRange))
+          interference[x].insert(y);
       }
     }
   }
