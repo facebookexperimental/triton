@@ -186,6 +186,7 @@ private:
     size_t size;
     size_t alignment;
     size_t offset;
+    SetVector<int> regionIds;
 
     bool operator==(const BufferT &other) const { return id == other.id; }
     bool operator<(const BufferT &other) const { return id < other.id; }
