@@ -403,8 +403,8 @@ public:
   unsigned numBuffers;
 };
 
-// Find transitive users of the root op. Ignore control flow ops such as yield
-// in between.
+// Find transitive users of the root op. Track through control flow ops (such as
+// yield) to get to the real users.
 void getTransitiveUsers(Value root,
                         SetVector<std::pair<Operation *, unsigned>> &users) {
   for (Operation *userOp : root.getUsers()) {
@@ -462,8 +462,8 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
 
         SetVector<std::pair<Operation *, unsigned>> users;
         getTransitiveUsers(result, users);
-        for (auto pc : users) {
-          auto userOp = pc.first;
+        for (auto user : users) {
+          auto userOp = user.first;
           auto consumerTaskIds = getAsyncTaskIds(userOp);
           if (consumerTaskIds.empty())
             continue;
@@ -474,7 +474,7 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
           // Add a channel from the single producer task to consumerTaskIds.
           if (consumerTaskIds.size() > 0) {
             channels.push_back(std::make_unique<Channel>(
-                producerTaskId, consumerTaskIds, userOp, pc.second,
+                producerTaskId, consumerTaskIds, userOp, user.second,
                 producerNumBuffers));
           }
         }
@@ -495,8 +495,13 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 }
 
-// Update map, which will be keyed by getDstOp() of the channel. Use
-// orderedChannels to enforce deterministic order for map.
+// Group channels in two ways:
+//  - by producer ops. One producer corresponds to multiple channels. This
+//    grouping will be used to create buffers per shared producer.
+//  - by consumer ops. One consumer corresponds to multiple channels. This
+//  grouping will be used to create barriers per shared consumer.
+// Also compute orderedChannels, which will be keyed by getDstOp() of channels,
+// to enforce deterministic order for map.
 void groupChannels(
     SmallVector<Channel *> &channels,
     DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
@@ -1006,6 +1011,7 @@ DenseMap<Channel *, Value> createBuffer(
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
   OpBuilder builder(funcOp);
+  builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   for (auto &item : channelsGroupedByProducers) {
     auto &channels = item.second;
     auto srcValue = item.first->getSrcOperand();
@@ -1038,7 +1044,6 @@ DenseMap<Channel *, Value> createBuffer(
       Type memdescType =
           tt::MemDescType::get(bufferShape, elemType, sharedLayout,
                                sharedMemorySpace, /*mutableMemory*/ true);
-      builder.setInsertionPointToStart(&(funcOp.getBody().front()));
       Value buffer =
           builder.create<ttg::LocalAllocOp>(funcOp.getLoc(), memdescType);
 
@@ -1115,6 +1120,8 @@ static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
   return copy;
 }
 
+// Create a local copy for a channel that is populated by the producer and
+// accessed by the consumer.
 static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
                             Channel *channel, Value srcBufferIdx,
                             Value dstBufferIdx) {
@@ -1505,7 +1512,6 @@ void insertAsyncCopy(triton::FuncOp funcOp,
       auto tSize = forOp.getBody()->getArguments().size();
       assert(tSize >= 2);
       bufferIdx = forOp.getBody()->getArguments().back();
-      phase = forOp.getBody()->getArgument(tSize - 2); // next to last argument
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will
       // be used by both producer and consumers.
@@ -1516,8 +1522,6 @@ void insertAsyncCopy(triton::FuncOp funcOp,
       builder.setAsynTaskIdsFromArray(asyncTasksPC);
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           srcOp->getLoc(), 0, 32);
-      phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          srcOp->getLoc(), 0, 1);
     }
 
     for (auto channel : mutuallyNonDominatingChannels) {
@@ -1626,6 +1630,7 @@ public:
       funcOp.dump();
     });
 
+    // Step 7: Lower the loads. Also add local copy ops for non-load producers.
     insertAsyncCopy(funcOp, channelsGroupedByProducers, bufferMap);
     LLVM_DEBUG({
       LDBG("\n\nwith async copy");
@@ -1634,7 +1639,6 @@ public:
 
     // If loadResult has a single use which is LocalAlloc, we can get rid of
     // sharedLoad and replace all uses of LocalAlloc with viewLoad.
-    DenseMap<Operation *, Value> opsToReplace;
     foldLocalLoads(funcOp);
     LLVM_DEBUG({
       LDBG("\n\nsimplify localLoad + localAlloc");
