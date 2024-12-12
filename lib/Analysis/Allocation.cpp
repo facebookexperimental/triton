@@ -432,50 +432,29 @@ private:
                         buffer->regionIds.insert(rId);
                       }
                     });
-      bool isSharedGlobalForWS = false, isPrivateGlobalForWS = false,
-           isLocalForWS = false;
-      // Check regions on buffer.
-      if (buffer->regionIds.size() == 1)
-        isLocalForWS = true;
-      if (buffer->regionIds.size() > 1) {
-        // Assume region 0 is producer.
-        if (buffer->regionIds.count(0) && buffer->regionIds.size() == 2)
-          isPrivateGlobalForWS = true;
-        else
-          isSharedGlobalForWS = true;
-      }
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
-      std::for_each(
-          liveOperations.begin(), liveOperations.end(), [&](Operation *liveOp) {
-            if (isSharedGlobalForWS) { //! getAsyncTaskIds(liveOp).empty()) {
-              // For a buffer that is associated with warp specialization, due
-              // to producer-consumer channel:
-              // We differentiate the case of buffers that are shared with
-              // multiple consumers vs. buffers that are private to one
-              // consumer. For the latter, we can start from 0 (due to producer
-              // in a different region) and end at the top-level op within the
-              // region. For the former, we need to cover the whole range of
-              // [0, operationId.size()), since we don't know execution of the
-              // other consumer.
-              // For a buffer that is local to a consumer: we need to make sure
-              // not to overlap with local buffers from another consumer.
-              minId = 0;
-              maxId = operationId.size();
-              return;
-            }
-            if (isPrivateGlobalForWS) {
-              minId = 0;
-              maxId = operationId[liveOp] + 1 > maxId ? operationId[liveOp] + 1
-                                                      : maxId;
-            }
-            if (operationId[liveOp] < minId) {
-              minId = operationId[liveOp];
-            }
-            if ((operationId[liveOp] + 1) > maxId) {
-              maxId = operationId[liveOp] + 1;
-            }
-          });
+      std::for_each(liveOperations.begin(), liveOperations.end(),
+                    [&](Operation *liveOp) {
+                      if (buffer->regionIds.size() > 1) {
+                        // For a buffer that is associated with warp
+                        // specialization, due to producer-consumer channel, it
+                        // should have at least two regions, and it will be live
+                        // throughout. For a buffer that is local to a consumer:
+                        // we need to make sure not to overlap with local
+                        // buffers from another consumer. This will be handled
+                        // when building the interference graph.
+                        minId = 0;
+                        maxId = operationId.size();
+                        return;
+                      }
+                      if (operationId[liveOp] < minId) {
+                        minId = operationId[liveOp];
+                      }
+                      if ((operationId[liveOp] + 1) > maxId) {
+                        maxId = operationId[liveOp] + 1;
+                      }
+                    });
       return Interval(minId, maxId);
     };
 
@@ -485,27 +464,18 @@ private:
   }
 
   void dumpBuffers() {
-    LDBG("Dump bufferRange ---------");
+    LDBG("Dump bufferRange: id size offset ---------");
     for (auto bufferIter : bufferRange) {
       LLVM_DEBUG({
-        llvm::dbgs() << "-- " << bufferIter.first->size << " " << bufferIter.first->offset << " regions ";
+        llvm::dbgs() << "-- " << bufferIter.first->id << " "
+                     << bufferIter.first->size << " "
+                     << bufferIter.first->offset << " regions [";
         for (auto tId : bufferIter.first->regionIds) {
           llvm::dbgs() << tId << " ";
         }
-        llvm::dbgs() << " interval " << bufferIter.second.start() << " "
+        llvm::dbgs() << "] interval " << bufferIter.second.start() << " "
                      << bufferIter.second.end() << "\n";
       });
-    }
-  }
-  void printBuffers() {
-    llvm::errs() << "Dump bufferRange ---------" << "\n";
-    for (auto bufferIter : bufferRange) {
-      llvm::errs() << "-- " << bufferIter.first->size << " " << bufferIter.first->offset << " regions ";
-      for (auto tId : bufferIter.first->regionIds) {
-        llvm::errs() << tId << " ";
-      }
-      llvm::errs() << " interval " << bufferIter.second.start() << " "
-                   << bufferIter.second.end() << "\n";
     }
   }
 
@@ -532,9 +502,9 @@ private:
     buildInterferenceGraph(buffers, interference);
     do {
       allocate(buffers, interference);
-      dumpBuffers();
       buildInterferenceGraph(buffers, interference);
     } while (!interference.empty());
+    dumpBuffers();
   }
 
   /// Computes the initial shared memory offsets.
@@ -606,8 +576,8 @@ private:
       auto tA = A->regionIds;
       auto tB = B->regionIds;
       for (auto t1 : tA) {
-        for (auto t2 : tA) {
-          if (t1 != 0 && t2 != 0 && t1 != t2)
+        for (auto t2 : tB) {
+          if (t1 != t2)
             return true;
         }
       }
@@ -631,7 +601,7 @@ private:
           interference[x].insert(y);
         }
         // if x and y belong to different regions (ignore producer region).
-        if (inDifferentRegion(x, y) && xSizeRange.intersects(yOpRange))
+        if (inDifferentRegion(x, y) && xSizeRange.intersects(ySizeRange))
           interference[x].insert(y);
       }
     }
