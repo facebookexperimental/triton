@@ -580,6 +580,8 @@ private:
     auto inDifferentRegion = [&](BufferT *A, BufferT *B) {
       auto tA = A->regionIds;
       auto tB = B->regionIds;
+      if (tA.empty() && tB.empty())
+        return false;
       if (tA.empty() || tB.empty())
         return true;
       for (auto t1 : tA) {
