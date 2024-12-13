@@ -114,19 +114,103 @@ static SmallVector<unsigned> collectBlockArgsForTask(
 
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
-                        AsyncTaskId asyncTaskId);
+                        AsyncTaskId asyncTaskId,
+                        SmallVector<scf::ForOp> &loopWithBufferReuse,
+                        Value tmpIdxForOuter);
 
+// Return the argument that tracks accumLoopCount if there is an outer
+// ForOp.
+Value getOuterLoopArg(scf::ForOp parentForOp) {
+  assert(parentForOp);
+  auto tSize = parentForOp.getBody()->getArguments().size();
+  assert(tSize >= 3); // accum, bufferIdx, phase
+  Value tmpIdxForOuter = parentForOp.getBody()->getArgument(tSize - 3);
+  return tmpIdxForOuter;
+}
+
+// At this stage, part of the region is specialized. The input is the new ifOp
+// for the taskId we are currently working on. The thenBlock has been
+// specialized.
+Value getAccumLoopCount(scf::IfOp ifOp, Value tmpIdxForOuter) {
+  // FIXME: last argument of ForOp is bufferIdx which is a modulo number.
+  // We can replace it with the non-modulo number.
+  // For now, trace the use of the last argument for the outer loop.
+  bool lastIsFor = false;
+  Operation *lastOp = nullptr;
+  auto users = tmpIdxForOuter.getUsers();
+  Operation *lastUser = nullptr;
+  // FIXME: Look at thenBlock only for now.
+  for (Operation &thenOp : ifOp.thenBlock()->getOperations()) {
+    if (auto lastFor = dyn_cast<scf::ForOp>(thenOp)) {
+      lastIsFor = true;
+      lastOp = lastFor.getOperation();
+    }
+    if (auto lastIf = dyn_cast<scf::IfOp>(thenOp)) {
+      lastIsFor = false;
+      lastOp = lastIf.getOperation();
+    }
+    for (auto *user : users)
+      if (user == &thenOp)
+        lastUser = user;
+  }
+  // lastOp is specialized already.
+  assert(lastOp != nullptr);
+  if (auto lastFor = dyn_cast<scf::ForOp>(lastOp)) {
+    // Get the last user of tmpIdxForOuter inside this ifOp.
+    assert(lastUser);
+    return lastUser->getResult(0);
+  }
+  auto lastIf = cast<scf::IfOp>(lastOp);
+  assert(ifOp.getNumResults() >= 1);
+  auto numRes = ifOp.getNumResults();
+  return ifOp.getResult(numRes - 1);
+}
+
+static bool
+needAccumulatedBufIdx(scf::IfOp ifOp,
+                      SmallVector<scf::ForOp> &loopWithBufferReuse) {
+  // Only if it contains a ForOp that is in the sharing group.
+  bool needAccum = false;
+  ifOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
+    if (auto forOp = dyn_cast<scf::ForOp>(subOp))
+      for (auto tLoop : loopWithBufferReuse)
+        if (forOp.getOperation() == tLoop.getOperation()) {
+          needAccum = true;
+          break;
+        }
+  });
+  return needAccum;
+}
+
+// For certain cases, we need to add an additional output for
+// IfOp to track the accumulatedBufferIdx, we will need to add
+// a corresponding elseBlock with yieldOp.
+// About accumulatedBufferIdx, we assume
+// -- there is an instruction right after a ForOp to update it.
+// -- the last result of IfOp updates it
+// We also assume that given a group of ForOps that share buffers, all ForOps
+// must be under the same outer ForOp (in this case, we assume only double
+// nested) or there are no outer ForOp. For now, we assume there is a single
+// group of ForOps. When handling an IfOp here, find the last ForOp or the last
+// IfOp, for the former case, we find the instruction right after the ForOp, for
+// the latter, we get the last result of the IfOp.
 Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
                           OpBuilderWithAsyncTaskIds &builder,
-                          AsyncTaskId asyncTaskId) {
+                          AsyncTaskId asyncTaskId,
+                          SmallVector<scf::ForOp> &loopWithBufferReuse,
+                          Value tmpIdxForOuter) {
   LLVM_DEBUG({
     LDBG("specialize ifOp ");
     ifOp.dump();
   });
 
+  SmallVector<Type> newResultTypes(ifOp->getResultTypes());
+  bool needAccum = needAccumulatedBufIdx(ifOp, loopWithBufferReuse);
+  if (needAccum)
+    newResultTypes.push_back(builder.getI64Type());
   auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
-      ifOp.getLoc(), ifOp->getResultTypes(),
-      mapping.lookup(ifOp.getCondition()), true, ifOp.elseBlock());
+      ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
+      needAccum ? true : ifOp.elseBlock() != nullptr);
 
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
   ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
@@ -134,17 +218,56 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   // Handle thenRegion of this IfOp.
   ifBuilder.setInsertionPointToEnd(newIfOp.thenBlock());
   for (Operation &thenOp : ifOp.thenBlock()->getOperations()) {
-    SpecializeOp(&thenOp, mapping, ifBuilder, asyncTaskId);
+    SpecializeOp(&thenOp, mapping, ifBuilder, asyncTaskId, loopWithBufferReuse,
+                 tmpIdxForOuter);
+  }
+
+  // Update yields
+  auto loc = ifOp.getLoc();
+  auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
+    ifBuilder.setInsertionPoint(yield);
+    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(loc, operands);
+    yield.erase();
+  };
+
+  // Add one more operand to Yield.
+  Value accum;
+  if (needAccum) {
+    // Returns the specialized ForOp.
+    if (newIfOp->getParentOfType<scf::ForOp>()) {
+      assert(!tmpIdxForOuter);
+      tmpIdxForOuter = getOuterLoopArg(newIfOp->getParentOfType<scf::ForOp>());
+    } else {
+      assert(tmpIdxForOuter);
+      tmpIdxForOuter = mapping.lookupOrDefault(tmpIdxForOuter);
+    }
+    SmallVector<Value> ifYieldOperands = newIfOp.thenYield().getOperands();
+    accum = getAccumLoopCount(newIfOp, tmpIdxForOuter);
+    ifYieldOperands.push_back(accum);
+    updateYield(newIfOp.thenYield(), ifYieldOperands);
   }
 
   // Handle elseRegion of the IfOp.
   if (ifOp.elseBlock()) {
     ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
     for (Operation &elseOp : ifOp.elseBlock()->getOperations()) {
-      SpecializeOp(&elseOp, mapping, ifBuilder, asyncTaskId);
+      SpecializeOp(&elseOp, mapping, ifBuilder, asyncTaskId,
+                   loopWithBufferReuse, tmpIdxForOuter);
     }
+    // Add one more operand to Yield.
+    if (needAccum) {
+      SmallVector<Value> elseYieldOperands = newIfOp.elseYield().getOperands();
+      elseYieldOperands.push_back(tmpIdxForOuter);
+      updateYield(newIfOp.elseYield(), elseYieldOperands);
+    }
+  } else if (needAccum) {
+    // Create YieldOp with one operand for accumulatedBufferIdx.
+    ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
+    SmallVector<Value> yieldOperands;
+    yieldOperands.push_back(tmpIdxForOuter);
+    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(ifOp.getLoc(),
+                                                   yieldOperands);
   }
-
   for (unsigned i = 0; i < ifOp.getNumResults(); ++i)
     mapping.map(ifOp.getResult(i), newIfOp.getResult(i));
   return newIfOp;
@@ -152,7 +275,9 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
 
 Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            OpBuilderWithAsyncTaskIds &builder,
-                           AsyncTaskId asyncTaskId) {
+                           AsyncTaskId asyncTaskId,
+                           SmallVector<scf::ForOp> &loopWithBufferReuse,
+                           Value tmpIdxForOuter) {
   // Prepare blockArgToYieldOperand mapping.
   DenseMap<BlockArgument, Value> blockArgToYieldOperand;
   auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -197,7 +322,8 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   forBuilder.setAsynTaskIdsFromArray({asyncTaskId});
   forBuilder.setInsertionPointToStart(newForOp.getBody());
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    SpecializeOp(&op, mapping, forBuilder, asyncTaskId);
+    SpecializeOp(&op, mapping, forBuilder, asyncTaskId, loopWithBufferReuse,
+                 tmpIdxForOuter);
   }
 
   // Create YieldOp for newForOp.
@@ -232,7 +358,9 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
-                        AsyncTaskId asyncTaskId) {
+                        AsyncTaskId asyncTaskId,
+                        SmallVector<scf::ForOp> &loopWithBufferReuse,
+                        Value tmpIdxForOuter) {
   auto taskIds = getAsyncTaskIds(op);
   // yieldOp are sometimes implict, meaning they do not necessarily have a task
   // id, but they should be shared by all async tasks.
@@ -247,9 +375,11 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
     return newOp;
   } else {
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      return SpecializeIfOp(ifOp, mapping, builder, asyncTaskId);
+      return SpecializeIfOp(ifOp, mapping, builder, asyncTaskId,
+                            loopWithBufferReuse, tmpIdxForOuter);
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      return SpecializeForOp(forOp, mapping, builder, asyncTaskId);
+      return SpecializeForOp(forOp, mapping, builder, asyncTaskId,
+                             loopWithBufferReuse, tmpIdxForOuter);
     } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
       // recursively set async task ids for child ops
@@ -267,9 +397,11 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
 }
 
 // Create IfOp for each ayncTaskId.
-DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
-                                                  int regDecProducer,
-                                                  int regIncConsumer) {
+DenseMap<AsyncTaskId, scf::IfOp>
+SpecializeRegion(triton::FuncOp funcOp, int regDecProducer, int regIncConsumer,
+                 SmallVector<scf::ForOp> &loopWithBufferReuse,
+                 Value tmpIdxForOuter,
+                 DenseMap<AsyncTaskId, Value> &mapForAccumLoopVar) {
 
   LLVM_DEBUG({
     LDBG("\n\n");
@@ -329,8 +461,11 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
 
     IRMapping mapping;
     for (Operation *op : opList) {
-      SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
+      SpecializeOp(op, mapping, taskBuilder, asyncTaskId, loopWithBufferReuse,
+                   tmpIdxForOuter);
     }
+    if (tmpIdxForOuter)
+      mapForAccumLoopVar[asyncTaskId] = mapping.lookup(tmpIdxForOuter);
   }
 
   // Decide if this taskId is a producer or a consumer, and create either
@@ -706,28 +841,93 @@ void reorderProducerOps(SmallVector<Channel *> &channels) {
 }
 
 bool isInnermostLoop(scf::ForOp forOp) {
-  for (Operation &nestedOp : forOp.getBody()->getOperations()) {
-    if (isa<scf::ForOp>(nestedOp)) {
-      return false;
+  bool isInner = true;
+  forOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
+    if (subOp != forOp.getOperation())
+      if (auto forOp = dyn_cast<scf::ForOp>(subOp))
+        isInner = false;
+  });
+  return isInner;
+}
+
+// Find nested parallel forOps under outer loop.
+void populateLoopSteps(SmallVector<scf::ForOp> &loopWithBufferReuse,
+                       SmallVector<Value> &accumLoopCountsAfterLoop,
+                       Value tmpIdxForOuter) {
+  scf::ForOp inOp = loopWithBufferReuse.front();
+  LDBG("populateLoopSteps: " << loopWithBufferReuse.size());
+
+  OpBuilderWithAsyncTaskIds builder(inOp.getContext());
+  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(inOp));
+
+  unsigned loopId = 0;
+  for (auto &forOp : loopWithBufferReuse) {
+    builder.setInsertionPointAfter(forOp);
+    auto loc = forOp.getLoc();
+    // numSteps = ((upperBound - lowerBound) + forOpStep - 1) / forOpStep
+    Value numSteps = builder.createWithAsyncTaskIds<arith::SubIOp>(
+        loc, forOp.getUpperBound(), forOp.getLowerBound());
+    numSteps = builder.createWithAsyncTaskIds<arith::AddIOp>(loc, numSteps,
+                                                             forOp.getStep());
+    if (forOp.getStep().getType() != builder.getI64Type())
+      numSteps = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          loc, builder.getI64Type(), numSteps);
+
+    Value one =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+    numSteps =
+        builder.createWithAsyncTaskIds<arith::SubIOp>(loc, numSteps, one);
+    Value innerForStep = forOp.getStep();
+    if (forOp.getStep().getType() != builder.getI64Type())
+      innerForStep = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          loc, builder.getI64Type(), forOp.getStep());
+    numSteps = builder.createWithAsyncTaskIds<arith::DivUIOp>(loc, numSteps,
+                                                              innerForStep);
+    if (loopId == 0) {
+      accumLoopCountsAfterLoop.push_back(tmpIdxForOuter);
     }
+    // Assume tmpIdxForOuter is 64 bit.
+    Value accumulatedLoopCount = builder.createWithAsyncTaskIds<arith::AddIOp>(
+        loc, tmpIdxForOuter, numSteps);
+    // Use tmpIdxForOuter here instead of accumulatedLoopCount since
+    // accumulatedLoopCount can be out of scope, we will fix them later.
+    accumLoopCountsAfterLoop.push_back(tmpIdxForOuter);
+    ++loopId;
   }
-  return true;
 }
 
 // Add phase and bufferIndex to be used when lowering the producer.
+// When hasParallelReuse is true, we pass in accumulatedLoopCount and update it.
 scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
-                         scf::ForOp &parentForOp) {
+                         scf::ForOp &parentForOp, Value accumulatedLoopCount,
+                         SmallVector<Value> &accumLoopCountsAfterLoop,
+                         SmallVector<scf::ForOp> &loopWithBufferReuse,
+                         /*Value totalSteps, */ bool hasParallelReuse,
+                         bool isOuterOfReuse) {
   auto loc = forOp.getLoc();
   Block *body = forOp.getBody();
 
   OpBuilderWithAsyncTaskIds builder(forOp.getContext());
   builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(forOp));
   builder.setInsertionPoint(forOp);
+  if (hasParallelReuse) {
+    LLVM_DEBUG({
+      LDBG("createNewLoop hasParallelReuse: ");
+      accumulatedLoopCount.dump();
+    });
+  }
 
   Value numBuffersVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
 
   // Step 1: Append bufferIdx and phase as forOp arguments.
+  Value tmpIdxForOuter;
+  if (isOuterOfReuse) {
+    tmpIdxForOuter = body->insertArgument(body->getNumArguments(),
+                                          builder.getI64Type(), loc);
+    populateLoopSteps(loopWithBufferReuse, accumLoopCountsAfterLoop,
+                      tmpIdxForOuter);
+  }
   Value phase =
       body->insertArgument(body->getNumArguments(), builder.getI1Type(), loc);
   Value bufferIdx =
@@ -767,7 +967,13 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
       builder.createWithAsyncTaskIds<mlir::arith::OrIOp>(loc, cond0, cond1);
 
   // Step 3: Add nextBufferIdx and nextPhase to yieldOp.
-  yieldOp->insertOperands(yieldOp.getNumOperands(), {nextPhase, nextBufferIdx});
+  if (isOuterOfReuse) {
+    Value nextTmpIdx = accumLoopCountsAfterLoop.back();
+    yieldOp->insertOperands(yieldOp.getNumOperands(),
+                            {nextTmpIdx, nextPhase, nextBufferIdx});
+  } else
+    yieldOp->insertOperands(yieldOp.getNumOperands(),
+                            {nextPhase, nextBufferIdx});
 
   // Step 4: Create loop arguments for the new ForOp.
   SmallVector<Value> newLoopArgs;
@@ -775,48 +981,57 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
     newLoopArgs.push_back(operand);
 
   builder.setInsertionPoint(forOp);
-  Value initBufferIdx, initPhase;
+  Value initBufferIdx, initPhase, initTmpIdx;
   // Set initial values for bufferIdx and phase.
   if (parentForOp) {
-    // It is possible that parent loop induction variable has different type.
-    // Here we promote to 64 bit.
-    // numSteps = ((upperBound - lowerBound) + forOpStep - 1) / forOpStep
-    Value numSteps = builder.createWithAsyncTaskIds<arith::SubIOp>(
-        loc, forOp.getUpperBound(), forOp.getLowerBound());
-    numSteps = builder.createWithAsyncTaskIds<arith::AddIOp>(loc, numSteps,
-                                                             forOp.getStep());
-    if (forOp.getStep().getType() != builder.getI64Type())
-      numSteps = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-          loc, builder.getI64Type(), numSteps);
+    if (hasParallelReuse) {
+      // FIXME: is it possible that numSteps is different for each iteration of
+      // the outer loop? We should add a loop variable to track tmpIdx. It
+      // should start with 0, then increment with numSteps_for_loopA, then
+      // numSteps_for_loopB.
+      initBufferIdx = accumulatedLoopCount;
+    } else {
+      // It is possible that parent loop induction variable has different type.
+      // Here we promote to 64 bit.
+      // numSteps = ((upperBound - lowerBound) + forOpStep - 1) / forOpStep
+      Value numSteps = builder.createWithAsyncTaskIds<arith::SubIOp>(
+          loc, forOp.getUpperBound(), forOp.getLowerBound());
+      numSteps = builder.createWithAsyncTaskIds<arith::AddIOp>(loc, numSteps,
+                                                               forOp.getStep());
+      if (forOp.getStep().getType() != builder.getI64Type())
+        numSteps = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+            loc, builder.getI64Type(), numSteps);
 
-    Value one =
-        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-    numSteps =
-        builder.createWithAsyncTaskIds<arith::SubIOp>(loc, numSteps, one);
-    Value innerForStep = forOp.getStep();
-    if (forOp.getStep().getType() != builder.getI64Type())
-      innerForStep = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-          loc, builder.getI64Type(), forOp.getStep());
-    numSteps = builder.createWithAsyncTaskIds<arith::DivUIOp>(loc, numSteps,
-                                                              innerForStep);
+      Value one =
+          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+      numSteps =
+          builder.createWithAsyncTaskIds<arith::SubIOp>(loc, numSteps, one);
+      Value innerForStep = forOp.getStep();
+      if (forOp.getStep().getType() != builder.getI64Type())
+        innerForStep = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+            loc, builder.getI64Type(), forOp.getStep());
+      numSteps = builder.createWithAsyncTaskIds<arith::DivUIOp>(loc, numSteps,
+                                                                innerForStep);
 
-    // TODO: use a global flattened iteration space index for multi-dim loops.
-    // tmpIdx = parentForOp.iterationIdx * numSteps
-    // initBufferIdx = tmpIdx - tmpIdx / numBuffers * numBuffers
-    // initPhase = (tmpIdx / numBuffers) & 1
-    // Assume parent ForOp has bufferIdx as the last argument.
-    Value parentIterIdx = builder.createWithAsyncTaskIds<arith::SubIOp>(
-        loc, parentForOp.getInductionVar(), parentForOp.getLowerBound());
-    parentIterIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
-        loc, parentIterIdx, parentForOp.getStep());
-    if (parentForOp.getStep().getType() != builder.getI64Type())
-      parentIterIdx = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-          loc, builder.getI64Type(), parentIterIdx);
+      // TODO: use a global flattened iteration space index for multi-dim loops.
+      // tmpIdx = (parentInductionVar - parentLowBound) / parentStep * numSteps
+      Value parentIterIdx = builder.createWithAsyncTaskIds<arith::SubIOp>(
+          loc, parentForOp.getInductionVar(), parentForOp.getLowerBound());
+      parentIterIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
+          loc, parentIterIdx, parentForOp.getStep());
+      if (parentForOp.getStep().getType() != builder.getI64Type())
+        parentIterIdx = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+            loc, builder.getI64Type(), parentIterIdx);
+      // Calculate tmpIdx.
+      initBufferIdx = builder.createWithAsyncTaskIds<arith::MulIOp>(
+          loc, parentIterIdx, numSteps);
+    }
 
-    initBufferIdx = builder.createWithAsyncTaskIds<arith::MulIOp>(
-        loc, parentIterIdx, numSteps);
     numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
         loc, builder.getI64Type(), numBuffersVal);
+    // Calculate tmpIdx / numBuffers
+    // initBufferIdx = tmpIdx - tmpIdx / numBuffers * numBuffers
+    // initPhase = (tmpIdx / numBuffers) & 1
     Value bufferIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
         loc, initBufferIdx, numBuffersVal);
     initBufferIdx = builder.createWithAsyncTaskIds<arith::SubIOp>(
@@ -826,17 +1041,51 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
     initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
         loc, builder.getI32Type(), initBufferIdx);
 
+    Value one =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
     bufferIdx =
         builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
     initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
         loc, builder.getI1Type(), bufferIdx);
   } else {
     // Set initial phase to false, and initial bufferIdx to 0.
-    initBufferIdx =
-        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
-    initPhase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 1);
+    //   tmpIdx = accumulatedLoopCount
+    //   initBufferIdx = tmpIdx - tmpIdx/numBuffers * numBuffers (modulo)
+    //   initPhase = (tmpIdx / numBuffers) & 1
+    if (hasParallelReuse) {
+      initBufferIdx = accumulatedLoopCount;
+      numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          loc, builder.getI64Type(), numBuffersVal);
+      Value bufferIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
+          loc, initBufferIdx, numBuffersVal);
+      initBufferIdx = builder.createWithAsyncTaskIds<arith::SubIOp>(
+          loc, initBufferIdx,
+          builder.createWithAsyncTaskIds<arith::MulIOp>(loc, bufferIdx,
+                                                        numBuffersVal));
+      initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+          loc, builder.getI32Type(), initBufferIdx);
+
+      Value one =
+          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+      bufferIdx =
+          builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
+      initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+          loc, builder.getI1Type(), bufferIdx);
+    } else {
+      initBufferIdx =
+          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+      initPhase =
+          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 1);
+      if (isOuterOfReuse)
+        initTmpIdx =
+            builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64);
+    }
   }
-  newLoopArgs.append({initPhase, initBufferIdx});
+  if (isOuterOfReuse) {
+    assert(!hasParallelReuse && !parentForOp);
+    newLoopArgs.append({initTmpIdx, initPhase, initBufferIdx});
+  } else
+    newLoopArgs.append({initPhase, initBufferIdx});
 
   // Step 5: Create newForOp and take the region of the original forOp.
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
@@ -899,10 +1148,186 @@ getTaskTopRegion(triton::FuncOp funcOp,
   return asyncTaskOps;
 }
 
+static unsigned getNumChannelsInLoop(scf::ForOp forOp,
+                                     const SmallVector<Channel *> &channels,
+                                     SmallVector<Channel *> &channelsInLoop) {
+  unsigned num = 0;
+  for (auto *ch : channels) {
+    scf::ForOp srcParent = ch->getSrcOp()->getParentOfType<scf::ForOp>();
+    scf::ForOp dstParent = ch->getSrcOp()->getParentOfType<scf::ForOp>();
+    if (srcParent == forOp && dstParent == forOp) {
+      channelsInLoop.push_back(ch);
+    }
+  }
+  return channelsInLoop.size();
+}
+
+// After specializing regions, fix up the logic here.
+// Return the update prevAccum.
+Value updateAccumLoopCount(Operation *parentOp, Value tmpIdxForOuter,
+                           Value prevAccum) {
+  // parentOp must be IfOp or ForOp.
+  auto users = tmpIdxForOuter.getUsers();
+  DenseSet<Operation *> userSet;
+  for (auto user : users)
+    userSet.insert(user);
+  SmallVector<Operation *> opList;
+  if (auto forOp = dyn_cast<scf::ForOp>(parentOp))
+    for (Operation &op : forOp.getBody()->without_terminator())
+      opList.push_back(&op);
+  if (auto ifOp = dyn_cast<scf::IfOp>(parentOp))
+    for (Operation &op : ifOp.thenBlock()->getOperations())
+      opList.push_back(&op);
+
+  // Go through body of parentOp. Update users of tmpIdxForOuter on the way.
+  for (Operation *op : opList) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      bool needAccum = false;
+      ifOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
+        if (auto forOp = dyn_cast<scf::ForOp>(subOp))
+          needAccum = true;
+      });
+      if (!needAccum)
+        continue;
+      // go inside ifOp->thenBlock to fix up.
+      updateAccumLoopCount(op, tmpIdxForOuter, prevAccum);
+      // Update yield operand.
+      if (prevAccum != tmpIdxForOuter) {
+        ifOp.elseYield()->replaceUsesOfWith(tmpIdxForOuter, prevAccum);
+        LLVM_DEBUG({
+          LDBG("replace elseYield");
+          prevAccum.dump();
+        });
+      } else {
+        LDBG("no need to replace elseYield");
+      }
+      assert(ifOp.getNumResults() >= 1);
+      auto numRes = ifOp.getNumResults();
+      LDBG("update prevAccum with result from IfOp");
+      prevAccum = ifOp.getResult(numRes - 1); // last argument of this ifOp
+      continue;
+    }
+    if (userSet.count(op)) {
+      if (prevAccum != tmpIdxForOuter) {
+        LLVM_DEBUG({
+          LDBG("replace use of tmpIdxForOuter: ");
+          op->dump();
+          prevAccum.dump();
+        });
+        op->replaceUsesOfWith(tmpIdxForOuter, prevAccum);
+      } else {
+        LDBG("no need to replace prevAccum == tmpIdxForOuter");
+      }
+      if (isa<arith::AddIOp>(op)) {
+        prevAccum = op->getResult(0);
+        LLVM_DEBUG({
+          LDBG("update prevAccum: ");
+          prevAccum.dump();
+        });
+      }
+    }
+  }
+  return prevAccum;
+}
+
+bool reuseBuffers(SmallVector<Operation *> &taskTopOps,
+                  const SmallVector<Channel *> &channels,
+                  DenseMap<Channel *, Channel *> &mapToRepresenting,
+                  SmallVector<scf::ForOp> &loopWithBufferReuse) {
+  if (!triton::tools::getBoolEnv("ENABLE_BUFFER_REUSE"))
+    return false;
+  // For the case of multiple parallel ForOps with same number of channels,
+  // we can try reusing the buffers across the parallel ForOps.
+  // One case is
+  //   ForOp
+  //   ForOp
+  // The other case is
+  //   ForOp (persistent)
+  //     ForOp
+  //     ForOp
+  // For the case of
+  //   ForOp (persistent)
+  //     ForOp
+  // We update loopWithBufferReuse with the inner loop and use accumLoopCount
+  // via the outer loop to update bufferIdx. This is needed when the loop count
+  // for the inner loop varies with each outer loop iteration.
+  // Assume we handle outer ForOp first, then inner ForOp in program order.
+  SmallVector<scf::ForOp> orderedForOps;
+  SmallVector<scf::ForOp> innerForOps;
+  for (auto &op : taskTopOps) {
+    op->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
+      if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
+        if (isInnermostLoop(forOp))
+          innerForOps.push_back(forOp);
+        orderedForOps.push_back(forOp);
+      }
+    });
+  }
+  LDBG("reuseBuffers number of inner loops: " << innerForOps.size());
+  if (innerForOps.empty())
+    return false;
+  if (innerForOps.size() == 1) {
+    // Persistent with a single inner loop.
+    scf::ForOp parentForOp = innerForOps[0]->getParentOfType<scf::ForOp>();
+    if (parentForOp)
+      loopWithBufferReuse = innerForOps;
+    return false;
+  }
+  // Check to see if the innermost loops are under one parent. And there are no
+  // other loops. Make sure the inner loops have same number of channels.
+  bool firstLoop = true;
+  Operation *outerLoop = nullptr;
+  unsigned numChannels = 0, numBuffers = 0;
+  SmallVector<Channel *> channelsInLoopOne;
+  for (auto &innerLoop : innerForOps) {
+    scf::ForOp parentForOp = innerLoop->getParentOfType<scf::ForOp>();
+    SmallVector<Channel *> channelsInLoop;
+    getNumChannelsInLoop(innerLoop, channels, channelsInLoop);
+    if (firstLoop) {
+      outerLoop = parentForOp.getOperation();
+      numChannels = channelsInLoop.size();
+      channelsInLoopOne = channelsInLoop;
+      numBuffers = channelsInLoop[0]->numBuffers;
+      if (numChannels == 0)
+        return false;
+    } else {
+      if (outerLoop != parentForOp.getOperation())
+        return false;
+      if (numChannels != channelsInLoop.size())
+        return false;
+      if (numBuffers != channelsInLoop[0]->numBuffers)
+        return false;
+      unsigned idx = 0;
+      for (auto *ch : channelsInLoop) {
+        // TODO: sort the channels in the loop according to buffer size.
+        mapToRepresenting[ch] = channelsInLoopOne[idx++];
+      }
+    }
+    firstLoop = false;
+  }
+  LLVM_DEBUG({
+    LDBG("reuseBuffers: ");
+    for (auto &kv : mapToRepresenting) {
+      llvm::dbgs() << "---- from ";
+      kv.first->getDstOp()->dump();
+      llvm::dbgs() << "---- to ";
+      kv.second->getDstOp()->dump();
+    }
+  });
+  loopWithBufferReuse = innerForOps;
+  return true;
+}
+
 // For ForOps in taskTopOps, create new ForOp for each by adding phase,
 // bufferIdx to the arguments.
-void appendBufferIdxArgs(SmallVector<Operation *> &taskTopOps,
-                         unsigned numBuffers) {
+Value appendBufferIdxArgs(
+    SmallVector<Operation *> &taskTopOps, unsigned numBuffers,
+    const SmallVector<Channel *> &channels,
+    const DenseMap<Channel *, Channel *> &mapToRepresenting,
+    SmallVector<scf::ForOp> &loopWithBufferReuse) {
   SmallVector<scf::ForOp> orderedForOps;
   for (auto &op : taskTopOps) {
     op->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
@@ -911,13 +1336,65 @@ void appendBufferIdxArgs(SmallVector<Operation *> &taskTopOps,
       }
     });
   }
+  LDBG("appendBufferIdxArgs number of ForOps: " << orderedForOps.size());
+  SmallVector<Value> accumLoopCountsAfterLoop;
+  // When there is no outer loop, we need to create a place holder for
+  // tmpIdxForOuter. Every forOp in loopWithBufferReuse either has the same
+  // outer loop or has no outer loop.
+  Value tmpIdxForOuter;
+  if (loopWithBufferReuse.size() > 1) {
+    scf::ForOp oneFor = loopWithBufferReuse[0];
+    // Check to see if it has an outer loop.
+    scf::ForOp parentForOp = oneFor->getParentOfType<scf::ForOp>();
+    if (!parentForOp) {
+      // Insert before the first IfOp or the first ForOp. Or the first
+      // taskTopOp.
+      OpBuilderWithAsyncTaskIds builder(taskTopOps[0]->getContext());
+      builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(oneFor));
+      builder.setInsertionPoint(taskTopOps[0]);
+      tmpIdxForOuter = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          oneFor.getLoc(), 0, 64);
+      populateLoopSteps(loopWithBufferReuse, accumLoopCountsAfterLoop,
+                        tmpIdxForOuter);
+    }
+  }
 
+  unsigned loopId = 0, innerLoopId = 0;
+  SmallVector<scf::ForOp> updatedLoopsWithReuse;
+  bool hasAccumLoopCount = !loopWithBufferReuse.empty();
   for (auto &origForOp : orderedForOps) {
+    LLVM_DEBUG({
+      LDBG("call createNewLoop on");
+      origForOp.dump();
+    });
+
     scf::ForOp parentForOp = origForOp->getParentOfType<scf::ForOp>();
     scf::ForOp newForOp;
     // for(...) -> for(..., phase, bufferIdx)
     unsigned loopNumBuffers = getNumBuffersOrDefault(origForOp, numBuffers);
-    newForOp = createNewLoop(origForOp, loopNumBuffers, parentForOp);
+    // Update accumLoopCountsAfterLoop when this loop contains parallel forOps.
+    bool isOuterOfReuse = hasAccumLoopCount && !isInnermostLoop(origForOp);
+    bool innerLoop = isInnermostLoop(origForOp);
+    bool hasParallelReuse = hasAccumLoopCount && innerLoop;
+    Value accumulatedLoopCount =
+        hasParallelReuse ? accumLoopCountsAfterLoop[innerLoopId] : Value();
+    //  When isOuterOfReuse is true, accumulatedLoopCount will be set.
+    bool hasReuse = false; // origForOp in loopWithBufferReuse
+    for (auto tLoop : loopWithBufferReuse)
+      if (origForOp.getOperation() == tLoop.getOperation()) {
+        hasReuse = true;
+        break;
+      }
+    newForOp = createNewLoop(origForOp, loopNumBuffers, parentForOp,
+                             accumulatedLoopCount, accumLoopCountsAfterLoop,
+                             loopWithBufferReuse,
+                             /*totalSteps,*/ hasParallelReuse, isOuterOfReuse);
+    if (hasReuse)
+      updatedLoopsWithReuse.push_back(newForOp);
+    LLVM_DEBUG({
+      LDBG("after createNewLoop ");
+      newForOp.dump();
+    });
     // origForOp is erased in createNewLoop. If origForOp is a top operation
     // (i.e in taskTopOps), make sure taskTopOps is updated with the newForOp.
     auto asyncTaskLoopForItr = std::find(taskTopOps.begin(), taskTopOps.end(),
@@ -926,7 +1403,13 @@ void appendBufferIdxArgs(SmallVector<Operation *> &taskTopOps,
       // Update taskTopOps.
       *asyncTaskLoopForItr = newForOp.getOperation();
     }
+    ++loopId;
+    if (innerLoop)
+      ++innerLoopId;
   }
+  if (!loopWithBufferReuse.empty())
+    loopWithBufferReuse = updatedLoopsWithReuse;
+  return tmpIdxForOuter;
 }
 
 // Create an allocation to hold the mbarriers.
@@ -969,6 +1452,7 @@ createToken(const DenseMap<Channel *, SmallVector<Channel *>>
                 &channelsGroupedByConsumers,
             const SmallVector<Channel *> &orderedChannels,
             triton::FuncOp funcOp, int numConsumerGroups,
+            DenseMap<Channel *, SmallVector<Channel *>> &channelReuse,
             DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
   DenseMap<Channel *, DenseMap<int, Value>> ret;
   OpBuilder builder(funcOp);
@@ -976,6 +1460,8 @@ createToken(const DenseMap<Channel *, SmallVector<Channel *>>
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
     Channel *channel = it->second.front();
+    if (!channelReuse.count(channel))
+      continue;
     for (auto consumerAsyncTaskId : channel->relation.second) {
       Value v;
       if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>()) {
@@ -985,8 +1471,12 @@ createToken(const DenseMap<Channel *, SmallVector<Channel *>>
         v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1);
       }
       // Channels in the group share the same set of tokens.
-      for (auto &c : it->second)
+      for (auto &c : it->second) {
         ret[c][consumerAsyncTaskId] = v;
+      }
+      for (auto *reuse : channelReuse[channel]) {
+        ret[reuse][consumerAsyncTaskId] = v;
+      }
 
       auto producerOp = it->second.front()->getSrcOp();
       if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
@@ -995,6 +1485,10 @@ createToken(const DenseMap<Channel *, SmallVector<Channel *>>
         for (auto &c : it->second) {
           ret[c][consumerAsyncTaskId] = v;
           barrierAllocMap[c][consumerAsyncTaskId] = bAlloc;
+        }
+        for (auto *reuse : channelReuse[channel]) {
+          ret[reuse][consumerAsyncTaskId] = v;
+          barrierAllocMap[reuse][consumerAsyncTaskId] = bAlloc;
         }
       }
     }
@@ -1006,12 +1500,24 @@ createToken(const DenseMap<Channel *, SmallVector<Channel *>>
 // the buffer array will contain numBuffers.
 DenseMap<Channel *, Value> createBuffer(
     DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
-    triton::FuncOp funcOp, int numConsumerGroups) {
+    triton::FuncOp funcOp, int numConsumerGroups,
+    DenseMap<Channel *, Channel *> &mapToRepresenting,
+    DenseMap<Channel *, SmallVector<Channel *>> &channelReuse) {
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+  for (auto &item : channelsGroupedByProducers) {
+    auto c = item.first;
+    if (mapToRepresenting.count(c)) {
+      channelReuse[mapToRepresenting[c]].push_back(c);
+      LDBG("update channelReuse key " << mapToRepresenting[c] << " " << c);
+    } else {
+      channelReuse[c].push_back(c);
+      LDBG("update channelReuse key " << c << " " << c);
+    }
+  }
   for (auto &item : channelsGroupedByProducers) {
     auto &channels = item.second;
     auto srcValue = item.first->getSrcOperand();
@@ -1053,6 +1559,19 @@ DenseMap<Channel *, Value> createBuffer(
     } else {
       llvm_unreachable("Unexpected result type");
     }
+  }
+  unsigned groupId = 0;
+  for (auto &kv : channelReuse) {
+    if (kv.second.size() <= 1)
+      continue;
+    bufferMap[kv.first].getDefiningOp()->setAttr(
+        "allocation.shareGroup",
+        IntegerAttr::get(IntegerType::get(context, 32), groupId));
+    for (auto *c : kv.second)
+      bufferMap[c].getDefiningOp()->setAttr(
+          "allocation.shareGroup",
+          IntegerAttr::get(IntegerType::get(context, 32), groupId));
+    ++groupId;
   }
   return bufferMap;
 }
@@ -1630,7 +2149,17 @@ public:
     // ForOps.
     SmallVector<Operation *> asyncTaskTopOps =
         getTaskTopRegion(funcOp, channels);
-    appendBufferIdxArgs(asyncTaskTopOps, numBuffers);
+    // Update mapToRepresenting that maps a channel to the representing channel
+    // in the sharing group.
+    DenseMap<Channel *, Channel *> mapToRepresenting;
+    SmallVector<scf::ForOp> loopWithBufferReuse;
+    reuseBuffers(asyncTaskTopOps, channels, mapToRepresenting,
+                 loopWithBufferReuse);
+    unsigned loopsWithAccumLoopCount = loopWithBufferReuse.size();
+    // Use and update loopWithBufferReuse.
+    Value tmpIdxForOuter =
+        appendBufferIdxArgs(asyncTaskTopOps, numBuffers, channels,
+                            mapToRepresenting, loopWithBufferReuse);
     LLVM_DEBUG({
       LDBG("\n\nafter appendBufferIdxArgs");
       funcOp.dump();
@@ -1638,12 +2167,16 @@ public:
 
     // Step 5: Create tokens, and buffers. A set of tokens for each group of
     // channels and an array of buffers for each channel.
+    // Update channelReuse that maps from a representing channel to the group of
+    // channels that share buffers.
+    DenseMap<Channel *, SmallVector<Channel *>> channelReuse;
+    DenseMap<Channel *, Value> bufferMap =
+        createBuffer(channelsGroupedByProducers, funcOp, numConsumerGroups,
+                     mapToRepresenting, channelReuse);
     DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
     DenseMap<Channel *, DenseMap<int, Value>> tokenMap =
         createToken(channelsGroupedByConsumers, orderedChannels, funcOp,
-                    numConsumerGroups, barrierAllocMap);
-    DenseMap<Channel *, Value> bufferMap =
-        createBuffer(channelsGroupedByProducers, funcOp, numConsumerGroups);
+                    numConsumerGroups, channelReuse, barrierAllocMap);
     LLVM_DEBUG({
       LDBG("\n\nafter createBuffer");
       funcOp.dump();
@@ -1673,11 +2206,46 @@ public:
       funcOp.dump();
     });
 
-    auto ret = SpecializeRegion(funcOp, regDecProducer, regIncConsumer);
+    // Assuming there are no changes to loops in loopWithBufferReuse.
+    DenseMap<AsyncTaskId, Value> mapForAccumLoopVar;
+    auto ret = SpecializeRegion(funcOp, regDecProducer, regIncConsumer,
+                                loopWithBufferReuse, tmpIdxForOuter,
+                                mapForAccumLoopVar);
     LLVM_DEBUG({
       LDBG("\n\nwith SpecializeRegion");
       funcOp.dump();
     });
+
+    if (loopsWithAccumLoopCount >= 1) {
+      // Get top-level parentForOp for each taskId/region.
+      auto getTopForOp = [&](scf::IfOp ifOp) -> scf::ForOp {
+        for (Operation &op : ifOp.thenBlock()->getOperations())
+          if (auto forOp = dyn_cast<scf::ForOp>(&op))
+            return forOp;
+        return scf::ForOp();
+      };
+      for (auto &block : funcOp.getBody().getBlocks()) {
+        for (Operation &op : block.getOperations()) {
+          if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
+            scf::ForOp parentForOp = getTopForOp(ifOp);
+            // Get the async taskId.
+            auto taskIds = getAsyncTaskIds(&op);
+            assert(taskIds.size() == 1);
+            Value tmpIdxForOuter = parentForOp ? getOuterLoopArg(parentForOp)
+                                               : mapForAccumLoopVar[taskIds[0]];
+            Operation *topOp = parentForOp ? parentForOp.getOperation() : &op;
+            Value prevAccum =
+                updateAccumLoopCount(topOp, tmpIdxForOuter, tmpIdxForOuter);
+            // handle yield for tmpIdxForOuter.
+            if (parentForOp) {
+              auto forYield =
+                  cast<scf::YieldOp>(parentForOp.getBody()->getTerminator());
+              forYield->replaceUsesOfWith(tmpIdxForOuter, prevAccum);
+            }
+          }
+        }
+      }
+    }
   }
 
   void runOnOperation() override {
