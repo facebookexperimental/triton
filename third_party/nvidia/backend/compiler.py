@@ -231,6 +231,7 @@ class CUDABackend(BaseBackend):
         if capability // 10 >= 8:
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,

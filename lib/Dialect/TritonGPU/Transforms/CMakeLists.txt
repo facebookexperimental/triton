@@ -19,6 +19,7 @@ add_triton_library(TritonGPUTransforms
   ReorderInstructions.cpp
   Utility.cpp
   TaskIdPropagate.cpp
+  WSTaskPartition.cpp
   WSDataPartition.cpp
   WSCodePartition.cpp
   WSLowering.cpp

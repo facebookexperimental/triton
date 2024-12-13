@@ -179,6 +179,20 @@ def TritonGPUOptimizeAccumulatorInit: Pass<"tritongpu-optimize-accumulator-init"
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUWSTaskPartition : Pass<"tritongpu-warp-spec-task-partition", "mlir::ModuleOp"> {
+  let summary = "Warp specialization task partition";
+
+  let description = "This pass computes a warp schedule partition by annoating anchor operations with async task ids";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let options = [
+    Option<"numConsumerGroups", "num-consumer-groups",
+           "int32_t", /*default*/"0",
+           "number of consumer warp groups for warp specialization">
+  ];
+}
+
 def TritonGPUTaskIdPropagate : Pass<"triton-gpu-taskid-propagate", "mlir::ModuleOp"> {
   let summary = "Propagate async_task_id annotations based on dependencies";
 
