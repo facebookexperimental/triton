@@ -342,8 +342,8 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 // CHECK: scf.for
 // CHECK: triton_gpu.local_load
 // CHECK: triton_nvidia_gpu.consumer_wait
-// CHECK: tt.experimental_descriptor_store
 // CHECK: triton_nvidia_gpu.consumer_release
+// CHECK: tt.experimental_descriptor_store
 
 #blocked = #triton_gpu.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #triton_gpu.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>

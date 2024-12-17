@@ -1302,6 +1302,7 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 // "channelsGroupedByConsumers". tokenMap tracks the set of tokens for each
 // channel.
 void insertAsyncComm(
+    triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
     const DenseMap<Channel *, DenseMap<int, Value>> &tokenMap,
@@ -1324,14 +1325,41 @@ void insertAsyncComm(
                                       int consumerAsyncTaskId) -> Operation * {
     if (c->getBlock() != p->getBlock())
       return getSameLevelOp(p, c);
-    for (auto it = c->getBlock()->rbegin(); it != c->getBlock()->rend(); ++it) {
-      if (!it->hasAttr("async_task_id"))
-        continue;
-      auto asyncAttr = it->getAttrOfType<DenseIntElementsAttr>("async_task_id")
-                           .getValues<int>();
-      if (asyncAttr.size() == 1 && asyncAttr[0] == consumerAsyncTaskId)
-        return &(*it);
+
+    // Find a common place for all users of the consumer, which would be the
+    // common post dominator.
+    mlir::PostDominanceInfo dom(funcOp);
+    std::unordered_set<Operation *> mutuallyNonDominatingUsers;
+    for (auto user : c->getUsers()) {
+      auto it = mutuallyNonDominatingUsers.begin();
+      while (it != mutuallyNonDominatingUsers.end()) {
+        if (dom.properlyPostDominates(user, *it)) {
+          it = mutuallyNonDominatingUsers.erase(it);
+        } else if (dom.properlyPostDominates(*it, user)) {
+          break;
+        } else {
+          ++it;
+        }
+      }
+      if (it == mutuallyNonDominatingUsers.end())
+        mutuallyNonDominatingUsers.insert(user);
     }
+
+    if (mutuallyNonDominatingUsers.size() == 1) {
+      // Find the common parent of this user and c
+      auto user = *mutuallyNonDominatingUsers.begin();
+      while (user && user->getParentOp() != c->getParentOp())
+        user = user->getParentOp();
+      assert(user && "Failed to find common parent of this user and c");
+      return user;
+    }
+
+    for (auto &op : reverse(c->getBlock()->getOperations())) {
+      auto asyncTasks = getAsyncTaskIds(&op);
+      if (asyncTasks.size() == 1 && asyncTasks[0] == consumerAsyncTaskId)
+        return &op;
+    }
+
     return nullptr;
   };
 
@@ -1623,8 +1651,8 @@ public:
 
     // Step 6: add async communication ops (ProducerAcquire etc). Also lower the
     // loads.
-    insertAsyncComm(channelsGroupedByConsumers, tokenMap, barrierAllocMap,
-                    bufferMap, numConsumerGroups);
+    insertAsyncComm(funcOp, channelsGroupedByConsumers, tokenMap,
+                    barrierAllocMap, bufferMap, numConsumerGroups);
     LLVM_DEBUG({
       LDBG("\n\nwith SyncOps");
       funcOp.dump();
