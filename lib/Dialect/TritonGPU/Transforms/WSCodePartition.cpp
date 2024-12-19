@@ -1237,8 +1237,6 @@ bool reuseBuffers(SmallVector<Operation *> &taskTopOps,
                   const SmallVector<Channel *> &channels,
                   DenseMap<Channel *, Channel *> &mapToRepresenting,
                   SmallVector<scf::ForOp> &loopWithBufferReuse) {
-  if (!triton::tools::getBoolEnv("ENABLE_BUFFER_REUSE"))
-    return false;
   // For the case of multiple parallel ForOps with same number of channels,
   // we can try reusing the buffers across the parallel ForOps.
   // One case is
@@ -1508,14 +1506,19 @@ DenseMap<Channel *, Value> createBuffer(
   MLIRContext *context = funcOp.getContext();
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+  DenseSet<Channel *> visited;
   for (auto &item : channelsGroupedByProducers) {
-    auto c = item.first;
-    if (mapToRepresenting.count(c)) {
-      channelReuse[mapToRepresenting[c]].push_back(c);
-      LDBG("update channelReuse key " << mapToRepresenting[c] << " " << c);
-    } else {
-      channelReuse[c].push_back(c);
-      LDBG("update channelReuse key " << c << " " << c);
+    auto &channels = item.second;
+    for (auto c : channels) {
+      assert(!visited.count(c));
+      visited.insert(c);
+      if (mapToRepresenting.count(c)) {
+        channelReuse[mapToRepresenting[c]].push_back(c);
+        LDBG("update channelReuse key " << mapToRepresenting[c] << " " << c);
+      } else {
+        channelReuse[c].push_back(c);
+        LDBG("update channelReuse key " << c << " " << c);
+      }
     }
   }
   for (auto &item : channelsGroupedByProducers) {
