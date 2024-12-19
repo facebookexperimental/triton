@@ -434,17 +434,19 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
   }
 }
 
-// ----- verify that we can reuse buffers between two for loops
-// CHECK-LABEL: @_attn_bwd_ws
-// CHECK: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<2x64x128xbf16
-// CHECK: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<2x64x128xbf16
-// CHECK: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<2x64x128xbf16
-// CHECK: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<2x64x128xbf16
+// -----
 
-// CHECK: %[[TASKID:.*]] = triton_nvidia_gpu.get_async_task_id : i32
+// Verify that we can reuse buffers between two for loops
+// CHECK-LABEL: @_attn_bwd_ws
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<2x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<2x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<2x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<2x64x128xbf16
+
+// CHECK: %[[TID:.*]] = triton_nvidia_gpu.get_async_task_id : i32
 // CHECK: %[[ZERO:.*]] = arith.constant 0 : i32
-// CHECK: %[[WG0:.*]] = arith.cmpi eq, %[[TASKID]], %[[ZERO]] : i32
-// CHECK: scf.if %[[WG0]]
+// CHECK: %[[TWG0:.*]] = arith.cmpi eq, %[[TID]], %[[ZERO]] : i32
+// CHECK: scf.if %[[TWG0]]
 // CHECK: triton_nvidia_gpu.reg_dealloc 40
 // CHECK: scf.if
 // CHECK: scf.yield
@@ -470,8 +472,8 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 // CHECK: scf.yield {{.*}} %[[IF_IDX]]
 
 // CHECK: %[[ONE:.*]] = arith.constant 1 : i32
-// CHECK: %[[WG1:.*]] = arith.cmpi eq, %[[TASKID]], %[[ONE]] : i32
-// CHECK: scf.if %[[WG1]]
+// CHECK: %[[TWG1:.*]] = arith.cmpi eq, %[[TID]], %[[ONE]] : i32
+// CHECK: scf.if %[[TWG1]]
 // CHECK: triton_nvidia_gpu.reg_alloc 232
 // CHECK: scf.if
 // CHECK: scf.yield
@@ -497,8 +499,8 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 // CHECK: scf.yield {{.*}} %[[IF_IDX_WG1]]
 
 // CHECK: %[[TWO:.*]] = arith.constant 2 : i32
-// CHECK: %[[WG2:.*]] = arith.cmpi eq, %[[TASKID]], %[[TWO]] : i32
-// CHECK: scf.if %[[WG2]]
+// CHECK: %[[TWG2:.*]] = arith.cmpi eq, %[[TID]], %[[TWO]] : i32
+// CHECK: scf.if %[[TWG2]]
 // CHECK: triton_nvidia_gpu.reg_alloc 232
 // CHECK: scf.if
 // CHECK: scf.yield
