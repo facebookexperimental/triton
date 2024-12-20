@@ -1,5 +1,6 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "passes.h"
@@ -70,6 +71,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUOptimizeAccumulatorInit);
   ADD_PASS_OPTION_WRAPPER_1("add_ws_task_partition",
                             createTritonGPUWSTaskPartition, int);
+  ADD_PASS_WRAPPER_0("add_loop_peeling", createTritonMatmulLoopPeeling);
   ADD_PASS_OPTION_WRAPPER_1("add_ws_data_partition",
                             createTritonGPUWSDataPartition, int);
   ADD_PASS_OPTION_WRAPPER_1("add_ws_lowering", createTritonGPUWSLowering, int);

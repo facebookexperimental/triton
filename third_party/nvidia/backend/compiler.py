@@ -244,6 +244,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
+        passes.ttgpuir.add_loop_peeling(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         if capability // 10 >= 9:

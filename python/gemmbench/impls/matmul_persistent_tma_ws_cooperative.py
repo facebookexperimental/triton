@@ -156,6 +156,7 @@ def matmul_persistent_tma_ws_cooperative_kernel(
         offs_bn = pid_n * BLOCK_SIZE_N
         offs_k = 0
 
+        tl.assume(tl.cdiv(K, BLOCK_SIZE_K)>0)
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             with tl.async_task([0]):

@@ -25,6 +25,7 @@ add_triton_library(TritonGPUTransforms
   WSLowering.cpp
   PingPong.cpp
   WSCanonicalization.cpp
+  MatmulLoopPeeling.cpp
 
   DEPENDS
   TritonGPUTransformsIncGen
