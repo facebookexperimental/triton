@@ -716,6 +716,7 @@ void partitionTasks(triton::FuncOp &funcOp) {
   RewritePatternSet cleanUpPatterns(funcOp.getContext());
   populateForOpDeadArgumentElimination(cleanUpPatterns);
   scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns, funcOp.getContext());
+  scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns, funcOp.getContext());
   if (applyPatternsAndFoldGreedily(funcOp, std::move(cleanUpPatterns))
           .failed()) {
     llvm_unreachable("failed to clean up");
