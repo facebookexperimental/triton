@@ -1330,7 +1330,33 @@ void insertAsyncComm(
     // common post dominator.
     mlir::PostDominanceInfo dom(funcOp);
     std::unordered_set<Operation *> mutuallyNonDominatingUsers;
+    SmallVector<Operation *> users;
     for (auto user : c->getUsers()) {
+      if (isa<TransOp>(user)) {
+        // TransOp is not a real consumer. It caculates the shared memor/
+        // address for the real consumer. Continue to find its transitive users
+        // recursively.
+        DenseSet<Operation *> visited;
+        SmallVector<Operation *> transUsers;
+        transUsers.push_back(user);
+        while (!transUsers.empty()) {
+          auto transUser = transUsers.pop_back_val();
+          visited.insert(transUser);
+          if (isa<TransOp>(transUser)) {
+            for (auto transitiveUser : transUser->getUsers()) {
+              if (!visited.count(transitiveUser))
+                transUsers.push_back(transitiveUser);
+            }
+          } else {
+            users.push_back(transUser);
+          }
+        }
+      } else {
+        users.push_back(user);
+      }
+    }
+
+    for (auto user : users) {
       auto it = mutuallyNonDominatingUsers.begin();
       while (it != mutuallyNonDominatingUsers.end()) {
         if (dom.properlyPostDominates(user, *it)) {
