@@ -251,4 +251,12 @@ def TritonGPUWSLowering : Pass<"tritongpu-warp-spec-lowering", "mlir::ModuleOp">
            "number of consumer warp groups for warp specialization">
   ];
 }
+
+def TritonMatmulLoopPeeling : Pass<"tritongpu-matmul-loop-peeling", "mlir::ModuleOp"> {
+  let summary = "Loop peeling for matmul loop";
+
+  let description = "Peel the first iteration of the matmul loop to avoid the initialization of the accumulator";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
 #endif

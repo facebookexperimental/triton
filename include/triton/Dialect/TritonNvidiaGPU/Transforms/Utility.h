@@ -58,6 +58,13 @@ public:
     return op;
   }
 
+  Operation *cloneWithAsyncTaskIds(Operation &op, IRMapping &mapper) {
+    Operation *newOp = OpBuilder::clone(op, mapper);
+    if (!asyncTaskIds.empty())
+      setAsyncTaskIds(newOp, asyncTaskIds);
+    return newOp;
+  }
+
 private:
   SmallVector<AsyncTaskId> asyncTaskIds;
 };
