@@ -1333,7 +1333,7 @@ void insertAsyncComm(
     SmallVector<Operation *> users;
     for (auto user : c->getUsers()) {
       if (isa<TransOp>(user)) {
-        // TransOp is not a real consumer. It caculates the shared memor/
+        // TransOp is not a real consumer. It caculates the shared memory
         // address for the real consumer. Continue to find its transitive users
         // recursively.
         DenseSet<Operation *> visited;
