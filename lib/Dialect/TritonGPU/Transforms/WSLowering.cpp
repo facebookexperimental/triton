@@ -198,13 +198,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                                           THREADS_PER_TASK);
     }
 
-    if (numCTAs == 1) {
-      builder.create<mlir::gpu::BarrierOp>(loc);
-    } else {
-      // Make sure that MBarriers are initialized in all CTAs.
-      builder.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
-      builder.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
-    }
+    assert(numCTAs == 1 && "remote CTA is not supported yet");
+    builder.create<mlir::gpu::BarrierOp>(loc);
 
     // Helper function for extracting one index from bufferFullArray.
     auto extractBufferFull = [&](Location loc, Value idx) -> Value {
@@ -255,18 +250,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     op->erase();
   }
 
-  // Insert a cluster barrier before the kernel exits. Without this barrier,
-  // mbarrier_remote_arrive will fail if the remote CTA already exits.
-  if (numCTAs > 1) {
-    parentOp->walk([&](triton::FuncOp funcOp) {
-      Block *block = &funcOp.getBody().front();
-      auto returnOp = llvm::cast<triton::ReturnOp>(block->getTerminator());
-      OpBuilder builder(returnOp);
-      auto loc = returnOp.getLoc();
-      builder.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
-      builder.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
-    });
-  }
+  assert(numCTAs == 1 && "remote CTA is not supported yet");
 }
 
 #define GEN_PASS_DEF_TRITONGPUWSLOWERING
