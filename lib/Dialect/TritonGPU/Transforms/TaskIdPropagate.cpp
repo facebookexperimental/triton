@@ -1,3 +1,4 @@
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -169,7 +170,7 @@ struct AsyncTaskIdsCompare {
 
 // Make sure the def chain contains the right taskId.
 bool verifyTaskId(triton::FuncOp &funcOp,
-                  const llvm::DenseSet<Operation *>& anchorOps) {
+                  const llvm::DenseSet<Operation *> &anchorOps) {
   bool retCode = true;
   DenseSet<SmallVector<AsyncTaskId>, AsyncTaskIdsCompare> anchorAsyncTasks;
   for (auto anchorOp : anchorOps) {
@@ -177,7 +178,7 @@ bool verifyTaskId(triton::FuncOp &funcOp,
   }
 
   funcOp.walk([&](Operation *op) {
-    // Skip control ops    
+    // Skip control ops
     if (llvm::isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp>(op))
       return;
 
@@ -315,9 +316,60 @@ void backwardPropagateTaskIds(Operation *op,
   }
 }
 
-void backwardPropagateTaskIds(llvm::DenseSet<Operation *> &anchorOps) {
-  for (Operation *op : anchorOps) {
+void backwardPropagateTaskIds(llvm::DenseSet<Operation *> &rootOps,
+                              llvm::DenseSet<Operation *> &anchorOps) {
+  for (Operation *op : rootOps) {
     backwardPropagateTaskIds(op, anchorOps);
+  }
+}
+
+void forwardPropagateTaskIds(Operation *root,
+                             const llvm::DenseSet<Operation *> &anchors) {
+  auto asyncTasks = getAsyncTaskIds(root);
+  SmallVector<Value> queue;
+  for (Value result : root->getResults())
+    queue.push_back(result);
+
+  DenseSet<Value> seen;
+  for (auto anchor : anchors) {
+    if (anchor != root)
+      for (auto result : anchor->getResults())
+        seen.insert(result);
+  }
+
+  while (!queue.empty()) {
+    auto v = queue.back();
+    queue.pop_back();
+    if (!seen.insert(v).second)
+      continue;
+
+    for (Operation *depOp : v.getUsers()) {
+      auto depAsyncTasks = getAsyncTaskIds(depOp);
+      // Skip depOp that already has task ids. Those could be either anchorOps
+      // or propagated backward from anchor ops.
+      if (!depAsyncTasks.empty() && depAsyncTasks != asyncTasks)
+        continue;
+      setAsyncTaskIds(depOp, asyncTasks);
+      // Go through yieldOp to propagate task ids to the result of parentOp.
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(depOp)) {
+        auto parentOp = yieldOp->getParentOp();
+        for (OpOperand &operand : yieldOp->getOpOperands()) {
+          if (operand.get() == v) {
+            queue.push_back(parentOp->getResult(operand.getOperandNumber()));
+            break;
+          }
+        }
+      } else {
+        for (Value result : depOp->getResults())
+          queue.push_back(result);
+      }
+    }
+  }
+}
+
+void forwardPropagateTaskIds(llvm::DenseSet<Operation *> &anchorOps) {
+  for (Operation *op : anchorOps) {
+    forwardPropagateTaskIds(op, anchorOps);
   }
 }
 
@@ -349,8 +401,11 @@ public:
     llvm::DenseSet<Operation *> anchorOps;
     funcOp.walk([&](mlir::Operation *op) {
       auto asyncTasks = getAsyncTaskIds(op);
-      if (!asyncTasks.empty() &&
-          !isa<arith::ConstantOp, arith::ConstantIntOp>(op))
+      if (asyncTasks.empty())
+        return;
+      std::sort(asyncTasks.begin(), asyncTasks.end());
+      setAsyncTaskIds(op, asyncTasks);
+      if (!isa<arith::ConstantOp, arith::ConstantIntOp>(op))
         anchorOps.insert(op);
     });
 
@@ -361,10 +416,30 @@ public:
       funcOp->dump();
     });
 
-    backwardPropagateTaskIds(anchorOps);
+    backwardPropagateTaskIds(anchorOps, anchorOps);
 
     LLVM_DEBUG({
       LDBG("after backwardPropagateTaskIds ");
+      funcOp->dump();
+    });
+
+    forwardPropagateTaskIds(anchorOps);
+
+    LLVM_DEBUG({
+      LDBG("after forwardPropagateTaskIds ");
+      funcOp->dump();
+    });
+
+    llvm::DenseSet<Operation *> rootOps;
+    funcOp.walk([&](mlir::Operation *op) {
+      auto asyncTasks = getAsyncTaskIds(op);
+      if (!asyncTasks.empty() &&
+          !isa<arith::ConstantOp, arith::ConstantIntOp>(op))
+        rootOps.insert(op);
+    });
+    backwardPropagateTaskIds(rootOps, anchorOps);
+    LLVM_DEBUG({
+      LDBG("after final backwardPropagateTaskIds ");
       funcOp->dump();
     });
 
