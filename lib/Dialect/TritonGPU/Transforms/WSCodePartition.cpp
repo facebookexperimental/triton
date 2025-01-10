@@ -184,8 +184,12 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
 
   ifBuilder.setInsertionPointToEnd(newIfOp.thenBlock());
   SmallVector<Operation *> opList;
-  for (Operation &op : newIfOp.thenBlock()->getOperations())
-    opList.push_back(&op);
+  for (Operation &op : newIfOp.thenBlock()->getOperations()) {
+    if (auto tOp = dyn_cast<scf::ForOp>(&op))
+      opList.push_back(&op);
+    if (auto tOp = dyn_cast<scf::IfOp>(&op))
+      opList.push_back(&op);
+  }
 
   // Update yields
   auto loc = ifOp.getLoc();
@@ -210,8 +214,12 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
     ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
     newIfOp.getElseRegion().takeBody(ifOp.getElseRegion());
     opList.clear();
-    for (Operation &op : newIfOp.elseBlock()->getOperations())
-      opList.push_back(&op);
+    for (Operation &op : newIfOp.elseBlock()->getOperations()) {
+      if (auto tOp = dyn_cast<scf::ForOp>(&op))
+        opList.push_back(&op);
+      if (auto tOp = dyn_cast<scf::IfOp>(&op))
+        opList.push_back(&op);
+    }
     // elseBlock starts with tmpAccumLoopCount
     endAccum =
         updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
@@ -226,16 +234,12 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
   SmallVector<Value> elseYieldOperands = newIfOp.elseYield().getOperands();
   elseYieldOperands.push_back(endAccum);
   updateYield(newIfOp.elseYield(), elseYieldOperands);
-#if 1
   int resultIdx = 0;
   // Replace old if with the new one.
   for (auto result : ifOp.getResults()) {
     result.replaceAllUsesWith(newIfOp->getResult(resultIdx++));
   }
-#else
-  for (unsigned i = 0; i < ifOp.getNumResults(); ++i)
-    mapping.map(ifOp.getResult(i), newIfOp.getResult(i));
-#endif
+  ifOp.erase();
   return newIfOp;
 }
 
@@ -1228,8 +1232,8 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
             newForOp.getLoc(), prevAccum, numSteps);
       }
       // If the loop is the outer loop for a reuse loop, we are done.
-    }
-    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      // At this point, op is no longer valid.
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
       if (needAccumulatedLoopCnt(ifOp, loopWithBufferReuse)) {
         auto newIfOp =
             rewriteIfOp(ifOp, numBuffers, taskTopOps, commonOuterLoop,
@@ -1307,8 +1311,12 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
 
   // Handle ops in loop body, only IfOps and ForOps.
   SmallVector<Operation *> opList;
-  for (Operation &op : newForOp.getBody()->without_terminator())
-    opList.push_back(&op);
+  for (Operation &op : newForOp.getBody()->without_terminator()) {
+    if (auto tOp = dyn_cast<scf::ForOp>(&op))
+      opList.push_back(&op);
+    if (auto tOp = dyn_cast<scf::IfOp>(&op))
+      opList.push_back(&op);
+  }
   Value endAccum = updateAccumLoopCount(
       opList, numBuffers, taskTopOps, commonOuterLoop, loopWithBufferReuse,
       isOuterOfReuse ? getAccumLoopCountArg(newForOp) : prevAccum);
