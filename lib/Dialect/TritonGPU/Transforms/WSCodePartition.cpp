@@ -142,12 +142,12 @@ needAccumulatedLoopCnt(scf::IfOp ifOp,
   return needAccum;
 }
 
-Value updateAccumLoopCountNew(SmallVector<Operation *> &opList,
-                              unsigned numBuffers,
-                              SmallVector<Operation *> &taskTopOps,
-                              Operation *commonOuterLoop,
-                              SmallVector<Operation *> &loopWithBufferReuse,
-                              Value prevAccum);
+Value updateAccumLoopCount(SmallVector<Operation *> &opList,
+                           unsigned numBuffers,
+                           SmallVector<Operation *> &taskTopOps,
+                           Operation *commonOuterLoop,
+                           SmallVector<Operation *> &loopWithBufferReuse,
+                           Value prevAccum);
 
 scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
                                 SmallVector<Operation *> &taskTopOps,
@@ -196,19 +196,9 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
   };
 
   // Add one more operand to then Yield.
-#if 0
-  if (newIfOp->getParentOfType<scf::ForOp>()) {
-    assert(!tmpAccumLoopCount);
-    tmpAccumLoopCount =
-        getAccumLoopCountArg(newIfOp->getParentOfType<scf::ForOp>());
-  } else {
-    assert(tmpAccumLoopCount);
-    // tmpAccumLoopCount = mapping.lookupOrDefault(tmpAccumLoopCount);
-  }
-#endif
-  Value endAccum = updateAccumLoopCountNew(opList, numBuffers, taskTopOps,
-                                           commonOuterLoop, loopWithBufferReuse,
-                                           prevAccum); // tmpAccumLoopCount);
+  Value endAccum = updateAccumLoopCount(opList, numBuffers, taskTopOps,
+                                        commonOuterLoop, loopWithBufferReuse,
+                                        prevAccum); // tmpAccumLoopCount);
 
   SmallVector<Value> ifYieldOperands = newIfOp.thenYield().getOperands();
   // Value accum = getAccumLoopCount(newIfOp, tmpAccumLoopCount);
@@ -224,8 +214,8 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
       opList.push_back(&op);
     // elseBlock starts with tmpAccumLoopCount
     endAccum =
-        updateAccumLoopCountNew(opList, numBuffers, taskTopOps, commonOuterLoop,
-                                loopWithBufferReuse, prevAccum);
+        updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
+                             loopWithBufferReuse, prevAccum);
   } else {
     // Create an empty yield
     auto yieldOp =
@@ -464,10 +454,6 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
-#if 0
-    if (tmpAccumLoopCount)
-      mapForAccumLoopVar[asyncTaskId] = mapping.lookup(tmpAccumLoopCount);
-#endif
   }
 
   // Decide if this taskId is a producer or a consumer, and create either
@@ -873,11 +859,6 @@ Value getNumSteps(scf::ForOp forOp, OpBuilderWithAsyncTaskIds &builder) {
         loc, builder.getI64Type(), forOp.getStep());
   numSteps = builder.createWithAsyncTaskIds<arith::DivUIOp>(loc, numSteps,
                                                             innerForStep);
-#if 0
-    // Assume tmpAccumLoopCount is 64 bit.
-    Value accumulatedLoopCount = builder.createWithAsyncTaskIds<arith::AddIOp>(
-        loc, tmpAccumLoopCount, numSteps);
-#endif
   return numSteps;
 }
 
@@ -910,10 +891,6 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
   if (isOuterOfReuse) {
     tmpAccumLoopCount = body->insertArgument(body->getNumArguments(),
                                              builder.getI64Type(), loc);
-#if 0
-    populateLoopSteps(loopWithBufferReuse, accumLoopCountsAfterLoop,
-                      tmpAccumLoopCount);
-#endif
   }
   Value phase =
       body->insertArgument(body->getNumArguments(), builder.getI1Type(), loc);
@@ -982,26 +959,6 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
       // Here we promote to 64 bit.
       // numSteps = ((upperBound - lowerBound) + forOpStep - 1) / forOpStep
       Value numSteps = getNumSteps(forOp, builder);
-#if 0
-      Value numSteps = builder.createWithAsyncTaskIds<arith::SubIOp>(
-          loc, forOp.getUpperBound(), forOp.getLowerBound());
-      numSteps = builder.createWithAsyncTaskIds<arith::AddIOp>(loc, numSteps,
-                                                               forOp.getStep());
-      if (forOp.getStep().getType() != builder.getI64Type())
-        numSteps = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-            loc, builder.getI64Type(), numSteps);
-
-      Value one =
-          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-      numSteps =
-          builder.createWithAsyncTaskIds<arith::SubIOp>(loc, numSteps, one);
-      Value innerForStep = forOp.getStep();
-      if (forOp.getStep().getType() != builder.getI64Type())
-        innerForStep = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-            loc, builder.getI64Type(), forOp.getStep());
-      numSteps = builder.createWithAsyncTaskIds<arith::DivUIOp>(loc, numSteps,
-                                                                innerForStep);
-#endif
 
       // TODO: use a global flattened iteration space index for multi-dim loops.
       // initBufferIdx = (parentInductionVar - parentLowBound) / parentStep *
@@ -1241,12 +1198,12 @@ bool reuseBuffers(SmallVector<Operation *> &taskTopOps,
 
 // Go through a list of operations under one scope.
 // prevAccum can be null if there is an outer loop for the reuse loops.
-Value updateAccumLoopCountNew(SmallVector<Operation *> &opList,
-                              unsigned numBuffers,
-                              SmallVector<Operation *> &taskTopOps,
-                              Operation *commonOuterLoop,
-                              SmallVector<Operation *> &loopWithBufferReuse,
-                              Value prevAccum) {
+Value updateAccumLoopCount(SmallVector<Operation *> &opList,
+                           unsigned numBuffers,
+                           SmallVector<Operation *> &taskTopOps,
+                           Operation *commonOuterLoop,
+                           SmallVector<Operation *> &loopWithBufferReuse,
+                           Value prevAccum) {
   for (Operation *op : opList) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       auto newForOp =
@@ -1324,14 +1281,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   // this loop has an outer loop, an extra arg for accumLoopCount should have
   // been added to the outer loop.
   Value accumulatedLoopCount = prevAccum; // Value();
-#if 0
-  if (hasReuse) {
-    accumulatedLoopCount =
-        commonOuterLoop
-            ? getAccumLoopCountArg(origForOp->getParentOfType<scf::ForOp>())
-            : prevAccum; // tmpAccumLoopCount;
-  }
-#endif
   newForOp = createNewLoop(origForOp, loopNumBuffers, parentForOp,
                            accumulatedLoopCount, loopWithBufferReuse, hasReuse,
                            isOuterOfReuse);
@@ -1360,7 +1309,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   SmallVector<Operation *> opList;
   for (Operation &op : newForOp.getBody()->without_terminator())
     opList.push_back(&op);
-  Value endAccum = updateAccumLoopCountNew(
+  Value endAccum = updateAccumLoopCount(
       opList, numBuffers, taskTopOps, commonOuterLoop, loopWithBufferReuse,
       isOuterOfReuse ? getAccumLoopCountArg(newForOp) : prevAccum);
 
@@ -1423,8 +1372,8 @@ Value appendBufferIdxArgs(
     if (auto origForOp = dyn_cast<scf::ForOp>(op))
       opList.push_back(op);
   }
-  updateAccumLoopCountNew(opList, numBuffers, taskTopOps, commonOuterLoop,
-                          loopWithBufferReuse, tmpAccumLoopCount);
+  updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
+                       loopWithBufferReuse, tmpAccumLoopCount);
 
   return tmpAccumLoopCount;
 }
