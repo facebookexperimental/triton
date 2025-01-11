@@ -249,9 +249,35 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
     ifOp.dump();
   });
 
+  // It is possible that we need to reduce the results. One example
+  // is that the defining op for the yield operation is not for this
+  // taskId and the defining op is not specialized, thus we should
+  // remove the result.
+  // We need to update the result types correctly here.
+  unsigned resultIdx = 0;
+  DenseSet<unsigned> ignoredResults;
+  if (!ifOp->getResultTypes().empty()) {
+    for (Value yieldV : ifOp.thenYield().getOperands()) {
+      // Check the defining op for the corresponding result.
+      if (Operation *def = yieldV.getDefiningOp()) {
+        bool hasTaskId = hasAsyncTaskId(def, asyncTaskId);
+        if (!hasTaskId)
+          ignoredResults.insert(resultIdx);
+      }
+      ++resultIdx;
+    }
+  }
+
+  SmallVector<Type> newResultTypes;
+  resultIdx = 0;
+  for (auto ty : ifOp->getResultTypes()) {
+    if (!ignoredResults.count(resultIdx))
+      newResultTypes.push_back(ty);
+    ++resultIdx;
+  }
   auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
-      ifOp.getLoc(), ifOp->getResultTypes(),
-      mapping.lookup(ifOp.getCondition()), true, ifOp.elseBlock());
+      ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
+      ifOp.elseBlock());
 
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
   ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
@@ -262,16 +288,45 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
     SpecializeOp(&thenOp, mapping, ifBuilder, asyncTaskId);
   }
 
+  // Update yields
+  auto loc = ifOp.getLoc();
+  auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
+    ifBuilder.setInsertionPoint(yield);
+    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(loc, operands);
+    yield.erase();
+  };
+  SmallVector<Value> ifYieldOperands;
+  resultIdx = 0;
+  for (Value yieldV : newIfOp.thenYield().getOperands()) {
+    if (!ignoredResults.count(resultIdx))
+      ifYieldOperands.push_back(yieldV);
+    ++resultIdx;
+  }
+  updateYield(newIfOp.thenYield(), ifYieldOperands);
+
   // Handle elseRegion of the IfOp.
   if (ifOp.elseBlock()) {
     ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
     for (Operation &elseOp : ifOp.elseBlock()->getOperations()) {
       SpecializeOp(&elseOp, mapping, ifBuilder, asyncTaskId);
     }
+    SmallVector<Value> elseYieldOperands;
+    resultIdx = 0;
+    for (Value yieldV : newIfOp.elseYield().getOperands()) {
+      if (!ignoredResults.count(resultIdx))
+        elseYieldOperands.push_back(yieldV);
+      ++resultIdx;
+    }
+    updateYield(newIfOp.elseYield(), elseYieldOperands);
   }
 
-  for (unsigned i = 0; i < ifOp.getNumResults(); ++i)
-    mapping.map(ifOp.getResult(i), newIfOp.getResult(i));
+  unsigned newResIdx = 0;
+  for (unsigned i = 0; i < ifOp.getNumResults(); ++i) {
+    if (!ignoredResults.count(i)) {
+      mapping.map(ifOp.getResult(i), newIfOp.getResult(newResIdx));
+      ++newResIdx;
+    }
+  }
   return newIfOp;
 }
 
