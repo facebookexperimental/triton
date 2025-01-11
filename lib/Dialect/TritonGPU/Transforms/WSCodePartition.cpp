@@ -200,12 +200,11 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
   };
 
   // Add one more operand to then Yield.
-  Value endAccum = updateAccumLoopCount(opList, numBuffers, taskTopOps,
-                                        commonOuterLoop, loopWithBufferReuse,
-                                        prevAccum); // tmpAccumLoopCount);
+  Value endAccum =
+      updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
+                           loopWithBufferReuse, prevAccum);
 
   SmallVector<Value> ifYieldOperands = newIfOp.thenYield().getOperands();
-  // Value accum = getAccumLoopCount(newIfOp, tmpAccumLoopCount);
   ifYieldOperands.push_back(endAccum);
   updateYield(newIfOp.thenYield(), ifYieldOperands);
 
@@ -220,7 +219,6 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
       if (auto tOp = dyn_cast<scf::IfOp>(&op))
         opList.push_back(&op);
     }
-    // elseBlock starts with tmpAccumLoopCount
     endAccum =
         updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
                              loopWithBufferReuse, prevAccum);
@@ -938,7 +936,7 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
   if (isOuterOfReuse) {
     // We have not iterated through the body yet, so do not have the right value
     // for nextTmpIdx. This will be fixed in the caller.
-    Value nextTmpIdx = tmpAccumLoopCount; // accumLoopCountsAfterLoop.back();
+    Value nextTmpIdx = tmpAccumLoopCount;
     yieldOp->insertOperands(yieldOp.getNumOperands(),
                             {nextTmpIdx, nextPhase, nextBufferIdx});
   } else
@@ -1330,13 +1328,18 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   return newForOp;
 }
 
-// For ForOps in taskTopOps, create new ForOp for each by adding phase,
-// bufferIdx to the arguments.
 // This function takes a list of channels, a mapping from a channel
 // to its representing channel if the key shares smem space with the
 // representing channel, and a list of loops that are sharing smem spaces. Note
 // that every loop in loopWithBufferReuse either has the same outer loop or has
 // no outer loop.
+// For ForOps in taskTopOps, create new ForOp for each by adding phase,
+// bufferIdx to the arguments. In the case of sharing smem, we need to traverse
+// and update IfOps when necessary. We call updateAccumLoopCount on the list
+// of top level Ops that are ForOps or IfOps enclosing a loop with buffer reuse.
+// updateAccumLoopCount calls createNewLoopWrapper on ForOps, and rewriteIfOp on
+// IfOps. Both will call updateAccumLoopCount on the list of Ops in the ForOp
+// body or the thenBlock, elseBlock for IfOp.
 Value appendBufferIdxArgs(
     SmallVector<Operation *> &taskTopOps, unsigned numBuffers,
     const SmallVector<Channel *> &channels,
@@ -1366,8 +1369,6 @@ Value appendBufferIdxArgs(
     builder.setInsertionPoint(taskTopOps[0]);
     tmpAccumLoopCount = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         oneFor->getLoc(), 0, 64);
-    // populateLoopSteps(loopWithBufferReuse, accumLoopCountsAfterLoop,
-    //                   tmpAccumLoopCount);
   }
 
   SmallVector<Operation *> opList;
@@ -2134,11 +2135,9 @@ public:
     SmallVector<Operation *> loopWithBufferReuse;
     reuseBuffers(asyncTaskTopOps, channels, mapToRepresenting,
                  loopWithBufferReuse);
-    unsigned loopsWithAccumLoopCount = loopWithBufferReuse.size();
     // Use and update loopWithBufferReuse.
-    Value tmpAccumLoopCount =
-        appendBufferIdxArgs(asyncTaskTopOps, numBuffers, channels,
-                            mapToRepresenting, loopWithBufferReuse);
+    appendBufferIdxArgs(asyncTaskTopOps, numBuffers, channels,
+                        mapToRepresenting, loopWithBufferReuse);
     LLVM_DEBUG({
       LDBG("\n\nafter appendBufferIdxArgs");
       funcOp.dump();
@@ -2186,7 +2185,6 @@ public:
     });
 
     // Assuming there are no changes to loops in loopWithBufferReuse.
-    DenseMap<AsyncTaskId, Value> mapForAccumLoopVar;
     auto ret = SpecializeRegion(funcOp, regDecProducer, regIncConsumer);
     LLVM_DEBUG({
       LDBG("\n\nwith SpecializeRegion");
