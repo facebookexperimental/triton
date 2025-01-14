@@ -291,6 +291,7 @@ def matmul_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    tl.assume(tl.cdiv(K, BLOCK_SIZE_K)>0)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
