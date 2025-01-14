@@ -158,11 +158,11 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
 // For certain cases, we need to add an additional output for
 // IfOp to track the accumulatedLoopCount, we may need to add
 // a corresponding elseBlock with yieldOp.
-scf::IfOp rewriteIfOp(scf::IfOp ifOp, // IRMapping &mapping,
-                      unsigned numBuffers, SmallVector<Operation *> &taskTopOps,
+scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
+                      SmallVector<Operation *> &taskTopOps,
                       Operation *commonOuterLoop,
                       SmallVector<Operation *> &loopWithBufferReuse,
-                      /*Value tmpAccumLoopCount, */ Value prevAccum) {
+                      Value prevAccum) {
   LLVM_DEBUG({
     LDBG("rewrite ifOp for smem sharing ");
     ifOp.dump();
