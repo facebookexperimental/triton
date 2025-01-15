@@ -5,9 +5,9 @@
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 
 #include <memory>
 
@@ -96,10 +96,12 @@ public:
     auto alloc = rewriter.create<LocalAllocOp>(loc, memDescType, op.getSrc());
     auto attrs = op->getAttrs();
     alloc->setAttrs(attrs);
-    auto fence = rewriter.create<triton::nvidia_gpu::FenceAsyncSharedOp>(loc, false);
+    auto fence =
+        rewriter.create<triton::nvidia_gpu::FenceAsyncSharedOp>(loc, false);
     fence->setAttrs(attrs);
-    auto asyncCopy = rewriter.create<triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(
-        loc, op.getDescPtr(), op.getIndices(), alloc);
+    auto asyncCopy =
+        rewriter.create<triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(
+            loc, op.getDescPtr(), op.getIndices(), alloc);
     asyncCopy->setAttrs(attrs);
     auto tma_wait = rewriter.create<triton::nvidia_gpu::TMAStoreWait>(loc, 0);
     tma_wait->setAttrs(attrs);

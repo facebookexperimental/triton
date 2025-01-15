@@ -1,8 +1,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 
 using namespace mlir;
 namespace tt = mlir::triton;
@@ -46,8 +45,8 @@ static Value createAlloc(scf::ForOp &forOp,
   Type memdescType =
       tt::MemDescType::get(ty.getShape(), ty.getElementType(), encoding,
                            sharedMemorySpace, /*mutableMemory*/ true);
-  Value alloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(storeOp->getLoc(),
-                                                  memdescType, Value());
+  Value alloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
+      storeOp->getLoc(), memdescType, Value());
   return alloc;
 }
 
@@ -63,7 +62,8 @@ static void createTMAAsyncCopy(scf::ForOp &forOp,
   // Put wait before the local_store make the store truly async. We know
   // that we are the only user of the CopyLocalToGlobal.
   builder.createWithAsyncTaskIds<ttng::TMAStoreWait>(loc, 0);
-  builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(loc, storeOp.getSrc(), alloc);
+  builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(loc, storeOp.getSrc(),
+                                                    alloc);
   builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(loc, false);
   builder.createWithAsyncTaskIds<ttng::AsyncTMACopyLocalToGlobalOp>(
       loc, storeOp.getDescPtr(), storeOp.getIndices(), alloc);

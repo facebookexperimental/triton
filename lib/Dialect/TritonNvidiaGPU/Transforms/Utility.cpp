@@ -1,5 +1,5 @@
 
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -35,12 +35,14 @@ bool hasAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
 }
 
 void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
-  SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(), asyncTaskIds.end());
+  SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
+                                              asyncTaskIds.end());
   sort(sortedAsyncTaskIds);
   auto i32Ty = IntegerType::get(op->getContext(), 32);
   auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
   auto vecTy = VectorType::get(size, i32Ty);
-  op->setAttr("async_task_id", DenseIntElementsAttr::get(vecTy, sortedAsyncTaskIds));
+  op->setAttr("async_task_id",
+              DenseIntElementsAttr::get(vecTy, sortedAsyncTaskIds));
 }
 
 SmallVector<AsyncTaskId> getNestedAsyncTaskIds(Operation *op) {
@@ -69,7 +71,8 @@ void addAsyncTaskIds(Operation *op, ArrayRef<int> asyncTasks) {
 
 void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
   auto origAsyncTaskIds = getAsyncTaskIds(op);
-  auto end = std::remove(origAsyncTaskIds.begin(), origAsyncTaskIds.end(), asyncTaskId);
+  auto end = std::remove(origAsyncTaskIds.begin(), origAsyncTaskIds.end(),
+                         asyncTaskId);
   origAsyncTaskIds.erase(end, origAsyncTaskIds.end());
   if (origAsyncTaskIds.empty())
     op->removeAttr("async_task_id");
@@ -77,12 +80,9 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
     setAsyncTaskIds(op, origAsyncTaskIds);
 }
 
-void removeAsyncTaskIds(Operation *op) {
-  op->removeAttr("async_task_id");
-}
+void removeAsyncTaskIds(Operation *op) { op->removeAttr("async_task_id"); }
 //===----------------------------------------------------------------------===//
 // Implementations for general auto WS
 //===----------------------------------------------------------------------===//
-
 
 } // namespace mlir
