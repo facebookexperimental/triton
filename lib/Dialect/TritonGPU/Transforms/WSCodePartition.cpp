@@ -143,20 +143,28 @@ static bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
   return !enclosing(ifOp, pOp.getOperation());
 }
 
-// Return true if the IfOp contains a ForOp that is in loopWithBufferReuse.
+// Return true if the IfOp contains a ForOp that is in opsWithBufferReuse.
+// We want to support reuse between channels in a loop and channels in a IfOp.
 static bool
 needAccumulatedLoopCnt(scf::IfOp ifOp,
-                       SmallVector<Operation *> &loopWithBufferReuse) {
+                       SmallVector<Operation *> &opsWithBufferReuse) {
   bool needAccum = false;
   ifOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
-    if (auto forOp = dyn_cast<scf::ForOp>(subOp))
-      for (auto tLoop : loopWithBufferReuse)
+    for (auto tOp : opsWithBufferReuse) {
+      if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
         // For the case of ifOp contains forOp, which contains subOp, no need to
         // generate accumLoopCount for ifOp.
-        if (forOp.getOperation() == tLoop && immediateEnclosing(ifOp, tLoop)) {
+        if (subOp == tOp && immediateEnclosing(ifOp, tOp)) {
           needAccum = true;
           break;
         }
+      } else {
+        if (subOp == tOp) {
+          needAccum = true;
+          break;
+        }
+      }
+    }
   });
   return needAccum;
 }
@@ -165,13 +173,13 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
                            unsigned numBuffers,
                            SmallVector<Operation *> &taskTopOps,
                            Operation *commonOuterLoop,
-                           SmallVector<Operation *> &loopWithBufferReuse,
+                           SmallVector<Operation *> &opsWithBufferReuse,
                            Value prevAccum);
 
 scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
                                 SmallVector<Operation *> &taskTopOps,
                                 Operation *commonOuterLoop,
-                                SmallVector<Operation *> &loopWithBufferReuse,
+                                SmallVector<Operation *> &opsWithBufferReuse,
                                 Value prevAccum);
 
 // For certain cases, we need to add an additional output for
@@ -180,7 +188,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
 scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
                       SmallVector<Operation *> &taskTopOps,
                       Operation *commonOuterLoop,
-                      SmallVector<Operation *> &loopWithBufferReuse,
+                      SmallVector<Operation *> &opsWithBufferReuse,
                       Value prevAccum) {
   LLVM_DEBUG({
     LDBG("rewrite ifOp for smem sharing ");
@@ -221,7 +229,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
   // Add one more operand to then Yield.
   Value endAccum =
       updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
-                           loopWithBufferReuse, prevAccum);
+                           opsWithBufferReuse, prevAccum);
 
   SmallVector<Value> ifYieldOperands = newIfOp.thenYield().getOperands();
   ifYieldOperands.push_back(endAccum);
@@ -240,7 +248,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
     }
     endAccum =
         updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
-                             loopWithBufferReuse, prevAccum);
+                             opsWithBufferReuse, prevAccum);
   } else {
     // Create an empty yield
     auto yieldOp =
@@ -256,6 +264,14 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
   for (auto result : ifOp.getResults()) {
     result.replaceAllUsesWith(newIfOp->getResult(resultIdx++));
   }
+
+  // If ifOp is in opsWithBufferReuse, replace.
+  auto tmpIter = std::find(opsWithBufferReuse.begin(), opsWithBufferReuse.end(),
+                           ifOp.getOperation());
+  if (tmpIter != opsWithBufferReuse.end()) {
+    *tmpIter = newIfOp.getOperation();
+  }
+
   ifOp.erase();
   return newIfOp;
 }
@@ -892,6 +908,17 @@ void reorderProducerOps(SmallVector<Channel *> &channels) {
   });
 }
 
+unsigned getLoopDepth(Operation *op) {
+  unsigned depth = 0;
+  auto pOp = op->getParentOfType<scf::ForOp>();
+  while (pOp) {
+    ++depth;
+    pOp = pOp->getParentOfType<scf::ForOp>();
+  }
+  return depth;
+}
+
+#if 0
 bool isInnermostLoop(scf::ForOp forOp) {
   bool isInner = true;
   forOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
@@ -901,6 +928,7 @@ bool isInnermostLoop(scf::ForOp forOp) {
   });
   return isInner;
 }
+#endif
 
 // Generate code
 //   numSteps = ((upperBound - lowerBound) + forOpStep - 1) / forOpStep
@@ -932,7 +960,6 @@ Value getNumSteps(scf::ForOp forOp, OpBuilderWithAsyncTaskIds &builder) {
 // When isOuterOfReuse is true, we add an additional arg for accumLoopCount.
 scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
                          scf::ForOp &parentForOp, Value accumulatedLoopCount,
-                         SmallVector<Operation *> &loopWithBufferReuse,
                          bool hasParallelReuse, bool isOuterOfReuse) {
   auto loc = forOp.getLoc();
   Block *body = forOp.getBody();
@@ -1160,97 +1187,140 @@ getTaskTopRegion(triton::FuncOp funcOp,
   return asyncTaskOps;
 }
 
-static unsigned getNumChannelsInLoop(scf::ForOp forOp,
-                                     const SmallVector<Channel *> &channels,
-                                     SmallVector<Channel *> &channelsInLoop) {
+static unsigned getNumChannelsInOp(Operation *op,
+                                   const SmallVector<Channel *> &channels,
+                                   SmallVector<Channel *> &channelsInOp) {
   unsigned num = 0;
   for (auto *ch : channels) {
-    scf::ForOp srcParent = ch->getSrcOp()->getParentOfType<scf::ForOp>();
-    scf::ForOp dstParent = ch->getSrcOp()->getParentOfType<scf::ForOp>();
-    if (srcParent == forOp && dstParent == forOp) {
-      channelsInLoop.push_back(ch);
-    }
+    // Get the immediate parent.
+    auto srcParent = ch->getSrcOp()->getParentOp();
+    auto dstParent = ch->getDstOp()->getParentOp();
+    if (srcParent == op && dstParent == op)
+      channelsInOp.push_back(ch);
   }
-  return channelsInLoop.size();
+  return channelsInOp.size();
 }
 
-bool reuseBuffers(SmallVector<Operation *> &taskTopOps,
+void reuseBuffers(SmallVector<Operation *> &taskTopOps,
                   const SmallVector<Channel *> &channels,
                   DenseMap<Channel *, Channel *> &mapToRepresenting,
-                  SmallVector<Operation *> &loopWithBufferReuse) {
+                  SmallVector<Operation *> &opsWithBufferReuse) {
   // For the case of multiple parallel ForOps with same number of channels,
-  // we can try reusing the buffers across the parallel ForOps.
-  // One case is
-  //   ForOp
-  //   ForOp
-  // The other case is
+  // we can try reusing the buffers across the parallel ForOps or across ForOps
+  // and IfOps. Case 1:
+  //   ForOp_A
+  //   ForOp_B
+  // --> opsWithBufferReuse: ForOp_A ForOp_B
+  // Case 2:
   //   ForOp (persistent)
-  //     ForOp
-  //     ForOp
-  // For the case of
+  //     ForOp_A
+  //     ForOp_B
+  // --> opsWithBufferReuse: ForOp_A ForOp_B
+  // Case 3:
   //   ForOp (persistent)
-  //     ForOp
-  // We update loopWithBufferReuse with the inner loop and use accumLoopCount
-  // via the outer loop to update bufferIdx. This is needed when the loop count
-  // for the inner loop varies with each outer loop iteration.
-  // Assume we handle outer ForOp first, then inner ForOp in program order.
-  SmallVector<scf::ForOp> orderedForOps;
-  SmallVector<Operation *> innerForOps;
+  //     ForOp_A
+  // --> --> opsWithBufferReuse: ForOp_A
+  // Case 4:
+  //   ForOp
+  //   IfOp
+  // --> opsWithBufferReuse: ForOp IfOp
+  // We use accumLoopCount to update bufferIdx for the sharing groups. If there
+  // is an outer loop, we will need to add an argument to it. Assume we handle
+  // outer ForOp first, then inner ForOp in program order.
+  unsigned maxDepth = 0;
+  DenseMap<unsigned, SmallVector<Operation *>> loopDepthMap;
   for (auto &op : taskTopOps) {
     op->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
-      if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
-        if (isInnermostLoop(forOp))
-          innerForOps.push_back(forOp.getOperation());
-        orderedForOps.push_back(forOp);
+      if (dyn_cast<scf::ForOp>(subOp) || dyn_cast<scf::IfOp>(subOp)) {
+        unsigned tDepth = getLoopDepth(subOp);
+        loopDepthMap[tDepth].push_back(subOp);
+        if (tDepth > maxDepth)
+          maxDepth = tDepth;
       }
     });
   }
-  LDBG("reuseBuffers number of inner loops: " << innerForOps.size());
-  if (innerForOps.empty())
-    return false;
-  if (innerForOps.size() == 1) {
-    // Persistent with a single inner loop.
-    scf::ForOp parentForOp = innerForOps[0]->getParentOfType<scf::ForOp>();
-    if (parentForOp) {
-      loopWithBufferReuse = innerForOps;
-      LDBG("-- loopWithBufferReuse with size 1");
-    }
-    return false;
+  // A list of IfOps/ForOps at the innermost level: loopDepthMap[maxDepth]
+  auto &opsAtMaxDepth = loopDepthMap[maxDepth];
+  LDBG("reuseBuffers number of inner ops: " << opsAtMaxDepth.size());
+  if (opsAtMaxDepth.empty())
+    return;
+  if (opsAtMaxDepth.size() == 1 && dyn_cast<scf::ForOp>(opsAtMaxDepth[0]) &&
+      maxDepth > 0) {
+    // Persistent with a single inner loop. There is no sharing group, but
+    // we can use the logic to generate accumLoopCount for persistent case.
+    opsWithBufferReuse = opsAtMaxDepth;
+    LDBG("-- opsWithBufferReuse with size 1");
+    return;
   }
-  // Check to see if the innermost loops are under one parent. And there are no
-  // other loops. Make sure the inner loops have same number of channels.
-  bool firstLoop = true;
+  // Find ops that contain immediate channels. And the ops do not overlap
+  // live range. For example
+  // If
+  //   For
+  // --> If and For can overlap. But
+  // For
+  // If
+  // --> can't overlap
+  SmallVector<Operation *> innerOps;
+  SmallVector<Operation *> innerLoops;
+  for (auto *innerOp : opsAtMaxDepth) {
+    SmallVector<Channel *> channelsInOp;
+    getNumChannelsInOp(innerOp, channels, channelsInOp);
+    if (channelsInOp.empty())
+      continue;
+    innerOps.push_back(innerOp);
+    if (dyn_cast<scf::ForOp>(innerOp))
+      innerLoops.push_back(innerOp);
+  }
+  // Make sure opsWithBufferReuse are under the same ForOp or at the top level.
+  // Make sure opsWithBufferReuse contain the same number of channels, and the
+  // same numBuffers for the channels. Channels in the first op will be the
+  // representing channels. All sharing groups will span the same set of regions
+  // in opsWithBufferReuse.
+  bool firstOp = true;
   Operation *outerLoop = nullptr;
   unsigned numChannels = 0, numBuffers = 0;
-  SmallVector<Channel *> channelsInLoopOne;
-  for (auto &innerLoop : innerForOps) {
-    scf::ForOp parentForOp = innerLoop->getParentOfType<scf::ForOp>();
-    SmallVector<Channel *> channelsInLoop;
-    getNumChannelsInLoop(cast<scf::ForOp>(innerLoop), channels, channelsInLoop);
-    if (firstLoop) {
-      outerLoop = parentForOp.getOperation();
-      numChannels = channelsInLoop.size();
-      channelsInLoopOne = channelsInLoop;
-      numBuffers = channelsInLoop[0]->numBuffers;
-      if (numChannels == 0)
-        return false;
-    } else {
-      if (outerLoop != parentForOp.getOperation())
-        return false;
-      if (numChannels != channelsInLoop.size())
-        return false;
-      if (numBuffers != channelsInLoop[0]->numBuffers)
-        return false;
-      unsigned idx = 0;
-      for (auto *ch : channelsInLoop) {
-        // TODO: sort the channels in the loop according to buffer size.
-        mapToRepresenting[ch] = channelsInLoopOne[idx++];
+  SmallVector<Channel *> channelsInOpOne;
+  for (auto *innerOp : innerOps) {
+    // Ignore IfOps that overlap with innerLoops.
+    if (dyn_cast<scf::IfOp>(innerOp)) {
+      bool ignore = false;
+      for (auto *innerLoop : innerLoops) {
+        if (innerOp == innerLoop->getParentOp()) {
+          ignore = true;
+          break;
+        }
       }
+      if (ignore)
+        continue;
     }
-    firstLoop = false;
+    scf::ForOp parentForOp = innerOp->getParentOfType<scf::ForOp>();
+    SmallVector<Channel *> channelsInOp;
+    getNumChannelsInOp(innerOp, channels, channelsInOp);
+    if (firstOp) {
+      outerLoop = parentForOp.getOperation();
+      numChannels = channelsInOp.size();
+      channelsInOpOne = channelsInOp;
+      numBuffers = channelsInOp[0]->numBuffers;
+      opsWithBufferReuse.push_back(innerOp);
+    } else {
+      if (outerLoop != parentForOp.getOperation() ||
+          numChannels != channelsInOp.size())
+        // Not under the same outer loop.
+        return;
+      if (numBuffers != channelsInOp[0]->numBuffers)
+        return;
+      unsigned idx = 0;
+      for (auto *ch : channelsInOp) {
+        // TODO: sort the channels in the loop according to buffer size.
+        mapToRepresenting[ch] = channelsInOpOne[idx++];
+      }
+      opsWithBufferReuse.push_back(innerOp);
+    }
+    firstOp = false;
   }
   LLVM_DEBUG({
-    LDBG("reuseBuffers: ");
+    LDBG("reuseBuffers: " << numChannels << " channels opsWithBufferReuse "
+                          << opsWithBufferReuse.size());
     for (auto &kv : mapToRepresenting) {
       llvm::dbgs() << "---- from ";
       kv.first->getDstOp()->dump();
@@ -1258,8 +1328,7 @@ bool reuseBuffers(SmallVector<Operation *> &taskTopOps,
       kv.second->getDstOp()->dump();
     }
   });
-  loopWithBufferReuse = innerForOps;
-  return true;
+  // opsWithBufferReuse = innerOps;
 }
 
 // Go through a list of operations under one scope.
@@ -1268,17 +1337,17 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
                            unsigned numBuffers,
                            SmallVector<Operation *> &taskTopOps,
                            Operation *commonOuterLoop,
-                           SmallVector<Operation *> &loopWithBufferReuse,
+                           SmallVector<Operation *> &opsWithBufferReuse,
                            Value prevAccum) {
   for (Operation *op : opList) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       auto newForOp =
           createNewLoopWrapper(forOp, numBuffers, taskTopOps, commonOuterLoop,
-                               loopWithBufferReuse, prevAccum);
+                               opsWithBufferReuse, prevAccum);
       // Update prevAccum to be after the loop.
-      // If the loop is in loopWithBufferReuse, generate prevAccum + numSteps.
+      // If the loop is in opsWithBufferReuse, generate prevAccum + numSteps.
       bool hasReuse = false;
-      for (auto tLoop : loopWithBufferReuse)
+      for (auto tLoop : opsWithBufferReuse)
         if (newForOp.getOperation() == tLoop) {
           hasReuse = true;
           break;
@@ -1296,10 +1365,10 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
       // If the loop is the outer loop for a reuse loop, we are done.
       // At this point, op is no longer valid.
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      if (needAccumulatedLoopCnt(ifOp, loopWithBufferReuse)) {
+      if (needAccumulatedLoopCnt(ifOp, opsWithBufferReuse)) {
         auto newIfOp =
             rewriteIfOp(ifOp, numBuffers, taskTopOps, commonOuterLoop,
-                        loopWithBufferReuse, prevAccum);
+                        opsWithBufferReuse, prevAccum);
         // update prevAccum to be result of the new IfOp.
         assert(newIfOp.getNumResults() >= 1);
         auto numRes = newIfOp.getNumResults();
@@ -1311,7 +1380,7 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
           if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
             // Handle forOp.
             createNewLoopWrapper(forOp, numBuffers, taskTopOps, commonOuterLoop,
-                                 loopWithBufferReuse, prevAccum);
+                                 opsWithBufferReuse, prevAccum);
           }
         });
       }
@@ -1323,7 +1392,7 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
 scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
                                 SmallVector<Operation *> &taskTopOps,
                                 Operation *commonOuterLoop,
-                                SmallVector<Operation *> &loopWithBufferReuse,
+                                SmallVector<Operation *> &opsWithBufferReuse,
                                 Value prevAccum) {
   LLVM_DEBUG({
     LDBG("call createNewLoop on");
@@ -1338,18 +1407,17 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   bool isOuterOfReuse =
       commonOuterLoop && commonOuterLoop == origForOp.getOperation();
   bool hasReuse = false;
-  for (auto tLoop : loopWithBufferReuse)
+  for (auto tLoop : opsWithBufferReuse)
     if (origForOp.getOperation() == tLoop) {
       hasReuse = true;
       break;
     }
-  // Set accumulatedLoopCount when this is a loop in loopWithBufferReuse. If
+  // Set accumulatedLoopCount when this is a loop in opsWithBufferReuse. If
   // this loop has an outer loop, an extra arg for accumLoopCount should have
   // been added to the outer loop.
   Value accumulatedLoopCount = prevAccum; // Value();
   newForOp = createNewLoop(origForOp, loopNumBuffers, parentForOp,
-                           accumulatedLoopCount, loopWithBufferReuse, hasReuse,
-                           isOuterOfReuse);
+                           accumulatedLoopCount, hasReuse, isOuterOfReuse);
   LLVM_DEBUG({
     LDBG("after createNewLoop ");
     newForOp.dump();
@@ -1364,10 +1432,10 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   }
 
   // origForOp is erased in createNewLoop. If origForOp is in
-  // loopWithBufferReuse, replace.
-  auto tmpIter = std::find(loopWithBufferReuse.begin(),
-                           loopWithBufferReuse.end(), origForOp.getOperation());
-  if (tmpIter != loopWithBufferReuse.end()) {
+  // opsWithBufferReuse, replace.
+  auto tmpIter = std::find(opsWithBufferReuse.begin(), opsWithBufferReuse.end(),
+                           origForOp.getOperation());
+  if (tmpIter != opsWithBufferReuse.end()) {
     *tmpIter = newForOp.getOperation();
   }
 
@@ -1380,7 +1448,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
       opList.push_back(&op);
   }
   Value endAccum = updateAccumLoopCount(
-      opList, numBuffers, taskTopOps, commonOuterLoop, loopWithBufferReuse,
+      opList, numBuffers, taskTopOps, commonOuterLoop, opsWithBufferReuse,
       isOuterOfReuse ? getAccumLoopCountArg(newForOp) : prevAccum);
 
   // Update yieldOp.
@@ -1395,7 +1463,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
 // This function takes a list of channels, a mapping from a channel
 // to its representing channel if the key shares smem space with the
 // representing channel, and a list of loops that are sharing smem spaces. Note
-// that every loop in loopWithBufferReuse either has the same outer loop or has
+// that every loop in opsWithBufferReuse either has the same outer loop or has
 // no outer loop.
 // For ForOps in taskTopOps, create new ForOp for each by adding phase,
 // bufferIdx to the arguments. In the case of sharing smem, we need to traverse
@@ -1408,25 +1476,25 @@ Value appendBufferIdxArgs(
     SmallVector<Operation *> &taskTopOps, unsigned numBuffers,
     const SmallVector<Channel *> &channels,
     const DenseMap<Channel *, Channel *> &mapToRepresenting,
-    SmallVector<Operation *> &loopWithBufferReuse) {
+    SmallVector<Operation *> &opsWithBufferReuse) {
   // In order to handle sharing smem for a list of loops, we have two cases,
-  // one is the top-level op containing all loops in loopWithBufferReuse is
+  // one is the top-level op containing all loops in opsWithBufferReuse is
   // a ForOp.
-  bool genAccumLoopCount = !loopWithBufferReuse.empty();
+  bool genAccumLoopCount = !opsWithBufferReuse.empty();
   Operation *commonOuterLoop = nullptr;
   if (genAccumLoopCount) {
-    auto oneFor = loopWithBufferReuse[0];
+    auto oneFor = opsWithBufferReuse[0];
     scf::ForOp parentForOp = oneFor->getParentOfType<scf::ForOp>();
     if (parentForOp)
       commonOuterLoop = parentForOp.getOperation();
   }
 
   // When there is no outer loop, we need to create a place holder for
-  // tmpAccumLoopCount. Every forOp in loopWithBufferReuse either has the same
+  // tmpAccumLoopCount. Every forOp in opsWithBufferReuse either has the same
   // outer loop or has no outer loop.
   Value tmpAccumLoopCount;
-  if (loopWithBufferReuse.size() > 1 && !commonOuterLoop) {
-    auto oneFor = loopWithBufferReuse[0];
+  if (opsWithBufferReuse.size() > 1 && !commonOuterLoop) {
+    auto oneFor = opsWithBufferReuse[0];
     // Initialize tmpAccumLoopCount to be 0.
     OpBuilderWithAsyncTaskIds builder(taskTopOps[0]->getContext());
     builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(oneFor));
@@ -1444,7 +1512,7 @@ Value appendBufferIdxArgs(
       opList.push_back(op);
   }
   updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
-                       loopWithBufferReuse, tmpAccumLoopCount);
+                       opsWithBufferReuse, tmpAccumLoopCount);
 
   return tmpAccumLoopCount;
 }
@@ -2220,12 +2288,12 @@ public:
     // Update mapToRepresenting that maps a channel to the representing channel
     // in the sharing group.
     DenseMap<Channel *, Channel *> mapToRepresenting;
-    SmallVector<Operation *> loopWithBufferReuse;
+    SmallVector<Operation *> opsWithBufferReuse;
     reuseBuffers(asyncTaskTopOps, channels, mapToRepresenting,
-                 loopWithBufferReuse);
-    // Use and update loopWithBufferReuse.
+                 opsWithBufferReuse);
+    // Use and update opsWithBufferReuse.
     appendBufferIdxArgs(asyncTaskTopOps, numBuffers, channels,
-                        mapToRepresenting, loopWithBufferReuse);
+                        mapToRepresenting, opsWithBufferReuse);
     LLVM_DEBUG({
       LDBG("\n\nafter appendBufferIdxArgs");
       funcOp.dump();
@@ -2272,7 +2340,6 @@ public:
       funcOp.dump();
     });
 
-    // Assuming there are no changes to loops in loopWithBufferReuse.
     auto ret = SpecializeRegion(funcOp, regDecProducer, regIncConsumer);
     LLVM_DEBUG({
       LDBG("\n\nwith SpecializeRegion");
