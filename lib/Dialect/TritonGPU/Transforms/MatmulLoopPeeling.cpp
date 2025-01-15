@@ -93,8 +93,8 @@ bool loopMustBeRunAtLeastOnce(scf::ForOp forOp) {
   auto stepInt = getConstantIntValue(step);
 
   // Peeling is not needed if there is one or less iteration.
-  if (lbInt && ubInt && stepInt && ceil(float(*ubInt - *lbInt) / *stepInt) <= 1)
-    return false;
+  if (lbInt && ubInt && stepInt)
+    return ceil(float(*ubInt - *lbInt) / *stepInt) > 1;
 
   // Check if there is an assume that says the loop is not empty.
   if (!lbInt || !ubInt) {
