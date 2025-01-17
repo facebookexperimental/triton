@@ -86,22 +86,25 @@ void doPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   // Step 1. Select loads into the first task, which is the producer task by
   // default. Place dots into the second task, which is the consumer.
   // Only consider loads that are connected to a dot op in a loop.
-  SmallVector<Operation *> producerOps;
+  DenseSet<Operation *> producerOps;
   SmallVector<Operation *> consumerOps;
+  BackwardSliceOptions opt;
+  opt.omitBlockArguments = true;
+  opt.inclusive = true;
+
   for (auto op : dots) {
-    if (getLoopLevel(op) == 0)
-      continue;
     consumerOps.push_back(op);
     auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op);
     if (!dotOp)
       continue;
     SetVector<Operation *> backwardSlice;
-    getBackwardSlice(dotOp.getA(), &backwardSlice);
-    getBackwardSlice(dotOp.getB(), &backwardSlice);
-
+    getBackwardSlice(dotOp.getA(), &backwardSlice, opt);
+    getBackwardSlice(dotOp.getB(), &backwardSlice, opt);
     for (auto depOp : backwardSlice) {
-      if (isa<triton::LoadOp, ExperimentalDescriptorLoadOp>(depOp)) {
-        producerOps.push_back(depOp);
+      if (isa<ExperimentalDescriptorLoadOp>(depOp)) {
+          producerOps.insert(depOp);
+      } else if (isa<triton::LoadOp>(depOp) && isExpensiveLoadOrStore(depOp)) {
+          producerOps.insert(depOp);
       }
     }
   }
