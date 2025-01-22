@@ -1180,10 +1180,10 @@ struct AsyncTMACopyLocalToGlobalOpConversion
     // We clamp the block size and the codegen will emit multiple copy
     // operations.
     for (int copyIdx = 0; copyIdx < numCopies; copyIdx += numWarps) {
+      auto warpOffset = getWarpOffset(op);
       int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
       if (numWarpsToCopy == 1)
-        warpID = i32_val(0);
-      auto warpOffset = getWarpOffset(op);
+        warpID = i32_val(warpOffset);
       warpID = sub(warpID, i32_val(warpOffset));
       id = sub(id, i32_val(warpOffset * warpSize));
       Value boxPred =
