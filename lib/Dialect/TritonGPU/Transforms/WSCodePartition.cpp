@@ -124,6 +124,27 @@ Value getAccumLoopCountArg(scf::ForOp parentForOp) {
   return tmpAccumLoopCount;
 }
 
+// Check to see if op is enclosed under ifOp.
+static bool enclosing(scf::IfOp ifOp, Operation *op) {
+  auto pOp = op->getParentOfType<scf::IfOp>();
+  while (pOp) {
+    if (pOp == ifOp)
+      return true;
+    pOp = pOp->getParentOfType<scf::IfOp>();
+  }
+  return false;
+}
+
+// Check to see if there is no outer loop that is enclosed under ifOp.
+static bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
+  auto pOp = subOp->getParentOfType<scf::ForOp>();
+  if (!pOp)
+    return true;
+  if (enclosing(ifOp, pOp.getOperation()))
+    return false;
+  return true;
+}
+
 // Return true if the IfOp contains a ForOp that is in loopWithBufferReuse.
 static bool
 needAccumulatedLoopCnt(scf::IfOp ifOp,
@@ -132,7 +153,9 @@ needAccumulatedLoopCnt(scf::IfOp ifOp,
   ifOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
     if (auto forOp = dyn_cast<scf::ForOp>(subOp))
       for (auto tLoop : loopWithBufferReuse)
-        if (forOp.getOperation() == tLoop) {
+        // For the case of ifOp contains forOp, which contains subOp, no need to
+        // generate accumLoopCount for ifOp.
+        if (forOp.getOperation() == tLoop && immediateEnclosing(ifOp, tLoop)) {
           needAccum = true;
           break;
         }
