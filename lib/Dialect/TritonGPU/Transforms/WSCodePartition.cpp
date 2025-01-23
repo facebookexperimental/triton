@@ -140,9 +140,7 @@ static bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
   auto pOp = subOp->getParentOfType<scf::ForOp>();
   if (!pOp)
     return true;
-  if (enclosing(ifOp, pOp.getOperation()))
-    return false;
-  return true;
+  return !enclosing(ifOp, pOp.getOperation());
 }
 
 // Return true if the IfOp contains a ForOp that is in loopWithBufferReuse.
