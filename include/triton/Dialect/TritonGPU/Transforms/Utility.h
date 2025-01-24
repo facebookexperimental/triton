@@ -280,6 +280,8 @@ public:
   OpTy replaceOpWithNewOp(Operation *op, Args &&...args) {
     auto newOp =
         rewriter->replaceOpWithNewOp<OpTy>(op, std::forward<Args>(args)...);
+    if (!asyncTaskIds.empty())
+      setAsyncTaskIds(newOp, asyncTaskIds);
     return newOp;
   }
 
