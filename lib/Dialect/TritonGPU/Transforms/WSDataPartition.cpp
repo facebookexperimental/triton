@@ -60,13 +60,13 @@ void fixTaskId(triton::FuncOp &funcOp) {
       // Do not update loads.
       if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(defOp))
         continue;
-      // Skip control flow ops.
-      if (isa<scf::YieldOp>(op))
-        continue;
       auto defTaskIds = getAsyncTaskIds(defOp);
       // Make sure defTaskIds cover asyncTaskIds. Call addAsyncTaskIds if
       // necessary.
       if (!oneVecCoversTheOther(defTaskIds, asyncTaskIds)) {
+        // Skip control flow ops.
+        if (isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+          continue;
         // Const ops with same value but different task ids can be folded.
         if (defOp->getDialect()->getNamespace() == "arith") {
           LLVM_DEBUG({

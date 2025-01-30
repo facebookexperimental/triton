@@ -73,9 +73,24 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
       if (!hasAsyncTaskId(user, asyncTaskId))
         continue;
 
-      // Skip control flow ops that are shared by all async tasks
-      if (isa<scf::YieldOp>(user))
+      if (isa<scf::YieldOp>(user)) {
+        if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
+          // For block arguments, we need to check the initial value as well.
+          if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
+            auto initArg = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
+            if (Operation *def = initArg.getDefiningOp()) {
+              if (hasAsyncTaskId(def, asyncTaskId)) {
+                argIndices.insert(argIdx);
+              }
+            } else {
+              llvm_unreachable("Initial value should have a defining op");
+            }
+          }
+        }
+
+        // Skip control flow ops that are shared by all async tasks
         continue;
+      }
 
       // Found a real user, the arg is needed
       if (user->getNumRegions() == 0) {
@@ -300,7 +315,22 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
           keptResultVec.push_back(resultIdx);
         }
       } else {
-        keptResultVec.push_back(resultIdx);
+        assert(isa<BlockArgument>(yieldV) && "Unexpected yield value");
+        auto bbArg = cast<BlockArgument>(yieldV);
+        // Find transive defining op for the block arg
+        Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
+        if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
+          // track initial value
+          auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
+          if (Operation *def = initArg.getDefiningOp()) {
+            if (hasAsyncTaskId(def, asyncTaskId))
+              keptResultVec.push_back(resultIdx);
+          } else {
+            llvm_unreachable("Initial value should have a defining op");
+          }
+        } else {
+          llvm_unreachable("Unexpected block argument owner");
+        }
       }
       ++resultIdx;
     }
