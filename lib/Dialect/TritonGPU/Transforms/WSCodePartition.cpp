@@ -1318,6 +1318,9 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
     }
     firstOp = false;
   }
+  if (opsWithBufferReuse.size() == 1 && maxDepth == 0)
+    // A single op in buffer reuse and there is no outer loop.
+    opsWithBufferReuse.clear();
   LLVM_DEBUG({
     LDBG("reuseBuffers: " << numChannels << " channels opsWithBufferReuse "
                           << opsWithBufferReuse.size());
@@ -1376,13 +1379,15 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
         prevAccum = newIfOp.getResult(numRes - 1); // last result
       } else {
         // Still need to process ForOps in pre-order.
+        SmallVector<scf::ForOp> innerForOps;
         ifOp->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
           if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
-            // Handle forOp.
-            createNewLoopWrapper(forOp, numBuffers, taskTopOps, commonOuterLoop,
-                                 opsWithBufferReuse, prevAccum);
+            innerForOps.push_back(forOp);
           }
         });
+        for (auto innerFor : innerForOps)
+          createNewLoopWrapper(innerFor, numBuffers, taskTopOps,
+                               commonOuterLoop, opsWithBufferReuse, prevAccum);
       }
     }
   }
