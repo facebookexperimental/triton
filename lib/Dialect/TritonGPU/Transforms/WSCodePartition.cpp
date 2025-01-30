@@ -745,6 +745,9 @@ void groupChannels(
     if (dst1->getBlock() != dst2->getBlock() || !dst1->hasOneUse() ||
         !dst2->hasOneUse())
       return false;
+    // Check taskIds on dstOps.
+    if (getAsyncTaskIds(dst1) != getAsyncTaskIds(dst2))
+      return false;
     Operation *dst1User = *(dst1->getUsers().begin());
     Operation *dst2User = *(dst2->getUsers().begin());
     return dst1User == dst2User && dst1User->getBlock() == dst1->getBlock();

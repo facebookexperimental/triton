@@ -528,8 +528,6 @@ Value LayoutPropagation::getValueAs(Value value, Attribute encoding) {
                                          tensorType.getElementType(), encoding);
     Value converted = rewriter.create<ConvertLayoutOp>(value.getLoc(), tmpType,
                                                        rewrittenValue);
-    if (value.getDefiningOp())
-      converted.getDefiningOp()->setAttrs(value.getDefiningOp()->getAttrs());
     // TODO: we could cache the conversion.
     return converted;
   }

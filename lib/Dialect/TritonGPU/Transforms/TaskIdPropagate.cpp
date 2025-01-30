@@ -283,7 +283,8 @@ void backwardPropagateTaskIds(Operation *op,
     }
 
     auto op = value.getDefiningOp();
-    addAsyncTaskIds(op, asyncTasks);
+    if (!anchors.count(op))
+      addAsyncTaskIds(op, asyncTasks);
 
     // Handle for loops.
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {

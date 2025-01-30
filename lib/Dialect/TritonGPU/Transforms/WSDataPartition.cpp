@@ -660,12 +660,15 @@ Operation *sliceOp(Value v, int offset, OpBuilderWithAsyncTaskIds &builder,
   }
 }
 
-void partitionTasks(triton::FuncOp &funcOp) {
+void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
 
   // op -> (partition dim, num of partitions)
   DataPartitionScheme partitionScheme;
-  if (!computePartitionScheme(funcOp, partitionScheme))
+  if (!computePartitionScheme(funcOp, partitionScheme)) {
+    if (numConsumerGroups > 1)
+      llvm::errs() << "computePartitionScheme failed when requested\n";
     return;
+  }
 
   for (int i = 0; i < partitionScheme.numPartitions; i++) {
     OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
@@ -763,7 +766,7 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numConsumerGroups == 0)
       return;
-    partitionTasks(funcOp);
+    partitionTasks(funcOp, numConsumerGroups);
   }
 
   void runOnOperation() override {
