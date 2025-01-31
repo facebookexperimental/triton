@@ -56,6 +56,17 @@ llvm::raw_ostream &mlir_dumps_or_dbgs() {
   }
 }
 
+#if 0
+void setAsyncTaskIds(Operation *op, ArrayRef<int> asyncTaskIds) {
+  SmallVector<int> sortedAsyncTaskIds(asyncTaskIds.begin(), asyncTaskIds.end());
+  sort(sortedAsyncTaskIds);
+  auto i32Ty = IntegerType::get(op->getContext(), 32);
+  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
+  auto vecTy = VectorType::get(size, i32Ty);
+  op->setAttr("async_task_id", DenseIntElementsAttr::get(vecTy, sortedAsyncTaskIds));
+}
+#endif
+
 // A custom op builder that keeps track of the last location
 class TritonOpBuilder {
 public:
@@ -115,7 +126,10 @@ public:
 
   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
     auto loc = getLastLoc();
-    return builder->create<OpTy>(loc, std::forward<Args>(args)...);
+    auto ret = builder->create<OpTy>(loc, std::forward<Args>(args)...);
+    if (asyncTaskIds)
+      ::setAsyncTaskIds(ret, *asyncTaskIds);
+    return ret;
   }
 
   // Overload to create or fold a single result operation.
@@ -134,9 +148,16 @@ public:
     return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
   }
 
+  void setAsyncTaskIds(std::vector<int> taskIds) { this->asyncTaskIds = taskIds; }
+
+  void unsetAsyncTaskIds() {
+    this->asyncTaskIds = std::nullopt;
+  }
+
 private:
   std::unique_ptr<OpBuilder> builder;
   std::unique_ptr<Location> lastLoc;
+  std::optional<std::vector<int>> asyncTaskIds;
   bool lineInfoEnabled = !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
 };
 
@@ -749,6 +770,12 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, OpBuilder::InsertPoint pt) {
              self.restoreInsertionPoint(pt);
            })
+      .def("set_async_task_ids",
+           [](TritonOpBuilder &self, std::vector<int> v) {
+             self.setAsyncTaskIds(v);
+           })
+      .def("unset_async_task_ids",
+           [](TritonOpBuilder &self) { self.unsetAsyncTaskIds(); })
       // Attr
       .def("get_bool_attr",
            [](TritonOpBuilder &self, bool value) {
