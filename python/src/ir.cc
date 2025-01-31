@@ -56,17 +56,6 @@ llvm::raw_ostream &mlir_dumps_or_dbgs() {
   }
 }
 
-#if 0
-void setAsyncTaskIds(Operation *op, ArrayRef<int> asyncTaskIds) {
-  SmallVector<int> sortedAsyncTaskIds(asyncTaskIds.begin(), asyncTaskIds.end());
-  sort(sortedAsyncTaskIds);
-  auto i32Ty = IntegerType::get(op->getContext(), 32);
-  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
-  auto vecTy = VectorType::get(size, i32Ty);
-  op->setAttr("async_task_id", DenseIntElementsAttr::get(vecTy, sortedAsyncTaskIds));
-}
-#endif
-
 // A custom op builder that keeps track of the last location
 class TritonOpBuilder {
 public:
@@ -148,11 +137,11 @@ public:
     return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
   }
 
-  void setAsyncTaskIds(std::vector<int> taskIds) { this->asyncTaskIds = taskIds; }
-
-  void unsetAsyncTaskIds() {
-    this->asyncTaskIds = std::nullopt;
+  void setAsyncTaskIds(std::vector<int> taskIds) {
+    this->asyncTaskIds = taskIds;
   }
+
+  void unsetAsyncTaskIds() { this->asyncTaskIds = std::nullopt; }
 
 private:
   std::unique_ptr<OpBuilder> builder;
