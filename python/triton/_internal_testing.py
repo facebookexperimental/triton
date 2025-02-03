@@ -37,6 +37,13 @@ def is_cuda():
     return False if target is None else target.backend == "cuda"
 
 
+def is_new_cpu():
+    target = get_current_target()
+    if target is None:
+        return False
+    return not is_interpreter() and target.backend == "cpu"
+
+
 def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 

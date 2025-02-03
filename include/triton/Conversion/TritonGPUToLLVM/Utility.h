@@ -383,6 +383,9 @@ LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
                                          StringRef funcName, Type funcType,
                                          StringRef libname = "",
                                          StringRef libpath = "");
+
+bool isCPUMode();
+void enableCPUMode();
 } // namespace gpu
 
 } // namespace triton
@@ -656,6 +659,20 @@ Value mxfpScaleBf16(RewriterBase &rewriter, Location loc, Value v, Value scale,
                     bool fastMath);
 
 } // namespace LLVM
+
+/* ------------------------------------ */
+// Returns CTA level thread idx
+inline Value getThreadId(RewriterBase &rewriter, Location loc) {
+  if (triton::gpu::isCPUMode()) {
+    // Currently, we only have a single (GPU) thread in a warp. Always 0.
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    return b.i32_val(0);
+  }
+
+  Value tid =
+      rewriter.create<::mlir::gpu::ThreadIdOp>(loc, ::mlir::gpu::Dimension::x);
+  return rewriter.create<arith::IndexCastOp>(loc, i32_ty, tid);
+}
 
 // -----------------------------------------------------------------------
 // Shared memory utilities
@@ -1201,13 +1218,20 @@ void storeDistributedToShared(
     RewriterBase &rewriter, const TargetInfoBase &target,
     std::pair<size_t, Type> *const llvmOpCount = nullptr);
 
+SmallVector<Value> unpackLLVector(Location loc, Value llvmVec, RewriterBase &);
+Value packLLVector(Location loc, ValueRange vals, RewriterBase &);
+
 inline SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                            RewriterBase &rewriter) {
   assert(bool(llvmStruct) && "can not unpack null values");
   if (llvmStruct.getType().isIntOrIndexOrFloat() ||
-      isa<triton::PointerType>(llvmStruct.getType()) ||
-      isa<LLVM::LLVMPointerType>(llvmStruct.getType()))
+      isa<triton::PointerType, LLVM::LLVMPointerType>(llvmStruct.getType()))
     return {llvmStruct};
+
+  if (isa<VectorType, LLVM::LLVMFixedVectorType>(llvmStruct.getType())) {
+    return unpackLLVector(loc, llvmStruct, rewriter);
+  }
+
   ArrayRef<Type> types =
       cast<LLVM::LLVMStructType>(llvmStruct.getType()).getBody();
   SmallVector<Value> results(types.size());
@@ -1223,8 +1247,20 @@ inline Value packLLElements(Location loc,
                             const LLVMTypeConverter *typeConverter,
                             ValueRange resultVals, RewriterBase &rewriter,
                             Type type) {
-  auto structType =
-      dyn_cast<LLVM::LLVMStructType>(typeConverter->convertType(type));
+  Type convertedType = typeConverter->convertType(type);
+  auto vectorType = dyn_cast<VectorType>(convertedType);
+  if (vectorType) {
+    assert(resultVals.size() == vectorType.getNumElements());
+    return packLLVector(loc, resultVals, rewriter);
+  }
+
+  auto fixedVecType = dyn_cast<LLVM::LLVMFixedVectorType>(convertedType);
+  if (fixedVecType) {
+    assert(resultVals.size() == fixedVecType.getNumElements());
+    return packLLVector(loc, resultVals, rewriter);
+  }
+
+  auto structType = dyn_cast<LLVM::LLVMStructType>(convertedType);
   if (!structType) {
     assert(resultVals.size() == 1);
     return *resultVals.begin();
@@ -1266,8 +1302,9 @@ inline SmallVector<Value> unpackLLVector(Location loc, Value llvmVec,
 
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   SmallVector<Value> results;
-  for (int i = 0; i < cast<VectorType>(llvmVec.getType()).getNumElements();
-       i++) {
+  // It can handle either VectorType or LLVMFixedVectorType.
+  for (int i = 0;
+       i < LLVM::getVectorNumElements(llvmVec.getType()).getFixedValue(); i++) {
     results.push_back(b.extract_element(llvmVec, b.i32_val(i)));
   }
   return results;
@@ -1276,11 +1313,23 @@ inline SmallVector<Value> unpackLLVector(Location loc, Value llvmVec,
 inline Value packLLVector(Location loc, ValueRange vals,
                           RewriterBase &rewriter) {
   assert(vals.size() > 0);
-  auto vecType = vec_ty(vals[0].getType(), vals.size());
+  auto vecType = LLVM::getVectorType(vals[0].getType(), vals.size());
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value vec = b.undef(vecType);
   for (int i = 0; i < vals.size(); i++) {
     vec = b.insert_element(vec, vals[i], b.i32_val(i));
+  }
+  return vec;
+}
+
+inline Value packLLVectorRange(Location loc, ValueRange vals, size_t offset,
+                               size_t size, RewriterBase &rewriter) {
+  assert(vals.size() > 0 && offset + size <= vals.size());
+  auto vecType = vec_ty(vals[offset].getType(), size);
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value vec = b.undef(vecType);
+  for (int i = offset; i < offset + size; i++) {
+    vec = b.insert_element(vec, vals[i], b.i32_val(i - offset));
   }
   return vec;
 }
@@ -1298,7 +1347,6 @@ isSimpleSharedMemoryAccess(ArrayRef<int64_t> shape,
          /*swizzling and rank-reduced and rank >= 2*/
          (shape == allocShape.take_back(rank) && rank >= 2);
 }
-
 } // namespace mlir
 
 #endif
