@@ -102,6 +102,9 @@ static SmallVector<int64_t> getShape(Value v) {
     return {type.getShape().begin(), type.getShape().end()};
   } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
     return {type.getShape().begin(), type.getShape().end()};
+  } else if (auto type = dyn_cast<TensorDescType>(v.getType())) {
+    return {type.getBlockType().getShape().begin(),
+            type.getBlockType().getShape().end()};
   }
   return {};
 }
@@ -125,12 +128,18 @@ void getBackwardSliceToPartition(Value root, unsigned dim, int sliceSize,
             isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                 arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp,
                 ConvertLayoutOp, triton::gpu::LocalAllocOp, LoadOp,
-                ExperimentalDescriptorLoadOp>(op)) {
+                ExperimentalDescriptorLoadOp, nvidia_gpu::TMEMAllocOp,
+                nvidia_gpu::TMEMLoadOp>(op)) {
           for (Value operand : op->getOperands())
             queue.push_back(operand);
         } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
           queue.push_back(dim == 0 ? dotOp.getA() : dotOp.getB());
           queue.push_back(dotOp.getC());
+        } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+          queue.push_back(dim == 0 ? dotOp.getA() : dotOp.getB());
+          queue.push_back(dotOp.getD());
+        } else if (auto tensorDescOp = dyn_cast<ReinterpretTensorDescOp>(op)) {
+          continue;
         } else {
           llvm_unreachable("Unexpected op");
         }
@@ -197,6 +206,10 @@ void getSliceToPartition(Value root, unsigned dim, int sliceSize,
       getBackwardSliceToPartition(dim == 0 ? dotOp.getA() : dotOp.getB(), dim,
                                   sliceSize, slice);
       getBackwardSliceToPartition(dotOp.getC(), dim, sliceSize, slice);
+    } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+      getBackwardSliceToPartition(dim == 0 ? dotOp.getA() : dotOp.getB(), dim,
+                                  sliceSize, slice);
+      getBackwardSliceToPartition(dotOp.getD(), dim, sliceSize, slice);
     }
   }
 }
@@ -214,14 +227,14 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
   // Do not partition producer tasks
 
   // Use dot to drive the partition
-  SetVector<nvidia_gpu::WarpGroupDotOp> dots;
+  SetVector<Operation *> dots;
 
   // check all dot ops that have more than one async task id
   funcOp.walk([&](Operation *op) {
     auto asyncTaskIds = getAsyncTaskIds(op);
     if (asyncTaskIds.size() > 1) {
-      if (auto dotWaitOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
-        dots.insert(dotWaitOp);
+      if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+        dots.insert(op);
       }
     }
   });
@@ -229,12 +242,24 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
   // Checking if all dots can be partitioned in the same way
   int numWarps =
       TritonGPUDialect::getNumWarps(funcOp->getParentOfType<ModuleOp>());
-  for (auto dotOp : dots) {
+  for (auto op : dots) {
     // partition along M first, otherwise along N
-    RankedTensorType dotType = dotOp.getType();
+    Value opndA, opndB, accumulator;
+
+    if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
+      opndA = dotOp.getA();
+      opndB = dotOp.getB();
+      accumulator = dotOp.getC();
+    } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+      opndA = dotOp.getA();
+      opndB = dotOp.getB();
+      accumulator = dotOp.getD();
+    }
+
+    auto dotType = accumulator.getType();
     LLVM_DEBUG({
       LDBG("Computing partition scheme for");
-      dotOp.dump();
+      op->dump();
       LDBG("\n");
     });
     auto shapePerCTA = getShapePerCTA(dotType);
@@ -242,8 +267,7 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
       LDBG("partition not possible: shapePerCTA " << shapePerCTA.size());
       return false;
     }
-    auto CTALayout = getCTALayout(dotType.getEncoding());
-    auto asyncTaskIds = getAsyncTaskIds(dotOp);
+    auto asyncTaskIds = getAsyncTaskIds(op);
     int sliceSizeM = shapePerCTA[0] / asyncTaskIds.size();
     int sliceSizeN = shapePerCTA[1] / asyncTaskIds.size();
     int partitionDim, partitionSize;
@@ -253,12 +277,12 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
       LLVM_DEBUG({ LDBG("partition along M\n"); });
       partitionDim = 0;
       partitionSize = sliceSizeM;
-      partitionOperand = dotOp.getA();
+      partitionOperand = opndA;
     } else if (sliceSizeN >= 256) {
       LLVM_DEBUG({ LDBG("partition along N\n"); });
       partitionDim = 1;
       partitionSize = sliceSizeN;
-      partitionOperand = dotOp.getB();
+      partitionOperand = opndB;
     } else {
       LDBG("partition not possible: " << sliceSizeM << " " << sliceSizeN);
       return false;
@@ -277,7 +301,7 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
 
     // Partition the slice closure
     SetVector<Operation *> &slice = partitionScheme.ops;
-    getSliceToPartition(dotOp.getD(), partitionDim, partitionSize, slice);
+    getSliceToPartition(accumulator, partitionDim, partitionSize, slice);
 
     LLVM_DEBUG({
       partitionOperand.dump();
@@ -377,6 +401,16 @@ Operation *sliceOp(Operation *op, int offset,
         auto newType = RankedTensorType::get(shape, type.getElementType(),
                                              type.getEncoding());
         newV.setType(newType);
+      } else if (auto type = dyn_cast<TensorDescType>(v.getType())) {
+        auto blockType = type.getBlockType();
+        SmallVector<int64_t> shape{blockType.getShape().begin(),
+                                   blockType.getShape().end()};
+        int sliceSize = shape[dim] / numOfPartitions;
+        shape[dim] = sliceSize;
+        auto newBlockType =
+            RankedTensorType::get(shape, blockType.getElementType());
+        auto newType = TensorDescType::get(builder.getContext(), newBlockType);
+        newV.setType(newType);
       }
 
       mappings.map(v, newV);
@@ -388,8 +422,8 @@ Operation *sliceOp(Operation *op, int offset,
   // slice operands first
   Operation *newOp;
   if (op->hasTrait<OpTrait::Elementwise>() ||
-      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, LocalAllocOp>(
-          op)) {
+      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, LocalAllocOp,
+          nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, builder, mappings, reverseMappings,
               partitionScheme);
@@ -439,9 +473,13 @@ Operation *sliceOp(Operation *op, int offset,
     SmallVector<int64_t> shape;
     Value coordVal;
     if (auto loadOp = dyn_cast<ExperimentalDescriptorLoadOp>(op)) {
+      sliceOp(loadOp.getDesc(), offset, builder, mappings, reverseMappings,
+              partitionScheme);
       coordVal = loadOp.getIndices()[dim];
       shape = getShape(loadOp.getResult());
     } else if (auto storeOp = dyn_cast<ExperimentalDescriptorStoreOp>(op)) {
+      sliceOp(storeOp.getDesc(), offset, builder, mappings, reverseMappings,
+              partitionScheme);
       coordVal = storeOp.getIndices()[dim];
       shape = getShape(storeOp.getSrc());
     }
@@ -464,11 +502,20 @@ Operation *sliceOp(Operation *op, int offset,
       mappings.map(v, newV);
       reverseMappings.map(newV, v);
     }
+  } else if (auto tensorDescOp = dyn_cast<ReinterpretTensorDescOp>(op)) {
+    newOp = cloneAndSetResultType(op);
   } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
     // Only hanlde A and accumulator
     sliceOp(dim == 0 ? dotOp.getA() : dotOp.getB(), offset, builder, mappings,
             reverseMappings, partitionScheme);
     sliceOp(dotOp.getC(), offset, builder, mappings, reverseMappings,
+            partitionScheme);
+    newOp = cloneAndSetResultType(op);
+  } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+    // Only hanlde A and accumulator
+    sliceOp(dim == 0 ? dotOp.getA() : dotOp.getB(), offset, builder, mappings,
+            reverseMappings, partitionScheme);
+    sliceOp(dotOp.getD(), offset, builder, mappings, reverseMappings,
             partitionScheme);
     newOp = cloneAndSetResultType(op);
   } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
