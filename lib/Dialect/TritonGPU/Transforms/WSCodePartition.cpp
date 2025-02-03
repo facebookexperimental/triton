@@ -317,7 +317,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
       } else {
         assert(isa<BlockArgument>(yieldV) && "Unexpected yield value");
         auto bbArg = cast<BlockArgument>(yieldV);
-        // Find transive defining op for the block arg
+        // Find transitive defining op for the block arg
         Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
         if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
           // track initial value
