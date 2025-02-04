@@ -56,7 +56,6 @@ void TritonNvidiaGPUDialect::initialize() {
   addOperations<
 #define GET_OP_LIST
 #include "triton/Dialect/TritonNvidiaGPU/IR/Ops.cpp.inc"
-#include "triton/Dialect/TritonNvidiaGPU/IR/OpsEnums.cpp.inc"
       >();
 }
 

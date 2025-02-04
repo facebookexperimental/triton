@@ -23,11 +23,6 @@ namespace gpu {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-enum class LoadType {
-  LoadAsyncOp,
-  LoadTMAOp,
-};
-
 static Value createThreadIdOp(OpBuilder &builder, Location loc) {
   Value threadId = builder.create<::mlir::gpu::ThreadIdOp>(
       loc, builder.getIndexType(), ::mlir::gpu::Dimension::x);
@@ -60,25 +55,6 @@ void lowerGetAsyncTaskIdOp(Operation *parentOp, int numConsumerGroups) {
     op->erase();
 }
 
-//===----------------------------------------------------------------------===//
-// Lower token operations
-//===----------------------------------------------------------------------===//
-
-LoadType scanLoadTypes(ttng::CreateTokenOp createTokenOp) {
-  std::set<LoadType> loadTypes;
-  createTokenOp->getBlock()->walk([&](Operation *op) {
-    if (auto asyncCopy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
-      loadTypes.insert(LoadType::LoadAsyncOp);
-    } else if (auto asyncCopy =
-                   dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-      loadTypes.insert(LoadType::LoadTMAOp);
-    }
-  });
-  assert(loadTypes.size() > 0 && "no async copy in the block");
-  assert(loadTypes.size() == 1 && "block contains both async copy and tma");
-  return *loadTypes.begin();
-}
-
 Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
                           bool emptyBarrier) {
   auto loc = op->getLoc();
@@ -109,18 +85,12 @@ void processProducerAcquireOp(OpBuilder &builder, ttng::ProducerAcquireOp op,
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttng::ProducerCommitOp op,
-                             Value bufferFull, LoadType loadType) {
+                             Value bufferFull, ttng::TokenLoadType loadType) {
   auto loc = op.getLoc();
   int txCnt = 0;
   ttng::MBarrierArriveOp arriveOp;
 
-  if (loadType == LoadType::LoadAsyncOp) {
-    // Each thread arrives.
-    Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
-    arriveOp = builder.create<ttng::MBarrierArriveOp>(
-        loc, bufferFull, pred, /*remoteCTAId*/ nullptr, /*trackAsyncOp*/ true,
-        txCnt);
-  } else {
+  if (loadType == ttng::TokenLoadType::TMALoadOp) {
     // Only thread 0 arrives for TMA load.
     Value _0 = builder.create<arith::ConstantIntOp>(loc, 0, 32);
     Value threadId = createThreadIdOp(builder, loc);
@@ -128,6 +98,12 @@ void processProducerCommitOp(OpBuilder &builder, ttng::ProducerCommitOp op,
                                                threadId, _0);
     arriveOp = builder.create<ttng::MBarrierArriveOp>(
         loc, bufferFull, pred, /*remoteCTAId*/ nullptr, /*trackAsyncOp*/ false,
+        txCnt);
+  } else {
+    // Each thread arrives.
+    Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
+    arriveOp = builder.create<ttng::MBarrierArriveOp>(
+        loc, bufferFull, pred, /*remoteCTAId*/ nullptr, /*trackAsyncOp*/ true,
         txCnt);
   }
 
@@ -159,7 +135,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                           int numConsumerGroups) {
   SmallVector<Operation *> deprecatedOps;
   parentOp->walk([&](ttng::CreateTokenOp createTokenOp) {
-    LoadType loadType = scanLoadTypes(createTokenOp);
+    ttng::TokenLoadType loadType = createTokenOp.getLoadType();
     MLIRContext *context = createTokenOp.getContext();
     OpBuilder builder(createTokenOp);
     Location loc = createTokenOp.getLoc();
@@ -188,7 +164,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       Value barrierFullView = builder.create<ttg::MemDescSubviewOp>(
           loc, singleBarrierMemDescType, bufferFullArray, idx);
       unsigned bufferFullCount =
-          loadType == LoadType::LoadTMAOp ? 1 : THREADS_PER_TASK;
+          loadType == ttng::TokenLoadType::TMALoadOp ? 1 : THREADS_PER_TASK;
       builder.create<ttng::InitBarrierOp>(loc, barrierFullView,
                                           bufferFullCount);
 

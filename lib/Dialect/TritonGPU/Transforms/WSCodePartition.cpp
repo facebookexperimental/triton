@@ -1590,13 +1590,14 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
 // for each consumer taskId. Return a map that maps each channel + consumer
 // taskId to a token. Also update barrierAllocMap that maps each channel +
 // consumer taskId to a BarrierAlloc.
-DenseMap<Channel *, DenseMap<int, Value>>
-createToken(const DenseMap<Channel *, SmallVector<Channel *>>
-                &channelsGroupedByConsumers,
-            const SmallVector<Channel *> &orderedChannels,
-            triton::FuncOp funcOp, int numConsumerGroups,
-            DenseMap<Channel *, SmallVector<Channel *>> &channelReuse,
-            DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
+DenseMap<Channel *, DenseMap<int, Value>> createToken(
+    const DenseMap<Channel *, SmallVector<Channel *>>
+        &channelsGroupedByConsumers,
+    const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp,
+    int numConsumerGroups,
+    const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
+    DenseMap<Channel *, SmallVector<Channel *>> &channelReuse,
+    DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
   DenseMap<Channel *, DenseMap<int, Value>> ret;
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
@@ -1606,12 +1607,25 @@ createToken(const DenseMap<Channel *, SmallVector<Channel *>>
     if (!channelReuse.count(channel))
       continue;
     for (auto consumerAsyncTaskId : channel->relation.second) {
+      ttng::TokenLoadType tokenLoadType;
+      auto copyOp = copyOpMap.find(channel)->second.first;
+      if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
+        tokenLoadType = ttng::TokenLoadType::AsyncLoadOp;
+      } else if (isa<ExperimentalDescriptorLoadOp>(copyOp)) {
+        tokenLoadType = ttng::TokenLoadType::TMALoadOp;
+      } else if (isa<LocalStoreOp>(copyOp)) {
+        tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
+      } else {
+        llvm_unreachable("Unexpected load type");
+      }
+
       Value v;
       if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>()) {
-        v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(),
-                                                channel->numBuffers);
+        v = builder.create<ttng::CreateTokenOp>(
+            funcOp.getLoc(), channel->numBuffers, tokenLoadType);
       } else {
-        v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1);
+        v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1,
+                                                tokenLoadType);
       }
       // Channels in the group share the same set of tokens.
       for (auto &c : it->second) {
@@ -2356,22 +2370,13 @@ public:
       funcOp.dump();
     });
 
-    // Step 5: Create tokens, and buffers. A set of tokens for each group of
-    // channels and an array of buffers for each channel.
-    // Update channelReuse that maps from a representing channel to the group of
+    // Step 5: Create buffers. An array of buffers for each channel. Update
+    // channelReuse that maps from a representing channel to the group of
     // channels that share buffers.
     DenseMap<Channel *, SmallVector<Channel *>> channelReuse;
     DenseMap<Channel *, Value> bufferMap =
         createBuffer(channelsGroupedByProducers, funcOp, numConsumerGroups,
                      mapToRepresenting, channelReuse);
-    DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
-    DenseMap<Channel *, DenseMap<int, Value>> tokenMap =
-        createToken(channelsGroupedByConsumers, orderedChannels, funcOp,
-                    numConsumerGroups, channelReuse, barrierAllocMap);
-    LLVM_DEBUG({
-      LDBG("\n\nafter createBuffer");
-      funcOp.dump();
-    });
 
     // Step 6: Lower the loads. Also add local copy ops for non-load
     // producers.
@@ -2382,7 +2387,18 @@ public:
       funcOp.dump();
     });
 
-    // Step 7: add async communication ops (ProducerAcquire etc). Also lower
+    // Step 7: Create tokens. A set of tokens for each group of channels for
+    // each channel.
+    DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
+    DenseMap<Channel *, DenseMap<int, Value>> tokenMap = createToken(
+        channelsGroupedByConsumers, orderedChannels, funcOp, numConsumerGroups,
+        copyOpMap, channelReuse, barrierAllocMap);
+    LLVM_DEBUG({
+      LDBG("\n\nafter createBuffer");
+      funcOp.dump();
+    });
+
+    // Step 8: add async communication ops (ProducerAcquire etc). Also lower
     // TMA loads.
     insertAsyncComm(funcOp, channelsGroupedByConsumers, tokenMap,
                     barrierAllocMap, bufferMap, copyOpMap, numConsumerGroups);

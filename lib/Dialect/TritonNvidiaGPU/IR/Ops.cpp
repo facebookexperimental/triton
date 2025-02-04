@@ -27,6 +27,7 @@
 
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonNvidiaGPU/IR/Ops.cpp.inc"
+#include "triton/Dialect/TritonNvidiaGPU/IR/OpsEnums.cpp.inc"
 
 namespace mlir {
 namespace triton {
@@ -100,10 +101,11 @@ void GetAsyncTaskIdOp::build(::mlir::OpBuilder &builder,
 }
 
 void CreateTokenOp::build(::mlir::OpBuilder &builder,
-                          ::mlir::OperationState &state, uint32_t num) {
+                          ::mlir::OperationState &state, uint32_t num,
+                          TokenLoadType loadType) {
   auto tokenType = TokenType::get(builder.getContext());
   auto resultType = RankedTensorType::get({num}, tokenType);
-  build(builder, state, resultType, num);
+  build(builder, state, resultType, num, loadType);
 }
 
 static LogicalResult verifyBarrierType(Operation *op, MemDescType barrierType) {
