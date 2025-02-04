@@ -51,3 +51,11 @@ class GPUDriver(DriverBase):
     # TODO: remove once TMA is cleaned up
     def assemble_tensormap_to_arg(self, tensormaps_info, args):
         return args
+
+
+class NonGPUDriver(DriverBase):
+
+    def __init__(self):
+        self.get_device_capability = lambda: 0
+        self.get_current_stream = lambda _: 0
+        self.get_current_device = lambda: 0

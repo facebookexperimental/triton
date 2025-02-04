@@ -16,6 +16,7 @@ import re
 import functools
 import os
 import sysconfig
+import time
 
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
 #    and any following whitespace
@@ -119,6 +120,8 @@ class IRSource:
         return self.module
 
     def parse_options(self):
+        if self.ext == "ttmir":
+            assert False, "ttmir is not supported yet"
         if self.ext == "ttgir":
             num_warps = self.module.get_int_attr("ttg.num-warps")
             assert num_warps is not None, "Unable to parse ttg.num-warps attribute"
@@ -278,6 +281,7 @@ def compile(src, target=None, options=None):
         filter_traceback(e)
         raise
     use_ir_loc = os.environ.get("USE_IR_LOC", None)
+    start_time = time.time()
     for ext, compile_ir in list(stages.items())[first_stage:]:
         next_module = compile_ir(module, metadata)
         ir_filename = f"{file_name}.{ext}"
@@ -309,6 +313,8 @@ def compile(src, target=None, options=None):
     if not os.environ.get("TRITON_ENABLE_ASAN", "0") == "1":
         context.disable_multithreading()
     # return handle to compiled kernel
+    elapsed_time = time.time() - start_time
+    print(f"[triton-machine] Compilation completed in {elapsed_time:.2f} seconds")
     return CompiledKernel(src, metadata_group, hash)
 
 

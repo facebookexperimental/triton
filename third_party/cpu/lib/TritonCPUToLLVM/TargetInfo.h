@@ -1,58 +1,71 @@
-#ifndef TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TARGETINFO_H_
-#define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TARGETINFO_H_
+#ifndef TRITON_CONVERSION_TRITONGPU_TO_LLVM_TARGETINFONVIDIA_H
+#define TRITON_CONVERSION_TRITONGPU_TO_LLVM_TARGETINFONVIDIA_H
 
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
-#include "llvm/TargetParser/TargetParser.h"
-#include <string>
 
-namespace mlir::triton::AMD {
+namespace mlir::triton::CPU {
+
 class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
-  explicit TargetInfo(std::string arch) : arch(std::move(arch)) {}
+  TargetInfo() {}
 
-  ISAFamily getISAFamily() const { return deduceISAFamily(arch); }
-
-  llvm::AMDGPU::GPUKind getGPUKind() const;
-
-  int getSharedMemorySize() const;
-
-  bool supportMaximumMinimum() const override;
+  bool supportMaximumMinimum() const override { return false; }
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;
 
   Value ballot(RewriterBase &rewriter, Location loc, Type type,
-               Value cmp) const override;
+               Value cmp) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
 
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     std::optional<Value> ctaId, Value val,
-                    Value pred) const override;
+                    Value pred) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     std::optional<Value> ctaId, Type elemTy,
-                    Value pred) const override;
+                    Value pred) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
 
   bool canUseStMatrix(RankedTensorType tensorTy, ArrayRef<unsigned> repShape,
                       ArrayRef<unsigned> paddedRepShape,
                       ArrayRef<unsigned> order,
-                      int swizzleByteSize) const override;
+                      int swizzleByteSize) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
+
   void storeMatrixShared(RewriterBase &rewriter, Location loc, Value ptr,
-                         Value val) const override;
+                         Value val) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
-                   int i) const override;
+                   int i) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
   Value shuffleUp(RewriterBase &rewriter, Location loc, Value val,
-                  int i) const override;
+                  int i) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
-                   int i) const override;
+                   int i) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
-                   Value i) const override;
+                   Value i) const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
 
   Value programId(RewriterBase &rewriter, Location loc, ModuleOp moduleOp,
                   int axis) const override;
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
-                  unsigned interleave) const override;
+                  unsigned interleave) const override {
+    return false;
+  }
 
   std::string getMulhiFuncName(Type resultElementTy) const override;
 
@@ -64,18 +77,16 @@ public:
 
   void assertFail(RewriterBase &rewriter, Location loc, StringRef message,
                   StringRef file, StringRef func, int line) const override;
-  int getSharedAddressSpace() const override;
 
-  bool supportVectorizedAtomics() const override;
+  int getSharedAddressSpace() const override {
+    llvm::report_fatal_error("Not supported on CPU");
+  }
 
-  bool isCPUMode() const override { return false; }
+  bool supportVectorizedAtomics() const override { return false; };
 
-private:
-  void printfImpl(Value formatStrStart, int formatStrByteCount, ValueRange args,
-                  RewriterBase &rewriter, bool useStdErr) const;
-
-  std::string arch;
+  bool isCPUMode() const override { return true; }
 };
-} // namespace mlir::triton::AMD
 
-#endif // TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TARGETINFO_H_
+} // namespace mlir::triton::CPU
+
+#endif // TRITON_CONVERSION_TRITONGPU_TO_LLVM_TARGETINFONVIDIA_H

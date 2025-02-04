@@ -26,6 +26,11 @@ static int __builtin_ctz(unsigned x) {
 
 #endif
 
+namespace {
+// TODO: I don't like it. This is a quick hack for PoC.
+bool cpuMode = false;
+} // namespace
+
 namespace mlir {
 
 namespace triton::gpu {
@@ -56,6 +61,10 @@ LLVM::LLVMFuncOp appendOrGetExternFuncOp(RewriterBase &rewriter, Operation *op,
                               StringAttr::get(op->getContext(), libpath));
   return ret;
 }
+
+bool isCPUMode() { return cpuMode; }
+
+void enableCPUMode() { cpuMode = true; }
 } // namespace triton::gpu
 
 SmallVector<std::pair<StringAttr, Value>>

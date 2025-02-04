@@ -64,6 +64,8 @@ public:
 
   int getPtxVersion() const { return ptxVersion; }
 
+  bool isCPUMode() const override { return false; }
+
 private:
   int computeCapability;
   int ptxVersion;
