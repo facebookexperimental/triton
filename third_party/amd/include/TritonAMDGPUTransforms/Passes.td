@@ -121,4 +121,15 @@ def TritonAMDGPUConvertToBufferOps : Pass<"tritonamdgpu-convert-buffer-ops", "ml
   let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUWSLowering : Pass<"tritonamdgpu-ws-lowering", "mlir::ModuleOp"> {
+  let summary = "Lowering WS ops to amd gpu";
+
+    let description = "This pass lowers wave specialization ops to WS dialect.";
+
+    let constructor = "mlir::createTritonAMDGPUWSLoweringPass()";
+
+    let dependentDialects = ["mlir::ROCDL::ROCDLDialect",
+                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
 #endif

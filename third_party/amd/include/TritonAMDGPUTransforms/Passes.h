@@ -1,6 +1,7 @@
 #ifndef TRITON_DIALECT_TRITONAMDGPU_TRANSFORMS_PASSES_H_
 #define TRITON_DIALECT_TRITONAMDGPU_TRANSFORMS_PASSES_H_
 
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -25,6 +26,8 @@ std::unique_ptr<Pass> createTritonAMDGPUOptimizeEpiloguePass();
 std::unique_ptr<Pass> createTritonAMDGPUCanonicalizePointersPass();
 
 std::unique_ptr<Pass> createTritonAMDGPUConvertToBufferOpsPass();
+
+std::unique_ptr<Pass> createTritonAMDGPUWSLoweringPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
