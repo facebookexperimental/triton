@@ -325,13 +325,13 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 // CHECK: scf.if %[[#WG1]]
 // CHECK: triton_nvidia_gpu.reg_alloc 232
 // CHECK: scf.for
-// CHECK: triton_nvidia_gpu.producer_acquire
 // CHECK: scf.for
 // CHECK: triton_nvidia_gpu.wait_barrier
 // CHECK: triton_gpu.local_load
 // CHECK: triton_gpu.local_load
 // CHECK: triton_nvidia_gpu.warp_group_dot
 // CHECK: triton_nvidia_gpu.consumer_release
+// CHECK: triton_nvidia_gpu.producer_acquire
 // CHECK: triton_gpu.local_store
 // CHECK: triton_nvidia_gpu.producer_commit
 // CHECK: %c2_i32 = arith.constant 2 : i32
@@ -340,8 +340,8 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 // CHECK: triton_nvidia_gpu.reg_alloc 232
 // CHECK: scf.for
 // CHECK: scf.for
-// CHECK: triton_gpu.local_load
 // CHECK: triton_nvidia_gpu.consumer_wait
+// CHECK: triton_gpu.local_load
 // CHECK: triton_nvidia_gpu.consumer_release
 // CHECK: tt.experimental_descriptor_store
 

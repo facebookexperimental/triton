@@ -2069,6 +2069,7 @@ void insertAsyncComm(
       auto pcOp = copyOpMap.find(c)->second;
       producerOps.insert(pcOp.first);
       consumerOps.insert(pcOp.second);
+      consumerOps.insert(c->getDstOp());
     }
 
     // Find head producer
@@ -2278,10 +2279,8 @@ void insertAsyncCopy(
     }
 
     for (auto &channel : kv.second) {
-      copyOpMap[channel] = {producerConsumerOps.first, channel->getDstOp()};
+      copyOpMap[channel] = producerConsumerOps;
     }
-
-    copyOpMap[domininatingChannel] = producerConsumerOps;
   }
 }
 
