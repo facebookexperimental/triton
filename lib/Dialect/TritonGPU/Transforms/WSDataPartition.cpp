@@ -249,7 +249,7 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
     if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
       opndA = dotOp.getA();
       opndB = dotOp.getB();
-      accumulator = dotOp.getC();
+      accumulator = dotOp.getD();
     } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
       opndA = dotOp.getA();
       opndB = dotOp.getB();
