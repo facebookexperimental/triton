@@ -63,6 +63,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDGPUStreamPipelineV2();
   mlir::registerTritonAMDGPUCanonicalizePointers();
   mlir::registerTritonAMDGPUConvertToBufferOps();
+  mlir::registerTritonAMDGPUWSLowering();
 
   // TODO: register Triton & TritonGPU passes
   registry.insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,

@@ -1,8 +1,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 
-#include <set>
-
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/OperationSupport.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -11,6 +10,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include <set>
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
