@@ -27,6 +27,7 @@ from triton._internal_testing import (
     float_dtypes_with_bfloat16,
     dtypes,
     dtypes_with_bfloat16,
+    is_cpu,
     is_cuda,
     is_interpreter,
     is_hopper,
@@ -36,7 +37,6 @@ from triton._internal_testing import (
     is_hip_mi300,
     is_xpu,
     get_arch,
-    is_new_cpu,
     torch_float8_dtypes,
     torch_dtypes,
     numpy_random,
@@ -126,7 +126,7 @@ def check_type_supported(dtype, device):
     if is_interpreter():
         if dtype in [tl.bfloat16, "bfloat16", torch.bfloat16]:
             pytest.skip("bfloat16 is not supported in the interpreter")
-    if dtype == 'float8e4b15' and is_new_cpu():
+    if dtype == 'float8e4b15' and is_cpu():
         pytest.skip("float8e4b15 not supported on CPU")
 
 
@@ -334,7 +334,7 @@ def test_empty_kernel_scalar_arg(device):
 
 # generic test functions
 def _test_unary(dtype_x, expr, numpy_expr=None, device='cuda', num_ctas=1):
-    if is_new_cpu() and dtype_x == 'bfloat16':
+    if is_cpu() and dtype_x == 'bfloat16':
         pytest.skip("experimental cpu: unsupported precisions")
 
     check_type_supported(dtype_x, device)  # early return if dtype_x is not supported
@@ -559,7 +559,7 @@ def test_dtype_codegen():
 ])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_bin_op(dtype_x, dtype_y, op, num_ctas, device):
-    if is_new_cpu() and (dtype_x == 'bfloat16' or dtype_y == 'bfloat16'):
+    if is_cpu() and (dtype_x == 'bfloat16' or dtype_y == 'bfloat16'):
         pytest.skip("experimental cpu: unsupported precisions")
 
     expr = f'x {op} y'
@@ -1229,7 +1229,7 @@ def test_abs_fp8(in_dtype, device):
             pytest.skip("float8e4b15 not supported on CUDA >= 9.0")
         if in_dtype == tl.float8e4nv and cc < (8, 9):
             pytest.skip("float8e4nv not supported on CUDA < 8.9")
-    elif is_new_cpu():
+    elif is_cpu():
         pytest.skip('CPU not supports "fp8e4b15"')
 
     @triton.jit
@@ -1500,7 +1500,7 @@ def noinline_multi_values_fn(x, y, Z):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("mode", ["simple", "call_graph", "shared", "dynamic", "multi_values"])
 def test_noinline(mode, device):
-    if is_new_cpu() and mode == "shared":
+    if is_cpu() and mode == "shared":
         pytest.skip("experimental cpu: need to support tid/pid for noinlined functions")
 
     @triton.jit
@@ -1849,7 +1849,7 @@ def test_load_scope_sem_coop_grid_cta_one(device):
                               for size in [1024, 32]]) if torch.__version__ >= "2.1" else []))
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
-    if is_new_cpu() and (dtype_x == 'bfloat16' or dtype_z == 'bfloat16'):
+    if is_cpu() and (dtype_x == 'bfloat16' or dtype_z == 'bfloat16'):
         pytest.skip("experimental cpu: unsupported precisions")
 
     # CUDA: bfloat16 on cc < 80 will not be tested
@@ -1863,19 +1863,19 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
     if is_hip() and (dtype_z in ("bfloat16", "float8_e4m3fn") or dtype_x == "float8_e4m3fn"):
         pytest.skip(f'test_cast{(dtype_x, dtype_z)} cast to bfloat16 not supported on HIP.')
 
-    if is_new_cpu() and (dtype_x in torch_float8_dtypes or dtype_z in torch_float8_dtypes):
+    if is_cpu() and (dtype_x in torch_float8_dtypes or dtype_z in torch_float8_dtypes):
         pytest.skip(f'test_cast{(dtype_x, dtype_z)} is not supported on CPU.')
 
     # fptrunc fp32->fp16 is broken in LLVM for large vectors:
     #   https://github.com/llvm/llvm-project/issues/95274
     # TODO: remove the change after the bug is fixed.
-    if is_new_cpu() and dtype_x == "float32" and dtype_z == "float16":
+    if is_cpu() and dtype_x == "float32" and dtype_z == "float16":
         size = 512
 
     # bf16 vector cast is broken in LLVM for large vectors:
     #   https://github.com/llvm/llvm-project/issues/92471
     # TODO: Remove the change after the bug is fixed.
-    if is_new_cpu() and dtype_x == 'bfloat16' and size > 128:
+    if is_cpu() and dtype_x == 'bfloat16' and size > 128:
         size = 128
 
     torch.manual_seed(0)
@@ -2319,7 +2319,7 @@ def get_reduced_dtype(dtype_str, op):
 def test_reduce1d(op, dtype_str, shape, num_ctas, device):
     check_type_supported(dtype_str, device)  # bfloat16 on cc < 80 will not be tested
 
-    if is_new_cpu() and dtype_str == 'bfloat16':
+    if is_cpu() and dtype_str == 'bfloat16':
         pytest.skip("experimental cpu: unsupported precisions")
 
     # triton kernel
@@ -2425,7 +2425,7 @@ reduce_bool = [(op, 'bool', shape, axis, False) for op in ['xor_sum'] for shape 
 def test_reduce(op, dtype_str, shape, axis, keep_dims, num_ctas, device):
     check_type_supported(dtype_str, device)  # bfloat16 on cc < 80 will not be tested
 
-    if is_new_cpu() and dtype_str == 'bfloat16':
+    if is_cpu() and dtype_str == 'bfloat16':
         pytest.skip("experimental cpu: unsupported precisions")
 
     @triton.jit
@@ -2608,15 +2608,15 @@ def roll(a1, b1_last, b1_cur, a2, b2_last, b2_cur):
 @pytest.mark.parametrize("op, dtype_str, shape, axis, reverse, num_warps", scan_configs + negative_config)
 def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
     check_type_supported(dtype_str, device)
-    # if is_new_cpu():
+    # if is_cpu():
     #     pytest.skip("experimental cpu: too long compilation time")
 
     # TODO: Takes ~20 mins to compile. Need to improve it. Mostly spent in LLVM vectorizer
-    if is_new_cpu() and (shape[0] >= 128 or shape[1] >= 128):
+    if is_cpu() and (shape[0] >= 128 or shape[1] >= 128):
         pytest.skip("experimental cpu: too long compilation time")
 
     if dtype_str == 'bfloat16':
-        if is_new_cpu():
+        if is_cpu():
             pytest.skip("experimental cpu: unsupported precisions")
 
         if is_cuda() and op == 'cummax':
@@ -2628,7 +2628,7 @@ def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
     # bf16 vector cast is broken in LLVM for large vectors:
     #   https://github.com/llvm/llvm-project/issues/92471
     # TODO: Remove the change after the bug is fixed.
-    if is_new_cpu() and dtype_str == 'bfloat16':
+    if is_cpu() and dtype_str == 'bfloat16':
         shape = (min(shape[0], 128), min(shape[1], 128))
 
     # triton kernel
@@ -2767,7 +2767,7 @@ def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("M, N", [[2048, 2], [1024, 8], [1024, 128], [256, 512], [32, 512], [8, 512], [8, 2]])
 def test_histogram(M, N, device):
-    if is_new_cpu() and (M, N) in ((1024, 128), (256, 512)):
+    if is_cpu() and (M, N) in ((1024, 128), (256, 512)):
         pytest.skip("experimental cpu: too long compilation time")
 
     @triton.jit
@@ -2797,7 +2797,7 @@ def test_histogram(M, N, device):
 def test_scan_1d(M, N):
 
     # TODO: Fix it
-    if is_new_cpu():
+    if is_cpu():
         pytest.skip("TODO: Fix it")
 
     @triton.jit
@@ -3564,7 +3564,7 @@ def get_test_dot_small_mn_fma_cases():
 def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack, mma_nonk_size,
              num_ctas, device):
     not_supported = ['float8e4nv', 'float8e5', 'bfloat16', 'float16', 'int8']
-    if is_new_cpu():  #  and (in_dtype in not_supported or out_dtype in not_supported):
+    if is_cpu():  #  and (in_dtype in not_supported or out_dtype in not_supported):
         pytest.skip("experimental cpu: unsupported precisions")
 
     if is_interpreter():
@@ -4059,7 +4059,7 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
                           for M, N, K in [(32, 32, 32)]
                           for in_dtype_str, out_dtype_str in [('float16', 'float16'), ('float32', 'float32')]])
 def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str, device):
-    if is_new_cpu():
+    if is_cpu():
         pytest.skip("experimental cpu: need to fully implement DotOperandEncodingAttr::toLinearLayout")
 
     if is_hip():
@@ -4071,7 +4071,7 @@ def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_
                 pytest.skip(f"{in_dtype_str} is not supported in WMMA dot, FMA does not support dot3d")
             if out_dtype_str == "float16":
                 pytest.skip(f"{out_dtype_str} has low precision in WMMA dot")
-    elif is_new_cpu():
+    elif is_cpu():
         if out_dtype_str == "float16":
             pytest.skip("Test is skipped due to float16 accuracy issue")
         input_precision = "tf32" if in_dtype_str == 'float32' else "ieee"
@@ -4376,8 +4376,6 @@ def test_const(device, choose_const, constexpr, mode):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ['float32', 'float16'])
 def test_dot_without_load(dtype_str, device):
-    if is_new_cpu() and dtype_str == 'float16':
-        pytest.skip("experimental cpu: unsupported precisions")
 
     @triton.jit
     def _kernel(out):
@@ -4390,7 +4388,7 @@ def test_dot_without_load(dtype_str, device):
     kernel = patch_kernel(_kernel, {'GENERATE_TEST_HERE': f"tl.full((32, 32), 1.0, tl.{dtype_str})"})
     a = torch.ones((32, 32), dtype=getattr(torch, dtype_str), device=device)
     b = torch.ones((32, 32), dtype=getattr(torch, dtype_str), device=device)
-    if is_new_cpu() and dtype_str == "float16":
+    if is_cpu() and dtype_str == "float16":
         # torch.matmul not implemented for Half float (float16) cpu
         out_ref = torch.tensor(np.matmul(to_numpy(a), to_numpy(b)), dtype=getattr(torch, dtype_str), device=device)
     else:
@@ -4503,7 +4501,7 @@ def test_masked_load_scalar(num_ctas, mask_val, other_val, device):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_masked_load_shared_memory(dtype, device):
 
-    if is_new_cpu() and dtype in [torch.bfloat16, torch.float16]:
+    if is_cpu() and dtype in [torch.bfloat16, torch.float16]:
         pytest.skip("experimental cpu: unsupported precisions")
 
     check_type_supported(dtype, device)  # bfloat16 on cc < 80 will not be tested
@@ -4540,7 +4538,7 @@ def test_masked_load_shared_memory(dtype, device):
 
     pgm = _kernel[(1, )](in1, in2, out, in1.stride()[0], in2.stride()[0], out.stride()[0], in1.numel(), in2.numel(),
                          out.numel(), M=M, N=N, K=K)
-    if is_new_cpu() and (dtype == torch.float16 or dtype == torch.bfloat16):
+    if is_cpu() and (dtype == torch.float16 or dtype == torch.bfloat16):
         # torch.matmul not implemented for Half float (float16) cpu
         reference_out = torch.tensor(np.matmul(to_numpy(in1), to_numpy(in2))).to(torch.float32)
         # f32_in1 = convert_float_to_float32(in1)
@@ -5055,7 +5053,7 @@ def test_trans_reshape(device):
     actual = torch.zeros(expected.shape, dtype=torch.int32, device=device)
 
     k = kernel[(1, )](input, actual, shape[0], shape[1])
-    if not is_new_cpu():
+    if not is_cpu():
         assert k.asm['ttgir'].count(
             'ttg.convert_layout') == 1, "Expected exactly one convert_layout op in the TTGIR after optimization"
 
@@ -5743,7 +5741,7 @@ def test_num_threads(device):
     if is_hip():
         pytest.skip("test_num_threads is not supported in HIP")
 
-    if is_new_cpu():
+    if is_cpu():
         pytest.skip("Use TRITON_CPU_ALLOW_MULTI_WARPS=1")
 
     @triton.jit
@@ -6457,7 +6455,7 @@ def test_ptx_cast(dtype_str, device):
 
 def f8_to_f16(x, dtype):
 
-    if is_new_cpu():
+    if is_cpu():
         assert (False and "Works as expected only for GPU")
 
     @triton.jit
@@ -6516,7 +6514,7 @@ def matmul_kernel(  #
 @pytest.mark.parametrize("low_precision_acc", [0, 32, 64, 128])
 def test_dot_max_num_imprecise_acc(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, in_type_str, low_precision_acc, device):
     num_stages = 3
-    if is_new_cpu():
+    if is_cpu():
         pytest.skip("experimental cpu: unsupported precisions")
 
     if is_cuda():
@@ -6702,7 +6700,7 @@ def test_clamp(dtype, device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", ['bfloat16', 'float16', 'float32'])
 def test_clamp_symmetric(dtype, device):
-    if is_new_cpu() and dtype == 'bfloat16':
+    if is_cpu() and dtype == 'bfloat16':
         pytest.skip("experimental cpu: unsupported precisions")
 
     @triton.jit
@@ -6763,7 +6761,7 @@ def test_tl_range(device):
     if is_hip():
         pytest.skip("test_tl_range is not supported in HIP")
     M, N, K = 64, 64, 512
-    if is_new_cpu():
+    if is_cpu():
         block_m, block_n, block_k = 32, 32, 64
     else:
         block_m, block_n, block_k = M, N, 64
@@ -6775,7 +6773,7 @@ def test_tl_range(device):
         1,
     ](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M, BLOCK_N,
       BLOCK_K, 0, num_stages=5)
-    if is_new_cpu():
+    if is_cpu():
         # torch.matmul not implemented for Half float (float16) cpu
         ref_out = torch.tensor(np.matmul(to_numpy(a), to_numpy(b)), dtype=torch.float32, device=device)
     else:
