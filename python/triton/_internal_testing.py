@@ -37,7 +37,7 @@ def is_cuda():
     return False if target is None else target.backend == "cuda"
 
 
-def is_new_cpu():
+def is_cpu():
     target = get_current_target()
     if target is None:
         return False
