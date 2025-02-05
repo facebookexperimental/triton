@@ -173,12 +173,24 @@ public:
     auto resultElementTy = getElementTypeOrSelf(resultTy);
     Type elemTy = this->getTypeConverter()->convertType(resultElementTy);
     SmallVector<SmallVector<Value>> allOperands;
+    int vecLength = 0;
     for (auto operand : adaptor.getOperands()) {
       auto argTy = op->getOperand(0).getType();
       auto subOperands = unpackLLElements(loc, operand, rewriter);
-      allOperands.resize(subOperands.size());
-      for (auto v : llvm::enumerate(subOperands))
-        allOperands[v.index()].push_back(v.value());
+      if (triton::gpu::isCPUMode() && subOperands.size() > 1) {
+        // For CPU mode, it could result in many scalar operations (as many as
+        // the vector length). Promote them to vector operations. Note that this
+        // is still inefficient. We could directly get vector types.
+        assert(vecLength == 0 || vecLength == subOperands.size());
+        vecLength = subOperands.size();
+        Value vecSubOperand = packLLVector(loc, subOperands, rewriter);
+        allOperands.resize(1);
+        allOperands[0].push_back(vecSubOperand);
+      } else {
+        allOperands.resize(subOperands.size());
+        for (auto v : llvm::enumerate(subOperands))
+          allOperands[v.index()].push_back(v.value());
+      }
     }
     if (allOperands.size() == 0)
       allOperands.push_back({});
@@ -186,7 +198,9 @@ public:
     SmallVector<Value> resultVals;
     for (auto it = allOperands.begin(), end = allOperands.end(); it != end;) {
       auto curr = static_cast<const ConcreteT *>(this)->createDestOps(
-          op, adaptor, rewriter, elemTy, MultipleOperandsRange(it, end), loc);
+          op, adaptor, rewriter,
+          (vecLength > 0 ? LLVM::getVectorType(elemTy, vecLength) : elemTy),
+          MultipleOperandsRange(it, end), loc);
       if (curr.size() == 0)
         return failure();
       for (auto v : curr) {
@@ -196,6 +210,15 @@ public:
       }
       it += curr.size();
     }
+
+    if (triton::gpu::isCPUMode() && vecLength > 0) {
+      // The result is also a vector. Unpack the vector and repack to the struct
+      // type. Again, this is highly inefficient and should be optimized.
+      assert(resultVals.size() == 1 &&
+             LLVM::isCompatibleVectorType(resultVals[0].getType()));
+      resultVals = unpackLLVector(loc, resultVals[0], rewriter);
+    }
+
     resultVals = maybeDeduplicate(op, resultVals);
     Value view = packLLElements(loc, this->getTypeConverter(), resultVals,
                                 rewriter, resultTy);
