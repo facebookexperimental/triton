@@ -389,10 +389,25 @@ Operation *sliceOp(Operation *op, int offset,
                                    type.getShape().end()};
         int sliceSize = shape[dim] / numOfPartitions;
         shape[dim] = sliceSize;
-        auto newType =
-            MemDescType::get(shape, type.getElementType(), type.getEncoding(),
-                             type.getMemorySpace(), type.getMutableMemory());
-        newV.setType(newType);
+        // change encoding for ttng.tensor_memory_encoding to match gen5.
+        if (auto tmem = dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(
+                type.getEncoding())) {
+          Attribute accEncoding =
+              triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+                  builder.getContext(),
+                  dim == 0 ? tmem.getBlockM() / 2 : tmem.getBlockM(),
+                  dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
+                  tmem.getUnpacked(), tmem.getCTASplitM(), tmem.getCTASplitN());
+          auto newType =
+              MemDescType::get(shape, type.getElementType(), accEncoding,
+                               type.getMemorySpace(), type.getMutableMemory());
+          newV.setType(newType);
+        } else {
+          auto newType =
+              MemDescType::get(shape, type.getElementType(), type.getEncoding(),
+                               type.getMemorySpace(), type.getMutableMemory());
+          newV.setType(newType);
+        }
       } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
         SmallVector<int64_t> shape{type.getShape().begin(),
                                    type.getShape().end()};
@@ -422,12 +437,103 @@ Operation *sliceOp(Operation *op, int offset,
   // slice operands first
   Operation *newOp;
   if (op->hasTrait<OpTrait::Elementwise>() ||
-      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, LocalAllocOp,
-          nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp>(op)) {
+      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, LocalAllocOp>(
+          op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, builder, mappings, reverseMappings,
               partitionScheme);
     newOp = cloneAndSetResultType(op);
+  } else if (auto tmemLdOp = dyn_cast<nvidia_gpu::TMEMLoadOp>(op)) {
+    for (Value operand : op->getOperands())
+      sliceOp(operand, offset, builder, mappings, reverseMappings,
+              partitionScheme);
+    auto srcTy = mappings.lookupOrNull(tmemLdOp.getSrc()).getType();
+    auto type = cast<MemDescType>(srcTy);
+    auto tmem = cast<nvidia_gpu::TensorMemoryEncodingAttr>(type.getEncoding());
+
+    RankedTensorType oldRetType = tmemLdOp.getType();
+    auto retShapePerCTA = getShapePerCTA(oldRetType);
+    int numWarps =
+        TritonGPUDialect::getNumWarps(op->getParentOfType<ModuleOp>());
+    auto CTALayout = getCTALayout(oldRetType.getEncoding());
+    builder.setInsertionPoint(op);
+    Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
+        tmem.getBlockM(), tmem.getBlockN(), retShapePerCTA, numWarps,
+        CTALayout);
+
+    SmallVector<int64_t> shape{oldRetType.getShape().begin(),
+                               oldRetType.getShape().end()};
+    int sliceSize = shape[dim] / numOfPartitions;
+    shape[dim] = sliceSize;
+    auto newAccType = RankedTensorType::get(shape, oldRetType.getElementType(),
+                                            newDistributedEncoding);
+    auto ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
+        op->getLoc(), newAccType, mappings.lookupOrNull(tmemLdOp.getSrc()));
+
+    auto newType = RankedTensorType::get(shape, oldRetType.getElementType(),
+                                         oldRetType.getEncoding());
+    auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(op->getLoc(),
+                                                                 newType, ld);
+    auto v = tmemLdOp->getResult(0);
+    auto newV = cvtOp->getResult(0);
+    mappings.map(v, newV);
+    reverseMappings.map(newV, v);
+    newOp = cvtOp;
+  } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
+    for (Value operand : op->getOperands())
+      sliceOp(operand, offset, builder, mappings, reverseMappings,
+              partitionScheme);
+    // Check for src.
+    if (tmemAllocOp.getSrc()) {
+      // src is blocked layout. apply convert layout on src
+      auto srcTy = cast<RankedTensorType>(
+          mappings.lookupOrNull(tmemAllocOp.getSrc()).getType());
+
+      // convert from srcTy to a compatible blocked layout.
+      auto retShapePerCTA = getShapePerCTA(srcTy);
+      int numWarps =
+          TritonGPUDialect::getNumWarps(op->getParentOfType<ModuleOp>());
+      auto CTALayout = getCTALayout(srcTy.getEncoding());
+      builder.setInsertionPoint(op);
+
+      // calculate new tmem type.
+      auto retType = cast<MemDescType>(tmemAllocOp.getType());
+      SmallVector<int64_t> shape{retType.getShape().begin(),
+                                 retType.getShape().end()};
+      int sliceSize = shape[dim] / numOfPartitions;
+      shape[dim] = sliceSize;
+      auto tmem =
+          cast<nvidia_gpu::TensorMemoryEncodingAttr>(retType.getEncoding());
+      auto accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+          builder.getContext(),
+          dim == 0 ? tmem.getBlockM() / 2 : tmem.getBlockM(),
+          dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
+          tmem.getUnpacked(), tmem.getCTASplitM(), tmem.getCTASplitN());
+      auto newType = MemDescType::get(shape, retType.getElementType(),
+                                      accEncoding, retType.getMemorySpace(),
+                                      retType.getMutableMemory());
+
+      Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
+          accEncoding.getBlockM(), accEncoding.getBlockN(), retShapePerCTA,
+          numWarps, CTALayout);
+      auto newAccType = RankedTensorType::get(
+          srcTy.getShape(), srcTy.getElementType(), newDistributedEncoding);
+      auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
+          op->getLoc(), newAccType,
+          mappings.lookupOrNull(tmemAllocOp.getSrc()));
+
+      // replace tmemAllocOp with alloc, where the src is cvtOp.
+      auto alloc =
+          builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMAllocOp>(
+              op->getLoc(), newType, cvtOp);
+
+      auto v = tmemAllocOp->getResult(0);
+      auto newV = alloc->getResult(0);
+      mappings.map(v, newV);
+      reverseMappings.map(newV, v);
+      newOp = alloc;
+    } else
+      newOp = cloneAndSetResultType(op);
   } else if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
     builder.setInsertionPoint(op);
     auto valAttr = cast<DenseElementsAttr>(constOp.getValueAttr());
@@ -730,6 +836,7 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
   // clean up
 
   SmallVector<Operation *> opsToDelete;
+  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
   for (auto op : partitionScheme.ops) {
     if (isa<scf::YieldOp>(op))
       continue;
@@ -756,6 +863,42 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
     partitionScheme.ops.remove(op);
     op->erase();
   }
+
+  // Collect original operations
+  SmallVector<scf::ForOp> orderedForOps;
+  funcOp.walk([&](Operation *op) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op))
+      orderedForOps.push_back(forOp);
+  });
+  for (auto &forOp : orderedForOps) {
+    SmallVector<Operation *> opList;
+    forOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
+      if (!isa<scf::YieldOp>(subOp) && subOp != forOp.getOperation() &&
+          partitionScheme.ops.count(subOp))
+        opList.push_back(subOp);
+    });
+    Block &block = *forOp.getBody();
+    for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
+      Operation *op = *it;
+      LLVM_DEBUG({
+        LDBG("erasing op ");
+        op->dump();
+      });
+      // Update YieldOpnd if op feeds into Yield.
+      for (unsigned i = 0; i < op->getNumResults(); ++i) {
+        for (OpOperand &yieldOpOperand : op->getResult(i).getUses()) {
+          if (auto yieldOp =
+                  dyn_cast<scf::YieldOp>(yieldOpOperand.getOwner())) {
+            auto operandNumber = yieldOpOperand.getOperandNumber();
+            BlockArgument arg = block.getArgument(operandNumber + 1);
+            yieldOp.setOperand(operandNumber, arg);
+          }
+        }
+      }
+      op->erase();
+    }
+  }
+
   LLVM_DEBUG({
     LDBG("prior to clean up:");
     funcOp.dump();
