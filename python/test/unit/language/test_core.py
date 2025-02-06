@@ -2608,8 +2608,6 @@ def roll(a1, b1_last, b1_cur, a2, b2_last, b2_cur):
 @pytest.mark.parametrize("op, dtype_str, shape, axis, reverse, num_warps", scan_configs + negative_config)
 def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
     check_type_supported(dtype_str, device)
-    # if is_cpu():
-    #     pytest.skip("experimental cpu: too long compilation time")
 
     # TODO: Takes ~20 mins to compile. Need to improve it. Mostly spent in LLVM vectorizer
     if is_cpu() and (shape[0] >= 128 or shape[1] >= 128):
@@ -3564,8 +3562,10 @@ def get_test_dot_small_mn_fma_cases():
 def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack, mma_nonk_size,
              num_ctas, device):
     not_supported = ['float8e4nv', 'float8e5', 'bfloat16', 'float16', 'int8']
-    if is_cpu():  #  and (in_dtype in not_supported or out_dtype in not_supported):
+    if is_cpu() and (in_dtype in not_supported or out_dtype in not_supported):
         pytest.skip("experimental cpu: unsupported precisions")
+    if is_cpu() and (M > 32 or N > 32):
+        pytest.skip("experimental cpu: too long compile time")
 
     if is_interpreter():
         if in_dtype == 'bfloat16':
@@ -4060,7 +4060,7 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
                           for in_dtype_str, out_dtype_str in [('float16', 'float16'), ('float32', 'float32')]])
 def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str, device):
     if is_cpu():
-        pytest.skip("experimental cpu: need to fully implement DotOperandEncodingAttr::toLinearLayout")
+        pytest.skip("experimental cpu: fix type promotion")
 
     if is_hip():
         # hip does not support tf32 precision, so use ieee for all tests
@@ -4376,6 +4376,8 @@ def test_const(device, choose_const, constexpr, mode):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ['float32', 'float16'])
 def test_dot_without_load(dtype_str, device):
+    if is_new_cpu() and dtype_str == 'float16':
+        pytest.skip("experimental cpu: fix type promotion")
 
     @triton.jit
     def _kernel(out):

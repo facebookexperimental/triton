@@ -229,6 +229,29 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
       retSizePerThread[rank - 1] = 4;
       retSizePerThread[rank - 2] = 4;
     }
+
+    // For the CPU mode, where it can have larger vector size than GPU, we need
+    // to increase the size per thread.
+    if (numElements / (numWarps * threadsPerWarp) >= 64) {
+      retSizePerThread[rank - 1] = 8;
+      retSizePerThread[rank - 2] = 8;
+    }
+    if (numElements / (numWarps * threadsPerWarp) >= 256) {
+      retSizePerThread[rank - 1] = 16;
+      retSizePerThread[rank - 2] = 16;
+    }
+    if (numElements / (numWarps * threadsPerWarp) >= 1024) {
+      retSizePerThread[rank - 1] = 32;
+      retSizePerThread[rank - 2] = 32;
+    }
+    // TODO: Should we generalize fro an arbitrary number? Anyhow, the CPU mode
+    // takes too long compilation time for larger block/tensor sizes. So, this
+    // is good enough for now.
+    if (numElements / (numWarps * threadsPerWarp) >= 4096) {
+      retSizePerThread[rank - 1] = 64;
+      retSizePerThread[rank - 2] = 64;
+    }
+
     retSizePerThread[rank - 1] = std::min(
         retSizePerThread[rank - 1], static_cast<unsigned>(origShape[rank - 1]));
     retSizePerThread[rank - 2] = std::min(
