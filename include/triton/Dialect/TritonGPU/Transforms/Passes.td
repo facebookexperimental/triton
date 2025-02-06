@@ -265,4 +265,19 @@ def TritonGPUWSLowering : Pass<"tritongpu-warp-spec-lowering", "mlir::ModuleOp">
            "number of consumer warp groups for warp specialization">
   ];
 }
+
+def TritonGPUPingPongSync: Pass<"tritongpu-ping-pong-sync", "mlir::ModuleOp"> {
+  let summary = "TritonGPU experiemental ping pong schedule";
+
+  let description = "This pass generates warp specialized code baed on warp group id attributes.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+  let options = [
+    Option<"numConsumerGroups", "num-consumer-groups",
+           "int32_t", /*default*/"1",
+           "number of consumer warp groups for warp specialization">,
+  ];
+}
+
 #endif

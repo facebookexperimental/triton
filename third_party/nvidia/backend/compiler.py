@@ -237,6 +237,7 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,
                                                  opt.reg_dec_producer, opt.reg_inc_consumer)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages)
+            passes.ttgpuir.add_ping_pong_sync(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
         passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)

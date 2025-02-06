@@ -23,6 +23,7 @@ add_triton_library(TritonGPUTransforms
   WSDataPartition.cpp
   WSCodePartition.cpp
   WSLowering.cpp
+  PingPong.cpp
 
   DEPENDS
   TritonGPUTransformsIncGen
