@@ -438,10 +438,10 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 
 // Verify that we can reuse buffers between two for loops
 // CHECK-LABEL: @_attn_bwd_ws
-// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<2x64x128xbf16
-// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<2x64x128xbf16
-// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<2x64x128xbf16
-// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<2x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<1x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<1x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 0 : i32} : () -> !tt.memdesc<1x64x128xbf16
+// CHECK-DAG: triton_gpu.local_alloc  {allocation.shareGroup = 1 : i32} : () -> !tt.memdesc<1x64x128xbf16
 
 // CHECK: %[[TID:.*]] = triton_nvidia_gpu.get_async_task_id : i32
 // CHECK: %[[ZERO:.*]] = arith.constant 0 : i32
