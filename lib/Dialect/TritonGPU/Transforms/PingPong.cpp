@@ -36,12 +36,10 @@ namespace gpu {
 
 // Returns the taskId if op has a single taskId, otherwise, returns -1.
 static int getSingleTaskId(Operation *op) {
-  if (!op->hasAttr("async_task_id"))
+  auto asyncTasks = getAsyncTaskIds(op);
+  if (asyncTasks.size() != 1)
     return -1;
-  auto taskArray = op->getAttrOfType<DenseIntElementsAttr>("async_task_id");
-  if (taskArray.getValues<int>().size() > 1)
-    return -1;
-  return taskArray.getValues<int>()[0];
+  return asyncTasks[0];
 }
 
 // Treat exp2, mulf, addf, reduce as expensive computation when data type is
@@ -81,6 +79,8 @@ public:
     Gemm,
     OtherComp,
   };
+  const int PING_BARRIER = 9;
+  const int PONG_BARRIER = 10;
 
   unsigned getLoopDepth(Operation *op) {
     unsigned depth = 0;
@@ -151,6 +151,8 @@ public:
     // when number of consumer warp groups == 2.
     if (numConsumerGroups != 2)
       return;
+    if (!mlir::triton::tools::getBoolEnv("ENABLE_PINGPONG"))
+      return;
 
     SmallVector<scf::ForOp> loops;
     // Identify ForOps for consumer warp groups. Here we assume taskId 0 is for
@@ -179,9 +181,6 @@ public:
     }
     // Verify loopDepthMap1 and loopDepthMap2: a single ForOp at depth of 0
     // and a single ForOp at depth of 1.
-
-    if (!mlir::triton::tools::getBoolEnv("ENABLE_PINGPONG"))
-      return;
     LDBG("Found loops: " << loopDepthMap1.size());
     if (loopDepthMap1.empty())
       return;
@@ -249,7 +248,6 @@ public:
       ends.push_back(endOfGemm);
     }
     // TODO: epilogue overlapping.
-    static int PING_BARRIER = 9;
     {
       // "bar.arrive 9, 256" only when task Id is 2.
       Operation *outerLoopTask2 = loopDepthMap2[0][0];
@@ -280,7 +278,6 @@ public:
       // FIXME: hard-code total number of threads to be 256 when
       // numConsumerGroups is 2.
       Value numThreads = builder.create<arith::ConstantIntOp>(forLoc, 256, 32);
-      static int PONG_BARRIER = 10;
       // for taskId of 1, generate: bar.sync pingBarrier; bar.arrive pongBarrier
       // for taskId of 2, outside of the loop, generate bar.arrive pingBarrier
       //   inside the loop, generate bar.sync pongBarrier; bar.arrive
@@ -289,13 +286,6 @@ public:
           builder.create<arith::ConstantIntOp>(forLoc, PING_BARRIER, 32);
 
       int wgId = getSingleTaskId(forOp);
-#if 0
-      // "bar.arrive 9, 256" only when task Id is 2.
-      LDBG("Check loop with taskId: " << wgId);
-      if (wgId == 2)
-        builder.create<ttng::NamedBarrierArriveOp>(forLoc, pingBarrier,
-                                                   numThreads);
-#endif
       // At startOfGemm, insert "bar.sync 9 or 10, 256"
       builder.setInsertionPoint(startOfGemm);
       auto loc = startOfGemm->getLoc();

@@ -269,7 +269,7 @@ def TritonGPUWSLowering : Pass<"tritongpu-warp-spec-lowering", "mlir::ModuleOp">
 def TritonGPUPingPongSync: Pass<"tritongpu-ping-pong-sync", "mlir::ModuleOp"> {
   let summary = "TritonGPU experiemental ping pong schedule";
 
-  let description = "This pass generates warp specialized code baed on warp group id attributes.";
+  let description = "This pass inserts barriers to enforce critical section for gemms.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect"];
