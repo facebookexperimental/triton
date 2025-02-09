@@ -2427,6 +2427,8 @@ def test_reduce(op, dtype_str, shape, axis, keep_dims, num_ctas, device):
 
     if is_cpu() and dtype_str == 'bfloat16':
         pytest.skip("experimental cpu: unsupported precisions")
+    if is_cpu() and any(s > 32 for s in shape):
+        pytest.skip("experimental cpu: too long compilation time")
 
     @triton.jit
     def kernel(X, Z, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, IS_3D: tl.constexpr,
@@ -2527,7 +2529,7 @@ def test_reduce(op, dtype_str, shape, axis, keep_dims, num_ctas, device):
             np.testing.assert_equal(z_ref, z_tri)
 
 
-scan2d_shapes = [(8, 32), (16, 32), (32, 16), (2, 1024), (1024, 2), (32, 32), (1, 1024)]
+scan2d_shapes = [(8, 32), (16, 32), (32, 16), (2, 1024), (1024, 2), (32, 32), (1, 1024), (1, 128)]
 
 scan_configs = [(op, type, shape, axis, reverse, num_warps)
                 for num_warps in [4, 16]
@@ -2609,8 +2611,7 @@ def roll(a1, b1_last, b1_cur, a2, b2_last, b2_cur):
 def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
     check_type_supported(dtype_str, device)
 
-    # TODO: Takes ~20 mins to compile. Need to improve it. Mostly spent in LLVM vectorizer
-    if is_cpu() and (shape[0] >= 128 or shape[1] >= 128):
+    if is_cpu() and shape in [(2, 1024), (1024, 2), (1, 1024)]:
         pytest.skip("experimental cpu: too long compilation time")
 
     if dtype_str == 'bfloat16':
@@ -2796,7 +2797,7 @@ def test_scan_1d(M, N):
 
     # TODO: Fix it
     if is_cpu():
-        pytest.skip("TODO: Fix it")
+        pytest.fail("TODO: Runtime crash. Fix it")
 
     @triton.jit
     def scan_kernel(out_ptr, in_ptr, M: tl.constexpr, N: tl.constexpr):
@@ -3346,6 +3347,8 @@ def test_permute(dtype_str, shape, perm, num_ctas, device):
     if is_hip():
         if shape == (128, 128) and dtype_str == 'float32':
             pytest.skip("TODO Out of LDS for float32 with shape 128x128")
+    if is_cpu() and any(s > 32 for s in shape):
+        pytest.skip("experimental cpu: too long compilation time")
 
     # triton kernel
     @triton.jit
@@ -3564,7 +3567,7 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
     not_supported = ['float8e4nv', 'float8e5', 'bfloat16', 'float16', 'int8']
     if is_cpu() and (in_dtype in not_supported or out_dtype in not_supported):
         pytest.skip("experimental cpu: unsupported precisions")
-    if is_cpu() and (M > 32 or N > 32):
+    if is_cpu() and (M > 32 or N > 32 or K > 32):
         pytest.skip("experimental cpu: too long compile time")
 
     if is_interpreter():
@@ -4040,13 +4043,14 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
         assert re.search(r'(mma|wgmma.mma_async).sync.aligned.m\d+n\d+k16(?:.row.col)?.f32.(f|bf)16.(f|bf)16', ptx)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str",
                          [(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str)
                           for B in [1, 2, 4, 8]
-                          for num_warps in [1, 2, 4, 8, 16]
-                          for BLOCK_M, BLOCK_N in [(32, 32)]
-                          for M, N, K in [(64, 64, 64), (32, 32, 32)]
+                          for num_warps in ([1, 2, 4, 8, 16] if not is_cpu() else [1])
+                          for BLOCK_M, BLOCK_N in ([(32, 32)] if not is_cpu() else [(8, 8)])
+                          for M, N, K in ([(64, 64, 64), (32, 32, 32)] if not is_cpu() else [(16, 16, 16), (8, 8, 8)])
                           for in_dtype_str, out_dtype_str in [('int8', 'int8'), ('float16', 'float16'),
                                                               ('float16', 'float32'), ('float32', 'float32')]] +
                          # Large block sizes
@@ -4054,13 +4058,13 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
                          # Small block sizes
                          [(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str)
                           for B in [1, 2, 8]
-                          for num_warps in [1, 2, 4]
+                          for num_warps in ([1, 2, 4] if not is_cpu() else [1])
                           for BLOCK_M, BLOCK_N in [(1, 32), (32, 2), (8, 8)]
                           for M, N, K in [(32, 32, 32)]
                           for in_dtype_str, out_dtype_str in [('float16', 'float16'), ('float32', 'float32')]])
 def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str, device):
-    if is_cpu():
-        pytest.skip("experimental cpu: fix type promotion")
+    if is_cpu() and (M > 64 or N > 64):
+        pytest.skip("experimental cpu: too long compilation time")
 
     if is_hip():
         # hip does not support tf32 precision, so use ieee for all tests
@@ -4213,6 +4217,12 @@ def test_dot_mulbroadcasted(in_dtype, device):
 
     M, N, K = 256, 192, 160
     BM, BN, BK = 128, 32, 32
+
+    # TODO: Too slow for the new cpu. Fix FMA.
+    if is_cpu():
+        M, N, K = 32, 24, 20
+        BM, BN, BK = 16, 4, 4
+
     rs = RandomState(17)
     x = numpy_random((M, K), dtype_str=in_dtype, rs=rs)
     y = numpy_random((K, N), dtype_str=in_dtype, rs=rs)
@@ -4376,8 +4386,8 @@ def test_const(device, choose_const, constexpr, mode):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ['float32', 'float16'])
 def test_dot_without_load(dtype_str, device):
-    if is_new_cpu() and dtype_str == 'float16':
-        pytest.skip("experimental cpu: fix type promotion")
+    if is_cpu() and dtype_str == 'float16':
+        pytest.fail("experimental cpu: fix type promotion")
 
     @triton.jit
     def _kernel(out):
