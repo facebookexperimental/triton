@@ -2377,6 +2377,10 @@ public:
     DenseMap<Channel *, Value> bufferMap =
         createBuffer(channelsGroupedByProducers, funcOp, numConsumerGroups,
                      mapToRepresenting, channelReuse);
+    LLVM_DEBUG({
+      LDBG("\n\nafter createBuffer");
+      funcOp.dump();
+    });
 
     // Step 6: Lower the loads. Also add local copy ops for non-load
     // producers.
@@ -2394,7 +2398,7 @@ public:
         channelsGroupedByConsumers, orderedChannels, funcOp, numConsumerGroups,
         copyOpMap, channelReuse, barrierAllocMap);
     LLVM_DEBUG({
-      LDBG("\n\nafter createBuffer");
+      LDBG("\n\nafter createToken");
       funcOp.dump();
     });
 
