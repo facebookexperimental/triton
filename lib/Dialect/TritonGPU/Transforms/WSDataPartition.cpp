@@ -457,10 +457,15 @@ Operation *sliceOp(Operation *op, int offset,
         TritonGPUDialect::getNumWarps(op->getParentOfType<ModuleOp>());
     auto CTALayout = getCTALayout(oldRetType.getEncoding());
     builder.setInsertionPoint(op);
+    // The source op is already sliced at this point, so srcTy, type, tmem is
+    // sliced. We use getTmemCompatibleLayout to get a block layout that is for
+    // the sliced tmem here.
     Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
         tmem.getBlockM(), tmem.getBlockN(), retShapePerCTA, numWarps,
         CTALayout);
 
+    // oldRetType is the desired output, we slice it and convert from the
+    // compatible layout to the sliced desired output.
     SmallVector<int64_t> shape{oldRetType.getShape().begin(),
                                oldRetType.getShape().end()};
     int sliceSize = shape[dim] / numOfPartitions;
