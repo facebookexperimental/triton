@@ -411,6 +411,9 @@ public:
         anchorOps.insert(op);
     });
 
+    // If there is no anchorOp, task id propagation is not needed.
+    if (anchorOps.empty())
+      return;
     populateTaskIdsForControlDependencies(anchorOps);
 
     LLVM_DEBUG({
