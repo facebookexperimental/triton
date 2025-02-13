@@ -1397,6 +1397,13 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
 
 // Go through a list of operations under one scope.
 // prevAccum can be null if there is an outer loop for the reuse loops.
+//
+// opsUsingNumBuffers - ops that use buffers with a specific stage. For a
+// enclosing region such as forOp, if none of its inner ops use buffers with a
+// specific stage, we don't need to add an argument to the forOp.
+//
+// bufferArgIndices - map from forOp to a map from numBuffers to the index of
+// the argument for numBuffers.
 Value updateAccumLoopCount(
     SmallVector<Operation *> &opList, unsigned numBuffers,
     SmallVector<Operation *> &taskTopOps, Operation *commonOuterLoop,
