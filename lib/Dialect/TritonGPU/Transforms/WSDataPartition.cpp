@@ -339,13 +339,6 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
   int numWarps =
       TritonGPUDialect::getNumWarps(funcOp->getParentOfType<ModuleOp>());
   for (auto dotOp : dots) {
-    // // Validate the partition scheme that is already computed for the dot
-    // if (partitionScheme.opPartitionDims.contains(dotOp)) {
-    //   unsigned partitionDim = partitionScheme.opPartitionDims[dotOp];
-    //   // TODO: validate the partition scheme
-    //   continue;
-    // }
-
     // partition along M first, otherwise along N
     RankedTensorType dotType = dotOp.getType();
     LLVM_DEBUG({
