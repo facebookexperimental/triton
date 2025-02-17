@@ -98,7 +98,7 @@ struct ConvertTritonGPUToLLVM
     // Hack: WSLowering may have changed the effective number of warps,
     // in a way that isn't reflected in triton_gpu.num-warps.  If so, we have to
     // respect that here.
-    if (Attribute attr = mod->getAttr("triton_gpu.num-warp-groups-per-cta")) {
+    if (Attribute attr = mod->getAttr("ttg.num-warp-groups-per-cta")) {
       numWarps *= cast<IntegerAttr>(attr).getInt();
     }
 

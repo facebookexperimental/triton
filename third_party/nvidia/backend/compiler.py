@@ -267,6 +267,7 @@ class CUDABackend(BaseBackend):
                                                  opt.reg_dec_producer, opt.reg_inc_consumer)
             passes.ttgpuir.add_loop_scheduling(pm, opt.num_stages)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages)
+            passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
         if capability // 10 >= 10:
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)

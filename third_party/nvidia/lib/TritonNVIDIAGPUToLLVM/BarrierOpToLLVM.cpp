@@ -34,6 +34,33 @@ using namespace mlir::triton;
 
 namespace {
 
+struct BarrierOpConversion
+    : public ConvertOpToLLVMPattern<mlir::gpu::BarrierOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::gpu::BarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    if (op->hasAttr("bar_id")) {
+      // llvm.nvvm.barrier0 doesn't support bar_id and num_threads attributes,
+      // so we have to lower it to ptx manually.
+      auto barId = op->getAttrOfType<IntegerAttr>("bar_id").getInt();
+      auto numThreads = op->getAttrOfType<IntegerAttr>("num_threads").getInt();
+      ::mlir::triton::PTXBuilder ptxBuilder;
+      auto &barSyncOp = *ptxBuilder.create<>("bar.sync");
+      barSyncOp(ptxBuilder.newConstantOperand(barId),
+                ptxBuilder.newConstantOperand(numThreads));
+      auto voidTy = void_ty(op->getContext());
+      ptxBuilder.launch(rewriter, op->getLoc(), voidTy);
+      rewriter.eraseOp(op);
+      return success();
+    }
+    // Otherwise we let the default lowering handle it
+    return failure();
+  }
+};
+
 // --------------------------------------------------------------------------
 // -- MBarrier related Ops lowering, to be moved to a separate file ---------
 // --------------------------------------------------------------------------
@@ -290,6 +317,7 @@ struct WaitBarrierOpConversion
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
+  patterns.add<BarrierOpConversion>(typeConverter, benefit);
   patterns.add<MBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);

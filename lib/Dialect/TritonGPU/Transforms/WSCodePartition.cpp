@@ -1875,7 +1875,7 @@ void insertAsyncComm(
     std::unordered_set<Operation *> mutuallyNonDominatingUsers;
     SmallVector<Operation *> users;
     for (auto user : c->getUsers()) {
-      if (isa<TransOp>(user)) {
+      if (isa<TransOp, MemDescTransOp>(user)) {
         // TransOp is not a real consumer. It caculates the shared memory
         // address for the real consumer. Continue to find its transitive users
         // recursively.
@@ -1885,7 +1885,7 @@ void insertAsyncComm(
         while (!transUsers.empty()) {
           auto transUser = transUsers.pop_back_val();
           visited.insert(transUser);
-          if (isa<TransOp>(transUser)) {
+          if (isa<TransOp, MemDescTransOp>(transUser)) {
             for (auto transitiveUser : transUser->getUsers()) {
               if (!visited.count(transitiveUser))
                 transUsers.push_back(transitiveUser);
