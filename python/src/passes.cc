@@ -84,6 +84,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                             createTritonGPUTaskIdPropagate, int);
   ADD_PASS_OPTION_WRAPPER_4("add_ws_code_partition",
                             createTritonGPUWSCodePartition, int, int, int, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_canonicalization",
+                            createTritonGPUWSCanonicalization, int);
 }
 
 void init_triton_passes_convert(py::module &&m) {
