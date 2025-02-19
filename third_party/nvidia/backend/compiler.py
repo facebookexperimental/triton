@@ -294,6 +294,8 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_fence_insertion(pm)
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         passes.common.add_canonicalizer(pm)
+        if capability // 10 >= 9:
+            passes.ttgpuir.add_ws_canonicalization(pm, opt.num_consumer_groups)
         pm.run(mod)
         metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         return mod

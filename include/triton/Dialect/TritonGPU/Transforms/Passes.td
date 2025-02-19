@@ -365,4 +365,18 @@ def TritonGPUWSLowering : Pass<"tritongpu-warp-spec-lowering", "mlir::ModuleOp">
            "number of consumer warp groups for warp specialization">
   ];
 }
+
+def TritonGPUWSCanonicalization : Pass<"tritongpu-warp-spec-canonicalization", "mlir::ModuleOp"> {
+  let summary = "Warp specialization canonicalization";
+
+  let description = "This pass fixes up async task id for each op wrapped in a WS region.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let options = [
+    Option<"numConsumerGroups", "num-consumer-groups",
+           "int32_t", /*default*/"0",
+           "number of consumer warp groups for warp specialization">
+  ];
+}
 #endif
