@@ -827,8 +827,6 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
     }
   }
 
-  // clean up
-
   SmallVector<Operation *> opsToDelete;
   OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
   for (auto op : partitionScheme.ops) {
@@ -858,41 +856,6 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
     op->erase();
   }
 
-  // Collect original operations
-  SmallVector<scf::ForOp> orderedForOps;
-  funcOp.walk([&](Operation *op) {
-    if (auto forOp = dyn_cast<scf::ForOp>(op))
-      orderedForOps.push_back(forOp);
-  });
-  for (auto &forOp : orderedForOps) {
-    SmallVector<Operation *> opList;
-    forOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
-      if (!isa<scf::YieldOp>(subOp) && subOp != forOp.getOperation() &&
-          partitionScheme.ops.count(subOp))
-        opList.push_back(subOp);
-    });
-    Block &block = *forOp.getBody();
-    for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
-      Operation *op = *it;
-      LLVM_DEBUG({
-        LDBG("erasing op ");
-        op->dump();
-      });
-      // Update YieldOpnd if op feeds into Yield.
-      for (unsigned i = 0; i < op->getNumResults(); ++i) {
-        for (OpOperand &yieldOpOperand : op->getResult(i).getUses()) {
-          if (auto yieldOp =
-                  dyn_cast<scf::YieldOp>(yieldOpOperand.getOwner())) {
-            auto operandNumber = yieldOpOperand.getOperandNumber();
-            BlockArgument arg = block.getArgument(operandNumber + 1);
-            yieldOp.setOperand(operandNumber, arg);
-          }
-        }
-      }
-      op->erase();
-    }
-  }
-
   LLVM_DEBUG({
     LDBG("prior to clean up:");
     funcOp.dump();
@@ -900,7 +863,15 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
 
   // delete block arguments
   RewritePatternSet cleanUpPatterns(funcOp.getContext());
-  populateForOpDeadArgumentElimination(cleanUpPatterns);
+  DenseSet<Operation *> opsCanBeTriviallyDead;
+  for (auto op : partitionScheme.ops) {
+    // ignore the side effect of ops that are already sliced. The resulting ops
+    // preserve the side effect.
+    if (!isMemoryEffectFree(op))
+      opsCanBeTriviallyDead.insert(op);
+  }
+
+  populateForOpDeadArgumentElimination(cleanUpPatterns, opsCanBeTriviallyDead);
   scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns, funcOp.getContext());
   scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns, funcOp.getContext());
   if (applyPatternsGreedily(funcOp, std::move(cleanUpPatterns)).failed()) {
