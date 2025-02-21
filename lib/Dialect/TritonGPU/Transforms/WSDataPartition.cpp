@@ -788,6 +788,76 @@ Operation *sliceOp(Value v, int offset, IRMapping &mappings,
   }
 }
 
+void doDeepCleanup(triton::FuncOp &funcOp,
+                   DataPartitionScheme &partitionScheme) {
+  SmallVector<Operation *> opsToDelete;
+  DenseSet<Operation *> opsCanBeTriviallyDead;
+
+  do {
+    opsToDelete.clear();
+    opsCanBeTriviallyDead.clear();
+
+    // Identify root ops that are not used so to be deleted.
+    funcOp.walk([&](Operation *op) {
+      if (isa<scf::YieldOp>(op))
+        return;
+      if (!partitionScheme.ops.contains(op))
+        return;
+
+      // Ignore the side effect of ops that are already sliced. The
+      // resulting ops preserve the side effect.
+      if (!isMemoryEffectFree(op))
+        opsCanBeTriviallyDead.insert(op);
+
+      bool notUsed = true;
+      for (auto result : op->getResults()) {
+        if (!result.getUsers().empty()) {
+          notUsed = false;
+          break;
+        }
+      }
+      if (notUsed)
+        opsToDelete.push_back(op);
+    });
+
+    LLVM_DEBUG({
+      LDBG("opsToDelete:\n");
+      for (auto op : opsToDelete) {
+        LDBG("op: ");
+        op->dump();
+      }
+      LDBG("\n");
+    });
+
+    if (opsToDelete.empty())
+      return;
+
+    // Delete root ops.
+    for (auto op : opsToDelete) {
+      partitionScheme.ops.remove(op);
+      op->erase();
+    }
+
+    LLVM_DEBUG({
+      LDBG("prior to loop arg deletion:");
+      funcOp.dump();
+    });
+
+    // delete block arguments
+    RewritePatternSet cleanUpPatterns(funcOp.getContext());
+    populateForOpDeadArgumentElimination(cleanUpPatterns,
+                                         opsCanBeTriviallyDead);
+    scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns,
+                                            funcOp.getContext());
+    scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns,
+                                           funcOp.getContext());
+    if (applyPatternsGreedily(funcOp, std::move(cleanUpPatterns)).failed()) {
+      llvm_unreachable("failed to clean up");
+      // signalPassFailure();
+    }
+  } while (!opsToDelete.empty());
+}
+
 void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
 
   // op -> (partition dim, num of partitions)
@@ -827,86 +897,13 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
     }
   }
 
-  // clean up
-
-  SmallVector<Operation *> opsToDelete;
-  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
-  for (auto op : partitionScheme.ops) {
-    if (isa<scf::YieldOp>(op))
-      continue;
-    bool notUsed = true;
-    for (auto result : op->getResults()) {
-      if (!result.getUsers().empty()) {
-        notUsed = false;
-        break;
-      }
-    }
-    if (notUsed)
-      opsToDelete.push_back(op);
-  }
-
   LLVM_DEBUG({
-    LDBG("opsToDelete:\n");
-    for (auto op : opsToDelete) {
-      LDBG("op: ");
-      op->dump();
-    }
-    LDBG("\n");
-  });
-  for (auto op : opsToDelete) {
-    partitionScheme.ops.remove(op);
-    op->erase();
-  }
-
-  // Collect original operations
-  SmallVector<scf::ForOp> orderedForOps;
-  funcOp.walk([&](Operation *op) {
-    if (auto forOp = dyn_cast<scf::ForOp>(op))
-      orderedForOps.push_back(forOp);
-  });
-  for (auto &forOp : orderedForOps) {
-    SmallVector<Operation *> opList;
-    forOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
-      if (!isa<scf::YieldOp>(subOp) && subOp != forOp.getOperation() &&
-          partitionScheme.ops.count(subOp))
-        opList.push_back(subOp);
-    });
-    Block &block = *forOp.getBody();
-    for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
-      Operation *op = *it;
-      LLVM_DEBUG({
-        LDBG("erasing op ");
-        op->dump();
-      });
-      // Update YieldOpnd if op feeds into Yield.
-      for (unsigned i = 0; i < op->getNumResults(); ++i) {
-        for (OpOperand &yieldOpOperand : op->getResult(i).getUses()) {
-          if (auto yieldOp =
-                  dyn_cast<scf::YieldOp>(yieldOpOperand.getOwner())) {
-            auto operandNumber = yieldOpOperand.getOperandNumber();
-            BlockArgument arg = block.getArgument(operandNumber + 1);
-            yieldOp.setOperand(operandNumber, arg);
-          }
-        }
-      }
-      op->erase();
-    }
-  }
-
-  LLVM_DEBUG({
-    LDBG("prior to clean up:");
+    LDBG("prior to final cleanup:");
     funcOp.dump();
   });
 
-  // delete block arguments
-  RewritePatternSet cleanUpPatterns(funcOp.getContext());
-  populateForOpDeadArgumentElimination(cleanUpPatterns);
-  scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns, funcOp.getContext());
-  scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns, funcOp.getContext());
-  if (applyPatternsGreedily(funcOp, std::move(cleanUpPatterns)).failed()) {
-    llvm_unreachable("failed to clean up");
-    // signalPassFailure();
-  }
+  // Make sure original ops are not used
+  doDeepCleanup(funcOp, partitionScheme);
 
   // Make sure original ops are not used
   LLVM_DEBUG({
