@@ -365,6 +365,10 @@ private:
       auto value = valueBufferIter.first;
       auto *buffer = valueBufferIter.second;
       bufferRange[buffer] = getLiveness(value, buffer);
+      LLVM_DEBUG({
+        llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
+        value.dump();
+      });
     }
   }
 
@@ -418,6 +422,10 @@ private:
           bufferRange.insert({buffer, Interval(operationId.lookup(op),
                                                operationId.lookup(op) + 1)});
         }
+        LLVM_DEBUG({
+          llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
+          op->dump();
+        });
       }
     };
     processScratchMemory(allocation->opScratch);
@@ -505,6 +513,18 @@ private:
     }
   }
 
+  void dumpInterferenceGraph(const GraphT &interference) {
+    LDBG("\n");
+    LDBG("Dump interference graph: \n");
+    for (auto edges : interference) {
+      llvm::dbgs() << "-- from " << edges.first->id << " to ";
+      for (auto node : edges.second) {
+        llvm::dbgs() << node->id << "; ";
+      }
+      llvm::dbgs() << "\n";
+    }
+  }
+
   /// Computes the shared memory offsets for all related values.
   /// Paper: Algorithms for Compile-Time Memory Optimization
   /// (https://dl.acm.org/doi/pdf/10.5555/314500.315082)
@@ -545,6 +565,14 @@ private:
       }
       buffers.emplace_back(bufferIter.first);
     }
+
+    // Sort buffers by size in descending order to reduce the fragmentation
+    // on big buffers caused by smaller buffers. Big buffers have a higher
+    // chance to overlap with multiple other buffers, and allocating them first
+    // (by calculateStarts) ensures a higher chance that they will occupy a
+    // standalone smem slot.
+    llvm::stable_sort(
+        buffers, [&](BufferT *A, BufferT *B) { return A->size > B->size; });
 
     calculateStarts(buffers);
     dumpBuffers();
@@ -634,6 +662,7 @@ private:
         xBuffers.erase(bufferIt);
       }
     }
+    LLVM_DEBUG(dumpBuffers());
   }
 
   /// Builds a graph of all shared memory values. Edges are created between
@@ -678,6 +707,8 @@ private:
           interference[x].insert(y);
       }
     }
+
+    LLVM_DEBUG(dumpInterferenceGraph(interference));
   }
 
   /// Finalizes shared memory offsets considering interference.
@@ -705,6 +736,9 @@ private:
       }
       auto it = std::find(available.begin(), available.end(), true);
       colors[x] = std::distance(available.begin(), it);
+      LLVM_DEBUG({
+        llvm::dbgs() << "-- color " << x->id << " " << colors[x] << "\n";
+      });
     }
     // Finalize allocation
     // color0: [0, 7), [0, 8), [0, 15) -> [0, 7), [0, 8), [0, 15)
@@ -722,6 +756,7 @@ private:
       allocation->sharedMemorySize =
           std::max(allocation->sharedMemorySize, x->offset + x->size);
     }
+    LLVM_DEBUG(dumpBuffers());
   }
 
 private:
