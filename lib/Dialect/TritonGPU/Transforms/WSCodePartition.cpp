@@ -184,17 +184,21 @@ needAccumulatedLoopCnt(scf::IfOp ifOp,
   return needAccum;
 }
 
+// accumCntMap: maps from a control op to a Value, make sure the control
+// op is up-to-date (i.e will be updated when a control op is re-written).
 Value updateAccumLoopCount(SmallVector<Operation *> &opList,
                            unsigned numBuffers,
                            SmallVector<Operation *> &taskTopOps,
                            Operation *commonOuterLoop,
                            SmallVector<Operation *> &opsWithBufferReuse,
+                           DenseMap<Operation *, Value> &accumCntMap,
                            Value prevAccum);
 
 scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
                                 SmallVector<Operation *> &taskTopOps,
                                 Operation *commonOuterLoop,
                                 SmallVector<Operation *> &opsWithBufferReuse,
+                                DenseMap<Operation *, Value> &accumCntMap,
                                 Value prevAccum);
 
 // For certain cases, we need to add an additional output for
@@ -204,6 +208,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
                       SmallVector<Operation *> &taskTopOps,
                       Operation *commonOuterLoop,
                       SmallVector<Operation *> &opsWithBufferReuse,
+                      DenseMap<Operation *, Value> &accumCntMap,
                       Value prevAccum) {
   LLVM_DEBUG({
     LDBG("rewrite ifOp for smem sharing ");
@@ -244,7 +249,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
   // Add one more operand to then Yield.
   Value endAccum =
       updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
-                           opsWithBufferReuse, prevAccum);
+                           opsWithBufferReuse, accumCntMap, prevAccum);
 
   SmallVector<Value> ifYieldOperands = newIfOp.thenYield().getOperands();
   ifYieldOperands.push_back(endAccum);
@@ -263,7 +268,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
     }
     endAccum =
         updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
-                             opsWithBufferReuse, prevAccum);
+                             opsWithBufferReuse, accumCntMap, prevAccum);
   } else {
     // Create an empty yield
     auto yieldOp =
@@ -1367,19 +1372,38 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
   // opsWithBufferReuse = innerOps;
 }
 
+// Helper function to get a list of control Ops for which we need
+// accumCnt. We go through all channels and find the enclosing controlOp.
+// If the controlOp is inside an IfOp, the outer loops will need accumCnt.
+// For the case of
+// ForA (accumIfA, accumForB, accumIfB, bufIdx, phase)
+//   IfA
+//     Channel A --> uses accumIfA of ForA
+//     ForB (bufIdx, phase)
+//       Channel B --> uses argIdx of ForB
+//   ForC (accumIfB, bufIdx, phase)
+//     IfB
+//       Channel C --> uses accumIfB of ForC
+// ForOps will have two additional args bufIdx and phase, both are for the case
+// of channels directly under the ForOp.
+void updateAccumRegions() {}
+
 // Go through a list of operations under one scope.
 // prevAccum can be null if there is an outer loop for the reuse loops.
+// -- prevAccum: for buffer reuse, opsWithBufferReuse.size() > 1
+// -- accumCntMap: opsWithBufferReuse.size() == 1, no buffer reuse
 Value updateAccumLoopCount(SmallVector<Operation *> &opList,
                            unsigned numBuffers,
                            SmallVector<Operation *> &taskTopOps,
                            Operation *commonOuterLoop,
                            SmallVector<Operation *> &opsWithBufferReuse,
+                           DenseMap<Operation *, Value> &accumCntMap,
                            Value prevAccum) {
   for (Operation *op : opList) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       auto newForOp =
           createNewLoopWrapper(forOp, numBuffers, taskTopOps, commonOuterLoop,
-                               opsWithBufferReuse, prevAccum);
+                               opsWithBufferReuse, accumCntMap, prevAccum);
       // Update prevAccum to be after the loop.
       // If the loop is in opsWithBufferReuse, generate prevAccum + numSteps.
       bool hasReuse = false;
@@ -1404,7 +1428,7 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
       if (needAccumulatedLoopCnt(ifOp, opsWithBufferReuse)) {
         auto newIfOp =
             rewriteIfOp(ifOp, numBuffers, taskTopOps, commonOuterLoop,
-                        opsWithBufferReuse, prevAccum);
+                        opsWithBufferReuse, accumCntMap, prevAccum);
         // update prevAccum to be result of the new IfOp.
         assert(newIfOp.getNumResults() >= 1);
         auto numRes = newIfOp.getNumResults();
@@ -1420,7 +1444,8 @@ Value updateAccumLoopCount(SmallVector<Operation *> &opList,
         });
         for (auto innerFor : innerForOps)
           createNewLoopWrapper(innerFor, numBuffers, taskTopOps,
-                               commonOuterLoop, opsWithBufferReuse, prevAccum);
+                               commonOuterLoop, opsWithBufferReuse, accumCntMap,
+                               prevAccum);
       }
     }
   }
@@ -1431,6 +1456,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
                                 SmallVector<Operation *> &taskTopOps,
                                 Operation *commonOuterLoop,
                                 SmallVector<Operation *> &opsWithBufferReuse,
+                                DenseMap<Operation *, Value> &accumCntMap,
                                 Value prevAccum) {
   LLVM_DEBUG({
     LDBG("call createNewLoop on");
@@ -1487,7 +1513,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   }
   Value endAccum = updateAccumLoopCount(
       opList, numBuffers, taskTopOps, commonOuterLoop, opsWithBufferReuse,
-      isOuterOfReuse ? getAccumLoopCountArg(newForOp) : prevAccum);
+      accumCntMap, isOuterOfReuse ? getAccumLoopCountArg(newForOp) : prevAccum);
 
   // Update yieldOp.
   if (isOuterOfReuse) {
@@ -1498,18 +1524,21 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   return newForOp;
 }
 
-// This function takes a list of channels, a mapping from a channel
-// to its representing channel if the key shares smem space with the
-// representing channel, and a list of loops that are sharing smem spaces. Note
-// that every loop in opsWithBufferReuse either has the same outer loop or has
-// no outer loop.
-// For ForOps in taskTopOps, create new ForOp for each by adding phase,
-// bufferIdx to the arguments. In the case of sharing smem, we need to traverse
-// and update IfOps when necessary. We call updateAccumLoopCount on the list
-// of top level Ops that are ForOps or IfOps enclosing a loop with buffer reuse.
-// updateAccumLoopCount calls createNewLoopWrapper on ForOps, and rewriteIfOp on
-// IfOps. Both will call updateAccumLoopCount on the list of Ops in the ForOp
-// body or the thenBlock, elseBlock for IfOp.
+// This function takes
+// -- channels: a list of channels
+// -- mapToRepresenting: a mapping from a channel to its representing channel if
+// the channel shares smem space with the representing channel
+// -- opsWithBufferReuse: a list of control ops that are sharing smem spaces.
+// Note that every loop in opsWithBufferReuse either has the same outer loop or
+// has no outer loop.
+// We call updateAccumLoopCount on the list of top level Ops that are control
+// ops (ForOps or IfOps). updateAccumLoopCount calls createNewLoopWrapper on
+// ForOps, and rewriteIfOp on IfOps. Both will call updateAccumLoopCount on the
+// list of Ops in the ForOp body or the thenBlock, elseBlock for IfOp.
+// createNewLoopWrapper will create a new ForOp by adding phase,
+// bufferIdx, and a list of accumLoopCnt to the arguments.
+// In the case of sharing smem or persistent, we need to traverse and update
+// IfOps via rewriteIfOp, when necessary.
 Value appendBufferIdxArgs(
     SmallVector<Operation *> &taskTopOps, unsigned numBuffers,
     const SmallVector<Channel *> &channels,
@@ -1540,6 +1569,7 @@ Value appendBufferIdxArgs(
     tmpAccumLoopCount = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         oneFor->getLoc(), 0, 64);
   }
+  DenseMap<Operation *, Value> accumCntMap;
 
   SmallVector<Operation *> opList;
   for (auto &op : taskTopOps) {
@@ -1550,7 +1580,7 @@ Value appendBufferIdxArgs(
       opList.push_back(op);
   }
   updateAccumLoopCount(opList, numBuffers, taskTopOps, commonOuterLoop,
-                       opsWithBufferReuse, tmpAccumLoopCount);
+                       opsWithBufferReuse, accumCntMap, tmpAccumLoopCount);
 
   return tmpAccumLoopCount;
 }
