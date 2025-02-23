@@ -574,7 +574,7 @@ private:
     llvm::stable_sort(
         buffers, [&](BufferT *A, BufferT *B) { return A->size > B->size; });
 
-    calculateStarts(buffers);
+    // calculateStarts(buffers);
     dumpBuffers();
 
     // NOTE: The original paper doesn't consider interference between
@@ -585,7 +585,7 @@ private:
     // increase the buffer offset and keep reducing conflicts, we will
     // eventually reach a fixed point.
     GraphT interference;
-    buildInterferenceGraph(buffers, interference);
+    buildInterferenceGraph(buffers, interference, true /*initial*/);
     do {
       allocate(buffers, interference);
       buildInterferenceGraph(buffers, interference);
@@ -668,7 +668,7 @@ private:
   /// Builds a graph of all shared memory values. Edges are created between
   /// shared memory values that are overlapping.
   void buildInterferenceGraph(const SmallVector<BufferT *> &buffers,
-                              GraphT &interference) {
+                              GraphT &interference, bool initial = false) {
     // Reset interference graph
     auto inDifferentRegion = [&](BufferT *A, BufferT *B) {
       auto tA = A->regionIds;
@@ -698,6 +698,9 @@ private:
         Interval ySizeRange = {yStart, yStart + ySize};
         auto xOpRange = bufferRange.lookup(x);
         auto yOpRange = bufferRange.lookup(y);
+        if (initial &&
+            (xOpRange.intersects(yOpRange) || inDifferentRegion(x, y)))
+          interference[x].insert(y);
         if (xOpRange.intersects(yOpRange) &&
             xSizeRange.intersects(ySizeRange)) {
           interference[x].insert(y);
@@ -737,7 +740,9 @@ private:
       auto it = std::find(available.begin(), available.end(), true);
       colors[x] = std::distance(available.begin(), it);
       LLVM_DEBUG({
-        llvm::dbgs() << "-- color " << x->id << " " << colors[x] << "\n";
+        llvm::dbgs() << "-- color " << x->id << " " << x->size << " "
+                     << x->offset << " " << x->sharingGroup << " " << colors[x]
+                     << "\n";
       });
     }
     // Finalize allocation
@@ -749,7 +754,8 @@ private:
     for (auto x : buffers) {
       size_t newOffset = 0;
       for (auto y : interference.lookup(x)) {
-        newOffset = std::max(newOffset, y->offset + y->size);
+        newOffset =
+            std::max(newOffset, (y->offset < 0 ? 0 : y->offset) + y->size);
       }
       if (colors.lookup(x) != 0)
         x->setOffsetAligned(newOffset);
