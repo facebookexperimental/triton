@@ -108,9 +108,13 @@ struct DataPartitionScheme {
   DenseMap<Operation *, unsigned> opPartitionDims;
   DenseMap<Operation *, unsigned> dotPartitionOperand;
   // Ops that are rematerialized through both dimensions.
-  DenseSet<Operation *> rematerializedOps;
+  DenseMap<Operation *, SetVector<unsigned>> rematerializedOps;
   // Ops should not be partitioned due to rematerialization.
   DenseSet<Operation *> opsToSkip;
+
+  // op with noOpPartitionDim will be duplicated instead of partitioned.
+  // Use -2 to avoid conflict with Empty/Tombstone value.
+  static const unsigned noOpPartitionDim = ~0U - 2;
 
   void append(DataPartitionScheme &other) {
     for (auto op : other.ops)
@@ -119,13 +123,32 @@ struct DataPartitionScheme {
       opPartitionDims.insert(op);
     for (auto op : other.dotPartitionOperand)
       dotPartitionOperand.insert(op);
-    for (auto op : other.rematerializedOps)
+    for (auto &op : other.rematerializedOps)
       rematerializedOps.insert(op);
     for (auto op : other.opsToSkip)
       opsToSkip.insert(op);
   }
 
   bool partitionIsCompatible() { return true; }
+
+  bool isValidPartitionDim(unsigned dim) const {
+    return dim < numPartitions || dim == DataPartitionScheme::noOpPartitionDim;
+  }
+
+  unsigned flipPartitionDim(unsigned dim) const {
+    if (dim == DataPartitionScheme::noOpPartitionDim)
+      return dim;
+    return numPartitions - 1 - dim;
+  }
+
+  bool isPartitioned(Operation *op) const {
+    return opPartitionDims.contains(op) || rematerializedOps.contains(op) ||
+           opsToSkip.contains(op);
+  }
+
+  bool shouldBePartitioned(Operation *op) const {
+    return opPartitionDims.contains(op) || rematerializedOps.contains(op);
+  }
 
   void undoPartition(Operation *op) {
     if (opPartitionDims.contains(op)) {
@@ -134,11 +157,6 @@ struct DataPartitionScheme {
       ops.remove_if([=](Operation *x) { return x == op; });
       opsToSkip.insert(op);
     }
-  }
-
-  bool isPartitioned(Operation *op) const {
-    return opPartitionDims.contains(op) || rematerializedOps.contains(op) ||
-           opsToSkip.contains(op);
   }
 
   void dump() const {
@@ -157,8 +175,13 @@ struct DataPartitionScheme {
     LDBG("\n");
     if (!rematerializedOps.empty()) {
       LDBG(" ops to rematerialize\n");
-      for (auto &op : rematerializedOps)
-        op->dump();
+      for (auto &op : rematerializedOps) {
+        op.first->dump();
+        LDBG(" along dim ");
+        for (auto &dim : op.second) {
+          LDBG(dim << " ");
+        }
+      }
       LDBG("\n");
     }
 
@@ -185,43 +208,46 @@ static SmallVector<int64_t> getShape(Type type) {
 
 static SmallVector<int64_t> getShape(Value v) { return getShape(v.getType()); }
 
-static bool needToSlice(Value v, int dim, int size) {
+static bool needToSlice(Value v, unsigned dim, int size) {
+  if (dim == DataPartitionScheme::noOpPartitionDim)
+    return true;
   auto shape = getShape(v);
   return shape.size() > dim && shape[dim] > size;
 }
 
 static bool isControlFlowOp(Operation *op) {
-  return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp, scf::IfOp,
-             arith::ConstantOp>(op);
+  return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp, scf::IfOp>(op);
 }
 
 static bool rematerializeOp(Operation *op, DataPartitionScheme &partitionScheme,
                             unsigned currentDim) {
-  // assert op has a conflicting partition dim.
-  assert(partitionScheme.opPartitionDims[op] != currentDim &&
-         "op has no conflicting partition dim");
-  if (auto allocOp = dyn_cast<LocalAllocOp>(op)) {
-    // Create mem desc and reset the parition of LocalAlloc and its dependent
-    // ops.
-    partitionScheme.rematerializedOps.insert(op);
-    partitionScheme.opPartitionDims.erase(op);
+  // Bail out if op is already rematerialized.
+  if (partitionScheme.rematerializedOps.contains(op)) {
+    partitionScheme.rematerializedOps[op].insert(currentDim);
+    return true;
+  }
+
+  if (isa<LocalAllocOp, arith::ConstantOp>(op)) {
+    // assert op has a conflicting partition dim.
+    auto existingDim = partitionScheme.opPartitionDims[op];
+    assert(existingDim != currentDim && "op has no conflicting partition dim");
+    partitionScheme.rematerializedOps[op].insert(existingDim);
+    partitionScheme.rematerializedOps[op].insert(currentDim);
     // Undo the partition of the dependency ops in the backward slice.
     SetVector<Operation *> slice;
     BackwardSliceOptions opt;
     opt.omitBlockArguments = true;
     getBackwardSlice(op, &slice);
-    for (auto depOp : slice) {
+    for (auto depOp : slice)
       partitionScheme.undoPartition(depOp);
-    }
     return true;
   }
-
   return false;
 }
 
 bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
                                  unsigned currentDim) {
-  assert(currentDim < 2 && "only suuport 2D partition");
+  assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
     return true;
   if (auto op = v.getDefiningOp()) {
@@ -233,6 +259,7 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
         if (!rematerializeOp(op, partitionScheme, currentDim)) {
           LLVM_DEBUG({
             LDBG("incompatible partitioning during backwards:");
+            LDBG("dim " << currentDim);
             op->dump();
           });
           return false;
@@ -244,7 +271,7 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
 
     // Flip dim when op is trans
     if (isa<TransOp>(op))
-      currentDim = 1 - currentDim;
+      currentDim = partitionScheme.flipPartitionDim(currentDim);
 
     // Recusively process operands backwards.
     if (op->hasTrait<OpTrait::Elementwise>() ||
@@ -311,7 +338,7 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
 // Return false if the partition is not possible.
 bool getForwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
                                 unsigned currentDim, DenseSet<Value> &seen) {
-  assert(currentDim < 2 && "only suuport 2D partition");
+  assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
   if (!seen.insert(v).second)
     return true;
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
@@ -319,6 +346,10 @@ bool getForwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
 
   // Recusively process operands forwards.
   for (Operation *depOp : v.getUsers()) {
+    // Flip dim when op is trans
+    if (isa<TransOp>(depOp))
+      currentDim = partitionScheme.flipPartitionDim(currentDim);
+
     // Check dim compatibility
     if (!partitionScheme.ops.insert(depOp)) {
       if (!isControlFlowOp(depOp) &&
@@ -373,11 +404,13 @@ bool getForwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
       if ((currentDim == 0 && v == dotOp.getB()) ||
           (currentDim == 1 && v == dotOp.getA())) {
         // It is fine to continue the partition if the dot output is immediately
-        // stored out via an atomic add.
+        // stored out via an atomic add, as the dot computes a partial result.
         if (onlyUsedByAtomicStore(dotOp.getD())) {
           partitionScheme.dotPartitionOperand[dotOp] =
               v == dotOp.getA() ? 0 : 1;
-          return true;
+          // Duplicate the users of the dot output since the shape of the output
+          // will not be changed
+          currentDim = DataPartitionScheme::noOpPartitionDim;
         } else {
           LLVM_DEBUG({
             auto opnd = (v == dotOp.getA()) ? "A" : "B";
@@ -390,10 +423,6 @@ bool getForwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
         partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
       }
     }
-
-    // Flip dim when op is trans
-    if (isa<TransOp>(depOp))
-      currentDim = 1 - currentDim;
 
     for (Value result : depOp->getResults())
       if (!getForwardSliceToPartition(result, partitionScheme, currentDim,
@@ -434,6 +463,10 @@ bool getSliceToPartition(Value root, DataPartitionScheme &partitionScheme,
     return false;
 
   for (auto op : forwardPartitionScheme.ops) {
+    // skip ops that have noOpPartitionDim
+    currentDim = partitionScheme.opPartitionDims[op];
+    if (currentDim == DataPartitionScheme::noOpPartitionDim)
+      continue;
     if (op->hasTrait<OpTrait::Elementwise>() ||
         isa<tt::StoreOp, ExperimentalDescriptorStoreOp, AtomicRMWOp>(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
@@ -457,6 +490,10 @@ bool getSliceToPartition(Value root, DataPartitionScheme &partitionScheme,
         unsigned otherOpndIndx = 1 - opndIndx;
         if (!getBackwardSliceToPartition(dotOp.getOperand(otherOpndIndx),
                                          partitionScheme, 1 - currentDim))
+          return false;
+        // Hanlde accumulator
+        if (!getBackwardSliceToPartition(dotOp.getC(), partitionScheme,
+                                         DataPartitionScheme::noOpPartitionDim))
           return false;
       }
     }
@@ -569,6 +606,92 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
   return !partitionScheme.ops.empty();
 }
 
+void rewriteRematerializedOps(triton::FuncOp &funcOp,
+                              DataPartitionScheme &partitionScheme) {
+  if (partitionScheme.rematerializedOps.empty())
+    return;
+
+  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
+
+  // For each rematerialized op, create a new op and replace its user with it.
+  for (auto opDim : partitionScheme.rematerializedOps) {
+    auto oldOp = opDim.first;
+    partitionScheme.opPartitionDims.erase(oldOp);
+    partitionScheme.ops.remove(oldOp);
+    builder.setInsertionPoint(oldOp);
+    builder.setAsyncTaskIdsFromOp(oldOp);
+
+    // Skip the first dim which will be using the original op.
+    for (unsigned i = 0; i < opDim.second.size(); i++) {
+      unsigned dim = opDim.second[i];
+      LLVM_DEBUG({
+        LDBG("rewriting op along dim " << dim << ":");
+        oldOp->dump();
+      });
+
+      Operation *newOp = nullptr;
+      if (auto allocOp = dyn_cast<LocalAllocOp>(oldOp)) {
+        // create a memdesc view
+        auto memdescType = allocOp.getType();
+        SmallVector<int64_t> shape = getShape(memdescType);
+        int sliceSize = shape[dim] / partitionScheme.numPartitions;
+        shape[dim] = sliceSize;
+        Value zero = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            allocOp.getLoc(), 0, 32);
+        auto slicedMemdescType = MemDescType::get(
+            shape, memdescType.getElementType(), memdescType.getEncoding(),
+            memdescType.getMemorySpace(), memdescType.getMutableMemory());
+        SmallVector<Value> offsets(shape.size(), zero);
+        auto viewOp = builder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
+            allocOp.getLoc(), slicedMemdescType, allocOp.getResult(), offsets);
+        newOp = viewOp;
+      } else if (isa<arith::ConstantOp>(oldOp)) {
+        newOp = builder.clone(*oldOp);
+      } else {
+        llvm_unreachable("Unexpected op");
+      }
+
+      LLVM_DEBUG({
+        LDBG("new op:");
+        newOp->dump();
+      });
+
+      setAsyncTaskIds(newOp, getAsyncTaskIds(oldOp));
+      partitionScheme.ops.insert(newOp);
+      partitionScheme.opPartitionDims[newOp] = dim;
+
+      // replace the users that have same partition dim with the op.
+      auto dimMatches = [&](OpOperand &operand) {
+        auto user = operand.getOwner();
+        assert(partitionScheme.opPartitionDims.contains(user) &&
+               "user not partitioned");
+        unsigned userDim = partitionScheme.opPartitionDims[user];
+        if (isa<TransOp>(user)) {
+          // flip userDim for trans
+          userDim = partitionScheme.flipPartitionDim(userDim);
+        } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(user)) {
+          // infer userDim for dot
+          assert(partitionScheme.dotPartitionOperand.contains(user) &&
+                 "no operand info");
+          unsigned opndIndx = partitionScheme.dotPartitionOperand[user];
+          if (userDim == 0 && opndIndx == 1 || userDim == 1 && opndIndx == 0)
+            userDim = DataPartitionScheme::noOpPartitionDim;
+        }
+
+        if (userDim != dim)
+          return false;
+        LLVM_DEBUG({
+          LDBG("replacing user with dim " << userDim << ":");
+          user->dump();
+        });
+        return true;
+      };
+
+      oldOp->getResult(0).replaceUsesWithIf(newOp->getResult(0), dimMatches);
+    }
+  }
+}
+
 Operation *sliceOp(Value v, int offset, OpBuilderWithAsyncTaskIds &builder,
                    IRMapping &mappings, IRMapping &reverseMappings,
                    DataPartitionScheme &partitionScheme);
@@ -584,8 +707,8 @@ Operation *sliceOp(Operation *op, int offset,
   if (reverseMappings.contains(op))
     return op;
 
-  int dim = partitionScheme.opPartitionDims[op];
-  int numOfPartitions = partitionScheme.numPartitions;
+  unsigned dim = partitionScheme.opPartitionDims[op];
+  unsigned numOfPartitions = partitionScheme.numPartitions;
 
   LLVM_DEBUG({
     LDBG("slicing along dim " << dim << ":");
@@ -619,25 +742,39 @@ Operation *sliceOp(Operation *op, int offset,
     if (!op->getResults().empty()) {
       auto v = op->getResult(0);
       auto newV = newOp->getResult(0);
-      if (auto type = dyn_cast<MemDescType>(v.getType())) {
-        SmallVector<int64_t> shape{type.getShape().begin(),
-                                   type.getShape().end()};
-        int sliceSize = shape[dim] / numOfPartitions;
-        shape[dim] = sliceSize;
-        auto newType =
-            MemDescType::get(shape, type.getElementType(), type.getEncoding(),
-                             type.getMemorySpace(), type.getMutableMemory());
-        newV.setType(newType);
-      } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-        SmallVector<int64_t> shape{type.getShape().begin(),
-                                   type.getShape().end()};
-        int sliceSize = shape[dim] / numOfPartitions;
-        shape[dim] = sliceSize;
-        auto newType = RankedTensorType::get(shape, type.getElementType(),
-                                             type.getEncoding());
-        newV.setType(newType);
+      bool needRetype = true;
+      if (dim == DataPartitionScheme::noOpPartitionDim) {
+        // Just duplicate the op for noOpPartitionDim
+        needRetype = false;
+      } else if (isa<nvidia_gpu::WarpGroupDotOp>(op)) {
+        assert(partitionScheme.dotPartitionOperand.contains(op) &&
+               "no operand info");
+        unsigned opndIndx = partitionScheme.dotPartitionOperand[op];
+        if (dim == 0 && opndIndx == 1 || dim == 1 && opndIndx == 0) {
+          needRetype = false;
+        }
       }
 
+      if (needRetype) {
+        if (auto type = dyn_cast<MemDescType>(v.getType())) {
+          SmallVector<int64_t> shape{type.getShape().begin(),
+                                     type.getShape().end()};
+          int sliceSize = shape[dim] / numOfPartitions;
+          shape[dim] = sliceSize;
+          auto newType =
+              MemDescType::get(shape, type.getElementType(), type.getEncoding(),
+                               type.getMemorySpace(), type.getMutableMemory());
+          newV.setType(newType);
+        } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+          SmallVector<int64_t> shape{type.getShape().begin(),
+                                     type.getShape().end()};
+          int sliceSize = shape[dim] / numOfPartitions;
+          shape[dim] = sliceSize;
+          auto newType = RankedTensorType::get(shape, type.getElementType(),
+                                               type.getEncoding());
+          newV.setType(newType);
+        }
+      }
       mappings.map(v, newV);
       reverseMappings.map(newV, v);
     }
@@ -646,9 +783,10 @@ Operation *sliceOp(Operation *op, int offset,
 
   // slice operands first
   Operation *newOp;
-  if (op->hasTrait<OpTrait::Elementwise>() ||
+  if ((dim == DataPartitionScheme::noOpPartitionDim) ||
+      op->hasTrait<OpTrait::Elementwise>() ||
       isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, FpToFpOp,
-          AtomicRMWOp>(op)) {
+          AtomicRMWOp, LocalAllocOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, builder, mappings, reverseMappings,
               partitionScheme);
@@ -723,31 +861,6 @@ Operation *sliceOp(Operation *op, int offset,
       mappings.map(v, newV);
       reverseMappings.map(newV, v);
     }
-  } else if (auto allocOp = dyn_cast<LocalAllocOp>(op)) {
-    if (partitionScheme.rematerializedOps.contains(op)) {
-      // create a memdesc view
-      builder.setInsertionPoint(op);
-      auto memdescType = allocOp.getType();
-      SmallVector<int64_t> shape = getShape(memdescType);
-      int sliceSize = shape[dim] / numOfPartitions;
-      shape[dim] = sliceSize;
-      Value zero = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          allocOp.getLoc(), 0, 32);
-      auto slicedMemdescType = MemDescType::get(
-          shape, memdescType.getElementType(), memdescType.getEncoding(),
-          memdescType.getMemorySpace(), memdescType.getMutableMemory());
-      SmallVector<Value> offsets(shape.size(), zero);
-      offsets[dim] = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          allocOp.getLoc(), shape[dim] * dim / numOfPartitions, 32);
-      auto viewOp = builder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
-          allocOp.getLoc(), slicedMemdescType, allocOp.getResult(), offsets);
-      newOp = viewOp;
-    } else {
-      for (Value operand : op->getOperands())
-        sliceOp(operand, offset, builder, mappings, reverseMappings,
-                partitionScheme);
-      newOp = cloneAndSetResultType(op);
-    }
   } else if (auto transOp = dyn_cast<TransOp>(op)) {
     sliceOp(transOp.getSrc(), offset, builder, mappings, reverseMappings,
             partitionScheme);
@@ -757,9 +870,6 @@ Operation *sliceOp(Operation *op, int offset,
     SmallVector<int64_t> shape{type.getShape().begin(), type.getShape().end()};
     int sliceSize = shape[dim] / numOfPartitions;
     shape[dim] = sliceSize;
-    // swap the two dimensions
-    assert(shape.size() == 2 && "only support 2D tensor");
-    std::swap(shape[dim], shape[1 - dim]);
     auto newType =
         MemDescType::get(shape, type.getElementType(), type.getEncoding(),
                          type.getMemorySpace(), type.getMutableMemory());
@@ -777,17 +887,16 @@ Operation *sliceOp(Operation *op, int offset,
     LDBG("slicing operand " << opndIndx << "\n");
     sliceOp(dotOp.getOperand(opndIndx), offset, builder, mappings,
             reverseMappings, partitionScheme);
-    if (dim == 0 && opndIndx == 0 || dim == 1 && opndIndx == 1) {
-      // Hanlde accumulator
-      sliceOp(dotOp.getC(), offset, builder, mappings, reverseMappings,
-              partitionScheme);
-    } else {
+    if (dim == 0 && opndIndx == 1 || dim == 1 && opndIndx == 0) {
       // slice the other operand
       unsigned otherOpndIndx = 1 - opndIndx;
       LDBG("slicing operand " << otherOpndIndx << "\n");
       sliceOp(dotOp.getOperand(otherOpndIndx), offset, builder, mappings,
               reverseMappings, partitionScheme);
     }
+    // Hanlde accumulator
+    sliceOp(dotOp.getC(), offset, builder, mappings, reverseMappings,
+            partitionScheme);
     newOp = cloneAndSetResultType(op);
   } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     // Add new loop arguments
@@ -967,11 +1076,23 @@ void partitionTasks(triton::FuncOp &funcOp, int numConsumerGroups) {
     return;
   }
 
+  // Rewrite the rematerialized ops.
+  LDBG("Rewriting rematerialized Ops");
+  rewriteRematerializedOps(funcOp, partitionScheme);
+  LLVM_DEBUG({
+    LDBG("After rewriting rematerialized Ops:");
+    funcOp.dump();
+    LDBG("\n");
+    LDBG(" Final parition scheme:\n");
+    partitionScheme.dump();
+  });
+
+  // Slice the ops.
   for (int i = 0; i < partitionScheme.numPartitions; i++) {
     OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
     IRMapping mappings, reverseMappings;
 
-    LLVM_DEBUG({ LDBG("partitioning op for task " << i << ":\n"); });
+    LDBG("partitioning op for task " << i + 1 << ":\n");
 
     // TODO: compute a topological order for partitionScheme.ops and
     // slice in that order.
