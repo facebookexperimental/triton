@@ -208,14 +208,6 @@ void getAccumCntsPreOrder(Operation *ctrlOp,
   for (auto *op : opsWithChannels) {
     LDBG("getAccumCntsPreOrder: " << ctrlOp << " opsWithChannels " << op);
   }
-#if 0
-  for (auto *op : opsWithChannels) {
-    if (ctrlOp == op) {
-      preOrderOps.push_back(op);
-      break;
-    }
-  }
-#endif
   ctrlOp->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
     // This will walk ctrlOp.
     if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
@@ -240,12 +232,6 @@ void getAccumCntsPreOrder(Operation *ctrlOp,
         }
       }
     }
-#if 0
-    if (opsWithChannels.count(subOp)) {
-      LDBG("getAccumCntsPreOrder: push " << subOp);
-      preOrderOps.push_back(subOp);
-    }
-#endif
   });
   LDBG("getAccumCntsPreOrder: " << ctrlOp << " size " << preOrderOps.size());
 }
@@ -255,15 +241,6 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
                         const DenseSet<Operation *> &opsWithChannels) {
   // Walk parentForOp in preorder.
   unsigned preOrderId = 0, ctrlId = 0;
-#if 0
-  // We may need accumCnt for parentForOp itself.
-  for (auto *op : opsWithChannels) {
-    if (parentForOp.getOperation() == op) {
-      ++preOrderId;
-      break;
-    }
-  }
-#endif
   bool found = false;
   parentForOp->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
     // This will walk parentForOp.
@@ -313,11 +290,6 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
        << parentForOp.getOperation() << " pOp " << pOp << " " << tSize << " "
        << parentTCnts << " " << accumArgId);
 
-#if 0
-  OpBuilderWithAsyncTaskIds builder(dstOp->getContext());
-  builder.setInsertionPoint(dstOp);
-  builder.setAsyncTaskIdsFromOp(dstOp);
-#endif
   auto loc = dstOp->getLoc();
   Value numBuffersVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
@@ -835,100 +807,6 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   return nullptr;
 }
 
-static void eraseIfOp(scf::IfOp ifOp);
-static void eraseForOp(scf::ForOp forOp) {
-  Block &block = *forOp.getBody();
-  auto yieldOp = cast<scf::YieldOp>(block.getTerminator());
-  SmallVector<unsigned> deadArg;
-  for (auto yieldOperand : llvm::enumerate(yieldOp->getOperands()))
-    deadArg.push_back(yieldOperand.index());
-  for (unsigned deadArgIdx : deadArg) {
-    BlockArgument arg = block.getArgument(deadArgIdx + 1);
-    yieldOp.setOperand(deadArgIdx, arg);
-  }
-  SmallVector<Operation *> bodyList;
-  for (Operation &op : forOp.getBody()->without_terminator()) {
-    bodyList.push_back(&op);
-  }
-  for (auto it2 = bodyList.rbegin(); it2 != bodyList.rend(); ++it2) {
-    Operation *op2 = *it2;
-    LLVM_DEBUG({
-      LDBG("erasing body of forOp ");
-      op2->dump();
-    });
-    if (auto ifOp = dyn_cast<scf::IfOp>(op2))
-      eraseIfOp(ifOp);
-    else if (auto forOp2 = dyn_cast<scf::ForOp>(op2))
-      eraseForOp(forOp2);
-    else
-      op2->erase();
-  }
-  LLVM_DEBUG({
-    LDBG("erasing forOp ");
-    forOp.dump();
-    forOp->getParentOp()->dump();
-  });
-  forOp.erase();
-}
-
-static void eraseIfOp(scf::IfOp ifOp) {
-  auto loc = ifOp.getLoc();
-  OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
-  ifBuilder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(ifOp));
-
-  auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
-    ifBuilder.setInsertionPoint(yield);
-    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(loc, operands);
-    yield.erase();
-  };
-  SmallVector<Value> ifYieldOperands;
-  updateYield(ifOp.thenYield(), ifYieldOperands);
-  if (ifOp.elseBlock()) {
-    updateYield(ifOp.elseYield(), ifYieldOperands);
-  }
-  SmallVector<Operation *> bodyList;
-  for (Operation &op : ifOp.thenBlock()->getOperations()) {
-    bodyList.push_back(&op);
-  }
-  for (auto it2 = bodyList.rbegin(); it2 != bodyList.rend(); ++it2) {
-    Operation *op2 = *it2;
-    LLVM_DEBUG({
-      LDBG("erasing thenBlock of ifOp ");
-      op2->dump();
-    });
-    if (auto ifOp2 = dyn_cast<scf::IfOp>(op2))
-      eraseIfOp(ifOp2);
-    else if (auto forOp = dyn_cast<scf::ForOp>(op2))
-      eraseForOp(forOp);
-    else
-      op2->erase();
-  }
-  if (ifOp.elseBlock()) {
-    SmallVector<Operation *> bodyList;
-    for (Operation &op : ifOp.elseBlock()->getOperations()) {
-      bodyList.push_back(&op);
-    }
-    for (auto it2 = bodyList.rbegin(); it2 != bodyList.rend(); ++it2) {
-      Operation *op2 = *it2;
-      LLVM_DEBUG({
-        LDBG("erasing elseBlock of ifOp ");
-        op2->dump();
-      });
-      if (auto ifOp2 = dyn_cast<scf::IfOp>(op2))
-        eraseIfOp(ifOp2);
-      else if (auto forOp = dyn_cast<scf::ForOp>(op2))
-        eraseForOp(forOp);
-      else
-        op2->erase();
-    }
-  }
-  LLVM_DEBUG({
-    LDBG("erasing ifOp ");
-    ifOp.dump();
-  });
-  ifOp.erase();
-}
-
 // Create IfOp for each ayncTaskId.
 DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
                                                   int regDecProducer,
@@ -1037,26 +915,6 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
         });
       }
     }
-#if 0
-    // Check to make sure ops under ForOp only have uses in the same ForOp.
-    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      op->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
-        // Check users of subOp.
-        for (unsigned i = 0; i < subOp->getNumResults(); ++i) {
-          for (Operation *user : subOp->getResult(i).getUsers()) {
-            // Make sure user is under the same forOp
-            if (!enclosing(forOp, user)) {
-              LLVM_DEBUG({
-                LDBG("op has use outside");
-                subOp->dump();
-              });
-            }
-          }
-        }
-      });
-      eraseForOp(forOp);
-    } else
-#endif
     op->erase();
   }
   return tasksToIfOp;
@@ -2768,13 +2626,6 @@ void insertAsyncCopy(
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will
       // be used by both producer and consumers.
-#if 0
-      OpBuilderWithAsyncTaskIds builder(srcOp);
-      SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
-      for (auto channel : mutuallyNonDominatingChannels)
-        asyncTasksPC.append(getAsyncTaskIds(channel->getDstOp()));
-      builder.setAsynTaskIdsFromArray(asyncTasksPC);
-#endif
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           srcOp->getLoc(), 0, 32);
     }
@@ -2827,64 +2678,6 @@ void foldLocalLoads(triton::FuncOp funcOp) {
   OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
   for (auto kv : opsToReplace)
     replaceUsesAndPropagateType(builder, kv.getFirst(), kv.getSecond());
-}
-
-static bool oneVecCoversTheOther(SmallVector<AsyncTaskId> &one,
-                                 SmallVector<AsyncTaskId> &other) {
-  // Every element of other appears in one.
-  for (AsyncTaskId t : other) {
-    // If t doesn't appear in one, return false.
-    bool found = false;
-    for (AsyncTaskId t2 : one) {
-      if (t2 == t) {
-        found = true;
-        break;
-      }
-    }
-    if (!found)
-      return false;
-  }
-  return true;
-}
-
-static bool verifyTaskId(triton::FuncOp &funcOp) {
-  bool hasError = false;
-  funcOp.walk([&](Operation *op) {
-    // Skip control ops
-    if (llvm::isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp>(op))
-      return;
-
-    auto asyncTaskIds = getAsyncTaskIds(op);
-    for (Value operand : op->getOperands()) {
-      Operation *defOp = operand.getDefiningOp();
-      if (!defOp)
-        continue;
-      if (llvm::isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(defOp))
-        continue;
-      if (llvm::isa<mlir::triton::gpu::LocalAllocOp, ttng::CreateTokenOp>(
-              defOp))
-        continue;
-      auto defTaskIds = getAsyncTaskIds(defOp);
-      // Make sure defTaskIds cover asyncTaskIds. Call addAsyncTaskIds if
-      // necessary.
-      LLVM_DEBUG({
-        if (!oneVecCoversTheOther(defTaskIds, asyncTaskIds)) {
-          hasError = true;
-          // print defOp and op
-          LDBG("Def op does not cover op");
-          LDBG("Def op");
-          defOp->dump();
-          LDBG("op");
-          op->dump();
-        }
-      });
-#if 0
-      assert(oneVecCoversTheOther(defTaskIds, asyncTaskIds) &&
-             "defTaskIds should cover asyncTaskIds");
-#endif
-    }
-  });
-  return hasError;
 }
 
 class TritonGPUWSCodePartitionPass
@@ -3001,7 +2794,6 @@ public:
       funcOp.dump();
     });
 
-    // verifyTaskId(funcOp);
     auto ret = SpecializeRegion(funcOp, regDecProducer, regIncConsumer);
     LLVM_DEBUG({
       LDBG("\n\nwith SpecializeRegion");
