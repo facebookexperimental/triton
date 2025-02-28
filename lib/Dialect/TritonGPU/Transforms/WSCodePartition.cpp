@@ -91,6 +91,11 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
         // Skip control flow ops that are shared by all async tasks
         continue;
       }
+      // If use is the initial value of ForOp argument.
+      if (auto userFor = dyn_cast<scf::ForOp>(user)) {
+        argIndices.insert(argIdx);
+        return;
+      }
 
       // Found a real user, the arg is needed
       if (user->getNumRegions() == 0) {
