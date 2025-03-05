@@ -709,6 +709,35 @@ def TT_DotScaledOp : TT_Op<"dot_scaled", [Pure,
 }
 
 //
+// Sparse Dot Op
+//
+def TT_SparseDotOp : TT_Op<"sparse_dot", [Pure,
+                             DeclareOpInterfaceMethods<DotOpInterface>,
+                             TypesMatchWith<"result's type matches accumulator's type",
+                                            "d", "c", "$_self">]> {
+    let summary = "sparse_dot";
+
+    let description = [{
+        TODO
+    }];
+
+    let arguments = (
+      ins
+      TT_FpIntTensor:$a,
+      TT_FpIntTensor:$b,
+      TT_FpIntTensor:$c,
+      TT_IntTensor:$aMeta
+    );
+
+    let results = (outs TT_FpIntTensor:$d);
+
+    // attr-dict prints enums as integers.  To get inputPrecision printed as a
+    // string, we need to specify it explicitly.
+    let assemblyFormat = [{$a`,` $b`,` $c`,` $aMeta attr-dict `:` type($a) `meta` type($aMeta) `*` type($b) `->` type($d)}];
+    let hasVerifier = 0;
+}
+
+//
 // Reduce Op
 //
 def TT_ReduceOp: TT_Op<"reduce",
