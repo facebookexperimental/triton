@@ -281,6 +281,7 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
         passes.convert.add_arith_to_llvmir(pm)
+        nvidia.passes.ttgpuir.add_fix_ws_barrier(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)

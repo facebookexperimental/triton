@@ -20,6 +20,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     UpcastMXFPToLLVM.cpp
     TargetInfo.cpp
     RegReallocOpToLLVM.cpp
+    FixWSBarrier.cpp
 
     DEPENDS
     TritonNVIDIAGPUConversionPassIncGen

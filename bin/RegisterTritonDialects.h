@@ -49,6 +49,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerDecomposeUnsupportedNVIDIAConversions();
   mlir::registerLLVMDIScope();
+  mlir::triton::registerFixWSBarrierPass();
 
   // TritonAMDGPUToLLVM passes
   mlir::triton::registerConvertTritonAMDGPUToLLVM();
