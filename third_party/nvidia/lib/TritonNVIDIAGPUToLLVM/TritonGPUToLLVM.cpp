@@ -64,6 +64,9 @@ public:
     addLegalOp<triton::gpu::WarpYieldOp>();
     addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
     addLegalOp<triton::gpu::WarpReturnOp>();
+
+    // TODO(sparsity) - do we need this?
+    addLegalOp<triton::SparseDotOp>(); // Rewritten in a separate pass
   }
 };
 

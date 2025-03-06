@@ -140,6 +140,15 @@ def NVGPU_WGMMAOp : NVGPU_Op<"wgmma", []> {
   let assemblyFormat = "$opA `,` $opB `,` $useC (`,` $opC^)? attr-dict `:` functional-type(operands, $res)";
 }
 
+def NVGPU_SparseWGMMAOp : NVGPU_Op<"wgmma_sp", []> {
+  let arguments = (ins WGMMA_OperandType:$opA, I32:$metaA, WGMMA_OperandType:$opB, LLVM_AnyStruct:$opC,
+                   I32Attr:$m, I32Attr:$n, I32Attr:$k,
+                   WGMMA_EltTypeAttr:$eltTypeC, WGMMA_EltTypeAttr:$eltTypeA, WGMMA_EltTypeAttr:$eltTypeB,
+                   WGMMA_LayoutAttr:$layoutA, WGMMA_LayoutAttr:$layoutB);
+  let results = (outs LLVM_AnyStruct:$res);
+  let assemblyFormat = "$opA `meta` $metaA `,` $opB `,` $opC attr-dict `:` functional-type(operands, $res)";
+}
+
 def NVGPU_FenceAsyncSharedOp : NVGPU_Op<"fence_async_shared", []> {
   let arguments = (ins BoolAttr:$bCluster);
   let assemblyFormat = "attr-dict";

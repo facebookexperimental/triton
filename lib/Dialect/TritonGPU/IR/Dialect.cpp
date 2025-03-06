@@ -519,6 +519,63 @@ LogicalResult tryJoinOnAxis(MLIRContext *ctx, const LinearLayout &inLl,
   return success();
 }
 
+// TODO(sparsity) maybe replace with linear layouts, or otherwise clean up
+namespace {
+// Implied properties of 2:4 sparse dots.
+constexpr int kContractingFactor = 2;
+constexpr int kMetadataElementsPerPackedValue = 8;
+constexpr int kMetadataElementsPerWarp = 16;
+} // namespace
+
+//--- SparseDotMetaEncodingAttr ---
+unsigned
+SparseDotMetaEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
+                                                  Type eltTy) const {
+  auto mmaLayout = mlir::cast<NvidiaMmaEncodingAttr>(getParent());
+  return product<int64_t>(shape) /
+         (mmaLayout.getWarpsPerCTA()[0] * kMetadataElementsPerWarp);
+}
+
+SmallVector<unsigned>
+SparseDotMetaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
+                                             Type eltTy) const {
+  llvm_unreachable("getElemsPerThread is not supported for sparse dot meta");
+  return SmallVector<unsigned>();
+}
+
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTAsPerCGA() const {
+  return ::getCTAsPerCGA(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTAOrder() const {
+  return ::getCTAOrder(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTASplitNum() const {
+  return ::getCTASplitNum(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getWarpsPerCTA() const {
+  return ::getWarpsPerCTA(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getWarpOrder() const {
+  return {1, 0};
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getThreadsPerWarp() const {
+  return ::getThreadsPerWarp(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getThreadOrder() const {
+  return {1, 0};
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getSizePerThread() const {
+  return ::getSizePerThread(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getShapePerCTATile(
+    ArrayRef<int64_t> tensorShape) const {
+  return ::getShapePerCTATile(getParent(), tensorShape);
+}
+std::optional<LinearLayout>
+SparseDotMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
+  return ::toLinearLayout(shape, getParent());
+}
+
 } // namespace gpu
 } // namespace triton
 } // namespace mlir
