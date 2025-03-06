@@ -1360,6 +1360,18 @@ elements along the K dim, or they use all elements of the tensor along the K dim
   }];
 }
 
+def SparseDotMetaEncodingAttr : DistributedEncoding<"SparseDotMetaEncoding", "sparse_dot_meta_encoding"> {
+  let mnemonic = "sparse_dot_meta";
+
+  let parameters = (ins "Attribute":$parent);
+  let assemblyFormat = "`<``{` struct(params) `}``>`";
+  let extraClassDeclaration = extraDistributedDeclaration # [{
+    SmallVector<unsigned> getContigPerThread() {
+      return getSizePerThread();
+    };
+  }];
+}
+
 def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {
   let mnemonic = "shared_memory";
   let description = [{
