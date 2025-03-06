@@ -304,6 +304,20 @@ LogicalResult DotOp::verify() {
                                                      bEncoding);
 }
 
+//-- SparseDotOp --
+// TODO(sparsity)
+// This is from https://github.com/SamGinzburg/triton/tree/PR-AMDSparsity,
+// when SparseDotOp implements DotOpInterface. The current ws-main branch
+// doesn't include the DotOpInterface commit, so we need to comment this out
+// until we rebase over that commit.
+/*
+bool SparseDotOp::verifyDims() {
+  auto aShape = this->getA().getType().getShape();
+  auto bShape = this->getB().getType().getShape();
+  return aShape[aShape.size() - 1] * 2 == bShape[aShape.size() - 2];
+}
+*/
+
 //-- MakeRangeOp --
 OpFoldResult MakeRangeOp::fold(FoldAdaptor adaptor) {
   // make_range(start, start + 1) -> constant(start)
