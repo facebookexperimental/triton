@@ -64,6 +64,8 @@ public:
     addIllegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    // TODO(sparsity) - do we need this?
+    addLegalOp<triton::SparseDotOp>(); // Rewritten in a separate pass
   }
 };
 
