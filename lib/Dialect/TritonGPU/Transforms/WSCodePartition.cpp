@@ -1336,7 +1336,7 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
     // Increment by 1.
     builder.setInsertionPoint(yieldOp);
     Value one =
-        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 32);
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
     Value nextCntIdx = builder.createWithAsyncTaskIds<arith::AddIOp>(
         loc, tmpAccumLoopCount, one);
     yieldOp->insertOperands(yieldOp.getNumOperands(),
