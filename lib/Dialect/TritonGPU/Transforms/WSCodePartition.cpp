@@ -282,15 +282,20 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &opsWithChannels,
-                          Value &outBufferIdx, Value &phase) {
+                          Value &outBufferIdx, Value &phase,
+                          bool hasBufferReuse) {
   auto parentForOp = dstOp->getParentOfType<scf::ForOp>();
   auto *pOp = dstOp->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned accumArgId = getAccumArgIdx(parentForOp, pOp, opsWithChannels);
   auto tSize = parentForOp.getBody()->getArguments().size();
   auto parentTCnts = getAccumCnts(parentForOp, opsWithChannels);
-  Value accumCnt =
-      parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
+  Value accumCnt;
+  if (hasBufferReuse)
+    accumCnt = parentForOp.getBody()->getArguments().back();
+  else
+    accumCnt =
+        parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
   LDBG("getBufferIdxAndPhase: parentForOp "
        << parentForOp.getOperation() << " pOp " << pOp << " " << tSize << " "
        << parentTCnts << " " << accumArgId);
@@ -2355,7 +2360,8 @@ void insertAsyncComm(
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
     const DenseMap<Channel *, Value> &bufferMap,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    int numConsumerGroups, DenseSet<Operation *> &opsWithChannels) {
+    int numConsumerGroups, DenseSet<Operation *> &opsWithChannels,
+    bool hasBufferReuse) {
 
   // Find the operation that is along producer's parent chain, and its parent
   // is the same op as producer's parent. Here p is producer, and c is consumer.
@@ -2512,7 +2518,7 @@ void insertAsyncComm(
         headProducer->dump();
       });
       getBufferIdxAndPhase(builder, headProducer, kv.second.front()->numBuffers,
-                           opsWithChannels, bufferIdx, phase);
+                           opsWithChannels, bufferIdx, phase, hasBufferReuse);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
@@ -2587,7 +2593,7 @@ void insertAsyncCopy(
         &channelsGroupedByProducers,
     const DenseMap<Channel *, Value> &bufferMap,
     DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &opsWithChannels) {
+    DenseSet<Operation *> &opsWithChannels, bool hasBufferReuse) {
   // For each producer op, create a async_copy or local_store from the producer
   // to the buffer. Create a local_load from the buffer at the dominating
   // consumer.
@@ -2627,7 +2633,7 @@ void insertAsyncCopy(
         srcOp->dump();
       });
       getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->numBuffers,
-                           opsWithChannels, bufferIdx, phase);
+                           opsWithChannels, bufferIdx, phase, hasBufferReuse);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will
       // be used by both producer and consumers.
@@ -2747,6 +2753,7 @@ public:
       LDBG("\n\nafter appendBufferIdxArgs");
       funcOp.dump();
     });
+    bool hasBufferReuse = opsWithBufferReuse.size() > 1;
 
     // Step 5: Create buffers. An array of buffers for each channel. Update
     // channelReuse that maps from a representing channel to the group of
@@ -2764,7 +2771,7 @@ public:
     // producers.
     DenseMap<Channel *, std::pair<Operation *, Operation *>> copyOpMap;
     insertAsyncCopy(funcOp, channelsGroupedByProducers, bufferMap, copyOpMap,
-                    opsWithChannels);
+                    opsWithChannels, hasBufferReuse);
     LLVM_DEBUG({
       LDBG("\n\nwith async copy");
       funcOp.dump();
@@ -2785,7 +2792,7 @@ public:
     // TMA loads.
     insertAsyncComm(funcOp, channelsGroupedByConsumers, tokenMap,
                     barrierAllocMap, bufferMap, copyOpMap, numConsumerGroups,
-                    opsWithChannels);
+                    opsWithChannels, hasBufferReuse);
     LLVM_DEBUG({
       LDBG("\n\nwith SyncOps");
       funcOp.dump();
