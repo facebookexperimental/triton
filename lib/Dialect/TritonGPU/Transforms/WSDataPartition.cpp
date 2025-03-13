@@ -277,6 +277,15 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
     if (isa<TransOp>(op))
       currentDim = partitionScheme.flipPartitionDim(currentDim);
 
+    if (auto expandDimsOp = dyn_cast<ExpandDimsOp>(op)) {
+      // currentDim is the dim after expansion.
+      assert(expandDimsOp.getAxis() != currentDim &&
+             "expanded dim always has shape 1");
+      // Parition along currentDim - 1 for ExpandDimsOp.
+      if (expandDimsOp.getAxis() < currentDim)
+        currentDim--;
+    }
+
     // Recusively process operands backwards.
     if (op->hasTrait<OpTrait::Elementwise>() ||
         isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
@@ -553,7 +562,7 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
       partitionSize.push_back(sliceSizeM);
     }
 
-    if (sliceSizeN >= 256) {
+    if (sliceSizeN >= 128) {
       partitionDim.push_back(1);
       partitionSize.push_back(sliceSizeN);
     }
