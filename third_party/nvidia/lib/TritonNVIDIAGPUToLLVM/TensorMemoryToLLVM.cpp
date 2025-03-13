@@ -226,6 +226,15 @@ void calculateAddressAndEmitTmemMessage(
   Value warpIdInGroup = b.urem(warpId, b.i32_val(4));
   Value warpGroupId = b.udiv(warpId, b.i32_val(4));
 
+  auto asyncTaskIds = getAsyncTaskIds(op);
+  if (!asyncTaskIds.empty()) {
+    // numWarpGroups is for the current groups that do the load. In WS mode, we
+    // assume only one warp group does TMEMLoad.
+    assert(asyncTaskIds.size() == 1 &&
+           "only support TMEM load in single async task");
+    warpGroupId = b.sub(warpGroupId, b.i32_val(asyncTaskIds[0]));
+  }
+
   for (int block = 0; block < info.numBlocks; block += info.numWarpGroups) {
     Value address = b.ptrtoint(i32_ty, baseAddress);
     Value blockId =
@@ -364,7 +373,7 @@ static void lowerStoreToTensorMemory(Location loc, Operation *op, Value src,
 
   // Emit a barrier to ensure all threads have finished writing to tensor memory
   // before any use of the tensor memory.
-  b.barrier();
+  insertBarrier(rewriter, op);
 }
 
 struct TensorMemoryAllocOpConversion
