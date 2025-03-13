@@ -169,6 +169,7 @@ def matmul_persistent_tma_ws_cooperative_annotated_kernel(
         offs_k = 0
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tl.assume(tl.cdiv(K, BLOCK_SIZE_K)>0)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             with tl.async_task([0]):
                 a = tl._experimental_descriptor_load(
@@ -263,6 +264,7 @@ def matmul_persistent_tma_ws_cooperative_kernel(
         offs_k = 0
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tl.assume(tl.cdiv(K, BLOCK_SIZE_K)>0)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             a = tl._experimental_descriptor_load(
                 a_ptr,
