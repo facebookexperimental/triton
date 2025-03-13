@@ -178,6 +178,32 @@ static bool enclosingAChannel(Operation *ctrlOp,
   return false;
 }
 
+// Return true if the IfOp contains a ForOp that is in opsWithBufferReuse.
+// We want to support reuse between channels in a loop and channels in a IfOp.
+static bool
+needAccumulatedLoopCntForReuse(scf::IfOp ifOp,
+                               SmallVector<Operation *> &opsWithBufferReuse) {
+  bool needAccum = false;
+  ifOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
+    for (auto tOp : opsWithBufferReuse) {
+      if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
+        // For the case of ifOp contains forOp, which contains subOp, no need to
+        // generate accumLoopCount for ifOp.
+        if (subOp == tOp && immediateEnclosing(ifOp, tOp)) {
+          needAccum = true;
+          break;
+        }
+      } else {
+        if (subOp == tOp) {
+          needAccum = true;
+          break;
+        }
+      }
+    }
+  });
+  return needAccum;
+}
+
 // Return the argument that tracks accumLoopCount if there is an outer
 // ForOp.
 Value getReuseAccumCntArg(scf::ForOp parentForOp) {
@@ -241,8 +267,12 @@ unsigned getAccumCnts(Operation *ctrlOp,
       if (enclosing(ifOp, op))
         ++cnt;
   }
-  if (opsWithBufferReuse.size() > 1)
-    ++cnt;
+  if (auto tIf = dyn_cast<scf::IfOp>(ctrlOp))
+    if (needAccumulatedLoopCntForReuse(tIf, opsWithBufferReuse))
+      ++cnt;
+  if (dyn_cast<scf::ForOp>(ctrlOp))
+    if (opsWithBufferReuse.size() > 1)
+      ++cnt;
   return cnt;
 }
 
@@ -383,32 +413,6 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
       builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
   phase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI1Type(), bufferIdx);
-}
-
-// Return true if the IfOp contains a ForOp that is in opsWithBufferReuse.
-// We want to support reuse between channels in a loop and channels in a IfOp.
-static bool
-needAccumulatedLoopCntForReuse(scf::IfOp ifOp,
-                               SmallVector<Operation *> &opsWithBufferReuse) {
-  bool needAccum = false;
-  ifOp.walk<WalkOrder::PreOrder>([&](Operation *subOp) {
-    for (auto tOp : opsWithBufferReuse) {
-      if (auto forOp = dyn_cast<scf::ForOp>(subOp)) {
-        // For the case of ifOp contains forOp, which contains subOp, no need to
-        // generate accumLoopCount for ifOp.
-        if (subOp == tOp && immediateEnclosing(ifOp, tOp)) {
-          needAccum = true;
-          break;
-        }
-      } else {
-        if (subOp == tOp) {
-          needAccum = true;
-          break;
-        }
-      }
-    }
-  });
-  return needAccum;
 }
 
 static bool
@@ -1412,7 +1416,8 @@ scf::ForOp createNewLoop(scf::ForOp forOp, int numBuffers,
   // Will be fixed in the caller.
   for (unsigned i = 0; i < numAccumCnts; i++)
     yieldOp->insertOperands(yieldOp.getNumOperands(),
-                            {body->getArgument(tSize - numAccumCnts + i)});
+                            {body->getArgument(tSize - numAccumCnts + i -
+                                               (isBufferReuse ? 1 : 0))});
   //}
   if (isOuterOfReuse) {
     // We have not iterated through the body yet, so do not have the right value
@@ -1566,7 +1571,8 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
   }
   // A list of IfOps/ForOps at the innermost level: loopDepthMap[maxDepth]
   auto &opsAtMaxDepth = loopDepthMap[maxDepth];
-  LDBG("reuseBuffers number of inner ops: " << opsAtMaxDepth.size());
+  LDBG("reuseBuffers number of inner ops: " << opsAtMaxDepth.size()
+                                            << " at depth " << maxDepth);
   if (opsAtMaxDepth.empty() || opsAtMaxDepth.size() == 1)
     return;
 #if 0
@@ -1645,7 +1651,7 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
     }
     firstOp = false;
   }
-  if (opsWithBufferReuse.size() == 1 && maxDepth == 0)
+  if (opsWithBufferReuse.size() == 1)
     // A single op in buffer reuse and there is no outer loop.
     opsWithBufferReuse.clear();
   LLVM_DEBUG({
@@ -1885,6 +1891,10 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
       opList, numBuffers, taskTopOps, commonOuterLoop, opsWithBufferReuse,
       opsWithChannels,
       isOuterOfReuse ? getReuseAccumCntArg(newForOp) : prevAccum);
+  LLVM_DEBUG({
+    LDBG("-- before replacing yieldOp ");
+    newForOp.dump();
+  });
 
   // Update yieldOp.
   if (isOuterOfReuse) {
@@ -1916,9 +1926,13 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   if (isOuterOfReuse || hasReuse)
     numAccumCnts++;
   accumArgId = tSize - numAccumCnts; // first accumCnt: ForA.arg[accumForA]
+  LDBG("-- tSize, numAccumCnts, accumArgId " << tSize << " " << numAccumCnts
+                                             << " " << accumArgId);
 
   // If there is a channel directly in forOp, yield ForA.arg[accumForA]+1.
-  for (auto *op : opsWithChannels) {
+  DenseSet<Operation *> excludeReuse;
+  excludeChannelsWithReuse(opsWithChannels, opsWithBufferReuse, excludeReuse);
+  for (auto *op : excludeReuse) {
     if (newForOp.getOperation() == op) {
       Value arg = newForOp.getBody()->getArgument(accumArgId);
       OpBuilderWithAsyncTaskIds builder(newForOp->getContext());
@@ -1934,19 +1948,40 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
       break;
     }
   }
+  LDBG("-- accumArgId after channels directly under " << accumArgId);
   // This order should align with the preorder that is used for accumCnts.
+  SmallVector<Operation *> dummy;
   for (auto *op : opList) {
-    if (!enclosingAChannel(op, opsWithChannels))
+    if (!enclosingAChannel(op, excludeReuse))
       continue;
     auto numRes = op->getNumResults();
-    unsigned tCnts = getAccumCnts(op, opsWithChannels, opsWithBufferReuse);
+    // Ignore reuse AccumCnt here as it is handled earlier.
+    unsigned tCnts = getAccumCnts(op, excludeReuse, dummy);
+    // For now, we only supported limited form of reuse where we have double
+    // loop nests.
+    bool hasReuseCnt = false;
+    if (auto tIf = dyn_cast<scf::IfOp>(op))
+      hasReuseCnt = needAccumulatedLoopCntForReuse(tIf, opsWithBufferReuse);
+    LDBG("-- hasReuseCnt, numRes, tCnts, accumArgId "
+         << hasReuseCnt << " " << numRes << " " << tCnts << " " << accumArgId);
     for (unsigned i = 0; i < tCnts; ++i) {
       Value arg = newForOp.getBody()->getArgument(accumArgId);
-      Value endAccum = op->getResult(numRes - tCnts + i);
+      Value endAccum =
+          op->getResult(numRes - tCnts + i - (hasReuseCnt ? 1 : 0));
+      LLVM_DEBUG({
+        LDBG("-- replace use of arg with result "
+             << numRes - tCnts + i - (hasReuseCnt ? 1 : 0));
+        op->dump();
+      });
       yieldOp->replaceUsesOfWith(arg, endAccum);
+      LLVM_DEBUG(yieldOp->dump());
       ++accumArgId;
     }
   }
+  LLVM_DEBUG({
+    LDBG("-- after all replacing ");
+    newForOp.dump();
+  });
   //}
   return newForOp;
 }
