@@ -36,4 +36,11 @@ def ConvertTritonGPUToLLVM : Pass<"convert-triton-gpu-to-llvm", "mlir::ModuleOp"
     ];
 }
 
+def FixWSBarrier : Pass<"fix-ws-barrier", "mlir::ModuleOp"> {
+    let summary = "Fix the barrier usage in LLVM due to warp specialization";
+    let constructor = "mlir::triton::createFixWSBarrierPass()";
+    let dependentDialects = ["mlir::LLVM::LLVMDialect",
+                             "mlir::NVVM::NVVMDialect"];
+}
+
 #endif

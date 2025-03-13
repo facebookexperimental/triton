@@ -26,6 +26,9 @@ void init_triton_nvidia_passes_ttgpuir(py::module &&m) {
   m.def("add_decompose_unsupported_conversions", [](mlir::PassManager &pm) {
     pm.addPass(NVIDIA::createDecomposeUnsupportedConversionsPass());
   });
+  m.def("add_fix_ws_barrier", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createFixWSBarrierPass());
+  });
 }
 
 void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
