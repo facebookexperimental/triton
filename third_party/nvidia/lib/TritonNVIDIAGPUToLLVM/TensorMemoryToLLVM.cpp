@@ -53,8 +53,9 @@ int getNum32BRegs(int rowsPerMessage, bool unpackedb16, int numElementsPer32B,
 // Map the distributed layout onto the tmem. Calculate the address and emit one
 // or more tmem messages.
 void calculateAddressAndEmitTmemMessage(
-    Location loc, ModuleOp mod, Value baseAddress, RankedTensorType tensorType,
-    MemDescType memType, ConversionPatternRewriter &rewriter,
+    Location loc, ModuleOp mod, Operation *op, Value baseAddress,
+    RankedTensorType tensorType, MemDescType memType,
+    ConversionPatternRewriter &rewriter,
     const std::function<void(Value /*startAddress*/,
                              int /*secondHalfColOffset*/, bool /*unpackedb16*/,
                              int /*regsPerMessage*/,
@@ -107,6 +108,16 @@ void calculateAddressAndEmitTmemMessage(
   Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
   Value warpIdInGroup = b.urem(warpId, b.i32_val(4));
   Value warpGroupId = b.udiv(warpId, b.i32_val(4));
+
+  auto asyncTaskIds = getAsyncTaskIds(op);
+  if (!asyncTaskIds.empty()) {
+    // numWarpGroups is for the current groups that do the load. In WS mode, we
+    // assume only one warp group does TMEMLoad.
+    assert(asyncTaskIds.size() == 1 &&
+           "only support TMEM load in single async task");
+    warpGroupId = b.sub(warpGroupId, b.i32_val(asyncTaskIds[0]));
+  }
+
   Value rowId = b.mul(warpIdInGroup, b.i32_val(numRowsPerWarp));
 
   int colsPerWarpGroup = numColsPerBlock / numWarpGroupsPerBlock;
@@ -220,9 +231,9 @@ static void reorderScales(SmallVector<Value> &srcValues, int64_t k) {
   srcValues = std::move(reorderedValues);
 }
 
-static void lowerStoreToTensorMemory(Location loc, ModuleOp mod, Value src,
-                                     Value dest, Value llSrc, Value pred,
-                                     SharedMemoryObject smemObj,
+static void lowerStoreToTensorMemory(Location loc, ModuleOp mod, Operation *op,
+                                     Value src, Value dest, Value llSrc,
+                                     Value pred, SharedMemoryObject smemObj,
                                      ConversionPatternRewriter &rewriter) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   SmallVector<Value> srcValues = unpackLLElements(loc, llSrc, rewriter);
@@ -236,7 +247,7 @@ static void lowerStoreToTensorMemory(Location loc, ModuleOp mod, Value src,
   }
   int regIdx = 0;
   calculateAddressAndEmitTmemMessage(
-      loc, mod, smemObj.getBase(), cast<RankedTensorType>(src.getType()),
+      loc, mod, op, smemObj.getBase(), cast<RankedTensorType>(src.getType()),
       cast<MemDescType>(dest.getType()), rewriter,
       [&](Value startAddress, int secondHalfColOffset, bool unpackedb16,
           int regsPerMessage, bool useStridedMessage) {
@@ -253,7 +264,7 @@ static void lowerStoreToTensorMemory(Location loc, ModuleOp mod, Value src,
 
   // Emit a barrier to ensure all threads have finished writing to tensor memory
   // before any use of the tensor memory.
-  b.barrier();
+  insertBarrier(rewriter, op);
 }
 
 struct TensorMemoryAllocOpConversion
@@ -287,7 +298,7 @@ struct TensorMemoryAllocOpConversion
                                       shape.size(), loc, rewriter);
 
     if (op.getSrc()) {
-      lowerStoreToTensorMemory(loc, mod, op.getSrc(), op.getResult(),
+      lowerStoreToTensorMemory(loc, mod, op, op.getSrc(), op.getResult(),
                                adaptor.getSrc(), b.i1_val(true), smemObj,
                                rewriter);
     }
@@ -386,7 +397,7 @@ struct TensorMemoryLoadOpConversion
 
     SmallVector<Value> resultVals;
     calculateAddressAndEmitTmemMessage(
-        loc, mod, smemObj.getBase(), op.getType(), op.getSrc().getType(),
+        loc, mod, op, smemObj.getBase(), op.getType(), op.getSrc().getType(),
         rewriter,
         [&](Value startAddress, int secondHalfColOffset, bool unpackedb16,
             int regsPerMessage, bool useStridedMessage) {
@@ -423,7 +434,7 @@ struct TensorMemoryStoreOpConversion
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
         op.getLoc(), adaptor.getDst(), llvmElemTy, rewriter);
     Value pred = adaptor.getPred();
-    lowerStoreToTensorMemory(loc, mod, op.getSrc(), op.getDst(),
+    lowerStoreToTensorMemory(loc, mod, op, op.getSrc(), op.getDst(),
                              adaptor.getSrc(), pred, smemObj, rewriter);
 
     rewriter.eraseOp(op);

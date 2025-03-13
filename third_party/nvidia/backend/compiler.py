@@ -314,6 +314,8 @@ class CUDABackend(BaseBackend):
 
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+        if capability // 10 >= 9:
+            passes.ttgpuir.add_ws_canonicalization(pm, options.num_consumer_groups)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_index_to_llvmir(pm)
         passes.ttgpuir.add_allocate_shared_memory(pm)

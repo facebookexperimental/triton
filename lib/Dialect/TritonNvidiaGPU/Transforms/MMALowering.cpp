@@ -2,6 +2,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
@@ -38,9 +39,14 @@ public:
     MemDescType barrierMemDescType =
         MemDescType::get({1}, rewriter.getI64Type(), barrierEncoding,
                          sharedMemorySpace, /*mutableMemory=*/true);
+
+    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, op);
+
     Value barrierAlloc =
-        rewriter.create<LocalAllocOp>(loc, barrierMemDescType, Value());
-    rewriter.create<InitBarrierOp>(loc, barrierAlloc, 1);
+        taskIdRewriter.create<LocalAllocOp>(loc, barrierMemDescType, Value());
+
+    taskIdRewriter.create<InitBarrierOp>(loc, barrierAlloc, 1);
+
     op.getBarrierMutable().assign(barrierAlloc);
 
     rewriter.setInsertionPointAfter(op);
