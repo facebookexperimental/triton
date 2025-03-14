@@ -548,16 +548,16 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
   ifBuilder.setInsertionPoint(newIfOp.thenYield());
 
   auto parentForOp = newIfOp->getParentOfType<scf::ForOp>();
-  unsigned tSize;
+  unsigned tSize, parentTCnts = 0;
   SmallVector<Operation *> preOrderOpsOfParent;
   if (parentForOp) {
     tSize = parentForOp.getBody()->getArguments().size();
     getAccumCntsPreOrder(parentForOp.getOperation(), opsWithChannels,
                          opsWithBufferReuse, preOrderOpsOfParent);
+    parentTCnts =
+        getAccumCnts(parentForOp.getOperation(), opsWithChannels,
+                     opsWithBufferReuse); // preOrderOpsOfParent.size();
   }
-  auto parentTCnts =
-      getAccumCnts(parentForOp.getOperation(), opsWithChannels,
-                   opsWithBufferReuse); // preOrderOpsOfParent.size();
   LDBG("rewrite ifOp: parentFor " << parentTCnts << " accumCnts");
 
 #if 0
