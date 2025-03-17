@@ -1158,6 +1158,7 @@ void groupChannels(
   //    (dst1 and dst2 are in the same block, both have a single user, and
   //     dst1User == dst2User and dst1User is in the same block as dst1))
   auto channelCanBeMerged = [](Channel *c1, Channel *c2) -> bool {
+    // TODO: do not merge if one consumer is tcgen05_mma
     if (c1->getSrcOp()->getBlock() != c2->getSrcOp()->getBlock())
       return false;
     Operation *dst1 = c1->getDstOp(), *dst2 = c2->getDstOp();
@@ -2061,20 +2062,53 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   return barrierAlloc;
 }
 
+struct CommChannel {
+  DenseMap<int, Value> tokens;
+  // Producer barrier is only needed when the producer op itself can update the
+  // barrier inline, such as the TMA load.
+  std::optional<Value> producerBarrier;
+  // Consumer barrier is only needed when the consumer op itself can update the
+  // barrier inline, such as the TCGen5MMAOp.
+  std::optional<Value> consumerBarrier;
+};
+
+static Operation *getRealConsumer(Operation *consumerOp) {
+  // For a consumer of local_alloc, probe a step further to see if the
+  // real consumer is a TCGen5MMAOp.
+  if (isa<LocalAllocOp>(consumerOp)) {
+    int userCount = 0;
+    Operation *transitiveConsumer;
+    for (auto user : consumerOp->getUsers()) {
+      transitiveConsumer = user;
+      userCount++;
+      if (userCount > 1)
+        break;
+    }
+
+    if (userCount == 1) {
+      if (isa<nvidia_gpu::TCGen5MMAOp, nvidia_gpu::WarpGroupDotOp>(
+              transitiveConsumer)) {
+        return transitiveConsumer;
+      }
+    }
+  }
+
+  return consumerOp;
+}
+
 // channelsGroupedByConsumers: channels are grouped together.
 // Go through each group, check the first channel in the group, create a token
 // for each consumer taskId. Return a map that maps each channel + consumer
 // taskId to a token. Also update barrierAllocMap that maps each channel +
 // consumer taskId to a BarrierAlloc.
-DenseMap<Channel *, DenseMap<int, Value>> createToken(
+void createToken(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
     const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp,
     int numConsumerGroups,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
     DenseMap<Channel *, SmallVector<Channel *>> &channelReuse,
-    DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
-  DenseMap<Channel *, DenseMap<int, Value>> ret;
+    DenseMap<Channel *, CommChannel> &tokenMap) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   for (auto *key : orderedChannels) {
@@ -2082,51 +2116,75 @@ DenseMap<Channel *, DenseMap<int, Value>> createToken(
     Channel *channel = it->second.front();
     if (!channelReuse.count(channel))
       continue;
+
+    CommChannel commChannel;
+    auto producerOp = it->second.front()->getSrcOp();
+    auto consumerOp = it->second.front()->getDstOp();
+    consumerOp = getRealConsumer(consumerOp);
+
+    if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
+      commChannel.producerBarrier =
+          createBarrierAlloc(funcOp, channel->numBuffers);
+    }
+
     for (auto consumerAsyncTaskId : channel->relation.second) {
-      ttng::TokenLoadType tokenLoadType;
-      auto copyOp = copyOpMap.find(channel)->second.first;
-      if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
-        tokenLoadType = ttng::TokenLoadType::AsyncLoadOp;
-      } else if (isa<ExperimentalDescriptorLoadOp>(copyOp)) {
-        tokenLoadType = ttng::TokenLoadType::TMALoadOp;
-      } else if (isa<LocalStoreOp>(copyOp)) {
-        tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
-      } else {
-        llvm_unreachable("Unexpected load type");
+      // No token is needed for a TMA <-> TCGen5MMAOp channel
+      if (!isa<tt::ExperimentalDescriptorLoadOp>(producerOp) ||
+          !isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+        ttng::TokenLoadType tokenLoadType;
+        auto copyOp = copyOpMap.find(channel)->second.first;
+        if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
+          tokenLoadType = ttng::TokenLoadType::AsyncLoadOp;
+        } else if (isa<ExperimentalDescriptorLoadOp>(copyOp)) {
+          tokenLoadType = ttng::TokenLoadType::TMALoadOp;
+        } else if (isa<LocalStoreOp>(copyOp)) {
+          tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
+        } else {
+          llvm_unreachable("Unexpected load type");
+        }
+        Value v;
+        if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
+          v = builder.create<ttng::CreateTokenOp>(
+              funcOp.getLoc(), channel->numBuffers, tokenLoadType);
+        else
+          v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1,
+                                                  tokenLoadType);
+        commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
-      Value v;
-      if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>()) {
-        v = builder.create<ttng::CreateTokenOp>(
-            funcOp.getLoc(), channel->numBuffers, tokenLoadType);
-      } else {
-        v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1,
-                                                tokenLoadType);
-      }
-      // Channels in the group share the same set of tokens.
-      for (auto &c : it->second) {
-        ret[c][consumerAsyncTaskId] = v;
-      }
-      for (auto *reuse : channelReuse[channel]) {
-        ret[reuse][consumerAsyncTaskId] = v;
-      }
-
-      auto producerOp = it->second.front()->getSrcOp();
-      if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
-        Value bAlloc = createBarrierAlloc(funcOp, channel->numBuffers);
-        // Channels in the group share the same set of tokens.
-        for (auto &c : it->second) {
-          ret[c][consumerAsyncTaskId] = v;
-          barrierAllocMap[c][consumerAsyncTaskId] = bAlloc;
-        }
-        for (auto *reuse : channelReuse[channel]) {
-          ret[reuse][consumerAsyncTaskId] = v;
-          barrierAllocMap[reuse][consumerAsyncTaskId] = bAlloc;
-        }
+      if (isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+        Value v = createBarrierAlloc(funcOp, channel->numBuffers);
+        commChannel.consumerBarrier = v;
       }
     }
+
+    // Channels in the group share the same set of tokens.
+    for (auto &c : it->second) {
+      tokenMap[c] = commChannel;
+    }
+    for (auto *reuse : channelReuse[channel]) {
+      tokenMap[reuse] = commChannel;
+    }
   }
-  return ret;
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "Communication Channels: \n";
+    for (auto &item : tokenMap) {
+      llvm::dbgs() << "\ndata channel: \n";
+      llvm::dbgs() << *item.first->getSrcOp() << "\n";
+      llvm::dbgs() << *item.first->getDstOp() << "\n";
+      llvm::dbgs() << "communication channel: \n";
+      for (auto &kv : item.second.tokens) {
+        llvm::dbgs() << "token: " << kv.first << " " << kv.second << "\n";
+      }
+      if (item.second.producerBarrier)
+        llvm::dbgs() << "producer barrier: " << *item.second.producerBarrier
+                     << "\n";
+      if (item.second.consumerBarrier)
+        llvm::dbgs() << "consumer barrier: " << *item.second.consumerBarrier
+                     << "\n";
+    }
+  });
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
@@ -2460,6 +2518,29 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   return copy;
 }
 
+void desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
+                       nvidia_gpu::TCGen5MMAOp mmaOp, Value barrierAlloc,
+                       Value bufferIdx, Value phase, Operation *headProducer) {
+  // attach the barrier as an operand of the mma op.
+  builder.setInsertionPoint(mmaOp);
+  builder.setAsyncTaskIdsFromOp(mmaOp);
+  auto consumerBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  mmaOp.getBarrierMutable().assign(consumerBarrier);
+
+  // Create a wait_barrier before the producer.
+  builder.setInsertionPoint(headProducer);
+  builder.setAsyncTaskIdsFromOp(headProducer);
+  consumerBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+      headProducer->getLoc(), builder.getI32Type(), phase);
+  auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+      headProducer->getLoc(), consumerBarrier, phase);
+
+  // Create a wait_barrier before the tmem load.
+}
+
 // Lower producers for channels. Here channels are grouped in
 // "channelsGroupedByConsumers". tokenMap tracks the set of tokens for each
 // channel.
@@ -2467,7 +2548,7 @@ void insertAsyncComm(
     triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
-    const DenseMap<Channel *, DenseMap<int, Value>> &tokenMap,
+    const DenseMap<Channel *, CommChannel> &tokenMap,
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
     const DenseMap<Channel *, Value> &bufferMap,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
@@ -2564,6 +2645,7 @@ void insertAsyncComm(
       producerOps.insert(pcOp.first);
       consumerOps.insert(pcOp.second);
       consumerOps.insert(c->getDstOp());
+      consumerOps.insert(getRealConsumer(c->getDstOp()));
     }
 
     // Find head producer
@@ -2602,7 +2684,7 @@ void insertAsyncComm(
     }
 
     // We have one set of tokens for each channel group.
-    auto tokens = tokenMap.find(kv.second.front())->second;
+    auto &commChannel = tokenMap.find(kv.second.front())->second;
     auto masterChannel = kv.getFirst();
 
     SmallVector<AsyncTaskId> asyncTaskP;
@@ -2640,37 +2722,42 @@ void insertAsyncComm(
     }
 
     builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
-    for (auto token : tokens) {
-      // Insert ProducerAcquireOp before the producer.
-      builder.setInsertionPoint(headProducer);
-      builder.createWithAsyncTaskIds<ttng::ProducerAcquireOp>(
-          headProducer->getLoc(), token.second, bufferIdx, phase);
+    for (const auto &token : commChannel.tokens) {
+      if (!commChannel.consumerBarrier) {
+        // Insert ProducerAcquireOp before the producer.
+        builder.setInsertionPoint(headProducer);
+        builder.createWithAsyncTaskIds<ttng::ProducerAcquireOp>(
+            headProducer->getLoc(), token.second, bufferIdx, phase);
+      }
 
-      // Insert ProducerCommitOp if producer is LoadOp. For TMA, TMA lowering
+      // Insert ProducerCommitOp if producer is not TMA. For TMA, TMA lowering
       // will handle the ProducerCommit.
-      if (!isa<tt::ExperimentalDescriptorLoadOp>(headProducer)) {
+      if (!commChannel.producerBarrier) {
         builder.setInsertionPointAfter(tailProducer);
         builder.createWithAsyncTaskIds<ttng::ProducerCommitOp>(
             tailProducer->getLoc(), token.second, bufferIdx);
       }
     }
 
-    for (auto token : tokens) {
+    for (const auto &token : commChannel.tokens) {
       builder.setAsynTaskIdsFromArray(token.first);
       // Insert ConsumerWaitOp
-      if (!isa<tt::ExperimentalDescriptorLoadOp>(headProducer)) {
+      if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
         builder.createWithAsyncTaskIds<ttng::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
       }
 
-      // Insert ConsumerReleaseOp.
-      auto consumerReleasePoint =
-          consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
-      builder.setInsertionPointAfter(consumerReleasePoint);
-      builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
-          consumerReleasePoint->getLoc(), token.second, bufferIdx);
+      // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
+      // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
+      if (!isa<nvidia_gpu::TCGen5MMAOp>(tailConsumer)) {
+        auto consumerReleasePoint =
+            consumerReleaseHeutistic(tailProducer, tailConsumer, token.first);
+        builder.setInsertionPointAfter(consumerReleasePoint);
+        builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
+            consumerReleasePoint->getLoc(), token.second, bufferIdx);
+      }
     }
 
     SmallVector<tt::ExperimentalDescriptorLoadOp> tmaLoads;
@@ -2685,14 +2772,18 @@ void insertAsyncComm(
       }
     }
 
+    // Desynchronize TCGen5MMAOp. Set up consumer release and producer acquire.
+    auto &c = kv.first;
+    if (auto mmaOp =
+            dyn_cast<nvidia_gpu::TCGen5MMAOp>(getRealConsumer(c->getDstOp()))) {
+      desyncTCGen5MMAOp(builder, mmaOp, *commChannel.consumerBarrier, bufferIdx,
+                        phase, headProducer);
+    }
+
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
-      auto barrierAllocs = barrierAllocMap.find(kv.second.front())->second;
-      // TODO: we created one Alloc for each consumer taskId, but here, we
-      // only use the first Alloc.
-      auto barrierAlloc = barrierAllocs.begin()->second;
-      optimizeTMALoads(builder, tmaLoads, buffers, barrierAlloc, bufferIdx,
-                       bufferIdx, phase, headProducer, headConsumer);
+      optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
+                       bufferIdx, bufferIdx, phase, headProducer, headConsumer);
     }
   }
 }
@@ -2893,9 +2984,9 @@ public:
     // Step 7: Create tokens. A set of tokens for each group of channels for
     // each channel.
     DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
-    DenseMap<Channel *, DenseMap<int, Value>> tokenMap = createToken(
-        channelsGroupedByConsumers, orderedChannels, funcOp, numConsumerGroups,
-        copyOpMap, channelReuse, barrierAllocMap);
+    DenseMap<Channel *, CommChannel> tokenMap;
+    createToken(channelsGroupedByConsumers, orderedChannels, funcOp,
+                numConsumerGroups, copyOpMap, channelReuse, tokenMap);
     LLVM_DEBUG({
       LDBG("\n\nafter createToken");
       funcOp.dump();

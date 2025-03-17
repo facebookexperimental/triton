@@ -282,6 +282,7 @@ class CUDABackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             passes.common.add_licm(pm)
             passes.ttgpuir.add_optimize_accumulator_init(pm)
+            nvidia.passes.ttnvgpuir.add_keep_acc_in_tmem(pm)
             passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)
