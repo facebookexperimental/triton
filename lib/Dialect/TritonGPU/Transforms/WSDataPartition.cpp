@@ -51,52 +51,58 @@ static bool oneVecCoversTheOther(SmallVector<AsyncTaskId> &one,
 
 // Make sure the def chain contains the right taskId.
 void fixTaskId(triton::FuncOp &funcOp) {
-  funcOp.walk([&](Operation *op) {
-    auto asyncTaskIds = getAsyncTaskIds(op);
-    for (Value operand : op->getOperands()) {
-      Operation *defOp = operand.getDefiningOp();
-      if (!defOp)
-        continue;
-      // Do not update loads.
-      if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(defOp))
-        continue;
-      auto defTaskIds = getAsyncTaskIds(defOp);
-      // Make sure defTaskIds cover asyncTaskIds. Call addAsyncTaskIds if
-      // necessary.
-      if (!oneVecCoversTheOther(defTaskIds, asyncTaskIds)) {
-        // Skip control flow ops.
-        if (isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+  bool changed = false;
+  do {
+    changed = false;
+    funcOp.walk([&](Operation *op) {
+      auto asyncTaskIds = getAsyncTaskIds(op);
+      for (Value operand : op->getOperands()) {
+        Operation *defOp = operand.getDefiningOp();
+        if (!defOp)
           continue;
-        // Const ops with same value but different task ids can be folded.
-        if (defOp->getDialect()->getNamespace() == "arith") {
-          LLVM_DEBUG({
-            LDBG("backward fixing taskId for");
-            defOp->dump();
-          });
-          addAsyncTaskIds(defOp, asyncTaskIds);
-          LLVM_DEBUG({
-            LDBG("resulting");
-            defOp->dump();
-          });
+        // Do not update loads.
+        if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(defOp))
+          continue;
+        auto defTaskIds = getAsyncTaskIds(defOp);
+        // Make sure defTaskIds cover asyncTaskIds. Call addAsyncTaskIds if
+        // necessary.
+        if (!oneVecCoversTheOther(defTaskIds, asyncTaskIds)) {
+          // Skip control flow ops.
+          if (isa<scf::YieldOp, scf::ForOp, scf::IfOp>(op))
+            continue;
+          // Const ops with same value but different task ids can be folded.
+          if (defOp->getDialect()->getNamespace() == "arith") {
+            LLVM_DEBUG({
+              LDBG("backward fixing taskId for");
+              defOp->dump();
+            });
+            addAsyncTaskIds(defOp, asyncTaskIds);
+            changed = true;
+            LLVM_DEBUG({
+              LDBG("resulting");
+              defOp->dump();
+            });
+          }
+        }
+        if (operand.hasOneUse() &&
+            !oneVecCoversTheOther(asyncTaskIds, defTaskIds)) {
+          // YieldOp may lose task attribute during MLIR canonicalization.
+          if (isa<scf::YieldOp, scf::IfOp>(op)) {
+            LLVM_DEBUG({
+              LDBG("forward fixing taskId for");
+              defOp->dump();
+            });
+            addAsyncTaskIds(op, defTaskIds);
+            changed = true;
+            LLVM_DEBUG({
+              LDBG("resulting");
+              defOp->dump();
+            });
+          }
         }
       }
-      if (operand.hasOneUse() &&
-          !oneVecCoversTheOther(asyncTaskIds, defTaskIds)) {
-        // YieldOp may lose task attribute during MLIR canonicalization.
-        if (isa<scf::YieldOp, scf::IfOp>(op)) {
-          LLVM_DEBUG({
-            LDBG("forward fixing taskId for");
-            defOp->dump();
-          });
-          addAsyncTaskIds(op, defTaskIds);
-          LLVM_DEBUG({
-            LDBG("resulting");
-            defOp->dump();
-          });
-        }
-      }
-    }
-  });
+    });
+  } while (changed);
 }
 
 struct DataPartitionScheme {
