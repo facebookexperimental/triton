@@ -104,7 +104,8 @@ struct FixWSBarrier
     // Scan through the kernel function to find the used barrier id
     llvm::DenseMap<Block *, int> barIdReuse;
     llvm::SmallVector<llvm::StringRef> operands;
-    llvm::SmallSet<int, 16> allocBarId;
+    // The barrier id 9, 10, 12, 14 are reserved
+    llvm::SmallSet<int, 16> allocBarId = {9, 10, 12, 14};
 
     // Helper function to setup metadata for used barrier id
     auto processEachBarSync = [&](StringRef instruction, Block *block) {
@@ -112,6 +113,7 @@ struct FixWSBarrier
       operandsStr = operandsStr.rtrim(";");
       operands.clear();
       operandsStr.split(operands, ',');
+      assert(operands.size() == 2);
       int barId = -1;
       operands[0].trim().getAsInteger(0, barId);
       int threadCount = -1;
