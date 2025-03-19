@@ -93,7 +93,17 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
       }
       // If use is the initial value of ForOp argument.
       if (auto userFor = dyn_cast<scf::ForOp>(user)) {
-        argIndices.insert(argIdx);
+        // For block arguments, we need to check the initial value as well.
+        if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
+          auto initArg = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
+          if (Operation *def = initArg.getDefiningOp()) {
+            if (hasAsyncTaskId(def, asyncTaskId)) {
+              argIndices.insert(argIdx);
+            }
+          } else {
+            llvm_unreachable("Initial value should have a defining op");
+          }
+        }
         return;
       }
 
