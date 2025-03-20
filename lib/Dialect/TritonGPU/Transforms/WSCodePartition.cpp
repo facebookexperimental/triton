@@ -3,6 +3,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
@@ -536,6 +537,16 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
   builder.setInsertionPoint(returnOp);
   Value curAsyncTaskId = builder.create<ttng::GetAsyncTaskIdOp>(loc);
 
+  // Instead of a new IfOp for each task, we create one partitionRegion.
+  auto nTaskIds = getNestedAsyncTaskIds(funcOp);
+  SmallVector<int32_t> partitionNumWarps;
+  for (AsyncTaskId asyncTaskId : nTaskIds)
+    partitionNumWarps.push_back(4);
+  ArrayRef<Type> dummyTypes;
+  ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
+  auto wsOp = impB.create<WarpSpecializeOp>(dummyTypes, partitionNumWarps,
+                                            nTaskIds.size());
+  // Put producer wg in default. Check D71524884 for an example.
   DenseMap<AsyncTaskId, scf::IfOp> tasksToIfOp;
 
   // Clone all operations into the corresponding if blocks. If the operation
