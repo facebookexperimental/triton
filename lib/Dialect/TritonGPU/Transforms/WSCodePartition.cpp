@@ -516,12 +516,6 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
   Value endAccumReuseThen = endAccum, endAccumReuseElse;
 
   SmallVector<Value> ifYieldOperands = newIfOp.thenYield().getOperands();
-#if 0
-  if (hasBufferReuse) {
-    ifYieldOperands.push_back(endAccum);
-    updateYield(newIfOp.thenYield(), ifYieldOperands);
-  }
-#endif
 
   // Handle elseRegion of the IfOp.
   if (ifOp.elseBlock()) {
@@ -570,14 +564,6 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
   }
   LDBG("rewrite ifOp: parentFor " << parentTCnts << " accumCnts");
 
-#if 0
-  // Add one more operand to else Yield.
-  if (hasBufferReuse) {
-    ifYieldOperands.push_back(endAccum);
-    updateYield(newIfOp.thenYield(), ifYieldOperands);
-    elseYieldOperands.push_back(endAccum);
-  }
-#endif
   // else {
   //  Update both ifYieldOperands and elseYieldOperands.
   //  See below for an example of how to update yieldOp of IfA and IfB.
@@ -1585,16 +1571,6 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
                                             << " at depth " << maxDepth);
   if (opsAtMaxDepth.empty() || opsAtMaxDepth.size() == 1)
     return;
-#if 0
-  if (opsAtMaxDepth.size() == 1 && dyn_cast<scf::ForOp>(opsAtMaxDepth[0]) &&
-      maxDepth > 0) {
-    // Persistent with a single inner loop. There is no sharing group, but
-    // we can use the logic to generate accumLoopCount for persistent case.
-    opsWithBufferReuse = opsAtMaxDepth;
-    LDBG("-- opsWithBufferReuse with size 1");
-    return;
-  }
-#endif
   // Find ops that contain immediate channels. And the ops do not overlap
   // live range. For example
   // If
@@ -1818,8 +1794,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
   // argument value.
   // Get initial value of accumCnts prior to the loop.
   SmallVector<Value> initialAccum;
-  //{
-  unsigned tSize = 999, tNum = 999, accumArgId = 999;
+  unsigned tSize = 0, tNum = 0, accumArgId = 0;
   if (parentForOp) {
     tSize = parentForOp.getBody()->getArguments().size();
     tNum = getAccumCnts(parentForOp.getOperation(), opsWithChannels,
@@ -1856,7 +1831,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp, unsigned numBuffers,
     }
     initialAccum.push_back(startAccum);
   }
-  //}
 
   newForOp = createNewLoop(origForOp, loopNumBuffers, parentForOp, initialAccum,
                            accumulatedLoopCount, hasReuse, isOuterOfReuse);
