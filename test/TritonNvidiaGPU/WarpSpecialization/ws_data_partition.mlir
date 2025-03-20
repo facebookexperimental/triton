@@ -138,19 +138,6 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
 // -----
 
 // CHECK-LABEL: @cross_dim_partition
-// CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<64x128xbf16
-// CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<64x128xbf16
-// CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<128x128xbf16
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : tensor<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : tensor<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
-// CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
-
 #blocked = #triton_gpu.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 2], warpsPerCTA = [1, 4], order = [0, 1]}>
 #blocked1 = #triton_gpu.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #mma = #triton_gpu.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 16]}>
@@ -201,17 +188,26 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
       %22 = arith.muli %0, %c128_i32 {async_task_id = dense<0> : vector<1xi32>} : i32
       %23 = arith.addi %5, %22 {async_task_id = dense<0> : vector<1xi32>} : i32
       %24 = arith.muli %3, %c128_i32 {async_task_id = dense<0> : vector<1xi32>} : i32
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<64x128xbf16
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<64x128xbf16
       %25 = tt.experimental_descriptor_load %11[%23, %24] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8> -> tensor<128x128xbf16, #blocked1>
       %26 = triton_gpu.local_alloc %25 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #blocked1>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
       %27 = arith.muli %2, %c256_i32 {async_task_id = dense<[0, 1, 2]> : vector<3xi32>} : i32
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<128x128xbf16
       %28 = tt.experimental_descriptor_load %12[%27, %24] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8> -> tensor<128x128xbf16, #blocked1>
       %29 = triton_gpu.local_alloc %28 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #blocked1>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
       %30 = triton_nvidia_gpu.warp_group_dot %26, %29, %cst {async_task_id = dense<[1, 2]> : vector<2xi32>, inputPrecision = 0 : i32} : !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> * !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> tensor<128x128xf32, #mma>
       %31 = arith.truncf %30 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #mma> to tensor<128x128xbf16, #mma>
       %32 = triton_gpu.local_alloc %31 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #mma>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<64x128xbf16
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<64x128xbf16
       %33 = tt.experimental_descriptor_load %13[%23, %24] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8> -> tensor<128x128xbf16, #blocked1>
       %34 = triton_gpu.local_alloc %33 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #blocked1>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
       %35 = tt.trans %34 {async_task_id = dense<[1, 2]> : vector<2xi32>, order = array<i32: 1, 0>} : !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory>
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
       %36 = triton_nvidia_gpu.warp_group_dot %35, %32, %cst {async_task_id = dense<[1, 2]> : vector<2xi32>, inputPrecision = 0 : i32} : !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory> * !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> tensor<128x128xf32, #mma>
       %37 = triton_gpu.convert_layout %36 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #mma> -> tensor<128x128xf32, #blocked>
       %38 = arith.truncf %37 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
@@ -236,15 +232,21 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
       %57 = tt.addptr %55, %56 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128x!tt.ptr<bf16>, #blocked>, tensor<128x128xi32, #blocked>
       %58 = tt.atomic_rmw fadd, relaxed, gpu, %57, %38, %cst_0 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128x!tt.ptr<bf16>, #blocked>, tensor<128x128xbf16, #blocked>, tensor<128x128xi1, #blocked>) -> tensor<128x128xbf16, #blocked>
       %59 = arith.addi %27, %c128_i32 {async_task_id = dense<0> : vector<1xi32>} : i32
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<128x128xbf16
       %60 = tt.experimental_descriptor_load %12[%59, %24] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8> -> tensor<128x128xbf16, #blocked1>
       %61 = triton_gpu.local_alloc %60 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #blocked1>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
       %62 = tt.trans %61 {async_task_id = dense<[1, 2]> : vector<2xi32>, order = array<i32: 1, 0>} : !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory>
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
       %63 = triton_nvidia_gpu.warp_group_dot %34, %62, %cst {async_task_id = dense<[1, 2]> : vector<2xi32>, inputPrecision = 0 : i32} : !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> * !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory> -> tensor<128x128xf32, #mma>
       %64 = arith.truncf %63 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #mma> to tensor<128x128xbf16, #mma>
+      // CHECK: tt.experimental_descriptor_load {{.*}} -> tensor<128x128xbf16
       %65 = tt.experimental_descriptor_load %12[%27, %24] {async_task_id = dense<0> : vector<1xi32>} : !tt.ptr<i8> -> tensor<128x128xbf16, #blocked1>
       %66 = triton_gpu.local_alloc %65 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #blocked1>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
       %67 = tt.trans %66 {async_task_id = dense<[1, 2]> : vector<2xi32>, order = array<i32: 1, 0>} : !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory>
       %68 = triton_gpu.convert_layout %64 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xbf16, #mma> -> tensor<128x128xbf16, #triton_gpu.dot_op<{opIdx = 0, parent = #mma}>>
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : tensor<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : tensor<64x128xbf16, {{.*}} * !tt.memdesc<128x128xbf16, {{.*}} -> tensor<64x128xf32, {{.*}}
       %69 = triton_nvidia_gpu.warp_group_dot %68, %67, %cst {async_task_id = dense<[1, 2]> : vector<2xi32>, inputPrecision = 0 : i32} : tensor<128x128xbf16, #triton_gpu.dot_op<{opIdx = 0, parent = #mma}>> * !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory> -> tensor<128x128xf32, #mma>
       %70 = triton_gpu.convert_layout %69 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #mma> -> tensor<128x128xf32, #blocked1>
       %71 = arith.truncf %70 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #blocked1> to tensor<128x128xbf16, #blocked1>
@@ -254,6 +256,8 @@ module attributes {"triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 4 :
       tt.experimental_descriptor_store %14[%73, %74], %71 {async_task_id = dense<[1, 2]> : vector<2xi32>} : !tt.ptr<i8>, tensor<128x128xbf16, #blocked1>
       %75 = triton_gpu.local_alloc %64 {async_task_id = dense<[1, 2]> : vector<2xi32>} : (tensor<128x128xbf16, #mma>) -> !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory>
       %76 = tt.trans %75 {async_task_id = dense<[1, 2]> : vector<2xi32>, order = array<i32: 1, 0>} : !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory>
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
+      // CHECK: triton_nvidia_gpu.warp_group_dot {{.*}} : !tt.memdesc<128x64xbf16, {{.*}} * !tt.memdesc<64x128xbf16, {{.*}} -> tensor<128x128xf32, {{.*}}
       %77 = triton_nvidia_gpu.warp_group_dot %76, %26, %cst {async_task_id = dense<[1, 2]> : vector<2xi32>, inputPrecision = 0 : i32} : !tt.memdesc<128x128xbf16, #shared1, #triton_gpu.shared_memory> * !tt.memdesc<128x128xbf16, #shared, #triton_gpu.shared_memory> -> tensor<128x128xf32, #mma>
       %78 = triton_gpu.convert_layout %77 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #mma> -> tensor<128x128xf32, #blocked>
       %79 = arith.truncf %78 {async_task_id = dense<[1, 2]> : vector<2xi32>} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>

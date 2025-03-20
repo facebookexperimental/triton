@@ -104,8 +104,9 @@ struct DataPartitionScheme {
   // ops to be partitioned.
   SetVector<Operation *> ops;
   // Which dimension to partition. For dot, dim 0 means along M dimension, 1
-  // means along N dimensiont.
+  // means along N dimension.
   DenseMap<Operation *, unsigned> opPartitionDims;
+  // For dot, which operand to partition along opPartitionDims.
   DenseMap<Operation *, unsigned> dotPartitionOperand;
   // Ops that are rematerialized through both dimensions.
   DenseMap<Operation *, SetVector<unsigned>> rematerializedOps;
@@ -142,19 +143,15 @@ struct DataPartitionScheme {
   }
 
   bool isPartitioned(Operation *op) const {
-    return opPartitionDims.contains(op) || rematerializedOps.contains(op) ||
-           opsToSkip.contains(op);
-  }
-
-  bool shouldBePartitioned(Operation *op) const {
     return opPartitionDims.contains(op) || rematerializedOps.contains(op);
   }
+
+  bool isSkipped(Operation *op) const { return opsToSkip.contains(op); }
 
   void undoPartition(Operation *op) {
     if (opPartitionDims.contains(op)) {
       opPartitionDims.erase(op);
       ops.remove(op);
-      ops.remove_if([=](Operation *x) { return x == op; });
       opsToSkip.insert(op);
     }
   }
@@ -219,6 +216,7 @@ static bool isControlFlowOp(Operation *op) {
   return isa<ReturnOp, FuncOp, scf::YieldOp, scf::ForOp, scf::IfOp>(op);
 }
 
+// Duplicate the op for different partition dims.
 static bool rematerializeOp(Operation *op, DataPartitionScheme &partitionScheme,
                             unsigned currentDim) {
   // Bail out if op is already rematerialized.
@@ -521,7 +519,8 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
   int numWarps =
       TritonGPUDialect::getNumWarps(funcOp->getParentOfType<ModuleOp>());
   for (auto dotOp : dots) {
-    if (partitionScheme.isPartitioned(dotOp)) {
+    if (partitionScheme.isPartitioned(dotOp) ||
+        partitionScheme.isSkipped(dotOp)) {
       continue;
     }
 
@@ -606,6 +605,8 @@ bool computePartitionScheme(triton::FuncOp &funcOp,
   return !partitionScheme.ops.empty();
 }
 
+// For each op to be rematerialized, create a new op and replace its user with
+// the new op.
 void rewriteRematerializedOps(triton::FuncOp &funcOp,
                               DataPartitionScheme &partitionScheme) {
   if (partitionScheme.rematerializedOps.empty())
