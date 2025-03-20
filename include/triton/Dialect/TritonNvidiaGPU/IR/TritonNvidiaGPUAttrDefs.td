@@ -14,6 +14,7 @@ def TT_TokenLoadTypeAttr : I32EnumAttr<
       I32EnumAttrCase<"AsyncLoadOp", 1, "asyncLoadOp">,
       I32EnumAttrCase<"TMALoadOp", 2, "tmaLoadOp">,
       I32EnumAttrCase<"LocalStoreOp", 3, "localStoreOp">,
+      I32EnumAttrCase<"TmemLoadOp", 4, "TmemLoadOp">,
     ]>{
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
