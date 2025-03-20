@@ -617,13 +617,11 @@ void rewriteRematerializedOps(triton::FuncOp &funcOp,
   // For each rematerialized op, create a new op and replace its user with it.
   for (auto opDim : partitionScheme.rematerializedOps) {
     auto oldOp = opDim.first;
-    partitionScheme.opPartitionDims.erase(oldOp);
-    partitionScheme.ops.remove(oldOp);
     builder.setInsertionPoint(oldOp);
     builder.setAsyncTaskIdsFromOp(oldOp);
 
     // Skip the first dim which will be using the original op.
-    for (unsigned i = 0; i < opDim.second.size(); i++) {
+    for (unsigned i = 1; i < opDim.second.size(); i++) {
       unsigned dim = opDim.second[i];
       LLVM_DEBUG({
         LDBG("rewriting op along dim " << dim << ":");
