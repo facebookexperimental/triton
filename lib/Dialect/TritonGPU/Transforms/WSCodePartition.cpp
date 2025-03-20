@@ -354,6 +354,8 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   return ctrlId;
 }
 
+// Get the current accumulation count for the given op within its immediate
+// scope.
 // ForA (accumForA, accumIfA, accumForB, accumIfB)
 //   IfA (accumIfA, accumForB)
 //     Channel A --> uses ForA.arg[accumIfA]
@@ -370,13 +372,11 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 // Right now, we only support a limited form of buffer reuse. We only allow
 // reuses among a list of parallel control ops. And we will add a single
 // AccumCnt as the last argument.
-void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
-                          unsigned numBuffers,
-                          const DenseSet<Operation *> &opsWithChannels,
-                          Value &outBufferIdx, Value &phase,
-                          SmallVector<Operation *> &opsWithBufferReuse) {
-  auto parentForOp = dstOp->getParentOfType<scf::ForOp>();
-  auto *pOp = dstOp->getParentOp();
+Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                    const DenseSet<Operation *> &opsWithChannels,
+                    SmallVector<Operation *> &opsWithBufferReuse) {
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned accumArgId;
   unsigned tSize = parentForOp.getBody()->getArguments().size();
@@ -385,10 +385,10 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
   Value accumCnt;
   bool partOfReuse = false;
   if (opsWithBufferReuse.size() > 1) {
-    partOfReuse = channelWithReuse(dstOp, opsWithBufferReuse);
+    partOfReuse = channelWithReuse(op, opsWithBufferReuse);
   }
   if (opsWithBufferReuse.size() > 1 && partOfReuse) {
-    // Check to see if the dstOp is inside opsWithBufferReuse.
+    // Check to see if the op is inside opsWithBufferReuse.
     accumCnt = parentForOp.getBody()->getArguments().back();
     accumArgId = parentTCnts - 1;
   } else {
@@ -397,11 +397,17 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
     accumCnt =
         parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
   }
-  LDBG("getBufferIdxAndPhase: parentForOp "
-       << parentForOp.getOperation() << " pOp " << pOp << " " << tSize << " "
-       << parentTCnts << " " << accumArgId);
 
-  auto loc = dstOp->getLoc();
+  LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
+                                     << pOp << " " << tSize << " "
+                                     << parentTCnts << " " << accumArgId);
+  return accumCnt;
+}
+
+// Compute and return the buffer index and phase for a given accumulate count.
+std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+                                             Location loc, Value accumCnt,
+                                             unsigned numBuffers) {
   Value numBuffersVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
   numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
@@ -415,14 +421,56 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
       loc, accumCnt,
       builder.createWithAsyncTaskIds<arith::MulIOp>(loc, bufferIdx,
                                                     numBuffersVal));
-  outBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+  initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI32Type(), initBufferIdx);
 
   Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
   bufferIdx =
       builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
-  phase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+  Value initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI1Type(), bufferIdx);
+  return {initBufferIdx, initPhase};
+}
+
+void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                          unsigned numBuffers,
+                          const DenseSet<Operation *> &opsWithChannels,
+                          Value &bufferIdx, Value &phase,
+                          SmallVector<Operation *> &opsWithBufferReuse) {
+  Value accumCnt =
+      getAccumCount(builder, op, opsWithChannels, opsWithBufferReuse);
+  std::tie(bufferIdx, phase) =
+      getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+}
+
+// Get the bufferIdx and phase for the last iteration of the immediate scope.
+std::pair<Value, Value>
+getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+                               Operation *op, unsigned numBuffers,
+                               const DenseSet<Operation *> &opsWithChannels,
+                               SmallVector<Operation *> &opsWithBufferReuse) {
+  // Get the current in-scope accumulation count for op.
+  Value accumCnt =
+      getAccumCount(builder, op, opsWithChannels, opsWithBufferReuse);
+
+  // Get the out-of-scope accumulation count.
+  assert(isa<BlockArgument>(accumCnt) &&
+         "Expected accumCnt to be a block argument");
+  auto bbArg = dyn_cast<BlockArgument>(accumCnt);
+  Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
+  if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
+    accumCnt = forOp.getResult(bbArg.getArgNumber() - 1);
+  } else {
+    llvm_unreachable("Unexpected block argument owner");
+  }
+
+  // The accumulation count is one past the last iteration. Subtract one to get
+  // the last valid iteration index.
+  auto loc = bbAargOwner->getLoc();
+  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  accumCnt = builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, one);
+
+  return getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
 }
 
 static bool
@@ -2520,7 +2568,10 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 
 void desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
                        nvidia_gpu::TCGen5MMAOp mmaOp, Value barrierAlloc,
-                       Value bufferIdx, Value phase, Operation *headProducer) {
+                       Value bufferIdx, Value phase, unsigned numBuffers,
+                       Operation *headProducer,
+                       DenseSet<Operation *> &opsWithChannels,
+                       SmallVector<Operation *> &opsWithBufferReuse) {
   // attach the barrier as an operand of the mma op.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
@@ -2531,14 +2582,42 @@ void desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
   // Create a wait_barrier before the producer.
   builder.setInsertionPoint(headProducer);
   builder.setAsyncTaskIdsFromOp(headProducer);
-  consumerBarrier =
+  auto producerBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  // curPhase = curPhase xor True for emptyBarrier.
+  auto loc = headProducer->getLoc();
+  Value _1_1b = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+  phase =
+      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, phase, _1_1b);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-      headProducer->getLoc(), builder.getI32Type(), phase);
-  auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      headProducer->getLoc(), consumerBarrier, phase);
+      loc, builder.getI32Type(), phase);
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, producerBarrier,
+                                                      phase);
 
   // Create a wait_barrier before the tmem load.
+  SetVector<std::pair<Operation *, unsigned>> users;
+  getTransitiveUsers(mmaOp.getD(), users);
+  for (auto item : users) {
+    auto user = item.first;
+    if (user == mmaOp)
+      continue;
+    builder.setInsertionPoint(user);
+    builder.setAsyncTaskIdsFromOp(user);
+    // If user and mmaOp are in the same block, we can use the same barrier.
+    if (user->getBlock() != mmaOp->getBlock()) {
+      // Compute the barrier from the last consumer instance
+      // Extract the accum count from the consumer block.
+      std::tie(bufferIdx, phase) = getOutOfScopeBufferIdxAndPhase(
+          builder, mmaOp, numBuffers, opsWithChannels, opsWithBufferReuse);
+      phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          user->getLoc(), builder.getI32Type(), phase);
+      consumerBarrier =
+          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+    }
+
+    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(user->getLoc(),
+                                                        consumerBarrier, phase);
+  }
 }
 
 // Lower producers for channels. Here channels are grouped in
@@ -2753,7 +2832,7 @@ void insertAsyncComm(
       // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
       if (!isa<nvidia_gpu::TCGen5MMAOp>(tailConsumer)) {
         auto consumerReleasePoint =
-            consumerReleaseHeutistic(tailProducer, tailConsumer, token.first);
+            consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
         builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
             consumerReleasePoint->getLoc(), token.second, bufferIdx);
@@ -2777,7 +2856,8 @@ void insertAsyncComm(
     if (auto mmaOp =
             dyn_cast<nvidia_gpu::TCGen5MMAOp>(getRealConsumer(c->getDstOp()))) {
       desyncTCGen5MMAOp(builder, mmaOp, *commChannel.consumerBarrier, bufferIdx,
-                        phase, headProducer);
+                        phase, c->numBuffers, headProducer, opsWithChannels,
+                        opsWithBufferReuse);
     }
 
     // Optimize TMA loads.

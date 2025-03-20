@@ -74,9 +74,9 @@ impl_map = {fn.__name__: fn for fn in test_impls}
 
 def test():
     torch.manual_seed(0)
-    m = 128
-    n = 128
-    k = 64
+    m = 8192
+    n = 8192
+    k = 8192
     a = torch.randn((m, k), device="cuda", dtype=torch.float16)
     b = torch.randn((k, n), device="cuda", dtype=torch.float16)
     torch_output = torch.matmul(a, b)
