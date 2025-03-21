@@ -217,7 +217,7 @@ TMemRuntimeInfo getTMemRuntimeInfo(Operation *op, RankedTensorType tensorType,
 }
 
 void calculateAddressAndEmitTmemMessage(
-    Location loc, Value baseAddress, const TMemRuntimeInfo &info,
+    Location loc, Operation *op, Value baseAddress, const TMemRuntimeInfo &info,
     const TMemMessageTraits &message, ConversionPatternRewriter &rewriter,
     const std::function<void(Value, int, bool, int, bool)> &createMemoryOp) {
 
@@ -358,7 +358,7 @@ static void lowerStoreToTensorMemory(Location loc, Operation *op, Value src,
   const TMemMessageTraits message = selectTMemMessage(info);
   int regIdx = 0;
   calculateAddressAndEmitTmemMessage(
-      loc, tmemBase, info, message, rewriter,
+      loc, op, tmemBase, info, message, rewriter,
       [&](Value startAddress, int secondHalfColOffset, bool unpackedb16,
           int regsPerMsg, bool useStridedMessage) {
         SmallVector<Value> srcValuesSlice(srcValues.begin() + regIdx,
@@ -496,7 +496,7 @@ struct TensorMemoryLoadOpConversion
     const TMemMessageTraits message = selectTMemMessage(info);
     SmallVector<Value> resultVals;
     calculateAddressAndEmitTmemMessage(
-        loc, tmemBase, info, message, rewriter,
+        loc, op, tmemBase, info, message, rewriter,
         [&](Value startAddress, int secondHalfColOffset, bool unpackedb16,
             int regsPerMessage, bool useStridedMessage) {
           Value packedValues = createTensorMemoryLoad(
