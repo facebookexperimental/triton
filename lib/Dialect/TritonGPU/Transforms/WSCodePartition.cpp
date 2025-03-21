@@ -67,72 +67,91 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
 
   // Collect argument indices that can be reached along the definition chain.
   SetVector<unsigned> argIndices;
-  std::function<void(Value, unsigned)> dfs = [&](Value arg, unsigned argIdx) {
-    for (auto user : arg.getUsers()) {
-      // Skip ops that are not in the same async task
-      if (!hasAsyncTaskId(user, asyncTaskId))
-        continue;
+  std::function<void(scf::ForOp, Value, unsigned)> dfs =
+      [&](scf::ForOp nestedForOp, Value arg, unsigned argIdx) {
+        for (auto user : arg.getUsers()) {
+          // Skip ops that are not in the same async task
+          if (!hasAsyncTaskId(user, asyncTaskId))
+            continue;
 
-      if (isa<scf::YieldOp>(user)) {
-        if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
-          // For block arguments, we need to check the initial value as well.
-          if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
-            auto initArg = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
-            if (Operation *def = initArg.getDefiningOp()) {
-              if (hasAsyncTaskId(def, asyncTaskId)) {
-                argIndices.insert(argIdx);
+          if (isa<scf::YieldOp>(user)) {
+            if (auto ifOp = dyn_cast<scf::IfOp>(user->getParentOp())) {
+              // For block arguments, we need to check the initial value as
+              // well.
+              if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
+                auto initArg =
+                    nestedForOp.getInitArgs()[blockArg.getArgNumber() - 1];
+                if (Operation *def = initArg.getDefiningOp()) {
+                  if (hasAsyncTaskId(def, asyncTaskId)) {
+                    argIndices.insert(argIdx);
+                    return;
+                  }
+                } else {
+                  llvm_unreachable("Initial value should have a defining op");
+                }
               }
-            } else {
-              llvm_unreachable("Initial value should have a defining op");
+            }
+
+            // Skip control flow ops that are shared by all async tasks
+            continue;
+          }
+
+          // If use is the initial value of ForOp argument.
+          if (auto userFor = dyn_cast<scf::ForOp>(user)) {
+            // For block arguments, we need to check the initial value as well.
+            if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
+              auto initArg =
+                  nestedForOp.getInitArgs()[blockArg.getArgNumber() - 1];
+              if (Operation *def = initArg.getDefiningOp()) {
+                if (hasAsyncTaskId(def, asyncTaskId)) {
+                  argIndices.insert(argIdx);
+                  return;
+                }
+              } else {
+                // Recursive search the nested loop for the real users.
+                // find corresponding arg of userFor
+                Value userArg;
+                for (auto item : llvm::enumerate(userFor.getInitArgs())) {
+                  if (item.value() == arg) {
+                    userArg = userFor.getRegionIterArg(item.index());
+                    break;
+                  }
+                }
+                if (userArg) {
+                  dfs(userFor, userArg, argIdx);
+                }
+              }
+            }
+            // Skip control flow ops that are shared by all async tasks
+            continue;
+          }
+
+          // Found a real user, the arg is needed
+          if (user->getNumRegions() == 0) {
+            argIndices.insert(argIdx);
+            return;
+          }
+
+          // Iterate through all regions of the user operation
+          for (auto &region : user->getRegions()) {
+            for (auto regionArg : region.getArguments()) {
+              if (arg == regionArg)
+                dfs(nestedForOp, regionArg, argIdx);
             }
           }
         }
-
-        // Skip control flow ops that are shared by all async tasks
-        continue;
-      }
-      // If use is the initial value of ForOp argument.
-      if (auto userFor = dyn_cast<scf::ForOp>(user)) {
-        // For block arguments, we need to check the initial value as well.
-        if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
-          auto initArg = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
-          if (Operation *def = initArg.getDefiningOp()) {
-            if (hasAsyncTaskId(def, asyncTaskId)) {
-              argIndices.insert(argIdx);
-            }
-          } else {
-            llvm_unreachable("Initial value should have a defining op");
-          }
-        }
-        return;
-      }
-
-      // Found a real user, the arg is needed
-      if (user->getNumRegions() == 0) {
-        argIndices.insert(argIdx);
-        return;
-      }
-
-      // Iterate through all regions of the user operation
-      for (auto &region : user->getRegions()) {
-        for (auto regionArg : region.getArguments()) {
-          if (arg == regionArg)
-            dfs(regionArg, argIdx);
-        }
-      }
-    }
-  };
+      };
 
   // check dependency with DFS traversal for loop args and results.
   mlir::Block &block = forOp.getRegion().front();
   for (unsigned i = forOp.getNumInductionVars(); i < block.getNumArguments();
        ++i) {
     auto arg = block.getArgument(i);
-    dfs(arg, i - forOp.getNumInductionVars());
+    dfs(forOp, arg, i - forOp.getNumInductionVars());
   }
   for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
     auto result = forOp->getResult(i);
-    dfs(result, i);
+    dfs(forOp, result, i);
   }
 
   SmallVector<unsigned> args(argIndices.begin(), argIndices.end());
