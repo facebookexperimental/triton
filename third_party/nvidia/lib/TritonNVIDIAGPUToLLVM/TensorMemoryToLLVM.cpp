@@ -217,7 +217,7 @@ TMemRuntimeInfo getTMemRuntimeInfo(Operation *op, RankedTensorType tensorType,
 }
 
 void calculateAddressAndEmitTmemMessage(
-    Location loc, Value baseAddress, const TMemRuntimeInfo &info,
+    Location loc, Operation *op, Value baseAddress, const TMemRuntimeInfo &info,
     const TMemMessageTraits &message, ConversionPatternRewriter &rewriter,
     const std::function<void(Value, int, bool, int, bool)> &createMemoryOp) {
 
@@ -225,6 +225,15 @@ void calculateAddressAndEmitTmemMessage(
   Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
   Value warpIdInGroup = b.urem(warpId, b.i32_val(4));
   Value warpGroupId = b.udiv(warpId, b.i32_val(4));
+
+  auto asyncTaskIds = getAsyncTaskIds(op);
+  if (!asyncTaskIds.empty()) {
+    // numWarpGroups is for the current groups that do the load. In WS mode, we
+    // assume only one warp group does TMEMLoad.
+    assert(asyncTaskIds.size() == 1 &&
+           "only support TMEM load in single async task");
+    warpGroupId = b.sub(warpGroupId, b.i32_val(asyncTaskIds[0]));
+  }
 
   for (int block = 0; block < info.numBlocks; block += info.numWarpGroups) {
     Value address = b.ptrtoint(i32_ty, baseAddress);
@@ -349,7 +358,7 @@ static void lowerStoreToTensorMemory(Location loc, Operation *op, Value src,
   const TMemMessageTraits message = selectTMemMessage(info);
   int regIdx = 0;
   calculateAddressAndEmitTmemMessage(
-      loc, tmemBase, info, message, rewriter,
+      loc, op, tmemBase, info, message, rewriter,
       [&](Value startAddress, int secondHalfColOffset, bool unpackedb16,
           int regsPerMsg, bool useStridedMessage) {
         SmallVector<Value> srcValuesSlice(srcValues.begin() + regIdx,
@@ -364,7 +373,7 @@ static void lowerStoreToTensorMemory(Location loc, Operation *op, Value src,
 
   // Emit a barrier to ensure all threads have finished writing to tensor memory
   // before any use of the tensor memory.
-  b.barrier();
+  insertBarrier(rewriter, op);
 }
 
 struct TensorMemoryAllocOpConversion
@@ -487,7 +496,7 @@ struct TensorMemoryLoadOpConversion
     const TMemMessageTraits message = selectTMemMessage(info);
     SmallVector<Value> resultVals;
     calculateAddressAndEmitTmemMessage(
-        loc, tmemBase, info, message, rewriter,
+        loc, op, tmemBase, info, message, rewriter,
         [&](Value startAddress, int secondHalfColOffset, bool unpackedb16,
             int regsPerMessage, bool useStridedMessage) {
           Value packedValues = createTensorMemoryLoad(
