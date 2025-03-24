@@ -570,6 +570,19 @@ def matmul_descriptor_persistent(a, b):
                 "BLOCK_SIZE_N": 256,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 8,
+                "NUM_CONSUMER_GROUPS": 1,
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=1,
+            num_buffers_warp_spec=3,
+        ),
+         triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
                 "NUM_CONSUMER_GROUPS": 2,
             },
             num_stages=2,
@@ -627,19 +640,22 @@ def matmul_persistent_tma_ws_cooperative_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            a = tl._experimental_descriptor_load(
-                a_desc_ptr,
-                [offs_am, offs_k],
-                [BLOCK_SIZE_M, BLOCK_SIZE_K],
-                dtype,
-            )
-            b = tl._experimental_descriptor_load(b_desc_ptr, [offs_bn, offs_k], [BLOCK_SIZE_N, BLOCK_SIZE_K], dtype)
+            with tl.async_task([0]):
+                a = tl._experimental_descriptor_load(
+                    a_desc_ptr,
+                    [offs_am, offs_k],
+                    [BLOCK_SIZE_M, BLOCK_SIZE_K],
+                    dtype,
+                )
+                b = tl._experimental_descriptor_load(b_desc_ptr, [offs_bn, offs_k], [BLOCK_SIZE_N, BLOCK_SIZE_K], dtype)
 
-            accumulator = tl.dot(a, b.T, accumulator)
+            with tl.async_task([1, NUM_CONSUMER_GROUPS]):
+               accumulator = tl.dot(a, b.T, accumulator)
             offs_k += BLOCK_SIZE_K
 
         c = accumulator.to(dtype)
-        tl._experimental_descriptor_store(c_desc_ptr, c, [offs_am, offs_bn])
+        with tl.async_task([1, NUM_CONSUMER_GROUPS]):
+            tl._experimental_descriptor_store(c_desc_ptr, c, [offs_am, offs_bn])
 
 
 def matmul_persistent_tma_ws_cooperative(a, b):
