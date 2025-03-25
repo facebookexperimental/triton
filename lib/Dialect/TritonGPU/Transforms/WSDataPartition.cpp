@@ -935,6 +935,7 @@ Operation *sliceOp(Operation *op, int offset,
       }
 
       if (newInitArg) {
+        assert(newInitArg != initArg && "value not sliced");
         newLoopArgs.append({newInitArg});
         forOp.getBody()->insertArgument(forOp.getBody()->getNumArguments(),
                                         newInitArg.getType(), forOp.getLoc());
