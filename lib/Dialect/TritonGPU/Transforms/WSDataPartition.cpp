@@ -931,12 +931,10 @@ Operation *sliceOp(Operation *op, int offset,
             newInitArgOp->getRegion(parentRegion->getRegionNumber());
         newInitArg = parentRegion->getArgument(argIndex);
       } else {
-        auto initArgOp = initArg.getDefiningOp();
-        unsigned resultIndex = cast<mlir::OpResult>(initArg).getResultNumber();
-        newInitArg = newInitArgOp->getResult(resultIndex);
+        newInitArg = mappings.lookupOrNull(initArg);
       }
 
-      if (newInitArg != initArg) {
+      if (newInitArg) {
         newLoopArgs.append({newInitArg});
         forOp.getBody()->insertArgument(forOp.getBody()->getNumArguments(),
                                         newInitArg.getType(), forOp.getLoc());
