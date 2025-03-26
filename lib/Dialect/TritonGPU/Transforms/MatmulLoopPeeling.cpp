@@ -115,7 +115,7 @@ bool loopMustBeRunAtLeastOnce(scf::ForOp forOp) {
               return true;
             }
           case arith::CmpIPredicate::slt:
-            if (cmpOp.getLhs() == lb && cmpOp.getRhs() == lb) {
+            if (cmpOp.getLhs() == lb && cmpOp.getRhs() == ub) {
               return true;
             }
           default:
