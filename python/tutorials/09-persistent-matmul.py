@@ -570,20 +570,42 @@ def matmul_descriptor_persistent(a, b):
                 "BLOCK_SIZE_N": 256,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 8,
-                "NUM_CONSUMER_GROUPS": 1,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 2,
+                "LAST_EPILOG_CONSUMER": 2,
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=2,
+            num_buffers_warp_spec=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 1,
+                "LAST_EPILOG_CONSUMER": 1,
             },
             num_stages=2,
             num_warps=4,
             num_consumer_groups=1,
             num_buffers_warp_spec=3,
         ),
-         triton.Config(
+        triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
                 "BLOCK_SIZE_N": 256,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 8,
-                "NUM_CONSUMER_GROUPS": 2,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 2,
+                "FIRST_EPILOG_CONSUMER": 1,
+                "LAST_EPILOG_CONSUMER": 2,
             },
             num_stages=2,
             num_warps=4,
@@ -596,7 +618,10 @@ def matmul_descriptor_persistent(a, b):
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 8,
-                "NUM_CONSUMER_GROUPS": 1,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 1,
+                "LAST_EPILOG_CONSUMER": 1,
             },
             num_stages=3,
             num_warps=4,
@@ -620,7 +645,10 @@ def matmul_persistent_tma_ws_cooperative_kernel(
     BLOCK_SIZE_K: tl.constexpr,  #
     GROUP_SIZE_M: tl.constexpr,  #
     FP8_OUTPUT: tl.constexpr,  #
-    NUM_CONSUMER_GROUPS: tl.constexpr,
+    FIRST_MMA_CONSUMER: tl.constexpr,
+    LAST_MMA_CONSUMER: tl.constexpr,
+    FIRST_EPILOG_CONSUMER: tl.constexpr,
+    LAST_EPILOG_CONSUMER: tl.constexpr,
 ):
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
     num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
@@ -649,12 +677,12 @@ def matmul_persistent_tma_ws_cooperative_kernel(
                 )
                 b = tl._experimental_descriptor_load(b_desc_ptr, [offs_bn, offs_k], [BLOCK_SIZE_N, BLOCK_SIZE_K], dtype)
 
-            with tl.async_task([1, NUM_CONSUMER_GROUPS]):
+            with tl.async_task([FIRST_MMA_CONSUMER, LAST_MMA_CONSUMER]):
                accumulator = tl.dot(a, b.T, accumulator)
             offs_k += BLOCK_SIZE_K
 
         c = accumulator.to(dtype)
-        with tl.async_task([1, NUM_CONSUMER_GROUPS]):
+        with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
             tl._experimental_descriptor_store(c_desc_ptr, c, [offs_am, offs_bn])
 
 
@@ -682,7 +710,7 @@ def matmul_persistent_tma_ws_cooperative(a, b):
             a.data_ptr(),
             M,
             K,
-            META["BLOCK_SIZE_M"] // META["NUM_CONSUMER_GROUPS"],
+            META["BLOCK_SIZE_M"] // (META["LAST_MMA_CONSUMER"] - META["FIRST_MMA_CONSUMER"] + 1),
             META["BLOCK_SIZE_K"],
             a.element_size(),
         )
@@ -701,7 +729,7 @@ def matmul_persistent_tma_ws_cooperative(a, b):
             c.data_ptr(),
             M,
             N,
-            META["BLOCK_SIZE_M"] // META["NUM_CONSUMER_GROUPS"],
+            META["BLOCK_SIZE_M"] // (META["LAST_MMA_CONSUMER"] - META["FIRST_MMA_CONSUMER"] + 1),
             META["BLOCK_SIZE_N"],
             c.element_size(),
         )
