@@ -1167,6 +1167,47 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 }
 
+// When the consumer is a local_alloc loading from shared memory to registers,
+// look ahead for the actual consumers, usually dot ops, that can directly
+// use shared memory. The local_alloc will be removed later.
+static SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
+  if (isa<LocalAllocOp>(consumerOp)) {
+    DenseSet<Operation *> users;
+    for (auto user : consumerOp->getUsers()) {
+      if (isa<TransOp, MemDescTransOp>(user)) {
+        // TransOp is not a real consumer. It caculates the shared memory
+        // address for the real consumer. Continue to find its transitive users
+        // recursively.
+        DenseSet<Operation *> visited;
+        SmallVector<Operation *> transUsers;
+        transUsers.push_back(user);
+        while (!transUsers.empty()) {
+          auto transUser = transUsers.pop_back_val();
+          visited.insert(transUser);
+          if (isa<TransOp, MemDescTransOp>(transUser)) {
+            for (auto transitiveUser : transUser->getUsers()) {
+              if (!visited.count(transitiveUser))
+                transUsers.push_back(transitiveUser);
+            }
+          } else {
+            users.insert(transUser);
+          }
+        }
+      } else {
+        users.insert(user);
+      }
+    }
+
+    return SmallVector<Operation *>(users.begin(), users.end());
+  }
+  return {consumerOp};
+}
+
+static Operation *getUniqueActualConsumer(Operation *consumerOp) {
+  auto consumers = getActualConsumers(consumerOp);
+  return consumers.size() == 1 ? consumers[0] : consumerOp;
+}
+
 // Group channels in two ways:
 //  - by producer ops. One producer corresponds to multiple channels. This
 //    grouping will be used to create buffers per shared producer.
@@ -1206,20 +1247,18 @@ void groupChannels(
   //    (dst1 and dst2 are in the same block, both have a single user, and
   //     dst1User == dst2User and dst1User is in the same block as dst1))
   auto channelCanBeMerged = [](Channel *c1, Channel *c2) -> bool {
-    // TODO: do not merge if one consumer is tcgen05_mma
     if (c1->getSrcOp()->getBlock() != c2->getSrcOp()->getBlock())
       return false;
     Operation *dst1 = c1->getDstOp(), *dst2 = c2->getDstOp();
     if (dst1 == dst2)
       return true;
-    if (dst1->getBlock() != dst2->getBlock() || !dst1->hasOneUse() ||
-        !dst2->hasOneUse())
-      return false;
     // Check taskIds on dstOps.
     if (getAsyncTaskIds(dst1) != getAsyncTaskIds(dst2))
       return false;
-    Operation *dst1User = *(dst1->getUsers().begin());
-    Operation *dst2User = *(dst2->getUsers().begin());
+    auto dst1User = getUniqueActualConsumer(dst1);
+    auto dst2User = getUniqueActualConsumer(dst2);
+    if (!dst1User || !dst2User)
+      return false;
     return dst1User == dst2User && dst1User->getBlock() == dst1->getBlock();
   };
   assert(channels.size() > 0 && "channel size is zero");
@@ -2119,47 +2158,6 @@ struct CommChannel {
   // barrier inline, such as the TCGen5MMAOp.
   std::optional<Value> consumerBarrier;
 };
-
-// When the consumer is a local_alloc loading from shared memory to registers,
-// look ahead for the actual consumers, usually dot ops, that can directly
-// use shared memory. The local_alloc will be removed later.
-static SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
-  if (isa<LocalAllocOp>(consumerOp)) {
-    DenseSet<Operation *> users;
-    for (auto user : consumerOp->getUsers()) {
-      if (isa<TransOp, MemDescTransOp>(user)) {
-        // TransOp is not a real consumer. It caculates the shared memory
-        // address for the real consumer. Continue to find its transitive users
-        // recursively.
-        DenseSet<Operation *> visited;
-        SmallVector<Operation *> transUsers;
-        transUsers.push_back(user);
-        while (!transUsers.empty()) {
-          auto transUser = transUsers.pop_back_val();
-          visited.insert(transUser);
-          if (isa<TransOp, MemDescTransOp>(transUser)) {
-            for (auto transitiveUser : transUser->getUsers()) {
-              if (!visited.count(transitiveUser))
-                transUsers.push_back(transitiveUser);
-            }
-          } else {
-            users.insert(transUser);
-          }
-        }
-      } else {
-        users.insert(user);
-      }
-    }
-
-    return SmallVector<Operation *>(users.begin(), users.end());
-  }
-  return {consumerOp};
-}
-
-static Operation *getUniqueActualConsumer(Operation *consumerOp) {
-  auto consumers = getActualConsumers(consumerOp);
-  return consumers.size() == 1 ? consumers[0] : consumerOp;
-}
 
 // channelsGroupedByConsumers: channels are grouped together.
 // Go through each group, check the first channel in the group, create a token
