@@ -2120,28 +2120,45 @@ struct CommChannel {
   std::optional<Value> consumerBarrier;
 };
 
-static Operation *getRealConsumer(Operation *consumerOp) {
-  // For a consumer of local_alloc, probe a step further to see if the
-  // real consumer is a TCGen5MMAOp.
+// When the consumer is a local_alloc loading from shared memory to registers,
+// look ahead for the actual consumers, usually dot ops, that can directly
+// use shared memory. The local_alloc will be removed later.
+static SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
   if (isa<LocalAllocOp>(consumerOp)) {
-    int userCount = 0;
-    Operation *transitiveConsumer;
+    DenseSet<Operation *> users;
     for (auto user : consumerOp->getUsers()) {
-      transitiveConsumer = user;
-      userCount++;
-      if (userCount > 1)
-        break;
-    }
-
-    if (userCount == 1) {
-      if (isa<nvidia_gpu::TCGen5MMAOp, nvidia_gpu::WarpGroupDotOp>(
-              transitiveConsumer)) {
-        return transitiveConsumer;
+      if (isa<TransOp, MemDescTransOp>(user)) {
+        // TransOp is not a real consumer. It caculates the shared memory
+        // address for the real consumer. Continue to find its transitive users
+        // recursively.
+        DenseSet<Operation *> visited;
+        SmallVector<Operation *> transUsers;
+        transUsers.push_back(user);
+        while (!transUsers.empty()) {
+          auto transUser = transUsers.pop_back_val();
+          visited.insert(transUser);
+          if (isa<TransOp, MemDescTransOp>(transUser)) {
+            for (auto transitiveUser : transUser->getUsers()) {
+              if (!visited.count(transitiveUser))
+                transUsers.push_back(transitiveUser);
+            }
+          } else {
+            users.insert(transUser);
+          }
+        }
+      } else {
+        users.insert(user);
       }
     }
-  }
 
-  return consumerOp;
+    return SmallVector<Operation *>(users.begin(), users.end());
+  }
+  return {consumerOp};
+}
+
+static Operation *getUniqueActualConsumer(Operation *consumerOp) {
+  auto consumers = getActualConsumers(consumerOp);
+  return consumers.size() == 1 ? consumers[0] : consumerOp;
 }
 
 // channelsGroupedByConsumers: channels are grouped together.
@@ -2168,7 +2185,7 @@ void createToken(
     CommChannel commChannel;
     auto producerOp = it->second.front()->getSrcOp();
     auto consumerOp = it->second.front()->getDstOp();
-    consumerOp = getRealConsumer(consumerOp);
+    consumerOp = getUniqueActualConsumer(consumerOp);
 
     if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
       commChannel.producerBarrier =
@@ -2566,13 +2583,16 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   return copy;
 }
 
+// Make TCGen5MMAOp fully asynchronous by de-synchronizing it. This leverages
+// its inline barrier to synchronize with both the producer (TMA load) and the
+// consumer (TMEM load).
 void desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
                        nvidia_gpu::TCGen5MMAOp mmaOp, Value barrierAlloc,
                        Value bufferIdx, Value phase, unsigned numBuffers,
                        Operation *headProducer,
                        DenseSet<Operation *> &opsWithChannels,
                        SmallVector<Operation *> &opsWithBufferReuse) {
-  // attach the barrier as an operand of the mma op.
+  // Attach the barrier as an operand of the mma op.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
   auto consumerBarrier =
@@ -2646,6 +2666,7 @@ void insertAsyncComm(
     llvm_unreachable("Failed to find consumer's same level Op with producer");
   };
 
+  mlir::PostDominanceInfo dom(funcOp);
   auto consumerReleaseHeuristic = [&](Operation *p, Operation *c,
                                       int consumerAsyncTaskId) -> Operation * {
     if (c->getBlock() != p->getBlock())
@@ -2653,35 +2674,9 @@ void insertAsyncComm(
 
     // Find a common place for all users of the consumer, which would be the
     // common post dominator.
-    mlir::PostDominanceInfo dom(funcOp);
+    auto actualConsumers = getActualConsumers(c);
     std::unordered_set<Operation *> mutuallyNonDominatingUsers;
-    SmallVector<Operation *> users;
-    for (auto user : c->getUsers()) {
-      if (isa<TransOp, MemDescTransOp>(user)) {
-        // TransOp is not a real consumer. It caculates the shared memory
-        // address for the real consumer. Continue to find its transitive users
-        // recursively.
-        DenseSet<Operation *> visited;
-        SmallVector<Operation *> transUsers;
-        transUsers.push_back(user);
-        while (!transUsers.empty()) {
-          auto transUser = transUsers.pop_back_val();
-          visited.insert(transUser);
-          if (isa<TransOp, MemDescTransOp>(transUser)) {
-            for (auto transitiveUser : transUser->getUsers()) {
-              if (!visited.count(transitiveUser))
-                transUsers.push_back(transitiveUser);
-            }
-          } else {
-            users.push_back(transUser);
-          }
-        }
-      } else {
-        users.push_back(user);
-      }
-    }
-
-    for (auto user : users) {
+    for (auto user : actualConsumers) {
       auto it = mutuallyNonDominatingUsers.begin();
       while (it != mutuallyNonDominatingUsers.end()) {
         if (dom.properlyPostDominates(user, *it)) {
@@ -2724,7 +2719,7 @@ void insertAsyncComm(
       producerOps.insert(pcOp.first);
       consumerOps.insert(pcOp.second);
       consumerOps.insert(c->getDstOp());
-      consumerOps.insert(getRealConsumer(c->getDstOp()));
+      consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
     }
 
     // Find head producer
@@ -2853,8 +2848,8 @@ void insertAsyncComm(
 
     // Desynchronize TCGen5MMAOp. Set up consumer release and producer acquire.
     auto &c = kv.first;
-    if (auto mmaOp =
-            dyn_cast<nvidia_gpu::TCGen5MMAOp>(getRealConsumer(c->getDstOp()))) {
+    if (auto mmaOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(
+            getUniqueActualConsumer(c->getDstOp()))) {
       desyncTCGen5MMAOp(builder, mmaOp, *commChannel.consumerBarrier, bufferIdx,
                         phase, c->numBuffers, headProducer, opsWithChannels,
                         opsWithBufferReuse);
