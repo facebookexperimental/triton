@@ -164,6 +164,7 @@ struct InitBarrierOpConversion
 
     auto asyncTaskIds = getAsyncTaskIds(op);
     int executingThreadId = 0;
+#if 0
     if (!asyncTaskIds.empty()) {
       assert(asyncTaskIds.size() == 1 && "only support single async task");
       auto mod = op->getParentOfType<ModuleOp>();
@@ -171,6 +172,7 @@ struct InitBarrierOpConversion
       int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
       executingThreadId = asyncTaskIds[0] * numWarps * warpSize;
     }
+#endif
 
     auto id = getThreadId(rewriter, loc);
     auto pred = b.icmp_eq(id, b.i32_val(executingThreadId));
@@ -204,6 +206,7 @@ struct InvalBarrierOpConversion
 
     auto asyncTaskIds = getAsyncTaskIds(op);
     int executingThreadId = 0;
+#if 0
     if (!asyncTaskIds.empty()) {
       assert(asyncTaskIds.size() == 1 && "only support single async task");
       auto mod = op->getParentOfType<ModuleOp>();
@@ -211,6 +214,7 @@ struct InvalBarrierOpConversion
       int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
       executingThreadId = asyncTaskIds[0] * numWarps * warpSize;
     }
+#endif
     auto id = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(id, b.i32_val(executingThreadId));
     ::mlir::triton::PTXBuilder ptxBuilder;
@@ -242,6 +246,7 @@ struct BarrierExpectConversion
 
     auto asyncTaskIds = getAsyncTaskIds(op);
     int executingThreadId = 0;
+#if 0
     if (!asyncTaskIds.empty()) {
       assert(asyncTaskIds.size() == 1 && "only support single async task");
       auto mod = op->getParentOfType<ModuleOp>();
@@ -249,6 +254,7 @@ struct BarrierExpectConversion
       int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
       executingThreadId = asyncTaskIds[0] * numWarps * warpSize;
     }
+#endif
     auto id = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(id, b.i32_val(executingThreadId));
     pred = b.and_(pred, adaptor.getPred());

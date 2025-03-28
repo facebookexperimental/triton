@@ -18,8 +18,8 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
-#include <cassert>
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include <cassert>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -1222,10 +1222,12 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     auto asyncTaskIds = getAsyncTaskIds(op);
     int firstThreadId = 0;
+#if 0
     if (!asyncTaskIds.empty()) {
       assert(asyncTaskIds.size() == 1 && "only support single async task");
       firstThreadId = asyncTaskIds[0] * numWarps * warpSize;
     }
+#endif
 
     // The bounding box inner dimension must be less than or equal to the
     // swizzle size.
@@ -1331,9 +1333,11 @@ struct AsyncTMACopyLocalToGlobalOpConversion
       int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
       if (numWarpsToCopy == 1)
         warpID = b.i32_val(0);
+#if 0
       auto warpOffset = getWarpOffset(op);
       warpID = b.sub(warpID, b.i32_val(warpOffset));
       id = b.sub(id, b.i32_val(warpOffset * warpSize));
+#endif
       Value boxPred =
           b.and_(pred, b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
