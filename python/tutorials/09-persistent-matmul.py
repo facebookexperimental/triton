@@ -574,6 +574,24 @@ def matmul_descriptor_persistent(a, b):
                 "LAST_MMA_CONSUMER": 1,
                 "FIRST_EPILOG_CONSUMER": 2,
                 "LAST_EPILOG_CONSUMER": 2,
+                "EPILOGUE_SUBTILE" : True
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=2,
+            num_buffers_warp_spec=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 2,
+                "LAST_EPILOG_CONSUMER": 2,
+                "EPILOGUE_SUBTILE" : False
             },
             num_stages=2,
             num_warps=4,
@@ -590,11 +608,12 @@ def matmul_descriptor_persistent(a, b):
                 "LAST_MMA_CONSUMER": 1,
                 "FIRST_EPILOG_CONSUMER": 1,
                 "LAST_EPILOG_CONSUMER": 1,
+                "EPILOGUE_SUBTILE" : True
             },
             num_stages=2,
             num_warps=4,
             num_consumer_groups=1,
-            num_buffers_warp_spec=3,
+            num_buffers_warp_spec=4,
         ),
         triton.Config(
             {
@@ -606,6 +625,7 @@ def matmul_descriptor_persistent(a, b):
                 "LAST_MMA_CONSUMER": 2,
                 "FIRST_EPILOG_CONSUMER": 1,
                 "LAST_EPILOG_CONSUMER": 2,
+                "EPILOGUE_SUBTILE" : False
             },
             num_stages=2,
             num_warps=4,
@@ -622,6 +642,7 @@ def matmul_descriptor_persistent(a, b):
                 "LAST_MMA_CONSUMER": 1,
                 "FIRST_EPILOG_CONSUMER": 1,
                 "LAST_EPILOG_CONSUMER": 1,
+                "EPILOGUE_SUBTILE" : False
             },
             num_stages=3,
             num_warps=4,
@@ -649,6 +670,7 @@ def matmul_persistent_tma_ws_cooperative_kernel(
     LAST_MMA_CONSUMER: tl.constexpr,
     FIRST_EPILOG_CONSUMER: tl.constexpr,
     LAST_EPILOG_CONSUMER: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,  #
 ):
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
     num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
@@ -681,9 +703,19 @@ def matmul_persistent_tma_ws_cooperative_kernel(
                accumulator = tl.dot(a, b.T, accumulator)
             offs_k += BLOCK_SIZE_K
 
-        c = accumulator.to(dtype)
-        with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
-            tl._experimental_descriptor_store(c_desc_ptr, c, [offs_am, offs_bn])
+        if EPILOGUE_SUBTILE:
+            with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
+                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc0, acc1 = tl.split(acc)
+                c0 = acc0.to(dtype)
+                tl._experimental_descriptor_store(c_desc_ptr, c0, [offs_am, offs_bn])
+                c1 = acc1.to(dtype)
+                tl._experimental_descriptor_store(c_desc_ptr, c1, [offs_am, offs_bn  + BLOCK_SIZE_N // 2])
+        else:
+            with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
+                accumulator = accumulator.to(dtype)
+                tl._experimental_descriptor_store(c_desc_ptr, accumulator, [offs_am, offs_bn])
 
 
 def matmul_persistent_tma_ws_cooperative(a, b):
@@ -724,13 +756,17 @@ def matmul_persistent_tma_ws_cooperative(a, b):
             META["BLOCK_SIZE_K"],
             b.element_size(),
         )
+
+        store_block_n = META["BLOCK_SIZE_N"]
+        if META["EPILOGUE_SUBTILE"]:
+            store_block_n = store_block_n // 2
         desc_helper.fill_2d_tma_descriptor(
             "c",
             c.data_ptr(),
             M,
             N,
             META["BLOCK_SIZE_M"] // (META["LAST_MMA_CONSUMER"] - META["FIRST_MMA_CONSUMER"] + 1),
-            META["BLOCK_SIZE_N"],
+            store_block_n,
             c.element_size(),
         )
         return (min(
