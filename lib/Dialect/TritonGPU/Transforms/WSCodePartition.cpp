@@ -1110,6 +1110,29 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
           auto consumerTaskIds = getAsyncTaskIds(userOp);
           if (consumerTaskIds.empty())
             continue;
+          if (auto userFor = dyn_cast<scf::ForOp>(userOp)) {
+            // When dot is used by a ForOp, if dot only has a single taskId and
+            // the corresponding argument is only used by the same taskId, no
+            // need to create a channel for userOp along operand user.second.
+            // Get the actual consumerTaskIds.
+            for (auto item : llvm::enumerate(userFor.getInitArgs())) {
+              if (item.value() == userOp->getOperand(user.second)) {
+                auto userArg = userFor.getRegionIterArg(item.index());
+
+                // if (auto blockArg =
+                // dyn_cast<BlockArgument>(userOp->getOperand(user.second))) {
+                DenseSet<AsyncTaskId> tSet;
+                for (auto argUser : userArg.getUsers()) {
+                  auto tTaskIds = getAsyncTaskIds(argUser);
+                  for (auto tId : tTaskIds)
+                    tSet.insert(tId);
+                }
+                consumerTaskIds.clear();
+                for (auto tId : tSet)
+                  consumerTaskIds.push_back(tId);
+              }
+            }
+          }
           // Remove producer task id from consumerTaskIds.
           auto iter = std::remove(consumerTaskIds.begin(),
                                   consumerTaskIds.end(), producerTaskId);
@@ -1351,12 +1374,13 @@ void reorderProducerOps(SmallVector<Channel *> &channels) {
   });
 }
 
-unsigned getLoopDepth(Operation *op) {
+// Number of enclosing ForOps or IfOps.
+unsigned getCtrlDepth(Operation *op) {
   unsigned depth = 0;
-  auto pOp = op->getParentOfType<scf::ForOp>();
+  auto pOp = op->getParentOp(); // OfType<scf::ForOp>();
   while (pOp) {
     ++depth;
-    pOp = pOp->getParentOfType<scf::ForOp>();
+    pOp = pOp->getParentOp(); // fType<scf::ForOp>();
   }
   return depth;
 }
@@ -1577,7 +1601,7 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
   for (auto &op : taskTopOps) {
     op->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
       if (dyn_cast<scf::ForOp>(subOp) || dyn_cast<scf::IfOp>(subOp)) {
-        unsigned tDepth = getLoopDepth(subOp);
+        unsigned tDepth = getCtrlDepth(subOp);
         loopDepthMap[tDepth].push_back(subOp);
         if (tDepth > maxDepth)
           maxDepth = tDepth;
@@ -1641,12 +1665,20 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
       numBuffers = channelsInOp[0]->numBuffers;
       opsWithBufferReuse.push_back(innerOp);
     } else {
-      if (outerLoop != parentForOp.getOperation() ||
-          numChannels != channelsInOp.size())
+      if (outerLoop != parentForOp.getOperation()) {
         // Not under the same outer loop.
+        LDBG("reuseBuffers early exit: not under the same outer loop");
         return;
-      if (numBuffers != channelsInOp[0]->numBuffers)
+      }
+      if (numChannels != channelsInOp.size()) {
+        LDBG("reuseBuffers early exit: channel mismatch: "
+             << numChannels << " " << channelsInOp.size());
         return;
+      }
+      if (numBuffers != channelsInOp[0]->numBuffers) {
+        LDBG("reuseBuffers early exit: numBuffers mismatch");
+        return;
+      }
       unsigned idx = 0;
       for (auto *ch : channelsInOp) {
         // TODO: sort the channels in the loop according to buffer size.
