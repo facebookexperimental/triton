@@ -1616,6 +1616,53 @@ def _str_to_fp_type(float_format: str):
     return ty_enum
 
 
+def sparse_dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, lhs_meta: tl.tensor, builder: ir.builder) -> tl.tensor:
+    assert lhs.type.is_block() and rhs.type.is_block()
+    assert lhs.dtype in (tl.float16, tl.bfloat16), f"Unsupported lhs dtype {lhs.dtype}"
+    assert rhs.dtype in (tl.float16, tl.bfloat16), f"Unsupported rhs dtype {rhs.dtype}"
+    assert lhs.dtype == rhs.dtype, f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
+
+    lhs_rank = len(lhs.shape)
+    rhs_rank = len(rhs.shape)
+    assert lhs_rank == rhs_rank == 2, f"Both inputs must be 2D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
+    assert lhs.shape[-1].value * 2 == rhs.shape[
+        -2].value, f"First input shape {lhs.shape} and second input shape {rhs.shape} are not compatible for matmul (lhs: {lhs.shape} vs rhs: {rhs.shape})"
+    assert builder.codegen_fns.get("min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
+    min_dot_size = builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
+    assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value >= min_dot_size[2] \
+        and rhs.shape[-1].value >= min_dot_size[1], \
+            f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
+    # TODO constraints for lhs_meta
+
+    _0 = builder.get_fp32(0)
+    ret_scalar_ty = tl.float32
+
+    M = lhs.type.shape[-2]
+    N = rhs.type.shape[-1]
+    ret_ty = tl.block_type(ret_scalar_ty, [M, N])
+    if acc is None:
+        acc_handle = builder.create_splat(_0, [M, N])
+    else:
+        acc_handle = acc.handle
+        assert acc.type == ret_ty
+
+    return tl.tensor(builder.create_sparse_dot(lhs.handle, rhs.handle, acc_handle, lhs_meta.handle), ret_ty)
+
+
+def _str_to_fp_type(float_format: Optional[str]):
+    if float_format == 'e4m3':
+        return ir.F8F6F4TY.E4M3
+    if float_format == 'e5m2':
+        return ir.F8F6F4TY.E5M2
+    if float_format == 'e2m3':
+        return ir.F8F6F4TY.E2M3
+    if float_format == 'e3m2':
+        return ir.F8F6F4TY.E3M2
+    if float_format == 'e2m1':
+        return ir.F8F6F4TY.E2M1
+    raise ValueError(f"Invalid float format: {float_format}.")
+
+
 def _bitcast_to_fp_type(val: tl.tensor, float_format: str, builder: ir.builder):
     """
     If float_format is subbyte, make sure it's packed as uint8 and return it.
