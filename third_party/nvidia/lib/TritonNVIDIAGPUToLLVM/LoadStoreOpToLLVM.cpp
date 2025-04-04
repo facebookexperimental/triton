@@ -693,6 +693,13 @@ struct AtomicRMWOpConversion
     Type valueElemTy =
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
                  : valueTy;
+
+    const bool isHopper = getNVIDIAComputeCapability(moduleOp) >= 90;
+    if (valueElemTy.isBF16() && atomicRmwAttr == RMWOp::FADD && !isHopper) {
+      assert(false && "atom.add.bf16 only supported on Hopper");
+      return failure();
+    }
+
     const size_t valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
     auto elemsPerThread = getTotalElemsPerThread(val.getType());
     // packed: e.g. packed=2 for f16x2
@@ -792,6 +799,10 @@ struct AtomicRMWOpConversion
         rmwOp = "add";
         rmwOp += (valueElemNBits == 16 ? ".noftz" : "");
         sTy = "f" + sBits;
+
+        if (isHopper && valueElemTy.isBF16())
+          sTy = "bf" + sBits;
+
         sTy += (packed == 2 && valueElemNBits == 16) ? "x2" : "";
         break;
       case RMWOp::MAX:

@@ -6111,3 +6111,24 @@ def test_side_effectful_scan(device):
     Z = torch.zeros_like(X)
     sanitize_cumsum_kernel[(1, )](Z, X, BLOCK=BLOCK)
     torch.testing.assert_close(Z, X.cumsum(0).to(torch.int32))
+
+def is_hopper():
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+
+@pytest.mark.interpreter
+@pytest.mark.skipif(not is_hopper(), reason="Not implemented for A100")
+def test_bf16_atomics(device):
+    @triton.jit
+    def _kernel(src0, src1, dst, dst2):
+        offset = tl.load(src0, None)
+        val = tl.load(src1, None)
+        old = tl.atomic_add(dst + offset, val)
+        tl.store(dst2, old)
+
+    acc = torch.zeros(256, dtype=torch.bfloat16, device=device)
+    acc2 = torch.zeros(256, dtype=torch.bfloat16, device=device)
+    idx = torch.randint(0, 256, (16 << 20,), device=device)
+    val = torch.ones(16 << 20, dtype=torch.bfloat16, device=device)
+
+    h = _kernel[(triton.cdiv(idx.numel(), 1024),)](idx, val, acc, acc2)
+    assert 'atomic_rmw' in h.asm["ttir"]
