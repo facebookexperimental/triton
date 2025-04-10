@@ -1081,14 +1081,14 @@ public:
 struct TmemDataChannel : Channel {
   ttng::TMEMAllocOp tmemAllocOp;
   ttng::TCGen5MMAOp tmemMmaOp;
-  Operation *tmemProdcuerOp;
+  Operation *tmemProducerOp;
 
   TmemDataChannel(int producer, SmallVector<int> &consumers,
                   ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp tmemMmaOp,
                   Operation *tmemLoadOp, unsigned operandIdx,
                   unsigned numBuffers)
       : Channel(producer, consumers, tmemLoadOp, operandIdx, numBuffers),
-        tmemAllocOp(tmemAllocOp), tmemProdcuerOp(tmemAllocOp),
+        tmemAllocOp(tmemAllocOp), tmemProducerOp(tmemAllocOp),
         tmemMmaOp(tmemMmaOp) {
     assert(consumers.size() == 1 &&
            "TmemDataChannel must have a single consumer");
@@ -1097,7 +1097,7 @@ struct TmemDataChannel : Channel {
 
   ttng::TMEMAllocOp getAllocOp() { return tmemAllocOp; }
   ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
-  virtual Operation *getSrcOp() { return tmemProdcuerOp; }
+  virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
 
 // Find transitive users of the root op. Track through control flow ops (such as
@@ -1136,6 +1136,8 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                           triton::FuncOp &funcOp, unsigned numBuffers) {
   mlir::DominanceInfo dom(funcOp);
   funcOp.walk([&](Operation *op) {
+    // FIXME: It is possible that a local_alloc can start a channel, when a
+    // gemm's operand is in smem and comes from local_alloc.
     if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op) ||
         isa<mlir::triton::DotOpInterface>(op)) {
       auto producerTaskIds = getAsyncTaskIds(op);
@@ -1305,6 +1307,14 @@ void groupChannels(
     Operation *dst1 = c1->getDstOp(), *dst2 = c2->getDstOp();
     if (dst1 == dst2)
       return true;
+    // We only have one CommChannel for channels in channelsGroupedByConsumers.
+    // A CommChannel can have multiple tokens, one for each consumer taskId.
+    // Consider the case where channel v is between producer
+    // task 0 and consumer task 1, while channel p is between producer task 2
+    // and consumer task 1, but in createToken, we only consider the first
+    // channel in the group.
+    if (getAsyncTaskIds(c1->getSrcOp()) != getAsyncTaskIds(c2->getSrcOp()))
+      return false;
     // Check taskIds on dstOps.
     if (getAsyncTaskIds(dst1) != getAsyncTaskIds(dst2))
       return false;
@@ -2227,6 +2237,7 @@ void createToken(
     DenseMap<Channel *, CommChannel> &tokenMap) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+  DenseMap<nvidia_gpu::TCGen5MMAOp, Channel *> gen5Barriers;
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
     Channel *channel = it->second.front();
@@ -2242,11 +2253,22 @@ void createToken(
       commChannel.producerBarrier =
           createBarrierAlloc(funcOp, channel->numBuffers);
     }
+    // For channels associated with acc of gen5, consumerOp is not the gen5,
+    // it is usually tmem_load.
+    bool useGen5Barrier = isa<nvidia_gpu::TCGen5MMAOp>(consumerOp) &&
+                          producerOp->getBlock() == consumerOp->getBlock();
+    if (useGen5Barrier) {
+      auto mmaOp = cast<nvidia_gpu::TCGen5MMAOp>(consumerOp);
+      // If the gen5 barrier for this mmaOp is already used for another
+      // channel, do not use it for this channel.
+      if (gen5Barriers.count(mmaOp) && gen5Barriers[mmaOp] != channel)
+        useGen5Barrier = false;
+    }
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // No token is needed for a TMA <-> TCGen5MMAOp channel
       if (!isa<tt::ExperimentalDescriptorLoadOp>(producerOp) ||
-          !isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+          !useGen5Barrier) { // isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
         ttng::TokenLoadType tokenLoadType;
         auto copyOp = copyOpMap.find(channel)->second.first;
         if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
@@ -2270,9 +2292,10 @@ void createToken(
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
-      if (isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+      if (useGen5Barrier) {
         Value v = createBarrierAlloc(funcOp, channel->numBuffers);
         commChannel.consumerBarrier = v;
+        gen5Barriers[cast<nvidia_gpu::TCGen5MMAOp>(consumerOp)] = channel;
       }
     }
 
@@ -2590,7 +2613,7 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
       oldTMemAllocOp.getLoc(), srcView, oldTMemAllocOp.getSrc(), vTrue);
   oldTMemAllocOp->replaceAllUsesWith(srcView.getDefiningOp());
   oldTMemAllocOp.erase();
-  tmemChannel->tmemProdcuerOp = tmemStoreOp;
+  tmemChannel->tmemProducerOp = tmemStoreOp;
   return {tmemStoreOp, channel->getDstOp()};
 }
 
@@ -2981,9 +3004,29 @@ void insertAsyncComm(
       }
     }
 
+    LLVM_DEBUG({
+      LDBG("SrcOp of master Channel ");
+      masterChannel->getSrcOp()->dump();
+      LDBG("DstOp of master Channel ");
+      masterChannel->getDstOp()->dump();
+      LDBG("headProducer ");
+      headProducer->dump();
+      LDBG("tailProducer ");
+      tailProducer->dump();
+      LDBG("headConsumer ");
+      headConsumer->dump();
+      LDBG("tailConsumer ");
+      tailConsumer->dump();
+    });
+
     // Desynchronize TCGen5MMAOp. Set up consumer release and producer acquire.
-    if (auto mmaOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(
-            getUniqueActualConsumer(masterChannel->getDstOp()))) {
+    auto mmaOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(
+        getUniqueActualConsumer(masterChannel->getDstOp()));
+    if (mmaOp && commChannel.consumerBarrier) {
+      LLVM_DEBUG({
+        LDBG("unique actual consumer is gen5 mma ");
+        mmaOp->dump();
+      });
       auto tmemWaitBarrier = desyncTCGen5MMAOp(
           builder, mmaOp, *commChannel.consumerBarrier, bufferIdx, phase,
           masterChannel->numBuffers, headProducer, opsWithChannels,
@@ -3032,12 +3075,16 @@ void insertAsyncComm(
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
       // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
-      if (!isa<nvidia_gpu::TCGen5MMAOp>(tailConsumer)) {
+      if (!commChannel.consumerBarrier) {
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
         builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
             consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        LLVM_DEBUG({
+          LDBG("create ConsumerRelease ");
+          token.second.dump();
+        });
       }
     }
 
