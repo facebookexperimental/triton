@@ -1129,6 +1129,66 @@ void getTransitiveUsers(Value root,
   }
 }
 
+// When traversing gen5, producerOp can be either the defining op of operand
+// A or the accumulator.
+static void createChannel(Operation *producerOp, Operation *op,
+                          mlir::DominanceInfo &dom,
+                          SmallVector<std::unique_ptr<Channel>> &channels,
+                          bool opndAOfGen5, unsigned producerNumBuffers) {
+  // For TMEM channels, op is Gen5 op, producerOp can be either A operand
+  // or accumulator.
+  auto producerTaskIds = getAsyncTaskIds(opndAOfGen5 ? producerOp : op);
+  auto producerTaskId = producerTaskIds.front();
+  for (auto result : producerOp->getResults()) {
+    if (result.use_empty()) {
+      continue;
+    }
+
+    SetVector<std::pair<Operation *, unsigned>> users;
+    getTransitiveUsers(result, users);
+    for (auto user : users) {
+      auto userOp = user.first;
+      if (op == userOp && !opndAOfGen5)
+        continue;
+      // rule out users that are not dominated by op
+      if (op->getBlock() != userOp->getBlock()) {
+        if (!dom.properlyDominates(op->getParentOp(), userOp)) {
+          continue;
+        }
+      } else {
+        if (!dom.properlyDominates(op, userOp) && op != userOp)
+          continue;
+      }
+
+      auto consumerTaskIds = getAsyncTaskIds(userOp);
+      if (consumerTaskIds.empty())
+        continue;
+      // Remove producer task id from consumerTaskIds.
+      auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
+                              producerTaskId);
+      consumerTaskIds.erase(iter, consumerTaskIds.end());
+
+      const unsigned NUM_TMEM_BUFFERS = 1;
+      // Add a channel from the single producer task to consumerTaskIds.
+      if (consumerTaskIds.size() > 0) {
+        if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+          // When traversing Gen5MMA, we create channel for the accumulator.
+          if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(producerOp)) {
+            // Always use two buffers for TMEM channels.
+            channels.push_back(std::make_unique<TmemDataChannel>(
+                producerTaskId, consumerTaskIds, tmemAllocOp, dotOp, userOp,
+                user.second, NUM_TMEM_BUFFERS));
+          }
+        } else {
+          channels.push_back(
+              std::make_unique<Channel>(producerTaskId, consumerTaskIds, userOp,
+                                        user.second, producerNumBuffers));
+        }
+      }
+    }
+  }
+}
+
 // Loads will be in producer warp groups. For now, we only allow a single
 // warp group/task for a producer. For each LoadOp, create a channel from it
 // to any direct user which belongs to a different taskId.
@@ -1159,52 +1219,15 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
         auto accumulator = dotOp.getD();
         producerOp = accumulator.getDefiningOp();
-      }
-
-      for (auto result : producerOp->getResults()) {
-        if (result.use_empty()) {
-          continue;
-        }
-
-        SetVector<std::pair<Operation *, unsigned>> users;
-        getTransitiveUsers(result, users);
-        for (auto user : users) {
-          auto userOp = user.first;
-          if (op == userOp)
-            continue;
-          // rule out users that are not dominated by op
-          if (op->getBlock() != userOp->getBlock()) {
-            if (!dom.properlyDominates(op->getParentOp(), userOp)) {
-              continue;
-            }
-          } else {
-            if (!dom.properlyDominates(op, userOp))
-              continue;
-          }
-
-          auto consumerTaskIds = getAsyncTaskIds(userOp);
-          if (consumerTaskIds.empty())
-            continue;
-          // Remove producer task id from consumerTaskIds.
-          auto iter = std::remove(consumerTaskIds.begin(),
-                                  consumerTaskIds.end(), producerTaskId);
-          consumerTaskIds.erase(iter, consumerTaskIds.end());
-          // Add a channel from the single producer task to consumerTaskIds.
-          if (consumerTaskIds.size() > 0) {
-            if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
-              if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(producerOp)) {
-                // Always use two buffers for TMEM channels.
-                channels.push_back(std::make_unique<TmemDataChannel>(
-                    producerTaskId, consumerTaskIds, tmemAllocOp, dotOp, userOp,
-                    user.second, 2));
-              }
-            } else {
-              channels.push_back(std::make_unique<Channel>(
-                  producerTaskId, consumerTaskIds, userOp, user.second,
-                  producerNumBuffers));
-            }
-          }
-        }
+        createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
+        // We may need to create a TMEM channel for A operand.
+        auto opndA = dotOp.getA();
+        producerOp = opndA.getDefiningOp();
+        if (isa<ttng::TMEMAllocOp>(producerOp))
+          createChannel(producerOp, op, dom, channels, true /*opndA*/,
+                        producerNumBuffers);
+      } else {
+        createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
       }
     }
   });
