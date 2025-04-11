@@ -291,7 +291,7 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
         isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
             BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp, ConvertLayoutOp,
             triton::gpu::LocalAllocOp, LoadOp, TransOp, AtomicRMWOp,
-            triton::AddPtrOp, ExperimentalDescriptorLoadOp>(op)) {
+            triton::AddPtrOp, ExperimentalDescriptorLoadOp, FpToFpOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
