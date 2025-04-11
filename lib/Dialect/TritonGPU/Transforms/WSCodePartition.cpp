@@ -2326,8 +2326,8 @@ static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
 // the buffer array will contain numBuffers.
 DenseMap<Channel *, Value> createBuffer(
     DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
-    triton::FuncOp funcOp, int numConsumerGroups,
-    DenseMap<Channel *, Channel *> &mapToRepresenting,
+    const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp,
+    int numConsumerGroups, DenseMap<Channel *, Channel *> &mapToRepresenting,
     DenseMap<Channel *, SmallVector<Channel *>> &channelReuse) {
 
   DenseMap<Channel *, Value> bufferMap;
@@ -2349,10 +2349,13 @@ DenseMap<Channel *, Value> createBuffer(
       }
     }
   }
-  for (auto &item : channelsGroupedByProducers) {
-    auto &channels = item.second;
-    auto srcValue = item.first->getSrcOperand();
-    auto srcOp = item.first->getSrcOp();
+  for (auto *channelInOrder : orderedChannels) {
+    if (channelsGroupedByProducers.find(channelInOrder) ==
+        channelsGroupedByProducers.end())
+      continue;
+    auto &channels = channelsGroupedByProducers[channelInOrder];
+    auto srcValue = channelInOrder->getSrcOperand();
+    auto srcOp = channelInOrder->getSrcOp();
     auto *channel = channels.front();
     unsigned numBuffers = channel->numBuffers;
     Value buffer;
@@ -3228,8 +3231,8 @@ public:
     // channels that share buffers.
     DenseMap<Channel *, SmallVector<Channel *>> channelReuse;
     DenseMap<Channel *, Value> bufferMap =
-        createBuffer(channelsGroupedByProducers, funcOp, numConsumerGroups,
-                     mapToRepresenting, channelReuse);
+        createBuffer(channelsGroupedByProducers, channels, funcOp,
+                     numConsumerGroups, mapToRepresenting, channelReuse);
     LLVM_DEBUG({
       LDBG("\n\nafter createBuffer");
       funcOp.dump();
