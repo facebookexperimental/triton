@@ -2781,7 +2781,7 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 // (TMEM load).
 ttng::WaitBarrierOp desyncTCGen5MMAOp(
     OpBuilderWithAsyncTaskIds &builder, nvidia_gpu::TCGen5MMAOp mmaOp,
-    Value barrierAlloc, Value bufferIdx, Value phase, unsigned numBuffers,
+    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
     Operation *headProducer, DenseSet<Operation *> &opsWithChannels,
     SmallVector<Operation *> &opsWithBufferReuse, mlir::DominanceInfo &dom) {
   // Attach the barrier as an operand of the mma op.
@@ -2799,13 +2799,18 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
   // curPhase = curPhase xor True for emptyBarrier.
   auto loc = headProducer->getLoc();
   Value _1_1b = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  phase =
-      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, phase, _1_1b);
+  // Creating phase for headProducer.
+  Value phase =
+      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase, _1_1b);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, producerBarrier,
                                                       phase);
 
+  LLVM_DEBUG({
+    LDBG("desync: create wait_barrier for producer ");
+    producerBarrier.dump();
+  });
   // Create a wait_barrier before the tmem load.
   SetVector<std::pair<Operation *, unsigned>> users;
   getTransitiveUsers(mmaOp.getD(), users);
@@ -2834,6 +2839,15 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
           user->getLoc(), builder.getI32Type(), phase);
       consumerBarrier =
           getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+    } else {
+      // mmaOp can be in a different task from headProducer.
+      auto loc = user->getLoc();
+      Value _1_1b =
+          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+      phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
+                                                                  _1_1b);
+      phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          loc, builder.getI32Type(), phase);
     }
 
     // TODO: if there are multiple users of the mma op, we need to barrier
@@ -3168,17 +3182,38 @@ void insertAsyncCopy(
         mutuallyNonDominatingChannels.insert(c);
     }
 
+    assert(mutuallyNonDominatingChannels.size() == 1 &&
+           "conditional consumers not supported");
+    auto domininatingChannel = *mutuallyNonDominatingChannels.begin();
     auto srcOp = kv.getFirst()->getSrcOp();
+    LLVM_DEBUG({
+      LDBG("insertAsyncCopy handle channel ");
+      srcOp->dump();
+      domininatingChannel->getDstOp()->dump();
+    });
+
     Value bufferIdx;
     Value phase = Value();
     OpBuilderWithAsyncTaskIds builder(srcOp);
+    // Calculate TaskIds for bufferIdx and phase.
     SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
     for (auto channel : mutuallyNonDominatingChannels) {
+      // bufferIdx will be used in createTMEMCopy to construct subView
+      // to feed into both tmem_store and users of tmem_alloc. There are cases
+      // where a TMEM channel has srcOp in task 2, dstOp in task 2, while mmaOp
+      // is in task 1.
+      if (channel->channelKind == DataChannelKind::TMEM) {
+        TmemDataChannel *tmemChannel = static_cast<TmemDataChannel *>(channel);
+        for (auto task : getAsyncTaskIds(tmemChannel->getMmaOp()))
+          if (!llvm::is_contained(asyncTasksPC, task))
+            asyncTasksPC.push_back(task);
+      }
       for (auto task : getAsyncTaskIds(channel->getDstOp()))
         if (!llvm::is_contained(asyncTasksPC, task))
           asyncTasksPC.push_back(task);
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
+
     if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase ");
@@ -3194,10 +3229,10 @@ void insertAsyncCopy(
           srcOp->getLoc(), 0, 32);
     }
 
-    assert(mutuallyNonDominatingChannels.size() == 1 &&
-           "conditional consumers not supported");
-
-    auto domininatingChannel = *mutuallyNonDominatingChannels.begin();
+    LLVM_DEBUG({
+      LDBG("-- bufferIdx ");
+      bufferIdx.dump();
+    });
     std::pair<Operation *, Operation *> producerConsumerOps{nullptr, nullptr};
 
     // No need to create async copy for TMA load which will be handled in
