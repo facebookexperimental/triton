@@ -2253,8 +2253,6 @@ void createToken(
       commChannel.producerBarrier =
           createBarrierAlloc(funcOp, channel->numBuffers);
     }
-    // For channels associated with acc of gen5, consumerOp is not the gen5,
-    // it is usually tmem_load.
     bool useGen5Barrier = isa<nvidia_gpu::TCGen5MMAOp>(consumerOp) &&
                           producerOp->getBlock() == consumerOp->getBlock();
     if (useGen5Barrier) {
