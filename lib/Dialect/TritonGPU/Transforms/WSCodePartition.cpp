@@ -2840,7 +2840,9 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
       consumerBarrier =
           getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
     } else {
-      // mmaOp can be in a different task from headProducer.
+      // mmaOp can be in a different task from headProducer. Even if user and
+      // mma are in the same block and they share the same barrier, but the
+      // phases should be offset by 1.
       auto loc = user->getLoc();
       Value _1_1b =
           builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
