@@ -552,16 +552,18 @@ LogicalResult convertSparseWGMMA(ttng::SparseWarpGroupDotOp op,
   // TODO(sparsity): remove this debug
   auto aMetaTensor = cast<RankedTensorType>(op.getAMeta().getType());
   auto aMetaTensorShape = aMetaTensor.getShape();
-  auto linearEncoding = toLinearEncoding(aMetaTensor.getEncoding(), aMetaTensor.getShape());
-  auto linearElemsPerThread = linearEncoding.getElemsPerThread(aMetaTensorShape);
+  auto linearEncoding =
+      toLinearEncoding(aMetaTensor.getEncoding(), aMetaTensor.getShape());
+  auto linearElemsPerThread =
+      linearEncoding.getElemsPerThread(aMetaTensorShape);
   auto linearLayout = linearEncoding.toLinearLayout(aMetaTensorShape);
-  auto dim0Size = linearLayout.getOutDimSize(StringAttr::get(op.getContext(), "dim0"));
-  auto dim1Size = linearLayout.getOutDimSize(StringAttr::get(op.getContext(), "dim1"));
-  auto expectedTotalElemsPerThread = getTotalElemsPerThread(op.getAMeta().getType());
+  auto dim0Size =
+      linearLayout.getOutDimSize(StringAttr::get(op.getContext(), "dim0"));
+  auto dim1Size =
+      linearLayout.getOutDimSize(StringAttr::get(op.getContext(), "dim1"));
+  auto expectedTotalElemsPerThread =
+      getTotalElemsPerThread(op.getAMeta().getType());
   auto hMeta = unpackLLElements(loc, adaptor.getAMeta(), rewriter);
-
-  op->getParentOp()->dump();
-  llvm::outs().flush();
 
   SmallVector<Value> hMetaPacked;
   for (int i = 0; i < hMeta.size(); i += kCore) {
@@ -618,7 +620,6 @@ LogicalResult convertSparseWGMMA(ttng::SparseWarpGroupDotOp op,
   Value res = packLLElements(loc, typeConverter, fc, rewriter, structTy);
 
   rewriter.create<ttn::WGMMACommitGroupOp>(loc);
-  res = rewriter.create<ttn::WGMMAWaitGroupOp>(loc, res, 0);
   rewriter.replaceOp(op, res);
 
   return success();

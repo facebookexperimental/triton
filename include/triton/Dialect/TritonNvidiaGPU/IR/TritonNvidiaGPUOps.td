@@ -173,7 +173,8 @@ def TTNG_SparseWarpGroupDotOp : TTNG_Op<"sparse_warp_group_dot", [DeclareOpInter
     let arguments = (ins TTG_TensorOrMemDesc:$a,
                          TTG_TensorOrMemDesc:$b,
                          TT_FpIntTensor:$c,
-                         TTG_TensorOrMemDesc:$aMeta
+                         TTG_TensorOrMemDesc:$aMeta,
+                         DefaultValuedAttr<BoolAttr, "false">:$isAsync
     );  // TODO(sparsity): handle other args from WarpGroupDotOp
 
     let results = (outs TT_FpIntTensor:$d);

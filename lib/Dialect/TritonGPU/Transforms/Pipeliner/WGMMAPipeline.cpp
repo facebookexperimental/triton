@@ -291,7 +291,8 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
 // If the op can be properly async, this function returns the index of the dot
 // in the loop's iter_args.  (Rule (2) above ensures this is well-defined.)
 //
-static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
+template<typename DotOpType>
+static std::optional<int> dotCanBeProperlyAsync(DotOpType dotOp,
                                                 scf::ForOp forOp) {
   LDBG("Considering whether to make MMAv3 dot properly async: " << dotOp);
 
@@ -381,7 +382,7 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
   // Rule 3a: Are the only users of the dot's result from iteration i-1 other
   // MMAv3 dots?  If so, we're done, this dot can be properly async.
   if (llvm::all_of(iterArg.getUses(), [&](OpOperand &use) {
-        return isa<ttng::WarpGroupDotOp>(use.getOwner()) &&
+        return isa<ttng::WarpGroupDotOp, ttng::SparseWarpGroupDotOp>(use.getOwner()) &&
                use.getOperandNumber() == 2;
       })) {
     return iterArgIdx;
@@ -495,6 +496,28 @@ static void insertAsyncWarpGroupDotWaitInLoop(
   threadValuesThroughWait(wait, addlWaitOperands);
 }
 
+namespace {
+
+// TODO(sparsity): this is templated (instead of inlined)
+// because we need to handle WarpGroupDotOp and SparseWarpGroupDotOp.
+// See TODO below to consolidate...
+template<typename OpType>
+void processWarpGroupDotOp(IRRewriter& builder, llvm::MapVector<Operation *, int>& properlyAsyncDots, scf::ForOp forOp, OpType dotOp) {
+  dotOp.setIsAsync(true);
+  if (auto iterArgIdx = dotCanBeProperlyAsync(dotOp, forOp)) {
+    properlyAsyncDots[dotOp] = *iterArgIdx;
+  } else {
+    builder.setInsertionPointAfter(dotOp);
+    auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
+        dotOp.getLoc(), ArrayRef<Value>{},
+        /*pendings=*/0);
+    SmallVector<Value> waitOperands = {dotOp.getResult()};
+    threadValuesThroughWait(wait, waitOperands);
+  }
+}
+
+} // namespace
+
 // Convert MMAv3 ttng::WarpGroupDotOps {isAsync = False} (i.e. Hopper wgmma)
 // into ttng::WarpGroupDotOps {isAsync = True} and insert
 // ttng::WarpGroupDotWaitOps as necessary.
@@ -519,18 +542,13 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
   // the yield op.
   IRRewriter builder(forOp.getContext());
   llvm::MapVector<Operation *, int /*iterArgIdx*/> properlyAsyncDots;
+  // TODO(sparsity): can we make WarpGroupDotOp take a sparsity arg?
+  //   or otherwise make SparseWarpGroupDotOp and WarpGroupDotOp share an interface?
   for (auto WarpGroupDotOp : forOp.getBody()->getOps<ttng::WarpGroupDotOp>()) {
-    WarpGroupDotOp.setIsAsync(true);
-    if (auto iterArgIdx = dotCanBeProperlyAsync(WarpGroupDotOp, forOp)) {
-      properlyAsyncDots[WarpGroupDotOp] = *iterArgIdx;
-    } else {
-      builder.setInsertionPointAfter(WarpGroupDotOp);
-      auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
-          WarpGroupDotOp.getLoc(), ArrayRef<Value>{},
-          /*pendings=*/0);
-      SmallVector<Value> waitOperands = {WarpGroupDotOp.getResult()};
-      threadValuesThroughWait(wait, waitOperands);
-    }
+    processWarpGroupDotOp(builder, properlyAsyncDots, forOp, WarpGroupDotOp);
+  }
+  for (auto SparseWarpGroupDotOp : forOp.getBody()->getOps<ttng::SparseWarpGroupDotOp>()) {
+    processWarpGroupDotOp(builder, properlyAsyncDots, forOp, SparseWarpGroupDotOp);
   }
 
   if (properlyAsyncDots.empty()) {
