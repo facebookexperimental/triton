@@ -88,6 +88,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                             int);
   ADD_PASS_OPTION_WRAPPER_1("add_ws_canonicalization",
                             createTritonGPUWSCanonicalization, int);
+  ADD_PASS_WRAPPER_0("sparse_blocked_to_mma", createSparseBlockedToMMAPass);
+  ADD_PASS_WRAPPER_0("sparse_remove_layout_conversion", createSparseRemoveLayoutConversionPass);
 }
 
 void init_triton_passes_convert(py::module &&m) {

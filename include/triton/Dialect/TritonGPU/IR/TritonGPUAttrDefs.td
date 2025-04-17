@@ -1309,6 +1309,16 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
   let extraClassDeclaration = extraDistributedDeclaration;
 }
 
+def SparseDotMetaEncodingAttr : DistributedEncoding<"SparseDotMetaEncoding", "sparse_dot_meta_encoding"> {
+  let mnemonic = "sparse_dot_meta";
+
+  // TODO(sparsity): maybe we can make the parent explicitly a NvidiaMmaEncodingAttr
+  // and take the CTALayout from there.
+  let parameters = (ins "Attribute":$parent);
+  let assemblyFormat = "`<``{` struct(params) `}``>`";
+  let extraClassDeclaration = extraDistributedDeclaration;
+}
+
 def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {
   let mnemonic = "shared_memory";
   let description = [{

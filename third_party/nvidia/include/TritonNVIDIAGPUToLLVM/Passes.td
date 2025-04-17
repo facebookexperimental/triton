@@ -42,4 +42,13 @@ def ConvertWarpSpecializeToLLVM : Pass<"convert-warp-specialize-to-llvm", "mlir:
   let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::NVVM::NVVMDialect"];
 }
 
+def SparseWGMMAOpToLLVMPass : Pass<"sparse-wgmma-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Lowers sparse WGMMA to LLVM";
+  let dependentDialects = [
+    "triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+  ];
+  let constructor = "CreateSparseWGMMAOpToLLVMPass()";
+}
+
 #endif // TRITONGPU_CONVERSION_PASSES

@@ -131,6 +131,11 @@ private:
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getResult().getType();
 
+    // TODO(sparsity): clean this up...
+    if (isa<SparseDotMetaEncodingAttr>(dstTy.getEncoding())) {
+      return failure();
+    }
+
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(),
         typeConverter->convertType(srcTy.getElementType()), rewriter);

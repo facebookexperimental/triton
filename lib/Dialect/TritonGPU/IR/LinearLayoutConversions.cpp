@@ -1556,4 +1556,69 @@ LinearLayout getScaleTMEMStoreLinearLayout(RankedTensorType scaleType,
   return combineCtaCgaWithShape(regLanes, CTALayout, scaleType.getShape());
 }
 
+LinearLayout
+SparseDotMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
+  MLIRContext *ctx = getContext();
+
+  auto kRegister = S("register");
+  auto kLane = S("lane");
+  auto kWarp = S("warp");
+
+  int rank = shape.size();
+  // TODO(sparsity): need to make this match the dot operands' order.
+  // Note: apparently this should be warpOrder
+  // And for Hopper it must be {0, 1}.
+  SmallVector<unsigned> order = {0, 1};
+  SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
+
+  auto mmaEnc = llvm::cast<NvidiaMmaEncodingAttr>(getParent());
+  auto warpsPerCTA = getWarpsPerCTA();
+  std::vector<std::vector<int32_t>> warpBasis;
+
+  // TODO(sparsity) check on Ampere.
+  SmallVector<int32_t> shapePerWarp = {16, 2};
+
+  /*
+  if (mmaEnc.isAmpere()) {
+    for (auto idx : order) {
+      for (getWarpsPerCTA())
+    }
+
+  } else {
+    assert(mmaEnc.isHopper() && "SparseDot only supported w/ Ampere and
+  Hopper");
+  }
+    */
+  if (mmaEnc.isHopper()) {
+    for (int i = 1; i < warpsPerCTA[0]; i *= 2) {
+      warpBasis.push_back({shapePerWarp[0] * i, 0});
+    }
+    // The warpsPerCTA shape references the MMA output encoding.
+    // That encoding is M x N - we need to duplicate data along
+    // the K dimension if we have multiple warp groups along K.
+    for (int i = 1; i < warpsPerCTA[1]; i *= 2) {
+      warpBasis.push_back({0, 0});
+    }
+  } else {
+    assert(mmaEnc.isAmpere() && "SparseDot only supported w/ Ampere and Hopper");
+    assert(false && "Ampere not implemented yet");
+  }
+
+  // TODO(sparsity): handle the order...
+  // In other linear layouts, we outDimNames[order[0]], outDimNames[order[1]].
+  // But if we do that (and assuming that order is [1, 0]), then we'd need to
+  // transpose all the basis values in the definition below.
+  auto layoutPerCTA =
+      LinearLayout({{kRegister, {{8, 0}}},
+                    {kLane, {{0, 1}, {0, 0}, {1, 0}, {2, 0}, {4, 0}}},
+                    {kWarp, warpBasis}},
+                   {outDimNames[0], outDimNames[1]});
+
+  auto ctaLayout = getCTALayout(getParent());
+
+  auto res =
+      combineCtaCgaWithShape(layoutPerCTA, ctaLayout, shape);
+  return res;
+}
+
 } // namespace mlir::triton::gpu

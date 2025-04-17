@@ -396,4 +396,23 @@ def TritonGPUPingPongSync: Pass<"tritongpu-ping-pong-sync", "mlir::ModuleOp"> {
   ];
 }
 
+def SparseBlockedToMMAPass : Pass<"sparse-blocked-to-mma", "mlir::ModuleOp"> {
+  let summary = "Add convert layouts to/from MMA before and after SparseDotOp.";
+  let description = [{
+     Add convert layouts to and from MMA before and after SparseDotOp. In MMAV3,
+     shared memory allocations will be used for A and B operands.
+  }];
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+  ];
+}
+
+def SparseRemoveLayoutConversionPass
+    : Pass<"sparse-remove-layout-conversion", "mlir::ModuleOp"> {
+  let summary = "Replaces ConvertLayoutOp with sparse dot encoding";
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+  ];
+}
+
 #endif

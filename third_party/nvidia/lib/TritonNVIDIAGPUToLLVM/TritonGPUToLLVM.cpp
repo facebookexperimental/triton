@@ -64,6 +64,9 @@ public:
     addLegalOp<triton::gpu::WarpYieldOp>();
     addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
     addLegalOp<triton::gpu::WarpReturnOp>();
+
+    // TODO(sparsity) - do we need this?
+    addLegalOp<triton::SparseDotOp>(); // Rewritten in a separate pass
   }
 };
 
@@ -116,6 +119,7 @@ struct ConvertTritonGPUToLLVM
     mlir::triton::NVIDIA::populateTMAToLLVMPatterns(typeConverter, targetInfo,
                                                     patterns, benefit);
     populateDotOpToLLVMPatterns(typeConverter, patterns, benefit);
+    populateSparseDotOpToLLVMPatterns(typeConverter, patterns, benefit);
     populateElementwiseOpToLLVMPatterns(typeConverter, patterns,
                                         axisInfoAnalysis, computeCapability,
                                         targetInfo, benefit);

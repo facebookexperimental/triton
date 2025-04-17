@@ -121,4 +121,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       return true;
     return false;
   });
+  addDynamicallyLegalOp<triton::SparseDotOp>([](triton::SparseDotOp sparseDotOp) -> bool {
+    return sparseDotOp.getAMeta().getType().getEncoding() != nullptr;
+  });
 }

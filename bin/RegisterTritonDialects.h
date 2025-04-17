@@ -73,6 +73,11 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerTritonAMDGPUInsertInstructionSchedHints();
   mlir::triton::registerTritonAMDGPULowerInstructionSchedHints();
 
+  // SparseDotOp passes TODO(sparsity) do we really need this?
+  mlir::triton::gpu::registerSparseBlockedToMMAPass();
+  mlir::triton::gpu::registerSparseRemoveLayoutConversionPass();
+  mlir::triton::registerSparseWGMMAOpToLLVMPass();
+
   registry
       .insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
               mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,

@@ -519,6 +519,130 @@ LogicalResult tryJoinOnAxis(MLIRContext *ctx, const LinearLayout &inLl,
   return success();
 }
 
+//--- SparseDotMetaEncodingAttr ---
+/*
+unsigned SparseDotMetaEncodingAttr::getTotalElemsPerThread(
+    ArrayRef<int64_t> shape, Type eltTy) const {
+  constexpr int kMetadataElementsPerWarp = 16;
+  auto mmaLayout = mlir::cast<gpu::NvidiaMmaEncodingAttr>(getParent());
+  return product<int64_t>(shape) /
+         (mmaLayout.getWarpsPerCTA()[0] * kMetadataElementsPerWarp);
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getElemsPerThread(
+    ArrayRef<int64_t> shape, Type eltTy) const {
+  llvm_unreachable("getElemsPerThread is not supported for sparse dot meta");
+  return SmallVector<unsigned>();
+}
+*/
+
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTAsPerCGA() const {
+  return gpu::getCTAsPerCGA(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTAOrder() const {
+  return gpu::getCTAOrder(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTASplitNum() const {
+  return gpu::getCTASplitNum(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getWarpsPerCTA() const {
+  return gpu::getWarpsPerCTA(getParent());
+}
+/*
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getWarpOrder() const {
+  return {1, 0};
+}
+*/
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getThreadsPerWarp() const {
+  return gpu::getThreadsPerWarp(getParent());
+}
+/*
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getThreadOrder() const {
+  return {1, 0};
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getSizePerThread() const {
+  return gpu::getSizePerThread(getParent());
+}
+*/
+
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getRepOrder() const {
+  // TODO: b/381422752 - Maybe we should reuse upstream's implementation from
+  // lib/Dialect/TritonGPU/IR/Dialect.cpp, but we would need to make it public
+  // first.
+  if (auto parent = mlir::dyn_cast<gpu::DistributedEncodingTrait>(getParent()))
+    return parent.getRepOrder();
+  llvm::report_fatal_error("Unimplemented usage of getRepOrder");
+}
+
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getDefaultWarpOrder() const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "getDefaultWarpOrder not defined on SparseDotMetaEncodingAttr");
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getDefaultThreadOrder() const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "getDefaultThreadOrder not defined on SparseDotMetaEncodingAttr");
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getDefaultOrder() const {
+  // TODO(sparsity): IDK what this should be.
+  return {1, 0};
+}
+
+/*
+TODO(sparsity): the above patches are from the newer upstream commits, can we delete the stuff below?
+
+// TODO(sparsity) maybe replace with linear layouts, or otherwise clean up
+namespace {
+// Implied properties of 2:4 sparse dots.
+constexpr int kContractingFactor = 2;
+constexpr int kMetadataElementsPerPackedValue = 8;
+constexpr int kMetadataElementsPerWarp = 16;
+} // namespace
+
+//--- SparseDotMetaEncodingAttr ---
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getRepOrder() const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "getRepOrder not defined on SparseDotMetaEncodingAttr");
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTAsPerCGA() const {
+  return ::getCTAsPerCGA(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTAOrder() const {
+  return ::getCTAOrder(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getCTASplitNum() const {
+  return ::getCTAOrder(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getWarpsPerCTA() const {
+  return ::getWarpsPerCTA(getParent());
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getThreadsPerWarp() const {
+  return ::getThreadsPerWarp(getParent());
+}
+LinearLayout
+SparseDotMetaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "toLinearLayout not defined on SparseDotMetaEncodingAttr");
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getDefaultWarpOrder() const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "getDefaultWarpOrder not defined on SparseDotMetaEncodingAttr");
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getDefaultThreadOrder() const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "getDefaultThreadOrder not defined on SparseDotMetaEncodingAttr");
+}
+SmallVector<unsigned> SparseDotMetaEncodingAttr::getDefaultOrder() const {
+  // TODO: fix
+  llvm::report_fatal_error(
+      "getDefaultOrder not defined on SparseDotMetaEncodingAttr");
+}
+*/
+
 } // namespace gpu
 } // namespace triton
 } // namespace mlir

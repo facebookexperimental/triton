@@ -95,6 +95,55 @@ bool WarpGroupDotOp::verifyDims() {
   return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
 }
 
+// -- SparseWarpGroupDotOp --
+bool SparseWarpGroupDotOp::verifyDims() {
+  // TODO(sparsity): add more checks
+  auto aShape = this->getA().getType().getShape();
+  auto bShape = this->getB().getType().getShape();
+
+  return aShape[aShape.size() - 1] * 2 == bShape[aShape.size() - 2];
+}
+
+mlir::LogicalResult SparseWarpGroupDotOp::inferReturnTypes(
+  MLIRContext *context, std::optional<Location> location, ValueRange operands,
+  DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+  SmallVectorImpl<Type> &inferredReturnTypes) {
+  // type is the same as the accumulator
+  auto accTy = cast<RankedTensorType>(operands[2].getType());
+  inferredReturnTypes.push_back(accTy);
+
+  // verify encodings
+  auto aEnc =
+      cast<triton::gpu::TensorOrMemDesc>(operands[0].getType()).getEncoding();
+  auto bEnc =
+      cast<triton::gpu::TensorOrMemDesc>(operands[1].getType()).getEncoding();
+  auto retEnc = accTy.getEncoding();
+  if (aEnc) {
+    assert(bEnc);
+    Dialect &dialect = aEnc.getDialect();
+    auto interface = cast<DialectInferLayoutInterface>(&dialect);
+    if (interface->inferDotOpEncoding(aEnc, 0, retEnc, location).failed())
+      return mlir::failure();
+    if (interface->inferDotOpEncoding(bEnc, 1, retEnc, location).failed())
+      return mlir::failure();
+  }
+  return mlir::success();
+}
+
+
+void SparseWarpGroupDotOp::getEffects(
+  SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+      &effects) {
+auto &a = getAMutable();
+auto &b = getBMutable();
+if (isa<mlir::triton::gpu::MemDescType>(a.get().getType()))
+  effects.emplace_back(MemoryEffects::Read::get(), &a,
+                       mlir::triton::gpu::SharedMemory::get());
+if (isa<mlir::triton::gpu::MemDescType>(b.get().getType()))
+  effects.emplace_back(MemoryEffects::Read::get(), &b,
+                       mlir::triton::gpu::SharedMemory::get());
+}
+
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     ::mlir::MLIRContext *context, ::std::optional<::mlir::Location> location,

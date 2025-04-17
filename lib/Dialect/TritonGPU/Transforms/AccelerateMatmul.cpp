@@ -50,8 +50,8 @@ static int getMMAVersionSafe(int computeCapability, DotOp op) {
   return 0;
 }
 
-SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,
-                                     int numWarps) {
+SmallVector<unsigned>
+warpsPerTileV2(Operation *dotOp, const ArrayRef<int64_t> shape, int numWarps) {
   auto rank = shape.size();
   // Early exit for batched matmul
   if (rank == 3)
@@ -64,9 +64,8 @@ SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,
   auto slices = multiRootGetSlice(dotOp, {filter}, {filter});
   bool hasChainedDot = false;
   for (Operation *op : slices) {
-    if (isa<DotOp>(op) && (op != dotOp)) {
-      auto chainedDot = cast<DotOp>(op);
-      auto resTy = chainedDot.getResult().getType();
+    if (dotOp->getName() == op->getName() && op != dotOp) {
+      auto resTy = cast<RankedTensorType>(op->getResult(0).getType());
       if (resTy.getRank() != rank) {
         continue;
       }
@@ -115,10 +114,10 @@ SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,
 }
 
 SmallVector<unsigned, 2>
-warpsPerTileV3(DotOp dotOp, const ArrayRef<int64_t> shape, int numWarps,
+warpsPerTileV3(Operation *dotOp, const ArrayRef<int64_t> shape, int numWarps,
                const SmallVector<unsigned, 3> &instrShape) {
   SetVector<Operation *> slices;
-  mlir::getForwardSlice(dotOp.getResult(), &slices);
+  mlir::getForwardSlice(dotOp->getResult(0), &slices);
   // Contains a chained dot. We prefer to assign warps to one axis
   // to facilitate use cases like flash attention, allowing reductions within
   // the same warp.
@@ -276,6 +275,68 @@ public:
   BlockedToMMA(mlir::MLIRContext *context, int computeCapability, int benefit)
       : OpRewritePattern<DotOp>(context, benefit),
         computeCapability(computeCapability) {}
+
+  static bool bwdFilter(Operation *op) {
+    return op->getNumOperands() == 1 &&
+           (isa<FpToFpOp, BitcastOp, ConvertLayoutOp>(op) ||
+            isPureUnaryInlineAsm(op) ||
+            op->getDialect()->getTypeID() ==
+                mlir::TypeID::get<arith::ArithDialect>());
+  }
+
+  // TODO(sparsity): do we need this `public:` ?
+public:
+  // Finds the first different bitwidth in the chain of shape-preserving
+  // unary ops that x depends on.
+  // There are two primary scenarios:
+  // (1) Upcasting: A sequence such as loading an fp16, followed by arithmetic
+  // operations, then bitcasting to fp32, and finally computing in fp32.
+  // (2) Downcasting: This might involve loading an fp32, performing arithmetic
+  // operations, bitcasting to fp16, and finally computing in fp16.
+  // In the upcasting scenario, element reordering converts the original
+  // elements distribution to the order of higher precision primitives. As a
+  // result, kwidth can be the bitwidth of the lower precision primitive.
+  // Conversely, in the downcasting scenario, no reordering is performed,
+  // making it directory use the lower precision primitive.
+  static int computeOrigBitWidth(Value x) {
+    int finalBitWidth = getElementTypeOrSelf(x).getIntOrFloatBitWidth();
+    int origBitWidth = finalBitWidth;
+    SetVector<Operation *> slice;
+    mlir::BackwardSliceOptions opt;
+    opt.omitBlockArguments = true;
+    opt.filter = bwdFilter;
+    getBackwardSlice(x, &slice, opt);
+    for (auto op : slice) {
+      if (Value arg = op->getOperand(0))
+        if (auto argTy = dyn_cast<RankedTensorType>(arg.getType())) {
+          auto argBitWidth = argTy.getElementType().getIntOrFloatBitWidth();
+          if (argBitWidth != origBitWidth) {
+            origBitWidth = std::min<int>(origBitWidth, argBitWidth);
+            break;
+          }
+        }
+    }
+    return origBitWidth;
+  }
+
+public:
+  BlockedToMMA(mlir::MLIRContext *context, int computeCapability)
+      : OpRewritePattern<DotOp>(context), computeCapability(computeCapability) {
+  }
+
+  static SmallVector<unsigned, 3>
+  getWarpsPerTile(Operation *dotOp, const ArrayRef<int64_t> shape, int version,
+                  int numWarps, const SmallVector<unsigned, 3> &instrShape) {
+    switch (version) {
+    case 2:
+      return warpsPerTileV2(dotOp, shape, numWarps);
+    case 3:
+      return warpsPerTileV3(dotOp, shape, numWarps, instrShape);
+    default:
+      assert(false && "not supported version");
+      return {0, 0};
+    }
+  }
 
   mlir::LogicalResult
   matchAndRewrite(triton::DotOp dotOp,
@@ -854,6 +915,21 @@ public:
     decomposeMixedModeDotOp(m, computeCapability);
   }
 };
+
+// Expose helper functions from BlockedToMMA to be reused for sparse matmul.
+SmallVector<unsigned, 3>
+getWarpsPerTile(Operation *dotOp, ArrayRef<int64_t> shape, int version,
+                int numWarps, const SmallVector<unsigned, 3> &instrShape) {
+  return BlockedToMMA::getWarpsPerTile(dotOp, shape, version, numWarps,
+                                       instrShape);
+}
+int computeOrigBitWidth(Value x) {
+  return BlockedToMMA::computeOrigBitWidth(x);
+}
+Value getSharedMemMMAOperand(Value v, mlir::PatternRewriter &rewriter,
+                             int opIdx, bool allowTranspose) {
+  return getSharedMemoryMMAOperand(v, rewriter, opIdx, allowTranspose);
+}
 
 } // namespace gpu
 } // namespace triton

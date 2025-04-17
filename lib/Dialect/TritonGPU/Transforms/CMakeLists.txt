@@ -35,6 +35,7 @@ add_triton_library(TritonGPUTransforms
   WSLowering.cpp
   PingPong.cpp
   WSCanonicalization.cpp
+  SparseDot.cpp
 
   DEPENDS
   TritonGPUTransformsIncGen

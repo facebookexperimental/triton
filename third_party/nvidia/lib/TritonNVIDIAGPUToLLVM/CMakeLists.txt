@@ -20,6 +20,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     Fp4ToFpOpToLLVM.cpp
     TargetInfo.cpp
     RegReallocOpToLLVM.cpp
+    SparseDot.cpp
 
     DEPENDS
     TritonNVIDIAGPUConversionPassIncGen

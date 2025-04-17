@@ -42,7 +42,7 @@ public:
       return;
     ModuleOp mod = getOperation();
     mod.walk([&](Operation *op) {
-      if (!isa<ttng::WarpGroupDotOp>(op))
+      if (!isa<ttng::WarpGroupDotOp, tt::SparseDotOp, ttng::SparseWarpGroupDotOp>(op))
         return WalkResult::advance();
       OpBuilder builder(op);
       auto a = op->getOperand(0);

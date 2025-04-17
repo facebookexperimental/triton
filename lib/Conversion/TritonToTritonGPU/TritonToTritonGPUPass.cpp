@@ -279,6 +279,105 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
   }
 };
 
+struct TritonSparseDotPattern : public OpConversionPattern<SparseDotOp> {
+  using OpConversionPattern<SparseDotOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SparseDotOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType op_type = cast<RankedTensorType>(op.getType());
+
+    auto op_shape = op_type.getShape();
+    auto type_converter = getTypeConverter<TritonGPUTypeConverter>();
+    int num_warps = type_converter->getNumWarps();
+    int threads_per_warp = type_converter->getThreadsPerWarp();
+    int num_ctas = type_converter->getNumCTAs();
+
+    auto rank = op_shape.size();
+    auto num_elements = product<int64_t>(op_shape);
+    SmallVector<unsigned> ret_size_per_thread(rank, 1);
+    if (num_elements / (num_warps * threads_per_warp) >= 4) {
+      ret_size_per_thread[rank - 1] = 2;
+      ret_size_per_thread[rank - 2] = 2;
+    }
+    if (num_elements / (num_warps * threads_per_warp) >= 16) {
+      ret_size_per_thread[rank - 1] = 4;
+      ret_size_per_thread[rank - 2] = 4;
+    }
+    SmallVector<unsigned> ret_order(rank);
+    for (unsigned i = 0; i < rank; ++i)
+      ret_order[i] = rank - 1 - i;
+
+    Attribute d_encoding = triton::gpu::BlockedEncodingAttr::get(
+        getContext(), op_shape, ret_size_per_thread, ret_order, num_warps,
+        threads_per_warp, num_ctas);
+    RankedTensorType return_type =
+        RankedTensorType::get(op_shape, op_type.getElementType(), d_encoding);
+
+    // a must be of smem layout
+    auto a_type = cast<RankedTensorType>(adaptor.getA().getType());
+    Type a_element_type = a_type.getElementType();
+    Attribute a_encoding = a_type.getEncoding();
+    if (!a_encoding)
+      return failure();
+    Value a = adaptor.getA();
+    if (!isa<triton::gpu::DotOperandEncodingAttr>(a_encoding)) {
+      Attribute new_encoding = triton::gpu::DotOperandEncodingAttr::get(
+          getContext(), 0, d_encoding, a_element_type);
+      auto tensor_type = RankedTensorType::get(a_type.getShape(),
+                                               a_element_type, new_encoding);
+      a = rewriter.create<triton::gpu::ConvertLayoutOp>(a.getLoc(), tensor_type,
+                                                        a);
+    }
+
+    // b must be of smem layout
+    auto b_type = cast<RankedTensorType>(adaptor.getB().getType());
+    Type b_element_type = b_type.getElementType();
+    Attribute b_encoding = b_type.getEncoding();
+    if (!b_encoding)
+      return failure();
+    Value b = adaptor.getB();
+    if (!isa<triton::gpu::DotOperandEncodingAttr>(b_encoding)) {
+      Attribute new_encoding = triton::gpu::DotOperandEncodingAttr::get(
+          getContext(), 1, d_encoding, b_element_type);
+      auto tensor_type = RankedTensorType::get(b_type.getShape(),
+                                               b_element_type, new_encoding);
+      b = rewriter.create<triton::gpu::ConvertLayoutOp>(b.getLoc(), tensor_type,
+                                                        b);
+    }
+    Value c = adaptor.getC();
+    c = rewriter.create<triton::gpu::ConvertLayoutOp>(c.getLoc(), return_type,
+                                                      c);
+
+    // aMeta must be of smem layout
+    auto a_meta_type = cast<RankedTensorType>(adaptor.getAMeta().getType());
+    Attribute a_meta_encoding = a_meta_type.getEncoding();
+    if (!a_meta_encoding)
+      return failure();
+    Value a_meta = adaptor.getAMeta();
+    if (!isa<SparseDotMetaEncodingAttr>(a_meta_encoding)) {
+      // TODO(sparsity): ctaLayout should match A's layout. Use the default for
+      // now.
+      auto ctaLayout = CTALayoutAttr::getDefault(getContext(), /*rank=*/2);
+      Attribute new_encoding =
+          SparseDotMetaEncodingAttr::get(getContext(), d_encoding);
+      auto tensor_type = RankedTensorType::get(
+          a_meta_type.getShape(), a_meta_type.getElementType(), new_encoding);
+      a_meta = rewriter.create<triton::gpu::ConvertLayoutOp>(
+          a_meta.getLoc(), tensor_type, a_meta);
+    }
+
+    auto new_op = rewriter.replaceOpWithNewOp<SparseDotOp>(op, return_type, a,
+                                                           b, c, a_meta);
+    for (const NamedAttribute attr : op->getAttrs()) {
+      if (!new_op->hasAttr(attr.getName()))
+        new_op->setAttr(attr.getName(), attr.getValue());
+    }
+
+    return success();
+  }
+};
+
 struct TritonCatPattern : public OpConversionPattern<triton::CatOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -626,9 +725,9 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ExperimentalTensormapCreateOp>,
       GenericOpPattern<triton::ExperimentalTensormapFenceproxyAcquireOp>,
       // this assumes the right layout will be set later for dot scaled.
-      GenericOpPattern<triton::DotScaledOp>,
-      GenericOpPattern<triton::SparseDotOp>, GenericOpPattern<triton::CallOp>,
-      TritonFuncOpPattern>(typeConverter, context);
+      GenericOpPattern<triton::DotScaledOp>, TritonSparseDotPattern,
+      GenericOpPattern<triton::CallOp>, TritonFuncOpPattern>(typeConverter,
+                                                             context);
 }
 // Proton patterns
 // NOTE: Because Proton's inputs are scalars and not tensors this conversion
