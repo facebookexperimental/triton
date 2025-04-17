@@ -1856,6 +1856,14 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
 
 
 @builtin
+def sparse_dot(input, other, acc, input_meta, _builder=None):
+    """
+    TODO
+    """
+    return semantic.sparse_dot(input, other, acc, input_meta, _builder)
+
+
+@builtin
 def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", cache_modifier="", eviction_policy="",
          volatile=False, _builder=None):
     """
@@ -2909,6 +2917,7 @@ class async_task:
     """
     Context manager to run code fragments asynchronously.
     """
+
     def __init__(self, task_ids, _builder=None):
         self.task_ids = list({_constexpr_to_value(tid) for tid in task_ids})
         self.builder = _builder

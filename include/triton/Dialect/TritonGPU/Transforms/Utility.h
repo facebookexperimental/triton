@@ -259,9 +259,14 @@ public:
 
   template <typename OpTy, typename... Args>
   OpTy createWithAsyncTaskIds(Args &&...args) {
-    OpTy op = create<OpTy>(std::forward<Args>(args)...);
+    OpTy op = OpBuilder::create<OpTy>(std::forward<Args>(args)...);
     if (!asyncTaskIds.empty())
       setAsyncTaskIds(op, asyncTaskIds);
+    return op;
+  }
+
+  template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
+    OpTy op = createWithAsyncTaskIds<OpTy>(std::forward<Args>(args)...);
     return op;
   }
 

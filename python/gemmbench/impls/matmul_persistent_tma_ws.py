@@ -98,13 +98,29 @@ class TmaAutoTuneHelper:
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_N": 256,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 8,
+                "MMA_CONSUMER": 1,
+                "EPILOG_CONSUMER": 1,
             },
             num_stages=1,
             num_warps=4,
             num_consumer_groups=1,
+            num_buffers_warp_spec=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "MMA_CONSUMER": 1,
+                "EPILOG_CONSUMER": 2,
+            },
+            num_stages=1,
+            num_warps=4,
+            num_consumer_groups=2,
             num_buffers_warp_spec=3,
         ),
     ],
@@ -129,6 +145,8 @@ def matmul_persistent_tma_ws_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  #
     GROUP_SIZE_M: tl.constexpr,  #
+    MMA_CONSUMER: tl.constexpr,  #
+    EPILOG_CONSUMER: tl.constexpr,  #
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -169,13 +187,13 @@ def matmul_persistent_tma_ws_kernel(
                     b_ptr, [offs_k, offs_bn], [BLOCK_SIZE_K, BLOCK_SIZE_N], tl.float16
                 )
 
-            with tl.async_task([1]):
+            with tl.async_task([MMA_CONSUMER]):
                 accumulator = tl.dot(a, b, accumulator)
             offs_k += BLOCK_SIZE_K
 
         c = accumulator.to(tl.float16)
 
-        with tl.async_task([1]):
+        with tl.async_task([EPILOG_CONSUMER]):
             tl._experimental_descriptor_store(c_ptr, c, [offs_am, offs_bn])
 
 

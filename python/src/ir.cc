@@ -1617,6 +1617,11 @@ void init_triton_ir(py::module &&m) {
                                              rhs_scale.value_or(Value()),
                                              lhs_format, rhs_format, fast_math);
            })
+      .def("create_sparse_dot",
+           [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
+              mlir::Value &c, mlir::Value &aMeta) -> mlir::Value {
+             return self.create<SparseDotOp>(c.getType(), a, b, c, aMeta);
+           })
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::FloorOp>(val);
