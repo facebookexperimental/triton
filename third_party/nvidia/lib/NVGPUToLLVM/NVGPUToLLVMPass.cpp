@@ -37,28 +37,6 @@ const std::string kClusterCtaIdOp = "{\n"
                                     "mad.lo.u32 a1, a2, a4, a1;     \n"
                                     "mad.lo.u32 $0, a1, a3, a0;     \n"
                                     "}";
-const std::string Reg_Alloc_Op = "setmaxnreg.inc.sync.aligned.u32 #regCount;";
-const std::string Reg_Dealloc_Op = "setmaxnreg.dec.sync.aligned.u32 #regCount;";
-
-const std::string Named_Barrier_Arrive_Op = "bar.arrive $0, $1;";
-const std::string Named_Barrier_Wait_Op = "bar.sync $0, $1;";
-const std::string Canonical_Warp_Id_Op =
-    "{\n"
-    ".reg .u32 a<5>;              \n"
-    "mov.u32 a0, %tid.x;          \n" // x
-    "mov.u32 a1, %tid.y;          \n" // y
-    "mov.u32 a2, %tid.z;          \n" // z
-    "mov.u32 a3, %ntid.x;         \n" // nx
-    "mov.u32 a4, %ntid.y;         \n" // ny
-    "mad.lo.u32 a1, a2, a4, a1;   \n"
-    "mad.lo.u32 a0, a1, a3, a0;   \n"
-    "shr.u32 a0, a0, 5;           \n"
-    ".reg .b32         %tmp<3>;   \n"
-    "mov.u32   %tmp0, -1;         \n"
-    "mov.u32   %tmp1, 31;         \n"
-    "mov.u32   %tmp2, 0;          \n"
-    "shfl.sync.idx.b32         $0, a0, %tmp2, %tmp1, %tmp0;           \n"
-    "}";
 
 bool isNumber(const std::string &s) {
   return !s.empty() && std::find_if(s.begin(), s.end(), [](unsigned char c) {
@@ -875,18 +853,10 @@ public:
     POPULATE_NVGPU_OP(ttn::WGMMAFenceOp, kWgmmaFenceOp)
     POPULATE_NVGPU_OP(ttn::WGMMACommitGroupOp, kWgmmaCommitGroupOp)
     POPULATE_NVGPU_OP(ttn::ClusterWaitOp, kClusterWaitOp)
-    POPULATE_NVGPU_OP(ttn::RegAllocOp, Reg_Alloc_Op)
-    POPULATE_NVGPU_OP(ttn::RegDeallocOp, Reg_Dealloc_Op)
 #undef POPULATE_NVGPU_OP
-    patterns.add<NVGPUOpGenericPattern<ttn::NamedBarrierArriveOp>>(
-        context, Named_Barrier_Arrive_Op, Constraints(),
-        Constraints({"r", "r"}));
-    patterns.add<NVGPUOpGenericPattern<ttn::NamedBarrierWaitOp>>(
-        context, Named_Barrier_Wait_Op, Constraints(), Constraints({"r", "r"}));
     patterns.add<NVGPUOpGenericPattern<ttn::ClusterCTAIdOp>>(
         context, kClusterCtaIdOp, Constraints({"=r"}), Constraints());
-    patterns.add<NVGPUOpGenericPattern<ttn::CanonicalWarpIdOp>>(
-        context, Canonical_Warp_Id_Op, Constraints({"=r"}), Constraints());
+
     patterns.add<FenceAsyncSharedOpPattern, LoadMatrixOpPattern,
                  StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern,
                  LoadAcquireOpPattern, WGMMAWaitGroupOpPattern, WarpIdOpPattern,

@@ -36,8 +36,6 @@ struct AllocateSharedMemory
         }
         if (offset == -1)
           return;
-        if (op->hasAttr("allocation.offset"))
-          return;
         op->setAttr("allocation.offset",
                     IntegerAttr::get(IntegerType::get(ctx, 32), offset));
       });
