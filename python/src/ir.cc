@@ -28,7 +28,6 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
@@ -116,10 +115,7 @@ public:
 
   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
     auto loc = getLastLoc();
-    auto ret = builder->create<OpTy>(loc, std::forward<Args>(args)...);
-    if (asyncTaskIds)
-      ::setAsyncTaskIds(ret, *asyncTaskIds);
-    return ret;
+    return builder->create<OpTy>(loc, std::forward<Args>(args)...);
   }
 
   // Overload to create or fold a single result operation.
@@ -138,16 +134,9 @@ public:
     return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
   }
 
-  void setAsyncTaskIds(std::vector<int> taskIds) {
-    this->asyncTaskIds = taskIds;
-  }
-
-  void unsetAsyncTaskIds() { this->asyncTaskIds = std::nullopt; }
-
 private:
   std::unique_ptr<OpBuilder> builder;
   std::unique_ptr<Location> lastLoc;
-  std::optional<std::vector<int>> asyncTaskIds;
   bool lineInfoEnabled = !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
 };
 
@@ -777,12 +766,6 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, OpBuilder::InsertPoint pt) {
              self.restoreInsertionPoint(pt);
            })
-      .def("set_async_task_ids",
-           [](TritonOpBuilder &self, std::vector<int> v) {
-             self.setAsyncTaskIds(v);
-           })
-      .def("unset_async_task_ids",
-           [](TritonOpBuilder &self) { self.unsetAsyncTaskIds(); })
       // Attr
       .def(
           "get_unit_attr",
