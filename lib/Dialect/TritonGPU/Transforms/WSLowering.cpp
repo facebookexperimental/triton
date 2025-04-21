@@ -4,6 +4,7 @@
 #include <set>
 
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -134,6 +135,10 @@ void processConsumerReleaseOp(OpBuilder &builder, ttng::ConsumerReleaseOp op,
 void lowerTokenOperations(Operation *parentOp, int numCTAs,
                           int numConsumerGroups) {
   SmallVector<Operation *> deprecatedOps;
+  SmallVector<Operation *> deprecatedTokenOps;
+  DenseSet<Operation *> warpSpecOps;
+  DenseMap<Operation *, Value> tokenToFull;
+  DenseMap<Operation *, Value> tokenToEmpty;
   parentOp->walk([&](ttng::CreateTokenOp createTokenOp) {
     ttng::TokenLoadType loadType = createTokenOp.getLoadType();
     MLIRContext *context = createTokenOp.getContext();
@@ -154,10 +159,13 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     Type singleBarrierMemDescType =
         ttg::MemDescType::get({1}, builder.getI64Type(), barrierEncoding,
                               sharedMemorySpace, /*mutableMemory=*/true);
+    // These are created prior to warp_specialize.
     Value bufferFullArray = builder.create<mlir::triton::gpu::LocalAllocOp>(
         loc, barrierMemDescType, Value());
     Value bufferEmptyArray = builder.create<mlir::triton::gpu::LocalAllocOp>(
         loc, barrierMemDescType, Value());
+    tokenToFull[createTokenOp.getOperation()] = bufferFullArray;
+    tokenToEmpty[createTokenOp.getOperation()] = bufferEmptyArray;
 
     for (unsigned i = 0; i < createTokenOp.getNum(); i++) {
       Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
@@ -188,45 +196,137 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       return builder.create<ttg::MemDescSubviewOp>(
           loc, singleBarrierMemDescType, bufferEmptyArray, idx);
     };
-
-    // Process token users: ProducerAcquireOp, ProducerCommitOp, ConsumerWaitOp,
-    // and ConsumerReleaseOp.
-    for (Operation *user : createTokenOp.getResult().getUsers()) {
-      auto loc = user->getLoc();
-      builder.setInsertionPoint(user);
+    auto handleOneUser = [&](Operation *user) -> bool {
+      // Here builder is at the user, make sure usage of values outside of
+      // warp_specialize is via capture if user is in a partition region.
+      // We need bufferFullArray and bufferEmptyArray.
       if (auto op = dyn_cast<ttng::ProducerAcquireOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
+        auto pOp = user->getParentOp();
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processProducerAcquireOp(builder, op, bufferEmpty);
+        deprecatedOps.push_back(user);
+        return true;
       } else if (auto op = dyn_cast<ttng::ProducerCommitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processProducerCommitOp(builder, op, bufferFull, loadType);
+        deprecatedOps.push_back(user);
+        return true;
       } else if (auto op = dyn_cast<ttng::ConsumerWaitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerWaitOp(builder, op, bufferFull);
+        deprecatedOps.push_back(user);
+        return true;
       } else if (auto op = dyn_cast<ttng::ConsumerReleaseOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs);
-      } else {
+        deprecatedOps.push_back(user);
+        return true;
+      }
+      return false;
+    };
+
+    // Process token users: ProducerAcquireOp, ProducerCommitOp, ConsumerWaitOp,
+    // and ConsumerReleaseOp.
+    for (OpOperand &use : createTokenOp.getResult().getUses()) {
+      Operation *user = use.getOwner();
+      auto loc = user->getLoc();
+      builder.setInsertionPoint(user);
+      bool handled = handleOneUser(user);
+      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+        unsigned opndNum = use.getOperandNumber();
+        // Handle the regions. Trace uses of the argument corresponding to the
+        // captured value.
+        for (Region *region : wsOp.getPartitionRegions()) {
+          LDBG("-- region " << region->getNumArguments());
+          auto tArg = region->getArgument(opndNum);
+          for (Operation *tUser : tArg.getUsers()) {
+            builder.setInsertionPoint(tUser);
+            // Use of TokenOp via capture of warp_specialize.
+            handleOneUser(tUser);
+          }
+        }
+        warpSpecOps.insert(user);
+      } else if (!handled) {
         llvm_unreachable("Unexpected user of token");
       }
-      deprecatedOps.push_back(user);
     }
 
-    deprecatedOps.push_back(createTokenOp);
+    deprecatedTokenOps.push_back(createTokenOp);
   });
   for (auto op : deprecatedOps) {
+    LLVM_DEBUG({
+      LDBG("erasing deprecatedOps");
+      op->dump();
+    });
+    op->erase();
+  }
+  unsigned tokenRemoval = 0;
+  // Map from tokenOp to bufferFullArray, bufferEmptyArray.
+  // If a tokenOp is used by warp_specialize, remove it and add
+  // buffer[Full|Empty]Array.
+
+  for (auto op : deprecatedTokenOps) {
+    LLVM_DEBUG({
+      LDBG("erasing deprecatedOps");
+      op->dump();
+    });
+    ++tokenRemoval;
+    if (auto tokenOp = dyn_cast<ttng::CreateTokenOp>(op)) {
+      // Check to see if it is used by warpSpec. If yes, eraseOperand and
+      // eraseArgument.
+      for (OpOperand &use : tokenOp->getUses()) {
+        Operation *user = use.getOwner();
+        if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+          unsigned opndNum = use.getOperandNumber();
+          LDBG("wsOp user numOperands: " << wsOp->getNumOperands() << " idx "
+                                         << opndNum);
+
+          LLVM_DEBUG({
+            LDBG("prior to erasing " << tokenRemoval);
+            parentOp->dump();
+          });
+          wsOp->eraseOperand(opndNum);
+          Value empty = tokenToEmpty[op];
+          Value full = tokenToFull[op];
+          wsOp->insertOperands(wsOp.getNumOperands(), full);
+          wsOp->insertOperands(wsOp.getNumOperands(), empty);
+          // Handle the regions.
+          for (Region *region : wsOp.getPartitionRegions()) {
+            LDBG("-- region " << region->getNumArguments());
+            auto tArg = region->getArgument(opndNum);
+            for (Operation *tUser : tArg.getUsers()) {
+              LLVM_DEBUG({
+                LDBG("user for arg");
+                tUser->dump();
+              });
+            }
+            region->eraseArgument(opndNum);
+            BlockArgument arg =
+                region->addArgument(full.getType(), full.getLoc());
+            replaceAllUsesInRegionWith(full, arg, *region);
+            BlockArgument arg2 =
+                region->addArgument(empty.getType(), empty.getLoc());
+            replaceAllUsesInRegionWith(empty, arg2, *region);
+          }
+        }
+      }
+    }
     op->erase();
   }
 
   assert(numCTAs == 1 && "remote CTA is not supported yet");
+  LLVM_DEBUG({
+    LDBG("after lowering");
+    parentOp->dump();
+  });
 }
 
 #define GEN_PASS_DEF_TRITONGPUWSLOWERING

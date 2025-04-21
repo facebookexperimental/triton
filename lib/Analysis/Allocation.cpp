@@ -261,12 +261,14 @@ private:
       alloc.dump();
     });
     int sharingGroup = -1;
+#if 0
     if (alloc->hasAttr("allocation.shareGroup")) {
       sharingGroup =
           mlir::cast<IntegerAttr>(alloc->getAttr("allocation.shareGroup"))
               .getInt();
       LDBG("with shareGroup of " << sharingGroup);
     }
+#endif
     allocation->addBuffer<BufferT::BufferKind::Explicit>(
         alloc, bytes, alignment, 0, sharingGroup);
   }
@@ -339,6 +341,7 @@ private:
       getExplicitValueSize(op);
       getScratchValueSize(op);
     });
+#if 0
     LDBG("getValuesAndSizes --");
     for (auto valueBufferIter : allocation->valueBuffer) {
       auto *buffer = valueBufferIter.second;
@@ -346,6 +349,7 @@ private:
                  << "-- buffer " << buffer->id << " " << buffer->size << " "
                  << buffer->offset << " " << buffer->sharingGroup << "\n");
     }
+#endif
     // Get the alias values
     std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
     SharedMemoryAliasAnalysis *aliasAnalysis =
@@ -425,6 +429,10 @@ private:
 
         // Any scratch memory's live range is the current operation's live
         // range.
+#if 1
+        bufferRange.insert(
+            {buffer, Interval(operationId.at(op), operationId.at(op) + 1)});
+#else
         // Extend live range when asyncTaskId is not empty (i.e when we have
         // warp spec).
         if (getAsyncTaskIds(op).empty()) {
@@ -440,6 +448,7 @@ private:
           bufferRange.insert({buffer, Interval(operationId.lookup(op),
                                                operationId.lookup(op) + 1)});
         }
+#endif
         LLVM_DEBUG({
           llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
           op->dump();
@@ -476,6 +485,7 @@ private:
     Liveness liveness(operation);
     auto getValueLivenessRange = [&](Value value, BufferT *buffer) {
       auto liveOperations = liveness.resolveLiveness(value);
+#if 0
       // Update regions for buffer.
       std::for_each(liveOperations.begin(), liveOperations.end(),
                     [&](Operation *liveOp) {
@@ -483,10 +493,12 @@ private:
                         buffer->regionIds.insert(rId);
                       }
                     });
+#endif
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
-      std::for_each(
-          liveOperations.begin(), liveOperations.end(), [&](Operation *liveOp) {
+      std::for_each(liveOperations.begin(), liveOperations.end(),
+                    [&](Operation *liveOp) {
+#if 0
             if (buffer->regionIds.size() > 1 || buffer->sharingGroup >= 0) {
               // For a buffer that is associated with warp
               // specialization, due to producer-consumer channel, it
@@ -499,13 +511,14 @@ private:
               maxId = operationId.size();
               return;
             }
-            if (operationId[liveOp] < minId) {
-              minId = operationId[liveOp];
-            }
-            if ((operationId[liveOp] + 1) > maxId) {
-              maxId = operationId[liveOp] + 1;
-            }
-          });
+#endif
+                      if (operationId[liveOp] < minId) {
+                        minId = operationId[liveOp];
+                      }
+                      if ((operationId[liveOp] + 1) > maxId) {
+                        maxId = operationId[liveOp] + 1;
+                      }
+                    });
       return Interval(minId, maxId);
     };
 
@@ -570,6 +583,11 @@ private:
     });
 
     SmallVector<BufferT *> buffers;
+#if 1
+    for (auto bufferIter : bufferRange) {
+      buffers.emplace_back(bufferIter.first);
+    }
+#else
     // Handle sharingGroup here. For allocations with the same sharingGroup
     // get the union of the live range, and union of the regionIds. Put
     // the
@@ -605,6 +623,7 @@ private:
       }
       buffers.emplace_back(bufferIter.first);
     }
+#endif
 
     // Sort buffers by size in descending order to reduce the fragmentation
     // on big buffers caused by smaller buffers. Big buffers have a higher
@@ -633,6 +652,7 @@ private:
     } while (!interference.empty());
 
     LLVM_DEBUG(dumpAllocationSize());
+#if 0
     // Update allocation for sharingGroup.
     for (auto &kv : toGroup) {
       auto *rep = sharingIdToRep[kv.first];
@@ -645,6 +665,7 @@ private:
       }
     }
     dumpBuffers();
+#endif
   }
 
   /// Computes the initial shared memory offsets.
@@ -762,9 +783,12 @@ private:
             xSizeRange.intersects(ySizeRange)) {
           interference[x].insert(y);
         }
-        // if x and y belong to different regions (ignore producer region).
+#if 0 // Manman: enable this will cause unspecified launch failure, still not
+      // sure why if x and y belong to different regions (ignore producer
+      // region).
         if (inDifferentRegion(x, y) && xSizeRange.intersects(ySizeRange))
           interference[x].insert(y);
+#endif
       }
     }
 
