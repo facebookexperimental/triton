@@ -317,7 +317,7 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
                                        currentDim))
         return false;
       partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
-    } else if (auto tensorDescOp = dyn_cast<ReinterpretTensorDescOp>(op)) {
+    } else if (isa<ReinterpretTensorDescOp, MakeTensorDescOp>(op)) {
       return true;
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
       // track yield value
@@ -844,8 +844,8 @@ Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                      blockType.getShape().end()};
           int sliceSize = shape[dim] / numOfPartitions;
           shape[dim] = sliceSize;
-          auto newBlockType =
-              RankedTensorType::get(shape, blockType.getElementType());
+          auto newBlockType = RankedTensorType::get(
+              shape, blockType.getElementType(), blockType.getEncoding());
           auto newType =
               TensorDescType::get(builder.getContext(), newBlockType);
           newV.setType(newType);
@@ -1028,6 +1028,8 @@ Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       mappings.map(v, newV);
       reverseMappings.map(newV, v);
     }
+  } else if (auto tensorDescOp = dyn_cast<MakeTensorDescOp>(op)) {
+    newOp = cloneAndSetResultType(op);
   } else if (auto tensorDescOp = dyn_cast<ReinterpretTensorDescOp>(op)) {
     newOp = cloneAndSetResultType(op);
   } else if (isa<TransOp, MemDescTransOp>(op)) {

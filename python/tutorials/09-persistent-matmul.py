@@ -801,17 +801,15 @@ def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
 
 
 @triton.autotune(
-    configs=matmul_tma_ws_cooperative_get_configs(
-        pre_hook=matmul_ws_cooperative_set_block_size_hook
-    ),
+    configs=matmul_tma_ws_cooperative_get_configs(),
     key=["M", "N", "K"],
     use_cuda_graph=True,
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def matmul_kernel_persistent_tma_ws_cooperative(
-    a_desc,
-    b_desc,
-    c_desc,
+    a_ptr,
+    b_ptr,
+    c_ptr,
     M,
     N,
     K,
@@ -833,6 +831,28 @@ def matmul_kernel_persistent_tma_ws_cooperative(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
+
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[N, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+        ],
+    )
 
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -895,26 +915,23 @@ def matmul_persistent_tma_ws_cooperative(a, b):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
-    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
-    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
 
-    def grid(META):
-        nonlocal a_desc, b_desc, c_desc
-        BLOCK_M = META["BLOCK_SIZE_M"]
-        BLOCK_N = META["BLOCK_SIZE_N"]
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-            ),
-        )
+    triton.set_allocator(alloc_fn)
+
+    grid = lambda META: (
+        min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ),
+    )
 
     matmul_kernel_persistent_tma_ws_cooperative[grid](
-        a_desc,
-        b_desc,
-        c_desc,  #
+        a,
+        b,
+        c,  #
         M,
         N,
         K,  #
