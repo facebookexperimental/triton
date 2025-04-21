@@ -121,6 +121,10 @@ class CUDAOptions:
     num_warps: int = 4
     num_ctas: int = 1
     num_stages: int = 3
+    num_buffers_warp_spec: int = 0
+    num_consumer_groups: int = 0
+    reg_dec_producer: int = 0
+    reg_inc_consumer: int = 0
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -265,16 +269,31 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,
+                                                 opt.reg_dec_producer, opt.reg_inc_consumer)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
+            passes.ttgpuir.add_ping_pong_sync(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
         elif capability // 10 >= 10:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.common.add_licm(pm)
             passes.ttgpuir.add_optimize_accumulator_init(pm)
+            if opt.num_consumer_groups > 0:
+                nvidia.passes.ttnvgpuir.add_keep_acc_in_tmem(pm)
+            passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,
+                                                 opt.reg_dec_producer, opt.reg_inc_consumer)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
             nvidia.passes.ttnvgpuir.add_keep_acc_in_tmem(pm)
+            passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
             passes.common.add_canonicalizer(pm)
         else:
             passes.common.add_licm(pm)
@@ -290,6 +309,8 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_fence_insertion(pm)
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         passes.common.add_canonicalizer(pm)
+        if capability // 10 >= 9:
+            passes.ttgpuir.add_ws_canonicalization(pm, opt.num_consumer_groups)
         pm.run(mod)
         metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         return mod
@@ -305,6 +326,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
+        if capability // 10 >= 9:
+            passes.ttgpuir.add_ws_canonicalization(pm, options.num_consumer_groups)
         passes.convert.add_scf_to_cf(pm)
         passes.ttgpuir.add_allocate_shared_memory(pm)
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
