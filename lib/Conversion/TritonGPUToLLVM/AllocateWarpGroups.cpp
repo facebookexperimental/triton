@@ -133,12 +133,6 @@ struct AllocateWarpGroups
                    Builder(op.getContext()).getI32IntegerAttr(maxnreg));
     });
 
-    if (auto totalNumWarps =
-            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {
-      if (maxExtraWarps == 0)
-        // There is no WarpSpecializeOp and ttg.total-num-warps is already set.
-        return;
-    }
     Builder b(&getContext());
     mod->setAttr("ttg.total-num-warps",
                  b.getI32IntegerAttr(baseNumWarps + maxExtraWarps));
