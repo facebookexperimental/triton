@@ -373,15 +373,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   // Only run mma on one thread. We currently use elect as ptxas is not able to
   // detect that tid.x == 0 is true only for 1 thread.
   Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
-  auto asyncTaskIds = getAsyncTaskIds(dot);
-  int executingWarpId = 0;
-  if (!asyncTaskIds.empty()) {
-    assert(asyncTaskIds.size() == 1 && "only support single async task");
-    int numWarps = triton::gpu::lookupNumWarps(dot);
-    executingWarpId = asyncTaskIds[0] * numWarps;
-  }
-
-  Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(executingWarpId));
+  Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(0));
   if (twoCTAs) {
     // TODO: we have to sync the two CTAs because we currently don't use remove
     // barriers for the copies.

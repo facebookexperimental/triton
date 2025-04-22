@@ -501,12 +501,6 @@ private:
   /// Paper: Algorithms for Compile-Time Memory Optimization
   /// (https://dl.acm.org/doi/pdf/10.5555/314500.315082)
   void computeOffsets() {
-    bool hasShareGroup = false;
-    operation->walk<WalkOrder::PreOrder>([&](Operation *op) {
-      if (op->hasAttr("allocation.shareGroup"))
-        hasShareGroup = true;
-    });
-
     SmallVector<BufferT *> buffers;
     for (auto bufferIter : bufferRange) {
       buffers.emplace_back(bufferIter.first);
@@ -520,9 +514,7 @@ private:
     llvm::stable_sort(
         buffers, [&](BufferT *A, BufferT *B) { return A->size > B->size; });
 
-    if (!hasShareGroup)
-      calculateStarts(buffers);
-    dumpBuffers();
+    calculateStarts(buffers);
 
     // NOTE: The original paper doesn't consider interference between
     // the bumped ranges. Buffers that previously do not interfere with
@@ -532,7 +524,7 @@ private:
     // increase the buffer offset and keep reducing conflicts, we will
     // eventually reach a fixed point.
     GraphT interference;
-    buildInterferenceGraph(buffers, interference, hasShareGroup /*initial*/);
+    buildInterferenceGraph(buffers, interference);
     do {
       allocate(buffers, interference);
       buildInterferenceGraph(buffers, interference);
@@ -605,7 +597,7 @@ private:
   /// Builds a graph of all shared memory values. Edges are created between
   /// shared memory values that are overlapping.
   void buildInterferenceGraph(const SmallVector<BufferT *> &buffers,
-                              GraphT &interference, bool initial = false) {
+                              GraphT &interference) {
     // Reset interference graph
     interference.clear();
     for (auto x : buffers) {
@@ -621,9 +613,6 @@ private:
         auto xOpRange = bufferRange.lookup(x);
         auto yOpRange = bufferRange.lookup(y);
 
-        if (initial &&
-            (xOpRange.intersects(yOpRange) || inDifferentRegion(x, y)))
-          interference[x].insert(y);
         // Buffers interfere if their allocation offsets overlap and they are
         // live at the same time.
         if (xOpRange.intersects(yOpRange) &&
@@ -673,9 +662,7 @@ private:
       auto it = std::find(available.begin(), available.end(), true);
       colors[x] = std::distance(available.begin(), it);
       LLVM_DEBUG({
-        llvm::dbgs() << "-- color " << x->id << " " << x->size << " "
-                     << x->offset << " " << x->sharingGroup << " " << colors[x]
-                     << "\n";
+        llvm::dbgs() << "-- color " << x->id << " " << colors[x] << "\n";
       });
     }
     // Finalize allocation
@@ -687,8 +674,7 @@ private:
     for (auto x : buffers) {
       size_t newOffset = 0;
       for (auto y : interference.lookup(x)) {
-        newOffset =
-            std::max(newOffset, (y->offset < 0 ? 0 : y->offset) + y->size);
+        newOffset = std::max(newOffset, y->offset + y->size);
       }
       if (colors.lookup(x) != 0)
         x->setOffsetAligned(newOffset);
