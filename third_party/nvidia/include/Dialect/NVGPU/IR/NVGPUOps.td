@@ -95,16 +95,6 @@ def NVGPU_MBarrierArriveOp : NVGPU_Op<"mbarrier_arrive", []> {
   let assemblyFormat = "$mbarrier `,` $pred (`,` $ctaId^)? attr-dict `:` type($mbarrier)";
 }
 
-def NVGPU_NamedBarrierArriveOp : NVGPU_Op<"bar_arrive", []> {
-  let arguments = (ins I32:$bar, I32:$numThreads);
-  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
-}
-
-def NVGPU_NamedBarrierWaitOp : NVGPU_Op<"bar_wait", []> {
-  let arguments = (ins I32:$bar, I32:$numThreads);
-  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
-}
-
 def WGMMA_LayoutAttr : I32EnumAttr<"WGMMALayout",
     "wgmma layout, either 'row' or 'col'",
     [
@@ -194,27 +184,12 @@ def NVGPU_WarpIdOp : NVGPU_Op<"warp_id", [Pure]> {
   let assemblyFormat = "attr-dict";
 }
 
-def NVGPU_CanonicalWarpIdOp : NVGPU_Op<"canonical_warp_id", [Pure]> {
-  let results = (outs I32:$result);
-  let assemblyFormat = "attr-dict";
-}
-
 def NVGPU_TensorMemoryBaseAddress : NVGPU_Op<"tensor_memory_base", [Pure]> {
   let description = [{
     Op to represent base address of tensor memory in a kernel.
     This is used to simplify lowering from TritonGPU to LLVM.
   }];
   let results = (outs LLVM_PointerTensorMemory:$result);
-  let assemblyFormat = "attr-dict";
-}
-
-def NVGPU_RegAllocOp : NVGPU_Op<"reg_alloc", []> {
-  let arguments = (ins I32Attr: $regCount);
-  let assemblyFormat = "attr-dict";
-}
-
-def NVGPU_RegDeallocOp : NVGPU_Op<"reg_dealloc", []> {
-  let arguments = (ins I32Attr: $regCount);
   let assemblyFormat = "attr-dict";
 }
 

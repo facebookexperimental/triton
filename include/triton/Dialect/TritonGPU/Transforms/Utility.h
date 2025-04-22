@@ -177,6 +177,7 @@ LogicalResult getConvertBackwardSlice(
 // Populate pattern to remove dead cycles in ForOp.
 // opsCanBeTriviallyDead specifies the operations of which the side effect can
 // be ignored.
+// FIXME: opsCanBeTriviallyDead is used by DataPartitioning
 void populateForOpDeadArgumentElimination(
     RewritePatternSet &patterns, DenseSet<Operation *> &opsCanBeTriviallyDead);
 
@@ -250,11 +251,6 @@ void eraseLoopCarriedValues(scf::ForOp &loop, llvm::BitVector indices);
 // Return true if two value sets may refer to the same allocation.
 bool mayAliasAllocations(const DenseSet<Value> &lhs,
                          const DenseSet<Value> &rhs);
-
-// 0 is reserved for default sync.
-// TODO: comprehensive mechanism to globally manage namedbarrier.
-static int const nameBarrierIdBegin = 1;
-static int nameBarrierIdEnd = 16;
 
 /// Helper functions for async task
 typedef int AsyncTaskId;

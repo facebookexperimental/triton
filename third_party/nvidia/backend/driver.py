@@ -237,13 +237,9 @@ static inline void gpuAssert(CUresult code, const char *file, int line)
    {{
       const char* prefix = "Triton Error [CUDA]: ";
       const char* str;
-      int tI = (int)code;
       cuGetErrorString(code, &str);
       char err[1024] = {{0}};
       strcat(err, prefix);
-      char buffer[20];
-      snprintf(buffer, sizeof(buffer), "%d", tI);
-      strcat(err, buffer);
       strcat(err, str);
       PyGILState_STATE gil_state;
       gil_state = PyGILState_Ensure();
@@ -279,8 +275,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
   void *params[] = {{ {', '.join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
     if ((num_ctas == 1) && (0 == launch_cooperative_grid)) {{
-      CUresult ret = cuLaunchKernel(function, gridX, gridY, gridZ, 32*num_warps, 1, 1, shared_memory, stream, params, 0);
-      CUDA_CHECK(ret);
+      CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, gridZ, 32*num_warps, 1, 1, shared_memory, stream, params, 0));
     }} else if ((num_ctas == 1) && (0 != launch_cooperative_grid)) {{
       CUlaunchAttribute launchAttr[1];
       CUlaunchAttribute coopAttr = {{ .id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE, .value = 1}};
