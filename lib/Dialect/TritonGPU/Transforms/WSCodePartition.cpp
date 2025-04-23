@@ -995,7 +995,6 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
   builder.setInsertionPoint(returnOp);
   Value curAsyncTaskId = builder.create<ttng::GetAsyncTaskIdOp>(loc);
 
-#if 1
   // Instead of a new IfOp for each task, we create one partitionRegion.
   auto nTaskIds = getNestedAsyncTaskIds(funcOp);
   SmallVector<int32_t> partitionNumWarps;
@@ -1009,8 +1008,7 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
   impB.setInsertionPoint(returnOp);
   auto wsOp = impB.create<WarpSpecializeOp>(dummyTypes, partitionNumWarps,
                                             nTaskIds.size() - 1);
-  // Put producer wg in default. Check D71524884 for an example.
-#endif
+  // Put producer wg in default.
   DenseMap<AsyncTaskId, scf::IfOp> tasksToIfOp;
 
   // Clone all operations into the corresponding if blocks. If the operation
