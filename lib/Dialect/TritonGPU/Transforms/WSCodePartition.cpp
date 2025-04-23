@@ -2433,7 +2433,7 @@ DenseMap<Channel *, Value> createBuffer(
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       // Get basic information from tensorType
-      auto order = ttg::getOrder(tensorType);
+      auto order = ttg::getOrderForMemory(tensorType);
       auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
       auto elemType = tensorType.getElementType();
 
@@ -2495,7 +2495,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   if (!tensorType)
     return {nullptr, nullptr};
   // Get basic information from tensorType
-  auto order = ttg::getOrder(tensorType);
+  auto order = ttg::getOrderForMemory(tensorType);
   auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
@@ -2556,7 +2556,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   if (!tensorType)
     return {nullptr, nullptr};
   // Get basic information from tensorType
-  auto order = ttg::getOrder(tensorType);
+  auto order = ttg::getOrderForMemory(tensorType);
   auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 
@@ -2723,7 +2723,7 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   auto tensorType = dyn_cast<RankedTensorType>(loadType);
   assert(tensorType);
 
-  auto order = ttg::getOrder(tensorType);
+  auto order = ttg::getOrderForMemory(tensorType);
   auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
   auto elemType = tensorType.getElementType();
 

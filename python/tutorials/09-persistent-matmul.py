@@ -1033,7 +1033,7 @@ def bench(K, dtype, reps=10000, warmup_reps=10000):
                 a,
                 b,
             )
-    bench_fn(reps, warmup_reps, matmul_persistent_tma_ws_cooperative, a, b)
+    bench_fn("WS cooperative", reps, warmup_reps, matmul_persistent_tma_ws_cooperative, a, b)
 
 
 def run_test(expect, fn, a, b, label, enabled=True):
