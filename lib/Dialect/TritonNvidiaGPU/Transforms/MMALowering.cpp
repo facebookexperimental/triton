@@ -2,7 +2,6 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
-#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
@@ -40,13 +39,11 @@ public:
         MemDescType::get({1}, rewriter.getI64Type(), barrierEncoding,
                          sharedMemorySpace, /*mutableMemory=*/true);
 
-    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, op);
-
     Value barrierAlloc =
-        taskIdRewriter.create<LocalAllocOp>(loc, barrierMemDescType, Value());
-    taskIdRewriter.create<InitBarrierOp>(loc, barrierAlloc, 1);
-    op.addCompletionBarrier(
-        barrierAlloc, taskIdRewriter.create<arith::ConstantIntOp>(loc, 1, 1));
+        rewriter.create<LocalAllocOp>(loc, barrierMemDescType, Value());
+    rewriter.create<InitBarrierOp>(loc, barrierAlloc, 1);
+    op.addCompletionBarrier(barrierAlloc,
+                            rewriter.create<arith::ConstantIntOp>(loc, 1, 1));
 
     rewriter.setInsertionPointAfter(op);
     Value phase = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
