@@ -67,9 +67,7 @@ def _matmul_launch_metadata(grid, kernel, args):
 
 
 HAS_TENSOR_DESC = supports_tma() and hasattr(tl, "make_tensor_descriptor")
-HAS_HOST_TENSOR_DESC = supports_tma() and hasattr(
-    triton.tools.tensor_descriptor, "TensorDescriptor"
-)
+HAS_HOST_TENSOR_DESC = supports_tma() and hasattr(triton.tools.tensor_descriptor, "TensorDescriptor")
 HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
 
 
@@ -85,12 +83,7 @@ def matmul_get_configs(pre_hook=None):
             num_stages=s,
             num_warps=w,
             pre_hook=pre_hook,
-        )
-        for BM in [128]
-        for BN in [128, 256]
-        for BK in [64, 128]
-        for s in ([3, 4])
-        for w in [4, 8]
+        ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in ([3, 4]) for w in [4, 8]
     ]
 
 
@@ -99,24 +92,16 @@ def matmul_get_configs(pre_hook=None):
     key=["M", "N", "K"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,  #
-    M,
-    N,
-    K,  #
-    stride_am,
-    stride_ak,  #
-    stride_bk,
-    stride_bn,  #
-    stride_cm,
-    stride_cn,  #
-    BLOCK_SIZE_M: tl.constexpr,  #
-    BLOCK_SIZE_N: tl.constexpr,  #
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-):
+def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
+                  M, N, K,  #
+                  stride_am, stride_ak,  #
+                  stride_bk, stride_bn,  #
+                  stride_cm, stride_cn,  #
+                  BLOCK_SIZE_M: tl.constexpr,  #
+                  BLOCK_SIZE_N: tl.constexpr,  #
+                  BLOCK_SIZE_K: tl.constexpr,  #
+                  GROUP_SIZE_M: tl.constexpr,  #
+                  ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -172,22 +157,13 @@ def matmul(a, b):
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
     matmul_kernel[grid](
-        a,
-        b,
-        c,  #
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(0),
-        b.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
     )
     return c
 
@@ -210,20 +186,15 @@ def matmul_tma_set_block_size_hook(nargs):
     key=["M", "N", "K", "WARP_SPECIALIZE"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_tma(
-    a_desc,
-    b_desc,
-    c_desc,  #
-    M,
-    N,
-    K,  #
-    BLOCK_SIZE_M: tl.constexpr,  #
-    BLOCK_SIZE_N: tl.constexpr,  #
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    FP8_OUTPUT: tl.constexpr,  #
-    WARP_SPECIALIZE: tl.constexpr,  #
-):
+def matmul_kernel_tma(a_desc, b_desc, c_desc,  #
+                      M, N, K,  #
+                      BLOCK_SIZE_M: tl.constexpr,  #
+                      BLOCK_SIZE_N: tl.constexpr,  #
+                      BLOCK_SIZE_K: tl.constexpr,  #
+                      GROUP_SIZE_M: tl.constexpr,  #
+                      FP8_OUTPUT: tl.constexpr,  #
+                      WARP_SPECIALIZE: tl.constexpr,  #
+                      ):
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
 
     pid = tl.program_id(axis=0)
@@ -276,15 +247,11 @@ def matmul_tma(a, b, warp_specialize: bool):
     def grid(META):
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
-        return (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+        return (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
 
     matmul_kernel_tma[grid](
-        a_desc,
-        b_desc,
-        c_desc,  #
-        M,
-        N,
-        K,  #
+        a_desc, b_desc, c_desc,  #
+        M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         WARP_SPECIALIZE=warp_specialize,  #
     )
@@ -306,25 +273,17 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     key=["M", "N", "K"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_persistent(
-    a_ptr,
-    b_ptr,
-    c_ptr,  #
-    M,
-    N,
-    K,  #
-    stride_am,
-    stride_ak,  #
-    stride_bk,
-    stride_bn,  #
-    stride_cm,
-    stride_cn,  #
-    BLOCK_SIZE_M: tl.constexpr,  #
-    BLOCK_SIZE_N: tl.constexpr,  #
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    NUM_SMS: tl.constexpr,  #
-):
+def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
+                             M, N, K,  #
+                             stride_am, stride_ak,  #
+                             stride_bk, stride_bn,  #
+                             stride_cm, stride_cn,  #
+                             BLOCK_SIZE_M: tl.constexpr,  #
+                             BLOCK_SIZE_N: tl.constexpr,  #
+                             BLOCK_SIZE_K: tl.constexpr,  #
+                             GROUP_SIZE_M: tl.constexpr,  #
+                             NUM_SMS: tl.constexpr,  #
+                             ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -339,9 +298,7 @@ def matmul_kernel_persistent(
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -354,25 +311,15 @@ def matmul_kernel_persistent(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (
-                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-            )
-            b_ptrs = b_ptr + (
-                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            )
+            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-            a = tl.load(
-                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
-            )
-            b = tl.load(
-                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
-            )
+            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
             accumulator = tl.dot(a, b, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -395,25 +342,16 @@ def matmul_persistent(a, b):
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (
-        min(
-            NUM_SMS,
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        ),
-    )
+    grid = lambda META: (min(
+        NUM_SMS,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    ), )
     matmul_kernel_persistent[grid](
-        a,
-        b,
-        c,  #
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(0),
-        b.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
     )
     return c
@@ -447,22 +385,17 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
     key=["M", "N", "K", "WARP_SPECIALIZE"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_tma_persistent(
-    a_desc,
-    b_desc,
-    c_desc,  #
-    M,
-    N,
-    K,  #
-    BLOCK_SIZE_M: tl.constexpr,  #
-    BLOCK_SIZE_N: tl.constexpr,  #
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    FP8_OUTPUT: tl.constexpr,  #
-    EPILOGUE_SUBTILE: tl.constexpr,  #
-    NUM_SMS: tl.constexpr,  #
-    WARP_SPECIALIZE: tl.constexpr,  #
-):
+def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc,  #
+                                 M, N, K,  #
+                                 BLOCK_SIZE_M: tl.constexpr,  #
+                                 BLOCK_SIZE_N: tl.constexpr,  #
+                                 BLOCK_SIZE_K: tl.constexpr,  #
+                                 GROUP_SIZE_M: tl.constexpr,  #
+                                 FP8_OUTPUT: tl.constexpr,  #
+                                 EPILOGUE_SUBTILE: tl.constexpr,  #
+                                 NUM_SMS: tl.constexpr,  #
+                                 WARP_SPECIALIZE: tl.constexpr,  #
+                                 ):
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -476,12 +409,8 @@ def matmul_kernel_tma_persistent(
     # Enable warp specialization to leverage async warp scheduling in the GPU.
     # FIXME: This only works on Blackwell right now. On older GPUs, this will
     # use software pipelining.
-    for tile_id in tl.range(
-        start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
-    ):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -493,9 +422,7 @@ def matmul_kernel_tma_persistent(
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
@@ -539,20 +466,14 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
         nonlocal a_desc, b_desc, c_desc
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-            ),
-        )
+        return (min(
+            NUM_SMS,
+            triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+        ), )
 
     matmul_kernel_tma_persistent[grid](
-        a_desc,
-        b_desc,
-        c_desc,  #
-        M,
-        N,
-        K,  #
+        a_desc, b_desc, c_desc,  #
+        M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
         WARP_SPECIALIZE=warp_specialize,  #
@@ -565,21 +486,16 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
     key=["M", "N", "K", "WARP_SPECIALIZE"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_descriptor_persistent(
-    a_ptr,
-    b_ptr,
-    c_ptr,  #
-    M,
-    N,
-    K,  #
-    BLOCK_SIZE_M: tl.constexpr,  #
-    BLOCK_SIZE_N: tl.constexpr,  #
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    EPILOGUE_SUBTILE: tl.constexpr,  #
-    NUM_SMS: tl.constexpr,  #
-    WARP_SPECIALIZE: tl.constexpr,  #
-):
+def matmul_kernel_descriptor_persistent(a_ptr, b_ptr, c_ptr,  #
+                                        M, N, K,  #
+                                        BLOCK_SIZE_M: tl.constexpr,  #
+                                        BLOCK_SIZE_N: tl.constexpr,  #
+                                        BLOCK_SIZE_K: tl.constexpr,  #
+                                        GROUP_SIZE_M: tl.constexpr,  #
+                                        EPILOGUE_SUBTILE: tl.constexpr,  #
+                                        NUM_SMS: tl.constexpr,  #
+                                        WARP_SPECIALIZE: tl.constexpr,  #
+                                        ):
     # Matmul using TMA and device-side descriptor creation
     dtype = c_ptr.dtype.element_ty
     start_pid = tl.program_id(axis=0)
@@ -615,12 +531,8 @@ def matmul_kernel_descriptor_persistent(
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    for tile_id in tl.range(
-        start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
-    ):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -632,9 +544,7 @@ def matmul_kernel_descriptor_persistent(
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
@@ -669,19 +579,13 @@ def matmul_descriptor_persistent(a, b, warp_specialize: bool):
 
     triton.set_allocator(alloc_fn)
 
-    grid = lambda META: (
-        min(
-            NUM_SMS,
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        ),
-    )
+    grid = lambda META: (min(
+        NUM_SMS,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    ), )
     matmul_kernel_descriptor_persistent[grid](
-        a,
-        b,
-        c,  #
-        M,
-        N,
-        K,  #
+        a, b, c,  #
+        M, N, K,  #
         NUM_SMS=NUM_SMS,  #
         WARP_SPECIALIZE=warp_specialize,  #
     )
@@ -694,9 +598,7 @@ def matmul_ws_cooperative_set_block_size_hook(nargs):
     BLOCK_N = nargs["BLOCK_SIZE_N"]
     BLOCK_K = nargs["BLOCK_SIZE_K"]
     NUM_MMA_CONSUMERS = nargs["LAST_MMA_CONSUMER"] - nargs["FIRST_MMA_CONSUMER"] + 1
-    NUM_EPILOG_CONSUMERS = (
-        nargs["LAST_EPILOG_CONSUMER"] - nargs["FIRST_EPILOG_CONSUMER"] + 1
-    )
+    NUM_EPILOG_CONSUMERS = (nargs["LAST_EPILOG_CONSUMER"] - nargs["FIRST_EPILOG_CONSUMER"] + 1)
     nargs["a_desc"].block_shape = [BLOCK_M // NUM_MMA_CONSUMERS, BLOCK_K]
     nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
     if EPILOGUE_SUBTILE:
@@ -800,6 +702,20 @@ def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
     ]
 
 
+@triton.jit
+def no_op_async_task():
+    # do nothing
+    return
+
+
+has_warp_spec = hasattr(tl, "async_task")
+print("warp_spec: ", has_warp_spec)
+if has_warp_spec:
+    my_async_task = tl.async_task
+else:
+    my_async_task = no_op_async_task
+
+
 @triton.autotune(
     configs=matmul_tma_ws_cooperative_get_configs(),
     key=["M", "N", "K"],
@@ -861,25 +777,21 @@ def matmul_kernel_persistent_tma_ws_cooperative(
     # FIXME: This only works on Blackwell right now. On older GPUs, this will
     # use software pipelining.
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            with tl.async_task([0]):
+            with my_async_task([0]):
                 a = a_desc.load([offs_am, offs_k])
                 b = b_desc.load([offs_bn, offs_k])
             with tl.async_task([FIRST_MMA_CONSUMER, LAST_MMA_CONSUMER]):
                 accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
@@ -921,20 +833,14 @@ def matmul_persistent_tma_ws_cooperative(a, b):
 
     triton.set_allocator(alloc_fn)
 
-    grid = lambda META: (
-        min(
-            NUM_SMS,
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        ),
-    )
+    grid = lambda META: (min(
+        NUM_SMS,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    ), )
 
     matmul_kernel_persistent_tma_ws_cooperative[grid](
-        a,
-        b,
-        c,  #
-        M,
-        N,
-        K,  #
+        a, b, c,  #
+        M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
     )
@@ -951,7 +857,7 @@ def cublas_matmul(a, b):
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
     with proton.scope(
-        f"cublas [M={M}, N={N}, K={K}]",
+            f"cublas [M={M}, N={N}, K={K}]",
         {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2.0 * M * N * K},
     ):
         cublas.matmul(a, b, c)
@@ -964,7 +870,7 @@ def torch_matmul(a, b):
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
     with proton.scope(
-        f"torch [M={M}, N={N}, K={K}]",
+            f"torch [M={M}, N={N}, K={K}]",
         {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2.0 * M * N * K},
     ):
         c = torch.matmul(a, b.T)
@@ -1066,9 +972,7 @@ def validate(M, N, K, dtype):
     ]
     warp_specialize = [False, True] if HAS_WARP_SPECIALIZE else [False]
 
-    for (kernel, label, enabled), warp_specialize in itertools.product(
-        kernels, warp_specialize
-    ):
+    for (kernel, label, enabled), warp_specialize in itertools.product(kernels, warp_specialize):
         label = f"{label} (warp_specialize={warp_specialize})"
         enabled = enabled and (not warp_specialize or HAS_TENSOR_DESC)
         run_test(
