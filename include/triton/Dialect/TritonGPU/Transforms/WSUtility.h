@@ -60,7 +60,7 @@ struct CommChannel {
   std::optional<Value> producerBarrier;
   // Consumer barrier is only needed when the consumer op itself can update the
   // barrier inline, such as the TCGen5MMAOp.
-  std::optional<Value> consumerBarrier;
+  DenseMap<int, Value> consumerBarriers;
 };
 
 bool enclosing(scf::IfOp ifOp, Operation *op);

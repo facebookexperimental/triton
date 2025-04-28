@@ -737,6 +737,27 @@ static Operation *getUniqueActualConsumer(Operation *consumerOp) {
   return consumers.size() == 1 ? consumers[0] : consumerOp;
 }
 
+static Operation *getUniqueActualConsumer(Operation *consumerOp,
+                                          AsyncTaskId taskId) {
+  auto consumers = getActualConsumers(consumerOp);
+  if (consumers.size() == 1)
+    return consumers[0];
+  // Check to see if there is only one consumer with the specific taskId.
+  Operation *uniqOp = nullptr;
+  for (auto *op : consumers) {
+    SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(op);
+    assert(asyncTasks.size() > 0);
+    if (asyncTasks.size() > 1)
+      return consumerOp;
+    if (asyncTasks[0] == taskId) {
+      if (uniqOp)
+        return consumerOp;
+      uniqOp = op;
+    }
+  }
+  return uniqOp ? uniqOp : consumerOp;
+}
+
 // Group channels in two ways:
 //  - by producer ops. One producer corresponds to multiple channels. This
 //    grouping will be used to create buffers per shared producer.
@@ -1056,24 +1077,36 @@ void createToken(
 
     CommChannel commChannel;
     auto producerOp = it->second.front()->getSrcOp();
-    auto consumerOp = it->second.front()->getDstOp();
-    consumerOp = getUniqueActualConsumer(consumerOp);
+    auto dstOp = it->second.front()->getDstOp();
 
     if (isa<tt::DescriptorLoadOp>(producerOp)) {
       commChannel.producerBarrier =
           createBarrierAlloc(funcOp, channel->numBuffers);
     }
-    bool useGen5Barrier = isa<nvidia_gpu::TCGen5MMAOp>(consumerOp) &&
-                          producerOp->getBlock() == consumerOp->getBlock();
-    if (useGen5Barrier) {
-      auto mmaOp = cast<nvidia_gpu::TCGen5MMAOp>(consumerOp);
-      // If the gen5 barrier for this mmaOp is already used for another
-      // channel, do not use it for this channel.
-      if (gen5Barriers.count(mmaOp) && gen5Barriers[mmaOp] != channel)
-        useGen5Barrier = false;
-    }
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
+      // It is possible that this channel has two consumer taskIds.
+      Operation *consumerOp =
+          getUniqueActualConsumer(dstOp, consumerAsyncTaskId);
+
+      // For channels associated with acc of gen5, consumerOp is not the gen5,
+      // it is usually tmem_load.
+      bool useGen5Barrier = isa<nvidia_gpu::TCGen5MMAOp>(consumerOp) &&
+                            producerOp->getBlock() == consumerOp->getBlock();
+      LLVM_DEBUG({
+        LDBG("-- creatToken: useGen5Barrier = " << useGen5Barrier);
+        consumerOp->dump();
+      });
+      if (useGen5Barrier) {
+        auto mmaOp = cast<nvidia_gpu::TCGen5MMAOp>(consumerOp);
+        // If the gen5 barrier for this mmaOp is already used for another
+        // channel, do not use it for this channel.
+        if (gen5Barriers.count(mmaOp) && gen5Barriers[mmaOp] != channel) {
+          useGen5Barrier = false;
+          LDBG("-- mmaOp already has a channel associated");
+        }
+      }
+
       // No token is needed for a TMA <-> TCGen5MMAOp channel
       if (!isa<tt::DescriptorLoadOp>(producerOp) ||
           !useGen5Barrier) { // isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
@@ -1105,7 +1138,7 @@ void createToken(
 
       if (useGen5Barrier) {
         Value v = createBarrierAlloc(funcOp, channel->numBuffers);
-        commChannel.consumerBarrier = v;
+        commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<nvidia_gpu::TCGen5MMAOp>(consumerOp)] = channel;
       }
     }
@@ -1132,8 +1165,8 @@ void createToken(
       if (item.second.producerBarrier)
         llvm::dbgs() << "producer barrier: " << *item.second.producerBarrier
                      << "\n";
-      if (item.second.consumerBarrier)
-        llvm::dbgs() << "consumer barrier: " << *item.second.consumerBarrier
+      for (auto &kv : item.second.consumerBarriers)
+        llvm::dbgs() << "consumer barrier: " << kv.first << " " << kv.second
                      << "\n";
     }
   });
@@ -1546,24 +1579,37 @@ void insertAsyncComm(
       tailConsumer->dump();
     });
 
-    // Desynchronize TCGen5MMAOp. Set up consumer release and producer acquire.
-    auto mmaOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(
-        getUniqueActualConsumer(masterChannel->getDstOp()));
-    if (mmaOp && commChannel.consumerBarrier) {
-      LLVM_DEBUG({
-        LDBG("unique actual consumer is gen5 mma ");
-        mmaOp->dump();
-      });
-      auto tmemWaitBarrier = desyncTCGen5MMAOp(
-          builder, mmaOp, *commChannel.consumerBarrier, bufferIdx, phase,
-          masterChannel->numBuffers, headProducer, opsWithChannels,
-          opsWithBufferReuse, dom);
-      tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+    builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+
+    // Channel can have multiple consumers.
+    for (auto &consumerTaskId : masterChannel->relation.second) {
+      // Desynchronize TCGen5MMAOp. Set up consumer release and producer
+      // acquire.
+      auto mmaOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(
+          getUniqueActualConsumer(masterChannel->getDstOp(), consumerTaskId));
+      // Assume a single task for mmaOp.
+      if (mmaOp) {
+        SmallVector<AsyncTaskId> asyncTasksMma = getAsyncTaskIds(mmaOp);
+        assert(asyncTasksMma.size() == 1 && asyncTasksMma[0] == consumerTaskId);
+      }
+      if (mmaOp && commChannel.consumerBarriers.count(consumerTaskId)) {
+        LLVM_DEBUG({
+          LDBG("unique actual consumer is gen5 mma ");
+          mmaOp->dump();
+        });
+        auto iter = commChannel.consumerBarriers.find(consumerTaskId);
+        Value consumerBarrier = iter->second;
+        // Use consumerBarrier as gen5 inline barrier.
+        auto tmemWaitBarrier =
+            desyncTCGen5MMAOp(builder, mmaOp, consumerBarrier, bufferIdx, phase,
+                              masterChannel->numBuffers, headProducer,
+                              opsWithChannels, opsWithBufferReuse, dom);
+        tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+      }
     }
 
-    builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
     for (const auto &token : commChannel.tokens) {
-      if (!commChannel.consumerBarrier) {
+      if (commChannel.consumerBarriers.empty()) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint = getSameLevelOp(headConsumer, headProducer);
         builder.setInsertionPoint(producerAcquirePoint);
@@ -1602,7 +1648,7 @@ void insertAsyncComm(
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
       // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
-      if (!commChannel.consumerBarrier) {
+      if (commChannel.consumerBarriers.empty()) {
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
