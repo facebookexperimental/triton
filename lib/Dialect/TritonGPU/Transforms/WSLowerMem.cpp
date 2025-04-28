@@ -23,6 +23,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/WSUtility.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/WSUtility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <list>
 #include <unordered_set>
@@ -194,7 +195,8 @@ static std::pair<Operation *, Operation *>
 createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
                Value srcBufferIdx, Value dstBufferIdx) {
   // Replace original tmem alloc with tmem_store.
-  TmemDataChannel *tmemChannel = static_cast<TmemDataChannel *>(channel);
+  ttng::TmemDataChannel *tmemChannel =
+      static_cast<ttng::TmemDataChannel *>(channel);
   auto oldTMemAllocOp = tmemChannel->getAllocOp();
   auto newTMemAllocOp = bufferMap.find(channel)->second;
   OpBuilderWithAsyncTaskIds builder(oldTMemAllocOp);
@@ -259,6 +261,7 @@ static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
   return loadSize * tensorTy.getElementType().getIntOrFloatBitWidth() / 8;
 }
 
+#if 0
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx) {
   auto context = barrierAlloc.getContext();
@@ -275,7 +278,7 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
       barrierAlloc.getLoc(), barrierTy, barrierAlloc,
       ArrayRef<Value>({bufferIdx}));
 }
-
+#endif
 Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                 Type loadType, Value buffer, Value bufferIdx,
                                 bool mutableMem) {
@@ -430,7 +433,8 @@ void insertAsyncCopy(
       // where a TMEM channel has srcOp in task 2, dstOp in task 2, while mmaOp
       // is in task 1.
       if (channel->channelKind == DataChannelKind::TMEM) {
-        TmemDataChannel *tmemChannel = static_cast<TmemDataChannel *>(channel);
+        ttng::TmemDataChannel *tmemChannel =
+            static_cast<ttng::TmemDataChannel *>(channel);
         for (auto task : getAsyncTaskIds(tmemChannel->getMmaOp()))
           if (!llvm::is_contained(asyncTasksPC, task))
             asyncTasksPC.push_back(task);

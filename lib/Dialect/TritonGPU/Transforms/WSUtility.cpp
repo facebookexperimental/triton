@@ -181,4 +181,114 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   return ctrlId;
 }
 
+namespace triton {
+namespace gpu {
+// Compute and return the buffer index and phase for a given accumulate count.
+std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+                                             Location loc, Value accumCnt,
+                                             unsigned numBuffers) {
+  Value numBuffersVal =
+      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
+  numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+      loc, builder.getI64Type(), numBuffersVal);
+  // Calculate accumCnt / numBuffers
+  // initBufferIdx = accumCnt - accumCnt / numBuffers * numBuffers
+  // initPhase = (accumCnt / numBuffers) & 1
+  Value bufferIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
+      loc, accumCnt, numBuffersVal);
+  Value initBufferIdx = builder.createWithAsyncTaskIds<arith::SubIOp>(
+      loc, accumCnt,
+      builder.createWithAsyncTaskIds<arith::MulIOp>(loc, bufferIdx,
+                                                    numBuffersVal));
+  initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+      loc, builder.getI32Type(), initBufferIdx);
+
+  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  bufferIdx =
+      builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
+  Value initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+      loc, builder.getI1Type(), bufferIdx);
+  return {initBufferIdx, initPhase};
+}
+
+// Get the current accumulation count for the given op within its immediate
+// scope.
+// ForA (accumForA, accumIfA, accumForB, accumIfB)
+//   IfA (accumIfA, accumForB)
+//     Channel A --> uses ForA.arg[accumIfA]
+//     ForB (accumForB)
+//       Channel B --> uses ForB.arg[accumForB]
+//   ThenYield ForA.arg[accumIfA] + 1, ForB.res[accumForB]
+//   ElseYield ForA.arg[accumIfA], ForA.arg[accumForB]
+//   ForC (accumForC, accumIfB)
+//     IfB
+//       Channel C --> uses ForC.arg[accumIfB]
+//     ThenYield ForC.arg[accumIfB] + 1
+//     ElseYield ForC.arg[accumIfB]
+//   Channel D --> uses ForA.arg[accumForA]
+// Right now, we only support a limited form of buffer reuse. We only allow
+// reuses among a list of parallel control ops. And we will add a single
+// AccumCnt as the last argument.
+Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                    const DenseSet<Operation *> &opsWithChannels,
+                    SmallVector<Operation *> &opsWithBufferReuse) {
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  auto *pOp = op->getParentOp();
+  // Get parentForOp.arg[pOp]
+  unsigned accumArgId;
+  unsigned tSize = parentForOp.getBody()->getArguments().size();
+  unsigned parentTCnts =
+      getAccumCnts(parentForOp, opsWithChannels, opsWithBufferReuse);
+  Value accumCnt;
+  bool partOfReuse = false;
+  if (opsWithBufferReuse.size() > 1) {
+    partOfReuse = channelWithReuse(op, opsWithBufferReuse);
+  }
+  if (opsWithBufferReuse.size() > 1 && partOfReuse) {
+    // Check to see if the op is inside opsWithBufferReuse.
+    accumCnt = parentForOp.getBody()->getArguments().back();
+    accumArgId = parentTCnts - 1;
+  } else {
+    accumArgId =
+        getAccumArgIdx(parentForOp, pOp, opsWithChannels, opsWithBufferReuse);
+    accumCnt =
+        parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
+  }
+
+  LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
+                                     << pOp << " " << tSize << " "
+                                     << parentTCnts << " " << accumArgId);
+  return accumCnt;
+}
+
+void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                          unsigned numBuffers,
+                          const DenseSet<Operation *> &opsWithChannels,
+                          Value &bufferIdx, Value &phase,
+                          SmallVector<Operation *> &opsWithBufferReuse) {
+  Value accumCnt =
+      getAccumCount(builder, op, opsWithChannels, opsWithBufferReuse);
+  std::tie(bufferIdx, phase) =
+      getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+}
+
+Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
+                                 Value barrierAlloc, Value bufferIdx) {
+  auto context = barrierAlloc.getContext();
+  Attribute sharedMemorySpace =
+      triton::gpu::SharedMemorySpaceAttr::get(context);
+  ttg::MemDescType barrierTy = ttg::MemDescType::get(
+      {1}, builder.getI64Type(),
+      cast<ttg::MemDescType>(barrierAlloc.getType()).getEncoding(),
+      sharedMemorySpace,
+      /*mutableMemory=*/true);
+
+  // Create barrierForTMA from barrierAlloc.
+  return builder.createWithAsyncTaskIds<ttg::MemDescSubviewOp>(
+      barrierAlloc.getLoc(), barrierTy, barrierAlloc,
+      ArrayRef<Value>({bufferIdx}));
+}
+} // namespace gpu
+} // namespace triton
+
 } // namespace mlir

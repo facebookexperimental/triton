@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <numeric>
 
+namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
+namespace triton {
+namespace nvidia_gpu {
 struct TmemDataChannel : Channel {
   ttng::TMEMAllocOp tmemAllocOp;
   ttng::TCGen5MMAOp tmemMmaOp;
@@ -33,7 +36,8 @@ struct TmemDataChannel : Channel {
   ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
   virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
-
+} // namespace nvidia_gpu
+} // namespace triton
 } // namespace mlir
 
 #endif // TRITON_DIALECT_TRITONNVIDIAGPU_TRANSFORMS_WSUTILITY_H_

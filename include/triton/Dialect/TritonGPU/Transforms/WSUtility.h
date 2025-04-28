@@ -6,12 +6,15 @@
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <algorithm>
 #include <numeric>
 
 namespace mlir {
 class DominanceInfo;
 class PostDominanceInfo;
+
+namespace tt = mlir::triton;
 
 namespace triton {
 class ModuleAxisInfoAnalysis;
@@ -22,8 +25,6 @@ namespace gpu {
 class SwizzledSharedEncodingAttr;
 }
 } // namespace triton
-
-namespace ttng = ::mlir::triton::nvidia_gpu;
 
 enum class DataChannelKind { SMEM, TMEM };
 
@@ -50,28 +51,6 @@ public:
   unsigned operandIdx;
   unsigned numBuffers;
   DataChannelKind channelKind = DataChannelKind::SMEM;
-};
-
-struct TmemDataChannel : Channel {
-  ttng::TMEMAllocOp tmemAllocOp;
-  ttng::TCGen5MMAOp tmemMmaOp;
-  Operation *tmemProducerOp;
-
-  TmemDataChannel(int producer, SmallVector<int> &consumers,
-                  ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp tmemMmaOp,
-                  Operation *tmemLoadOp, unsigned operandIdx,
-                  unsigned numBuffers)
-      : Channel(producer, consumers, tmemLoadOp, operandIdx, numBuffers),
-        tmemAllocOp(tmemAllocOp), tmemProducerOp(tmemAllocOp),
-        tmemMmaOp(tmemMmaOp) {
-    assert(consumers.size() == 1 &&
-           "TmemDataChannel must have a single consumer");
-    channelKind = DataChannelKind::TMEM;
-  }
-
-  ttng::TMEMAllocOp getAllocOp() { return tmemAllocOp; }
-  ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
-  virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
 
 struct CommChannel {
@@ -123,7 +102,36 @@ void reuseBuffers(SmallVector<Operation *> &taskTopOps,
 void updateAccumRegions(SmallVector<Operation *> &opList,
                         const SmallVector<Channel *> &channels,
                         DenseSet<Operation *> &opsWithChannels);
+void insertAsyncCopy(
+    triton::FuncOp funcOp,
+    const DenseMap<Channel *, SmallVector<Channel *>>
+        &channelsGroupedByProducers,
+    const DenseMap<Channel *, Value> &bufferMap,
+    DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
+    DenseSet<Operation *> &opsWithChannels,
+    SmallVector<Operation *> &opsWithBufferReuse);
 
+Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                    const DenseSet<Operation *> &opsWithChannels,
+                    SmallVector<Operation *> &opsWithBufferReuse);
+std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+                                             Location loc, Value accumCnt,
+                                             unsigned numBuffers);
+void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                          unsigned numBuffers,
+                          const DenseSet<Operation *> &opsWithChannels,
+                          Value &bufferIdx, Value &phase,
+                          SmallVector<Operation *> &opsWithBufferReuse);
+
+Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
+                                 Value barrierAlloc, Value bufferIdx);
+
+Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
+                            SmallVector<Value> &buffers, Value barrierAlloc,
+                            Value bufferIdx, Value bufferIdxExtract,
+                            Value phase, Operation *headProducer,
+                            Operation *headConsumer);
 } // namespace gpu
 } // namespace triton
 
