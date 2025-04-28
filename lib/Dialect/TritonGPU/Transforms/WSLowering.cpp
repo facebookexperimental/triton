@@ -349,6 +349,7 @@ public:
     lowerGetAsyncTaskIdOp(mod, numConsumerGroups);
     lowerTokenOperations(mod, numCTAs, numConsumerGroups);
 
+#if 0 // not needed with new lowering
     // We assume number of warps per warp group is 4.
     // With Warp Spec, the effective warps per CTA is
     // number of warp groups * 4, but within each warp group, layout will use
@@ -366,6 +367,7 @@ public:
     int numWarps = triton::gpu::lookupNumWarps(mod);
     mod->setAttr("ttg.total-num-warps",
                  builder.getI32IntegerAttr(numWarps * (1 + numConsumerGroups)));
+#endif
   }
 };
 
