@@ -21,9 +21,14 @@ namespace ttg = triton::gpu;
 
 SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
   SmallVector<AsyncTaskId> asyncTaskIds;
-  if (auto attr = op->getAttrOfType<DenseIntElementsAttr>("async_task_id"))
-    for (AsyncTaskId asyncTaskId : attr.getValues<AsyncTaskId>())
-      asyncTaskIds.push_back(asyncTaskId);
+  if (auto attr = op->getAttrOfType<DenseIntElementsAttr>("async_task_id")) {
+    for (AsyncTaskId asyncTaskId : attr.getValues<AsyncTaskId>()) {
+      // TODO(Arda): Remove this check once why we have duplicate async task ids
+      if (asyncTaskIds.empty() ||
+          asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
+        asyncTaskIds.push_back(asyncTaskId);
+    }
+  }
   return asyncTaskIds;
 }
 
