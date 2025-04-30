@@ -104,6 +104,8 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<TaskIdLattice *> operands,
     ArrayRef<const TaskIdLattice *> results) {
   // Already annotated
+  // TODO(Arda): Replace the following with getAsyncTaskIds when we no longer
+  // need to dump the task ids into the IR.
   auto taskIdAttr = op->getAttrOfType<DenseIntElementsAttr>("async_task_id");
   if (taskIdAttr) {
     const auto annotated = TaskId(taskIdAttr);
@@ -122,8 +124,6 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
       propagateIfChanged(operandLattice, changed);
     }
-    addDependency(const_cast<TaskIdLattice *>(resultLattice),
-                  getProgramPointAfter(op));
   }
 
   for (const auto resultLattice : results) {

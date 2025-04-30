@@ -193,7 +193,7 @@ public:
       funcOp.walk([&](mlir::Operation *op) {
         auto taskIds = TaskId::getUninitialized();
         // Get the union of the results
-        for (auto [i, result] : llvm::enumerate(op->getResults())) {
+        for (auto result : op->getResults()) {
           auto *lattice = solver.lookupState<TaskIdLattice>(result);
           if (!lattice)
             llvm_unreachable("Lattice not found.");
@@ -201,7 +201,7 @@ public:
         }
         // Get the union of the operands
         if (op->getNumResults() == 0) {
-          for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
+          for (auto operand : op->getOperands()) {
             auto *lattice = solver.lookupState<TaskIdLattice>(operand);
             if (!lattice)
               llvm_unreachable("Lattice not found.");
