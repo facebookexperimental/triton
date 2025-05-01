@@ -43,6 +43,7 @@ add_triton_library(TritonGPUTransforms
   WSCodePartition.cpp
   WSLowerMem.cpp
   WSLowering.cpp
+  WSSpecialize.cpp
   WSUtility.cpp
   PingPong.cpp
   WSCanonicalization.cpp

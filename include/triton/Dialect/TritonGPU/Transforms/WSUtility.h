@@ -132,6 +132,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
                             Operation *headConsumer);
+void SpecializeRegion(triton::FuncOp funcOp, int regDecProducer,
+                      int regIncConsumer);
 } // namespace gpu
 } // namespace triton
 
