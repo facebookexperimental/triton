@@ -19,6 +19,11 @@ from .._utils import find_paths_if, get_iterable_path, set_iterable_path
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
 
 
+WITH_DISPATCH = {} # central registry for all 'with' handlers
+
+from triton.tlx.compiler.dispatch import TLX_WITH_DISPATCH
+WITH_DISPATCH.update(TLX_WITH_DISPATCH)
+
 def check_identifier_legality(name, type):
     pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
     if not re.match(pattern, name):
@@ -56,7 +61,6 @@ def _is_non_scalar_tensor(o: Any) -> bool:
 
 def _is_list_like(o: Any) -> bool:
     return isinstance(o, (list, tuple))
-
 
 def _check_fn_args(node, fn, args):
     if fn.noinline:
@@ -890,6 +894,19 @@ class CodeGenerator(ast.NodeVisitor):
             f'Loop-carried variable {name} has initial type {live_val.type} '\
             f'but is re-assigned to {loop_val.type} in loop! '\
             f'Please make sure that the type stays consistent.'
+
+    def visit_withitem(self, node):
+        return self.visit(node.context_expr)
+
+    def visit_With(self, node):
+        assert len(node.items) == 1
+        context = node.items[0].context_expr
+        if isinstance(context, ast.Call):
+            withitemClass = self.visit(context.func)
+            handler = WITH_DISPATCH.get(withitemClass)
+            if handler:
+                return handler(self, node)
+        return self.visit_compound_statement(node.body)
 
     def visit_While(self, node):
         with enter_sub_region(self) as sr:
