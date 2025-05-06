@@ -44,24 +44,34 @@ def visit_withAsyncTasks(self, node):
         for stmt in stmts:
             assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
-            assert task.explict
-            taskNumWarps.append(task.num_warps)
+            assert task.is_explict
+            if not task.is_default:
+                taskNumWarps.append(task.num_warps)
 
         # create tasks body block
         ws_op = self.builder.create_warp_specialize_op(taskNumWarps, len(stmts) - 1)
-
-        for index, stmt in enumerate(stmts):
+        index = 1
+        has_default = False
+        for stmt in stmts:
             assert _is_async_task(self, stmt)
-            # create a WarpSpecializePartitionsOp for the task
-            task_body = ws_op.get_region(index)
+            task = _get_async_task(self, stmt)
+            if task.is_default:
+                task_body = ws_op.get_default_region()
+                has_default = True
+            else:
+                task_body = ws_op.get_partition_region(index-1)
+                index += 1
             partitionBlock = self.builder.create_block_with_parent(task_body, [])
             self.builder.set_insertion_point_to_start(partitionBlock)
             self.visit(stmt)
-            if index == 0:
+            if task.is_default:
                 self.builder.create_warp_yield_op()
             else:
                 self.builder.create_warp_return_op()
 
+        if not has_default:
+            task_body = ws_op.get_region(0)
+            partitionBlock = self.builder.create_block_with_parent(task_body, [])
 
         # Capture live-ins
         # liveins

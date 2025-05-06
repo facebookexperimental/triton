@@ -8,17 +8,23 @@ class async_task:
     def __init__(self, *args, _builder=None, **kwargs):
         self.builder = _builder
         # Handle the optional positional argument like [0]
+        self.is_default = False
+        self.is_explict = False
+        self.task_ids = None
+        self.num_warps = None
         if args:
-            self.task_ids = list({core._constexpr_to_value(tid) for tid in args[0]})
-            self.num_warps = None
-            self.explict = False
+            assert len(args) == 1
+            if isinstance(args[0], core.constexpr) and args[0] == "default":
+                self.is_explict = True
+                self.is_default = True
+            else:
+                self.task_ids = list({core._constexpr_to_value(tid) for tid in args[0]})
         else:
-            self.task_ids = None
+            self.is_explict = True
             self.num_warps = core._constexpr_to_value(kwargs.get("num_warps", None))
-            self.explict = True
 
     def __enter__(self):
-        if not self.explict:
+        if not self.is_explict:
             self.builder.set_async_task_ids(self.task_ids)
         return self
 
@@ -27,19 +33,11 @@ class async_task:
 
 
 class async_tasks:
-    """
-    Context manager to run code fragments asynchronously.
-    """
-    def __init__(self, _builder=None):
-        # Support both: async_task([0]) and async_task(warp_id=4, num_warps=4)
-        if args and isinstance(args[0], list):
-            self.task_ids = list({core._constexpr_to_value(tid) for tid in task_ids})
-            self.start_warp_id = None
-            self.num_warps = None
-            self.explict = False
-        else:
-            self.task_ids = None
-            self.start_warp_id = kwargs.get("warp_id", None)
-            self.num_warps = kwargs.get("num_warps", None)
-            self.explict = True
-        self.builder = _builder
+    def __init__(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
