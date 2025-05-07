@@ -587,6 +587,52 @@ public:
   }
 };
 
+class TritonWarpSpecializePattern
+    : public OpConversionPattern<WarpSpecializeOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(WarpSpecializeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> newResultTypes;
+    for (auto type : op.getResultTypes()) {
+      Type newType = typeConverter->convertType(type);
+      if (!newType)
+        return rewriter.notifyMatchFailure(op, "not a 1:1 type conversion");
+      newResultTypes.push_back(newType);
+    }
+
+    auto newOp = rewriter.create<WarpSpecializeOp>(
+        op.getLoc(), newResultTypes, op.getPartitionNumWarps(),
+        op.getPartitionRegions().size());
+
+    // Update the operands and types.
+    newOp->setOperands(adaptor.getOperands());
+
+    rewriter.inlineRegionBefore(op.getDefaultRegion(), newOp.getDefaultRegion(),
+                                newOp.getDefaultRegion().end());
+    // Retype region arguments
+    if (failed(rewriter.convertRegionTypes(&newOp.getDefaultRegion(),
+                                           *getTypeConverter()))) {
+      return rewriter.notifyMatchFailure(op, "could not convert body types");
+    }
+
+    for (unsigned i = 0; i < op.getPartitionRegions().size(); ++i) {
+      auto *oldRegion = op.getPartitionRegions()[i];
+      auto *newRegion = newOp.getPartitionRegions()[i];
+      rewriter.inlineRegionBefore(*oldRegion, *newRegion, newRegion->end());
+      // Retype region arguments
+      if (failed(rewriter.convertRegionTypes(newRegion, *getTypeConverter()))) {
+        return rewriter.notifyMatchFailure(op, "could not convert body types");
+      }
+    }
+
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns, unsigned numCTAs) {
   MLIRContext *context = patterns.getContext();
@@ -607,7 +653,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ReduceReturnOp>, TritonScanPattern,
       GenericOpPattern<triton::ScanReturnOp>,
       GenericOpPattern<triton::MakeRangeOp>, TritonExpandDimsPattern,
-      TritonTransPattern, TritonDotPattern,
+      TritonTransPattern, TritonDotPattern, TritonWarpSpecializePattern,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,
       GatherScatterOpPattern<triton::nvidia_gpu::AsyncTMAGatherOp>,
