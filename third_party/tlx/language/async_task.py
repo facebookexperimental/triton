@@ -24,12 +24,10 @@ class async_task:
             self.num_warps = core._constexpr_to_value(kwargs.get("num_warps", None))
 
     def __enter__(self):
-        if not self.is_explict:
-            self.builder.set_async_task_ids(self.task_ids)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.builder.unset_async_task_ids()
+        pass
 
 
 class async_tasks:
