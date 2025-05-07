@@ -117,6 +117,8 @@ class enter_sub_region:
         self.liveins = self.generator.lscope.copy()
         self.prev_defs = self.generator.local_defs.copy()
         self.generator.local_defs = {}
+        self.used_vars = self.generator.used_vars.copy()
+        self.generator.used_vars = set()
         self.insert_block = self.generator.builder.get_insertion_block()
         self.insert_point = self.generator.builder.get_insertion_point()
         return self.liveins, self.insert_block
@@ -125,6 +127,7 @@ class enter_sub_region:
         self.generator.builder.restore_insertion_point(self.insert_point)
         self.generator.lscope = self.liveins
         self.generator.local_defs = self.prev_defs
+        self.generator.used_vars |= self.used_vars
 
 
 # Check if the given syntax node has an "early" return
@@ -321,6 +324,7 @@ class CodeGenerator(ast.NodeVisitor):
         # SSA-construction
         # name => language.tensor
         self.local_defs: Dict[str, tensor] = {}
+        self.used_vars = set()
         self.dereference_name: Callable[[str], Any] = self._define_name_lookup()
         self.fn = None
         # Are we currently visiting an ast.arg's default value?  These have some
@@ -598,6 +602,8 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_Name(self, node):
         if type(node.ctx) is ast.Store:
             return node.id
+        if isinstance(node.ctx, (ast.Load, ast.Store)):
+            self.used_vars.add(node.id)
         return self.dereference_name(node.id)
 
     def visit_Store(self, node):

@@ -465,7 +465,11 @@ void init_triton_ir(py::module &&m) {
       .def("get_parent_region", &Region::getParentRegion, ret::reference)
       .def("size", [](Region &self) { return self.getBlocks().size(); })
       .def("empty", &Region::empty)
-      .def("id", [](Region &self) { return (uint64_t)&self; });
+      .def("id", [](Region &self) { return (uint64_t)&self; })
+      .def("add_argument", [](Region &self, Type ty) -> BlockArgument {
+        auto loc = UnknownLoc::get(ty.getContext());
+        return self.addArgument(ty, loc);
+      });
 
   py::class_<Block>(m, "block", py::module_local())
       .def("arg",
@@ -596,7 +600,17 @@ void init_triton_ir(py::module &&m) {
       .def("get_before", &scf::WhileOp::getBefore, ret::reference)
       .def("get_after", &scf::WhileOp::getAfter, ret::reference);
   py::class_<ttg::WarpSpecializeOp, OpState>(m, "WarpSpecializeOp",
-                                             py::module_local());
+                                             py::module_local())
+      .def("get_default_region", &ttg::WarpSpecializeOp::getDefaultRegion,
+           ret::reference)
+      .def(
+          "get_partition_region",
+          [](ttg::WarpSpecializeOp self, unsigned idx) -> Region & {
+            if (idx >= self.getNumRegions())
+              throw pybind11::index_error("Op region index out of range");
+            return *self.getPartitionRegions()[idx];
+          },
+          ret::reference);
   py::class_<ttg::WarpYieldOp, OpState>(m, "WarpYieldOp", py::module_local());
   py::class_<ttg::WarpReturnOp, OpState>(m, "WarpReturnOp", py::module_local());
   py::class_<scf::ConditionOp, OpState>(m, "ConditionOp", py::module_local());
