@@ -30,7 +30,7 @@ def visit_withAsyncTask(self, node):
 
 
 def visit_withAsyncTasks(self, node):
-    from triton.compiler.code_generator import enter_sub_region, _is_list_like, flatten_values_to_ir
+    from triton.compiler.code_generator import enter_sub_region, _is_list_like, _is_constexpr
     with enter_sub_region(self) as sr:
         liveins, ip_block = sr
         ip, last_loc = self._get_insertion_point_and_loc()
@@ -60,7 +60,10 @@ def visit_withAsyncTasks(self, node):
         ws_op = self.builder.create_warp_specialize_op(taskNumWarps, len(stmts) - 1)
 
         # Add captures
-        captures = sorted(liveins.keys() & self.used_vars)
+        captures = sorted(
+            v for v in (liveins.keys() & self.used_vars)
+            if not _is_constexpr(liveins[v])
+        )
         for name in captures:
             val = liveins[name]
             ws_op.append_operand(val.handle);
