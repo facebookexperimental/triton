@@ -618,9 +618,8 @@ public:
       return rewriter.notifyMatchFailure(op, "could not convert body types");
     }
 
-    for (unsigned i = 0; i < op.getPartitionRegions().size(); ++i) {
-      auto *oldRegion = op.getPartitionRegions()[i];
-      auto *newRegion = newOp.getPartitionRegions()[i];
+    for (auto [oldRegion, newRegion] : llvm::zip_equal(
+             op.getPartitionRegions(), newOp.getPartitionRegions())) {
       rewriter.inlineRegionBefore(*oldRegion, *newRegion, newRegion->end());
       // Retype region arguments
       if (failed(rewriter.convertRegionTypes(newRegion, *getTypeConverter()))) {

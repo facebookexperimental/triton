@@ -58,7 +58,7 @@ def add2(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor):
 
 
 @triton.jit
-def add2_warp_specailized_kernel(
+def add2_warp_specialized_kernel(
     x_ptr,
     y_ptr,
     z_ptr,
@@ -87,13 +87,13 @@ def add2_warp_specailized_kernel(
             tl.store(c_ptr + offsets, output, mask=mask)
 
 
-def add2_warp_specailized(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor):
+def add2_warp_specialized(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor):
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(a)
     assert x.device == DEVICE and y.device == DEVICE and output1.device == DEVICE
     n_elements = output1.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    add2_warp_specailized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE=1024)
+    add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE=1024)
     return output1, output2
 
 
@@ -108,7 +108,7 @@ a = torch.rand(size, device=DEVICE)
 b = torch.rand(size, device=DEVICE)
 output_torch_1, output_torch_2 = dual_add(x, y, a, b)
 output_triton_1, output_triton_2 = add2(x, y, a, b)
-output_triton_ws_1, output_triton_ws_2 = add2_warp_specailized(x, y, a, b)
+output_triton_ws_1, output_triton_ws_2 = add2_warp_specialized(x, y, a, b)
 
 print(
     f"The maximum difference between torch and triton is "
@@ -168,7 +168,7 @@ def benchmark(size, provider):
         )
     if provider == "triton_ws":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: add2_warp_specailized(x, y, a, b), quantiles=quantiles
+            lambda: add2_warp_specialized(x, y, a, b), quantiles=quantiles
         )
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
