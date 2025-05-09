@@ -92,6 +92,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     MLIRContext &context, TritonGPUTypeConverter &typeConverter)
     : ConversionTarget(context) {
   // TODO: we should also verify ops of TritonGPUDialect
+  addLegalDialect<triton::gpu::TritonGPUDialect>();
 
   // Some ops from SCF are illegal
   addIllegalOp<scf::ExecuteRegionOp, scf::ParallelOp, scf::ReduceOp,
@@ -100,7 +101,6 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
                              triton::TritonDialect, cf::ControlFlowDialect,
                              scf::SCFDialect, ub::UBDialect,
-                             triton::gpu::TritonGPUDialect,
                              triton::nvidia_gpu::TritonNvidiaGPUDialect>(
       [&](Operation *op) {
         bool hasLegalRegions = true;
@@ -122,6 +122,19 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     if (aEncoding && isa<triton::gpu::DotOperandEncodingAttr>(aEncoding) &&
         bEncoding && isa<triton::gpu::DotOperandEncodingAttr>(bEncoding))
       return true;
+    return false;
+  });
+
+  addDynamicallyLegalOp<WarpSpecializeOp>([&](WarpSpecializeOp wsOp) -> bool {
+    bool hasLegalRegions = true;
+    hasLegalRegions =
+        hasLegalRegions && typeConverter.isLegal(&wsOp.getDefaultRegion());
+    for (auto *region : wsOp.getPartitionRegions()) {
+      hasLegalRegions = hasLegalRegions && typeConverter.isLegal(region);
+    }
+    if (hasLegalRegions && typeConverter.isLegal(wsOp)) {
+      return true;
+    }
     return false;
   });
 }
