@@ -124,4 +124,17 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       return true;
     return false;
   });
+
+  addDynamicallyLegalOp<WarpSpecializeOp>([&](WarpSpecializeOp wsOp) -> bool {
+    bool hasLegalRegions = true;
+    hasLegalRegions =
+        hasLegalRegions && typeConverter.isLegal(&wsOp.getDefaultRegion());
+    for (auto *region : wsOp.getPartitionRegions()) {
+      hasLegalRegions = hasLegalRegions && typeConverter.isLegal(region);
+    }
+    if (hasLegalRegions && typeConverter.isLegal(wsOp)) {
+      return true;
+    }
+    return false;
+  });
 }
