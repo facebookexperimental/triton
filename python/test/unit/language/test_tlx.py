@@ -39,7 +39,6 @@ def dual_add(x, y, a, b):
     return x + y, a + b
 
 
-@pytest.mark.interpreter
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
     reason="Requires compute capability == 9 for NV",
