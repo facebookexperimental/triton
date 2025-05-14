@@ -18,11 +18,12 @@ from .._utils import find_paths_if, get_iterable_path, set_iterable_path
 
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
 
-
-WITH_DISPATCH = {} # central registry for all 'with' handlers
+WITH_DISPATCH = {}  # central registry for all 'with' handlers
 
 from triton.tlx.compiler.dispatch import TLX_WITH_DISPATCH
+
 WITH_DISPATCH.update(TLX_WITH_DISPATCH)
+
 
 def check_identifier_legality(name, type):
     pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
@@ -61,6 +62,7 @@ def _is_non_scalar_tensor(o: Any) -> bool:
 
 def _is_list_like(o: Any) -> bool:
     return isinstance(o, (list, tuple))
+
 
 def _check_fn_args(node, fn, args):
     if fn.noinline:
