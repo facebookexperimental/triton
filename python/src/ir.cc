@@ -613,6 +613,8 @@ void init_triton_ir(py::module &&m) {
           ret::reference);
   py::class_<ttg::WarpYieldOp, OpState>(m, "WarpYieldOp", py::module_local());
   py::class_<ttg::WarpReturnOp, OpState>(m, "WarpReturnOp", py::module_local());
+  py::class_<ttg::LocalAllocOp, OpState>(m, "LocalAllocOp", py::module_local());
+
   py::class_<scf::ConditionOp, OpState>(m, "ConditionOp", py::module_local());
 
   py::class_<Operation, std::unique_ptr<Operation, py::nodelete>>(
@@ -1817,11 +1819,6 @@ void init_triton_ir(py::module &&m) {
              return self.create<MakeTensorDescOp>(base, shape, strides,
                                                   tensorShape, isSignedInteger);
            })
-      // Proton Ops
-      .def("create_proton_record",
-           [](TritonOpBuilder &self, bool isStart, int32_t regionId) -> void {
-             self.create<mlir::triton::proton::RecordOp>(isStart, regionId);
-           })
       // Warp specialize ops
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
@@ -1839,6 +1836,25 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> ttg::WarpReturnOp {
              ArrayRef<Type> dummyTypes;
              return self.create<ttg::WarpReturnOp>();
+           })
+      .def("create_local_alloc",
+           [](TritonOpBuilder &self, std::vector<int64_t> shape,
+              Type &elementType) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             auto CTALayout =
+                 ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
+                                         /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+             auto encoding = ttg::SwizzledSharedEncodingAttr::get(
+                 context, 1, 1, 1, {0}, CTALayout);
+             auto memDesc = ttg::MemDescType::get(shape, elementType, encoding,
+                                                  memorySpace);
+             return self.create<ttg::LocalAllocOp>(memDesc);
+           })
+      // Proton Ops
+      .def("create_proton_record",
+           [](TritonOpBuilder &self, bool isStart, int32_t regionId) -> void {
+             self.create<mlir::triton::proton::RecordOp>(isStart, regionId);
            });
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
