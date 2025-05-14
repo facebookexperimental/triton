@@ -35,6 +35,7 @@ def add2_warp_specialized_kernel(
             output = a + b
             tl.store(c_ptr + offsets, output, mask=mask)
 
+
 def dual_add(x, y, a, b):
     return x + y, a + b
 
@@ -55,7 +56,7 @@ def test_add2(BLOCK_SIZE, device):
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(a)
     n_elements = output1.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)

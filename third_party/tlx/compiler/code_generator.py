@@ -60,13 +60,10 @@ def visit_withAsyncTasks(self, node):
         ws_op = self.builder.create_warp_specialize_op(taskNumWarps, len(stmts) - 1)
 
         # Add captures
-        captures = sorted(
-            v for v in (liveins.keys() & self.used_vars)
-            if not _is_constexpr(liveins[v])
-        )
+        captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))
         for name in captures:
             val = liveins[name]
-            ws_op.append_operand(val.handle);
+            ws_op.append_operand(val.handle)
 
         index = 1
         has_default = False
@@ -77,7 +74,7 @@ def visit_withAsyncTasks(self, node):
                 task_body = ws_op.get_default_region()
                 has_default = True
             else:
-                task_body = ws_op.get_partition_region(index-1)
+                task_body = ws_op.get_partition_region(index - 1)
                 index += 1
             block = self.builder.create_block_with_parent(task_body, [])
             self.builder.set_insertion_point_to_start(block)
@@ -91,7 +88,6 @@ def visit_withAsyncTasks(self, node):
                     val = liveins[name]
                     arg = task_body.add_argument(val.handle.get_type())
                     block.replace_use_in_block_with(val.handle, arg)
-
 
         if not has_default:
             task_body = ws_op.get_region(0)

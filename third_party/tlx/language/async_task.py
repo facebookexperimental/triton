@@ -5,6 +5,7 @@ class async_task:
     """
     Context manager to run code fragments asynchronously.
     """
+
     def __init__(self, *args, _builder=None, **kwargs):
         self.builder = _builder
         # Handle the optional positional argument like [0]
@@ -31,6 +32,7 @@ class async_task:
 
 
 class async_tasks:
+
     def __init__(self):
         pass
 
