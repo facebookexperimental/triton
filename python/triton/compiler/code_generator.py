@@ -18,9 +18,9 @@ from .._utils import find_paths_if, get_iterable_path, set_iterable_path
 
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
 
-WITH_DISPATCH = {}  # central registry for all 'with' handlers
-
 from triton.tlx.compiler.dispatch import TLX_WITH_DISPATCH
+
+WITH_DISPATCH = {}  # central registry for all 'with' handlers
 
 WITH_DISPATCH.update(TLX_WITH_DISPATCH)
 
