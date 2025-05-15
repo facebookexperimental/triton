@@ -12,6 +12,7 @@ import triton.tlx.language as tlx
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_async_tasks(BLOCK_SIZE, device):
+
     @triton.jit
     def add2_warp_specialized_kernel(
         x_ptr,
@@ -54,7 +55,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(a)
     n_elements = output1.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
@@ -68,6 +69,7 @@ def test_async_tasks(BLOCK_SIZE, device):
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_alloc_barriers(BLOCK_SIZE, device):
+
     @triton.jit
     def add_with_mbarrier(
         x_ptr,
@@ -95,7 +97,7 @@ def test_alloc_barriers(BLOCK_SIZE, device):
 
     output = torch.empty_like(x)
     n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     add_with_mbarrier[grid](x, y, output, n_elements, BLOCK_SIZE)
 
-    torch.testing.assert_close(output, x+y, check_dtype=False)
+    torch.testing.assert_close(output, x + y, check_dtype=False)

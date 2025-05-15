@@ -2,6 +2,7 @@ import triton.language.core as tl
 
 from . import types as tlx
 
+
 @tl.builtin
 def alloc_barriers(
     num_barriers: tl.constexpr,

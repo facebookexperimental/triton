@@ -28,6 +28,7 @@ class buffered_tensor(tl.base_value):
         # IR handle
         self.handle = handle
 
+
 # class mbarriers(tl.tensor):
 class mbarriers(tl.base_value):
     """
