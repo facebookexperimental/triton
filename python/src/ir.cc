@@ -614,6 +614,10 @@ void init_triton_ir(py::module &&m) {
   py::class_<ttg::WarpYieldOp, OpState>(m, "WarpYieldOp", py::module_local());
   py::class_<ttg::WarpReturnOp, OpState>(m, "WarpReturnOp", py::module_local());
   py::class_<ttg::LocalAllocOp, OpState>(m, "LocalAllocOp", py::module_local());
+  py::class_<ttng::InitBarrierOp, OpState>(m, "InitBarrierOp",
+                                           py::module_local());
+  py::class_<ttng::InvalBarrierOp, OpState>(m, "InvalBarrierOp",
+                                            py::module_local());
 
   py::class_<scf::ConditionOp, OpState>(m, "ConditionOp", py::module_local());
 
@@ -1853,19 +1857,32 @@ void init_triton_ir(py::module &&m) {
            })
       // mbarrier ops
       .def("create_alloc_barriers",
-           [](TritonOpBuilder &self, uint16_t num_barriers,
-              Type &dtype) -> mlir::Value {
-             std::vector<int64_t> shape = {num_barriers};
+           [](TritonOpBuilder &self, uint16_t num_barriers) -> mlir::Value {
+             // Allocate buffer in shared memory
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
-             auto CTALayout =
-                 ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
-                                         /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
-             auto encoding = ttg::SwizzledSharedEncodingAttr::get(
-                 context, 1, 1, 1, {0}, CTALayout);
-             auto memDesc =
-                 ttg::MemDescType::get(shape, dtype, encoding, memorySpace);
-             return self.create<ttg::LocalAllocOp>(memDesc);
+             auto barrierCTALayout = CTALayoutAttr::get(
+                 /*context=*/context, /*CTAsPerCGA=*/{1},
+                 /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+             auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
+                 context, 1, 1, 1, {0}, barrierCTALayout);
+             auto memDesc = ttg::MemDescType::get(
+                 {num_barriers}, self.getBuilder().getI64Type(),
+                 barrierEncoding, memorySpace);
+             mlir::Value bufferViews = self.create<ttg::LocalAllocOp>(memDesc);
+
+             // Init barrier in each slot
+             for (auto i = 0; i < num_barriers; i++) {
+               // get buf by offset
+               mlir::Value buf =
+                   self.create<arith::ConstantIntOp>(bufferViews.getLoc(), i);
+               // init barrier
+               self.create<ttng::InitBarrierOp>(buf,
+                                                /*number of arrives*/ 1);
+             }
+
+             // Return mlir::Value
+             return bufferViews;
            })
       // Proton Ops
       .def("create_proton_record",
