@@ -1851,6 +1851,22 @@ void init_triton_ir(py::module &&m) {
                                                   memorySpace);
              return self.create<ttg::LocalAllocOp>(memDesc);
            })
+      // mbarrier ops
+      .def("create_alloc_barriers",
+           [](TritonOpBuilder &self, uint16_t num_barriers,
+              Type &dtype) -> mlir::Value {
+             std::vector<int64_t> shape = {num_barriers};
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             auto CTALayout =
+                 ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
+                                         /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+             auto encoding = ttg::SwizzledSharedEncodingAttr::get(
+                 context, 1, 1, 1, {0}, CTALayout);
+             auto memDesc =
+                 ttg::MemDescType::get(shape, dtype, encoding, memorySpace);
+             return self.create<ttg::LocalAllocOp>(memDesc);
+           })
       // Proton Ops
       .def("create_proton_record",
            [](TritonOpBuilder &self, bool isStart, int32_t regionId) -> void {

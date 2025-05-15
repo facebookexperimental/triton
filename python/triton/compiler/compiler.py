@@ -53,6 +53,7 @@ def convert_type_repr(x):
 class ASTSource:
 
     def __init__(self, fn, signature, constexprs=None, attrs=None) -> None:
+        import pdb; pdb.set_trace()
         self.fn = fn
         self.ext = "ttir"
         self.name = fn.__name__
@@ -257,6 +258,7 @@ class CompileTimer:
 
 
 def compile(src, target=None, options=None):
+    import pdb; pdb.set_trace()
     compilation_listener = knobs.compilation.listener
     if compilation_listener:
         timer = CompileTimer()
