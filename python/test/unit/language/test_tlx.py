@@ -107,6 +107,11 @@ def test_alloc_barriers(BLOCK_SIZE, device):
     assert kernel.asm["ttgir"].count("ttng.init_barrier") == 10
 
 
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_local_alloc_index(BLOCK_SIZE, device):
 
     @triton.jit
@@ -129,6 +134,3 @@ def test_local_alloc_index(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = local_alloc_index[grid](x, y, n_elements, BLOCK_SIZE)
     # TODO(Arda): Once we have the loads, add checks here
-
-
-test_local_alloc_index(BLOCK_SIZE=256, device='cuda')
