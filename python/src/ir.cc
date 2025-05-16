@@ -1857,13 +1857,8 @@ void init_triton_ir(py::module &&m) {
                                                   memorySpace);
              return self.create<ttg::LocalAllocOp>(memDesc);
            })
-      // mbarrier ops
       .def("create_alloc_barriers",
-           [](TritonOpBuilder &self, int num_barriers) -> mlir::Value {
-            // TODO. figure out how to do buffer indexing
-            num_barriers = 1;  // should be arrive_counts.size()
-
-             // Allocate buffer in shared memory
+           [](TritonOpBuilder &self, int num_barriers, int arrive_count) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto barrierCTALayout = CTALayoutAttr::get(
@@ -1871,31 +1866,28 @@ void init_triton_ir(py::module &&m) {
                  /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
              auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
                  context, 1, 1, 1, {0}, barrierCTALayout);
-             auto memDesc = ttg::MemDescType::get(
+             auto barriersMemDescType = ttg::MemDescType::get(
                  {num_barriers}, self.getBuilder().getI64Type(),
                  barrierEncoding, memorySpace);
-             mlir::Value bufferViews = self.create<ttg::LocalAllocOp>(memDesc);
+
+             auto singleBarrierMemDescType =
+             ttg::MemDescType::get({1}, self.getBuilder().getI64Type(), barrierEncoding,
+             memorySpace, /*mutableMemory=*/true);
+
+             // Allocate buffer in shared memory
+             mlir::Value bufferViews = self.create<ttg::LocalAllocOp>(barriersMemDescType);
 
              // Init barrier in each slot
              for (auto i = 0; i < num_barriers; i++) {
-                // single buffer mem desc type
-                auto singleBarrierMemDescType =
-                ttg::MemDescType::get({1}, self.getBuilder().getI64Type(), barrierEncoding,
-                memorySpace, /*mutableMemory=*/true);
-
-                // single buffer view
+                // Obtain the single buffer view
                 Value idx = self.getBuilder().create<arith::ConstantIntOp>(bufferViews.getLoc(), i, 32);
                mlir::Value buf =
-                   self.create<mlir::triton::gpu::MemDescSubviewOp>(singleBarrierMemDescType, bufferViews, {idx});
+                   self.create<mlir::triton::gpu::MemDescSubviewOp>(singleBarrierMemDescType, bufferViews, idx);
 
-               // init barrier
-              //  self.create<ttng::InitBarrierOp>(buf,
-              //                                   /*number of arrives*/ 1);
+               // Initialize mbarrier at buf view
+               self.create<ttng::InitBarrierOp>(buf,
+                                                /*number of arrives*/ arrive_count);
              }
-
-              // self.create<ttng::InitBarrierOp>(bufferViews,
-              //                                   // /*number of arrives*/ arrive_counts[0]);
-              //                                   /*number of arrives*/ 1);
 
              // Return mlir::Value
              return bufferViews;
