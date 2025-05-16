@@ -1856,9 +1856,7 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_memdesc_subview",
            [](TritonOpBuilder &self, Value localAlloc,
-              std::vector<Value> &bufferIdx) -> mlir::Value {
-             assert(bufferIdx.size() == 1 &&
-                    "tlx.get_buffer can index only one dimension.");
+              Value bufferIdx) -> mlir::Value {
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              auto context = self.getBuilder().getContext();
@@ -1872,12 +1870,13 @@ void init_triton_ir(py::module &&m) {
              Type memDescType = ttg::MemDescType::get(
                  localAllocShape.drop_front(), localAllocType.getElementType(),
                  encoding, sharedMemorySpace,
-                 /*mutableMemory=*/true);
+                 /*mutableMemory=*/localAllocType.getMutableMemory());
              return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
                                                        bufferIdx);
            })
       .def("create_alloc_barriers",
-           [](TritonOpBuilder &self, int num_barriers, int arrive_count) -> mlir::Value {
+           [](TritonOpBuilder &self, int num_barriers,
+              int arrive_count) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto barrierCTALayout = CTALayoutAttr::get(

@@ -8,7 +8,7 @@ __all__ = [
     "async_tasks",
     "buffered_tensor",
     "local_alloc",
-    "get_buffer",
+    "local_view",
     "mbarriers",
     "alloc_barriers",
 ]

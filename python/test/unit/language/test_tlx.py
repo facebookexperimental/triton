@@ -116,10 +116,9 @@ def test_local_alloc_index(BLOCK_SIZE, device):
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        # pid = tl.program_id(axis=0)
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2))
-        buffer0 = tlx.get_buffer(buffers, [0])
-        buffer1 = tlx.get_buffer(buffers, [1])
+        buffer0 = tlx.local_view(buffers, 0)
+        buffer1 = tlx.local_view(buffers, 1)
 
 
     torch.manual_seed(0)
