@@ -613,9 +613,6 @@ void init_triton_ir(py::module &&m) {
           ret::reference);
   py::class_<ttg::WarpYieldOp, OpState>(m, "WarpYieldOp", py::module_local());
   py::class_<ttg::WarpReturnOp, OpState>(m, "WarpReturnOp", py::module_local());
-  // py::class_<ttg::LocalAllocOp, OpState>(m, "LocalAllocOp", py::module_local());
-  // py::class_<ttg::MemDescType, OpState>(m, "MemDescType", py::module_local());
-  // py::class_<ttg::MemDescSubviewOp, OpState>(m, "MemDescSubviewOp", py::module_local());
   py::class_<ttng::InitBarrierOp, OpState>(m, "InitBarrierOp",
                                            py::module_local());
   py::class_<ttng::InvalBarrierOp, OpState>(m, "InvalBarrierOp",

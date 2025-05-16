@@ -64,8 +64,8 @@ def test_async_tasks(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(
-    not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
-    reason="Requires compute capability == 9 for NV",
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_alloc_barriers(BLOCK_SIZE, device):
@@ -81,7 +81,7 @@ def test_alloc_barriers(BLOCK_SIZE, device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
 
-        bars = tlx.alloc_barriers(2, 2)
+        bars = tlx.alloc_barriers(10, 2)
 
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
@@ -98,6 +98,8 @@ def test_alloc_barriers(BLOCK_SIZE, device):
     output = torch.empty_like(x)
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    add_with_mbarrier[grid](x, y, output, n_elements, BLOCK_SIZE)
+    kernel = add_with_mbarrier[grid](x, y, output, n_elements, BLOCK_SIZE)
 
     torch.testing.assert_close(output, x + y, check_dtype=False)
+
+    assert kernel.asm["ttgir"].count("ttng.init_barrier") == 10
