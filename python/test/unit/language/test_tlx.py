@@ -81,6 +81,8 @@ def test_alloc_barriers(BLOCK_SIZE, device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
 
+        # arrive_counts = (1, 1)
+        # bars = tlx.alloc_barriers(arrive_counts=arrive_counts)
         bars = tlx.alloc_barriers(num_barriers=tl.constexpr(2))
 
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
