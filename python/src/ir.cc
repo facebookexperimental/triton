@@ -1914,6 +1914,17 @@ void init_triton_ir(py::module &&m) {
              // Return mlir::Value
              return bufferViews;
            })
+      .def("create_thread_id",
+           [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
+             static constexpr mlir::gpu::Dimension dims[] = {
+                 mlir::gpu::Dimension::x, mlir::gpu::Dimension::y,
+                 mlir::gpu::Dimension::z};
+             Value threadId = self.create<::mlir::gpu::ThreadIdOp>(
+                 self.getBuilder().getIndexType(), dims[axis]);
+             threadId = self.create<arith::IndexCastOp>(
+                 self.getBuilder().getI32Type(), threadId);
+             return threadId;
+           })
       // Proton Ops
       .def("create_proton_record",
            [](TritonOpBuilder &self, bool isStart, int32_t regionId) -> void {

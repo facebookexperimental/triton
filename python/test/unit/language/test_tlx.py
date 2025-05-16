@@ -134,3 +134,32 @@ def test_local_alloc_index(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = local_alloc_index[grid](x, y, n_elements, BLOCK_SIZE)
     # TODO(Arda): Once we have the loads, add checks here
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+def test_thread_id(device):
+
+    @triton.jit
+    def store_from_thread_0_kernel(output_ptr, value, n_elements, axis : tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tid = tlx.thread_id(axis)
+        if tid == 0:
+            tl.store(output_ptr + offsets, value, mask=mask)
+
+    output = torch.zeros(32, dtype=torch.int32, device='cuda')
+    n_elements = output.numel()
+    value = 42
+    store_from_thread_0_kernel[(1,)](output, value, n_elements, 0, 32, num_warps=1)
+    torch.cuda.synchronize()
+    expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
+    expected_output[0] = value
+    torch.testing.assert_close(output, expected_output)
