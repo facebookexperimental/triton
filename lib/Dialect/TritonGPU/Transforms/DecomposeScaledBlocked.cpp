@@ -54,8 +54,9 @@ public:
     scaledA = cvtDotOperand(scaledA, 0);
     auto scaledB = scaleArg(rewriter, scaledDotOp, 1, computeType);
     scaledB = cvtDotOperand(scaledB, 1);
-    auto newDot = rewriter.create<DotOp>(scaledDotOp.getLoc(), scaledA, scaledB,
-                                         scaledDotOp.getC());
+    auto newDot = rewriter.create<DotOp>(
+        scaledDotOp.getLoc(), scaledA, scaledB, scaledDotOp.getC(),
+        ::mlir::triton::InputPrecision::IEEE, 0, rewriter.getI32IntegerAttr(0));
 
     rewriter.replaceOpWithNewOp<ConvertLayoutOp>(scaledDotOp,
                                                  scaledDotOp.getType(), newDot);

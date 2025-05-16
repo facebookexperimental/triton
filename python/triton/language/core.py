@@ -1802,7 +1802,7 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 
 
 @builtin
-def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,
+def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32, latency=None,
         _builder=None):
     """
     Returns the matrix product of two blocks.
@@ -1825,6 +1825,7 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     :param allow_tf32: *Deprecated.* If true, input_precision is set to "tf32".
       Only one of :code:`input_precision` and :code:`allow_tf32` can be
       specified (i.e. at least one must be :code:`None`).
+    :param latency: The int representing latency.
     """
     assert input_precision is None or allow_tf32 is None, "Only one of input_precision and allow_tf32 can be specified"
     if input_precision is None:
@@ -1835,7 +1836,7 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     input_precision = _constexpr_to_value(input_precision)
     out_dtype = _constexpr_to_value(out_dtype)
     max_num_imprecise_acc = _constexpr_to_value(max_num_imprecise_acc)
-    return semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
+    return semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, latency, _builder)
 
 
 @builtin

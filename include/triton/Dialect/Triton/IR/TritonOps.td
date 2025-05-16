@@ -650,6 +650,9 @@ def TT_DotOp : TT_Op<"dot", [Pure,
         tf32x3: implement the 3xTF32 trick. For more info see the pass in F32DotTC.cpp
         ieee: don't use TC, implement dot in software.
         If the GPU does not have Tensor cores or the inputs are not f32, this flag is ignored.
+
+        The $tt_latency attribute specifies the expected latency of the dot operation in cycles.
+        This can be used by the compiler for scheduling optimizations.
     }];
 
     let arguments = (
@@ -658,7 +661,8 @@ def TT_DotOp : TT_Op<"dot", [Pure,
       TT_FpIntTensor:$b,
       TT_FpIntTensor:$c,
       DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
-      DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc
+      DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc,
+      OptionalAttr<I32Attr>:$tt_latency
     );
 
     let results = (outs TT_FpIntTensor:$d);
@@ -666,7 +670,7 @@ def TT_DotOp : TT_Op<"dot", [Pure,
     // attr-dict prints enums as integers.  To get inputPrecision printed as a
     // string, we need to specify it explicitly.
     let assemblyFormat = [{
-      $a`,` $b`,` $c (`,` `inputPrecision` `=` $inputPrecision^)? attr-dict `:`
+      $a`,` $b`,` $c (`,` `inputPrecision` `=` $inputPrecision^)? (`,` `tt_latency` `=` $tt_latency^)? attr-dict `:`
       type($a) `*` type($b) `->` type($d)
     }];
     let hasVerifier = 1;

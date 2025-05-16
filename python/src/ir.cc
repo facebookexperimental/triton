@@ -1631,9 +1631,14 @@ void init_triton_ir(py::module &&m) {
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision,
-              int maxNumImpreciseAcc) -> mlir::Value {
+              int maxNumImpreciseAcc,
+              std::optional<int> latency) -> mlir::Value {
+             IntegerAttr latencyAttr = nullptr;
+             if (latency.has_value())
+               latencyAttr =
+                   self.getBuilder().getI32IntegerAttr(latency.value());
              return self.create<DotOp>(c.getType(), a, b, c, inputPrecision,
-                                       maxNumImpreciseAcc);
+                                       maxNumImpreciseAcc, latencyAttr);
            })
       .def("create_dot_scaled",
            [](TritonOpBuilder &self, mlir::Value &lhs,

@@ -60,9 +60,9 @@ public:
       return rewriter.create<arith::SubFOp>(dotOp.getLoc(), a, b);
     };
     auto dot = [&](Value a, Value b, Value c) -> Value {
-      return rewriter.create<DotOp>(dotOp->getLoc(), c.getType(), a, b, c,
-                                    InputPrecision::TF32,
-                                    dotOp.getMaxNumImpreciseAcc());
+      return rewriter.create<DotOp>(
+          dotOp->getLoc(), c.getType(), a, b, c, InputPrecision::TF32,
+          dotOp.getMaxNumImpreciseAcc(), dotOp.getTtLatencyAttr());
     };
     auto replaceNansWithZeros = [&](Value value) -> Value {
       auto nans = rewriter.create<arith::CmpFOp>(

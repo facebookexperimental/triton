@@ -546,7 +546,8 @@ public:
                                mfmaInstr->bElementType);
       newDot = rewriter.create<tt::DotOp>(dotOp.getLoc(), newAcc.getType(), a,
                                           b, newAcc, dotOp.getInputPrecision(),
-                                          dotOp.getMaxNumImpreciseAcc());
+                                          dotOp.getMaxNumImpreciseAcc(),
+                                          dotOp.getTtLatencyAttr());
     }
 
     Value dotOutput =
@@ -728,8 +729,9 @@ public:
         upcastMXFP(a, aScale, dotOp.getAElemType(), dotOp.getFastMath());
     Value scaledB =
         upcastMXFP(b, bScale, dotOp.getBElemType(), dotOp.getFastMath());
-    auto newDot = rewriter.create<DotOp>(dotOp.getLoc(), newRetType, scaledA,
-                                         scaledB, newAcc);
+    auto newDot = rewriter.create<DotOp>(
+        dotOp.getLoc(), newRetType, scaledA, scaledB, newAcc,
+        ::mlir::triton::InputPrecision::IEEE, 0, rewriter.getI32IntegerAttr(0));
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, oldRetType,
                                                       newDot);
     return success();
@@ -1040,7 +1042,8 @@ public:
                                          operandTypes[1]);
     auto newDot = rewriter.create<tt::DotOp>(
         dotOp.getLoc(), newRetType, castedA, castedB, newAcc,
-        dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc());
+        dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(),
+        dotOp.getTtLatencyAttr());
 
     Value dotOutput = convertAndCastTensor(rewriter, newDot, oldRetEncoding,
                                            oldRetType.getElementType());
@@ -1139,7 +1142,8 @@ public:
       auto newC = castToElTy(rewriter, dotOp.getC(), f32_ty);
       auto newDot = rewriter.create<DotOp>(
           dotOp.getLoc(), newC.getType(), dotOp.getA(), dotOp.getB(), newC,
-          dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc());
+          dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(),
+          dotOp.getTtLatencyAttr());
       auto newD = castToElTy(rewriter, newDot.getResult(), f16_ty);
       rewriter.replaceOp(dotOp, newD);
       return success();
@@ -1180,7 +1184,8 @@ public:
 
     auto newDot = rewriter.create<DotOp>(dotOp.getLoc(), newC.getType(), newA,
                                          newB, newC, dotOp.getInputPrecision(),
-                                         dotOp.getMaxNumImpreciseAcc());
+                                         dotOp.getMaxNumImpreciseAcc(),
+                                         dotOp.getTtLatencyAttr());
     auto newD = castToElTy(rewriter, newDot.getResult(), dotTypes.d);
 
     rewriter.replaceOp(dotOp, newD);

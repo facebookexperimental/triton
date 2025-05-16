@@ -182,7 +182,7 @@ public:
                                            rewriter.getF32FloatAttr(0)));
     rewriter.replaceOpWithNewOp<DotOp>(op, expandLhsOp.getSrc(),
                                        expandRhsOp.getSrc(), newAcc,
-                                       InputPrecision::TF32, 0);
+                                       InputPrecision::TF32, 0, rewriter.getI32IntegerAttr(0));
     return success();
   }
 };
