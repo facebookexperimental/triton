@@ -105,3 +105,30 @@ def test_alloc_barriers(BLOCK_SIZE, device):
     torch.testing.assert_close(output, x + y, check_dtype=False)
 
     assert kernel.asm["ttgir"].count("ttng.init_barrier") == 10
+
+
+def test_local_alloc_index(BLOCK_SIZE, device):
+
+    @triton.jit
+    def local_alloc_index(
+        x_ptr,
+        y_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2))
+        buffer0 = tlx.local_view(buffers, 0)
+        buffer1 = tlx.local_view(buffers, 1)
+
+
+    torch.manual_seed(0)
+    size = 256
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = local_alloc_index[grid](x, y, n_elements, BLOCK_SIZE)
+    # TODO(Arda): Once we have the loads, add checks here
+
+
+test_local_alloc_index(BLOCK_SIZE=256, device='cuda')

@@ -1854,8 +1854,29 @@ void init_triton_ir(py::module &&m) {
                                                   memorySpace);
              return self.create<ttg::LocalAllocOp>(memDesc);
            })
+      .def("create_memdesc_subview",
+           [](TritonOpBuilder &self, Value localAlloc,
+              Value bufferIdx) -> mlir::Value {
+             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+             auto localAllocShape = localAllocType.getShape();
+             auto context = self.getBuilder().getContext();
+             auto ctaLayout =
+                 ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
+                                         /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+             auto encoding = ttg::SwizzledSharedEncodingAttr::get(
+                 context, 1, 1, 1, {0}, ctaLayout);
+             Attribute sharedMemorySpace =
+                 triton::gpu::SharedMemorySpaceAttr::get(context);
+             Type memDescType = ttg::MemDescType::get(
+                 localAllocShape.drop_front(), localAllocType.getElementType(),
+                 encoding, sharedMemorySpace,
+                 /*mutableMemory=*/localAllocType.getMutableMemory());
+             return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
+                                                       bufferIdx);
+           })
       .def("create_alloc_barriers",
-           [](TritonOpBuilder &self, int num_barriers, int arrive_count) -> mlir::Value {
+           [](TritonOpBuilder &self, int num_barriers,
+              int arrive_count) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto barrierCTALayout = CTALayoutAttr::get(
