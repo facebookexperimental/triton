@@ -41,8 +41,8 @@ def dual_add(x, y, a, b):
 
 
 @pytest.mark.skipif(
-    not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
-    reason="Requires compute capability == 9 for NV",
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_add2(BLOCK_SIZE, device):
@@ -56,8 +56,10 @@ def test_add2(BLOCK_SIZE, device):
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(a)
     n_elements = output1.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    kernel = add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.warp_specialize" in ttgir
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)
