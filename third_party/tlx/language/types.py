@@ -7,8 +7,8 @@ class buffered_tensor(tl.base_value):
     such as shared memory (SMEM) or local memory (TMEM).
 
     This type is to model data that is not stored in global memory or registers
-    but instead resides in hardware-close memory spaces with specialized allocation
-    , access, or swizzling patterns.
+    but instead resides in hardware-close memory spaces with specialized
+    allocation, access, or swizzling patterns.
 
     Unlike regular `tl.tensor`, which models values computed by operations,
     `buffered_tensor` reflects a memory-backed buffer that may be explicitly

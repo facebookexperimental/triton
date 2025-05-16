@@ -64,3 +64,27 @@ def test_add2(BLOCK_SIZE, device):
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)
     torch.testing.assert_close(output2, ref_out2, check_dtype=False)
+
+
+@triton.jit
+def local_alloc_index(
+    x_ptr,
+    output_ptr1,
+    output_ptr2,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2))
+    buffer0 = tlx.get_buffer(buffers, [0])
+    buffer1 = tlx.get_buffer(buffers, [1])
+
+
+def test_local_alloc_index(BLOCK_SIZE, device):
+    torch.manual_seed(0)
+    size = 256
+    x = torch.rand((size, size), device=device)
+    output1 = torch.empty_like(x)
+    output2 = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = local_alloc_index[grid](x, output1, output2, BLOCK_SIZE)
