@@ -1868,25 +1868,29 @@ void init_triton_ir(py::module &&m) {
                  context, 1, 1, 1, {0}, barrierCTALayout);
              auto barriersMemDescType = ttg::MemDescType::get(
                  {num_barriers}, self.getBuilder().getI64Type(),
-                 barrierEncoding, memorySpace);
+                 barrierEncoding, memorySpace, /*mutableMemory=*/true);
 
-             auto singleBarrierMemDescType =
-             ttg::MemDescType::get({1}, self.getBuilder().getI64Type(), barrierEncoding,
-             memorySpace, /*mutableMemory=*/true);
+             auto singleBarrierMemDescType = ttg::MemDescType::get(
+                 {1}, self.getBuilder().getI64Type(), barrierEncoding,
+                 memorySpace, /*mutableMemory=*/true);
 
              // Allocate buffer in shared memory
-             mlir::Value bufferViews = self.create<ttg::LocalAllocOp>(barriersMemDescType);
+             mlir::Value bufferViews =
+                 self.create<ttg::LocalAllocOp>(barriersMemDescType);
 
-             // Init barrier in each slot
+             //  Init barrier in each slot
              for (auto i = 0; i < num_barriers; i++) {
-                // Obtain the single buffer view
-                Value idx = self.getBuilder().create<arith::ConstantIntOp>(bufferViews.getLoc(), i, 32);
+               // Obtain the single buffer view
+               Value idx = self.getBuilder().create<arith::ConstantIntOp>(
+                   bufferViews.getLoc(), i, 32);
                mlir::Value buf =
-                   self.create<mlir::triton::gpu::MemDescSubviewOp>(singleBarrierMemDescType, bufferViews, idx);
+                   self.create<mlir::triton::gpu::MemDescSubviewOp>(
+                       singleBarrierMemDescType, bufferViews, idx);
 
                // Initialize mbarrier at buf view
                self.create<ttng::InitBarrierOp>(buf,
-                                                /*number of arrives*/ arrive_count);
+                                                /*number of arrives*/
+                                                arrive_count);
              }
 
              // Return mlir::Value
