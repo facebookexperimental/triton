@@ -8,7 +8,7 @@ def alloc_barriers(
     num_barriers: tl.constexpr,
     arrive_count: tl.constexpr,
     _builder=None,
-) -> tlx.buffered_tensor:
+) -> tlx.mbarrier:
     """
     Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
 
