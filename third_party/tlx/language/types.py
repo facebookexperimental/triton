@@ -27,25 +27,3 @@ class buffered_tensor(tl.base_value):
         super().__init__()
         # IR handle
         self.handle = handle
-
-
-# class mbarriers(tl.tensor):
-class mbarriers(tl.base_value):
-    """
-    A symbolic type representing an array of mbarriers (each mbarrier is 8-byte)
-    with 1D tensor in uint64 dtype stored in shared memory.
-
-    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-size-alignment
-
-    Examples:
-        bars = tlx.alloc_barriers(num=4)
-
-    Attributes:
-        handle: The backing IR value representing the buffer allocation.
-    """
-
-    def __init__(self, handle):
-        """Not called by user code."""
-        super().__init__()
-        # IR handle
-        self.handle = handle
