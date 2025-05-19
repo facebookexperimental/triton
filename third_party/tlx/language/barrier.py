@@ -16,7 +16,7 @@ def alloc_barriers(
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
     """
-    return tlx.buffered_tensor(_builder.create_alloc_barriers(num_barriers.value, arrive_count.value), )
+    return tlx.mbarrier(_builder.create_alloc_barriers(num_barriers.value, arrive_count.value), )
 
 @tl.builtin
 def barrier_expect(

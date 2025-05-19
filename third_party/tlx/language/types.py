@@ -27,3 +27,12 @@ class buffered_tensor(tl.base_value):
         super().__init__()
         # IR handle
         self.handle = handle
+
+
+class mbarrier(buffered_tensor):
+    """
+    Define mbarrier type derived from buffered_tensor to support barrier specific operations/validations
+    """
+    def __init__(self, handle):
+        super().__init__(handle)
+        pass
