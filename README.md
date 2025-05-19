@@ -21,7 +21,7 @@ While this approach places more responsibility on the user, it reduces the compi
 
 - `buffers = tlx.local_alloc(shape, dtype, num_buffers)`
 
-    Allocate number_buffers buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers.. 
+    Allocate number_buffers buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers..
 
 
 - `buffers = tlx.tmem_alloc(size, NUM_STAGES)`
@@ -55,6 +55,8 @@ While this approach places more responsibility on the user, it reduces the compi
 
 - `tlx.barrier_expect_bytes(bar, bytes)`
 
+Signal a barrier of an expected number of bytes to be copied.
+
 
 ### Warp Specialization operations
 
@@ -69,7 +71,7 @@ While this approach places more responsibility on the user, it reduces the compi
 ```
 `tlx.async_tasks` opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block..
 
-`tlx.async_task(default)` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks. . 
+`tlx.async_task(default)` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks. .
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task..
 
@@ -86,7 +88,7 @@ While this approach places more responsibility on the user, it reduces the compi
 @triton.jit
 def matmul_kernel_tma_ws_cooperative_hopper(
    a_desc, b_desc, c_desc, M, N, K,
-   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, 
+   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
    NUM_STAGES: tl.constexpr, NUM_WARPS: tl.constexpr, dtype: tl.constexpr
 ):
     # allocate NUM_STAGES buffers
@@ -101,19 +103,19 @@ def matmul_kernel_tma_ws_cooperative_hopper(
     barFullB = tlx.alloc_barrier(NUM_STAGES, 128)
 
     with tlx.async_tasks():
-        # producer group 
+        # producer group
         with tl.async_task(num_warps = 4, registers=40)
             pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
             num_pid_n = tl.cdiv(N, BLOCK_N)
-            pid_m = pid // num_pid_m 
-            pid_n = pid % num_pid_n 
+            pid_m = pid // num_pid_m
+            pid_n = pid % num_pid_n
             offs_am = pid_m * BLOCK_M
             offs_bn = pid_n * BLOCK_N
             phase = 1
             for k in range(0, tl.cdiv(K, BLOCK_K)):
                 # locate the buffer index that current iteration should access
-                buf = k % NUM_STAGES       
+                buf = k % NUM_STAGES
                 offs_k = k * BLOCK_K
 
                 # wait for the A buffer to be released by the consumer 1
@@ -131,17 +133,17 @@ def matmul_kernel_tma_ws_cooperative_hopper(
                 tlx.barrier_wait(barEmptyA[buf2], phase)
                 tlx.barrier_expect_bytes(barFullA[buf2], BLOCK_M // 2 * BLOCK_K * dtype_size)
                 a[buf2] = tlx.async_descriptor_load(a_desc, [offs_am + BLOCK_M // 2, offs_k], barFullA[buf2])
-                
+
                 # buffers in a row share the same phase
                 phase = (buf < NUM_STAGES - 1) ? phase : phase ^ 1
 
-        # Two consumer groups 
+        # Two consumer groups
         with tl.async_task(num_warps = 4, registers=232, replicate=2)
             phase = 0
             for k in range(0, tl.cdiv(K, BLOCK_K)):
                 # locate the buffer index that current iteration should access
-                buf = k % NUM_STAGES     
-                phase = (buf > 0) ? phase : phase ^ 1  
+                buf = k % NUM_STAGES
+                phase = (buf > 0) ? phase : phase ^ 1
                 bufA = buf + NUM_STAGES * duplicate
                 # wait for the buffer to be produced by the consumer
                 tlx.barrier_wait(barFullA[bufA], phase)
@@ -163,7 +165,7 @@ def matmul_kernel_tma_ws_cooperative_hopper(
 @triton.jit
 def matmul_kernel_tma_ws_blackwell(
     a_desc, b_desc, c_desc, M, N, K,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, 
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr, NUM_WARPS: tl.constexpr, dtype: tl.constexpr
 ):
     # allocate NUM_STAGES buffers
@@ -178,19 +180,19 @@ def matmul_kernel_tma_ws_blackwell(
     barTmemFull = tlx.alloc_barrier(1, 32)
 
     with tlx.async_tasks():
-        # producer group 
+        # producer group
         with tlx.async_task("default"):
             pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
             num_pid_n = tl.cdiv(N, BLOCK_N)
-            pid_m = pid // num_pid_m 
-            pid_n = pid % num_pid_n 
+            pid_m = pid // num_pid_m
+            pid_n = pid % num_pid_n
             offs_am = pid_m * BLOCK_M
             offs_bn = pid_n * BLOCK_N
             phase = 0
             for k in range(0, tl.cdiv(K, BLOCK_K)):
                 # locate the buffer index that current iteration should access
-                buf = k % NUM_STAGES       
+                buf = k % NUM_STAGES
                 offs_k = k * BLOCK_K
                 # wait for the buffer to be released by the consumer
                 tlx.barrier_wait(barSmemEmpty[buf], phase ^ 1)
@@ -200,21 +202,21 @@ def matmul_kernel_tma_ws_blackwell(
                 # buffers in a row share the same phase
                 phase = (buf < NUM_STAGES - 1) ? phase : phase ^ 1
 
-        # mma group 
+        # mma group
         with tl.async_task(num_warps = 1)
             phase = 0
             buf = 0
             last_phase = 0
             for k in range(0, tl.cdiv(K, BLOCK_K)):
                 # locate the buffer index that current iteration should access
-                buf = k % NUM_STAGES       
+                buf = k % NUM_STAGES
                 # wait for the buffer to be produced by the consumer
                 tlx.barrier_wait(barSmemFull[buf], phase)
-                # release buffers on completion by setting barSmemEmpty 
+                # release buffers on completion by setting barSmemEmpty
                 acc[0] = tlx.async_dot(a[buf], b[buf].T, acc[0], barSmemEmpty[buf])
                 last_phase = phase
                 phase = (buf < NUM_STAGES - 1) ? phase : phase ^ 1
-            # wait for the last mma to complete  
+            # wait for the last mma to complete
             tlx.barrier_wait(barSmemEmpty[buf], last_phase)
             tlx.barrier_arrive(barTmemFull[0])
 

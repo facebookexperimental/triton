@@ -84,7 +84,7 @@ def test_alloc_barriers(BLOCK_SIZE, device):
 
         bars = tlx.alloc_barriers(num_barriers=10, arrive_count=2)
         
-        tlx.barrier_expect(tlx.local_view(bars, 0), 128)
+        tlx.barrier_expect_bytes(tlx.local_view(bars, 0), 128)
 
     torch.manual_seed(0)
     size = 98432
