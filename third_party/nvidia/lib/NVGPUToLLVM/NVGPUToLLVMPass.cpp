@@ -438,6 +438,77 @@ public:
   }
 };
 
+class MBarrierArriveOpPattern : public OpRewritePattern<ttn::MBarrierArriveOp> {
+public:
+  using OpRewritePattern<ttn::MBarrierArriveOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ttn::MBarrierArriveOp op,
+                                PatternRewriter &rewriter) const override {
+    return rewriteAsPtxAsm(op, rewriter, getPtxAsm(op),
+                           getOperandsAndConstraints(op));
+  }
+
+  OperandsAndConstraints
+  getOperandsAndConstraints(ttn::MBarrierArriveOp op) const {
+    OperandsAndConstraints operandsAndTypes;
+    Value mbarrier = op.getMbarrier();
+    Value pred = op.getPred();
+    Value ctaId = op.getCtaId();
+    auto arriveType = op.getArriveType();
+
+    switch (arriveType) {
+    case ttn::MBarriveType::normal:
+    case ttn::MBarriveType::cp_async:
+    case ttn::MBarriveType::expect_tx:
+      operandsAndTypes.push_back({mbarrier, "r"});
+      operandsAndTypes.push_back({pred, "b"});
+      break;
+    case ttn::MBarriveType::remote:
+      operandsAndTypes.push_back({mbarrier, "r"});
+      operandsAndTypes.push_back({ctaId, "r"});
+      operandsAndTypes.push_back({pred, "b"});
+      break;
+    default:
+      llvm::errs() << "Unsupported mbarrier arrive type " << arriveType << "\n";
+      llvm_unreachable("");
+      break;
+    }
+    return operandsAndTypes;
+  }
+
+  std::string getPtxAsm(ttn::MBarrierArriveOp op) const {
+    Value ctaId = op.getCtaId();
+    auto arriveType = op.getArriveType();
+    uint32_t txCount = op.getTxCount();
+    std::string ptxAsm;
+    switch (arriveType) {
+    case ttn::MBarriveType::normal:
+      ptxAsm = "@$1 mbarrier.arrive.shared.b64 _, [$0];";
+      break;
+    case ttn::MBarriveType::cp_async:
+      ptxAsm = "@$1 cp.async.mbarrier.arrive.noinc.shared.b64 [$0];";
+      break;
+    case ttn::MBarriveType::expect_tx:
+      assert(txCount > 0 && "txCount should be valid");
+      ptxAsm = "@$1 mbarrier.arrive.expect_tx.shared.b64 _, [$0], " +
+               std::to_string(txCount) + ";";
+      break;
+    case ttn::MBarriveType::remote:
+      assert(ctaId && "ctaId should have a valid value");
+      ptxAsm =
+          " { .reg .b32 remAddr32;                                       \n"
+          "  @$2 mapa.shared::cluster.u32  remAddr32, $0, $1;            \n"
+          "  @$2 mbarrier.arrive.shared::cluster.b64  _, [remAddr32]; }  \n";
+      break;
+    default:
+      llvm::errs() << "Unsupported mbarrier arrive type " << arriveType << "\n";
+      llvm_unreachable("");
+      break;
+    }
+    return ptxAsm;
+  }
+};
+
 class WGMMAWaitGroupOpPattern : public OpRewritePattern<ttn::WGMMAWaitGroupOp> {
 public:
   using OpRewritePattern<ttn::WGMMAWaitGroupOp>::OpRewritePattern;
@@ -786,11 +857,10 @@ public:
     patterns.add<NVGPUOpGenericPattern<ttn::ClusterCTAIdOp>>(
         context, kClusterCtaIdOp, Constraints({"=r"}), Constraints());
 
-    patterns
-        .add<FenceAsyncSharedOpPattern, LoadMatrixOpPattern,
-             StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern,
-             LoadAcquireOpPattern, WGMMAWaitGroupOpPattern, WarpIdOpPattern>(
-            context);
+    patterns.add<FenceAsyncSharedOpPattern, LoadMatrixOpPattern,
+                 StoreMatrixOpPattern, ClusterArriveOpPattern, WGMMAOpPattern,
+                 LoadAcquireOpPattern, WGMMAWaitGroupOpPattern, WarpIdOpPattern,
+                 MBarrierArriveOpPattern>(context);
 
     if (applyPatternsGreedily(mod, std::move(patterns)).failed())
       signalPassFailure();

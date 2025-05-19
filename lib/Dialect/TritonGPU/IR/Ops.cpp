@@ -159,12 +159,13 @@ struct CanonicalizeConvertFromAlloc
 
   mlir::LogicalResult
   matchAndRewrite(triton::gpu::LocalAllocOp op,
-                  PatternRewriter &rewriter) const override {
+                  PatternRewriter &baseRewriter) const override {
     if (!op.getSrc())
       return failure();
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert)
       return failure();
+    PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(
         op, op->getResult(0).getType(), convert.getSrc());
     return mlir::success();
@@ -178,10 +179,11 @@ struct CanonicalizeConvertFromLocalStore
 
   mlir::LogicalResult
   matchAndRewrite(triton::gpu::LocalStoreOp op,
-                  PatternRewriter &rewriter) const override {
+                  PatternRewriter &baseRewriter) const override {
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert)
       return failure();
+    PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(op, convert.getSrc(),
                                                            op.getDst());
     return mlir::success();
@@ -292,7 +294,8 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(cvt(x, type1), type2) -> cvt(x, type2)
     if (auto cvt = dyn_cast<ConvertLayoutOp>(arg)) {
-      rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
+      PatternRewriterWithAsyncTaskIds rewriterTask(rewriter, cvt);
+      rewriterTask.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
           op, op->getResultTypes().front(), cvt.getSrc());
       return success();
     }

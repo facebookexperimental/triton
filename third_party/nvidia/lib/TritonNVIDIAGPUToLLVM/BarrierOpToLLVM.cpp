@@ -34,6 +34,47 @@ using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
+// --------------------------------------------------------------------------
+// -- MBarrier related Ops lowering, to be moved to a separate file ---------
+// --------------------------------------------------------------------------
+struct MBarrierArriveOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::MBarrierArriveOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::MBarrierArriveOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::MBarrierArriveOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto mbarrier = LLVM::getSharedMemoryObjectFromStruct(
+        op.getLoc(), adaptor.getMbarrier(),
+        typeConverter->convertType(op.getMbarrier().getType().getElementType()),
+        rewriter);
+
+    bool trackAsyncOp = op.getTrackAsyncOp();
+    triton::nvgpu::MBarriveType type = triton::nvgpu::MBarriveType::normal;
+    uint32_t txCount = op.getTxCount();
+    auto remoteCtaId = adaptor.getRemoteCtaId();
+    if (trackAsyncOp) {
+      type = triton::nvgpu::MBarriveType::cp_async;
+    } else if (remoteCtaId) {
+      assert(txCount == 0 &&
+             "remote arrive of transaction mbarrier is not implemented yet");
+      type = triton::nvgpu::MBarriveType::remote;
+    } else if (txCount > 0) {
+      type = triton::nvgpu::MBarriveType::expect_tx;
+    }
+    Value pred = adaptor.getPred();
+    if (pred == nullptr) {
+      pred = b.int_val(/*width*/ 1, 1);
+    }
+    rewriter.replaceOpWithNewOp<triton::nvgpu::MBarrierArriveOp>(
+        op, mbarrier.getBase(), pred, remoteCtaId, type, txCount);
+    return success();
+  }
+};
+
 struct FenceAsyncSharedOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::FenceAsyncSharedOp> {
   using ConvertOpToLLVMPattern<
@@ -222,6 +263,7 @@ struct ArriveBarrierOpConversion
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
+  patterns.add<MBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<FenceAsyncSharedOpConversion>(typeConverter, benefit);
   patterns.add<InitBarrierOpConversion, InvalBarrierOpConversion>(typeConverter,
                                                                   benefit);

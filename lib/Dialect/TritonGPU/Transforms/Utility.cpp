@@ -1104,8 +1104,16 @@ namespace {
 
 /// Detect dead arguments in scf.for op by assuming all the values are dead and
 /// propagate liveness property.
-struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
+class ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
+  DenseSet<Operation *> opsCanBeTriviallyDead;
+
+public:
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
+
+  explicit ForOpDeadArgElimination(
+      MLIRContext *context, const DenseSet<Operation *> &opsCanBeTriviallyDead)
+      : OpRewritePattern<scf::ForOp>(context),
+        opsCanBeTriviallyDead(opsCanBeTriviallyDead) {}
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const final {
@@ -1134,7 +1142,8 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
     // Operations with side-effects are always live. Mark all theirs operands as
     // live.
     block.walk([&](Operation *op) {
-      if (!isa<scf::YieldOp, scf::ForOp>(op) && !wouldOpBeTriviallyDead(op)) {
+      if (!isa<scf::YieldOp, scf::ForOp>(op) &&
+          !(wouldOpBeTriviallyDead(op) || opsCanBeTriviallyDead.contains(op))) {
         for (Value operand : op->getOperands())
           markLive(operand);
       }
@@ -1233,8 +1242,10 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
 
 } // namespace
 
-void populateForOpDeadArgumentElimination(RewritePatternSet &patterns) {
-  patterns.add<ForOpDeadArgElimination>(patterns.getContext());
+void populateForOpDeadArgumentElimination(
+    RewritePatternSet &patterns, DenseSet<Operation *> &opsCanBeTriviallyDead) {
+  patterns.add<ForOpDeadArgElimination>(patterns.getContext(),
+                                        opsCanBeTriviallyDead);
 }
 
 ttg::LocalAllocOp findShmemAlloc(Value operand) {
@@ -1430,6 +1441,7 @@ void replaceUsesAndPropagateType(OpBuilder &builder, Operation *oldUse,
       newVal.getDefiningOp()->setAttrs(user->getAttrs());
     }
     assert(newVal);
+    newVal.getDefiningOp()->setAttrs(user->getAttrs());
     replaceUsesAndPropagateType(builder, user, newVal);
     opsToDelete.push_back(use.getOwner());
   }

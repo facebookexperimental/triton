@@ -16,9 +16,11 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 
 namespace mlir {
 namespace triton {
@@ -363,6 +365,7 @@ public:
     auto mmaEnc = NvidiaMmaEncodingAttr::get(
         oldRetType.getContext(), versionMajor, versionMinor, warpsPerTile,
         CTALayout, instrShape);
+    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, dotOp);
     auto newRetType = RankedTensorType::get(
         oldRetType.getShape(), oldRetType.getElementType(), mmaEnc);
     // convert accumulator
@@ -393,7 +396,7 @@ public:
         a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose);
       }
       b = getSharedMemoryMMAOperand(b, rewriter, 1, allowTranspose);
-      newDot = rewriter.create<triton::nvidia_gpu::WarpGroupDotOp>(
+      newDot = taskIdRewriter.create<triton::nvidia_gpu::WarpGroupDotOp>(
           dotOp.getLoc(), newRetType, a, b, newAcc, nullptr,
           dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(), false);
     } else {
@@ -403,9 +406,9 @@ public:
 
       a = getDotOperand(a, 0, minBitwidth);
       b = getDotOperand(b, 1, minBitwidth);
-      newDot = rewriter.create<DotOp>(dotOp.getLoc(), newRetType, a, b, newAcc,
-                                      dotOp.getInputPrecision(),
-                                      dotOp.getMaxNumImpreciseAcc());
+      newDot = taskIdRewriter.create<DotOp>(dotOp.getLoc(), newRetType, a, b,
+                                            newAcc, dotOp.getInputPrecision(),
+                                            dotOp.getMaxNumImpreciseAcc());
     }
     // convert dot instruction
     rewriter.replaceOpWithNewOp<ConvertLayoutOp>(origDotOp, origDotOp.getType(),
@@ -560,8 +563,9 @@ public:
     auto tokType = rewriter.getType<AsyncTokenType>();
     auto acc = rewriter.create<triton::nvidia_gpu::TMEMAllocOp>(
         loc, accMemDescType, tokType, cvtAcc);
+    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, dotOp);
     auto vTrue = rewriter.create<arith::ConstantIntOp>(dotOp.getLoc(), 1, 1);
-    auto mma = rewriter.create<triton::nvidia_gpu::TCGen5MMAOp>(
+    auto mma = taskIdRewriter.create<triton::nvidia_gpu::TCGen5MMAOp>(
         loc, tokType, a, b, acc, acc.getToken(), /*useD=*/vTrue,
         /*pred=*/vTrue);
     mma.setTwoCtas(useTwoCTAs);
@@ -753,7 +757,8 @@ public:
         loc, scaleBType, /*token=*/Type(), newScaleB);
 
     auto vTrue = rewriter.create<arith::ConstantIntOp>(dotOp.getLoc(), 1, 1);
-    auto mmaOp = rewriter.create<triton::nvidia_gpu::TCGen5MMAScaledOp>(
+    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, dotOp);
+    auto mmaOp = taskIdRewriter.create<triton::nvidia_gpu::TCGen5MMAScaledOp>(
         loc, tokType, a, b, acc.getResult(), acc.getToken(), scaleA.getResult(),
         scaleB.getResult(), dotOp.getAElemType(), dotOp.getBElemType(),
         /*useD=*/vTrue, /*pred=*/vTrue);

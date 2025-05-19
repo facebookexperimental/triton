@@ -21,18 +21,19 @@ Note that currently this tutorial will fail on devices with a small shared memor
 
 import argparse
 import itertools
+from contextlib import contextmanager
+
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 import triton.profiler as proton
 from triton.tools.tensor_descriptor import TensorDescriptor
-from contextlib import contextmanager
-
-from typing import Optional
 
 if torch.cuda.is_available():
     from triton._C.libtriton import nvidia
+
     cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     cublas = nvidia.cublas.CublasLt(cublas_workspace)
 else:
@@ -60,7 +61,7 @@ def _matmul_launch_metadata(grid, kernel, args):
         bytes_per_elem = args["c_ptr"].element_size()
     else:
         bytes_per_elem = 1 if args["FP8_OUTPUT"] else 2
-    ret[f"flops{bytes_per_elem * 8}"] = 2. * M * N * K
+    ret[f"flops{bytes_per_elem * 8}"] = 2.0 * M * N * K
     ret["bytes"] = bytes_per_elem * (M * K + N * K + M * N)
     return ret
 
@@ -72,12 +73,17 @@ HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
 
 def matmul_get_configs(pre_hook=None):
     return [
-        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K" : BK, "GROUP_SIZE_M" : 8}, num_stages=s, num_warps=w, pre_hook=pre_hook) \
-        for BM in [128] \
-        for BN in [128, 256] \
-        for BK in [64,128] \
-        for s in ([3,4]) \
-        for w in [4,8] \
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": BM,
+                "BLOCK_SIZE_N": BN,
+                "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=s,
+            num_warps=w,
+            pre_hook=pre_hook,
+        ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in ([3, 4]) for w in [4, 8]
     ]
 
 
@@ -129,7 +135,7 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if (c_ptr.dtype.element_ty == tl.float8e4nv):
+    if c_ptr.dtype.element_ty == tl.float8e4nv:
         c = accumulator.to(tl.float8e4nv)
     else:
         c = accumulator.to(tl.float16)
@@ -318,7 +324,7 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if (c_ptr.dtype.element_ty == tl.float8e4nv):
+        if c_ptr.dtype.element_ty == tl.float8e4nv:
             c = accumulator.to(tl.float8e4nv)
         else:
             c = accumulator.to(tl.float16)
@@ -336,7 +342,10 @@ def matmul_persistent(a, b):
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
+    grid = lambda META: (min(
+        NUM_SMS,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    ), )
     matmul_kernel_persistent[grid](
         a, b, c,  #
         M, N, K,  #
@@ -352,9 +361,16 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
     return [
         triton.Config(
             {
-                'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 8, "EPILOGUE_SUBTILE":
-                SUBTILE
-            }, num_stages=s, num_warps=w, pre_hook=pre_hook)  #
+                "BLOCK_SIZE_M": BM,
+                "BLOCK_SIZE_N": BN,
+                "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": 8,
+                "EPILOGUE_SUBTILE": SUBTILE,
+            },
+            num_stages=s,
+            num_warps=w,
+            pre_hook=pre_hook,
+        )  #
         for BM in [128]  #
         for BN in [128, 256]  #
         for BK in [64, 128]  #
@@ -504,7 +520,10 @@ def matmul_kernel_descriptor_persistent(a_ptr, b_ptr, c_ptr,  #
         c_ptr,
         shape=[M, N],
         strides=[N, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2],
+        block_shape=[
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+        ],
     )
 
     # tile_id_c is used in the epilogue to break the dependency between
@@ -560,12 +579,270 @@ def matmul_descriptor_persistent(a, b, warp_specialize: bool):
 
     triton.set_allocator(alloc_fn)
 
-    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
+    grid = lambda META: (min(
+        NUM_SMS,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    ), )
     matmul_kernel_descriptor_persistent[grid](
         a, b, c,  #
         M, N, K,  #
         NUM_SMS=NUM_SMS,  #
         WARP_SPECIALIZE=warp_specialize,  #
+    )
+    return c
+
+
+def matmul_ws_cooperative_set_block_size_hook(nargs):
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
+    BLOCK_M = nargs["BLOCK_SIZE_M"]
+    BLOCK_N = nargs["BLOCK_SIZE_N"]
+    BLOCK_K = nargs["BLOCK_SIZE_K"]
+    NUM_MMA_CONSUMERS = nargs["LAST_MMA_CONSUMER"] - nargs["FIRST_MMA_CONSUMER"] + 1
+    NUM_EPILOG_CONSUMERS = (nargs["LAST_EPILOG_CONSUMER"] - nargs["FIRST_EPILOG_CONSUMER"] + 1)
+    nargs["a_desc"].block_shape = [BLOCK_M // NUM_MMA_CONSUMERS, BLOCK_K]
+    nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
+    if EPILOGUE_SUBTILE:
+        nargs["c_desc"].block_shape = [BLOCK_M // NUM_EPILOG_CONSUMERS, BLOCK_N // 2]
+    else:
+        nargs["c_desc"].block_shape = [BLOCK_M // NUM_EPILOG_CONSUMERS, BLOCK_N]
+
+
+def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 2,
+                "LAST_EPILOG_CONSUMER": 2,
+                "EPILOGUE_SUBTILE": True,
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=2,
+            num_buffers_warp_spec=4,
+            pre_hook=pre_hook,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 2,
+                "LAST_EPILOG_CONSUMER": 2,
+                "EPILOGUE_SUBTILE": False,
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=2,
+            num_buffers_warp_spec=3,
+            pre_hook=pre_hook,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 1,
+                "LAST_EPILOG_CONSUMER": 1,
+                "EPILOGUE_SUBTILE": True,
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=1,
+            num_buffers_warp_spec=4,
+            pre_hook=pre_hook,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 2,
+                "FIRST_EPILOG_CONSUMER": 1,
+                "LAST_EPILOG_CONSUMER": 2,
+                "EPILOGUE_SUBTILE": False,
+            },
+            num_stages=2,
+            num_warps=4,
+            num_consumer_groups=2,
+            num_buffers_warp_spec=3,
+            pre_hook=pre_hook,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "FIRST_MMA_CONSUMER": 1,
+                "LAST_MMA_CONSUMER": 1,
+                "FIRST_EPILOG_CONSUMER": 1,
+                "LAST_EPILOG_CONSUMER": 1,
+                "EPILOGUE_SUBTILE": False,
+            },
+            num_stages=3,
+            num_warps=4,
+            num_consumer_groups=0,  # disable warp specialization
+            num_buffers_warp_spec=3,
+            pre_hook=pre_hook,
+        ),
+    ]
+
+
+@triton.jit
+def no_op_async_task():
+    # do nothing
+    return
+
+
+has_warp_spec = hasattr(tl, "async_task")
+print("warp_spec: ", has_warp_spec)
+if has_warp_spec:
+    my_async_task = tl.async_task
+else:
+    my_async_task = no_op_async_task
+
+
+@triton.autotune(
+    configs=matmul_tma_ws_cooperative_get_configs(),
+    key=["M", "N", "K"],
+    use_cuda_graph=True,
+)
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_kernel_persistent_tma_ws_cooperative(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
+    FP8_OUTPUT: tl.constexpr,  #
+    NUM_SMS: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,  #
+    FIRST_MMA_CONSUMER: tl.constexpr,
+    LAST_MMA_CONSUMER: tl.constexpr,
+    FIRST_EPILOG_CONSUMER: tl.constexpr,
+    LAST_EPILOG_CONSUMER: tl.constexpr,
+):
+    dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[N, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+        ],
+    )
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    # Enable warp specialization to leverage async warp scheduling in the GPU.
+    # FIXME: This only works on Blackwell right now. On older GPUs, this will
+    # use software pipelining.
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            with my_async_task([0]):
+                a = a_desc.load([offs_am, offs_k])
+                b = b_desc.load([offs_bn, offs_k])
+            with tl.async_task([FIRST_MMA_CONSUMER, LAST_MMA_CONSUMER]):
+                accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+
+        # Epilogue subtiling is a technique to break our computation and stores into multiple pieces
+        # By subtiling we can reduce shared memory consumption by the epilogue and instead use that
+        # memory to increase our stage count.
+        # In this case we partition the accumulator into 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
+        if EPILOGUE_SUBTILE:
+            with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
+                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc0, acc1 = tl.split(acc)
+                c0 = acc0.to(dtype)
+                c_desc.store([offs_am_c, offs_bn_c], c0)
+                c1 = acc1.to(dtype)
+                c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+        else:
+            with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
+                accumulator = accumulator.to(dtype)
+                c_desc.store([offs_am_c, offs_bn_c], accumulator)
+
+
+def matmul_persistent_tma_ws_cooperative(a, b):
+    # Check constraints.
+    assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+
+    M, K = a.shape
+    N, K = b.shape
+    dtype = a.dtype
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+
+    grid = lambda META: (min(
+        NUM_SMS,
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    ), )
+
+    matmul_kernel_persistent_tma_ws_cooperative[grid](
+        a, b, c,  #
+        M, N, K,  #
+        FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
+        NUM_SMS=NUM_SMS,  #
     )
     return c
 
@@ -579,8 +856,10 @@ def cublas_matmul(a, b):
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
-    with proton.scope(f"cublas [M={M}, N={N}, K={K}]",
-                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
+    with proton.scope(
+            f"cublas [M={M}, N={N}, K={K}]",
+        {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2.0 * M * N * K},
+    ):
         cublas.matmul(a, b, c)
     return c
 
@@ -590,8 +869,10 @@ def torch_matmul(a, b):
     N, K = b.shape
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
-    with proton.scope(f"torch [M={M}, N={N}, K={K}]",
-                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
+    with proton.scope(
+            f"torch [M={M}, N={N}, K={K}]",
+        {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2.0 * M * N * K},
+    ):
         c = torch.matmul(a, b.T)
     return c
 
@@ -633,11 +914,32 @@ def bench(K, dtype, reps=10000, warmup_reps=10000):
     for ws in warp_specialize:
         ws_str = "_ws" if ws else ""
         if HAS_HOST_TENSOR_DESC:
-            bench_fn(f"tma_persistent{ws_str}", reps, warmup_reps, lambda a, b: matmul_tma_persistent(a, b, ws), a, b)
-            bench_fn(f"tma{ws_str}", reps, warmup_reps, lambda a, b: matmul_tma(a, b, ws), a, b)
+            bench_fn(
+                f"tma_persistent{ws_str}",
+                reps,
+                warmup_reps,
+                lambda a, b: matmul_tma_persistent(a, b, ws),
+                a,
+                b,
+            )
+            bench_fn(
+                f"tma{ws_str}",
+                reps,
+                warmup_reps,
+                lambda a, b: matmul_tma(a, b, ws),
+                a,
+                b,
+            )
         if HAS_TENSOR_DESC:
-            bench_fn(f"descriptor_persistent{ws_str}", reps, warmup_reps,
-                     lambda a, b: matmul_descriptor_persistent(a, b, ws), a, b)
+            bench_fn(
+                f"descriptor_persistent{ws_str}",
+                reps,
+                warmup_reps,
+                lambda a, b: matmul_descriptor_persistent(a, b, ws),
+                a,
+                b,
+            )
+    bench_fn("WS cooperative", reps, warmup_reps, matmul_persistent_tma_ws_cooperative, a, b)
 
 
 def run_test(expect, fn, a, b, label, enabled=True):
@@ -661,6 +963,7 @@ def validate(M, N, K, dtype):
     run_test(naive_result, torch_matmul, a, b, "Torch", enabled=dtype == torch.float16)
     run_test(naive_result, cublas_matmul, a, b, "cuBLAS", enabled=cublas is not None)
     run_test(naive_result, matmul_persistent, a, b.T, "Persistent")
+    run_test(naive_result, matmul_persistent_tma_ws_cooperative, a, b, "WS Cooperative")
 
     kernels = [
         (matmul_tma, "TMA", HAS_HOST_TENSOR_DESC),
@@ -672,16 +975,24 @@ def validate(M, N, K, dtype):
     for (kernel, label, enabled), warp_specialize in itertools.product(kernels, warp_specialize):
         label = f"{label} (warp_specialize={warp_specialize})"
         enabled = enabled and (not warp_specialize or HAS_TENSOR_DESC)
-        run_test(naive_result, lambda a, b: kernel(a, b, warp_specialize), a, b, label, enabled)
+        run_test(
+            naive_result,
+            lambda a, b: kernel(a, b, warp_specialize),
+            a,
+            b,
+            label,
+            enabled,
+        )
     print()
 
 
 def show_profile(precision, profile_name):
     import triton.profiler.viewer as proton_viewer
+
     metric_names = ["time/ms"]
-    if precision == 'fp8':
+    if precision == "fp8":
         metric_names = ["tflop8/s"] + metric_names
-    elif precision == 'fp16':
+    elif precision == "fp16":
         metric_names = ["tflop16/s"] + metric_names
     file_name = f"{profile_name}.hatchet"
     tree, metrics = proton_viewer.parse(metric_names, file_name)
@@ -696,10 +1007,10 @@ if __name__ == "__main__":
     parser.add_argument("--prec", type=str, choices=["fp8", "fp16"], default="fp16")
     args = parser.parse_args()
 
-    if args.prec == 'fp8' and (not hasattr(torch, "float8_e4m3fn") or not is_cuda()):
+    if args.prec == "fp8" and (not hasattr(torch, "float8_e4m3fn") or not is_cuda()):
         print("This example requires CUDA with fp8 support.")
     else:
-        dtype = torch.float8_e4m3fn if args.prec == 'fp8' else torch.float16
+        dtype = torch.float8_e4m3fn if args.prec == "fp8" else torch.float16
 
         if args.K and args.K_range is None:
             args.K_range = [args.K, args.K]
