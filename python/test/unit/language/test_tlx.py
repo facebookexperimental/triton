@@ -55,7 +55,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(a)
     n_elements = output1.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
@@ -83,7 +83,7 @@ def test_alloc_barriers(BLOCK_SIZE, device):
         pid = tl.program_id(axis=0)
 
         bars = tlx.alloc_barriers(num_barriers=10, arrive_count=2)
-        
+
         tlx.barrier_expect(tlx.local_view(bars, 0), 128)
 
     torch.manual_seed(0)
@@ -117,7 +117,6 @@ def test_local_alloc_index(BLOCK_SIZE, device):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2))
         buffer0 = tlx.local_view(buffers, 0)
         buffer1 = tlx.local_view(buffers, 1)
-
 
     torch.manual_seed(0)
     size = 256
