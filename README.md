@@ -55,6 +55,8 @@ While this approach places more responsibility on the user, it reduces the compi
 
 - `tlx.barrier_expect_bytes(bar, bytes)`
 
+    Signal a barrier of an expected number of bytes to be copied.
+
 
 ### Warp Specialization operations
 
