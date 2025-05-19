@@ -20,7 +20,7 @@ def alloc_barriers(
 
 @tl.builtin
 def barrier_expect_bytes(
-    bar: tlx.buffered_tensor,
+    bar: tlx.mbarriers,
     size: tl.constexpr,
     _builder=None,
 ) -> None:
