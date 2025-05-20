@@ -1845,8 +1845,9 @@ void init_triton_ir(py::module &&m) {
                                          /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
              auto encoding = ttg::SwizzledSharedEncodingAttr::get(
                  context, 1, 1, 1, {0}, CTALayout);
-             auto memDesc = ttg::MemDescType::get(shape, elementType, encoding,
-                                                  memorySpace);
+             auto memDesc =
+                 ttg::MemDescType::get(shape, elementType, encoding,
+                                       memorySpace, /*mutableMemory=*/true);
              return self.create<ttg::LocalAllocOp>(memDesc);
            })
       .def("create_memdesc_subview",
@@ -1862,21 +1863,23 @@ void init_triton_ir(py::module &&m) {
                  context, 1, 1, 1, {0}, ctaLayout);
              Attribute sharedMemorySpace =
                  triton::gpu::SharedMemorySpaceAttr::get(context);
+             Type memDescType;
              if (localAllocShape.size() == 1) {
-               Type memDescType = ttg::MemDescType::get(
+               memDescType = ttg::MemDescType::get(
                    {1}, localAllocType.getElementType(), encoding,
                    sharedMemorySpace,
                    /*mutableMemory=*/localAllocType.getMutableMemory());
-               return self.create<ttg::MemDescSubviewOp>(memDescType,
-                                                         localAlloc, bufferIdx);
              } else {
-               Type memDescType = ttg::MemDescType::get(
+               memDescType = ttg::MemDescType::get(
                    localAllocShape.drop_front(),
                    localAllocType.getElementType(), encoding, sharedMemorySpace,
                    /*mutableMemory=*/localAllocType.getMutableMemory());
-               return self.create<ttg::MemDescSubviewOp>(memDescType,
-                                                         localAlloc, bufferIdx);
              }
+             Value zero = self.create<arith::ConstantIntOp>(0, 32);
+             SmallVector<Value> offsets(localAllocShape.size(), zero);
+             offsets[0] = bufferIdx;
+             return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
+                                                       offsets);
            })
       // mbarrier ops
       .def("create_alloc_barriers",
