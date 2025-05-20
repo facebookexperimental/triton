@@ -81,16 +81,10 @@ def test_alloc_barriers(BLOCK_SIZE, device):
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
-        block_start = pid * BLOCK_SIZE
 
-        bars = tlx.alloc_barriers(10, 2)
-
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
-        x = tl.load(x_ptr + offsets, mask=mask)
-        y = tl.load(y_ptr + offsets, mask=mask)
-        output = x + y
-        tl.store(z_ptr + offsets, output, mask=mask)
+        bars = tlx.alloc_barriers(num_barriers=10, arrive_count=2)
+        
+        tlx.barrier_expect_bytes(tlx.local_view(bars, 0), 128)
 
     torch.manual_seed(0)
     size = 98432
@@ -102,9 +96,8 @@ def test_alloc_barriers(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = add_with_mbarrier[grid](x, y, output, n_elements, BLOCK_SIZE)
 
-    torch.testing.assert_close(output, x + y, check_dtype=False)
-
     assert kernel.asm["ttgir"].count("ttng.init_barrier") == 10
+    assert kernel.asm["ttgir"].count("ttng.barrier_expect") == 1
 
 
 @pytest.mark.skipif(

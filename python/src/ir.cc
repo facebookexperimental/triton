@@ -613,11 +613,6 @@ void init_triton_ir(py::module &&m) {
           ret::reference);
   py::class_<ttg::WarpYieldOp, OpState>(m, "WarpYieldOp", py::module_local());
   py::class_<ttg::WarpReturnOp, OpState>(m, "WarpReturnOp", py::module_local());
-  py::class_<ttng::InitBarrierOp, OpState>(m, "InitBarrierOp",
-                                           py::module_local());
-  py::class_<ttng::InvalBarrierOp, OpState>(m, "InvalBarrierOp",
-                                            py::module_local());
-
   py::class_<scf::ConditionOp, OpState>(m, "ConditionOp", py::module_local());
 
   py::class_<Operation, std::unique_ptr<Operation, py::nodelete>>(
@@ -1867,16 +1862,26 @@ void init_triton_ir(py::module &&m) {
                  context, 1, 1, 1, {0}, ctaLayout);
              Attribute sharedMemorySpace =
                  triton::gpu::SharedMemorySpaceAttr::get(context);
-             Type memDescType = ttg::MemDescType::get(
-                 localAllocShape.drop_front(), localAllocType.getElementType(),
-                 encoding, sharedMemorySpace,
-                 /*mutableMemory=*/localAllocType.getMutableMemory());
-             return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
-                                                       bufferIdx);
+             if (localAllocShape.size() == 1) {
+               Type memDescType = ttg::MemDescType::get(
+                   {1}, localAllocType.getElementType(), encoding,
+                   sharedMemorySpace,
+                   /*mutableMemory=*/localAllocType.getMutableMemory());
+               return self.create<ttg::MemDescSubviewOp>(memDescType,
+                                                         localAlloc, bufferIdx);
+             } else {
+               Type memDescType = ttg::MemDescType::get(
+                   localAllocShape.drop_front(),
+                   localAllocType.getElementType(), encoding, sharedMemorySpace,
+                   /*mutableMemory=*/localAllocType.getMutableMemory());
+               return self.create<ttg::MemDescSubviewOp>(memDescType,
+                                                         localAlloc, bufferIdx);
+             }
            })
+      // mbarrier ops
       .def("create_alloc_barriers",
-           [](TritonOpBuilder &self, int num_barriers,
-              int arrive_count) -> mlir::Value {
+           [](TritonOpBuilder &self, int numBarriers,
+              int arriveCount) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto barrierCTALayout = CTALayoutAttr::get(
@@ -1885,8 +1890,8 @@ void init_triton_ir(py::module &&m) {
              auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
                  context, 1, 1, 1, {0}, barrierCTALayout);
              auto barriersMemDescType = ttg::MemDescType::get(
-                 {num_barriers}, self.getBuilder().getI64Type(),
-                 barrierEncoding, memorySpace, /*mutableMemory=*/true);
+                 {numBarriers}, self.getBuilder().getI64Type(), barrierEncoding,
+                 memorySpace, /*mutableMemory=*/true);
 
              auto singleBarrierMemDescType = ttg::MemDescType::get(
                  {1}, self.getBuilder().getI64Type(), barrierEncoding,
@@ -1897,7 +1902,7 @@ void init_triton_ir(py::module &&m) {
                  self.create<ttg::LocalAllocOp>(barriersMemDescType);
 
              //  Init barrier in each slot
-             for (auto i = 0; i < num_barriers; i++) {
+             for (auto i = 0; i < numBarriers; i++) {
                // Obtain the single buffer view
                Value idx = self.getBuilder().create<arith::ConstantIntOp>(
                    bufferViews.getLoc(), i, 32);
@@ -1908,12 +1913,18 @@ void init_triton_ir(py::module &&m) {
                // Initialize mbarrier at buf view
                self.create<ttng::InitBarrierOp>(buf,
                                                 /*number of arrives*/
-                                                arrive_count);
+                                                arriveCount);
              }
 
              // Return mlir::Value
              return bufferViews;
            })
+      .def(
+          "create_barrier_expect",
+          [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes) -> void {
+            Value pred = self.create<arith::ConstantIntOp>(1, 1);
+            self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
+          })
       .def("create_thread_id",
            [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
              static constexpr mlir::gpu::Dimension dims[] = {

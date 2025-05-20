@@ -1,7 +1,7 @@
 from .async_task import async_task, async_tasks
-from .types import buffered_tensor, mbarriers
+from .types import * 
 from .mem_ops import *
-from .barrier import alloc_barriers
+from .barrier import *
 from .utility import *
 
 __all__ = [
@@ -9,8 +9,10 @@ __all__ = [
     "async_task",
     "async_tasks",
     "buffered_tensor",
+    "mbarriers",
     "local_alloc",
     "local_view",
-    "mbarriers",
+    "alloc_barriers",
+    "barrier_expect",
     "thread_id"
 ]
