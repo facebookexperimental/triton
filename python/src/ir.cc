@@ -1925,6 +1925,15 @@ void init_triton_ir(py::module &&m) {
             Value pred = self.create<arith::ConstantIntOp>(1, 1);
             self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
           })
+      .def("create_barrier_wait",
+           [](TritonOpBuilder &self, Value mbarrerLoc, Value phase) -> void {
+             self.create<ttng::WaitBarrierOp>(mbarrerLoc, phase);
+           })
+      .def(
+          "barrier_arrive",
+          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
+            self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
+          })
       // Proton Ops
       .def("create_proton_record",
            [](TritonOpBuilder &self, bool isStart, int32_t regionId) -> void {
