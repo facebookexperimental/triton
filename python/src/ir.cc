@@ -1862,12 +1862,21 @@ void init_triton_ir(py::module &&m) {
                  context, 1, 1, 1, {0}, ctaLayout);
              Attribute sharedMemorySpace =
                  triton::gpu::SharedMemorySpaceAttr::get(context);
-             Type memDescType = ttg::MemDescType::get(
-                 {1}, localAllocType.getElementType(), encoding,
-                 sharedMemorySpace,
-                 /*mutableMemory=*/localAllocType.getMutableMemory());
-             return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
-                                                       bufferIdx);
+             if (localAllocShape.size() == 1) {
+               Type memDescType = ttg::MemDescType::get(
+                   {1}, localAllocType.getElementType(), encoding,
+                   sharedMemorySpace,
+                   /*mutableMemory=*/localAllocType.getMutableMemory());
+               return self.create<ttg::MemDescSubviewOp>(memDescType,
+                                                         localAlloc, bufferIdx);
+             } else {
+               Type memDescType = ttg::MemDescType::get(
+                   localAllocShape.drop_front(),
+                   localAllocType.getElementType(), encoding, sharedMemorySpace,
+                   /*mutableMemory=*/localAllocType.getMutableMemory());
+               return self.create<ttg::MemDescSubviewOp>(memDescType,
+                                                         localAlloc, bufferIdx);
+             }
            })
       // mbarrier ops
       .def("create_alloc_barriers",
@@ -1915,15 +1924,6 @@ void init_triton_ir(py::module &&m) {
           [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes) -> void {
             Value pred = self.create<arith::ConstantIntOp>(1, 1);
             self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
-          })
-      .def("create_barrier_wait",
-           [](TritonOpBuilder &self, Value mbarrerLoc, Value phase) -> void {
-             self.create<ttng::WaitBarrierOp>(mbarrerLoc, phase);
-           })
-      .def(
-          "barrier_arrive",
-          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
-            self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
           })
       // Proton Ops
       .def("create_proton_record",
