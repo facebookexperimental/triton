@@ -136,10 +136,6 @@ def test_local_alloc_index(BLOCK_SIZE, device):
     # TODO(Arda): Once we have the loads, add checks here
 
 
-@pytest.mark.skipif(
-    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
-    reason="Requires compute capability >= 9 for NV",
-)
 def test_thread_id(device):
 
     @triton.jit
