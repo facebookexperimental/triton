@@ -48,6 +48,21 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         pass
 
 
+class nv_mma_shared_layout_encoding(shared_layout_encoding):
+    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
+        super().__init__()
+        self.shape = shape
+        self.order = order
+        self.elemType = elemType
+        self.numCTAsPerCGA = numCTAsPerCGA
+        self.numCTASplit = numCTASplit
+        self.numCTAOrder = numCTAOrder
+        self.fp4Padded = fp4Padded
+
+    def build(self, builder):
+        pass
+
+
 class buffered_tensor(tl.base_value):
     """
     A symbolic type representing a tensor allocated in a manually managed buffer
@@ -81,6 +96,7 @@ class buffered_tensor(tl.base_value):
         self.dtype = type.scalar
         # Layout encoding
         self.layout = layout
+        self.order = None
 
 
 class mbarriers(buffered_tensor):
