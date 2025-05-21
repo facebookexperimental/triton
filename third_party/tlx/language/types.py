@@ -32,7 +32,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
     Make a default non-swizzled shared layout encoding.
     """
     @classmethod
-    def make_default(cls, rank=2):
+    def make_default(cls, rank):
         return cls(
             vectorSize=1,
             perPhase=1,
