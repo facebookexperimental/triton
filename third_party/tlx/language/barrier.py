@@ -31,7 +31,6 @@ def barrier_expect_bytes(
     # TODO. add validator logics
     _builder.create_barrier_expect(bar.handle, size.value)
 
-
 @tl.builtin
 def barrier_wait(
     bar: tlx.buffered_tensor,
