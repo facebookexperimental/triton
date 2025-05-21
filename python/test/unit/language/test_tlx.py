@@ -114,10 +114,18 @@ def test_local_alloc_index(BLOCK_SIZE, device):
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2))
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x_ptr_offsets = x_ptr + offsets
+        y_ptr_offsets = y_ptr + offsets
+
+        buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, tl.constexpr(2))
         buffer0 = tlx.local_view(buffers, 0)
         buffer1 = tlx.local_view(buffers, 1)
-
+        tlx.async_load(x_ptr_offsets, buffer0, mask=mask)
+        tlx.async_load(y_ptr_offsets, buffer1, mask=mask)
 
     torch.manual_seed(0)
     size = 256
@@ -126,7 +134,10 @@ def test_local_alloc_index(BLOCK_SIZE, device):
     n_elements = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = local_alloc_index[grid](x, y, n_elements, BLOCK_SIZE)
-    # TODO(Arda): Once we have the loads, add checks here
+    assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
+    assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 2
+    assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
+    # TODO(Arda): Once we have the stores, add numerical checks here
 
 
 def test_thread_id(device):

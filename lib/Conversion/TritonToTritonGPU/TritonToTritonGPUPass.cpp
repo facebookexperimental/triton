@@ -670,6 +670,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ExperimentalTensormapFenceproxyAcquireOp>,
       // this assumes the right layout will be set later for dot scaled.
       GenericOpPattern<triton::DotScaledOp>, GenericOpPattern<triton::CallOp>,
+      GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
       TritonFuncOpPattern>(typeConverter, context);
 }
 // Proton patterns

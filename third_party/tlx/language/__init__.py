@@ -1,5 +1,5 @@
 from .async_task import async_task, async_tasks
-from .types import * 
+from .types import *
 from .mem_ops import *
 from .barrier import *
 from .utility import *
@@ -14,5 +14,6 @@ __all__ = [
     "local_view",
     "alloc_barriers",
     "barrier_expect",
-    "thread_id"
+    "thread_id",
+    "async_load",
 ]
