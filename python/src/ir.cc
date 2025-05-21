@@ -1881,6 +1881,16 @@ void init_triton_ir(py::module &&m) {
              return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
                                                        offsets);
            })
+      .def("create_async_load",
+           [](TritonOpBuilder &self, Value ptrTensor, Value result,
+              std::optional<Value> mask, std::optional<Value> other,
+              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+              bool isVolatile) -> mlir::Value {
+             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                 ptrTensor, result, mask.value_or(Value()),
+                 other.value_or(Value()), cacheModifier, evictionPolicy,
+                 isVolatile);
+           })
       // mbarrier ops
       .def("create_alloc_barriers",
            [](TritonOpBuilder &self, int numBarriers,

@@ -1,6 +1,5 @@
 import triton.language.core as tl
 
-
 class buffered_tensor(tl.base_value):
     """
     A symbolic type representing a tensor allocated in a manually managed buffer
@@ -22,11 +21,12 @@ class buffered_tensor(tl.base_value):
         handle: The backing IR value representing the buffer allocation.
     """
 
-    def __init__(self, handle):
+    def __init__(self, handle, type: tl.dtype):
         """Not called by user code."""
         super().__init__()
         # IR handle
         self.handle = handle
+        self.type = type
 
 
 class mbarriers(buffered_tensor):
