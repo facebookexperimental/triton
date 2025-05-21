@@ -2,13 +2,14 @@ import triton.language.core as tl
 from triton.language.semantic import _convert_elem_to_ir_value
 
 from . import types as tlx
-
+from typing import Optional
 
 @tl.builtin
 def local_alloc(
     shape: tuple,
     dtype: tl.dtype,
     num: tl.constexpr,
+    layout: Optional[tlx.shared_layout_encoding] = None,
     _builder=None,
 ) -> tlx.buffered_tensor:
     """
@@ -19,7 +20,21 @@ def local_alloc(
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._constexpr_to_value(dtype)
     elem_type = dtype.to_ir(_builder)
-    return tlx.buffered_tensor(_builder.create_local_alloc(full_shape, elem_type), )
+    block_type = tl.block_type(dtype, full_shape)
+    if layout is None:
+        layout = tlx.swizzled_shared_layout_encoding.make_default(rank = len(shape))
+        layout_handle = _builder.make_swizzled_shared_encoding_attr(
+            layout.vectorSize,
+            layout.perPhase,
+            layout.maxPhase,
+            layout.order,
+            layout.numCTAsPerCGA,
+            layout.numCTASplit,
+            layout.numCTAOrder,
+        )
+    else:
+        raise NotImplementedError("User-specified layout encoding not yet implemented.")
+    return tlx.buffered_tensor(_builder.create_local_alloc(full_shape, elem_type, layout_handle), block_type, layout)
 
 
 @tl.builtin
@@ -32,4 +47,9 @@ def local_view(
     Returns a subview of the buffer.
     """
     buffer_idx = _convert_elem_to_ir_value(_builder, buffer_idx, require_i64=False)
-    return tlx.buffered_tensor(_builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx), )
+    buffer_type = local_allocated_buffers.type
+    # A subview of a one-dimensional buffer is still one-dimensional.
+    view_shape = buffer_type.shape[1:] if len(buffer_type.shape) > 1 else buffer_type.shape
+    view_type = tl.block_type(buffer_type.element_ty, view_shape)
+    layout = local_allocated_buffers.layout
+    return tlx.buffered_tensor(_builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx), view_type, layout)
