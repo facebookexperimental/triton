@@ -83,7 +83,7 @@ def test_alloc_barriers(BLOCK_SIZE, device):
         pid = tl.program_id(axis=0)
 
         bars = tlx.alloc_barriers(num_barriers=10, arrive_count=2)
-        
+
         tlx.barrier_expect_bytes(tlx.local_view(bars, 0), 128)
 
     torch.manual_seed(0)
@@ -104,7 +104,7 @@ def test_alloc_barriers(BLOCK_SIZE, device):
     not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
     reason="Requires compute capability >= 9 for NV",
 )
-@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_local_alloc_index(BLOCK_SIZE, device):
 
     @triton.jit
