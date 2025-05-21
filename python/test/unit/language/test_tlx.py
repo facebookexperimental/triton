@@ -82,31 +82,22 @@ def test_mbarriers(BLOCK_SIZE, device):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
 
-        # create mbarrier for empty/full
-        bars_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=BLOCK_SIZE)
-        bars_full = tlx.alloc_barriers(num_barriers=1, arrive_count=BLOCK_SIZE)
+        # create mbarrier 
+        bars = tlx.alloc_barriers(num_barriers=1)
 
-        x_empty = tlx.local_view(bars_empty, 0)
-        x_full = tlx.local_view(bars_full, 0)
+        bar = tlx.local_view(bars, 0)
 
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        # Signal x_empty to wait
-        tlx.barrier_wait(bar=x_empty, phase=1)
-        # Signal x_full to expect 1 integer to be copied
-        tlx.barrier_expect_bytes(bar=x_full, size=4)
+        tlx.barrier_arrive(bar=bar)  # Release bar
+
+        tlx.barrier_wait(bar=bar, phase=0)  # Wait bar
 
         x = tl.load(x_ptr + offsets, mask=mask)
 
-        # Signal x_full to wait until it completes
-        tlx.barrier_wait(bar=x_full, phase=tl.constexpr(1))
-
         z = x * x
         tl.store(z_ptr + offsets, z, mask=mask)
-
-        # Release x_empty
-        tlx.barrier_arrive(bar=x_empty, arrive_count=BLOCK_SIZE)
 
     # prepare inputs
     torch.manual_seed(0)
@@ -124,8 +115,8 @@ def test_mbarriers(BLOCK_SIZE, device):
 
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
-    assert (ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2) and (
-        ttgir.count("ttng.barrier_expect") == 1) and (ttgir.count("ttng.arrive_barrier") == 1), f"TTGIR {ttgir}"
+    assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 1) and (
+        ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 1), f"TTGIR {ttgir}"
 
     z_ref = x * x
 

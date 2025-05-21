@@ -6,7 +6,7 @@ from . import types as tlx
 @tl.builtin
 def alloc_barriers(
     num_barriers: tl.constexpr,
-    arrive_count: tl.constexpr,
+    arrive_count: tl.constexpr = tl.constexpr(1),
     _builder=None,
 ) -> tlx.mbarriers:
     """
@@ -40,7 +40,7 @@ def barrier_wait(
     _builder=None,
 ) -> None:
     """
-    Signal a barrier of an expected number of bytes to be copied
+    Wait until the mbarrier phase completes
     """
 
     # TODO. add validator logics
@@ -50,7 +50,7 @@ def barrier_wait(
 @tl.builtin
 def barrier_arrive(
     bar: tlx.buffered_tensor,
-    arrive_count: tl.constexpr,
+    arrive_count: tl.constexpr = tl.constexpr(1),
     _builder=None,
 ) -> None:
     """
