@@ -79,23 +79,20 @@ def test_mbarriers(BLOCK_SIZE, device):
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # prologue
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
-
-        # create mbarrier 
-        bars = tlx.alloc_barriers(num_barriers=1)
-
-        bar = tlx.local_view(bars, 0)
-
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        tlx.barrier_arrive(bar=bar)  # Release bar
+        # mbarrier ops
+        bars = tlx.alloc_barriers(num_barriers=1)  # create 
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar=bar)  # Release 
+        tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
 
-        tlx.barrier_wait(bar=bar, phase=0)  # Wait bar
-
+        # Some arith ops TODO. add WS
         x = tl.load(x_ptr + offsets, mask=mask)
-
         z = x * x
         tl.store(z_ptr + offsets, z, mask=mask)
 
