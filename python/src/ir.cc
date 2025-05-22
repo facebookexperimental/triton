@@ -1835,16 +1835,21 @@ void init_triton_ir(py::module &&m) {
              ArrayRef<Type> dummyTypes;
              return self.create<ttg::WarpReturnOp>();
            })
+      .def("make_swizzled_shared_encoding_attr",
+           [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
+              unsigned maxPhase, std::vector<unsigned> order,
+              unsigned CTAsPerCGA, unsigned CTASplitNum, unsigned CTAOrder) {
+             auto context = self.getBuilder().getContext();
+             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
+                                                      CTASplitNum, CTAOrder);
+             return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
+                 context, vectorSize, perPhase, maxPhase, order, CTALayout));
+           })
       .def("create_local_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type &elementType) -> mlir::Value {
+              Type &elementType, Attribute &encoding) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
-             auto CTALayout =
-                 ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
-                                         /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
-             auto encoding = ttg::SwizzledSharedEncodingAttr::get(
-                 context, 1, 1, 1, {0}, CTALayout);
              auto memDesc =
                  ttg::MemDescType::get(shape, elementType, encoding,
                                        memorySpace, /*mutableMemory=*/true);
@@ -1856,23 +1861,19 @@ void init_triton_ir(py::module &&m) {
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              auto context = self.getBuilder().getContext();
-             auto ctaLayout =
-                 ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
-                                         /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
-             auto encoding = ttg::SwizzledSharedEncodingAttr::get(
-                 context, 1, 1, 1, {0}, ctaLayout);
              Attribute sharedMemorySpace =
                  triton::gpu::SharedMemorySpaceAttr::get(context);
              Type memDescType;
              if (localAllocShape.size() == 1) {
                memDescType = ttg::MemDescType::get(
-                   {1}, localAllocType.getElementType(), encoding,
-                   sharedMemorySpace,
+                   {1}, localAllocType.getElementType(),
+                   localAllocType.getEncoding(), sharedMemorySpace,
                    /*mutableMemory=*/localAllocType.getMutableMemory());
              } else {
                memDescType = ttg::MemDescType::get(
                    localAllocShape.drop_front(),
-                   localAllocType.getElementType(), encoding, sharedMemorySpace,
+                   localAllocType.getElementType(),
+                   localAllocType.getEncoding(), sharedMemorySpace,
                    /*mutableMemory=*/localAllocType.getMutableMemory());
              }
              Value zero = self.create<arith::ConstantIntOp>(0, 32);
