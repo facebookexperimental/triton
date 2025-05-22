@@ -76,6 +76,10 @@ Signal a barrier of an expected number of bytes to be copied.
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task..
 
 
+- `tlx.thread_id(axis)`
+
+    Returns the id of the current thread instance along the given `axis`.
+
 
 
 
@@ -104,7 +108,7 @@ def matmul_kernel_tma_ws_cooperative_hopper(
 
     with tlx.async_tasks():
         # producer group
-        with tl.async_task(num_warps = 4, registers=40)
+        with tlx.async_task(num_warps = 4, registers=40)
             pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
             num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -138,7 +142,7 @@ def matmul_kernel_tma_ws_cooperative_hopper(
                 phase = (buf < NUM_STAGES - 1) ? phase : phase ^ 1
 
         # Two consumer groups
-        with tl.async_task(num_warps = 4, registers=232, replicate=2)
+        with tlx.async_task(num_warps = 4, registers=232, replicate=2)
             phase = 0
             for k in range(0, tl.cdiv(K, BLOCK_K)):
                 # locate the buffer index that current iteration should access
@@ -203,7 +207,7 @@ def matmul_kernel_tma_ws_blackwell(
                 phase = (buf < NUM_STAGES - 1) ? phase : phase ^ 1
 
         # mma group
-        with tl.async_task(num_warps = 1)
+        with tlx.async_task(num_warps = 1)
             phase = 0
             buf = 0
             last_phase = 0
@@ -221,7 +225,7 @@ def matmul_kernel_tma_ws_blackwell(
             tlx.barrier_arrive(barTmemFull[0])
 
         # epilog group
-        with tl.async_task(num_warps = 4)
+        with tlx.async_task(num_warps = 4)
             phase = 0
             tl.barrier_wait(barTmemFull[0], phase)
             c = tlx.tmem_load(acc[0])
