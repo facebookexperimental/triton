@@ -98,7 +98,6 @@ def test_mbarriers(BLOCK_SIZE, device):
 
     # prepare inputs
     torch.manual_seed(0)
-    # size = 98432
     size = 4096
     x = torch.rand(size, device=device)
     z = torch.empty_like(x)
