@@ -5,6 +5,19 @@ from .barrier import *
 from .utility import *
 
 __all__ = [
-    "alloc_barriers", "async_task", "async_tasks", "buffered_tensor", "mbarriers", "local_alloc", "local_view",
-    "barrier_expect", "thread_id"
+    # warp specialization ops
+    "async_task",
+    "async_tasks",
+    # local buffer ops
+    "buffered_tensor", # type
+    "local_alloc",
+    "local_view",
+    # barrier ops
+    "mbarriers", # type
+    "alloc_barriers",
+    "barrier_expect_bytes",
+    "barrier_wait",
+    "barrier_arrive",
+    # debugging ops
+    "thread_id"
 ]
