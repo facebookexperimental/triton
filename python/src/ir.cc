@@ -1929,6 +1929,16 @@ void init_triton_ir(py::module &&m) {
             Value pred = self.create<arith::ConstantIntOp>(1, 1);
             self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
           })
+      .def("create_barrier_wait",
+           [](TritonOpBuilder &self, Value mbarrerLoc, int phase) -> void {
+             Value phaseVal = self.create<arith::ConstantIntOp>(phase, 32);
+             self.create<ttng::WaitBarrierOp>(mbarrerLoc, phaseVal);
+           })
+      .def(
+          "create_barrier_arrive",
+          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
+            self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
+          })
       .def("create_thread_id",
            [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
              static constexpr mlir::gpu::Dimension dims[] = {

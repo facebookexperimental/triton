@@ -70,34 +70,53 @@ def test_async_tasks(BLOCK_SIZE, device):
     reason="Requires compute capability >= 9 for NV",
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-def test_alloc_barriers(BLOCK_SIZE, device):
+def test_mbarriers(BLOCK_SIZE, device):
 
     @triton.jit
-    def add_with_mbarrier(
+    def tlx_square(
         x_ptr,
-        y_ptr,
         z_ptr,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # prologue
         pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
 
-        bars = tlx.alloc_barriers(num_barriers=10, arrive_count=2)
+        # mbarrier ops
+        bars = tlx.alloc_barriers(num_barriers=1)  # create 
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar=bar)  # Release 
+        tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
 
-        tlx.barrier_expect_bytes(tlx.local_view(bars, 0), 128)
+        # Some arith ops TODO. add WS
+        x = tl.load(x_ptr + offsets, mask=mask)
+        z = x * x
+        tl.store(z_ptr + offsets, z, mask=mask)
 
+    # prepare inputs
     torch.manual_seed(0)
-    size = 98432
+    size = 4096
     x = torch.rand(size, device=device)
-    y = torch.rand(size, device=device)
+    z = torch.empty_like(x)
+    z_ref = torch.empty_like(x)
 
-    output = torch.empty_like(x)
-    n_elements = output.numel()
+    n_elements = x.numel()
+
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = add_with_mbarrier[grid](x, y, output, n_elements, BLOCK_SIZE)
 
-    assert kernel.asm["ttgir"].count("ttng.init_barrier") == 10
-    assert kernel.asm["ttgir"].count("ttng.barrier_expect") == 1
+    kernel = tlx_square[grid](x, z, n_elements, BLOCK_SIZE)
+
+    # ASSERT in ttgir
+    ttgir = kernel.asm["ttgir"]
+    assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 1) and (
+        ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 1), f"TTGIR {ttgir}"
+
+    z_ref = x * x
+
+    torch.testing.assert_close(z, z_ref, check_dtype=False)
 
 
 @pytest.mark.skipif(
@@ -117,7 +136,6 @@ def test_local_alloc_index(BLOCK_SIZE, device):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2))
         buffer0 = tlx.local_view(buffers, 0)
         buffer1 = tlx.local_view(buffers, 1)
-
 
     torch.manual_seed(0)
     size = 256
