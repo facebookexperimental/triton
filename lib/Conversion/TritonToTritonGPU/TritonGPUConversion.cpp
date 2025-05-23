@@ -92,7 +92,6 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     MLIRContext &context, TritonGPUTypeConverter &typeConverter)
     : ConversionTarget(context) {
   // TODO: we should also verify ops of TritonGPUDialect
-  addLegalDialect<triton::gpu::TritonGPUDialect>();
 
   // Some ops from SCF are illegal
   addIllegalOp<scf::ExecuteRegionOp, scf::ParallelOp, scf::ReduceOp,
@@ -101,6 +100,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
                              triton::TritonDialect, cf::ControlFlowDialect,
                              scf::SCFDialect, ub::UBDialect,
+                             triton::gpu::TritonGPUDialect,
                              triton::nvidia_gpu::TritonNvidiaGPUDialect>(
       [&](Operation *op) {
         bool hasLegalRegions = true;
@@ -137,4 +137,12 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     }
     return false;
   });
+
+  addDynamicallyLegalOp<triton::gpu::AsyncCopyGlobalToLocalOp>(
+      [&](triton::gpu::AsyncCopyGlobalToLocalOp asyncGlobalToLocal) -> bool {
+        Attribute srcEncoding =
+            dyn_cast<RankedTensorType>(asyncGlobalToLocal.getSrc().getType())
+                .getEncoding();
+        return srcEncoding != nullptr;
+      });
 }

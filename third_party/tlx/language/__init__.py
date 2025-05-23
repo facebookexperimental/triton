@@ -12,6 +12,7 @@ __all__ = [
     "buffered_tensor", # type
     "local_alloc",
     "local_view",
+    "async_load",
     # barrier ops
     "mbarriers", # type
     "alloc_barriers",
