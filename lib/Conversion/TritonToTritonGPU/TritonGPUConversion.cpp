@@ -141,10 +141,8 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   addDynamicallyLegalOp<triton::gpu::AsyncCopyGlobalToLocalOp>(
       [&](triton::gpu::AsyncCopyGlobalToLocalOp asyncGlobalToLocal) -> bool {
         Attribute srcEncoding =
-            cast<RankedTensorType>(asyncGlobalToLocal.getSrc().getType())
+            dyn_cast<RankedTensorType>(asyncGlobalToLocal.getSrc().getType())
                 .getEncoding();
-        // TODO: Is this check too strict? Will it always be a blocked encoding?
-        return srcEncoding &&
-               isa<triton::gpu::BlockedEncodingAttr>(srcEncoding);
+        return srcEncoding != nullptr;
       });
 }
