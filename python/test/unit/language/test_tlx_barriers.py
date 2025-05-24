@@ -46,18 +46,21 @@ def tlx_square_non_ws(
 
     x = tl.load(x_ptr + offsets, mask=mask)  # Do something
 
+    p = 0
     tlx.barrier_arrive(bar=bar)  # Release
-    tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
+    tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
 
     z = x * x  # Do something
 
+    p = p ^ 1
     tlx.barrier_arrive(bar=bar)  # Release
-    tlx.barrier_wait(bar=bar, phase=1)  # Wait (proceed immediately)
+    tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
 
     tl.store(z_ptr + offsets, z, mask=mask)  # Do something
 
+    p = p ^ 1
     tlx.barrier_arrive(bar=bar)  # Release
-    tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
+    tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
 
 
 @triton.jit
@@ -76,18 +79,19 @@ def tlx_square_ws(
     b0 = tlx.local_view(bars, 0)
     b1 = tlx.local_view(bars, 1)
 
-    tlx.barrier_arrive(bar=b1)  # Kick off the 1st release to proceed the wait
-
+    phase = 0
     with tlx.async_tasks():
         with tlx.async_task("default"):
-            tlx.barrier_wait(bar=b1, phase=0)
+
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
 
             # Placeholder block to do something
 
             tlx.barrier_arrive(bar=b0)  # Release
 
         with tlx.async_task(num_warps=4):
-            tlx.barrier_wait(bar=b0, phase=0)  # Wait (proceed immediately)
+
+            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
 
             # Some arith ops TODO. add WS
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -95,6 +99,8 @@ def tlx_square_ws(
             x = tl.load(x_ptr + offsets, mask=mask)
             z = x * x
             tl.store(z_ptr + offsets, z, mask=mask)
+
+            tlx.barrier_arrive(bar=b0)  # Wait
 
 
 @triton.jit
@@ -158,7 +164,7 @@ def run_tlx_square(func, BLOCK_SIZE, device):
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 # def test_mbarriers(BLOCK_SIZE, device):
-def test_wait_arrive_no_ws(BLOCK_SIZE, device):
+def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device)
 
     # ASSERT in ttgir

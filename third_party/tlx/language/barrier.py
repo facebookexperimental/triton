@@ -5,9 +5,9 @@ from . import types as tlx
 
 @tl.builtin
 def alloc_barriers(
-    num_barriers: tl.constexpr,
-    arrive_count: tl.constexpr = tl.constexpr(1),
-    _builder=None,
+        num_barriers: tl.constexpr,
+        arrive_count: tl.constexpr = tl.constexpr(1),
+        _builder=None,
 ) -> tlx.mbarriers:
     """
     Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
@@ -36,7 +36,7 @@ def barrier_expect_bytes(
 @tl.builtin
 def barrier_wait(
     bar: tlx.buffered_tensor,
-    phase: tl.constexpr,
+    phase,
     _builder=None,
 ) -> None:
     """
@@ -44,14 +44,25 @@ def barrier_wait(
     """
 
     # TODO. add validator logics
-    _builder.create_barrier_wait(bar.handle, phase.value)
+
+    # TODO. Need to improve phase typing so that both of following usages would work:
+    # Case 1.
+    #   tlx.barrier_wait(b, 0)
+    # Case 2.
+    #   p=0
+    #   tlx.barrier_wait(b, p)
+    #  Now we just ensure case 2 works to support use case in WS-GEMM
+    assert type(
+        phase
+    ) == tl.tensor, "Users are suggested passing by `phase=<variable>` instead of `phase=<const>` (such as phase=0)"
+    _builder.create_barrier_wait(bar.handle, phase.handle)
 
 
 @tl.builtin
 def barrier_arrive(
-    bar: tlx.buffered_tensor,
-    arrive_count: tl.constexpr = tl.constexpr(1),
-    _builder=None,
+        bar: tlx.buffered_tensor,
+        arrive_count: tl.constexpr = tl.constexpr(1),
+        _builder=None,
 ) -> None:
     """
     Perform the arrive operation on an mbarrier
