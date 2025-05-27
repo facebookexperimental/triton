@@ -45,17 +45,12 @@ def barrier_wait(
 
     # TODO. add validator logics
 
-    # TODO. Need to improve phase typing so that both of following usages would work:
-    # Case 1.
-    #   tlx.barrier_wait(b, 0)
-    # Case 2.
-    #   p=0
-    #   tlx.barrier_wait(b, p)
-    #  Now we just ensure case 2 works to support use case in WS-GEMM
-    assert type(
-        phase
-    ) == tl.tensor, "Users are suggested passing by `phase=<variable>` instead of `phase=<const>` (such as phase=0)"
-    _builder.create_barrier_wait(bar.handle, phase.handle)
+    if isinstance(phase, tl.tensor):
+        _builder.create_barrier_wait(bar.handle, phase.handle)
+    elif isinstance(phase, tl.constexpr):
+        _builder.create_barrier_wait(bar.handle, phase.value)
+    else:
+        raise RuntimeError(f"`phase` is in type {type(phase)} (must be either `tl.tensor` or `tl.constexpr`)")
 
 
 @tl.builtin

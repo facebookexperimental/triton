@@ -60,7 +60,7 @@ def tlx_square_non_ws(
 
     p = p ^ 1
     tlx.barrier_arrive(bar=bar)  # Release
-    tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
+    tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
 
 
 @triton.jit
