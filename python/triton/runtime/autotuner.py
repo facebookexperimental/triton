@@ -4,6 +4,7 @@ import builtins
 import os
 import time
 import inspect
+from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
 from .jit import KernelInterface
@@ -97,6 +98,7 @@ class Autotuner(KernelInterface):
         while not inspect.isfunction(self.base_fn):
             self.base_fn = self.base_fn.fn
 
+        self._do_bench = do_bench
         self.num_warmups = warmup
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
@@ -110,7 +112,7 @@ class Autotuner(KernelInterface):
                           stacklevel=1)
             if use_cuda_graph:
                 from ..testing import do_bench_cudagraph
-                self.do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
+                self._do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
                     kernel_call,
                     rep=rep if rep is not None else 100,
                     quantiles=quantiles,
@@ -118,7 +120,7 @@ class Autotuner(KernelInterface):
                 return
 
             import triton.testing
-            self.do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
+            self._do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
                 kernel_call,
                 warmup=warmup if warmup is not None else 25,
                 rep=rep if rep is not None else 100,
@@ -126,10 +128,11 @@ class Autotuner(KernelInterface):
             )
             return
 
-        if do_bench is None:
-            self.do_bench = driver.active.get_benchmarker()
-        else:
-            self.do_bench = do_bench
+    @cached_property
+    def do_bench(self):
+        if self._do_bench is None:
+            return driver.active.get_benchmarker()
+        return self._do_bench
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
