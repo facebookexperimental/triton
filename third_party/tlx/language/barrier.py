@@ -59,3 +59,15 @@ def barrier_arrive(
 
     # TODO. add validator logics
     _builder.create_barrier_arrive(bar.handle, arrive_count.value)
+
+
+@tl.builtin
+def barrier_synchronize(
+    _builder=None,
+) -> None:
+    """
+    Synchronizes all work items of a workgroup
+    """
+
+    # TODO. add validator logics
+    _builder.create_barrier(bar.handle)
