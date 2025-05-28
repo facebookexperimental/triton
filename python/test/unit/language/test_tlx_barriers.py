@@ -103,39 +103,6 @@ def tlx_square_ws(
             tlx.barrier_arrive(bar=b0)  # Wait
 
 
-@triton.jit
-def tlx_square_ws_phase(
-    x_ptr,
-    z_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    # prologue
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-
-    # mbarrier ops
-    bars = tlx.alloc_barriers(num_barriers=2)  # create
-    b0 = tlx.local_view(bars, 0)
-    b1 = tlx.local_view(bars, 0)
-
-    with tlx.async_tasks():
-        with tlx.async_task("default"):
-            tlx.barrier_arrive(bar=b0)  # Release b0
-
-        with tlx.async_task(num_warps=4):
-            tlx.barrier_wait(bar=b0, phase=0)  # Wait b0
-
-            # Some arith ops TODO. add WS
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_elements
-            x = tl.load(x_ptr + offsets, mask=mask)
-            z = x * x
-            tl.store(z_ptr + offsets, z, mask=mask)
-
-            tlx.barrier_arrive(bar=b1, phase=0)  # Wait b0
-
-
 def run_tlx_square(func, BLOCK_SIZE, device):
 
     # prepare inputs

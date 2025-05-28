@@ -50,17 +50,51 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ### Barrier operations
 
-- `barriers = tlx.alloc_barrier(num_barriers, expected_count)`
+- `barriers = tlx.alloc_barrier(num_barriers, arrive_count=1)`
 
-    Allocate a specified number of barrier objects in the local memory.
+    Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
+
+    Input:
+    - `num_barriers`: The number of barriers to allocate.
+    - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
 
 - `tlx.barrier_wait(bar, phase)`
 
-- `tlx.barrier_arrive(bar)`
+    Wait until the mbarrier phase completes
+
+- `tlx.barrier_arrive(bar, arrive_count=1)`
+
+    Perform the arrive operation on an mbarrier
 
 - `tlx.barrier_expect_bytes(bar, bytes)`
 
-Signal a barrier of an expected number of bytes to be copied.
+  Signal a barrier of an expected number of bytes to be copied.
+
+Examples: how mbarriers are communicated in warp specialization
+```
+    phase = 0
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+
+            # Placeholder block to do something
+
+            tlx.barrier_arrive(bar=b0)  # Release
+
+        with tlx.async_task(num_warps=4):
+
+            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
+
+            # Some arith ops TODO. add WS
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x = tl.load(x_ptr + offsets, mask=mask)
+            z = x * x
+            tl.store(z_ptr + offsets, z, mask=mask)
+
+            tlx.barrier_arrive(bar=b0)  # Wait
+```
 
 
 ### Warp Specialization operations

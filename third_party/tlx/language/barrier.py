@@ -1,5 +1,7 @@
 import triton.language.core as tl
 
+from triton.language.semantic import _convert_elem_to_ir_value
+
 from . import types as tlx
 
 
@@ -48,7 +50,7 @@ def barrier_wait(
     if isinstance(phase, tl.tensor):
         _builder.create_barrier_wait(bar.handle, phase.handle)
     elif isinstance(phase, tl.constexpr):
-        _builder.create_barrier_wait(bar.handle, phase.value)
+        _builder.create_barrier_wait(bar.handle, _convert_elem_to_ir_value(_builder, phase.value, require_i64=False))
     else:
         raise RuntimeError(f"`phase` is in type {type(phase)} (must be either `tl.tensor` or `tl.constexpr`)")
 
