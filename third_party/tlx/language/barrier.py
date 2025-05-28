@@ -1,13 +1,15 @@
 import triton.language.core as tl
 
+from triton.language.semantic import _convert_elem_to_ir_value
+
 from . import types as tlx
 
 
 @tl.builtin
 def alloc_barriers(
-    num_barriers: tl.constexpr,
-    arrive_count: tl.constexpr = tl.constexpr(1),
-    _builder=None,
+        num_barriers: tl.constexpr,
+        arrive_count: tl.constexpr = tl.constexpr(1),
+        _builder=None,
 ) -> tlx.mbarriers:
     """
     Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
@@ -36,7 +38,7 @@ def barrier_expect_bytes(
 @tl.builtin
 def barrier_wait(
     bar: tlx.buffered_tensor,
-    phase: tl.constexpr,
+    phase,
     _builder=None,
 ) -> None:
     """
@@ -44,14 +46,20 @@ def barrier_wait(
     """
 
     # TODO. add validator logics
-    _builder.create_barrier_wait(bar.handle, phase.value)
+
+    if isinstance(phase, tl.tensor):
+        _builder.create_barrier_wait(bar.handle, phase.handle)
+    elif isinstance(phase, tl.constexpr):
+        _builder.create_barrier_wait(bar.handle, _convert_elem_to_ir_value(_builder, phase.value, require_i64=False))
+    else:
+        raise RuntimeError(f"`phase` is in type {type(phase)} (must be either `tl.tensor` or `tl.constexpr`)")
 
 
 @tl.builtin
 def barrier_arrive(
-    bar: tlx.buffered_tensor,
-    arrive_count: tl.constexpr = tl.constexpr(1),
-    _builder=None,
+        bar: tlx.buffered_tensor,
+        arrive_count: tl.constexpr = tl.constexpr(1),
+        _builder=None,
 ) -> None:
     """
     Perform the arrive operation on an mbarrier
