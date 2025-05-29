@@ -22,6 +22,7 @@ option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
 option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
 option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
 option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
+option(TRITON_BUILD_TLX "Build Triton TLX" ON)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 
 if(TRITON_BUILD_WITH_CCACHE)
@@ -207,6 +208,12 @@ if(TRITON_BUILD_PYTHON_MODULE)
   list(APPEND TRITON_PLUGIN_NAMES "proton")
   add_subdirectory(third_party/proton/dialect)
 
+  if (TRITON_BUILD_TLX)
+    add_subdirectory(third_party/tlx)
+  endif()
+  list(APPEND TRITON_PLUGIN_NAMES "tlx")
+  add_subdirectory(third_party/tlx/dialect)
+
   get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
   get_property(triton_plugins GLOBAL PROPERTY TRITON_PLUGINS)
   set(TRITON_LIBRARIES
@@ -318,6 +325,7 @@ if(NOT TRITON_BUILD_PYTHON_MODULE)
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
   add_subdirectory(third_party/proton/dialect)
+  add_subdirectory(third_party/tlx/dialect)
 endif()
 
 find_package(Threads REQUIRED)

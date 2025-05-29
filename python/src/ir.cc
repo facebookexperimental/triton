@@ -38,8 +38,7 @@
 #include "llvm/Support/SourceMgr.h"
 
 #include "third_party/proton/dialect/include/Dialect/Proton/IR/Dialect.h"
-
-namespace {
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 
 namespace py = pybind11;
 using namespace mlir;
@@ -47,6 +46,12 @@ using namespace triton;
 namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+namespace ir {
+
+// Pointer to the TritonOpBuilder class, used to register IR ops for third-party
+// dialects.
+static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
+py::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
 
 llvm::raw_fd_ostream &mlir_dumps() {
   std::error_code EC;
@@ -191,11 +196,12 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
   return result;
 }
 
-} // anonymous namespace
+} // namespace ir
 
 /*****************************************************************************/
 /* Python bindings for ir                                                    */
 /*****************************************************************************/
+using namespace ir;
 
 void init_triton_ir(py::module &&m) {
   using ret = py::return_value_policy;
@@ -303,7 +309,7 @@ void init_triton_ir(py::module &&m) {
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
                     ::mlir::triton::proton::ProtonDialect, LLVM::LLVMDialect,
-                    mlir::ub::UBDialect>();
+                    mlir::ub::UBDialect, ::mlir::triton::tlx::TLXDialect>();
     mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);
@@ -717,8 +723,12 @@ void init_triton_ir(py::module &&m) {
 
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  py::class_<TritonOpBuilder>(m, "builder", py::module_local(),
-                              py::dynamic_attr())
+  // The static builderClass object persists throughout the compilation,
+  // allowing third-party backends to register their ops separately.
+  static py::class_<TritonOpBuilder> builderClass(
+      m, "builder", py::module_local(), py::dynamic_attr());
+  builderClassPtr = &builderClass;
+  builderClass
       .def(py::init<MLIRContext *>())
       // getters
       .def("create_module",
