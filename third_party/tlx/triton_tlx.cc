@@ -22,4 +22,27 @@ void init_triton_tlx(py::module &&m) {
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
+
+  // py::class_<TritonOpBuilder>(m, "builder", py::module_local(),
+  //                             py::dynamic_attr())
+  //     .def(py::init<MLIRContext *>())
+  //     .def("create_convert_layout",
+  //          [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value
+  //          {
+  //            Type newType;
+  //            if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+  //              newType = ttg::MemDescType::get(
+  //                  type.getShape(), type.getElementType(), encoding,
+  //                  type.getMemorySpace(), type.getMutableMemory());
+  //            } else if (auto type = dyn_cast<RankedTensorType>(v.getType()))
+  //            {
+  //              newType = RankedTensorType::get(type.getShape(),
+  //                                              type.getElementType(),
+  //                                              encoding);
+  //            } else {
+  //              throw std::runtime_error("Unsupported type");
+  //            }
+  //            newType.dump();
+  //            return self.create<ttg::ConvertLayoutOp>(newType, v);
+  //          });
 }
