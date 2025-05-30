@@ -211,6 +211,8 @@ if(TRITON_BUILD_PYTHON_MODULE)
   if (TRITON_BUILD_TLX)
     add_subdirectory(third_party/tlx)
   endif()
+  list(APPEND TRITON_PLUGIN_NAMES "tlx")
+  add_subdirectory(third_party/tlx/dialect)
 
   get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
   get_property(triton_plugins GLOBAL PROPERTY TRITON_PLUGINS)

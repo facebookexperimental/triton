@@ -1,7 +1,2 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/dialect/include)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/dialect/include)
-add_subdirectory(dialect)
-if(TRITON_BUILD_PYTHON_MODULE)
-  add_triton_plugin(TritonTLX ${CMAKE_CURRENT_SOURCE_DIR}/triton_tlx.cc)
-  target_link_libraries(TritonTLX PRIVATE Python3::Module pybind11::headers)
-endif()

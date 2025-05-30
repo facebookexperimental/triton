@@ -28,8 +28,6 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
 
   let results = (outs TTG_MemDescType:$result);
 
-  let hasCanonicalizer = 1;
-
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
