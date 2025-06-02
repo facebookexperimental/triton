@@ -46,6 +46,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_F32_DEFAULT",
     "ENABLE_MMA_V5_ATT_PIPELINE",
     "ENABLE_PINGPONG",
+    "TRITON_WS_BARRIER_DEBUG"
     // clang-format on
 };
 
