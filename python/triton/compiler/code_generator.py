@@ -581,6 +581,7 @@ class CodeGenerator(ast.NodeVisitor):
             return
         assert isinstance(target, ast.Name)
         self.set_value(self.visit(target), value)
+        print("Var Name: ", target.id)
 
     def visit_Assign(self, node):
         # construct values to assign
