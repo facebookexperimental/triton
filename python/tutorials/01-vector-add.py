@@ -42,6 +42,7 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
     # would each access the elements [0:64, 64:128, 128:192, 192:256].
     # Note that offsets is a list of pointers:
     block_start = pid * BLOCK_SIZE
+    # test change
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     # Create a mask to guard memory operations against out-of-bounds accesses.
     mask = offsets < n_elements
