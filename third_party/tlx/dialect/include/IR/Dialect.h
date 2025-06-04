@@ -17,7 +17,7 @@
 
 namespace mlir {
 namespace triton {
-namespace tlx {} // namespace proton
+namespace tlx {} // namespace tlx
 } // namespace triton
 } // namespace mlir
 
