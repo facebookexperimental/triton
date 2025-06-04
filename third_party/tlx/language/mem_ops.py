@@ -1,12 +1,14 @@
 import triton.language.core as tl
 from triton.language.semantic import (
     _convert_elem_to_ir_value,
+    _convert_to_ir_values,
     _str_to_load_cache_modifier,
     _str_to_eviction_policy,
 )
 
 from . import types as tlx
 from .utility import cuda_parse_arch
+from .mma_ops import require_nv_mma_shared_layout
 from typing import Optional, Tuple
 
 
@@ -178,3 +180,51 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _builder=
 
     permuted_handle = _builder.create_memdesc_trans(input.handle, dims)
     return input.make_permute(permuted_handle, dims)
+
+@tl.builtin
+def async_descriptor_load(
+    desc: tl.tensor_descriptor_base,
+    result: tlx.buffered_tensor,
+    offsets : list[tl.tensor],
+    barrier: tlx.mbarriers,
+    cache_modifier: str = "",
+    eviction_policy: str = "",
+    _builder=None,
+) -> None:
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    # Requires a row-major layout for TMA only supports continuous memory access
+    result_handle = require_nv_mma_shared_layout(result, [1,0], _builder)
+    offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
+    cache = _str_to_load_cache_modifier(cache_modifier)
+    eviction = _str_to_eviction_policy(eviction_policy)
+    _builder.create_async_TMA_load(
+        desc.handle,
+        offsets,
+        barrier.handle,
+        result_handle,
+        cache,
+        eviction,
+        False)
+
+
+@tl.builtin
+def async_descriptor_store(
+    desc: tl.tensor_descriptor_base,
+    source: tlx.buffered_tensor,
+    offsets : list[tl.tensor],
+    _builder=None,
+) -> None:
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    # Requires a row-major layout for TMA only supports continuous memory access
+    source_handle = require_nv_mma_shared_layout(source, [1,0], _builder)
+    offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
+    _builder.create_async_TMA_store(
+        desc.handle,
+        offsets,
+        source_handle)

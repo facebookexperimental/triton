@@ -44,6 +44,9 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<unsigned> CTAsPerCGA,
               std::vector<unsigned> CTASplitNum,
               std::vector<unsigned> CTAOrder) {
+             assert(order.size() == CTAsPerCGA.size() && "shape mismatch");
+             assert(order.size() == CTASplitNum.size() && "shape mismatch");
+             assert(order.size() == CTAOrder.size() && "shape mismatch");
              auto context = self.getBuilder().getContext();
              auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
                                                       CTASplitNum, CTAOrder);
@@ -129,6 +132,23 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &arg,
               std::vector<int32_t> order) -> mlir::Value {
              return self.create<ttg::MemDescTransOp>(arg, order);
+           })
+      .def("create_async_TMA_load",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
+              Value mbarrier, Value result, CacheModifier cacheModifier,
+              EvictionPolicy evictionPolicy, bool isVolatile) -> void {
+             Value tmaPtr = self.create<ttng::TensorDescToTMAPtrOp>(desc);
+             Value pred = self.create<arith::ConstantIntOp>(1, 1);
+             self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
+                 tmaPtr, coord, mbarrier, result, pred, cacheModifier,
+                 evictionPolicy, isVolatile);
+           })
+      .def("create_async_TMA_store",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
+              Value source) -> void {
+             Value tmaPtr = self.create<ttng::TensorDescToTMAPtrOp>(desc);
+             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(tmaPtr, coord,
+                                                            source);
            });
 }
 

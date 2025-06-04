@@ -46,9 +46,15 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ### Async memory access
 
-- `buffer = tlx.async_descriptor_load(memdesc, [offsets], barrier)`
+
+- `tlx.async_descriptor_load(memdesc, buffer, [offsets], barrier, cache_modifier, eviction_policy, is_volatile)`
 
    Load a chunk of data from global memory into a local memory buffer. The global address, strides, and buffer size are defined by the memory descriptor. A barrier object is provided and signaled upon completion of the operation.
+
+
+- `tlx.async_descriptor_store(memdesc, buffer, [offsets])`
+
+   Store a chunk of data from local memory into global memory buffer. The global address, strides, and buffer size are defined by the memory descriptor.
 
 
 - `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`

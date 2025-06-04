@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_cuda
 import triton.tlx.language as tlx
+from typing import Optional
 
 
 @pytest.mark.skipif(
@@ -485,3 +486,73 @@ def test_wait_arrive_ws(BLOCK_SIZE, device):
             == 2) and (ttgir.count("ttng.wait_barrier") == 2) and (ttgir.count("ttng.barrier_expect") == 0) and (
                 ttgir.count("ttng.arrive_barrier")
                 == 2) and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1), f"TTGIR {ttgir}"
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+def test_descriptor_load(device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_load_kernel(
+        input_ptr,
+        output_ptr,
+        M, N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        triton.cdiv(N, BLOCK_SIZE_N)
+    )
+
+    # TODO: remove exception handling once layout propagation is implemented
+    with pytest.raises(RuntimeError) as _:
+        kernel = descriptor_load_kernel[grid](
+            x, y, M, N,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+        assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
+        assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
+        torch.testing.assert_close(x, y)
