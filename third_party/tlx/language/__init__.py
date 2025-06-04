@@ -3,6 +3,7 @@ from .types import *
 from .mem_ops import *
 from .barrier import *
 from .utility import *
+from .mma_ops import *
 
 __all__ = [
     # warp specialization ops
