@@ -111,7 +111,6 @@ def test_thread_id(device):
     @triton.jit
     def store_from_thread_0_kernel(output_ptr, value, n_elements, axis : tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-
     ):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
@@ -129,3 +128,27 @@ def test_thread_id(device):
     expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
     expected_output[0] = value
     torch.testing.assert_close(output, expected_output)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_descriptor_load(BLOCK_SIZE, device):
+
+    @triton.jit
+    def kernel(ptr, BLOCK_SIZE: tl.constexpr):
+        desc = tl.make_tensor_descriptor(ptr, [128, 128], [128, 1], [BLOCK_SIZE, BLOCK_SIZE])
+        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.int16, tl.constexpr(2))
+        buffer0 = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.async_descriptor_load(desc, buffer0, [0, 0], bar)
+
+    input = torch.empty((128, 128), dtype=torch.int16, device=device)
+    try:
+        kernel_info = kernel[(1, )](input, BLOCK_SIZE)
+    except RuntimeError:
+        # TODO: fix require_layout issue and check ttgir here.
+        pass

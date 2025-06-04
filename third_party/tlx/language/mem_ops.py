@@ -2,6 +2,7 @@ from typing import Optional
 import triton.language.core as tl
 from triton.language.semantic import (
     _convert_elem_to_ir_value,
+    _convert_to_ir_values,
     _str_to_load_cache_modifier,
     _str_to_eviction_policy,
 )
@@ -81,22 +82,48 @@ def async_load(
     eviction_policy: str = "",
     is_volatile: bool = False,
     _builder=None,
-) -> tlx.buffered_tensor:
+) -> None:
     """
     Loads buffer from global to local memory asynchronously.
     """
     cache = _str_to_load_cache_modifier(cache_modifier)
     eviction = _str_to_eviction_policy(eviction_policy)
-    return tlx.buffered_tensor(
-        _builder.create_async_load(
-            src.handle,
-            result.handle,
-            mask.handle if mask else None,
-            other.handle if other else None,
-            cache,
-            eviction,
-            is_volatile,
-        ),
-        result.type,
-        result.layout,
+    _builder.create_async_load(
+        src.handle,
+        result.handle,
+        mask.handle if mask else None,
+        other.handle if other else None,
+        cache,
+        eviction,
+        is_volatile,
     )
+
+
+@tl.builtin
+def async_descriptor_load(
+    desc: tl.tensor_descriptor_base,
+    result: tlx.buffered_tensor,
+    offsets : list[tl.tensor],
+    barrier: tlx.mbarriers,
+    cache_modifier: str = "",
+    eviction_policy: str = "",
+    _builder=None,
+) -> None:
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+
+    # TODO: require buffer layout to be NVMMASharedEncodingAttr
+    # layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(...)
+    # result = _builder.create_require_layout(result.handle, layout_handle)
+    offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
+    cache = _str_to_load_cache_modifier(cache_modifier)
+    eviction = _str_to_eviction_policy(eviction_policy)
+    _builder.create_async_TMA_load(
+        desc.handle,
+        offsets,
+        barrier.handle,
+        result.handle,
+        cache,
+        eviction,
+        False)
