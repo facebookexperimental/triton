@@ -82,6 +82,16 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
             CTASplitM=1,
             CTASplitN=1,
         )
+class nv_mma_shared_layout_encoding(shared_layout_encoding):
+    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
+        super().__init__()
+        self.shape = shape
+        self.order = order
+        self.elemType = elemType
+        self.numCTAsPerCGA = numCTAsPerCGA
+        self.numCTASplit = numCTASplit
+        self.numCTAOrder = numCTAOrder
+        self.fp4Padded = fp4Padded
 
     def build(self, builder):
         pass

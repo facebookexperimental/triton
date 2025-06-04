@@ -1758,7 +1758,11 @@ void init_triton_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
+<<<<<<< HEAD
       .def("make_nv_mma_shared_encoding_attr",
+=======
+      .def("make_nv_mma_shared_shared_encoding_attr",
+>>>>>>> 79f839e6 (create test_tlx_wgmma to begin)
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               std::vector<unsigned> order, Type &elemType,
               std::vector<unsigned> CTAsPerCGA,
@@ -1770,6 +1774,7 @@ void init_triton_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
                  context, shape, order, CTALayout, elemType, fp4Padded));
            })
+<<<<<<< HEAD
       .def("make_nv_mma_encoding_attr",
            [](TritonOpBuilder &self) {
              auto context = self.getBuilder().getContext();
@@ -1787,6 +1792,8 @@ void init_triton_ir(py::module &&m) {
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
            })
+=======
+>>>>>>> 79f839e6 (create test_tlx_wgmma to begin)
       .def("create_local_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding) -> mlir::Value {
@@ -1912,6 +1919,21 @@ void init_triton_ir(py::module &&m) {
              return self.create<ttng::WarpGroupDotOp>(
                  c.getType(), a, b, c, nullptr, inputPrecision,
                  maxNumImpreciseAcc, isAsync);
+      .def("create_convert_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             Type newType;
+             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+               newType = ttg::MemDescType::get(
+                   type.getShape(), type.getElementType(), encoding,
+                   type.getMemorySpace(), type.getMutableMemory());
+             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+               newType = RankedTensorType::get(type.getShape(),
+                                               type.getElementType(), encoding);
+             } else {
+               throw std::runtime_error("Unsupported type");
+             }
+             newType.dump();
+             return self.create<ttg::ConvertLayoutOp>(newType, v);
            })
       // Proton Ops
       .def("create_proton_record",

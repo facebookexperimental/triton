@@ -30,13 +30,13 @@ def test_async_dot(device):
 
     @triton.jit
     def tgt_kernel(
-        X, stride_xm, stride_xk, 
-        Y, stride_yk, stride_yn, 
+        X, stride_xm, stride_xk,
+        Y, stride_yk, stride_yn,
         Z, stride_zm, stride_zn,
-        BLOCK_M: tl.constexpr, 
-        BLOCK_N: tl.constexpr, 
-        BLOCK_K: tl.constexpr, 
-        INPUT_PRECISION: tl.constexpr, 
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
         out_dtype: tl.constexpr = tl.float32
     ):
         dummy_output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -65,4 +65,3 @@ def test_async_dot(device):
     }
     pgm = tgt_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1), **kern_kwargs)
 
-    assert False
