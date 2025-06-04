@@ -129,8 +129,6 @@ class buffered_tensor(tl.base_value):
         self.order = None
 
 
-
-
 class mbarriers(buffered_tensor):
     """
     Define mbarrier type derived from buffered_tensor to support barrier specific operations/validations
