@@ -90,4 +90,16 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   }];
 }
 
+def TritonTTIRHelloWorld : Pass</*cli-arg*/"triton-ttir-peephole", /*Op*/"mlir::ModuleOp"> {
+  let summary = "A foo pass that print hello world or var name infos";
+  let description = [{
+    This pass does nothing but only print
+  }];
+
+  let constructor = "mlir::triton::createTritonTTIRHelloWorldPass()";
+
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
+
 #endif
