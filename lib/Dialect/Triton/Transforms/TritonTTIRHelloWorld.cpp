@@ -23,7 +23,11 @@ private:
 
 public:
   void runOnOperation() override {
-    std::cout << "Hello, the operation ur visiting is: \n" << std::endl;
+    Operation* op = getOperation();
+    llvm::outs() << "[HelloWorld] Hello! Entering the TritonTTIRHelloWorld Pass: \n";
+    llvm::outs() << "[HelloWorld] op->getName() returns: " << op->getName() << "\n";
+    llvm::outs() << "[HelloWorld] op->getLoc() returns: " << op->getLoc() << "\n";
+    llvm::outs() << "[HelloWorld] op->dump() returns: " << "\n" ;
     op->dump();
   }
 };
