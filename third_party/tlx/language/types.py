@@ -38,10 +38,10 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             perPhase=1,
             maxPhase=1,
             order=list(range(rank)),
-            numCTAs=1,
-            numCTAsPerCGA=1,
-            numCTASplit=1,
-            numCTAOrder=1,
+            numCTAs=[1] * rank,
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=[1] * rank,
         )
 
     def build(self, builder):
