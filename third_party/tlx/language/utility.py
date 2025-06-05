@@ -1,6 +1,15 @@
 import triton.language.core as tl
 
 from . import types as tlx
+import re
+
+
+def cuda_parse_arch(arch):
+    pattern = r"^sm(\d+)$"
+    match = re.fullmatch(pattern, arch)
+    if not match:
+        raise ValueError(f"TRITON_OVERRIDE_ARCH must have the form {pattern}")
+    return int(match.group(1))
 
 @tl.builtin
 def thread_id(axis, _builder=None):
