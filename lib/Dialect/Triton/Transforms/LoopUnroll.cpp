@@ -37,12 +37,6 @@ class LoopUnrollPass : public impl::TritonLoopUnrollBase<LoopUnrollPass> {
 public:
   void runOnOperation() override {
     llvm::outs() << "[LoopUnroll.cpp] Entering the loop unrolling passes: \n";
-    Operation* op = getOperation();
-    llvm::outs() << "[LoopUnroll.cpp] Hello! Entering the LoopUnroll Pass: \n";
-    llvm::outs() << "[LoopUnroll.cpp] op->getName() returns: " << op->getName() << "\n";
-    llvm::outs() << "[LoopUnroll.cpp] op->getLoc() returns: " << op->getLoc() << "\n";
-    llvm::outs() << "[LoopUnroll.cpp] op->dump() returns: " << "\n" ;
-    op->dump();
 
     LDBG("Loop unroll pass");
     SmallVector<scf::ForOp, 4> loops;

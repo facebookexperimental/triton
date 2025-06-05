@@ -31,7 +31,7 @@ class LoopInvariantCodeMotionPass
   }
 
   void runOnOperation() override {
-    llvm::outs() << "[Test] Entering the loop inv code motion passes: \n";
+    llvm::outs() << "[LoopInvariantCodeMotion.cpp] Entering the loop inv code motion passes: \n";
 
     // Walk through all loops in a function in innermost-loop-first order.
     // This way, we first LICM from the inner loop, and place the ops in the
