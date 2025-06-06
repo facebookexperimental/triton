@@ -25,6 +25,15 @@ void init_triton_tlx_ir(py::module &&m) {
               }
               return self.create<tlx::RequireLayoutOp>(newType, v);
             })
+      .def("create_local_load",
+           [](TritonOpBuilder &self, Value subView,
+              std::optional<Value> asyncWaitToken) -> mlir::Value {
+             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+             auto newType = RankedTensorType::get(subViewType.getShape(),
+                                                  subViewType.getElementType());
+             return self.create<ttg::LocalLoadOp>(
+                 newType, subView, asyncWaitToken.value_or(Value()));
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               bool unpacked, unsigned CTASplitM, unsigned CTASplitN) {

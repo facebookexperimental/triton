@@ -76,6 +76,7 @@ def test_local_alloc_index(BLOCK_SIZE, device):
     def local_alloc_index(
         x_ptr,
         y_ptr,
+        output_ptr,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
@@ -94,20 +95,22 @@ def test_local_alloc_index(BLOCK_SIZE, device):
         x_local = tlx.local_load(buffer0)
         y_local = tlx.local_load(buffer1)
         local_add = x_local + y_local
-        # TODO(Arda): Local loads and the add get optimized away by the
-        # canonicalizer. Update the test once we have the stores.
+        tl.store(output_ptr + offsets, local_add, mask=mask)
 
     torch.manual_seed(0)
     size = 256
-    x = torch.rand(size, device=device)
-    y = torch.rand(size, device=device)
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    y = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
     n_elements = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = local_alloc_index[grid](x, y, n_elements, BLOCK_SIZE)
+    kernel = local_alloc_index[grid](x, y, output, n_elements, BLOCK_SIZE)
     assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
     assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 2
     assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
-    # TODO(Arda): Once we have the stores, add numerical checks here
+    assert kernel.asm["ttgir"].count("ttg.local_load") == 2
+    # TODO(Arda): Once we have the layout propagation pass, add numerical checks
+    # here
 
 
 @pytest.mark.skipif(
