@@ -87,11 +87,11 @@ def local_view(
         buffer_type.shape[1:] if len(buffer_type.shape) > 1 else buffer_type.shape
     )
     view_type = tl.block_type(buffer_type.element_ty, view_shape)
-    layout = local_allocated_buffers.layout
     return tlx.buffered_tensor(
         _builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx),
         view_type,
-        layout,
+        local_allocated_buffers.storage,
+        local_allocated_buffers.layout,
     )
 
 
@@ -162,3 +162,36 @@ def local_load(
     Loads buffer from local memory into a distributed tensor.
     """
     return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)
+
+
+@tl.builtin
+def local_trans(
+    input: tlx.buffered_tensor,
+    dims,
+    _builder=None
+) -> tlx.buffered_tensor:
+    """
+        Permutes the dimensions of a tensor.
+
+        If the parameter :code:`dims` is not specified, the function defaults to a (1,0) permutation,
+        effectively transposing a 2D tensor.
+
+        :param input: The input tensor.
+        :param dims: The desired ordering of dimensions.  For example,
+            :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
+
+        :code:`dims` can be passed as a tuple or as individual parameters: ::
+
+            # These are equivalent
+            trans(x, (2, 1, 0))
+            trans(x, 2, 1, 0)
+    """
+    if not dims:
+        dims = (1, 0)
+    if len(input.shape) != len(dims):
+        raise ValueError("permute dims must have the same length as input shape")
+    if sorted(tl._unwrap_if_constexpr(d) for d in dims) != list(range(len(dims))):
+        raise ValueError(f"permute dims must be a permutation of 0, 1, ..., n-1, but were {dims}")
+
+    permuted_handle = _builder.create_memdesc_trans(input.handle, dims)
+    return input.make_permute(permuted_handle, dims)

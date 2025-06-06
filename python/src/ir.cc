@@ -1748,16 +1748,6 @@ void init_triton_ir(py::module &&m) {
              ArrayRef<Type> dummyTypes;
              return self.create<ttg::WarpReturnOp>();
            })
-      .def("make_swizzled_shared_encoding_attr",
-           [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
-              unsigned maxPhase, std::vector<unsigned> order,
-              unsigned CTAsPerCGA, unsigned CTASplitNum, unsigned CTAOrder) {
-             auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
-                                                      CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
-                 context, vectorSize, perPhase, maxPhase, order, CTALayout));
-           })
       .def("create_local_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding) -> mlir::Value {
