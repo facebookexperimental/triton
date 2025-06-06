@@ -19,14 +19,14 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ### Local buffer allocation
 
-- `buffers = tlx.local_alloc(shape, dtype, num_buffers)`
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)`
 
-    Allocate number_buffers buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers..
+    Allocate `NUM_BUFFERS` buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers.
 
 
-- `buffers = tlx.tmem_alloc(size, NUM_STAGES)`
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)`
 
-    Allocate number_buffers of buffers in the tensor memory per thread block, each with size size.
+    Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
 ### Async memory access
 

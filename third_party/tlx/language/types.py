@@ -1,5 +1,6 @@
 import triton.language.core as tl
 from typing import Optional
+import enum
 
 
 class layout_encoding:
@@ -59,19 +60,36 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
 
+
+class tensor_memory_layout_encoding(shared_layout_encoding):
+    def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
+        super().__init__()
+        self.blockM = blockM
+        self.blockN = blockN
+        self.unpacked = unpacked
+        self.CTASplitM = CTASplitM
+        self.CTASplitN = CTASplitN
+
+    """
+    Make a default tensor memory layout encoding.
+    """
+    @classmethod
+    def make_default(cls, shape):
+        return cls(
+            blockM=shape[0],
+            blockN=shape[1],
+            unpacked=True,
+            CTASplitM=1,
+            CTASplitN=1,
+        )
+
     def build(self, builder):
         pass
 
-# class nv_mma_layout_encoding(layout_encoding):
-#     def __init__(self, numCTAsPerCGA, numCTASplit, numCTAOrder):
-#         super().__init__()
 
-#         self.numCTAsPerCGA = numCTAsPerCGA
-#         self.numCTASplit = numCTASplit
-#         self.numCTAOrder = numCTAOrder
-
-#     def build(self, builder):
-#         pass
+class storage_kind(enum.Enum):
+    smem = "smem"
+    tmem = "tmem"
 
 
 class buffered_tensor(tl.base_value):
@@ -95,7 +113,7 @@ class buffered_tensor(tl.base_value):
         handle: The backing IR value representing the buffer allocation.
     """
 
-    def __init__(self, handle, type: tl.dtype, layout: Optional[shared_layout_encoding] = None):
+    def __init__(self, handle, type: tl.dtype, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
         """Not called by user code."""
         super().__init__()
         # IR handle
@@ -105,9 +123,12 @@ class buffered_tensor(tl.base_value):
         self.type = type  # Tensor type (can be block_type)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = type.scalar
+        # Storage
+        self.storage = storage
         # Layout encoding
         self.layout = layout
         self.order = None
+
 
 
 class mbarriers(buffered_tensor):
