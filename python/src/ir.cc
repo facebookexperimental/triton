@@ -1886,17 +1886,10 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_warp_group_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
-              mlir::Value &c, const std::string inputPrecision,
+              mlir::Value &c, InputPrecision inputPrecision, int maxNumImpreciseAcc,
               bool isAsync) -> mlir::Value {
-             InputPrecision inputPrecisionAttr;
-             if (inputPrecision == "TF32")
-               inputPrecisionAttr = InputPrecision::TF32;
-             else if (inputPrecision == "TF32x3")
-               inputPrecisionAttr = InputPrecision::TF32x3;
-             else if (inputPrecision == "IEEE")
-               inputPrecisionAttr = InputPrecision::IEEE;
              return self.create<ttng::WarpGroupDotOp>(
-                 c.getType(), a, b, c, nullptr, inputPrecisionAttr, 0, isAsync);
+                 c.getType(), a, b, c, nullptr, inputPrecision, maxNumImpreciseAcc, isAsync);
            })
       .def("create_convert_layout",
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {

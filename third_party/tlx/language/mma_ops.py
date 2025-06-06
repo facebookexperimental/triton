@@ -1,16 +1,38 @@
 import triton.language.core as tl
+from triton import knobs
+import triton.language.semantic as semantic
 
 from . import types as tlx
+
+
+def require_layout(x: tlx.buffered_tensor, _builder=None):
+    layout_A = x.layout
+    if layout_A is not tlx.nv_mma_shared_layout_encoding:
+        # create datastruct to wrap layout encoding attributes
+        # TODO. why do we need this class object?
+        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=[1,0], elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
+    layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
+        [int(x) for x in layout.shape],
+        layout.order,
+        layout.elemType.to_ir(_builder),
+        layout.numCTAsPerCGA,
+        layout.numCTASplit,
+        layout.numCTAOrder,
+        layout.fp4Padded,
+    )
+    return _builder.create_require_layout(x.handle, layout_handle)
 
 
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
     # A: Union[tl.tensor, tlx.buffered_tensor],
-    A: tlx.buffered_tensor,
-    B: tlx.buffered_tensor,
-    C: tl.tensor,
-    input_precision: str = "tf32",
+    input: tlx.buffered_tensor,
+    other: tlx.buffered_tensor,
+    acc: tl.tensor,
+    input_precision=None,
+    allow_tf32=None,
+    max_num_imprecise_acc=None,
     out_dtype=tl.float32,
     _builder=None,
 ) -> tl.tensor:
@@ -35,71 +57,92 @@ def async_dot(
 
     input_precision can be one of: tf32, tf32x3, ieee.
     """
-    import pdb; pdb.set_trace()
-    out_dtype = tl._unwrap_if_constexpr(out_dtype)
-    M = C.type.shape[-2]
-    N = C.type.shape[-1]
-    ret_ty = tl.block_type(out_dtype, [M, N])
 
-    input_precision = input_precision.upper()
+    assert input_precision is None or allow_tf32 is None, "Only one of input_precision and allow_tf32 can be specified"
+    if input_precision is None:
+        supports_tf32 = _builder and "tf32" in _builder.options.allowed_dot_input_precisions
+        input_precision = knobs.language.fp32_default or ("tf32" if (supports_tf32 and
+                                                                     (allow_tf32 or allow_tf32 is None)) else "ieee")
+
+    input_precision = tl._unwrap_if_constexpr(input_precision)
+    out_dtype = tl._unwrap_if_constexpr(out_dtype)
+    max_num_imprecise_acc = tl._unwrap_if_constexpr(max_num_imprecise_acc)
+
+    # Perform dot_precheck shared by tl.dot
+    (input, other, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
+
+    # out_dtype = tl._unwrap_if_constexpr(out_dtype)
+    # M = C.type.shape[-2]
+    # N = C.type.shape[-1]
+    #
+    input = require_layout(input, _builder)
+    other = require_layout(other, _builder)
+
+    return tl.tensor(
+        _builder.create_warp_group_dot(
+            input, other, acc_handle, input_precision, max_num_imprecise_acc, True
+        ),
+        ret_ty
+    )
+    # ret_ty = tl.block_type(out_dtype, [M, N])
+
+    # input_precision = input_precision.upper()
 
     # Emit layout conversion for mismatched layouts
     # if isinstance(A, tlx.buffered_tensor):
 
-    layout_A = A.layout
-    # if layout_A is not tlx.nv_mma_shared_layout_encoding:
-    layout = tlx.nv_mma_shared_layout_encoding(shape=A.shape, order=[1,0], elemType=A.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False) # more like a dataclass
-    shape = [int(x) for x in layout.shape]
-    elem_type = layout.elemType.to_ir(_builder)
+    layout_A = input.layout
+    if layout_A is not tlx.nv_mma_shared_layout_encoding:
+        # create datastruct to wrap layout encoding attributes
+        layout = tlx.nv_mma_shared_layout_encoding(shape=A.shape, order=[1,0], elemType=A.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
     layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
-        shape,
+        [int(x) for x in layout.shape],
         layout.order,
-        elem_type,
+        layout.elemType.to_ir(_builder),
         layout.numCTAsPerCGA,
         layout.numCTASplit,
         layout.numCTAOrder,
         layout.fp4Padded,
     )
-
-    A = _builder.create_require_layout(A.handle, layout_handle)
-
+    input = _builder.create_require_layout(input.handle, layout_handle)
+    #
     # else:
     #     # promote reigster tensor to mma layout
     #     raise NotImplementedError("Assign register mma layout not yet implemented.")
 
-    layout_B = B.layout
+    # layout_B = B.layout
     # if layout_B is not tlx.nv_mma_shared_layout_encoding:
         # mma_layout = _builder.make_nv_mma_shared_shared_encoding_attr()
         # B = _builder.create_convert_layout(B, mma_layout)
 
-    layout = tlx.nv_mma_shared_layout_encoding(shape=B.shape, order=[1,0], elemType=B.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
-    shape = [int(x) for x in layout.shape]
-    elem_type = layout.elemType.to_ir(_builder)
-    layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
-        shape,
-        layout.order,
-        elem_type,
-        layout.numCTAsPerCGA,
-        layout.numCTASplit,
-        layout.numCTAOrder,
-        layout.fp4Padded,
-    )
-    B = _builder.create_require_layout(B.handle, layout_handle)
-
+    # layout = tlx.nv_mma_shared_layout_encoding(shape=B.shape, order=[1,0], elemType=B.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
+    # shape = [int(x) for x in layout.shape]
+    # elem_type = layout.elemType.to_ir(_builder)
+    # layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
+    #     shape,
+    #     layout.order,
+    #     elem_type,
+    #     layout.numCTAsPerCGA,
+    #     layout.numCTASplit,
+    #     layout.numCTAOrder,
+    #     layout.fp4Padded,
+    # )
+    # B = _builder.create_require_layout(B.handle, layout_handle)
+    #
     # import pdb; pdb.set_trace()
     # tl.foo()
 
-    if input_precision is None:
-        input_precision = _builder.options.default_dot_input_precision
+    # if input_precision is None:
+    #     input_precision = _builder.options.default_dot_input_precision
 
     # input_precision = _str_to_dot_input_precision(input_precision, builder)
 
     # return C
-    return tl.tensor(
+    # return tl.tensor(
         # _builder.create_warp_group_dot(
-        _builder.create_dot(
+        # _builder.create_dot(
             # A, B, C.handle, input_precision, True
-            A, B, C.handle, input_precision, 0
-        ),
-        ret_ty,
-    )
+            # A, B, C.handle, input_precision, 0
+        # ),
+    #     ret_ty,
+    # )

@@ -1625,12 +1625,14 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
             raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
     return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
+
 def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
         out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:
     (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = dot_precheck(lhs, rhs, acc, input_precision, max_num_imprecise_acc, out_dtype, builder)
 
     return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc,),
                      ret_ty)
+
 
 def _str_to_fp_type(float_format: str):
     ty_enum = getattr(ir.ScaleDotElemTypeTY, float_format.upper(), None)
