@@ -1577,13 +1577,18 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
     lhs_rank = len(lhs.shape)
     rhs_rank = len(rhs.shape)
     assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
-    assert lhs.shape[-1].value == rhs.shape[
-        -2].value, f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
+
+    # TODO. merge with same function in core.py
+    def _unwrap_if_constexpr(o):
+        return o.value if isinstance(o, tl.constexpr) else o
+
+    assert _unwrap_if_constexpr(lhs.shape[-1]) == _unwrap_if_constexpr(rhs.shape[-2]), f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
+
     assert builder.codegen_fns.get("min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
     min_dot_size = builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
-    assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value >= min_dot_size[2] \
-        and rhs.shape[-1].value >= min_dot_size[1], \
-            f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
+    # assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value >= min_dot_size[2] \
+    #     and rhs.shape[-1].value >= min_dot_size[1], \
+    #         f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
     if lhs.type.scalar.is_int():
         assert lhs.type.scalar == tl.int8, "only int8 supported!"
         _0 = builder.get_int32(0)
