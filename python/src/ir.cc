@@ -1805,6 +1805,15 @@ void init_triton_ir(py::module &&m) {
                  other.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile);
            })
+      .def("create_local_load",
+           [](TritonOpBuilder &self, Value subView,
+              std::optional<Value> asyncWaitToken) -> mlir::Value {
+             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+             auto newType = RankedTensorType::get(subViewType.getShape(),
+                                                  subViewType.getElementType());
+             return self.create<ttg::LocalLoadOp>(
+                 newType, subView, asyncWaitToken.value_or(Value()));
+           })
       // mbarrier ops
       .def("create_alloc_barriers",
            [](TritonOpBuilder &self, int numBarriers,
