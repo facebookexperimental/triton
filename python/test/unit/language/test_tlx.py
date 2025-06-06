@@ -138,6 +138,31 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
     assert kerenl_info.asm["ttgir"].count("kernel") == 1
 
 
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires compute capability >= 10 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_tmem_alloc_index(BLOCK_SIZE, device):
+
+    @triton.jit
+    def kernel(
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.tmem)
+        buffer0 = tlx.local_view(buffers, 0)
+        buffer1 = tlx.local_view(buffers, 1)
+
+
+    grid = lambda meta: (1, )
+    kerenl_info = kernel[grid](BLOCK_SIZE)
+    # TODO: check numerics once tmem load/store is ready
+    kerenl_info.asm["ttgir"]
+    assert kerenl_info.asm["ttgir"].count("kernel") == 1
+
+
+
 def test_thread_id(device):
 
     @triton.jit

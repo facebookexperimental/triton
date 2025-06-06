@@ -6,7 +6,7 @@ from triton.language.semantic import (
 )
 
 from . import types as tlx
-from .utility import cuda_parse_arch
+from . utility import cuda_parse_arch
 from typing import Optional
 
 
@@ -57,9 +57,7 @@ def local_alloc(
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
     if storage == tlx.storage_kind.smem:
-        tensor_handle = _builder.create_local_alloc(
-            full_shape, elem_type, layout_handle
-        )
+        tensor_handle = _builder.create_local_alloc(full_shape, elem_type, layout_handle)
     else:
         tensor_handle = _builder.create_tmem_alloc(full_shape, elem_type, layout_handle)
 

@@ -18,7 +18,6 @@ class shared_layout_encoding(layout_encoding):
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
-    def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
         super().__init__()
         self.vectorSize = vectorSize
         self.perPhase = perPhase
@@ -49,18 +48,6 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         pass
 
 
-class nv_mma_shared_layout_encoding(shared_layout_encoding):
-    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
-        super().__init__()
-        self.shape = shape
-        self.order = order
-        self.elemType = elemType
-        self.numCTAsPerCGA = numCTAsPerCGA
-        self.numCTASplit = numCTASplit
-        self.numCTAOrder = numCTAOrder
-        self.fp4Padded = fp4Padded
-
-
 class tensor_memory_layout_encoding(shared_layout_encoding):
     def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
         super().__init__()
@@ -82,6 +69,8 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
             CTASplitM=1,
             CTASplitN=1,
         )
+
+
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
     def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
         super().__init__()
@@ -95,17 +84,6 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def build(self, builder):
         pass
-
-# class nv_mma_layout_encoding(layout_encoding):
-#     def __init__(self, numCTAsPerCGA, numCTASplit, numCTAOrder):
-#         super().__init__()
-
-#         self.numCTAsPerCGA = numCTAsPerCGA
-#         self.numCTASplit = numCTASplit
-#         self.numCTAOrder = numCTAOrder
-
-#     def build(self, builder):
-#         pass
 
 
 class storage_kind(enum.Enum):
@@ -149,6 +127,7 @@ class buffered_tensor(tl.base_value):
         # Layout encoding
         self.layout = layout
         self.order = None
+
 
 
 
