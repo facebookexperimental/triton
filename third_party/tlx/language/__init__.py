@@ -9,6 +9,7 @@ __all__ = [
     # warp specialization ops
     "async_task",
     "async_tasks",
+    "async_dot",
 
     # local buffer ops
     "buffered_tensor", # type
