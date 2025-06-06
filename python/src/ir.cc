@@ -1888,6 +1888,8 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision, int maxNumImpreciseAcc,
               bool isAsync) -> mlir::Value {
+
+
              return self.create<ttng::WarpGroupDotOp>(
                  c.getType(), a, b, c, nullptr, inputPrecision, maxNumImpreciseAcc, isAsync);
            })
