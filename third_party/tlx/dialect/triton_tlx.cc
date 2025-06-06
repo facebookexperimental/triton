@@ -25,6 +25,18 @@ void init_triton_tlx_ir(py::module &&m) {
               }
               return self.create<tlx::RequireLayoutOp>(newType, v);
             })
+      .def("make_swizzled_shared_encoding_attr",
+           [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
+              unsigned maxPhase, std::vector<unsigned> order,
+              std::vector<unsigned> CTAsPerCGA,
+              std::vector<unsigned> CTASplitNum,
+              std::vector<unsigned> CTAOrder) {
+             auto context = self.getBuilder().getContext();
+             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
+                                                      CTASplitNum, CTAOrder);
+             return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
+                 context, vectorSize, perPhase, maxPhase, order, CTALayout));
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               bool unpacked, unsigned CTASplitM, unsigned CTASplitN) {
@@ -41,6 +53,11 @@ void init_triton_tlx_ir(py::module &&m) {
                  ttg::MemDescType::get(shape, elementType, encoding,
                                        memorySpace, /*mutableMemory=*/true);
              return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
+           })
+      .def("create_memdesc_trans",
+           [](TritonOpBuilder &self, Value &arg,
+              std::vector<int32_t> order) -> mlir::Value {
+             return self.create<ttg::MemDescTransOp>(arg, order);
            });
 }
 

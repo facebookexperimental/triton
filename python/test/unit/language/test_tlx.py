@@ -154,3 +154,24 @@ def test_thread_id(device):
     expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
     expected_output[0] = value
     torch.testing.assert_close(output, expected_output)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_local_trans(BLOCK_SIZE, device):
+
+    @triton.jit
+    def local_trans_kernel(
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(1))
+        buffer0 = tlx.local_view(buffers, 0)
+        buffer1 = tlx.local_trans(buffer0)
+
+    grid = lambda meta: (1, )
+    kerenl_info = local_trans_kernel[grid](BLOCK_SIZE)
+    # TODO: check numerics once tmem local_load is ready
+    assert kerenl_info.asm["ttgir"].count("kernel") == 1
