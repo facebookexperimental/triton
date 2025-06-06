@@ -1546,8 +1546,8 @@ def _str_to_dot_input_precision(input_precision, builder):
     return getattr(ir.INPUT_PRECISION, input_precision)
 
 
-def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
-        out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:
+def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
+        out_dtype: tl.dtype, builder: ir.builder) -> Tuple[Any]:
     assert lhs.type.is_block() and rhs.type.is_block()
 
     if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
@@ -1618,10 +1618,14 @@ def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optiona
     else:
         if lhs.dtype.is_fp8() and rhs.dtype.is_fp8() and max_num_imprecise_acc > K:
             raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
+    return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
-    return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc),
+def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
+        out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:
+    (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = dot_precheck(lhs, rhs, acc, input_precision, max_num_imprecise_acc, out_dtype, builder)
+
+    return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc,),
                      ret_ty)
-
 
 def _str_to_fp_type(float_format: str):
     ty_enum = getattr(ir.ScaleDotElemTypeTY, float_format.upper(), None)
