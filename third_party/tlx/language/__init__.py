@@ -14,10 +14,13 @@ __all__ = [
     "local_alloc",
     "local_view",
     "async_load",
+    "async_load_commit_group",
+    "async_load_wait_group",
     "storage_kind",  # type
 
     # barrier ops
     "mbarriers", # type
+    "async_token", # type
     "alloc_barriers",
     "barrier_expect_bytes",
     "barrier_wait",

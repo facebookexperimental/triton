@@ -158,3 +158,65 @@ def test_thread_id(device):
     expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
     expected_output[0] = value
     torch.testing.assert_close(output, expected_output)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_async_wait(BLOCK_SIZE, device):
+
+    @triton.jit
+    def async_wait_kernel(
+        input_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        input_ptr_offsets = input_ptr + offsets
+        buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        tlx.async_load(input_ptr_offsets, buffer, mask=mask)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+        x = tlx.local_load(buffer)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    @triton.jit
+    def async_wait_token_kernel(
+        input_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        input_ptr_offsets = input_ptr + offsets
+        buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        token = tlx.async_load(input_ptr_offsets, buffer, mask=mask)
+        token = tlx.async_load_commit_group([token])
+        tlx.async_load_wait_group(tl.constexpr(0), [token])
+        x = tlx.local_load(buffer)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    torch.manual_seed(0)
+    size = 64
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = async_wait_kernel[grid](x, output, n_elements, BLOCK_SIZE)
+    assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_wait") == 1
+    torch.testing.assert_close(x, output)
+    kernel = async_wait_token_kernel[grid](x, output, n_elements, BLOCK_SIZE)
+    torch.testing.assert_close(x, output)
