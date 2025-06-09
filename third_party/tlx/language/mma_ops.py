@@ -5,14 +5,14 @@ import triton.language.semantic as semantic
 from . import types as tlx
 
 
-def require_mma_layout(x: tlx.buffered_tensor, order, _builder=None):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
     layout_A = x.layout
     if layout_A is not tlx.nv_mma_shared_layout_encoding:
         # create datastruct to wrap layout encoding attributes
         # TODO. why do we need this class object?
         layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=order, elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
 
-    layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
+    layout_handle = _builder.make_nv_mma_shared_encoding_attr(
         [int(x) for x in layout.shape],
         layout.order,
         layout.elemType.to_ir(_builder),
@@ -22,6 +22,11 @@ def require_mma_layout(x: tlx.buffered_tensor, order, _builder=None):
         layout.fp4Padded,
     )
     return _builder.create_require_layout(x.handle, layout_handle)
+
+
+def require_nv_mma_layout(x: tl.tensor, _builder=None):
+    layout_handle = _builder.make_nv_mma_encoding_attr()
+    return _builder.create_convert_layout(x.handle, layout_handle)
 
 
 # async dot signature needs to be close to tl.dot as much as possible
@@ -80,9 +85,10 @@ def async_dot(
     # M = C.type.shape[-2]
     # N = C.type.shape[-1]
     #
-    input = require_mma_layout(input, [1,0], _builder)
-    other = require_mma_layout(other, [0,1], _builder)
-    # return dummy_output
+    input = require_nv_mma_shared_layout(input, [1,0], _builder)
+    other = require_nv_mma_shared_layout(other, [0,1], _builder)
+
+    acc = require_nv_mma_layout(dummy_output, _builder)
 
     # if acc is None:
     #     acc_handle = _builder.create_splat(ret_ty.to_ir(_builder), _0)
@@ -95,12 +101,11 @@ def async_dot(
     # TODO. placeholder to test prior logics
     # return acc_handle
 
-    import pdb; pdb.set_trace()
     _builder.create_fence_async_shared()
-    return dummy_output
+    # return dummy_output
     return tl.tensor(
         _builder.create_warp_group_dot(
-            input, other, acc_handle, input_precision, max_num_imprecise_acc, True
+            input, other, acc, input_precision, max_num_imprecise_acc, True
         ),
         ret_ty
     )

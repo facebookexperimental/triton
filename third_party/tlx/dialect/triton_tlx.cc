@@ -9,19 +9,19 @@ using namespace mlir;
 namespace ttg = triton::gpu;
 
 void init_triton_tlx_ir(py::module &&m) {
-  auto *builder_cls = ir::getBuilderClass();
-  builder_cls->def(
-      "create_require_layout",
-      [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
-        if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
-          auto newType = ttg::MemDescType::get(
-              type.getShape(), type.getElementType(), encoding,
-              type.getMemorySpace(), type.getMutableMemory());
-          return self.create<tlx::RequireLayoutOp>(newType, v);
-        } else {
-          throw std::runtime_error("Unsupported type");
-        }
-      });
+  // auto *builder_cls = ir::getBuilderClass();
+  // builder_cls->def(
+  //     "create_require_layout",
+  //     [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+  //       if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+  //         auto newType = ttg::MemDescType::get(
+  //             type.getShape(), type.getElementType(), encoding,
+  //             type.getMemorySpace(), type.getMutableMemory());
+  //         return self.create<tlx::RequireLayoutOp>(newType, v);
+  //       } else {
+  //         throw std::runtime_error("Unsupported type");
+  //       }
+  //     });
 }
 
 void init_triton_tlx_passes(py::module &&m) {

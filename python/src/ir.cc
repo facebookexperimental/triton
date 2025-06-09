@@ -1758,7 +1758,7 @@ void init_triton_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
-      .def("make_nv_mma_shared_shared_encoding_attr",
+      .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               std::vector<unsigned> order, Type &elemType,
               std::vector<unsigned> CTAsPerCGA,
@@ -1769,6 +1769,23 @@ void init_triton_ir(py::module &&m) {
                                                       CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
                  context, shape, order, CTALayout, elemType, fp4Padded));
+           })
+      .def("make_nv_mma_encoding_attr",
+           [](TritonOpBuilder &self) {
+             auto context = self.getBuilder().getContext();
+             int versionMajor = 3;
+             int versionMinor = 0;
+             llvm::ArrayRef<unsigned> warpsPerCTA = {4, 1};
+             std::vector<unsigned> CTAsPerCGA = {1, 1};
+             std::vector<unsigned> CTASplitNum = {1, 1};
+             std::vector<unsigned> CTAOrder = {1, 0};
+             llvm::ArrayRef<unsigned> instrShape = {16, 64, 8};
+
+             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
+                                                      CTASplitNum, CTAOrder);
+             return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
+                 context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
+                 instrShape));
            })
       .def("create_local_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -1893,7 +1910,8 @@ void init_triton_ir(py::module &&m) {
               mlir::Value &c, InputPrecision inputPrecision,
               int maxNumImpreciseAcc, bool isAsync) -> mlir::Value {
              return self.create<ttng::WarpGroupDotOp>(
-                 c.getType(), a, b, c, nullptr, inputPrecision, maxNumImpreciseAcc, isAsync);
+                 c.getType(), a, b, c, nullptr, inputPrecision,
+                 maxNumImpreciseAcc, isAsync);
            })
       .def("create_convert_layout",
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
@@ -1910,6 +1928,17 @@ void init_triton_ir(py::module &&m) {
              }
              newType.dump();
              return self.create<ttg::ConvertLayoutOp>(newType, v);
+           })
+      .def("create_require_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+               auto newType = ttg::MemDescType::get(
+                   type.getShape(), type.getElementType(), encoding,
+                   type.getMemorySpace(), type.getMutableMemory());
+               return self.create<tlx::RequireLayoutOp>(newType, v);
+             } else {
+               throw std::runtime_error("Unsupported type");
+             }
            })
       // Proton Ops
       .def("create_proton_record",
