@@ -61,7 +61,6 @@ void init_triton_tlx_ir(py::module &&m) {
               unsigned pendings) -> mlir::Value {
              return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
            });
-  ;
 }
 
 void init_triton_tlx_passes(py::module &&m) {
