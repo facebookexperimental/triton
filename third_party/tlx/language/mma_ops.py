@@ -5,12 +5,12 @@ import triton.language.semantic as semantic
 from . import types as tlx
 
 
-def require_mma_layout(x: tlx.buffered_tensor, _builder=None):
+def require_mma_layout(x: tlx.buffered_tensor, order, _builder=None):
     layout_A = x.layout
     if layout_A is not tlx.nv_mma_shared_layout_encoding:
         # create datastruct to wrap layout encoding attributes
         # TODO. why do we need this class object?
-        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=[1,0], elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
+        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=order, elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
 
     layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
         [int(x) for x in layout.shape],
@@ -80,8 +80,8 @@ def async_dot(
     # M = C.type.shape[-2]
     # N = C.type.shape[-1]
     #
-    input = require_mma_layout(input, _builder)
-    other = require_mma_layout(other, _builder)
+    input = require_mma_layout(input, [1,0], _builder)
+    other = require_mma_layout(other, [0,1], _builder)
     return dummy_output
 
     print("DAOHANG_DEBUG: input : ", input)
