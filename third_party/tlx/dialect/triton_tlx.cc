@@ -78,7 +78,6 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int32_t> order) -> mlir::Value {
              return self.create<ttg::MemDescTransOp>(arg, order);
            });
-  ;
 }
 
 void init_triton_tlx_passes(py::module &&m) {

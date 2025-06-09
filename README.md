@@ -37,6 +37,13 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Loads the buffer from local memory into a distributed tensor.
 
+
+- `buffer = tlx.local_trans(buffer, dims)`
+
+    Permutes the dimensions of a tensor.
+
+
+
 ### Async memory access
 
 - `buffer = tlx.async_descriptor_load(memdesc, [offsets], barrier)`
