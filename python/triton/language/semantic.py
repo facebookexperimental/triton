@@ -1608,6 +1608,7 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
     K = lhs.type.shape[-1]
     B = lhs.type.shape[0] if lhs_rank == 3 else None
     ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])
+
     if acc is None:
         acc_handle = builder.create_splat(ret_ty.to_ir(builder), _0)
     else:

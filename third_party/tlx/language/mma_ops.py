@@ -30,7 +30,8 @@ def async_dot(
     # A: Union[tl.tensor, tlx.buffered_tensor],
     input: tlx.buffered_tensor,
     other: tlx.buffered_tensor,
-    acc: tl.tensor,
+    dummy_output: tl.tensor,
+    acc=None, # tl.tensor,
     input_precision=None,
     allow_tf32=None,
     max_num_imprecise_acc=None,
@@ -62,8 +63,10 @@ def async_dot(
     assert input_precision is None or allow_tf32 is None, "Only one of input_precision and allow_tf32 can be specified"
     if input_precision is None:
         supports_tf32 = _builder and "tf32" in _builder.options.allowed_dot_input_precisions
-        input_precision = knobs.language.fp32_default or ("tf32" if (supports_tf32 and
-                                                                     (allow_tf32 or allow_tf32 is None)) else "ieee")
+        input_precision = knobs.language.fp32_default or (
+            "tf32" if (
+                supports_tf32 and (allow_tf32 or allow_tf32 is None)) else "ieee"
+            )
 
     input_precision = tl._unwrap_if_constexpr(input_precision)
     out_dtype = tl._unwrap_if_constexpr(out_dtype)
@@ -72,14 +75,27 @@ def async_dot(
     # Perform dot_precheck shared by tl.dot
     (input, other, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
 
+    # return tl.tensor(input, ret_ty)
     # out_dtype = tl._unwrap_if_constexpr(out_dtype)
     # M = C.type.shape[-2]
     # N = C.type.shape[-1]
     #
     input = require_mma_layout(input, _builder)
     other = require_mma_layout(other, _builder)
+    return dummy_output
 
-    import pdb; pdb.set_trace()
+    print("DAOHANG_DEBUG: input : ", input)
+
+    # if acc is None:
+    #     acc_handle = _builder.create_splat(ret_ty.to_ir(_builder), _0)
+    # else:
+    #     assert False # TODO. fix this later
+        # acc_handle = acc.handle
+        # import pdb; pdb.set_trace()
+        # assert acc.type == ret_ty, f"acc type {acc.type} does not match ret_ty {ret_ty}"
+
+    # TODO. placeholder to test prior logics
+    # return acc_handle
 
     return tl.tensor(
         _builder.create_warp_group_dot(

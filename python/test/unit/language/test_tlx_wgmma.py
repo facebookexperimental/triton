@@ -75,29 +75,41 @@ def test_async_dot(device):
         tl.store(Zs, z)
 
     @triton.jit
-    def async_dot_kernel(
+    def tgt_kernel(
+        X, stride_xm, stride_xk, 
+        Y, stride_yk, stride_yn, 
+        Z, stride_zm, stride_zn,
+        BLOCK_M: tl.constexpr, 
+        BLOCK_N: tl.constexpr, 
+        BLOCK_K: tl.constexpr, 
+        INPUT_PRECISION: tl.constexpr, 
+        out_dtype: tl.constexpr = tl.float32
         # a_ptr,
         # b_ptr,
-        c_ptr,
-        stride_cm,
-        stride_cn,
-        BLOCK_SIZE: tl.constexpr,
+        # stride_cm,
+        # stride_cn,
+        # BLOCK_SIZE: tl.constexpr,
     ):
-        # acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+        dummy_output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        off_m = tl.arange(0, BLOCK_M)
+        off_n = tl.arange(0, BLOCK_N)
 
-        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, 2)
-        a_smem = tlx.local_view(buffers, 0)
-        b_smem = tlx.local_view(buffers, 1)
+        buf_alloc_x = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float32, 1)
+        buf_alloc_y = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float32, 1)
+        a_smem = tlx.local_view(buf_alloc_x, 0)
+        b_smem = tlx.local_view(buf_alloc_y, 0)
 
-        # tlx.async_load(a_ptr, a_smem)
-        # tlx.async_load(b_ptr, b_smem)
+        Zs = Z + off_m[:, None] * stride_zm + off_n[None, :] * stride_zn
 
-        acc = tlx.async_dot(a_smem, b_smem)
+        # TODO. initialize values or async load
 
-        offs_cm = tl.arange(0, BLOCK_SIZE)
-        offs_cn = tl.arange(0, BLOCK_SIZE)
-        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        tl.store(c_ptrs, acc)
+        z = tlx.async_dot(a_smem, b_smem, dummy_output, input_precision=INPUT_PRECISION, out_dtype=out_dtype)
+        tl.store(Zs, z)
+
+        # offs_cm = tl.arange(0, BLOCK_SIZE)
+        # offs_cn = tl.arange(0, BLOCK_SIZE)
+        # c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        # tl.store(c_ptrs, acc)
 
     # a_gmem = torch.ones((64, 64), device=device, dtype=torch.float32)
     # b_gmem = torch.ones((64, 64), device=device, dtype=torch.float32)
@@ -124,4 +136,4 @@ def test_async_dot(device):
     kern_kwargs = {
         'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32
     }
-    pgm = ref_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1), **kern_kwargs)
+    pgm = tgt_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1), **kern_kwargs)
