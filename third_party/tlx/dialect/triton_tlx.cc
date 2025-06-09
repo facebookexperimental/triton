@@ -112,7 +112,20 @@ void init_triton_tlx_ir(py::module &&m) {
             //   throw std::runtime_error("Unsupported type");
             // }
             return self.create<tlx::RequireLayoutOp>(newType, v);
-          });
+          })
+    .def(
+      "create_require_layout",
+      [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+        Type newType;
+        if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+          newType = ttg::MemDescType::get(
+              type.getShape(), type.getElementType(), encoding,
+              type.getMemorySpace(), type.getMutableMemory());
+        } else {
+          throw std::runtime_error("Unsupported type");
+        }
+        return self.create<tlx::RequireLayoutOp>(newType, v);
+      });
 }
 
 void init_triton_tlx_passes(py::module &&m) {
