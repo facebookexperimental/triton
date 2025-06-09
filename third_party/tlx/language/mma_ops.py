@@ -29,11 +29,6 @@ def require_nv_mma_layout(x: tl.tensor, _builder=None):
     return _builder.create_convert_layout(x.handle, layout_handle)
 
 
-def require_nv_mma_layout(x: tl.tensor, _builder=None):
-    layout_handle = _builder.make_nv_mma_encoding_attr()
-    return _builder.create_convert_layout(x.handle, layout_handle)
-
-
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
