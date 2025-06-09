@@ -15,8 +15,8 @@ void init_triton_tlx_ir(py::module &&m) {
       [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
         if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
           auto newType = ttg::MemDescType::get(
-              type.getShape(), type.getElementType(),
-              dyn_cast<ttg::NvidiaMmaEncodingAttr>(encoding),
+              type.getShape(), type.getElementType(), encoding,
+              // dyn_cast<ttg::NvidiaMmaEncodingAttr>(encoding),
               type.getMemorySpace(), type.getMutableMemory());
           return self.create<tlx::RequireLayoutOp>(newType, v);
         } else {
