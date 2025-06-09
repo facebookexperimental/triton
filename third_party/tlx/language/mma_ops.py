@@ -82,9 +82,7 @@ def async_dot(
     #
     input = require_mma_layout(input, [1,0], _builder)
     other = require_mma_layout(other, [0,1], _builder)
-    return dummy_output
-
-    print("DAOHANG_DEBUG: input : ", input)
+    # return dummy_output
 
     # if acc is None:
     #     acc_handle = _builder.create_splat(ret_ty.to_ir(_builder), _0)
@@ -97,6 +95,9 @@ def async_dot(
     # TODO. placeholder to test prior logics
     # return acc_handle
 
+    import pdb; pdb.set_trace()
+    _builder.create_fence_async_shared()
+    return dummy_output
     return tl.tensor(
         _builder.create_warp_group_dot(
             input, other, acc_handle, input_precision, max_num_imprecise_acc, True

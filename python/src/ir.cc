@@ -1884,6 +1884,10 @@ void init_triton_ir(py::module &&m) {
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
            })
+      .def("create_fence_async_shared",
+           [](TritonOpBuilder &self) -> void {
+             self.create<ttng::FenceAsyncSharedOp>(false);
+           })
       .def("create_warp_group_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision,
