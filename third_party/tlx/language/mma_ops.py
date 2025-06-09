@@ -5,23 +5,23 @@ import triton.language.semantic as semantic
 from . import types as tlx
 
 
-# def require_mma_layout(x: tlx.buffered_tensor, op_idx: int, _builder=None):
-#     layout_A = x.layout
-#     if layout_A is not tlx.nv_mma_shared_layout_encoding:
-#         # create datastruct to wrap layout encoding attributes
-#         # TODO. why do we need this class object?
-#         layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=[1,0], elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
-#
-#     layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
-#         [int(x) for x in layout.shape],
-#         layout.order,
-#         layout.elemType.to_ir(_builder),
-#         layout.numCTAsPerCGA,
-#         layout.numCTASplit,
-#         layout.numCTAOrder,
-#         layout.fp4Padded,
-#     )
-#     return _builder.create_require_layout(x.handle, layout_handle, op_idx)
+def require_mma_layout(x: tlx.buffered_tensor, _builder=None):
+    layout_A = x.layout
+    if layout_A is not tlx.nv_mma_shared_layout_encoding:
+        # create datastruct to wrap layout encoding attributes
+        # TODO. why do we need this class object?
+        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=[1,0], elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
+
+    layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
+        [int(x) for x in layout.shape],
+        layout.order,
+        layout.elemType.to_ir(_builder),
+        layout.numCTAsPerCGA,
+        layout.numCTASplit,
+        layout.numCTAOrder,
+        layout.fp4Padded,
+    )
+    return _builder.create_require_layout(x.handle, layout_handle)
 
 
 # async dot signature needs to be close to tl.dot as much as possible
@@ -76,10 +76,8 @@ def async_dot(
     # M = C.type.shape[-2]
     # N = C.type.shape[-1]
     #
-    # input = require_mma_layout(input, 0, _builder)
-    # other = require_mma_layout(other, 1, _builder)
-    input = _builder.create_require_layout(input.handle, 0)
-    other = _builder.create_require_layout(other.handle, 1)
+    input = require_mma_layout(input, _builder)
+    other = require_mma_layout(other, _builder)
 
     import pdb; pdb.set_trace()
 
