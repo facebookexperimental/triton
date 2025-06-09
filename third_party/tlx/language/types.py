@@ -139,7 +139,7 @@ class mbarriers(buffered_tensor):
         # Temporarily use 1, as the shape must be a power of 2.
         # TODO: use the actual barrier count to compute shape for precise boundary checks.
         block_type = tl.block_type(tl.int64, [1])
-        super().__init__(handle, block_type)
+        super().__init__(handle, block_type, storage_kind.smem)
         pass
 
 
