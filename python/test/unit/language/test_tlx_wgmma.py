@@ -64,5 +64,3 @@ def test_async_dot(device):
         'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32
     }
     pgm = tgt_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1), **kern_kwargs)
-
-    assert False

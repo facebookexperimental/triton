@@ -45,15 +45,15 @@ void init_triton_tlx_ir(py::module &&m) {
       .def(
       "create_require_layout",
       [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
-        Type newType;
         if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
-          newType = ttg::MemDescType::get(
-              type.getShape(), type.getElementType(), encoding,
+          auto newType = ttg::MemDescType::get(
+              type.getShape(), type.getElementType(),
+              dyn_cast<ttg::NvidiaMmaEncodingAttr>(encoding),
               type.getMemorySpace(), type.getMutableMemory());
+          return self.create<tlx::RequireLayoutOp>(newType, v);
         } else {
           throw std::runtime_error("Unsupported type");
         }
-        return self.create<tlx::RequireLayoutOp>(newType, v);
       });
 }
 
