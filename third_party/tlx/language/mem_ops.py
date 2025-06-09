@@ -7,7 +7,7 @@ from triton.language.semantic import (
 
 from . import types as tlx
 from .utility import cuda_parse_arch
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @tl.builtin
@@ -167,7 +167,7 @@ def local_load(
 @tl.builtin
 def local_trans(
     input: tlx.buffered_tensor,
-    dims,
+    dims: Tuple[int]=(1, 0),
     _builder=None
 ) -> tlx.buffered_tensor:
     """
@@ -179,15 +179,7 @@ def local_trans(
         :param input: The input tensor.
         :param dims: The desired ordering of dimensions.  For example,
             :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
-
-        :code:`dims` can be passed as a tuple or as individual parameters: ::
-
-            # These are equivalent
-            trans(x, (2, 1, 0))
-            trans(x, 2, 1, 0)
     """
-    if not dims:
-        dims = (1, 0)
     if len(input.shape) != len(dims):
         raise ValueError("permute dims must have the same length as input shape")
     if sorted(tl._unwrap_if_constexpr(d) for d in dims) != list(range(len(dims))):
