@@ -21,7 +21,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
         layout.numCTAOrder,
         layout.fp4Padded,
     )
-    return _builder.create_require_layout(x.handle, layout_handle)
+    return _builder.create_convert_layout(x.handle, layout_handle)
 
 
 def require_nv_mma_layout(x: tl.tensor, _builder=None):
@@ -80,94 +80,15 @@ def async_dot(
     # Perform dot_precheck shared by tl.dot
     (input, other, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
 
-    # return tl.tensor(input, ret_ty)
-    # out_dtype = tl._unwrap_if_constexpr(out_dtype)
-    # M = C.type.shape[-2]
-    # N = C.type.shape[-1]
-    #
     input = require_nv_mma_shared_layout(input, [1,0], _builder)
     other = require_nv_mma_shared_layout(other, [0,1], _builder)
 
     acc = require_nv_mma_layout(dummy_output, _builder)
 
-    # if acc is None:
-    #     acc_handle = _builder.create_splat(ret_ty.to_ir(_builder), _0)
-    # else:
-    #     assert False # TODO. fix this later
-        # acc_handle = acc.handle
-        # import pdb; pdb.set_trace()
-        # assert acc.type == ret_ty, f"acc type {acc.type} does not match ret_ty {ret_ty}"
-
-    # TODO. placeholder to test prior logics
-    # return acc_handle
-
     _builder.create_fence_async_shared()
-    # return dummy_output
     return tl.tensor(
         _builder.create_warp_group_dot(
             input, other, acc, input_precision, max_num_imprecise_acc, True
         ),
         ret_ty
     )
-    # ret_ty = tl.block_type(out_dtype, [M, N])
-
-    # input_precision = input_precision.upper()
-
-    # Emit layout conversion for mismatched layouts
-    # if isinstance(A, tlx.buffered_tensor):
-
-    # layout_A = input.layout
-    # if layout_A is not tlx.nv_mma_shared_layout_encoding:
-    #     # create datastruct to wrap layout encoding attributes
-    #     layout = tlx.nv_mma_shared_layout_encoding(shape=A.shape, order=[1,0], elemType=A.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
-    # layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
-    #     [int(x) for x in layout.shape],
-    #     layout.order,
-    #     layout.elemType.to_ir(_builder),
-    #     layout.numCTAsPerCGA,
-    #     layout.numCTASplit,
-    #     layout.numCTAOrder,
-    #     layout.fp4Padded,
-    # )
-    # input = _builder.create_require_layout(input.handle, layout_handle)
-    #
-    # else:
-    #     # promote reigster tensor to mma layout
-    #     raise NotImplementedError("Assign register mma layout not yet implemented.")
-
-    # layout_B = B.layout
-    # if layout_B is not tlx.nv_mma_shared_layout_encoding:
-        # mma_layout = _builder.make_nv_mma_shared_shared_encoding_attr()
-        # B = _builder.create_convert_layout(B, mma_layout)
-
-    # layout = tlx.nv_mma_shared_layout_encoding(shape=B.shape, order=[1,0], elemType=B.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
-    # shape = [int(x) for x in layout.shape]
-    # elem_type = layout.elemType.to_ir(_builder)
-    # layout_handle = _builder.make_nv_mma_shared_shared_encoding_attr(
-    #     shape,
-    #     layout.order,
-    #     elem_type,
-    #     layout.numCTAsPerCGA,
-    #     layout.numCTASplit,
-    #     layout.numCTAOrder,
-    #     layout.fp4Padded,
-    # )
-    # B = _builder.create_require_layout(B.handle, layout_handle)
-    #
-    # import pdb; pdb.set_trace()
-    # tl.foo()
-
-    # if input_precision is None:
-    #     input_precision = _builder.options.default_dot_input_precision
-
-    # input_precision = _str_to_dot_input_precision(input_precision, builder)
-
-    # return C
-    # return tl.tensor(
-        # _builder.create_warp_group_dot(
-        # _builder.create_dot(
-            # A, B, C.handle, input_precision, True
-            # A, B, C.handle, input_precision, 0
-        # ),
-    #     ret_ty,
-    # )

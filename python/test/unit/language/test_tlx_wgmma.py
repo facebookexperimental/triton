@@ -11,8 +11,8 @@ from triton._internal_testing import is_cuda
     reason="Requires compute capability == 9 for NV",
 )
 def test_async_dot(device):
-    # Define a unit test with similar schema with tl.dot
-
+    """
+    Define a unit test with similar schema with tl.dot
     @triton.jit
     def ref_kernel(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, INPUT_PRECISION: tl.constexpr, out_dtype: tl.constexpr = tl.float32):
@@ -26,6 +26,7 @@ def test_async_dot(device):
         y = tl.load(Ys)
         z = tl.dot(x, y, input_precision=INPUT_PRECISION, out_dtype=out_dtype)
         tl.store(Zs, z)
+    """
 
     @triton.jit
     def tgt_kernel(
@@ -37,11 +38,6 @@ def test_async_dot(device):
         BLOCK_K: tl.constexpr, 
         INPUT_PRECISION: tl.constexpr, 
         out_dtype: tl.constexpr = tl.float32
-        # a_ptr,
-        # b_ptr,
-        # stride_cm,
-        # stride_cn,
-        # BLOCK_SIZE: tl.constexpr,
     ):
         dummy_output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         off_m = tl.arange(0, BLOCK_M)
@@ -58,28 +54,6 @@ def test_async_dot(device):
 
         z = tlx.async_dot(a_smem, b_smem, dummy_output, input_precision=INPUT_PRECISION, out_dtype=out_dtype)
         tl.store(Zs, z)
-
-        # offs_cm = tl.arange(0, BLOCK_SIZE)
-        # offs_cn = tl.arange(0, BLOCK_SIZE)
-        # c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        # tl.store(c_ptrs, acc)
-
-    # a_gmem = torch.ones((64, 64), device=device, dtype=torch.float32)
-    # b_gmem = torch.ones((64, 64), device=device, dtype=torch.float32)
-    # c = torch.ones((64, 64), device=device, dtype=torch.float32)
-    # grid = lambda META: (1,)
-    # async_dot_kernel[grid](
-    #     # a_gmem,
-    #     # b_gmem,
-    #     c,  #
-    #     c.stride(0),
-    #     c.stride(1),  #
-    #     64,
-    #     num_warps=4,
-    # )
-
-    # print("\nc = ", c)
-    # assert False
 
     M,N,K = (64,64,64)
     x = torch.ones((M, K), device=device, dtype=torch.float32)
