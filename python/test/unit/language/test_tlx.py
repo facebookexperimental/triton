@@ -70,10 +70,10 @@ def test_async_tasks(BLOCK_SIZE, device):
     reason="Requires compute capability >= 9 for NV",
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
-def test_local_alloc_index(BLOCK_SIZE, device):
+def test_local_load(BLOCK_SIZE, device):
 
     @triton.jit
-    def local_alloc_index(
+    def local_load(
         x_ptr,
         y_ptr,
         output_ptr,
@@ -92,6 +92,8 @@ def test_local_alloc_index(BLOCK_SIZE, device):
         buffer1 = tlx.local_view(buffers, 1)
         tlx.async_load(x_ptr_offsets, buffer0, mask=mask)
         tlx.async_load(y_ptr_offsets, buffer1, mask=mask)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
         x_local = tlx.local_load(buffer0)
         y_local = tlx.local_load(buffer1)
         local_add = x_local + y_local
@@ -104,13 +106,14 @@ def test_local_alloc_index(BLOCK_SIZE, device):
     output = torch.empty_like(x)
     n_elements = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = local_alloc_index[grid](x, y, output, n_elements, BLOCK_SIZE)
+    kernel = local_load[grid](x, y, output, n_elements, BLOCK_SIZE)
     assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
     assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 2
     assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
+    assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_wait") == 1
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
-    # TODO(Arda): Once we have the layout propagation pass, add numerical checks
-    # here
+    torch.testing.assert_close(x + y, output)
 
 
 @pytest.mark.skipif(
