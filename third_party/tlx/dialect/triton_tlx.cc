@@ -41,7 +41,17 @@ void init_triton_tlx_ir(py::module &&m) {
                  ttg::MemDescType::get(shape, elementType, encoding,
                                        memorySpace, /*mutableMemory=*/true);
              return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
-           });
+           })
+      .def("create_async_commit_group",
+           [](TritonOpBuilder &self,
+              std::vector<Value> asyncTokens) -> mlir::Value {
+             return self.create<ttg::AsyncCommitGroupOp>(asyncTokens);
+           })
+      .def("create_async_wait",
+           [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
+              unsigned pendings) -> mlir::Value {
+             return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
+           })
       .def(
       "create_require_layout",
       [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {

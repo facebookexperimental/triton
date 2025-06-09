@@ -1912,6 +1912,7 @@ void init_triton_ir(py::module &&m) {
              return self.create<ttng::WarpGroupDotOp>(
                  c.getType(), a, b, c, nullptr, inputPrecision,
                  maxNumImpreciseAcc, isAsync);
+           })
       .def("create_convert_layout",
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
              Type newType;
@@ -1927,6 +1928,17 @@ void init_triton_ir(py::module &&m) {
              }
              newType.dump();
              return self.create<ttg::ConvertLayoutOp>(newType, v);
+           })
+      .def("create_require_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+               auto newType = ttg::MemDescType::get(
+                   type.getShape(), type.getElementType(), encoding,
+                   type.getMemorySpace(), type.getMutableMemory());
+               return self.create<tlx::RequireLayoutOp>(newType, v);
+             } else {
+               throw std::runtime_error("Unsupported type");
+             }
            })
       // Proton Ops
       .def("create_proton_record",

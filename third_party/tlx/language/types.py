@@ -85,6 +85,17 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
     def build(self, builder):
         pass
 
+# class nv_mma_layout_encoding(layout_encoding):
+#     def __init__(self, numCTAsPerCGA, numCTASplit, numCTAOrder):
+#         super().__init__()
+
+#         self.numCTAsPerCGA = numCTAsPerCGA
+#         self.numCTASplit = numCTASplit
+#         self.numCTAOrder = numCTAOrder
+
+#     def build(self, builder):
+#         pass
+
 
 class storage_kind(enum.Enum):
     smem = "smem"
