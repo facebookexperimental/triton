@@ -30,15 +30,25 @@ While this approach places more responsibility on the user, it reduces the compi
 
 ### Async memory access
 
-- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`
-
-   Load a chunk of data from global memory into a local memory buffer asynchronously.
-
-
 - `buffer = tlx.async_descriptor_load(memdesc, [offsets], barrier)`
 
    Load a chunk of data from global memory into a local memory buffer. The global address, strides, and buffer size are defined by the memory descriptor. A barrier object is provided and signaled upon completion of the operation.
 
+
+- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`
+
+   Load a chunk of data from global memory into a local memory buffer asynchronously.
+
+   The operation returns a token object which can be used to track the completion of the operation.
+
+
+- `tlx.async_load_commit_group(tokens)`
+
+   Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.
+
+- `tlx.async_load_wait_group(tokens)`
+
+   Wait for completion of prior asynchronous copy operations. Optionally, each token represents a tracked async commit group operation.
 
 
 ### Async tensor core operations

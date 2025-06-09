@@ -44,12 +44,12 @@ void init_triton_tlx_ir(py::module &&m) {
             })
       .def("create_local_load",
            [](TritonOpBuilder &self, Value subView,
-              std::optional<Value> asyncWaitToken) -> mlir::Value {
+              std::optional<Value> asyncToken) -> mlir::Value {
              auto subViewType = cast<ttg::MemDescType>(subView.getType());
              auto newType = RankedTensorType::get(subViewType.getShape(),
                                                   subViewType.getElementType());
-             return self.create<ttg::LocalLoadOp>(
-                 newType, subView, asyncWaitToken.value_or(Value()));
+             return self.create<ttg::LocalLoadOp>(newType, subView,
+                                                  asyncToken.value_or(Value()));
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
@@ -67,6 +67,16 @@ void init_triton_tlx_ir(py::module &&m) {
                  ttg::MemDescType::get(shape, elementType, encoding,
                                        memorySpace, /*mutableMemory=*/true);
              return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
+           })
+      .def("create_async_commit_group",
+           [](TritonOpBuilder &self,
+              std::vector<Value> asyncTokens) -> mlir::Value {
+             return self.create<ttg::AsyncCommitGroupOp>(asyncTokens);
+           })
+      .def("create_async_wait",
+           [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
+              unsigned pendings) -> mlir::Value {
+             return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
            });
 }
 

@@ -105,13 +105,13 @@ def async_load(
     eviction_policy: str = "",
     is_volatile: bool = False,
     _builder=None,
-) -> tlx.buffered_tensor:
+) -> tlx.async_token:
     """
     Loads buffer from global to local memory asynchronously.
     """
     cache = _str_to_load_cache_modifier(cache_modifier)
     eviction = _str_to_eviction_policy(eviction_policy)
-    return tlx.buffered_tensor(
+    return tlx.async_token(
         _builder.create_async_load(
             src.handle,
             result.handle,
@@ -120,19 +120,45 @@ def async_load(
             cache,
             eviction,
             is_volatile,
-        ),
-        result.type,
-        result.layout,
+        )
     )
+
+
+@tl.builtin
+def async_load_commit_group(
+    tokens: list[tlx.async_token] = [],
+    _builder=None,
+) -> tlx.async_token:
+    """
+    Commits all prior initiated but uncommitted async_load ops an async group.
+    Each token represents a tracked async load operation.
+    """
+    handles = [t.handle for t in tokens]
+    return tlx.async_token(_builder.create_async_commit_group(handles))
+
+
+@tl.builtin
+def async_load_wait_group(
+    pendings: tl.constexpr,
+    tokens: list[tlx.async_token] = [],
+    _builder=None,
+) -> tlx.async_token:
+    """
+    Wait for completion of prior asynchronous copy operations.
+    Each token represents a tracked async commit group operation.
+    """
+    pendings = tl._unwrap_if_constexpr(pendings)
+    handles = [t.handle for t in tokens]
+    return tlx.async_token(_builder.create_async_wait(handles, pendings))
 
 
 @tl.builtin
 def local_load(
     src: tlx.buffered_tensor,
-    token=None,
+    token: tlx.async_token=None,
     _builder=None,
 ) -> tl.tensor:
     """
     Loads buffer from local memory into a distributed tensor.
     """
-    return tl.tensor(_builder.create_local_load(src.handle, token), src.type)
+    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)

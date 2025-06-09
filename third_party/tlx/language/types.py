@@ -141,3 +141,15 @@ class mbarriers(buffered_tensor):
         block_type = tl.block_type(tl.int64, [1])
         super().__init__(handle, block_type)
         pass
+
+
+class async_token(tl.base_value):
+    """
+    Defines a type of value used to track and synchronize asynchronous operations.
+    """
+    def __init__(self, handle):
+        self.handle = handle
+
+    @property
+    def type(self):
+        return None  # Python expects this to exist even if unused
