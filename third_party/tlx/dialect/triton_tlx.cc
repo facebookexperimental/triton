@@ -24,7 +24,7 @@ void init_triton_tlx_ir(py::module &&m) {
               } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
                 newType = RankedTensorType::get(
                     type.getShape(), type.getElementType(), encoding);
-                return self.create<ttg::ConvertLayoutOp>(newType, v);
+                return self.create<tlx::RequireLayoutOp>(newType, v);
               } else {
                 throw std::runtime_error("Unsupported type");
               }
@@ -44,6 +44,55 @@ void init_triton_tlx_ir(py::module &&m) {
              auto context = self.getBuilder().getContext();
              return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
                  context, blockM, blockN, unpacked, CTASplitM, CTASplitN));
+           })
+      .def("make_nv_mma_shared_encoding_attr",
+           [](TritonOpBuilder &self, std::vector<int64_t> shape,
+              std::vector<unsigned> order, Type &elemType,
+              std::vector<unsigned> CTAsPerCGA,
+              std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
+              bool fp4Padded) {
+
+             /* Validation logic for user defined layout encoding begin */
+             assert (shape.size() == order.size());
+             assert (order.size() == CTAsPerCGA.size());
+             assert (CTAsPerCGA.size() == CTASplitNum.size());
+             assert (CTASplitNum.size() == CTAOrder.size());
+             /* Validation logic for user defined layout encoding end */
+
+             auto context = self.getBuilder().getContext();
+             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
+                                                      CTASplitNum, CTAOrder);
+             return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
+                 context, shape, order, CTALayout, elemType, fp4Padded));
+           })
+      .def("make_nv_mma_encoding_attr",
+           [](TritonOpBuilder &self) {
+             auto context = self.getBuilder().getContext();
+             int versionMajor = 3;
+             int versionMinor = 0;
+             llvm::ArrayRef<unsigned> warpsPerCTA = {4, 1};
+             std::vector<unsigned> CTAsPerCGA = {1, 1};
+             std::vector<unsigned> CTASplitNum = {1, 1};
+             std::vector<unsigned> CTAOrder = {1, 0};
+             llvm::ArrayRef<unsigned> instrShape = {16, 64, 8};
+
+             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
+                                                      CTASplitNum, CTAOrder);
+             return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
+                 context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
+                 instrShape));
+           })
+      .def("create_fence_async_shared",
+           [](TritonOpBuilder &self) -> void {
+             self.create<ttng::FenceAsyncSharedOp>(false);
+           })
+      .def("create_warp_group_dot",
+           [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
+              mlir::Value &c, InputPrecision inputPrecision,
+              int maxNumImpreciseAcc, bool isAsync) -> mlir::Value {
+             return self.create<ttng::WarpGroupDotOp>(
+                 c.getType(), a, b, c, nullptr, inputPrecision,
+                 maxNumImpreciseAcc, isAsync);
            })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,

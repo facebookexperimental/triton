@@ -1758,35 +1758,6 @@ void init_triton_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
-      .def("make_nv_mma_shared_encoding_attr",
-           [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              std::vector<unsigned> order, Type &elemType,
-              std::vector<unsigned> CTAsPerCGA,
-              std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
-              bool fp4Padded) {
-             auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
-                                                      CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
-                 context, shape, order, CTALayout, elemType, fp4Padded));
-           })
-      .def("make_nv_mma_encoding_attr",
-           [](TritonOpBuilder &self) {
-             auto context = self.getBuilder().getContext();
-             int versionMajor = 3;
-             int versionMinor = 0;
-             llvm::ArrayRef<unsigned> warpsPerCTA = {4, 1};
-             std::vector<unsigned> CTAsPerCGA = {1, 1};
-             std::vector<unsigned> CTASplitNum = {1, 1};
-             std::vector<unsigned> CTAOrder = {1, 0};
-             llvm::ArrayRef<unsigned> instrShape = {16, 64, 8};
-
-             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
-                                                      CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
-                 context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
-                 instrShape));
-           })
       .def("create_local_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding) -> mlir::Value {
@@ -1900,18 +1871,6 @@ void init_triton_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
-           })
-      .def("create_fence_async_shared",
-           [](TritonOpBuilder &self) -> void {
-             self.create<ttng::FenceAsyncSharedOp>(false);
-           })
-      .def("create_warp_group_dot",
-           [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
-              mlir::Value &c, InputPrecision inputPrecision,
-              int maxNumImpreciseAcc, bool isAsync) -> mlir::Value {
-             return self.create<ttng::WarpGroupDotOp>(
-                 c.getType(), a, b, c, nullptr, inputPrecision,
-                 maxNumImpreciseAcc, isAsync);
            })
       // Proton Ops
       .def("create_proton_record",

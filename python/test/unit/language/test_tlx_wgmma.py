@@ -30,9 +30,8 @@ def test_async_dot(device):
 
     @triton.jit
     def tgt_kernel(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn, BLOCK_M: tl.constexpr,
-                   BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, INPUT_PRECISION: tl.constexpr,
-                   out_dtype: tl.constexpr = tl.float32):
-        dummy_output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                   BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, INPUT_PRECISION: tl.constexpr, out_dtype: tl.constexpr,
+                   COL_INPUT: tl.constexpr, COL_OTHER: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
 
@@ -45,7 +44,8 @@ def test_async_dot(device):
 
         # TODO. initialize values or async load
 
-        z = tlx.async_dot(a_smem, b_smem, dummy_output, input_precision=INPUT_PRECISION, out_dtype=out_dtype)
+        z = tlx.async_dot(a_smem, b_smem, input_precision=INPUT_PRECISION, out_dtype=out_dtype, col_input=COL_INPUT,
+                          col_other=COL_OTHER)
         tl.store(Zs, z)
 
     M, N, K = (64, 64, 64)
@@ -53,7 +53,10 @@ def test_async_dot(device):
     y = torch.ones((K, N), device=device, dtype=torch.float32)
     z = torch.empty_like(x, device=device, dtype=torch.float32)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32}
+    kern_kwargs = {
+        'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32, 'COL_INPUT': 0,
+        'COL_OTHER': 1
+    }
     with pytest.raises(RuntimeError) as _:
         _ = tgt_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1),
                                **kern_kwargs)

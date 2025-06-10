@@ -6,8 +6,7 @@ from . import types as tlx
 
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
-    layout_A = x.layout
-    if layout_A is not tlx.nv_mma_shared_layout_encoding:
+    if not isinstance(x.layout, tlx.nv_mma_shared_layout_encoding):
         # TODO. why do we need this class object?
         layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=order, elemType=x.dtype, numCTAsPerCGA=[1, 1],
                                                    numCTASplit=[1, 1], numCTAOrder=[1, 1], fp4Padded=False)
@@ -24,26 +23,17 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
     return _builder.create_convert_layout(x.handle, layout_handle)
 
 
-def require_nv_mma_layout(x: tl.tensor, _builder=None):
-    layout_handle = _builder.make_nv_mma_encoding_attr()
-    return _builder.create_convert_layout(x.handle, layout_handle)
-
-
-def require_nv_mma_layout(x: tl.tensor, _builder=None):
-    layout_handle = _builder.make_nv_mma_encoding_attr()
-    return _builder.create_convert_layout(x.handle, layout_handle)
-
-
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
     input: tlx.buffered_tensor,
     other: tlx.buffered_tensor,
-    dummy_output: tl.tensor,
     acc=None,  # tl.tensor,
     input_precision=None,
     allow_tf32=None,
     max_num_imprecise_acc=None,
+    col_input=0,
+    col_other=0,
     out_dtype=tl.float32,
     _builder=None,
 ) -> tl.tensor:
@@ -83,10 +73,11 @@ def async_dot(
     (input, other, acc_handle, input_precision, max_num_imprecise_acc,
      ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
 
-    input = require_nv_mma_shared_layout(input, [1, 0], _builder)
-    other = require_nv_mma_shared_layout(other, [0, 1], _builder)
+    # TODO. batched dot is not supported yet
+    input = require_nv_mma_shared_layout(input, [0, 1] if col_input else [1, 0], _builder)
+    other = require_nv_mma_shared_layout(other, [0, 1] if col_other else [1, 0], _builder)
 
-    acc = require_nv_mma_layout(dummy_output, _builder)
+    acc = _builder.create_convert_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
 
     _builder.create_fence_async_shared()
     return tl.tensor(_builder.create_warp_group_dot(input, other, acc, input_precision, max_num_imprecise_acc, True),
