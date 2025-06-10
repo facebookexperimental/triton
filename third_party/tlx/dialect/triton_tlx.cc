@@ -30,7 +30,7 @@ void init_triton_tlx_ir(py::module &&m) {
         }
         newType.dump();
       })
-      ->def("create_require_layout",
+      .def("create_require_layout",
             [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
               Type newType;
               if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
