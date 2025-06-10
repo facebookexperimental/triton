@@ -4,6 +4,7 @@ import enum
 
 
 class layout_encoding:
+
     def __init__(self):
         pass
 
@@ -12,12 +13,14 @@ class layout_encoding:
 
 
 class shared_layout_encoding(layout_encoding):
+
     def __init__(self):
         super().__init__()
         pass
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
+
     def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
         super().__init__()
         self.vectorSize = vectorSize
@@ -32,6 +35,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
     """
     Make a default non-swizzled shared layout encoding.
     """
+
     @classmethod
     def make_default(cls, rank):
         return cls(
@@ -50,6 +54,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
+
     def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
@@ -61,6 +66,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
     """
     Make a default tensor memory layout encoding.
     """
+
     @classmethod
     def make_default(cls, shape):
         return cls(
@@ -73,6 +79,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
+
     def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
         super().__init__()
         self.shape = shape
@@ -130,6 +137,7 @@ class mbarriers(buffered_tensor):
     """
     Define mbarrier type derived from buffered_tensor to support barrier specific operations/validations
     """
+
     def __init__(self, handle):
         # Temporarily use 1, as the shape must be a power of 2.
         # TODO: use the actual barrier count to compute shape for precise boundary checks.
@@ -142,6 +150,7 @@ class async_token(tl.base_value):
     """
     Defines a type of value used to track and synchronize asynchronous operations.
     """
+
     def __init__(self, handle):
         self.handle = handle
 

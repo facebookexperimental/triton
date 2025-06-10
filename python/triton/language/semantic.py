@@ -1,7 +1,7 @@
 from __future__ import annotations  # remove after python 3.11
 import warnings
 
-from typing import List, Optional, Sequence, Tuple, TypeVar
+from typing import List, Optional, Sequence, Tuple, TypeVar, Any
 import numbers
 
 from triton.runtime import driver
@@ -1546,8 +1546,8 @@ def _str_to_dot_input_precision(input_precision, builder):
     return getattr(ir.INPUT_PRECISION, input_precision)
 
 
-def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
-        out_dtype: tl.dtype, builder: ir.builder) -> Tuple[Any]:
+def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str],
+                 max_num_imprecise_acc: int, out_dtype: tl.dtype, builder: ir.builder) -> Tuple[Any]:
     assert lhs.type.is_block() and rhs.type.is_block()
 
     if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
@@ -1581,7 +1581,9 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
     def _unwrap_if_constexpr(o):
         return o.value if isinstance(o, tl.constexpr) else o
 
-    assert _unwrap_if_constexpr(lhs.shape[-1]) == _unwrap_if_constexpr(rhs.shape[-2]), f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
+    assert _unwrap_if_constexpr(lhs.shape[-1]) == _unwrap_if_constexpr(
+        rhs.shape[-2]
+    ), f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
 
     assert builder.codegen_fns.get("min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
     min_dot_size = builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
@@ -1628,10 +1630,16 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
 
 def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
         out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:
-    (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = dot_precheck(lhs, rhs, acc, input_precision, max_num_imprecise_acc, out_dtype, builder)
+    (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
+     ret_ty) = dot_precheck(lhs, rhs, acc, input_precision, max_num_imprecise_acc, out_dtype, builder)
 
-    return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc,),
-                     ret_ty)
+    return tl.tensor(builder.create_dot(
+        lhs.handle,
+        rhs.handle,
+        acc_handle,
+        input_precision,
+        max_num_imprecise_acc,
+    ), ret_ty)
 
 
 def _str_to_fp_type(float_format: str):
