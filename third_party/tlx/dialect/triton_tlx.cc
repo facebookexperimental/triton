@@ -77,7 +77,7 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, std::vector<Value> asyncTokens,
               unsigned pendings) -> mlir::Value {
              return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
-           });
+           })
       .def(
           "create_require_layout",
           [](TritonOpBuilder &self, Value &v, int opIdx) -> Value {
