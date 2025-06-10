@@ -1550,6 +1550,7 @@ def _str_to_dot_input_precision(input_precision, builder):
 def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
                  max_num_imprecise_acc: int, out_dtype: tl.dtype, builder: ir.builder) -> Tuple[Any]:
     input_precision = tl._unwrap_if_constexpr(input_precision)
+    allow_tf32 = tl._unwrap_if_constexpr(allow_tf32)
     assert input_precision is None or tl._unwrap_if_constexpr(
         allow_tf32) is None, "Only one of input_precision and allow_tf32 can be specified"
     if input_precision is None:
@@ -1639,10 +1640,10 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
     return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
 
-def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,
+def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32, max_num_imprecise_acc: int,
         out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:
     (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
-     ret_ty) = dot_precheck(lhs, rhs, acc, input_precision, max_num_imprecise_acc, out_dtype, builder)
+     ret_ty) = dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, builder)
 
     return tl.tensor(builder.create_dot(
         lhs.handle,
