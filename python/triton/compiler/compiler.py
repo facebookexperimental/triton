@@ -352,11 +352,7 @@ def compile(src, target=None, options=None):
 
     if compilation_listener:
         timer.finished_ir_initialization()
-    print(f"DAOHANG_DEBUG: Compiling {src.name} for {target} with options {options}")
-    # import pdb; pdb.set_trace()
-    # assert False
     for ext, compile_ir in list(stages.items())[first_stage:]:
-        # import pdb; pdb.set_trace()
         next_module = compile_ir(module, metadata)
         ir_filename = f"{file_name}.{ext}"
         if fn_override_manager is None:

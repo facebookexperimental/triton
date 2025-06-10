@@ -365,25 +365,6 @@ public:
     int versionMinor = computeCapability == 75 ? 1 : 0;
     auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
                                         numWarps, instrShape);
-    printf("DAOHANG_DEBUG: versionMajor = %d, versionMinor = %d\n",
-           versionMajor, versionMinor);
-    for (auto i = 0; i < warpsPerTile.size(); i++)
-      printf("DAOHANG_DEBUG: warpsPerTile[%d] = %d\n", i, warpsPerTile[i]);
-
-    for (auto i = 0; i < CTALayout.getCTAsPerCGA().size(); i++)
-      printf("DAOHANG_DEBUG: CTALayout.CTAsPerCGA[%d] = %d\n", i,
-             CTALayout.getCTAsPerCGA()[i]);
-
-    for (auto i = 0; i < CTALayout.getCTASplitNum().size(); i++)
-      printf("DAOHANG_DEBUG: CTALayout.CTASplitNum[%d] = %d\n", i,
-             CTALayout.getCTASplitNum()[i]);
-
-    for (auto i = 0; i < CTALayout.getCTAOrder().size(); i++)
-      printf("DAOHANG_DEBUG: CTALayout.CTAOrder[%d] = %d\n", i,
-             CTALayout.getCTAOrder()[i]);
-
-    for (auto i = 0; i < instrShape.size(); i++)
-      printf("DAOHANG_DEBUG: instrShape[%d] = %d\n", i, instrShape[i]);
     auto mmaEnc = NvidiaMmaEncodingAttr::get(
         oldRetType.getContext(), versionMajor, versionMinor, warpsPerTile,
         CTALayout, instrShape);
