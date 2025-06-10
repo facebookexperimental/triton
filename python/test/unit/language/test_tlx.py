@@ -55,7 +55,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     output1 = torch.empty_like(x)
     output2 = torch.empty_like(a)
     n_elements = output1.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
@@ -87,7 +87,7 @@ def test_local_load(BLOCK_SIZE, device):
         x_ptr_offsets = x_ptr + offsets
         y_ptr_offsets = y_ptr + offsets
 
-        buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, tl.constexpr(2))
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2))
         buffer0 = tlx.local_view(buffers, 0)
         buffer1 = tlx.local_view(buffers, 1)
         tlx.async_load(x_ptr_offsets, buffer0, mask=mask)
@@ -124,12 +124,10 @@ def test_local_load(BLOCK_SIZE, device):
 def test_tmem_alloc_index(BLOCK_SIZE, device):
 
     @triton.jit
-    def kernel(
-        BLOCK_SIZE: tl.constexpr,
-    ):
+    def kernel(BLOCK_SIZE: tl.constexpr, ):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.tmem)
-        buffer0 = tlx.local_view(buffers, 0)
-        buffer1 = tlx.local_view(buffers, 1)
+        buffer0 = tlx.local_view(buffers, 0)  # noqa: F841
+        buffer1 = tlx.local_view(buffers, 1)  # noqa: F841
 
     grid = lambda meta: (1, )
     kerenl_info = kernel[grid](BLOCK_SIZE)
@@ -141,9 +139,12 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
 def test_thread_id(device):
 
     @triton.jit
-    def store_from_thread_0_kernel(output_ptr, value, n_elements, axis : tl.constexpr,
+    def store_from_thread_0_kernel(
+        output_ptr,
+        value,
+        n_elements,
+        axis: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-
     ):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
@@ -156,7 +157,7 @@ def test_thread_id(device):
     output = torch.zeros(32, dtype=torch.int32, device='cuda')
     n_elements = output.numel()
     value = 42
-    store_from_thread_0_kernel[(1,)](output, value, n_elements, 0, 32, num_warps=1)
+    store_from_thread_0_kernel[(1, )](output, value, n_elements, 0, 32, num_warps=1)
     torch.cuda.synchronize()
     expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
     expected_output[0] = value
@@ -182,7 +183,7 @@ def test_async_wait(BLOCK_SIZE, device):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         input_ptr_offsets = input_ptr + offsets
-        buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, tl.constexpr(1))
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
         tlx.async_load(input_ptr_offsets, buffer, mask=mask)
         tlx.async_load_commit_group()
@@ -202,7 +203,7 @@ def test_async_wait(BLOCK_SIZE, device):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         input_ptr_offsets = input_ptr + offsets
-        buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, tl.constexpr(1))
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
         token = tlx.async_load(input_ptr_offsets, buffer, mask=mask)
         token = tlx.async_load_commit_group([token])
@@ -235,7 +236,8 @@ def test_local_trans(device):
     def local_trans_kernel(
         input_ptr,
         output_ptr,
-        M, N,
+        M,
+        N,
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
     ):
@@ -264,13 +266,7 @@ def test_local_trans(device):
     BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 64
     x = torch.rand((M, N), dtype=torch.float32, device=device)
     y = torch.empty((N, M), dtype=torch.float32, device=device)
-    grid = lambda meta: (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, BLOCK_SIZE_N)
-    )
-    kernel = local_trans_kernel[grid](
-        x, y, M, N,
-        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
-        num_warps=1)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    kernel = local_trans_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, num_warps=1)
     assert kernel.asm["ttgir"].count("ttg.memdesc_trans") == 1
     torch.testing.assert_close(y, x.T)

@@ -57,9 +57,7 @@ def local_alloc(
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
     if storage == tlx.storage_kind.smem:
-        tensor_handle = _builder.create_local_alloc(
-            full_shape, elem_type, layout_handle
-        )
+        tensor_handle = _builder.create_local_alloc(full_shape, elem_type, layout_handle)
     else:
         tensor_handle = _builder.create_tmem_alloc(full_shape, elem_type, layout_handle)
 
@@ -83,9 +81,7 @@ def local_view(
     buffer_idx = _convert_elem_to_ir_value(_builder, buffer_idx, require_i64=False)
     buffer_type = local_allocated_buffers.type
     # A subview of a one-dimensional buffer is still one-dimensional.
-    view_shape = (
-        buffer_type.shape[1:] if len(buffer_type.shape) > 1 else buffer_type.shape
-    )
+    view_shape = (buffer_type.shape[1:] if len(buffer_type.shape) > 1 else buffer_type.shape)
     view_type = tl.block_type(buffer_type.element_ty, view_shape)
     return tlx.buffered_tensor(
         _builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx),
@@ -120,8 +116,7 @@ def async_load(
             cache,
             eviction,
             is_volatile,
-        )
-    )
+        ))
 
 
 @tl.builtin
@@ -155,7 +150,7 @@ def async_load_wait_group(
 @tl.builtin
 def local_load(
     src: tlx.buffered_tensor,
-    token: tlx.async_token=None,
+    token: tlx.async_token = None,
     _builder=None,
 ) -> tl.tensor:
     """
@@ -165,11 +160,7 @@ def local_load(
 
 
 @tl.builtin
-def local_trans(
-    input: tlx.buffered_tensor,
-    dims: Tuple[int]=(1, 0),
-    _builder=None
-) -> tlx.buffered_tensor:
+def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _builder=None) -> tlx.buffered_tensor:
     """
         Permutes the dimensions of a tensor.
 

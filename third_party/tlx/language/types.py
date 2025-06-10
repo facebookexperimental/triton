@@ -5,6 +5,7 @@ from abc import abstractmethod
 
 
 class layout_encoding:
+
     def __init__(self):
         pass
 
@@ -13,6 +14,7 @@ class layout_encoding:
 
 
 class shared_layout_encoding(layout_encoding):
+
     def __init__(self):
         super().__init__()
         pass
@@ -20,14 +22,14 @@ class shared_layout_encoding(layout_encoding):
     """
     Create a new layout object that is a permutation of the current layout.
     """
+
     @abstractmethod
     def make_permute(self, dims) -> Self:
-        raise NotImplementedError(
-            f"{self.__class__.__name__}.make_permute() must be overridden in subclasses"
-        )
+        raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
+
     def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
         super().__init__()
         self.vectorSize = vectorSize
@@ -42,13 +44,14 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
     """
     Make a default non-swizzled shared layout encoding.
     """
+
     @classmethod
     def make_default(cls, rank):
         return cls(
             vectorSize=1,
             perPhase=1,
             maxPhase=1,
-            order = list(reversed(range(rank))), # e.g, [1, 0] as a row-major order
+            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
             numCTAs=[1] * rank,
             numCTAsPerCGA=[1] * rank,
             numCTASplit=[1] * rank,
@@ -58,20 +61,15 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
     """
     Create a new layout that is a permutation of the given layout.
     """
+
     def make_permute(self, dims) -> Self:
         permuted_order = tuple(self.order[d] for d in dims)
-        return swizzled_shared_layout_encoding(
-            self.vectorSize,
-            self.perPhase,
-            self.maxPhase,
-            permuted_order,
-            self.numCTAs,
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder)
+        return swizzled_shared_layout_encoding(self.vectorSize, self.perPhase, self.maxPhase, permuted_order,
+                                               self.numCTAs, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder)
 
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
+
     def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
@@ -83,6 +81,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
     """
     Make a default tensor memory layout encoding.
     """
+
     @classmethod
     def make_default(cls, shape):
         return cls(
@@ -95,7 +94,6 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
     def build(self, builder):
         pass
-
 
 
 class storage_kind(enum.Enum):
@@ -139,7 +137,6 @@ class buffered_tensor(tl.base_value):
         # Layout encoding
         self.layout = layout
 
-
     def make_permute(self, handle, dims) -> Self:
         permuted_type = tl.block_type(self.type.scalar, [self.shape[d] for d in dims])
         permuted_layout = self.layout.make_permute(dims)
@@ -155,6 +152,7 @@ class mbarriers(buffered_tensor):
     """
     Define mbarrier type derived from buffered_tensor to support barrier specific operations/validations
     """
+
     def __init__(self, handle):
         # Temporarily use 1, as the shape must be a power of 2.
         # TODO: use the actual barrier count to compute shape for precise boundary checks.
@@ -167,6 +165,7 @@ class async_token(tl.base_value):
     """
     Defines a type of value used to track and synchronize asynchronous operations.
     """
+
     def __init__(self, handle):
         self.handle = handle
 
