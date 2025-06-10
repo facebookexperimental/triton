@@ -32,31 +32,24 @@ static Value createThreadIdOp(OpBuilder &builder, Location loc) {
   return cast.getResult(0);
 }
 
-// Enable debug printing for barriers based on environment variable
 static bool enableBarrierDebugPrint =
     mlir::triton::tools::getBoolEnv("TRITON_WS_BARRIER_DEBUG");
 
-static void insertBarrierDebugPrint(mlir::OpBuilder &builder,
-                                    mlir::Location loc, llvm::StringRef prefix,
-                                    mlir::ValueRange values = {}) {
-  // Just return if environment variable isn't set
+static void emitBarrierDebugPrint(mlir::OpBuilder &builder, mlir::Location loc,
+                                  llvm::StringRef prefix,
+                                  mlir::ValueRange values = {}) {
   if (!enableBarrierDebugPrint)
     return;
-  // Get thread ID for better debugging
-  Value threadId = createThreadIdOp(builder, loc);
-  // Create a more descriptive prefix with thread ID
-  std::string fullPrefix = (prefix + ": ").str();
-  // Prepare values to print - add thread ID first
-  SmallVector<Value> printValues;
-  printValues.push_back(threadId);
-  printValues.append(values.begin(), values.end());
-  // Prepare the "isSigned" array: 0 for every printed value
-  SmallVector<int32_t> isSigned(printValues.size(), 0);
+
+  // The isSigned Array is needed for all PrintOp
+  // All are unsigned
+  SmallVector<int32_t> isSigned(values.size(), 0);
+
   builder.create<mlir::triton::PrintOp>(
       loc,
-      /*prefix=*/builder.getStringAttr(fullPrefix),
-      /*hex?=*/builder.getBoolAttr(false),
-      /*args=*/printValues,
+      /*prefix=*/builder.getStringAttr(prefix),
+      /*hex=*/builder.getBoolAttr(false),
+      /*args=*/values,
       /*isSigned=*/builder.getDenseI32ArrayAttr(isSigned));
 }
 
@@ -111,8 +104,8 @@ void processProducerAcquireOp(OpBuilder &builder, ttng::ProducerAcquireOp op,
   auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferEmpty, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
-  insertBarrierDebugPrint(builder, loc, "wait_barrier (producer acquire)",
-                          {op.getIdx(), phase});
+  emitBarrierDebugPrint(builder, loc, "wait_barrier (producer acquire)",
+                        {phase});
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttng::ProducerCommitOp op,
@@ -140,8 +133,8 @@ void processProducerCommitOp(OpBuilder &builder, ttng::ProducerCommitOp op,
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
-  insertBarrierDebugPrint(builder, loc, "barrier_arrive (producer commit)",
-                          {op.getIdx()});
+  emitBarrierDebugPrint(builder, loc, "barrier_arrive (producer commit)",
+                        {op.getIdx()});
 }
 
 void processConsumerWaitOp(OpBuilder &builder, ttng::ConsumerWaitOp op,
@@ -153,8 +146,7 @@ void processConsumerWaitOp(OpBuilder &builder, ttng::ConsumerWaitOp op,
   auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferFull, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
-  insertBarrierDebugPrint(builder, loc, "wait_barrier (consumer wait)",
-                          {op.getIdx(), phase});
+  emitBarrierDebugPrint(builder, loc, "wait_barrier (consumer)", {phase});
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttng::ConsumerReleaseOp op,
@@ -164,8 +156,8 @@ void processConsumerReleaseOp(OpBuilder &builder, ttng::ConsumerReleaseOp op,
       loc, bufferEmpty, nullptr, nullptr, false, 0);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
-  insertBarrierDebugPrint(builder, loc, "barrier_arrive (consumer release)",
-                          {op.getIdx()});
+  emitBarrierDebugPrint(builder, loc, "barrier_arrive (consumer release)",
+                        {op.getIdx()});
 }
 
 void lowerTokenOperations(Operation *parentOp, int numCTAs,
