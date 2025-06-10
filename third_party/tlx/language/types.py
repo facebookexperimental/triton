@@ -18,6 +18,7 @@ class shared_layout_encoding(layout_encoding):
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
+    def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
         super().__init__()
         self.vectorSize = vectorSize
         self.perPhase = perPhase
@@ -70,6 +71,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
             CTASplitN=1,
         )
 
+
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
     def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
         super().__init__()
@@ -80,37 +82,6 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTASplit = numCTASplit
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
-
-
-class tensor_memory_layout_encoding(shared_layout_encoding):
-    def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
-        super().__init__()
-        self.blockM = blockM
-        self.blockN = blockN
-        self.unpacked = unpacked
-        self.CTASplitM = CTASplitM
-        self.CTASplitN = CTASplitN
-
-    """
-    Make a default tensor memory layout encoding.
-    """
-    @classmethod
-    def make_default(cls, shape):
-        return cls(
-            blockM=shape[0],
-            blockN=shape[1],
-            unpacked=True,
-            CTASplitM=1,
-            CTASplitN=1,
-        )
-
-    def build(self, builder):
-        pass
-
-
-class storage_kind(enum.Enum):
-    smem = "smem"
-    tmem = "tmem"
 
 
 class storage_kind(enum.Enum):
@@ -154,7 +125,6 @@ class buffered_tensor(tl.base_value):
         # Layout encoding
         self.layout = layout
         self.order = None
-
 
 
 class mbarriers(buffered_tensor):
