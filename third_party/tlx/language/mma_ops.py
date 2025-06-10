@@ -20,7 +20,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
         layout.numCTAOrder,
         layout.fp4Padded,
     )
-    return _builder.create_convert_layout(x.handle, layout_handle)
+    return _builder.create_require_layout(x.handle, layout_handle)
 
 
 # async dot signature needs to be close to tl.dot as much as possible
@@ -59,25 +59,15 @@ def async_dot(
     input_precision can be one of: tf32, tf32x3, ieee.
     """
 
-    assert input_precision is None or allow_tf32 is None, "Only one of input_precision and allow_tf32 can be specified"
-    if input_precision is None:
-        supports_tf32 = _builder and "tf32" in _builder.options.allowed_dot_input_precisions
-        input_precision = knobs.language.fp32_default or ("tf32" if (supports_tf32 and
-                                                                     (allow_tf32 or allow_tf32 is None)) else "ieee")
-
-    input_precision = tl._unwrap_if_constexpr(input_precision)
-    out_dtype = tl._unwrap_if_constexpr(out_dtype)
-    max_num_imprecise_acc = tl._unwrap_if_constexpr(max_num_imprecise_acc)
-
     # Perform dot_precheck shared by tl.dot
     (input, other, acc_handle, input_precision, max_num_imprecise_acc,
-     ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
+     ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, _builder)
 
     # TODO. batched dot is not supported yet
     input = require_nv_mma_shared_layout(input, [0, 1] if col_input else [1, 0], _builder)
     other = require_nv_mma_shared_layout(other, [0, 1] if col_other else [1, 0], _builder)
 
-    acc = _builder.create_convert_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
+    acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
 
     _builder.create_fence_async_shared()
     return tl.tensor(_builder.create_warp_group_dot(input, other, acc, input_precision, max_num_imprecise_acc, True),

@@ -1546,8 +1546,20 @@ def _str_to_dot_input_precision(input_precision, builder):
     return getattr(ir.INPUT_PRECISION, input_precision)
 
 
-def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str],
+def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
                  max_num_imprecise_acc: int, out_dtype: tl.dtype, builder: ir.builder) -> Tuple[Any]:
+    input_precision = tl._unwrap_if_constexpr(input_precision)
+    assert input_precision is None or tl._unwrap_if_constexpr(allow_tf32) is None, "Only one of input_precision and allow_tf32 can be specified"
+    if input_precision is None:
+        supports_tf32 = _builder and "tf32" in _builder.options.allowed_dot_input_precisions
+        input_precision = knobs.language.fp32_default or ("tf32" if (supports_tf32 and
+                                                                     (allow_tf32 or allow_tf32 is None)) else "ieee")
+
+    input_precision = tl._unwrap_if_constexpr(input_precision)
+    out_dtype = tl._unwrap_if_constexpr(out_dtype)
+    max_num_imprecise_acc = tl._unwrap_if_constexpr(max_num_imprecise_acc)
+    acc = tl._unwrap_if_constexpr(acc)
+
     assert lhs.type.is_block() and rhs.type.is_block()
 
     if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
