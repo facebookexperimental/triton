@@ -115,26 +115,27 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     return false;
   });
 
-  addDynamicallyLegalOp<triton::gpu::AsyncCopyGlobalToLocalOp>(
-      [&](triton::gpu::AsyncCopyGlobalToLocalOp asyncGlobalToLocal) -> bool {
-        Attribute srcEncoding =
-            dyn_cast<RankedTensorType>(asyncGlobalToLocal.getSrc().getType())
-                .getEncoding();
-        return srcEncoding != nullptr;
-      });
+  addDynamicallyLegalOp<triton::gpu::AsyncCopyGlobalToLocalOp,
+                        triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(
+      [&](Operation *op) -> bool {
+        // make sure every RankedTensorType operand has encoding
+        for (auto operandType : op->getOperandTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
+        }
 
-  addDynamicallyLegalOp<triton::gpu::LocalStoreOp>(
-      [&](triton::gpu::LocalStoreOp op) -> bool {
-        Attribute srcEncoding =
-            dyn_cast<RankedTensorType>(op.getSrc().getType()).getEncoding();
-        return srcEncoding != nullptr;
-      });
-
-  addDynamicallyLegalOp<triton::gpu::LocalLoadOp>(
-      [&](triton::gpu::LocalLoadOp op) -> bool {
-        Attribute srcEncoding =
-            dyn_cast<RankedTensorType>(op.getResult().getType()).getEncoding();
-        return srcEncoding != nullptr;
+        // make sure result type has encoding if it is RankedTensorType
+        for (auto resultType : op->getResultTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
+        }
+        return true;
       });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
