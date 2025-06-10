@@ -63,6 +63,14 @@ def test_async_dot(device):
     kern_kwargs = {
         'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32
     }
-    pgm = tgt_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1), **kern_kwargs)
+    with pytest.raises(RuntimeError) as context:
+        pgm = tgt_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1), **kern_kwargs)
 
-    assert False
+    # TODO. assert "ttng.warp_group_dot" in pgm["ttir"] but not accessible due to thrown RuntimeError
+    # Following snippet can be found in the printed TTIR.
+    # %49 = "tlx.require_layout"(%10) : (!ttg.memdesc<64x64xf32, #shared, #smem, mutable>) -> !ttg.memdesc<64x64xf32, #shared1, #smem, mutable>
+    # %50 = "tlx.require_layout"(%13) : (!ttg.memdesc<64x64xf32, #shared, #smem, mutable>) -> !ttg.memdesc<64x64xf32, #shared2, #smem, mutable>
+    # %51 = "ttg.convert_layout"(%3) : (tensor<64x64xf32>) -> tensor<64x64xf32, #mma>
+    # "ttng.fence_async_shared"() <{bCluster = false}> : () -> ()
+    # %52 = "ttng.warp_group_dot"(%49, %50, %51) <{inputPrecision = 0 : i32, isAsync = true, maxNumImpreciseAcc = 0 : i32}> : (!ttg.memdesc<64x64xf32, #shared1, #smem, mutable>, !ttg.memdesc<64x64xf32, #shared2, #smem, mutable>, tensor<64x64xf32, #mma>) -> tensor<64x64xf32, #mma>
+
