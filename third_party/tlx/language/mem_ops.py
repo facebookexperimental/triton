@@ -158,6 +158,16 @@ def local_load(
     """
     return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)
 
+@tl.builtin
+def local_store(
+    dst: tlx.buffered_tensor,
+    src: tl.tensor,
+    _builder=None,
+) -> tl.tensor:
+    """
+    Store a distributed tensor into a buffer in local memory.
+    """
+    return tl.tensor(_builder.create_local_store(dst.handle, src.handle), tl.void)
 
 @tl.builtin
 def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _builder=None) -> tlx.buffered_tensor:

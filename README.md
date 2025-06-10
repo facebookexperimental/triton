@@ -38,10 +38,13 @@ While this approach places more responsibility on the user, it reduces the compi
     Loads the buffer from local memory into a distributed tensor.
 
 
+- `tlx.local_store(buffer, distributed_tensor)`
+
+    Store a distributed tensor into a buffer in local memory.
+
 - `buffer = tlx.local_trans(buffer, dims)`
 
     Permutes the dimensions of a tensor.
-
 
 
 ### Async memory access

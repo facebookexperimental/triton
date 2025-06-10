@@ -117,6 +117,62 @@ def test_local_load(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_local_store(BLOCK_SIZE, device):
+
+    @triton.jit
+    def local_load_store(
+        x_ptr,
+        y_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x_ptr_offsets = x_ptr + offsets
+        y_ptr_offsets = y_ptr + offsets
+
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(4))
+        buffer0 = tlx.local_view(buffers, 0)
+        buffer1 = tlx.local_view(buffers, 1)
+        buffer2 = tlx.local_view(buffers, 2)
+        tlx.async_load(x_ptr_offsets, buffer0, mask=mask)
+        tlx.async_load(y_ptr_offsets, buffer1, mask=mask)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+        x_local = tlx.local_load(buffer0)
+        y_local = tlx.local_load(buffer1)
+        local_add = x_local + y_local
+        # store result into buffer2 and then load it
+        tlx.local_store(buffer2, local_add)
+        result = tlx.local_load(buffer2)
+        tl.store(output_ptr + offsets, result, mask=mask)
+
+    torch.manual_seed(0)
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    y = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = local_load_store[grid](x, y, output, n_elements, BLOCK_SIZE)
+    assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
+    assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 3
+    assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
+    assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_wait") == 1
+    assert kernel.asm["ttgir"].count("ttg.local_load") == 3
+    assert kernel.asm["ttgir"].count("ttg.local_store") == 1
+    torch.testing.assert_close(x + y, output)
+
+
+@pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires compute capability >= 10 for NV",
 )

@@ -38,6 +38,10 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttg::LocalLoadOp>(newType, subView,
                                                   asyncToken.value_or(Value()));
            })
+      .def("create_local_store",
+           [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
+             self.create<ttg::LocalStoreOp>(regValues, dst);
+           })
       .def("make_swizzled_shared_encoding_attr",
            [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
               unsigned maxPhase, std::vector<unsigned> order,

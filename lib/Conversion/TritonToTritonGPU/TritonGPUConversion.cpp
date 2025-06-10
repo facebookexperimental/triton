@@ -123,6 +123,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
         return srcEncoding != nullptr;
       });
 
+  addDynamicallyLegalOp<triton::gpu::LocalStoreOp>(
+      [&](triton::gpu::LocalStoreOp op) -> bool {
+        Attribute srcEncoding =
+            dyn_cast<RankedTensorType>(op.getSrc().getType()).getEncoding();
+        return srcEncoding != nullptr;
+      });
+
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     for (auto arg : funcOp.getArguments()) {
       if (auto tensor = dyn_cast<RankedTensorType>(arg.getType())) {

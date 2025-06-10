@@ -14,6 +14,8 @@ __all__ = [
     "buffered_tensor",  # type
     "local_alloc",
     "local_view",
+    "local_load",
+    "local_store",
     "async_load",
     "async_load_commit_group",
     "async_load_wait_group",

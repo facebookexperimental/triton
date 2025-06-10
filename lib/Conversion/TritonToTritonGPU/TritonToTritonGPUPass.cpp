@@ -621,6 +621,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::CallOp>,
       GenericOpPattern<ReturnOp>,
       GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
+      GenericOpPattern<triton::gpu::LocalStoreOp>,
       TritonFuncOpPattern>(typeConverter, context);
 }
 // Proton patterns
