@@ -138,7 +138,6 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
     assert kerenl_info.asm["ttgir"].count("kernel") == 1
 
 
-
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires compute capability >= 10 for NV",
@@ -160,7 +159,6 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
     # TODO: check numerics once tmem load/store is ready
     kerenl_info.asm["ttgir"]
     assert kerenl_info.asm["ttgir"].count("kernel") == 1
-
 
 
 def test_thread_id(device):
