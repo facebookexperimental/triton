@@ -63,12 +63,11 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<unsigned> CTAsPerCGA,
               std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
               bool fp4Padded) {
-
              /* Validation logic for user defined layout encoding begin */
-             assert (shape.size() == order.size());
-             assert (order.size() == CTAsPerCGA.size());
-             assert (CTAsPerCGA.size() == CTASplitNum.size());
-             assert (CTASplitNum.size() == CTAOrder.size());
+             assert(shape.size() == order.size());
+             assert(order.size() == CTAsPerCGA.size());
+             assert(CTAsPerCGA.size() == CTASplitNum.size());
+             assert(CTASplitNum.size() == CTAOrder.size());
              /* Validation logic for user defined layout encoding end */
 
              auto context = self.getBuilder().getContext();

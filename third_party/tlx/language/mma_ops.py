@@ -61,7 +61,8 @@ def async_dot(
 
     # Perform dot_precheck shared by tl.dot
     (input, other, acc_handle, input_precision, max_num_imprecise_acc,
-     ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, _builder)
+     ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype,
+                                     _builder)
 
     # TODO. batched dot is not supported yet
     input = require_nv_mma_shared_layout(input, [0, 1] if col_input else [1, 0], _builder)

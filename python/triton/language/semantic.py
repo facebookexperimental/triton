@@ -8,6 +8,7 @@ from triton.runtime import driver
 
 from .._C.libtriton import ir
 from . import core as tl
+from .. import knobs
 
 T = TypeVar('T')
 
@@ -1549,9 +1550,10 @@ def _str_to_dot_input_precision(input_precision, builder):
 def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
                  max_num_imprecise_acc: int, out_dtype: tl.dtype, builder: ir.builder) -> Tuple[Any]:
     input_precision = tl._unwrap_if_constexpr(input_precision)
-    assert input_precision is None or tl._unwrap_if_constexpr(allow_tf32) is None, "Only one of input_precision and allow_tf32 can be specified"
+    assert input_precision is None or tl._unwrap_if_constexpr(
+        allow_tf32) is None, "Only one of input_precision and allow_tf32 can be specified"
     if input_precision is None:
-        supports_tf32 = _builder and "tf32" in _builder.options.allowed_dot_input_precisions
+        supports_tf32 = builder and "tf32" in builder.options.allowed_dot_input_precisions
         input_precision = knobs.language.fp32_default or ("tf32" if (supports_tf32 and
                                                                      (allow_tf32 or allow_tf32 is None)) else "ieee")
 
