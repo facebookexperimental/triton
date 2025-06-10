@@ -124,6 +124,7 @@ class buffered_tensor(tl.base_value):
         self.storage = storage
         # Layout encoding
         self.layout = layout
+        self.order = None
 
 
 class mbarriers(buffered_tensor):

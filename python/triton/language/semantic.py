@@ -1578,6 +1578,7 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
     rhs_rank = len(rhs.shape)
     assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
 
+    # TODO. merge with same function in core.py
     def _unwrap_if_constexpr(o):
         return o.value if isinstance(o, tl.constexpr) else o
 
@@ -1585,9 +1586,9 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
 
     assert builder.codegen_fns.get("min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
     min_dot_size = builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
-    assert _unwrap_if_constexpr(lhs.shape[-2]) >= min_dot_size[0] and _unwrap_if_constexpr(lhs.shape[-1]) >= min_dot_size[2] \
-        and _unwrap_if_constexpr(rhs.shape[-1]) >= min_dot_size[1], \
-            f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
+    # assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value >= min_dot_size[2] \
+    #     and rhs.shape[-1].value >= min_dot_size[1], \
+    #         f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
     if lhs.type.scalar.is_int():
         assert lhs.type.scalar == tl.int8, "only int8 supported!"
         _0 = builder.get_int32(0)
@@ -1607,6 +1608,7 @@ def dot_precheck(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision
     K = lhs.type.shape[-1]
     B = lhs.type.shape[0] if lhs_rank == 3 else None
     ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])
+
     if acc is None:
         acc_handle = builder.create_splat(ret_ty.to_ir(builder), _0)
     else:

@@ -8,6 +8,7 @@ from . import types as tlx
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
     layout_A = x.layout
     if layout_A is not tlx.nv_mma_shared_layout_encoding:
+        # create datastruct to wrap layout encoding attributes
         # TODO. why do we need this class object?
         layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=order, elemType=x.dtype, numCTAsPerCGA=[1, 1], numCTASplit=[1,1], numCTAOrder=[1,1], fp4Padded=False)
 
@@ -36,6 +37,7 @@ def require_nv_mma_layout(x: tl.tensor, _builder=None):
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
+    # A: Union[tl.tensor, tlx.buffered_tensor],
     input: tlx.buffered_tensor,
     other: tlx.buffered_tensor,
     dummy_output: tl.tensor,
