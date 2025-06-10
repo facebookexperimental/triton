@@ -111,7 +111,7 @@ void init_triton_tlx_ir(py::module &&m) {
                  ttg::MemDescType::get(shape, elementType, encoding,
                                        memorySpace, /*mutableMemory=*/true);
              return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
-           });
+           })
       .def(
           "create_require_layout",
           [](TritonOpBuilder &self, Value &v, int opIdx) -> Value {
