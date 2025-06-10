@@ -223,3 +223,54 @@ def test_async_wait(BLOCK_SIZE, device):
     torch.testing.assert_close(x, output)
     kernel = async_wait_token_kernel[grid](x, output, n_elements, BLOCK_SIZE)
     torch.testing.assert_close(x, output)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+def test_local_trans(device):
+
+    @triton.jit
+    def local_trans_kernel(
+        input_ptr,
+        output_ptr,
+        M, N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        off_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        # Compute global offsets
+        input_offset = off_m[:, None] * N + off_n[None, :]
+        output_offset = off_n[:, None] * M + off_m[None, :]
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1))
+        buffer0 = tlx.local_view(buffers, 0)
+        tlx.async_load(input_ptr + input_offset, buffer0)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+        buffer1 = tlx.local_trans(buffer0)
+        transposed = tlx.local_load(buffer1)
+        tl.store(output_ptr + output_offset, transposed)
+
+    torch.manual_seed(0)
+    M, N = 32, 64
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 64
+    x = torch.rand((M, N), dtype=torch.float32, device=device)
+    y = torch.empty((N, M), dtype=torch.float32, device=device)
+    grid = lambda meta: (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        triton.cdiv(N, BLOCK_SIZE_N)
+    )
+    kernel = local_trans_kernel[grid](
+        x, y, M, N,
+        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+        num_warps=1)
+    assert kernel.asm["ttgir"].count("ttg.memdesc_trans") == 1
+    torch.testing.assert_close(y, x.T)
