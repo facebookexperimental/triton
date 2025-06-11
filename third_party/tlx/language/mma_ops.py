@@ -71,5 +71,9 @@ def async_dot(
     acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
 
     _builder.create_fence_async_shared()
-    return tl.tensor(_builder.create_warp_group_dot(input, other, acc, input_precision, max_num_imprecise_acc, True),
-                     ret_ty)
+
+    output = _builder.create_warp_group_dot(input, other, acc, input_precision, max_num_imprecise_acc, True)
+
+    # Release the mma layout for the output to conform to what the user expects
+    output = _builder.create_release_layout(output)
+    return tl.tensor(output, ret_ty)

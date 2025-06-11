@@ -29,6 +29,17 @@ void init_triton_tlx_ir(py::module &&m) {
                 throw std::runtime_error("Unsupported type");
               }
             })
+      .def("create_release_layout",
+           [](TritonOpBuilder &self, Value &v) -> Value {
+             if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+               assert(type.getEncoding() && "Expect layout encoding");
+               auto newType = RankedTensorType::get(type.getShape(),
+                                                    type.getElementType());
+               return self.create<tlx::ReleaseLayoutOp>(newType, v);
+             } else {
+               throw std::runtime_error("Unsupported type");
+             }
+           })
       .def("create_local_load",
            [](TritonOpBuilder &self, Value subView,
               std::optional<Value> asyncToken) -> mlir::Value {

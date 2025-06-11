@@ -31,4 +31,17 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
+                                 [SameOperandsAndResultShape,
+                                  SameOperandsAndResultElementType,
+                                  Pure]> {
+  let summary = "release specific layout for a register buffer";
+
+  let arguments = (ins TT_Tensor:$src);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
 #endif

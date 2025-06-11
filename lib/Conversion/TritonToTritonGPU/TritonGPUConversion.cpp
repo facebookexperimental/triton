@@ -6,6 +6,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -116,7 +117,9 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   });
 
   addDynamicallyLegalOp<triton::gpu::AsyncCopyGlobalToLocalOp,
-                        triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(
+                        triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp,
+                        triton::tlx::RequireLayoutOp,
+                        triton::tlx::ReleaseLayoutOp>(
       [&](Operation *op) -> bool {
         // make sure every RankedTensorType operand has encoding
         for (auto operandType : op->getOperandTypes()) {
