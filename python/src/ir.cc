@@ -1758,33 +1758,31 @@ void init_triton_ir(py::module &&m) {
                                        memorySpace, /*mutableMemory=*/true);
              return self.create<ttg::LocalAllocOp>(memDesc);
            })
-      .def("create_memdesc_subview",
-           [](TritonOpBuilder &self, Value localAlloc,
-              Value bufferIdx) -> mlir::Value {
-             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
-             auto localAllocShape = localAllocType.getShape();
-             auto context = self.getBuilder().getContext();
-             Attribute sharedMemorySpace =
-                 triton::gpu::SharedMemorySpaceAttr::get(context);
-             Type memDescType;
-             if (localAllocShape.size() == 1) {
-               memDescType = ttg::MemDescType::get(
-                   {1}, localAllocType.getElementType(),
-                   localAllocType.getEncoding(), sharedMemorySpace,
-                   /*mutableMemory=*/localAllocType.getMutableMemory());
-             } else {
-               memDescType = ttg::MemDescType::get(
-                   localAllocShape.drop_front(),
-                   localAllocType.getElementType(),
-                   localAllocType.getEncoding(), sharedMemorySpace,
-                   /*mutableMemory=*/localAllocType.getMutableMemory());
-             }
-             Value zero = self.create<arith::ConstantIntOp>(0, 32);
-             SmallVector<Value> offsets(localAllocShape.size(), zero);
-             offsets[0] = bufferIdx;
-             return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
-                                                       offsets);
-           })
+      .def(
+          "create_memdesc_subview",
+          [](TritonOpBuilder &self, Value localAlloc,
+             Value bufferIdx) -> mlir::Value {
+            auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+            auto localAllocShape = localAllocType.getShape();
+            auto context = self.getBuilder().getContext();
+            Type memDescType;
+            if (localAllocShape.size() == 1) {
+              memDescType = ttg::MemDescType::get(
+                  {1}, localAllocType.getElementType(),
+                  localAllocType.getEncoding(), localAllocType.getMemorySpace(),
+                  /*mutableMemory=*/localAllocType.getMutableMemory());
+            } else {
+              memDescType = ttg::MemDescType::get(
+                  localAllocShape.drop_front(), localAllocType.getElementType(),
+                  localAllocType.getEncoding(), localAllocType.getMemorySpace(),
+                  /*mutableMemory=*/localAllocType.getMutableMemory());
+            }
+            Value zero = self.create<arith::ConstantIntOp>(0, 32);
+            SmallVector<Value> offsets(localAllocShape.size(), zero);
+            offsets[0] = bufferIdx;
+            return self.create<ttg::MemDescSubviewOp>(memDescType, localAlloc,
+                                                      offsets);
+          })
       .def("create_async_load",
            [](TritonOpBuilder &self, Value ptrTensor, Value result,
               std::optional<Value> mask, std::optional<Value> other,
