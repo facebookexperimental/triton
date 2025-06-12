@@ -13,6 +13,7 @@ class async_task:
         self.is_explict = False
         self.task_ids = None
         self.num_warps = None
+        self.num_regs = None
         if args:
             assert len(args) == 1
             if isinstance(args[0], core.constexpr) and args[0] == "default":
@@ -23,6 +24,7 @@ class async_task:
         else:
             self.is_explict = True
             self.num_warps = core._unwrap_if_constexpr(kwargs.get("num_warps", None))
+            self.num_regs = core._unwrap_if_constexpr(kwargs.get("registers", None))
 
     def __enter__(self):
         return self

@@ -44,20 +44,28 @@ def visit_withAsyncTasks(self, node):
         self.builder.set_insertion_point_to_start(block)
         # Count the number of sub tasks and caculate captures
         taskNumWarps = []
+        taskNumRegs = []
+        num_default = 0
         for stmt in stmts:
             assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
             assert task.is_explict
-            if not task.is_default:
+            if task.is_default:
+                num_default += 1
+            else:
                 # Get used vars to be captured
                 taskNumWarps.append(task.num_warps)
+                if task.num_regs:
+                    taskNumRegs.append(task.num_regs)
                 with enter_sub_region(self):
                     self.visit(stmt)
+
+        assert num_default == 1, "Default task must be one and only one"
         block.erase()
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
-        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, len(stmts) - 1)
+        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs, len(stmts) - 1)
 
         # Add captures
         captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))

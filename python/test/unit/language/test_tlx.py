@@ -35,7 +35,7 @@ def test_async_tasks(BLOCK_SIZE, device):
                 y = tl.load(y_ptr + offsets, mask=mask)
                 output = x + y
                 tl.store(z_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=4):
+            with tlx.async_task(num_warps=4, registers=100):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -60,6 +60,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     kernel = add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
+    assert "requestedRegisters" in ttgir
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)

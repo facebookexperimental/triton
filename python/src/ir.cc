@@ -1733,10 +1733,14 @@ void init_triton_ir(py::module &&m) {
       // Warp specialize ops
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
-              int numPartitionRegions) -> ttg::WarpSpecializeOp {
+              std::vector<int> requestedRegisters, int numPartitionRegions) -> ttg::WarpSpecializeOp {
              ArrayRef<Type> dummyTypes;
-             return self.create<ttg::WarpSpecializeOp>(
-                 dummyTypes, partitionNumWarps, numPartitionRegions);
+              auto wsOp = self.create<ttg::WarpSpecializeOp>(
+                  dummyTypes, partitionNumWarps, numPartitionRegions);
+
+                wsOp.setRequestedRegisters(requestedRegisters);
+
+                return wsOp;
            })
       .def("create_warp_yield_op",
            [](TritonOpBuilder &self) -> ttg::WarpYieldOp {
