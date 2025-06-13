@@ -77,3 +77,18 @@ def async_dot(
     # Release the mma layout for the output to conform to what the user expects
     output = _builder.create_release_layout(output)
     return tl.tensor(output, ret_ty)
+
+
+@tl.builtin
+def async_dot_wait(
+    pendings: tl.constexpr,
+    inp: tl.tensor,
+    _builder=None,
+) -> tl.tensor:
+    """
+    Wait for completion of prior asynchronous dot operations.
+    Each input must be the tensors corresponding to the async dot ops that we're
+    waiting on.
+    """
+    pendings = tl._unwrap_if_constexpr(pendings)
+    return tl.tensor(_builder.create_warp_group_dot_wait([inp.handle], pendings)[0], inp.type)
