@@ -26,7 +26,7 @@ class async_task:
             self.is_explict = True
             self.num_warps = core._unwrap_if_constexpr(kwargs.get("num_warps", None))
             self.num_regs = core._unwrap_if_constexpr(kwargs.get("registers", None))
-            self.replicate= core._unwrap_if_constexpr(kwargs.get("replicate", 1))
+            self.replicate = core._unwrap_if_constexpr(kwargs.get("replicate", 1))
 
     def __enter__(self):
         return self

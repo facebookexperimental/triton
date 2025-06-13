@@ -56,7 +56,7 @@ def visit_withAsyncTasks(self, node):
                 num_default += 1
             else:
                 assert task.replicate is not None, "Replicate must be non-None for non-default task"
-                taskReplica.append(task.replicate) 
+                taskReplica.append(task.replicate)
 
                 # Get used vars to be captured
                 taskNumWarps.extend([task.num_warps] * task.replicate)
