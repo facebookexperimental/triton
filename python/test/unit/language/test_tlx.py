@@ -35,7 +35,7 @@ def test_async_tasks(BLOCK_SIZE, device):
                 y = tl.load(y_ptr + offsets, mask=mask)
                 output = x + y
                 tl.store(z_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=4, registers=100):
+            with tlx.async_task(num_warps=4, registers=100, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)

@@ -74,29 +74,33 @@ def visit_withAsyncTasks(self, node):
             ws_op.append_operand(val.handle)
 
         index = 1
-        has_default = False
+        self.is_isolated_region = True
+
         for stmt in stmts:
             assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
+
             if task.is_default:
                 task_body = ws_op.get_default_region()
-                has_default = True
+
+                block = self.builder.create_block_with_parent(task_body, [])
+                self.builder.set_insertion_point_to_start(block)
+                self.visit(stmt)
+
+                self.builder.create_warp_yield_op()
             else:
                 task_body = ws_op.get_partition_region(index - 1)
                 index += 1
-            block = self.builder.create_block_with_parent(task_body, [])
-            self.builder.set_insertion_point_to_start(block)
-            self.is_isolated_region = True
-            self.visit(stmt)
-            if task.is_default:
-                self.builder.create_warp_yield_op()
-            else:
-                self.builder.create_warp_return_op()
-                for name in captures:
-                    val = liveins[name]
-                    arg = task_body.add_argument(val.handle.get_type())
-                    block.replace_use_in_block_with(val.handle, arg)
 
-        if not has_default:
-            task_body = ws_op.get_region(0)
-            block = self.builder.create_block_with_parent(task_body, [])
+                replicate = task.replicate
+                for i in range(replicate):
+                    block = self.builder.create_block_with_parent(task_body, [])
+                    self.builder.set_insertion_point_to_start(block)
+                    self.visit(stmt)
+
+                    for name in captures:
+                        val = liveins[name]
+                        arg = task_body.add_argument(val.handle.get_type())
+                        block.replace_use_in_block_with(val.handle, arg)
+
+                    self.builder.create_warp_return_op()
