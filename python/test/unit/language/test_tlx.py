@@ -376,6 +376,7 @@ def test_async_dot(device):
 
         z = tlx.async_dot(a_smem, b_smem, input_precision=INPUT_PRECISION, out_dtype=out_dtype, col_input=COL_INPUT,
                           col_other=COL_OTHER)
+        z = tlx.async_dot_wait(tl.constexpr(0), z)
         tl.store(Zs, z)
 
     M, N, K = (64, 64, 64)

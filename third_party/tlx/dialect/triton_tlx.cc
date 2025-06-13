@@ -123,6 +123,45 @@ void init_triton_tlx_ir(py::module &&m) {
                  c.getType(), a, b, c, nullptr, inputPrecision,
                  maxNumImpreciseAcc, isAsync);
            })
+      .def("create_warp_group_dot_wait",
+           [](TritonOpBuilder &self, std::vector<Value> inputs,
+              unsigned pendings) -> std::vector<Value> {
+             // Extract original sources for inputs wrapped in ReleaseLayoutOp.
+             // These are the true operands to WarpGroupDotWaitOp.
+             std::vector<Value> realInputs;
+             realInputs.reserve(inputs.size());
+             for (Value input : inputs) {
+               if (auto releaseOp =
+                       dyn_cast<tlx::ReleaseLayoutOp>(input.getDefiningOp()))
+                 realInputs.push_back(releaseOp.getSrc());
+               else
+                 realInputs.push_back(input);
+             }
+
+             // Create the warp group wait op using the unwrapped input values.
+             auto waitOp =
+                 self.create<ttng::WarpGroupDotWaitOp>(realInputs, pendings);
+             assert(waitOp.getNumResults() == inputs.size() &&
+                    "Result count mismatch with inputs");
+
+             // For each original input:
+             // - If it was a ReleaseLayoutOp, move it after the wait op and
+             // rewire it.
+             // - Otherwise, return the raw wait result.
+             std::vector<Value> outputs;
+             outputs.reserve(inputs.size());
+             for (unsigned i = 0; i < inputs.size(); ++i) {
+               if (auto release = dyn_cast<tlx::ReleaseLayoutOp>(
+                       inputs[i].getDefiningOp())) {
+                 release->moveAfter(waitOp.getOperation());
+                 release.getOperation()->setOperand(0, waitOp.getResult(i));
+                 outputs.push_back(release.getResult());
+               } else {
+                 outputs.push_back(waitOp.getResult(i));
+               }
+             }
+             return outputs;
+           })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding) -> mlir::Value {
