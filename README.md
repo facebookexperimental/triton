@@ -82,6 +82,16 @@ While this approach places more responsibility on the user, it reduces the compi
 - `acc = tlx.async_dot(a_reg, b[i], acc)`
 - `acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)`
 
+- `acc = tlx.async_dot_wait(tl.constexpr(0), acc)`
+
+    Wait for completion of prior asynchronous dot operations.
+
+Examples
+```
+    acc = tlx.async_dot(a_smem, b_smem)
+    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+    tl.store(C_ptrs, acc)
+```
 
 ### Barrier operations
 
