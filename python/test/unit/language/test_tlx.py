@@ -1,5 +1,6 @@
 import pytest
 import torch
+import re
 import triton
 import triton.language as tl
 from triton._internal_testing import is_cuda
@@ -35,7 +36,7 @@ def test_async_tasks(BLOCK_SIZE, device):
                 y = tl.load(y_ptr + offsets, mask=mask)
                 output = x + y
                 tl.store(z_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=4, registers=100):
+            with tlx.async_task(num_warps=4, registers=100, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -59,8 +60,13 @@ def test_async_tasks(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
     ttgir = kernel.asm["ttgir"]
-    assert "ttg.warp_specialize" in ttgir
-    assert "requestedRegisters" in ttgir
+
+    pattern_ws = (r'ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 100, 100>}')
+    assert re.search(pattern_ws, ttgir, flags=re.DOTALL)
+    pattern_p0 = (r'partition0(.*) num_warps\(4\)')
+    assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
+    pattern_p1 = (r'partition1(.*) num_warps\(4\)')
+    assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)
@@ -557,13 +563,7 @@ def test_descriptor_load(device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel(
-        input_ptr,
-        output_ptr,
-        M, N,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr
-    ):
+    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -600,16 +600,11 @@ def test_descriptor_load(device):
     BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
     x = torch.ones((M, N), dtype=torch.int16, device=device)
     y = torch.empty_like(x)
-    grid = lambda meta: (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, BLOCK_SIZE_N)
-    )
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     # TODO: remove exception handling once layout propagation is implemented
     with pytest.raises(RuntimeError) as _:
-        kernel = descriptor_load_kernel[grid](
-            x, y, M, N,
-            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+        kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
         assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
         assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
         torch.testing.assert_close(x, y)
