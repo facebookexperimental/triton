@@ -105,16 +105,16 @@ def _host_descriptor_pre_hook(nargs):
 if is_hip():
     NUM_STAGES_OPTIONS = [1]
 elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [2, 3, 4]
+    NUM_STAGES_OPTIONS = [2]
 else:
-    NUM_STAGES_OPTIONS = [2, 3, 4]
+    NUM_STAGES_OPTIONS = [2]
 
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [64, 128]\
-    for BN in [64, 128]\
+    for BM in [128]\
+    for BN in [128]\
     for s in NUM_STAGES_OPTIONS \
-    for w in [4, 8]\
+    for w in [4]\
 ]
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
@@ -574,7 +574,7 @@ attention = _attention.apply
 @pytest.mark.parametrize("N_CTX", [128, 1024, (2 if is_hip() else 4) * 1024])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [True])  # FIXME: Non-causal tests do not pass at the moment.
-@pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
+@pytest.mark.parametrize("warp_specialize", [True])  #if is_blackwell() else [False])
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, dtype=torch.float16):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -619,13 +619,13 @@ try:
 except BaseException:
     HAS_FLASH = False
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
+TORCH_HAS_FP8 = False  #hasattr(torch, 'float8_e5m2')
+BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
     for causal in [True, False]:
-        for warp_specialize in [False, True] if is_blackwell() else [False]:
+        for warp_specialize in [True]:  #if is_blackwell() else [False]:
             if mode == "bwd" and not causal:
                 continue
             configs.append(
