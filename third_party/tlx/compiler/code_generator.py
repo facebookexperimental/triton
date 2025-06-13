@@ -45,6 +45,8 @@ def visit_withAsyncTasks(self, node):
         # Count the number of sub tasks and caculate captures
         taskNumWarps = []
         taskNumRegs = []
+        taskReplica = []
+
         num_default = 0
         for stmt in stmts:
             assert _is_async_task(self, stmt)
@@ -53,10 +55,13 @@ def visit_withAsyncTasks(self, node):
             if task.is_default:
                 num_default += 1
             else:
+                assert task.replicate is not None, "Replicate must be non-None for non-default task"
+                taskReplica.append(task.replicate) 
+
                 # Get used vars to be captured
-                taskNumWarps.append(task.num_warps)
+                taskNumWarps.extend([task.num_warps] * task.replicate)
                 if task.num_regs:
-                    taskNumRegs.append(task.num_regs)
+                    taskNumRegs.extend([task.num_regs] * task.replicate)
                 with enter_sub_region(self):
                     self.visit(stmt)
 
@@ -65,7 +70,7 @@ def visit_withAsyncTasks(self, node):
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
-        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs, len(stmts) - 1)
+        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs, sum(taskReplica))
 
         # Add captures
         captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))
@@ -89,11 +94,10 @@ def visit_withAsyncTasks(self, node):
 
                 self.builder.create_warp_yield_op()
             else:
-                task_body = ws_op.get_partition_region(index - 1)
-                index += 1
+                for i in range(task.replicate):
+                    task_body = ws_op.get_partition_region(index - 1)
+                    index += 1
 
-                replicate = task.replicate
-                for i in range(replicate):
                     block = self.builder.create_block_with_parent(task_body, [])
                     self.builder.set_insertion_point_to_start(block)
                     self.visit(stmt)

@@ -59,8 +59,11 @@ def test_async_tasks(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = add2_warp_specialized_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
     ttgir = kernel.asm["ttgir"]
+    # TODO. more comprehensive regex check for finer granularity
     assert "ttg.warp_specialize" in ttgir
     assert "requestedRegisters" in ttgir
+    assert "partition0" in ttgir
+    assert "partition1" in ttgir
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)
