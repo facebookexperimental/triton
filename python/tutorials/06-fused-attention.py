@@ -33,7 +33,7 @@ def is_cuda():
 
 
 def supports_host_descriptor():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+    return False  #is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
 
 def is_blackwell():
@@ -620,11 +620,11 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = False  #hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
+BATCH, N_HEADS, HEAD_DIM = 8, 16, 128  #4, 32, 128
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
-    for causal in [True, False]:
+    for causal in [False]:  #[True, False]:
         for warp_specialize in [True]:  #if is_blackwell() else [False]:
             if mode == "bwd" and not causal:
                 continue
