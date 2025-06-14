@@ -6,7 +6,7 @@
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<Pass> createTritonTTIRHelloWorldPass();
+std::unique_ptr<Pass> createTritonTTIRChangeVarNamePass();
 
 // Generate the pass class declarations.
 #define GEN_PASS_DECL

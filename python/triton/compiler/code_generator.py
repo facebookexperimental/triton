@@ -566,6 +566,7 @@ class CodeGenerator(ast.NodeVisitor):
         return self.visit_Assign(node)
 
     def assignTarget(self, target, value):
+        print("Visiting var name: ", target.id)
         if isinstance(target, ast.Subscript):
             assert target.ctx.__class__.__name__ == "Store"
             return self.visit_Subscript_Store(target, value)
@@ -595,8 +596,10 @@ class CodeGenerator(ast.NodeVisitor):
                 value = semantic.to_tensor(value, self.builder)
             return value
 
-        values = _sanitize_value(self.visit(node.value))
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+        self.builder.set_loc_def_name(node.targets[0].id)
+
+        values = _sanitize_value(self.visit(node.value))
         assert len(targets) == 1
         self.assignTarget(targets[0], values)
 

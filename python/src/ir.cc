@@ -924,6 +924,9 @@ void init_triton_ir(py::module &&m) {
       .def("set_loc",
            [](TritonOpBuilder &self, const std::string &fileName, int line,
               int column) { self.setLastLoc(fileName, line, column); })
+      .def("set_loc_def_name",
+        [](TritonOpBuilder &self, const std::string &defName) { self.setLastLocDefName(defName); })
+
       .def("get_loc",
            [](TritonOpBuilder &self) -> Location { return self.getLastLoc(); })
 
@@ -1337,7 +1340,9 @@ void init_triton_ir(py::module &&m) {
       .def("create_load",
            [](TritonOpBuilder &self, Value &ptrs, CacheModifier cacheModifier,
               EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
+                llvm::errs() << "Def Name For Load: " << self.getLastLocDefName() << "\n";
+
+                return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
                                         isVolatile);
            })
       .def("create_store",
@@ -1352,6 +1357,8 @@ void init_triton_ir(py::module &&m) {
               std::optional<PaddingOption> paddingOption,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
               bool isVolatile) -> Value {
+             // plotfi
+	     llvm::errs() << "Def Name For Load: " << self.getLastLocDefName() << "\n";
              return self.create<LoadOp>(ptr, boundaryCheck, paddingOption,
                                         cacheModifier, evictionPolicy,
                                         isVolatile);
@@ -1367,7 +1374,9 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &ptrs, Value &mask,
               std::optional<Value> &other, CacheModifier cacheModifier,
               EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
+                llvm::errs() << "Def Name For Load: " << self.getLastLocDefName() << "\n";
+
+                return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
                                         cacheModifier, evictionPolicy,
                                         isVolatile);
            })
