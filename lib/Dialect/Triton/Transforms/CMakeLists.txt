@@ -13,6 +13,7 @@ add_triton_library(TritonTransforms
   RewriteTensorDescriptorToPointer.cpp
   ArithTypeConversion.cpp
   FunctionTypeConversion.cpp
+  TritonTTIRChangeVarName.cpp
 
   DEPENDS
   TritonTransformsIncGen

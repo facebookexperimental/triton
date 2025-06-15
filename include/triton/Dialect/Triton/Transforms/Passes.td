@@ -90,4 +90,16 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   }];
 }
 
+def TritonTTIRChangeVarName : Pass</*cli-arg*/"triton-ttir-change-var-name", /*Op*/"mlir::ModuleOp"> {
+  let summary = "A foo pass that do some trivial changes to the variable names in ttir";
+  let description = [{
+    This is an experimental pass that changes the variable names in ttir from %123 to %123_changed
+  }];
+
+  let constructor = "mlir::triton::createTritonTTIRChangeVarNamePass()";
+
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
+
 #endif
