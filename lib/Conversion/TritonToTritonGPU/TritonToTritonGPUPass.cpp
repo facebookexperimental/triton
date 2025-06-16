@@ -11,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONTOTRITONGPU
@@ -624,6 +625,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
       GenericOpPattern<triton::gpu::LocalStoreOp>,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
+      GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       TritonFuncOpPattern>(typeConverter, context);
 }
 // Proton patterns
