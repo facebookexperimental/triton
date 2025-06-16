@@ -73,7 +73,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     pattern_p1 = (r'partition1(.*) num_warps\(4\)')
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
 
-    # Check that the replica_id is correctly passed to the kernel
+    # Check that the replica_id is correctly passed to non-default regions
     # TTIR/TTGIR should be something like:
     #  partition0(...) {
     #   %cst = arith.constant dense<0.000000e+00> : tensor<1024xf32, #blocked>
