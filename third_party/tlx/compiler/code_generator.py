@@ -79,7 +79,6 @@ def visit_withAsyncTasks(self, node):
             ws_op.append_operand(val.handle)
 
         index = 1
-        self.is_isolated_region = True
 
         for stmt in stmts:
             assert _is_async_task(self, stmt)
