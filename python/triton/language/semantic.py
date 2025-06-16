@@ -1066,7 +1066,7 @@ def _load_block_pointer(ptr, mask, other, boundary_check, padding, cache, evicti
         builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile), dst_ty)
 
 
-def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder):
+def _prepare_legacy_load(ptr, mask, other, boundary_check, padding, builder):
     # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
     if not ptr.type.scalar.is_ptr():
         raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.load`")
@@ -1115,7 +1115,12 @@ def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_
     else:
         # Load by de-referencing the pointer of scalar
         dst_ty = elt_ty
+    return dst_ty, mask, other
 
+
+def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder):
+    # pre-check
+    dst_ty, mask, other = _prepare_legacy_load(ptr, mask, other, boundary_check, padding, builder)
     # Build IR
     if mask is None:
         ret = tl.tensor(builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
@@ -1123,7 +1128,7 @@ def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_
         ret = tl.tensor(
             builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache, eviction,
                                        is_volatile), dst_ty)
-    if is_bool:
+    if ptr.type.scalar == tl.int1:
         ret = cast(ret, tl.int1, builder)
     return ret
 

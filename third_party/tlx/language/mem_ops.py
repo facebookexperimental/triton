@@ -4,6 +4,7 @@ from triton.language.semantic import (
     _convert_to_ir_values,
     _str_to_load_cache_modifier,
     _str_to_eviction_policy,
+    _prepare_legacy_load,
 )
 
 from . import types as tlx
@@ -107,6 +108,14 @@ def async_load(
     """
     Loads buffer from global to local memory asynchronously.
     """
+    if src.type.is_ptr() and src.type.element_ty.is_block():
+        # Load by a block pointer: `pointer_type<block_type<>>`
+        # unsupported for now
+        raise NotImplementedError("async_load by block pointer is not supported yet")
+    else:
+        # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
+        _, mask, other = _prepare_legacy_load(src, mask, other, None, None, _builder)
+
     cache = _str_to_load_cache_modifier(cache_modifier)
     eviction = _str_to_eviction_policy(eviction_policy)
     return tlx.async_token(
