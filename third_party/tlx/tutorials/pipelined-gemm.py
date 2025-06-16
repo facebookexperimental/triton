@@ -112,6 +112,7 @@ def matmul_kernel_tma_pipelined_hopper(
         # prefetch
         tlx.async_load(a_ptrs, a_next, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
         tlx.async_load(b_ptrs, b_next, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
+        tlx.async_load_commit_group()
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -143,7 +144,7 @@ def matmul(a, b):
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
-        NUM_STAGES=1  #
+        NUM_STAGES=2  #
     )
     return c
 
