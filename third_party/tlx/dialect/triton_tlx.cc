@@ -2,6 +2,7 @@
 #include "ir.h" // TritonOpBuilder
 #include "mlir/Pass/PassManager.h"
 #include "passes.h"
+#include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace py = pybind11;
@@ -9,6 +10,7 @@ using namespace ir;
 using namespace mlir;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+namespace tlx = triton::tlx;
 
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
@@ -168,7 +170,9 @@ void init_triton_tlx_ir(py::module &&m) {
 }
 
 void init_triton_tlx_passes(py::module &&m) {
-  // TODO: add TLX passes
+  ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_attach_metadata",
+                            tlx::createTritonTLXAttachMetadata, std::string,
+                            int32_t, int32_t, int32_t);
 }
 
 void init_triton_tlx(py::module &&m) {

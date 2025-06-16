@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
-from triton._C.libtriton import ir, passes, llvm, nvidia
+from triton._C.libtriton import ir, passes, llvm, nvidia, tlx
 from triton import knobs
 from triton.runtime.errors import PTXASError
 
@@ -208,6 +208,7 @@ class CUDABackend(BaseBackend):
     def make_ttir(mod, metadata, opt, capability):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        tlx.tlx_passes.add_triton_tlx_attach_metadata(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         passes.common.add_inliner(pm)
         passes.ttir.add_rewrite_tensor_pointer(pm)
         if capability // 10 < 9:
