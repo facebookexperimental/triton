@@ -10,8 +10,6 @@ def TritonTLXAttachMetadata : Pass</*cli-arg*/"triton-tlx-attach-metadata", /*Op
     better into frontend DSL and TritonDialect.
   }];
 
-  let dependentDialects = ["mlir::triton::TritonDialect"];
-
   let options = [
       Option<"target", "target",
             "std::string", /*default*/"\"\"",
