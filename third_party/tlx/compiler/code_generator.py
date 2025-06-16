@@ -70,7 +70,8 @@ def visit_withAsyncTasks(self, node):
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
-        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs, sum(taskReplica))
+        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs if len(taskNumRegs) > 0 else None,
+                                                       sum(taskReplica))
 
         # Add captures
         captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))
