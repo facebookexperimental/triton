@@ -68,6 +68,9 @@ def visit_withAsyncTasks(self, node):
         assert num_default == 1, "Default task must be one and only one"
         block.erase()
 
+        assert len(taskNumRegs) in [0,
+                                    len(taskNumWarps)], "Registers are set for either ALL or NONE of non-default tasks"
+
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
         ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs if len(taskNumRegs) > 0 else None,
