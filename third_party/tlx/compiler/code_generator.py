@@ -1,6 +1,7 @@
 # third_party/tlx/codegen/async.py
 
 import ast
+import os
 import triton.tlx.language as tlx  # Make sure async_task(s) are exposed via tlx.__init__.py
 
 
@@ -98,6 +99,7 @@ def visit_withAsyncTasks(self, node):
                 self.builder.create_warp_yield_op()
             else:
                 for i in range(task.replicate):
+                    os.environ["TLX_ASYNC_TASK_REPLICA_ID"] = str(i)
                     task_body = ws_op.get_partition_region(index - 1)
                     index += 1
 

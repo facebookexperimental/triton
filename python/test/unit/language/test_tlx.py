@@ -41,7 +41,12 @@ def test_async_tasks(BLOCK_SIZE, device):
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
                 b = tl.load(b_ptr + offsets, mask=mask)
-                output = a + b
+                replica_id = tlx.async_task_replica_id()
+                # This no-op is just to test that replica_id
+                # is correctly passed to the kernel
+                a1 = a + replica_id
+                b1 = b - replica_id
+                output = a1 + b1
                 tl.store(c_ptr + offsets, output, mask=mask)
 
     def dual_add(x, y, a, b):
@@ -67,6 +72,25 @@ def test_async_tasks(BLOCK_SIZE, device):
     assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
     pattern_p1 = (r'partition1(.*) num_warps\(4\)')
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
+
+    # Check that the replica_id is correctly passed to the kernel
+    # TTIR/TTGIR should be something like:
+    #  partition0(...) {
+    #   %cst = arith.constant dense<0.000000e+00> : tensor<1024xf32, #blocked>
+    #   ...
+    #   %13 = arith.addf %9, %cst
+    #   ...}
+    #  partition1(...) {
+    #   %cst = arith.constant dense<1.000000e+00> : tensor<1024xf32, #blocked>
+    #   ...
+    #   %13 = arith.addf %9, %cst
+    #   %14 = arith.subf %12, %cst
+    #   ...}
+    pattern_cst = (r'cst = arith.constant dense\<.*\>')
+    found = re.findall(pattern_cst, ttgir)
+    assert len(found) == 2, "Expected 2 cst by calling `tlx.async_task_replica_id()` in two regions"
+    assert found[0] != found[1], "Two matches MUST be different"
+    assert "dense<0.0" in found[0] and "dense<1.0" in found[1], "Expected 0.0 and 1.0 as replica_id"
 
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)

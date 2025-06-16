@@ -2,6 +2,7 @@ import triton.language.core as tl
 
 from . import types as tlx
 import re
+import os
 
 
 def cuda_parse_arch(arch):
@@ -24,3 +25,7 @@ def thread_id(axis, _builder=None):
     if axis not in (0, 1, 2):
         raise ValueError(f"thread_id axis must be 0, 1, or 2 but got {axis}")
     return tl.tensor(_builder.create_thread_id(axis), tl.int32)
+
+@tl.builtin
+def async_task_replica_id(_builder=None):
+    return tl.constexpr(int(os.environ.get("TLX_ASYNC_TASK_REPLICA_ID", 0)))
