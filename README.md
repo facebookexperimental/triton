@@ -38,9 +38,19 @@ While this approach places more responsibility on the user, it reduces the compi
     Loads the buffer from local memory into a distributed tensor.
 
 
+- `distributed_tensor = tlx.local_load(buffer, optional_token, tlx.storage_kind.tmem)`
+
+    Loads the buffer from tensor memory into a distributed tensor.
+
+
 - `tlx.local_store(buffer, distributed_tensor)`
 
     Store a distributed tensor into a buffer in local memory.
+
+
+- `tlx.local_store(buffer, distributed_tensor, tlx.storage_kind.tmem)`
+
+    Store a distributed tensor into a buffer in tensor memory.
 
 - `buffer = tlx.local_trans(buffer, dims)`
 

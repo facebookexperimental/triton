@@ -6,6 +6,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 namespace tt = mlir::triton;
@@ -388,8 +389,25 @@ struct HoistTMEMAlloc
   using impl::TritonGPUHoistTMEMAllocBase<
       HoistTMEMAlloc>::TritonGPUHoistTMEMAllocBase;
 
+  // check whether we should bail early due to using TLX
+  bool shouldRun(ModuleOp &mod) const {
+    auto result = mod.walk([&](Operation *op) {
+      return llvm::TypeSwitch<Operation *, WalkResult>(op)
+          .Case<ttng::TMEMLoadOp, ttng::TMEMStoreOp>([](auto specificOp) {
+            if (specificOp.getToken() == nullptr) {
+              return WalkResult::interrupt();
+            }
+            return WalkResult::advance();
+          })
+          .Default([&](auto) { return WalkResult::advance(); });
+    });
+    return !result.wasInterrupted();
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    if (!shouldRun(m))
+      return;
     SmallVector<ttng::MMAv5OpInterface> mmaOps;
     m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });
     for (auto mmaOp : mmaOps) {

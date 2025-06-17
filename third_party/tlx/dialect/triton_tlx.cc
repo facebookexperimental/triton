@@ -3,6 +3,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace py = pybind11;
@@ -113,6 +114,22 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
            })
+      .def("make_default_tmem_layout_encoding",
+           [](TritonOpBuilder &self, std::vector<int64_t> shape,
+              Type elementType, int numWarps, int numCTAs) {
+             assert(shape.size() == 2 &&
+                    "Currently only support 2D tensors for TMEM layout");
+             ttg::BlockedEncodingAttr defaultBlockedEncoding =
+                 ttg::getDefaultBlockedEncoding(
+                     self.getContext(), shape, numWarps,
+                     32 /* threadsPerWarp */, numCTAs);
+             auto oldType = RankedTensorType::get(shape, elementType,
+                                                  defaultBlockedEncoding);
+             Attribute newDistributedEncoding =
+                 nvidia_gpu::getTmemCompatibleLayout(shape[0], shape[1],
+                                                     oldType, numWarps);
+             return newDistributedEncoding;
+           })
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self) -> void {
              self.create<ttng::FenceAsyncSharedOp>(false);
@@ -173,6 +190,23 @@ void init_triton_tlx_ir(py::module &&m) {
                  ttg::MemDescType::get(shape, elementType, encoding,
                                        memorySpace, /*mutableMemory=*/true);
              return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
+           })
+      .def("create_tmem_load",
+           [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
+              std::optional<Value> asyncToken) -> mlir::Value {
+             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+
+             // layoutEncoding must be TMEM compatible
+             auto newType = RankedTensorType::get(subViewType.getShape(),
+                                                  subViewType.getElementType(),
+                                                  layoutEncoding);
+             return self.create<ttng::TMEMLoadOp>(newType, subView,
+                                                  asyncToken.value_or(Value()));
+           })
+      .def("create_tmem_store",
+           [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
+             Value pred = self.create<arith::ConstantIntOp>(1, 1);
+             self.create<ttng::TMEMStoreOp>(dst, src, pred);
            })
       .def("create_async_commit_group",
            [](TritonOpBuilder &self,

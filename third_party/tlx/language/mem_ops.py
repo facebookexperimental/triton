@@ -13,6 +13,23 @@ from .mma_ops import require_nv_mma_shared_layout
 from typing import Optional, Tuple
 
 
+def _assert_blackwell_for_tmem(arch):
+    capability = int(cuda_parse_arch(arch))
+    assert capability >= 100, "tmem is only available on Blackwell"
+
+
+def _create_tmem_layout_encoding(
+    _builder,
+    tensor: tlx.buffered_tensor,
+):
+    num_warps = _builder.options.num_warps
+    assert num_warps > 0, "tmem load requires num_warps > 0"
+    num_ctas = _builder.options.num_ctas
+    assert num_ctas > 0, "tmem load requires num_ctas > 0"
+    return _builder.make_default_tmem_layout_encoding(list(tensor.shape), tensor.dtype.to_ir(_builder), num_warps,
+                                                      num_ctas)
+
+
 @tl.builtin
 def local_alloc(
     shape: tuple,
@@ -26,8 +43,7 @@ def local_alloc(
     Allocates buffer in shared memory and return a view of the buffer.
     """
     if storage == tlx.storage_kind.tmem:
-        capability = int(cuda_parse_arch(_builder.options.arch))
-        assert capability >= 100, "tmem is only available on Blackwell"
+        _assert_blackwell_for_tmem(_builder.options.arch)
 
     unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
     unwrapped_num = tl._unwrap_if_constexpr(num)
@@ -161,24 +177,42 @@ def async_load_wait_group(
 @tl.builtin
 def local_load(
     src: tlx.buffered_tensor,
+    storage: tlx.storage_kind = tlx.storage_kind.smem,
     token: tlx.async_token = None,
     _builder=None,
 ) -> tl.tensor:
     """
-    Loads buffer from local memory into a distributed tensor.
+    Loads buffer from local or tensor memory into a distributed tensor.
     """
+    if storage == tlx.storage_kind.tmem:
+        _assert_blackwell_for_tmem(_builder.options.arch)
+        tmem_compatible_layout_encoding = _create_tmem_layout_encoding(_builder, src)
+        load_handle = _builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
+                                                token.handle if token else None)
+        output = _builder.create_release_layout(load_handle)
+        return tl.tensor(output, src.type)
+
     return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)
+
 
 @tl.builtin
 def local_store(
     dst: tlx.buffered_tensor,
     src: tl.tensor,
+    storage: tlx.storage_kind = tlx.storage_kind.smem,
     _builder=None,
 ) -> tl.tensor:
     """
-    Store a distributed tensor into a buffer in local memory.
+    Store a distributed tensor into a buffer in local or tensor memory.
     """
+    if storage == tlx.storage_kind.tmem:
+        _assert_blackwell_for_tmem(_builder.options.arch)
+        tmem_compatible_layout_encoding = _create_tmem_layout_encoding(_builder, dst)
+        src_handle = _builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
+        return tl.tensor(_builder.create_tmem_store(dst.handle, src_handle), tl.void)
+
     return tl.tensor(_builder.create_local_store(dst.handle, src.handle), tl.void)
+
 
 @tl.builtin
 def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _builder=None) -> tlx.buffered_tensor:
@@ -200,11 +234,12 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _builder=
     permuted_handle = _builder.create_memdesc_trans(input.handle, dims)
     return input.make_permute(permuted_handle, dims)
 
+
 @tl.builtin
 def async_descriptor_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
-    offsets : list[tl.tensor],
+    offsets: list[tl.tensor],
     barrier: tlx.mbarriers,
     cache_modifier: str = "",
     eviction_policy: str = "",
@@ -215,25 +250,18 @@ def async_descriptor_load(
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     # Requires a row-major layout for TMA only supports continuous memory access
-    result_handle = require_nv_mma_shared_layout(result, [1,0], _builder)
+    result_handle = require_nv_mma_shared_layout(result, [1, 0], _builder)
     offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
     cache = _str_to_load_cache_modifier(cache_modifier)
     eviction = _str_to_eviction_policy(eviction_policy)
-    _builder.create_async_TMA_load(
-        desc.handle,
-        offsets,
-        barrier.handle,
-        result_handle,
-        cache,
-        eviction,
-        False)
+    _builder.create_async_TMA_load(desc.handle, offsets, barrier.handle, result_handle, cache, eviction, False)
 
 
 @tl.builtin
 def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
-    offsets : list[tl.tensor],
+    offsets: list[tl.tensor],
     _builder=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
@@ -241,9 +269,6 @@ def async_descriptor_store(
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     # Requires a row-major layout for TMA only supports continuous memory access
-    source_handle = require_nv_mma_shared_layout(source, [1,0], _builder)
+    source_handle = require_nv_mma_shared_layout(source, [1, 0], _builder)
     offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
-    _builder.create_async_TMA_store(
-        desc.handle,
-        offsets,
-        source_handle)
+    _builder.create_async_TMA_store(desc.handle, offsets, source_handle)

@@ -200,6 +200,45 @@ def test_tmem_alloc_index(BLOCK_SIZE, device):
     assert kerenl_info.asm["ttgir"].count("kernel") == 1
 
 
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_tmem_load_store(BLOCK_SIZE, device):
+
+    @triton.jit
+    def tmem_load_store_kernel(
+        x_ptr,
+        stride_m,
+        stride_n,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        offs_m = tl.arange(0, BLOCK_SIZE)
+        offs_n = tl.arange(0, BLOCK_SIZE)
+        x_ptr_offsets = x_ptr + (offs_m[:, None] * stride_m + offs_n[None, :] * stride_n)
+
+        a = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+
+        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        buffer1 = tlx.local_view(buffers, 0)
+        tlx.local_store(buffer1, a, tlx.storage_kind.tmem)
+        b = tlx.local_load(buffer1, tlx.storage_kind.tmem)
+        # b == a == tensor of 1.0
+        tl.store(x_ptr_offsets, b + 2)
+
+    x = torch.rand((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device=device)
+    grid = lambda meta: (1, )
+    kerenl_info = tmem_load_store_kernel[grid](x, x.stride(0), x.stride(1), BLOCK_SIZE)
+
+    assert kerenl_info.asm["ttir"].count("ttng.tmem_store") == 1
+    assert kerenl_info.asm["ttir"].count("ttng.tmem_load") == 1
+
+    assert kerenl_info.asm["ttgir"].count("kernel") == 1
+    assert kerenl_info.asm["ttgir"].count("ttng.tmem_alloc") == 1
+    assert kerenl_info.asm["ttgir"].count("ttng.tmem_store") == 1
+    assert kerenl_info.asm["ttgir"].count("ttng.tmem_load") == 1
+
+    ref_out = torch.ones_like(x) + 2
+    torch.testing.assert_close(x, ref_out)
+
+
 def test_thread_id(device):
 
     @triton.jit
