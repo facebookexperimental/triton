@@ -114,17 +114,28 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
            })
-      .def("make_default_tmem_layout_encoding",
+      .def("make_default_tmem_compatible_tensor_layout_encoding",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type elementType, int numWarps, int numCTAs) {
+              Type elementType, int numWarps, int threadsPerWarp, int numCTAs) {
+             // Include various assert to vet the input to make sure they're
+             // valid for MMAv5. See also lib/Analysis/Utiity.cpp:supportMMA
              assert(shape.size() == 2 &&
-                    "Currently only support 2D tensors for TMEM layout");
+                    "Only supporting 2D tensors for TMEM layout.");
+             assert((!elementType.isInteger()) &&
+                    "Integer type not supported.");
+             //  todo: check numWarps?
              ttg::BlockedEncodingAttr defaultBlockedEncoding =
-                 ttg::getDefaultBlockedEncoding(
-                     self.getContext(), shape, numWarps,
-                     32 /* threadsPerWarp */, numCTAs);
+                 ttg::getDefaultBlockedEncoding(self.getContext(), shape,
+                                                numWarps, threadsPerWarp,
+                                                numCTAs);
              auto oldType = RankedTensorType::get(shape, elementType,
                                                   defaultBlockedEncoding);
+             auto oldTypeShapePerCTA = ttg::getShapePerCTA(oldType);
+             auto rank = oldTypeShapePerCTA.size();
+             assert((oldTypeShapePerCTA[rank - 2] % 64 == 0 &&
+                     oldTypeShapePerCTA[rank - 1] % 8 == 0) &&
+                    "Shape unsupported by TMEM ops.");
+
              Attribute newDistributedEncoding =
                  nvidia_gpu::getTmemCompatibleLayout(shape[0], shape[1],
                                                      oldType, numWarps);

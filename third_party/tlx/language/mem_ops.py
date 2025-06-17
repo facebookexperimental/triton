@@ -18,7 +18,7 @@ def _assert_blackwell_for_tmem(arch):
     assert capability >= 100, "tmem is only available on Blackwell"
 
 
-def _create_tmem_layout_encoding(
+def _create_tmem_compatible_tensor_layout_encoding(
     _builder,
     tensor: tlx.buffered_tensor,
 ):
@@ -26,8 +26,10 @@ def _create_tmem_layout_encoding(
     assert num_warps > 0, "tmem load requires num_warps > 0"
     num_ctas = _builder.options.num_ctas
     assert num_ctas > 0, "tmem load requires num_ctas > 0"
-    return _builder.make_default_tmem_layout_encoding(list(tensor.shape), tensor.dtype.to_ir(_builder), num_warps,
-                                                      num_ctas)
+    threads_per_warp = 32  # hard-coded for now
+    return _builder.make_default_tmem_compatible_tensor_layout_encoding(list(tensor.shape),
+                                                                        tensor.dtype.to_ir(_builder), num_warps,
+                                                                        threads_per_warp, num_ctas)
 
 
 @tl.builtin
@@ -186,7 +188,7 @@ def local_load(
     """
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_builder.options.arch)
-        tmem_compatible_layout_encoding = _create_tmem_layout_encoding(_builder, src)
+        tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_builder, src)
         load_handle = _builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                 token.handle if token else None)
         output = _builder.create_release_layout(load_handle)
@@ -207,7 +209,7 @@ def local_store(
     """
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_builder.options.arch)
-        tmem_compatible_layout_encoding = _create_tmem_layout_encoding(_builder, dst)
+        tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_builder, dst)
         src_handle = _builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
         return tl.tensor(_builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
