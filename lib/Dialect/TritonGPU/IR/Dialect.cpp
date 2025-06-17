@@ -807,8 +807,7 @@ Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void BlockedEncodingAttr::print(mlir::AsmPrinter &printer) const {
-  printer << "<{"
-          << "sizePerThread = [" << ArrayRef(getSizePerThread()) << "]"
+  printer << "<{" << "sizePerThread = [" << ArrayRef(getSizePerThread()) << "]"
           << ", threadsPerWarp = [" << ArrayRef(getThreadsPerWarp()) << "]"
           << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]"
           << ", order = [" << getOrder() << "]";
@@ -1260,8 +1259,7 @@ Attribute NvidiaMmaEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "versionMajor = " << getVersionMajor()
+  printer << "<{" << "versionMajor = " << getVersionMajor()
           << ", versionMinor = " << getVersionMinor() //
           << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]";
 
@@ -1343,8 +1341,7 @@ Attribute AMDMfmaEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void AMDMfmaEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "versionMajor = " << getVersionMajor()                      //
+  printer << "<{" << "versionMajor = " << getVersionMajor()              //
           << ", versionMinor = " << getVersionMinor()                    //
           << ", warpsPerCTA = [" << getWarpsPerCTA() << "]"              //
           << ", instrShape = [" << ArrayRef{getMDim(), getNDim()} << "]" //
@@ -1434,8 +1431,7 @@ Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void AMDWmmaEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "version = " << getVersion()
+  printer << "<{" << "version = " << getVersion()
           << ", isTranspose = " << getIsTransposed() << ", warpsPerCTA = ["
           << ArrayRef(getWarpsPerCTA()) << "]";
   maybePrintCTALayout(getContext(), printer, getCTALayout(),
@@ -1483,9 +1479,8 @@ Attribute SliceEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void SliceEncodingAttr::print(mlir::AsmPrinter &printer) const {
-  printer << "<{"
-          << "dim = " << getDim() << ", "
-          << "parent = " << getParent() << "}>";
+  printer << "<{" << "dim = " << getDim() << ", " << "parent = " << getParent()
+          << "}>";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1560,8 +1555,7 @@ Attribute SwizzledSharedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void SwizzledSharedEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "vec = " << getVec() //
+  printer << "<{" << "vec = " << getVec() //
           << ", perPhase = " << getPerPhase()
           << ", maxPhase = " << getMaxPhase() //
           << ", order = [" << getOrder() << "]";
@@ -1635,9 +1629,8 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "swizzlingByteWidth = " << getSwizzlingByteWidth() //
-          << ", transposed = " << getTransposed()               //
+  printer << "<{" << "swizzlingByteWidth = " << getSwizzlingByteWidth() //
+          << ", transposed = " << getTransposed()                       //
           << ", elementBitWidth = " << getElementBitWidth();
   if (getFp4Padded()) {
     // Print only in this case to reduce the noise for the more common case.
@@ -1689,8 +1682,7 @@ Attribute AMDRotatingSharedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void AMDRotatingSharedEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "vec = " << getVec() //
+  printer << "<{" << "vec = " << getVec() //
           << ", perPhase = " << getPerPhase()
           << ", maxPhase = " << getMaxPhase() //
           << ", order = [" << getOrder() << "]";
@@ -3120,6 +3112,15 @@ int TritonGPUDialect::getThreadsPerWarp(ModuleOp module) {
   if (auto attr = module->getAttrOfType<IntegerAttr>(AttrNumThreadsPerWarp))
     return attr.getInt();
   return 32;
+}
+
+std::optional<int> triton::gpu::maybeLookupNumWarps(Block *block) {
+  if (auto partitions =
+          dyn_cast<WarpSpecializePartitionsOp>(block->getParentOp())) {
+    unsigned idx = block->getParent()->getRegionNumber();
+    return partitions.getParentOp().getPartitionNumWarps()[idx];
+  }
+  return maybeLookupNumWarps(block->getParentOp());
 }
 
 std::optional<int> triton::gpu::maybeLookupNumWarps(Operation *op) {

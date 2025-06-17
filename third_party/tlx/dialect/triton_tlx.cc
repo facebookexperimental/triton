@@ -116,14 +116,22 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("make_default_tmem_compatible_tensor_layout_encoding",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type elementType, int numWarps, int threadsPerWarp, int numCTAs) {
+              Type elementType, int moduleNumWarps, int threadsPerWarp,
+              int numCTAs) {
              // Include various assert to vet the input to make sure they're
              // valid for MMAv5. See also lib/Analysis/Utiity.cpp:supportMMA
              assert(shape.size() == 2 &&
                     "Only supporting 2D tensors for TMEM layout.");
              assert((!elementType.isInteger()) &&
                     "Integer type not supported.");
-             //  todo: check numWarps?
+
+             Block *parentBlock = self.getBuilder().getInsertionBlock();
+             int numWarps =
+                 ttg::maybeLookupNumWarps(parentBlock).value_or(moduleNumWarps);
+             assert((numWarps == 4 || numWarps == 8) &&
+                    "Currently only support numWarps 4 or 8 for TMEM load and "
+                    "store.");
+
              ttg::BlockedEncodingAttr defaultBlockedEncoding =
                  ttg::getDefaultBlockedEncoding(self.getContext(), shape,
                                                 numWarps, threadsPerWarp,

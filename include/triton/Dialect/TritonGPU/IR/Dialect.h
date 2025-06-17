@@ -53,6 +53,9 @@ int lookupNumWarps(Operation *op);
 // verifiers.
 std::optional<int> maybeLookupNumWarps(Operation *op);
 
+// Try to find the contextual number of warps of this block.
+std::optional<int> maybeLookupNumWarps(Block *block);
+
 // FIXME: Make this API and that of maybeLookupNumWarps consistent!
 // Utility to find the number of threads per warp
 int lookupThreadsPerWarp(OpBuilder &rewriter);
