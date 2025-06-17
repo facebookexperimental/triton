@@ -22,13 +22,13 @@ def _create_tmem_compatible_tensor_layout_encoding(
     _builder,
     tensor: tlx.buffered_tensor,
 ):
-    num_warps = _builder.options.num_warps
-    assert num_warps > 0, "tmem load requires num_warps > 0"
+    module_num_warps = _builder.options.num_warps
+    assert module_num_warps > 0, "tmem load requires num_warps > 0"
     num_ctas = _builder.options.num_ctas
     assert num_ctas > 0, "tmem load requires num_ctas > 0"
     threads_per_warp = 32
     return _builder.make_default_tmem_compatible_tensor_layout_encoding(list(tensor.shape),
-                                                                        tensor.dtype.to_ir(_builder), num_warps,
+                                                                        tensor.dtype.to_ir(_builder), module_num_warps,
                                                                         threads_per_warp, num_ctas)
 
 
