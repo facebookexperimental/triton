@@ -170,9 +170,8 @@ void init_triton_tlx_ir(py::module &&m) {
 }
 
 void init_triton_tlx_passes(py::module &&m) {
-  ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_attach_metadata",
-                            tlx::createTritonTLXAttachMetadata, std::string,
-                            int32_t, int32_t, int32_t);
+  ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
+                            std::string, int32_t, int32_t, int32_t);
 }
 
 void init_triton_tlx(py::module &&m) {

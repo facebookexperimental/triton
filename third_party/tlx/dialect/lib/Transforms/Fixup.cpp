@@ -9,17 +9,15 @@ namespace ttg = mlir::triton::gpu;
 
 namespace mlir::triton::tlx {
 
-#define GEN_PASS_DEF_TRITONTLXATTACHMETADATA
+#define GEN_PASS_DEF_TRITONTLXFIXUP
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
-#define DEBUG_TYPE "tlx-attach-metadata"
+#define DEBUG_TYPE "tlx-fixup"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-class TritonTLXAttachMetadataPass
-    : public impl::TritonTLXAttachMetadataBase<TritonTLXAttachMetadataPass> {
-  using impl::TritonTLXAttachMetadataBase<
-      TritonTLXAttachMetadataPass>::TritonTLXAttachMetadataBase;
+class TritonTLXFixupPass : public impl::TritonTLXFixupBase<TritonTLXFixupPass> {
+  using impl::TritonTLXFixupBase<TritonTLXFixupPass>::TritonTLXFixupBase;
 
 public:
   void runOnOperation() override {

@@ -1,5 +1,5 @@
 add_triton_library(TritonTLXTransforms
-  AttachMetadata.cpp
+  Fixup.cpp
 
   DEPENDS
   TritonTLXTransformsIncGen

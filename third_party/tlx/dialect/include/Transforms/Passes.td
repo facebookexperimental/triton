@@ -3,11 +3,11 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonTLXAttachMetadata : Pass</*cli-arg*/"triton-tlx-attach-metadata", /*Op*/"mlir::ModuleOp"> {
-  let summary = "Attach metadata to the module";
+def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Fixup the IR for TritonTLX";
   let description = [{
-    The pass attaches metadata to the TritonDialect module to help make TritonGPU or TritonNvidiaGPU integrate
-    better into frontend DSL and TritonDialect.
+    The pass did some fixup to the TritonDialect module to help make TritonGPU or TritonNvidiaGPU integrate
+    better into frontend DSL and TritonDialect, such as attaching metadata to the module.
   }];
 
   let options = [
