@@ -1,6 +1,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
@@ -23,6 +24,20 @@ public:
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
+    // First check if there is any TLX op in the module. If not, do nothing.
+    bool hasTLXOp = false;
+    auto tlxDialectName = TLXDialect::getDialectNamespace();
+    mod.walk([&](Operation *op) {
+      if (op->getDialect()->getNamespace() == tlxDialectName) {
+        hasTLXOp = true;
+        return;
+      }
+    });
+    if (!hasTLXOp) {
+      return;
+    }
+
+    // Attach metadata to the module.
     Builder b(&getContext());
     mod->setAttr(ttg::AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(ttg::AttrNumThreadsPerWarp,
