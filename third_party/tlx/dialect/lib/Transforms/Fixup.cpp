@@ -25,15 +25,15 @@ public:
     ModuleOp mod = getOperation();
 
     // First check if there is any TLX op in the module. If not, do nothing.
-    bool hasTLXOp = false;
     auto tlxDialectName = TLXDialect::getDialectNamespace();
-    mod.walk([&](Operation *op) {
+    WalkResult result = mod.walk([&](Operation *op) {
       if (op->getDialect()->getNamespace() == tlxDialectName) {
-        hasTLXOp = true;
-        return;
+        return WalkResult::interrupt();
       }
+      return WalkResult::advance();
     });
-    if (!hasTLXOp) {
+    if (!result.wasInterrupted()) {
+      // No TLX op found, do nothing.
       return;
     }
 
