@@ -26,4 +26,17 @@ def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp">
    ];
 }
 
+def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
+  let summary = "propagate layout information";
+
+  let description = [{
+    TODO
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif // TRITON_TLX_PASSES
