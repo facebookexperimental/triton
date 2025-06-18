@@ -343,6 +343,7 @@ void init_triton_ir(py::module &&m) {
         std::string str;
         llvm::raw_string_ostream os(str);
         self.print(os);
+        os << "defined name is: " << self.getDefName();
         return os.str();
       });
 

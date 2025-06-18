@@ -52,8 +52,15 @@ LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
 LLVM_SYSPATH=$LLVM_BUILD_DIR \
     pip3 install -e . --no-build-isolation
 
-
-
+# or
+LLVM_BUILD_DIR=`pwd`/../triton-llvm/build \
+DEBUG=1 \
+TRITON_BUILD_WITH_CLANG_LLD=1 \
+TRITON_BUILD_WITH_CCACHE=0 \
+LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
+LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
+LLVM_SYSPATH=$LLVM_BUILD_DIR \
+    pip3 install -e . --no-build-isolation
 
 # triton from internal repo has different pyproject.toml, so we need to run:
 LLVM_BUILD_DIR=`pwd`/../llvm-project/build \
