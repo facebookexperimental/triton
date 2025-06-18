@@ -29,4 +29,7 @@ def thread_id(axis, _builder=None):
 
 @tl.builtin
 def async_task_replica_id(_builder=None):
-    return tl.constexpr(int(os.environ.get("TLX_ASYNC_TASK_REPLICA_ID", 0)))
+    from triton.tlx.compiler.code_generator import region_replica_id_stack
+    assert len(region_replica_id_stack
+               ) > 0, "async_task_replica_id must be called inside an async region where the stack must be non-empty"
+    return tl.constexpr(region_replica_id_stack[-1])
