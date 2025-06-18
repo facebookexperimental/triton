@@ -76,8 +76,8 @@ def matmul_kernel_tma_pipelined_hopper(
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # allocate NUM_STAGES buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_STAGES)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_STAGES)
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_STAGES)
 
     # prefetch (pipelining) for NUM_STAGES - 1 buffers
     for i in range(0, NUM_STAGES):
@@ -119,7 +119,7 @@ def matmul_kernel_tma_pipelined_hopper(
 
     # wait for last mma to complete
     acc = tlx.async_dot_wait(0, acc)
-    c = acc.to(tl.float16)
+    c = acc.to(tlx.dtype_of(c_ptr))
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]

@@ -32,3 +32,17 @@ def async_task_replica_id(_builder=None):
     assert len(region_replica_id_stack
                ) > 0, "async_task_replica_id must be called inside an async region where the stack must be non-empty"
     return tl.constexpr(region_replica_id_stack[-1])
+
+def dtype_of(v, _builder=None) -> tl.dtype:
+    """
+    Returns the element type of a given tensor or tensor descriptor.
+    """
+    if isinstance(v, tl.tensor):
+        dtype = v.type.element_ty
+        if dtype.is_ptr():
+            dtype = dtype.element_ty
+        return dtype
+    elif isinstance(v, tl.tensor_descriptor_base):
+        return v.type.element_ty
+    else:
+        raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
