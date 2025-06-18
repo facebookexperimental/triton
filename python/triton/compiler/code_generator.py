@@ -330,6 +330,7 @@ class CodeGenerator(ast.NodeVisitor):
         # Are we currently visiting an ast.arg's default value?  These have some
         # special handling.
         self.visiting_arg_default_value = False
+        self.defined_name = None
 
     builtin_namespace: Dict[str, Any] = {
         _.__name__: _
@@ -566,6 +567,7 @@ class CodeGenerator(ast.NodeVisitor):
         return self.visit_Assign(node)
 
     def assignTarget(self, target, value):
+        print("Visiting var name: ", target.id)
         if isinstance(target, ast.Subscript):
             assert target.ctx.__class__.__name__ == "Store"
             return self.visit_Subscript_Store(target, value)
@@ -595,8 +597,16 @@ class CodeGenerator(ast.NodeVisitor):
                 value = semantic.to_tensor(value, self.builder)
             return value
 
-        values = _sanitize_value(self.visit(node.value))
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+        # self.builder.set_loc_def_name(node.targets[0].id)
+            # targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+
+        # operations of right hand side of assignment will be built after walking through the following self.visit(node.value)
+        # we temporarily store the name of defined globally, and delete it after finishing the
+        self.defined_name = node.targets[0].id
+        values = _sanitize_value(self.visit(node.value))
+        # self.defined_name = None
+
         assert len(targets) == 1
         self.assignTarget(targets[0], values)
 
@@ -633,8 +643,11 @@ class CodeGenerator(ast.NodeVisitor):
         return getattr(lhs, method_name)(rhs)
 
     def visit_BinOp(self, node):
+
         lhs = self.visit(node.left)
         rhs = self.visit(node.right)
+
+
         method_name = self._method_name_for_bin_op.get(type(node.op))
         if method_name is None:
             raise self._unsupported(node,
@@ -1392,9 +1405,21 @@ class CodeGenerator(ast.NodeVisitor):
             self.cur_node = node
             if hasattr(node, 'lineno') and hasattr(node, 'col_offset'):
                 self.builder.set_loc(self.file_name, self.begin_line + node.lineno, node.col_offset)
-                last_loc = self.builder.get_loc()
+                # last_loc = self.builder.get_loc()
+
+            # if self.defined_name is not None:
+            #     self.builder.set_loc_def_name(self.defined_name)
+            #     last_loc = self.builder.get_loc()
+            defined_name = self.defined_name
+            # self.builder.set_loc_def_name(self.defined_name)
+
+            # if the value of this syntax will be assigned to a name
+            if self.defined_name is not None:
+                self.builder.set_loc_def_name(self.defined_name)
+                self.defined_name = None    # sub-syntax didn't define this value
             try:
                 ret = super().visit(node)
+
             except CompilationError:
                 raise
             except Exception as e:

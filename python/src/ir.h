@@ -1,4 +1,5 @@
 #pragma once
+#include "llvm/ADT/StringRef.h"
 #include "mlir/IR/Builders.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <memory>
@@ -24,6 +25,21 @@ public:
   void setLastLoc(const std::string &fileName, int line, int column) {
     auto context = builder->getContext();
     setLastLoc(mlir::FileLineColLoc::get(context, fileName, line, column));
+  }
+
+  // void setLastLoc(const std::string &fileName, int line, int column, std::string defName) {
+  //   auto context = builder->getContext();
+  //   setLastLoc(mlir::FileLineColLoc::get(context, fileName, line, column));
+  // }
+
+  // record var name that was defined
+  void setLastLocDefName(std::string defName){
+    lastLoc -> setDefName(defName);
+  }
+
+  // plotfi
+  std::string getLastLocDefName() const {
+    return lastLoc->getDefName().c_str();
   }
 
   mlir::Location getLastLoc() {
@@ -62,6 +78,9 @@ public:
 
   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
     auto loc = getLastLoc();
+    // std::string tmp = "default999";
+    // loc.setDefName(tmp);
+    // assert(false && "plotfi");
     return builder->create<OpTy>(loc, std::forward<Args>(args)...);
   }
 
