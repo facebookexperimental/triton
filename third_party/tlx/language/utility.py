@@ -2,7 +2,6 @@ import triton.language.core as tl
 
 from . import types as tlx
 import re
-import os
 
 
 def cuda_parse_arch(arch):

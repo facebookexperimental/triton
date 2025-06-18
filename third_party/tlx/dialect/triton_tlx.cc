@@ -165,10 +165,6 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::AsyncTMACopyLocalToGlobalOp>(tmaPtr, coord,
                                                             source);
            });
-  // .def("async_task_replica_id", [](TritonOpBuilder &self) -> mlir::Value {
-  //   auto context = self.getBuilder().getContext();
-  //   return 0;
-  // });
 }
 
 void init_triton_tlx_passes(py::module &&m) {
