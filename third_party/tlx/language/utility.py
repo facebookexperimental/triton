@@ -24,3 +24,19 @@ def thread_id(axis, _builder=None):
     if axis not in (0, 1, 2):
         raise ValueError(f"thread_id axis must be 0, 1, or 2 but got {axis}")
     return tl.tensor(_builder.create_thread_id(axis), tl.int32)
+
+
+@tl.builtin
+def dtype_of(v, _builder=None) -> tl.dtype:
+    """
+    Returns the element type of a given tensor or tensor descriptor.
+    """
+    if isinstance(v, tl.tensor):
+        dtype = v.type.element_ty
+        if dtype.is_ptr():
+            dtype = dtype.element_ty
+        return dtype
+    elif isinstance(v, tl.tensor_descriptor_base):
+        return v.type.element_ty
+    else:
+        raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
