@@ -31,6 +31,19 @@ namespace tlx {
 #define GEN_PASS_DEF_TLXPROPAGATELAYOUT
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
+class RequireLayoutPattern : public mlir::OpRewritePattern<RequireLayoutOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(RequireLayoutOp requireLayoutOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto convertLayoutOp = rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
+        requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
+    return success();
+  }
+};
+
 class ReleaseLayoutPattern : public mlir::OpRewritePattern<ReleaseLayoutOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -60,33 +73,22 @@ public:
     solver.load<DeadCodeAnalysis>();
     solver.load<SparseConstantPropagation>();
     solver.load<LayoutPropagation>(symbolTable);
+    solver.load<LayoutForwardPropagation>();
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
     getOperation()->walk([&](triton::FuncOp funcOp) {
       WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
+        if (isa<tlx::RequireLayoutOp>(op))
+          return WalkResult::advance();
+
         for (auto [i, result] : llvm::enumerate(op->getResults())) {
           auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
           if (!lattice)
             llvm_unreachable("Lattice not found.");
           if (lattice->getValue().isUninitialized())
             continue;
-          if (auto origType = dyn_cast<RankedTensorType>(result.getType())) {
-            auto newType = RankedTensorType::get(
-                origType.getShape(), origType.getElementType(),
-                lattice->getValue().getLayoutEncoding());
-            op->getResult(i).setType(newType);
-            if (auto constantOp = dyn_cast<arith::ConstantOp>(op)) {
-              auto valAttr = cast<DenseElementsAttr>(constantOp.getValueAttr());
-              auto valType = cast<ShapedType>(valAttr.getType());
-              // This reshape hack adds the new encoding to the value
-              // attribute.
-              valAttr = valAttr.reshape(newType);
-              op->setAttr("value", valAttr);
-              break;
-            }
-          } else if (auto origType =
-                         dyn_cast<gpu::MemDescType>(result.getType())) {
+          if (auto origType = dyn_cast<gpu::MemDescType>(result.getType())) {
             auto newType = gpu::MemDescType::get(
                 origType.getShape(), origType.getElementType(),
                 lattice->getValue().getLayoutEncoding(),
@@ -100,14 +102,15 @@ public:
   }
 
   void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
+
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
+    patterns.add<RequireLayoutPattern>(context);
     patterns.add<ReleaseLayoutPattern>(context);
 
     if (applyPatternsGreedily(getOperation(), std::move(patterns)).failed())
       signalPassFailure();
-
-    getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
   }
 };
 

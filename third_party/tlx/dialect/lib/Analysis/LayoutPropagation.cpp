@@ -84,9 +84,7 @@ LogicalResult LayoutPropagation::visitOperation(
   return success();
 }
 
-void LayoutPropagation::visitBranchOperand(OpOperand &operand) {
-  // TODO(Arda): Implement this
-}
+void LayoutPropagation::visitBranchOperand(OpOperand &operand) {}
 
 void LayoutPropagation::visitCallOperand(OpOperand &operand) {
   llvm_unreachable(
@@ -94,5 +92,29 @@ void LayoutPropagation::visitCallOperand(OpOperand &operand) {
 }
 
 void LayoutPropagation::setToExitState(LayoutEncodingLattice *lattice) {}
+
+//===----------------------------------------------------------------------===//
+// LayoutForwardPropagation
+//===----------------------------------------------------------------------===//
+
+LogicalResult LayoutForwardPropagation::visitOperation(
+    Operation *op, ArrayRef<const LayoutEncodingLattice *> operands,
+    ArrayRef<LayoutEncodingLattice *> results) {
+
+  if (!isa<triton::gpu::MemDescSubviewOp>(op))
+    return success();
+
+  auto memDescSubviewOp = cast<triton::gpu::MemDescSubviewOp>(op);
+  for (const auto operandLattice : operands) {
+    for (auto [i, resultLattice] : llvm::enumerate(results)) {
+      ChangeResult changed = resultLattice->meet(operandLattice->getValue());
+      propagateIfChanged(resultLattice, changed);
+    }
+  }
+  return success();
+}
+
+void LayoutForwardPropagation::setToEntryState(LayoutEncodingLattice *lattice) {
+}
 
 } // namespace mlir::triton::tlx

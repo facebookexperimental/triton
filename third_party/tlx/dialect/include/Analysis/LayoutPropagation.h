@@ -80,6 +80,19 @@ public:
   void setToExitState(LayoutEncodingLattice *lattice) override;
 };
 
+class LayoutForwardPropagation
+    : public SparseForwardDataFlowAnalysis<LayoutEncodingLattice> {
+public:
+  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
+
+  LogicalResult
+  visitOperation(Operation *op,
+                 ArrayRef<const LayoutEncodingLattice *> operands,
+                 ArrayRef<LayoutEncodingLattice *> results) override;
+
+  void setToEntryState(LayoutEncodingLattice *lattice) override;
+};
+
 } // namespace mlir::triton::tlx
 
 #endif // TLX_ANALYSIS_LAYOUTPROPAGATION_H
