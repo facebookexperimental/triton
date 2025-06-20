@@ -3,6 +3,7 @@ from triton import knobs
 import triton.language.semantic as semantic
 
 from . import types as tlx
+from .utility import cuda_parse_arch
 
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
@@ -29,6 +30,8 @@ def async_dot(
     input: tlx.buffered_tensor,
     other: tlx.buffered_tensor,
     acc=None,  # tl.tensor,
+    mmav5: bool = False,
+    mBarrier=None,
     input_precision=None,
     allow_tf32=None,
     max_num_imprecise_acc=None,
@@ -67,6 +70,11 @@ def async_dot(
     # TODO. batched dot is not supported yet
     input = require_nv_mma_shared_layout(input, [0, 1] if col_input else [1, 0], _builder)
     other = require_nv_mma_shared_layout(other, [0, 1] if col_other else [1, 0], _builder)
+
+    if mmav5:
+        assert int(cuda_parse_arch(_builder.options.arch)) >= 100, "mmav5 is only supported on Blackwell and above"
+        output = _builder.create_tcgen5_dot(input, other, acc.handle, mBarrier.handle if mBarrier else None)
+        return tl.tensor(output, tl.void)
 
     acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
 

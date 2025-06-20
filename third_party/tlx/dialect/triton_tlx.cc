@@ -227,6 +227,34 @@ void init_triton_tlx_ir(py::module &&m) {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);
              self.create<ttng::TMEMStoreOp>(dst, src, pred);
            })
+      .def("create_tcgen5_dot",
+           [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
+              mlir::Value &d, std::optional<Value> mBarrier) -> mlir::Value {
+             // try to find the TMEMAllocOp that created d
+             ttng::TMEMAllocOp tmemAllocOp;
+             auto value = d;
+             while (true) {
+               if ((tmemAllocOp = value.getDefiningOp<ttng::TMEMAllocOp>())) {
+                 break;
+               }
+               auto subviewOp = value.getDefiningOp<ttg::MemDescSubviewOp>();
+               assert(subviewOp && "Failed to find TMEMAllocOp");
+               value = subviewOp.getSrc();
+             }
+
+             Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
+             auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
+             return self
+                 .create<ttng::TCGen5MMAOp>(
+                     tokType, a, b, d, tmemAllocOp.getToken(),
+                     predTrue /*useD*/, predTrue /*pred */, false /* two_ctas*/,
+                     mBarrier.has_value() ? ValueRange(mBarrier.value())
+                                          : ValueRange(),
+                     mBarrier.has_value()
+                         ? ValueRange(predTrue) /*barrier_preds*/
+                         : ValueRange())
+                 .getToken();
+           })
       .def("create_async_commit_group",
            [](TritonOpBuilder &self,
               std::vector<Value> asyncTokens) -> mlir::Value {
