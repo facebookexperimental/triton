@@ -86,7 +86,7 @@ def visit_withAsyncTasks(self, node):
                     with enter_sub_region(self):
                         self.visit(stmt)
 
-            region_replica_id_stack.pop()  # reset
+            region_replica_id_stack.pop()  # revert adding dummy placeholder
 
         assert num_default == 1, "Default task must be one and only one"
         block.erase()
