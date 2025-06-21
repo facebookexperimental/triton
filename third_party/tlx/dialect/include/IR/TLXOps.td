@@ -29,6 +29,8 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
   let results = (outs TTG_TensorOrMemDesc:$result);
 
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+
+  let hasFolder = 1;
 }
 
 def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",

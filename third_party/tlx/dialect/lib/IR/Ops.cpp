@@ -16,6 +16,18 @@
 
 namespace mlir {
 namespace triton {
-namespace tlx {} // namespace tlx
+namespace tlx {
+
+//-- RequireLayoutOp --
+
+OpFoldResult RequireLayoutOp::fold(FoldAdaptor adaptor) {
+  if (getType() == getSrc().getType()) {
+    // no-op
+    return getSrc();
+  }
+  return {};
+}
+
+} // namespace tlx
 } // namespace triton
 } // namespace mlir
