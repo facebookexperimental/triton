@@ -119,7 +119,7 @@ def test_local_load(BLOCK_SIZE, device):
         x_ptr_offsets = x_ptr + offsets
         y_ptr_offsets = y_ptr + offsets
 
-        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2))
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 2)
         buffer0 = tlx.local_view(buffers, 0)
         buffer1 = tlx.local_view(buffers, 1)
         tlx.async_load(x_ptr_offsets, buffer0, mask=mask)

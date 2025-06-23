@@ -1,3 +1,4 @@
+from inspect import unwrap
 import triton.language.core as tl
 from triton.language.semantic import (
     _convert_elem_to_ir_value,
@@ -36,7 +37,7 @@ def _create_tmem_compatible_tensor_layout_encoding(
 def local_alloc(
     shape: tuple,
     dtype: tl.dtype,
-    num: tl.constexpr,
+    num,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     layout: Optional[tlx.shared_layout_encoding] = None,
     _builder=None,
@@ -46,6 +47,19 @@ def local_alloc(
     """
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_builder.options.arch)
+
+    if not isinstance(num, tl.constexpr):
+        user_error = """
+`num` must be a constexpr without introducing any `ast.Assign` nodes,
+otherwise its value will be wrapped as `tensor.handle`.
+For example, following will fail because `num` will be promoted to tl.tensor by semantics.py
+in visit_Assign
+    num = tl.constexpr(2)
+    local_alloc(..., num=num)
+
+To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc(..., num=2)`
+        """
+        raise ValueError(user_error)
 
     unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
     unwrapped_num = tl._unwrap_if_constexpr(num)
