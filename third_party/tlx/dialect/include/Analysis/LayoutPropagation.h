@@ -61,10 +61,10 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// LayoutPropagation
+// LayoutBackwardPropagation
 //===----------------------------------------------------------------------===//
 
-class LayoutPropagation
+class LayoutBackwardPropagation
     : public SparseBackwardDataFlowAnalysis<LayoutEncodingLattice> {
 public:
   using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
@@ -79,6 +79,10 @@ public:
 
   void setToExitState(LayoutEncodingLattice *lattice) override;
 };
+
+//===----------------------------------------------------------------------===//
+// LayoutForwardPropagation
+//===----------------------------------------------------------------------===//
 
 class LayoutForwardPropagation
     : public SparseForwardDataFlowAnalysis<LayoutEncodingLattice> {

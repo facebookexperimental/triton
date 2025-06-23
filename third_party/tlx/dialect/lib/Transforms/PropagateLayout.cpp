@@ -72,7 +72,7 @@ public:
 
     solver.load<DeadCodeAnalysis>();
     solver.load<SparseConstantPropagation>();
-    solver.load<LayoutPropagation>(symbolTable);
+    solver.load<LayoutBackwardPropagation>(symbolTable);
     solver.load<LayoutForwardPropagation>();
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();

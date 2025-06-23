@@ -54,10 +54,10 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
 }
 
 //===----------------------------------------------------------------------===//
-// LayoutPropagation
+// LayoutBackwardPropagation
 //===----------------------------------------------------------------------===//
 
-LogicalResult LayoutPropagation::visitOperation(
+LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
   if (auto requireLayoutOp = dyn_cast<triton::tlx::RequireLayoutOp>(op)) {
@@ -84,14 +84,15 @@ LogicalResult LayoutPropagation::visitOperation(
   return success();
 }
 
-void LayoutPropagation::visitBranchOperand(OpOperand &operand) {}
+void LayoutBackwardPropagation::visitBranchOperand(OpOperand &operand) {}
 
-void LayoutPropagation::visitCallOperand(OpOperand &operand) {
+void LayoutBackwardPropagation::visitCallOperand(OpOperand &operand) {
   llvm_unreachable(
       "Should not have any call operands in the IR after inlining.");
 }
 
-void LayoutPropagation::setToExitState(LayoutEncodingLattice *lattice) {}
+void LayoutBackwardPropagation::setToExitState(LayoutEncodingLattice *lattice) {
+}
 
 //===----------------------------------------------------------------------===//
 // LayoutForwardPropagation

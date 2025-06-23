@@ -27,10 +27,13 @@ def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp">
 }
 
 def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
-  let summary = "propagate layout information";
+  let summary = "Propagate layout information";
 
   let description = [{
-    TODO
+    This pass propagates layout information from the tlx::RequireLayoutOp and
+    tlx::ReleaseLayoutOp by doing a backward and forward dataflow analysis. It
+    is expected that these ops would be either completely eliminated or turned
+    into ttg::ConvertLayoutOp(s).
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
