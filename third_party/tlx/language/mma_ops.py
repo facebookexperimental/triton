@@ -44,7 +44,7 @@ def async_dot(
     Performs a warp-group matrix multiply-accumulate operation of two blocks and return the matrix product.
 
     This maps directly to NVIDIA Hopper’s wgmma.mma_async instructions, enabling high-throughput matrix multiplication
-    across multiple warps within a warpgroup.
+    across multiple warps within a warpgroup, or Blackwell's tcgen05.mma instruction.
 
     The operation computes:
         D = A @ B + C
@@ -74,7 +74,7 @@ def async_dot(
     if mmav5:
         assert int(cuda_parse_arch(_builder.options.arch)) >= 100, "mmav5 is only supported on Blackwell and above"
         output = _builder.create_tcgen5_dot(input, other, acc.handle, mBarrier.handle if mBarrier else None)
-        return tl.tensor(output, tl.void)
+        return tl.async_token(output)
 
     acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
 
