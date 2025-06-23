@@ -74,7 +74,7 @@ def async_dot(
     if mmav5:
         assert int(cuda_parse_arch(_builder.options.arch)) >= 100, "mmav5 is only supported on Blackwell and above"
         output = _builder.create_tcgen5_dot(input, other, acc.handle, mBarrier.handle if mBarrier else None)
-        return tl.async_token(output)
+        return tlx.async_token(output)
 
     acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
 
