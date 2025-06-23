@@ -14,7 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/DataFlowFramework.h"
-#define DEBUG_TYPE "triton-gpu-taskid-propagate"
+#define DEBUG_TYPE "tlx-propagate-layout"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 

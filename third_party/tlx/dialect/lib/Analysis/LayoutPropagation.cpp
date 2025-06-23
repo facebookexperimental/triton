@@ -11,7 +11,7 @@
 
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 
-#define DEBUG_TYPE "layout-propagation"
+#define DEBUG_TYPE "tlx-layout-propagation"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
