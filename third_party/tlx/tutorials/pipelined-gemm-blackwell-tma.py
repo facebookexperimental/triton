@@ -222,4 +222,4 @@ def benchmark(M, N, K, provider):
 
 
 print("Running benchmarks...")
-# benchmark.run(show_plots=True, print_data=True)
+benchmark.run(show_plots=True, print_data=True)
