@@ -11,7 +11,8 @@ def validate_block_shape(shape: List[int]):
     numel = 1
     for i, d in enumerate(shape):
         if not isinstance(d, int):
-            raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
+            import pdb; pdb.set_trace()
+            raise TypeError(f"Shape element {i} {d} must have type `constexpr[int]`, got `constexpr[{type(d)}] : shape {shape}")
         if not is_power_of_two(d):
             raise ValueError(f"Shape element {i} must be a power of 2")
         numel *= d
