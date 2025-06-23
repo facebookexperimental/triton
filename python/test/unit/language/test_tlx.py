@@ -452,20 +452,7 @@ def test_async_dot(device):
 )
 def test_async_dot_blackwell(device):
     """
-    Define a unit test with similar schema with tl.dot
-    @triton.jit
-    def ref_kernel(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, INPUT_PRECISION: tl.constexpr, out_dtype: tl.constexpr = tl.float32):
-        off_m = tl.arange(0, BLOCK_M)
-        off_n = tl.arange(0, BLOCK_N)
-        off_k = tl.arange(0, BLOCK_K)
-        Xs = X + off_m[:, None] * stride_xm + off_k[None, :] * stride_xk
-        Ys = Y + off_k[:, None] * stride_yk + off_n[None, :] * stride_yn
-        Zs = Z + off_m[:, None] * stride_zm + off_n[None, :] * stride_zn
-        x = tl.load(Xs)
-        y = tl.load(Ys)
-        z = tl.dot(x, y, input_precision=INPUT_PRECISION, out_dtype=out_dtype)
-        tl.store(Zs, z)
+    Test D = A*B + A*B
     """
 
     @triton.jit
@@ -483,8 +470,10 @@ def test_async_dot_blackwell(device):
         acc_init = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         # async load a and b into SMEM
-        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1), order=[1, 0])
-        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1), order=[1, 0])
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1),
+                                      order=[1, 0])  #todo: remove `order` when we have layout propagation
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1),
+                                      order=[1, 0])  #todo: remove `order` when we have layout propagation
         a_smem = tlx.local_view(buf_alloc_a, 0)
         b_smem = tlx.local_view(buf_alloc_b, 0)
         tlx.async_load(a_ptrs, a_smem)
