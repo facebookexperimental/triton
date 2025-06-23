@@ -39,7 +39,7 @@ def tlx_attention_fwd(sm_scale, M,  #
 
     offset_y = off_z + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
-    # initialize offsets 
+    # initialize offsets
     offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M//2)
     offs_m1 = start_m * BLOCK_M + tl.arange(BLOCK_M//2, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -78,42 +78,87 @@ def tlx_attention_fwd(sm_scale, M,  #
     lo, hi = 0, N_CTX
     with tlx.async_tasks():
         with tlx.async_task("default"): # correction
+           # set up arguments
+           arg26 = arg27 = arg28 = arg30 = 0
+           arg29 = -1
            for start_n in tl.range(lo, hi, BLOCK_N):
                # data slice 0
-               tlx.barrier_wait(barrier[bufIdx], phase)
-               tlx.local_load # m_i
-               tlx.barrier_arrive(barrier[bufIdx])
-               tlx.barrier_wait(
-               tlx.local_load # m_ij
-               tlx.barrier_arrive(barrier[bufIdx])
+               # convert from ttng.wait_barrier to tlx.barrier_wait, trace the barrier and the phase
+               val_116 = arg26 ^ 1
+               val_117 = arg27 + 1
+               val_121 = 1 if val_117 == 3 else val_117
+               val_120 = arg28 ^ 1 if val_117 == 3 else arg28
+               view_1 = tlx.local_view(buffer_63, val_121)
+               view_2 = tlx.local_view(barrier_64, val_121)
+               view_3 = tlx.local_view(barrier_65, val_121)
+               tlx.barrier_wait(view_2, val_120)
+               m_i = tlx.local_load(view_1, tlx.storage_kind.smem) # m_i
+               tlx.barrier_arrive(view_3, 1)
+
+               val_126 = arg29 + 1
+               val_130 = 1 if val_126 == 3 else val_126
+               val_129 = arg30 ^ 1 if val_126 == 3 else arg30
+               view_4 = tlx.local_view(buffer_63, val_130)
+               view_5 = tlx.local_view(barrier_64, val_130)
+               view_6 = tlx.local_view(barrier_65, val_130)
+               tlx.barrier_wait(view_5, val_129)
+               m_ij = tlx.local_load(view_4) # m_ij
+               tlx.barrier_arrive(view_6, 1)
+
                alpha = tl.math.exp2(m_i - m_ij)
-               barrier_wait # acc0
+               view_7 = tlx.local_view(barrier_45, 0)
+               barrier_wait(view_7, arg26) # acc0
                # subtiling to reduce register pressure when hDim is 128
-               tmem_load
-               acc0 = acc0 * alpha[:, None]
-               tmem_store
-               tmem_load
-               acc0 = acc0 * alpha[:, None]
-               tmem_store
-               tlx.barrier_arrive( # acc0
+               view_8 = tlx.local_view(result_2, 0)
+               view_9 = tlx.subslice(view_8, 0) # N = 0
+               view_10 = tlx.subslice(view_8, 64) # N = 64
+               result_7 = tlx.local_load(view_9, tlx.storage_kind.tmem)
+               val_141 = result_7 * alpha[:, None]
+               tlx.local_store(view_9, val_141, tlx.storage_kind.tmem)
+               result_8 = tlx.local_load(view_10, tlx.storage_kind.tmem)
+               val_142 = result_8 * alpha[:, None]
+               tlx.local_store(view_10, val_142, tlx.storage_kind.tmem)
+               view_11 = tlx.local_view(barrier_43, 0)
+               tlx.barrier_arrive(view_11, 1) # acc0
 
                # data slice 1
-               tlx.barrier_wait(barrier[bufIdx], phase)
-               tlx.local_load # m_i
-               tlx.barrier_arrive(barrier[bufIdx])
-               tlx.barrier_wait(
-               tlx.local_load # m_ij
-               tlx.barrier_arrive(barrier[bufIdx])
-               alpha = tl.math.exp2(m_i - m_ij)
-               barrier_wait
-               tmem_load
-               acc0 = acc0 * alpha[:, None]
-               tmem_store
-               tmem_load
-               acc0 = acc0 * alpha[:, None]
-               tmem_store
-               tlx.barrier_arrive(
-               
+               view_12 = tlx.local_view(buffer_73, val_121)
+               view_13 = tlx.local_view(barrier_74, val_121)
+               view_14 = tlx.local_view(barrier_75, val_121)
+               tlx.barrier_wait(view_13, val_120)
+               m_i1 = tlx.local_load(view_12, tlx.storage_kind.smem) # m_i
+               tlx.barrier_arrive(view_14, 1)
+
+               view_15 = tlx.local_view(buffer_73, val_130)
+               view_16 = tlx.local_view(barrier_74, val_130)
+               view_17 = tlx.local_view(barrier_75, val_130)
+               tlx.barrier_wait(view_16, val_129)
+               m_ij1 = tlx.local_load(view_15) # m_ij
+               tlx.barrier_arrive(view_17, 1)
+
+               alpha1 = tl.math.exp2(m_i1 - m_ij1)
+               view_18 = tlx.local_view(barrier_57, 0)
+               barrier_wait(view_18, arg26) # acc1
+               # subtiling to reduce register pressure when hDim is 128
+               view_19 = tlx.local_view(result, 0)
+               view_20 = tlx.subslice(view_19, 0) # N = 0
+               view_21 = tlx.subslice(view_19, 64) # N = 64
+               result_9 = tlx.local_load(view_20, tlx.storage_kind.tmem)
+               val_157 = result_9 * alpha1[:, None]
+               tlx.local_store(view_20, val_157, tlx.storage_kind.tmem)
+               result_10 = tlx.local_load(view_21, tlx.storage_kind.tmem)
+               val_158 = result_10 * alpha1[:, None]
+               tlx.local_store(view_21, val_158, tlx.storage_kind.tmem)
+               view_22 = tlx.local_view(barrier_55, 0)
+               tlx.barrier_arrive(view_22, 1) # acc1
+
+               # update loop variables
+               arg26 = val_116
+               arg27 = val_121
+               arg28 = val_120
+               arg29 = val_130
+               arg30 = val_129
+
         with tlx.async_task(num_warps=1): # gemm
            # dot0_slice0
            tlx.async_dot(q0[bufIdx], k[bufIdx], acc0, False, True, barrier0, barrier1)
@@ -137,5 +182,3 @@ def tlx_attention_fwd(sm_scale, M,  #
            for start_n in tl.range(lo, hi, BLOCK_N):
 
     # epilogue
-
-
