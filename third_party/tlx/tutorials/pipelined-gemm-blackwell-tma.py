@@ -114,9 +114,8 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
         # if the previous MMA was issued in previous round of the buffers/barrier use, `phase` was flipped in last iteration,
         # meaning the previous MMA was issued "with `phase ^ 1`"
         prev_phase = phase ^ 1 if (i % NUM_STAGES == NUM_STAGES - 1) else phase
-        if k > 0:
-            # wait for dot op k-1 to complete before prefetching for its buffer for next time
-            tlx.barrier_wait(prev_dot_bar, prev_phase)
+        # wait for dot op k-1 to complete before prefetching for its buffer for next time
+        tlx.barrier_wait(prev_dot_bar, prev_phase)
 
         if i < num_iter:
             a_next = tlx.local_view(buffers_A, i % NUM_STAGES)
