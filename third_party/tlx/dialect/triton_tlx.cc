@@ -290,14 +290,6 @@ void init_triton_tlx_ir(py::module &&m) {
              Value tmaPtr = self.create<ttng::TensorDescToTMAPtrOp>(desc);
              self.create<ttng::AsyncTMACopyLocalToGlobalOp>(tmaPtr, coord,
                                                             source);
-           })
-      .def("create_async_TMA_reduce",
-           [](TritonOpBuilder &self, DescriptorReduceKind kind, Value desc,
-              std::vector<Value> &coord, Value source) -> void {
-             Value tmaPtr = self.create<ttng::TensorDescToTMAPtrOp>(desc);
-             //  self.create<ttng::AsyncTMACopyLocalToGlobalOp>(tmaPtr, coord,
-             //                                                 source);
-             self.create<DescriptorReduceOp>(kind, tmaPtr, source, coord);
            });
 }
 
