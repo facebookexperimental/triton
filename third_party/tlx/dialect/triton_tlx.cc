@@ -103,11 +103,11 @@ void init_triton_tlx_ir(py::module &&m) {
              auto context = self.getBuilder().getContext();
              int versionMajor = 3;
              int versionMinor = 0;
-             llvm::ArrayRef<unsigned> warpsPerCTA = {4, 1};
-             std::vector<unsigned> CTAsPerCGA = {1, 1};
-             std::vector<unsigned> CTASplitNum = {1, 1};
-             std::vector<unsigned> CTAOrder = {1, 0};
-             llvm::ArrayRef<unsigned> instrShape = {16, 64, 8};
+             llvm::SmallVector<unsigned, 2> warpsPerCTA = {4, 1};
+             llvm::SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
+             llvm::SmallVector<unsigned, 2> CTASplitNum = {1, 1};
+             llvm::SmallVector<unsigned, 2> CTAOrder = {1, 0};
+             llvm::SmallVector<unsigned, 3> instrShape = {16, 64, 8};
 
              auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
                                                       CTASplitNum, CTAOrder);
@@ -290,6 +290,14 @@ void init_triton_tlx_ir(py::module &&m) {
              Value tmaPtr = self.create<ttng::TensorDescToTMAPtrOp>(desc);
              self.create<ttng::AsyncTMACopyLocalToGlobalOp>(tmaPtr, coord,
                                                             source);
+           })
+      .def("create_async_TMA_reduce",
+           [](TritonOpBuilder &self, DescriptorReduceKind kind, Value desc,
+              std::vector<Value> &coord, Value source) -> void {
+             Value tmaPtr = self.create<ttng::TensorDescToTMAPtrOp>(desc);
+             //  self.create<ttng::AsyncTMACopyLocalToGlobalOp>(tmaPtr, coord,
+             //                                                 source);
+             self.create<DescriptorReduceOp>(kind, tmaPtr, source, coord);
            });
 }
 
