@@ -1,5 +1,4 @@
 import triton.language.core as tl
-from triton import knobs
 import triton.language.semantic as semantic
 
 from . import types as tlx
@@ -9,8 +8,9 @@ from .utility import cuda_parse_arch
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
     assert isinstance(x.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     if isinstance(x.layout, tlx.swizzled_shared_layout_encoding):
-        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.layout.order, elemType=x.dtype, numCTAsPerCGA=[1, 1],
-                                                   numCTASplit=[1, 1], numCTAOrder=[1, 1], fp4Padded=False)
+        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.layout.order, elemType=x.dtype,
+                                                   numCTAsPerCGA=[1, 1], numCTASplit=[1, 1], numCTAOrder=[1, 1],
+                                                   fp4Padded=False)
         layout_handle = _builder.make_nv_mma_shared_encoding_attr(
             [int(x) for x in layout.shape],
             layout.order,
@@ -73,19 +73,22 @@ def async_dot(
     # TODO. batched dot is not supported yet
     if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.smem:
         A_handle = require_nv_mma_shared_layout(A, _builder)
-    else :
+    else:
         # Registers or TMEM buffer do not need mma shared layout
         A_handle = A.handle
 
     B_handle = require_nv_mma_shared_layout(B, _builder)
 
     if version == 5:
-        assert isinstance(A, tlx.buffered_tensor) , "input must be a buffered tensor"
+        assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
         output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, mBarrier.handle if mBarrier else None)
         return tlx.async_token(output)
-    else :
-        acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0, _builder.options.num_warps))
-        output = _builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision, max_num_imprecise_acc, True)
+    else:
+        acc = _builder.create_require_layout(
+            acc_handle, _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
+                                                           _builder.options.num_warps))
+        output = _builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision,
+         max_num_imprecise_acc, True)
         # Release the mma layout for the output to conform to what the user expects
         output = _builder.create_release_layout(output)
         return tl.tensor(output, ret_ty)
