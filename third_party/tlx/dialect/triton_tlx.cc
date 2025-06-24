@@ -237,8 +237,11 @@ void init_triton_tlx_ir(py::module &&m) {
                if ((tmemAllocOp = value.getDefiningOp<ttng::TMEMAllocOp>())) {
                  break;
                }
+               // TODO: find the defining op properly - the defining op is not
+               // necessarily MemDescSubviewOp
                auto subviewOp = value.getDefiningOp<ttg::MemDescSubviewOp>();
-               assert(subviewOp && "Failed to find TMEMAllocOp");
+               assert(subviewOp && "Failed to find TMEMAllocOp defining the "
+                                   "accumulator TMEM passed to dot op.");
                value = subviewOp.getSrc();
              }
 
