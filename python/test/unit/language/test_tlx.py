@@ -479,9 +479,8 @@ def test_async_dot_blackwell(device):
 
     @triton.jit
     def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                          INPUT_PRECISION: tl.constexpr, out_dtype: tl.constexpr, COL_INPUT: tl.constexpr,
-                          COL_OTHER: tl.constexpr):
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, out_dtype: tl.constexpr,
+                          COL_INPUT: tl.constexpr, COL_OTHER: tl.constexpr):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -492,10 +491,8 @@ def test_async_dot_blackwell(device):
         acc_init = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         # async load a and b into SMEM
-        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1),
-                                      order=[1, 0])  #todo: remove `order` when we have layout propagation
-        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1),
-                                      order=[1, 0])  #todo: remove `order` when we have layout propagation
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
         a_smem = tlx.local_view(buf_alloc_a, 0)
         b_smem = tlx.local_view(buf_alloc_b, 0)
         tlx.async_load(a_ptrs, a_smem)
@@ -527,30 +524,27 @@ def test_async_dot_blackwell(device):
 
     torch.manual_seed(0)
     M, N, K = (64, 64, 32)
-    x = torch.randn((M, K), device=device, dtype=torch.float16)  # noqa: F841
-    y = torch.randn((K, N), device=device, dtype=torch.float16)  # noqa: F841
-    z = torch.zeros((M, N), device=device, dtype=torch.float16)  # noqa: F841
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {  # noqa: F841
-        'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32, 'COL_INPUT': 0,
-        'COL_OTHER': 1
-    }
-    # kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-    #                                    z.stride(1), **kern_kwargs)
+    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'out_dtype': tl.float32, 'COL_INPUT': 0, 'COL_OTHER': 0}
+    kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
+                                       z.stride(1), **kern_kwargs)
 
-    # ttgir = kernel.asm["ttgir"]
-    # assert ttgir.count("ttg.async_copy_global_to_local") == 2
-    # assert ttgir.count("ttng.tc_gen5_mma") == 2
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttg.async_copy_global_to_local") == 2
+    assert ttgir.count("ttng.tc_gen5_mma") == 2
 
-    # ptx = kernel.asm["ptx"]
-    # assert ptx.count("tcgen05.alloc") == 1
-    # assert ptx.count("tcgen05.wait") == 2
-    # assert ptx.count("tcgen05.commit") == 2
-    # assert ptx.count("mbarrier.try_wait") == 2
-    # assert ptx.count("tcgen05.dealloc") == 1
+    ptx = kernel.asm["ptx"]
+    assert ptx.count("tcgen05.alloc") == 1
+    assert ptx.count("tcgen05.wait") == 2
+    assert ptx.count("tcgen05.commit") == 2
+    assert ptx.count("mbarrier.try_wait") == 2
+    assert ptx.count("tcgen05.dealloc") == 1
 
-    # ref_out = torch.matmul(x, y) + torch.matmul(x, y)
-    # torch.testing.assert_close(z, ref_out)
+    ref_out = torch.matmul(x, y) + torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
 
 
 @triton.jit
