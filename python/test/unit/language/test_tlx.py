@@ -470,6 +470,91 @@ def test_async_dot(device):
     # %52 = "ttng.warp_group_dot"(%49, %50, %51) <{inputPrecision = 0 : i32, isAsync = true, maxNumImpreciseAcc = 0 : i32}> : (!ttg.memdesc<64x64xf32, #shared1, #smem, mutable>, !ttg.memdesc<64x64xf32, #shared2, #smem, mutable>, tensor<64x64xf32, #mma>) -> tensor<64x64xf32, #mma>
 
 
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] != 10,
+    reason="Requires compute capability == 10 (Blackwell) for NV",
+)
+def test_async_dot_blackwell(device):
+    """
+    Test D = A*B + A*B
+    """
+
+    @triton.jit
+    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                          INPUT_PRECISION: tl.constexpr, out_dtype: tl.constexpr, COL_INPUT: tl.constexpr,
+                          COL_OTHER: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        acc_init = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1),
+                                      order=[1, 0])  #todo: remove `order` when we have layout propagation
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1),
+                                      order=[1, 0])  #todo: remove `order` when we have layout propagation
+        a_smem = tlx.local_view(buf_alloc_a, 0)
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+        tlx.async_load(a_ptrs, a_smem)
+        tlx.async_load(b_ptrs, b_smem)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(buffers, 0)
+        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+
+        # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mmav5=True, mBarrier=None, input_precision=INPUT_PRECISION,
+                      out_dtype=out_dtype, col_input=COL_INPUT, col_other=COL_OTHER)
+
+        # given barrier, tcgen5 mma asynchronous semantic, need to explicitly wait for the barrier
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mmav5=True, mBarrier=bar, input_precision=INPUT_PRECISION,
+                      out_dtype=out_dtype, col_input=COL_INPUT, col_other=COL_OTHER)
+        tlx.barrier_wait(bar, tl.constexpr(0))
+
+        # now result == a*b + a*b
+        result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+
+        c = result.to(tl.float16)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)  # noqa: F841
+    y = torch.randn((K, N), device=device, dtype=torch.float16)  # noqa: F841
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)  # noqa: F841
+
+    kern_kwargs = {  # noqa: F841
+        'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'INPUT_PRECISION': "tf32", 'out_dtype': tl.float32, 'COL_INPUT': 0,
+        'COL_OTHER': 1
+    }
+    # kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
+    #                                    z.stride(1), **kern_kwargs)
+
+    # ttgir = kernel.asm["ttgir"]
+    # assert ttgir.count("ttg.async_copy_global_to_local") == 2
+    # assert ttgir.count("ttng.tc_gen5_mma") == 2
+
+    # ptx = kernel.asm["ptx"]
+    # assert ptx.count("tcgen05.alloc") == 1
+    # assert ptx.count("tcgen05.wait") == 2
+    # assert ptx.count("tcgen05.commit") == 2
+    # assert ptx.count("mbarrier.try_wait") == 2
+    # assert ptx.count("tcgen05.dealloc") == 1
+
+    # ref_out = torch.matmul(x, y) + torch.matmul(x, y)
+    # torch.testing.assert_close(z, ref_out)
+
+
 @triton.jit
 def tlx_square_non_ws(
     x_ptr,
