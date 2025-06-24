@@ -39,18 +39,14 @@ def tlx_attention_fwd(sm_scale, M,  #
 
     offset_y = off_z + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
+
     # initialize offsets
     offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M//2)
     offs_m1 = start_m * BLOCK_M + tl.arange(BLOCK_M//2, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    #offs_n = tl.arange(0, BLOCK_N)
 
-    m_i0 = tl.zeros([BLOCK_M//2], dtype=tl.float32) - float("inf")
-    l_i0 = tl.zeros([BLOCK_M//2], dtype=tl.float32) + 1.0
-    acc0 = tl.zeros([BLOCK_M//2, HEAD_DIM], dtype=tl.float32)
-
-    m_i1 = tl.zeros([BLOCK_M//2], dtype=tl.float32) - float("inf")
-    l_i1 = tl.zeros([BLOCK_M//2], dtype=tl.float32) + 1.0
-    acc1 = tl.zeros([BLOCK_M//2, HEAD_DIM], dtype=tl.float32)
+    cst_9 = tl.zeros([BLOCK_M//2], dtype=tl.float32) - float("inf")
+    cst_10 = tl.zeros([BLOCK_M//2], dtype=tl.float32) + 1.0
 
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
@@ -58,22 +54,49 @@ def tlx_attention_fwd(sm_scale, M,  #
     # allocate buffers for q0, q1
     buffers_q0 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float16, 1)
     buffers_q1 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float16, 1)
-    q0 = tlx.local_view(buffers_q0, 0)
-    q1 = tlx.local_view(buffers_q1, 0)
-    tlx.async_descriptor_load(desc_q, [], q0) # tma without mask
-    tlx.async_descriptor_load(desc_q, [], q1)
-
-    # load q0, q1 via tlx
-    #q0 = desc_q.load([qo_offset_y, 0])
-    #q1 = desc_q.load([qo_offset_y + BLOCK_M//2, 0])
+    buffer_q0 = tlx.local_view(buffers_q0, 0)
+    buffer_q1 = tlx.local_view(buffers_q1, 0)
+    tlx.async_descriptor_load(desc_q, [qo_offset_y, 0], buffer_q0) # tma without mask
+    tlx.async_descriptor_load(desc_q, [qo_offset_y + BLOCK_M//2], buffer_q1)
 
     # allocate NUM_STAGES buffers for k, v
-    buffers_k = tlx.local_alloc((BLOCK_N, HEAD_DIM), tl.float16, NUM_STAGES)
-    buffers_v = tlx.local_alloc((BLOCK_N, HEAD_DIM), tl.float16, NUM_STAGES)
+    buffer_23 = tlx.local_alloc((BLOCK_N, HEAD_DIM), tl.float16, NUM_STAGES) # k
+    buffer_32 = tlx.local_alloc((BLOCK_N, HEAD_DIM), tl.float16, NUM_STAGES) # v
+    buffer_63 = tlx.local_alloc((BLOCK_M//2), tl.float16, 3) # m_i
+    buffer_73 = tlx.local_alloc((BLOCK_M//2), tl.float16, 3)
+    buffer_83 = tlx.local_alloc((BLOCK_M//2), tl.float16, 1)
+    buffer_84 = tlx.local_alloc((BLOCK_M//2), tl.float16, 1)
+    buffer_85 = tlx.local_alloc((BLOCK_M//2), tl.float16, 1)
+    buffer_86 = tlx.local_alloc((BLOCK_M//2), tl.float16, 1)
+
+    # allocate tmem
+    result = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
+    result_2 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
+    result_3 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
+    result_4 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
 
     # allocate barriers for channels
+    barrier_24 = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
+    barrier_27 = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
+    barrier_33 = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
+    barrier_36 = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
+    barrier_39 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_41 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_43 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_45 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_47 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_49 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_51 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_53 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_55 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_57 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_59 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_61 = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    barrier_64 = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    barrier_65 = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    barrier_74 = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    barrier_75 = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
 
-    # warpspec
     # causal = False
     lo, hi = 0, N_CTX
     with tlx.async_tasks():
@@ -163,21 +186,21 @@ def tlx_attention_fwd(sm_scale, M,  #
            # dot0_slice0
            view_1 = tlx.local_view(barrier_24, 0)
            view_2 = tlx.local_view(barrier_27, 0)
-           view_3 = tlx.local_view(buffer_23, 0)
+           view_3 = tlx.local_view(buffer_23, 0) # k
            view_4 = tlx.trans(view_3)
            tlx.barrier_wait(view_2, 0)
            view_5 = tlx.local_view(barrier_41, 0)
            tlx.barrier_wait(view_5, 0)
            view_6 = tlx.local_view(result_3, 0)
            # TODO: support pred and multiple barriers
+           # dot0_slice1: q0 . k
            view_7 = tlx.local_view(barrier_39, 0)
-           tlx.async_dot(buffer_14, view_4, view_6, mmav5=True, useD=False, pred=True, view_1, view_7)
+           tlx.async_dot(buffer_q0, view_4, view_6, mmav5=True, useD=False, pred=True, view_1, view_7)
            view_8 = tlx.local_view(barrier_53, 0)
            tlx.barrier_wait(view_8, 0) # has predicate?
-           # dot0_slice1
            view_9 = tlx.local_view(result_4, 0)
            view_10 = tlx.local_view(barrier_51, 0)
-           tlx.async_dot(buffer_18, view_4, view_9, mmav5=True, useD=False, pred=True, view_1, view_10)
+           tlx.async_dot(buffer_q1, view_4, view_9, mmav5=True, useD=False, pred=True, view_1, view_10)
 
            arg65 = arg66 = arg67 = 0
            for start_n in tl.range(lo, hi, BLOCK_N):
@@ -205,7 +228,7 @@ def tlx_attention_fwd(sm_scale, M,  #
                view_21 = tlx.trans(view_20)
                tlx.barrier_wait(view_19, val_132, start_n < val_121)
                tlx.barrier_wait(view_5, arg67 ^ 1, start_n < val_121)
-               tlx.async_dot(buffer_14, view_21, view_6, mmav5=True, useD=False, pred=start_n < val_121, view_18, view_7)
+               tlx.async_dot(buffer_q0, view_21, view_6, mmav5=True, useD=False, pred=start_n < val_121, view_18, view_7)
                view_22 = tlx.reinterpret(view_9)
                view_23 = tlx.local_view(barrier_55, 0)
                tlx.barrier_wait(view_23, arg67 ^ 1)
@@ -216,7 +239,7 @@ def tlx_attention_fwd(sm_scale, M,  #
                tlx.async_dot(view_22, view_13, view_24, mmav5=True, useD=True, pred=True, view_11, view_25, barrier_59)
                tlx.barrier_wait(view_8, arg67 ^ 1, start_n < val_121)
                # dot0_slice1_iter_i+1
-               tlx.async_dot(barrier_18, view_21, view_9, mmav5=True, useD=False, pred=start_n < val_121, view_18, view_10)
+               tlx.async_dot(buffer_q1, view_21, view_9, mmav5=True, useD=False, pred=start_n < val_121, view_18, view_10)
 
                # update arg65/arg66/arg67
                arg65 = val_131
@@ -229,19 +252,19 @@ def tlx_attention_fwd(sm_scale, M,  #
            view_2 = tlx.local_view(barrier_27, 0)
            tlx.barrier_expect_bytes(view_2, 32768)
            view_3 = tlx.local_view(buffer_23, 0)
-           tlx.async_descriptor_load(arg9, view_3, [val_5, 0], view_2)
+           tlx.async_descriptor_load(desc_k, view_3, [offset_y, 0], view_2)
 
            view_4 = tlx.local_view(barrier_24, 1)
            tlx.barrier_wait(view_4, 0, pred=hi > 128)
            view_5 = tlx.local_view(barrier_27, 1)
            tlx.barrier_expect_bytes(view_5, 32768)
            view_6 = tlx.local_view(buffer_23, 1)
-           tlx.async_descriptor_load(arg9, view_6, [val_5 + 128, 0], view_5, pred=hi > 128)
+           tlx.async_descriptor_load(desc_k, view_6, [offset_y + 128, 0], view_5, pred=hi > 128)
            # load k_iter_0, k_iter_1
-           arg65 = val_5 + 128
+           arg65 = offset_y + 128
            arg66 = 1
            arg67 = arg68 = arg69 = 0
-           arg70 = val_5
+           arg70 = offset_y
            for start_n in tl.range(lo, hi, BLOCK_N):
                start_n = tl.multiple_of(start_n, BLOCK_N)
                val_126 = hi - 256
@@ -251,7 +274,7 @@ def tlx_attention_fwd(sm_scale, M,  #
                view_8 = tlx.local_view(barrier_36, arg68)
                tlx.barrier_expect_bytes(view_8, 32768)
                view_9 = tlx.local_view(buffer_32, arg68)
-               tlx.async_descriptor_load(arg14, view_9, [arg70, 0], view_8)
+               tlx.async_descriptor_load(desc_v, view_9, [arg70, 0], view_8)
 
                # load k_iter_i+2 with predicate
                val_132 = arg68 + 1
@@ -266,7 +289,7 @@ def tlx_attention_fwd(sm_scale, M,  #
                view_11 = tlx.local_view(barrier_27, val_141)
                tlx.barrier_expect_bytes(view_11, 32768)
                view_12 = tlx.local_view(buffer_23, val_141)
-               tlx.async_descriptor_load(arg9, view_12, [val_137, 0], view_11, pred=start_n < val_126)
+               tlx.async_descriptor_load(desc_k, view_12, [val_137, 0], view_11, pred=start_n < val_126)
 
                # update args
                arg70 = arg65
@@ -280,7 +303,6 @@ def tlx_attention_fwd(sm_scale, M,  #
            arg65 = cst_10
            arg66 = cst_9
            arg67 = arg68 = arg69 = 0
-           qk_scale = val_13
            for start_n in tl.range(lo, hi, BLOCK_N):
                view_1 = tlx.local_view(barrier_39, 0)
                tlx.barrier_wait(view_1, arg67)
@@ -325,7 +347,6 @@ def tlx_attention_fwd(sm_scale, M,  #
            arg65 = cst_10
            arg66 = cst_9
            arg67 = arg68 = arg69 = 0
-           qk_scale = val_13
            for start_n in tl.range(lo, hi, BLOCK_N):
                view_1 = tlx.local_view(barrier_51, 0)
                tlx.barrier_wait(view_1, arg67)
@@ -373,7 +394,7 @@ def tlx_attention_fwd(sm_scale, M,  #
     val_93 = tlx.local_load(buffer_83)
 
     val_95 = val_93 + tl.math.log2(val_91)
-    m_ptrs = arg1 + val_1 * arg24 + val_10
+    m_ptrs = M + val_1 * N_CTX + offs_m0
     tl.store(m_ptrs, val_95)
     view_1 = tlx.local_view(result_2, 0)
     result_5 = tlx.local_load(view_1, tlx.storage_kind.tmem)
@@ -381,11 +402,11 @@ def tlx_attention_fwd(sm_scale, M,  #
     acc = val_102.to(tl.float16)
     buffer_104 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float16, 1)
     # fence_async_shared
-    async_descriptor_store(arg19, buffer_104, [val_7, 0])
+    async_descriptor_store(desc_o, buffer_104, [val_7, 0])
     # tma_store_wait
 
     val_107 = val_90 + tl.math.log2(val_88)
-    m_ptrs = arg1 + val_1 * arg24 + val_12
+    m_ptrs = M + val_1 * N_CTX + offs_m1
     tl.store(m_ptrs, val_107)
     view_2 = tlx.local_view(result, 0)
     result_6 = tlx.local_load(view_2, tlx.storage_kind.tmem)
@@ -393,6 +414,6 @@ def tlx_attention_fwd(sm_scale, M,  #
     acc = val_111.to(tl.float16)
     buffer_113 = tlx.local_alloc((BLOCK_M//2, HEAD_DIM), tl.float16, 1)
     # fence_async_shared
-    async_descriptor_store(arg19, buffer_113, [val_17, 0])
+    async_descriptor_store(desc_o, buffer_113, [val_17, 0])
     # tma_store_wait
 
