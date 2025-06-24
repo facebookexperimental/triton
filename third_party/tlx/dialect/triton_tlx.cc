@@ -5,6 +5,7 @@
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace py = pybind11;
@@ -99,16 +100,24 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, shape, order, CTALayout, elemType, fp4Padded));
            })
       .def("make_nv_mma_encoding_attr",
-           [](TritonOpBuilder &self) {
+           [](TritonOpBuilder &self, Value opndA, Value opndAcc,
+              unsigned versionMajor, unsigned versionMinor,
+              unsigned moduleNumWarps) {
              auto context = self.getBuilder().getContext();
-             int versionMajor = 3;
-             int versionMinor = 0;
-             llvm::ArrayRef<unsigned> warpsPerCTA = {4, 1};
+             auto dtypeA =
+                 cast<ttg::TensorOrMemDesc>(opndA.getType()).getElementType();
+             auto retType = cast<RankedTensorType>(opndAcc.getType());
+             auto retShapePerCTA = retType.getShape();
+             Block *parentBlock = self.getBuilder().getInsertionBlock();
+             unsigned numWarps =
+                 ttg::maybeLookupNumWarps(parentBlock).value_or(moduleNumWarps);
+             auto instrShape = mmaVersionToInstrShape(
+                 versionMajor, retShapePerCTA, dtypeA, numWarps);
+             // Default to row partitioning for now. Should be smarter.
+             SmallVector<unsigned, 2> warpsPerCTA = {numWarps, 1};
              std::vector<unsigned> CTAsPerCGA = {1, 1};
              std::vector<unsigned> CTASplitNum = {1, 1};
              std::vector<unsigned> CTAOrder = {1, 0};
-             llvm::ArrayRef<unsigned> instrShape = {16, 64, 8};
-
              auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
                                                       CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
