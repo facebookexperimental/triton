@@ -115,9 +115,9 @@ void init_triton_tlx_ir(py::module &&m) {
                  versionMajor, retShapePerCTA, dtypeA, numWarps);
              // Default to row partitioning for now. Should be smarter.
              SmallVector<unsigned, 2> warpsPerCTA = {numWarps, 1};
-             std::vector<unsigned> CTAsPerCGA = {1, 1};
-             std::vector<unsigned> CTASplitNum = {1, 1};
-             std::vector<unsigned> CTAOrder = {1, 0};
+             SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
+             SmallVector<unsigned, 2> CTASplitNum = {1, 1};
+             SmallVector<unsigned, 2> CTAOrder = {1, 0};
              auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
                                                       CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
