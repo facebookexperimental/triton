@@ -34,8 +34,7 @@ static Value createThreadIdOp(OpBuilder &builder, Location loc) {
 
 // Lower to use GetCanonicalWarpIdOp.
 // In Hopper, each task is a warpgroup consisting of 4 warps.
-static const int WARPS_PER_TASK = 4;
-static const int THREADS_PER_TASK = 128;
+static const int THREADS_PER_WARP = 32;
 
 Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
                           bool emptyBarrier) {
@@ -115,7 +114,6 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                           int numConsumerGroups) {
   SmallVector<Operation *> deprecatedOps;
   SmallVector<Operation *> deprecatedTokenOps;
-  DenseSet<Operation *> warpSpecOps;
   DenseMap<Operation *, Value> tokenToFull;
   DenseMap<Operation *, Value> tokenToEmpty;
   parentOp->walk([&](ttnvws::CreateTokenOp createTokenOp) {
@@ -146,9 +144,50 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     tokenToFull[createTokenOp.getOperation()] = bufferFullArray;
     tokenToEmpty[createTokenOp.getOperation()] = bufferEmptyArray;
 
-    unsigned bufferFullCount =
-        loadType == ttnvws::TokenLoadType::TMALoadOp ? 1 : THREADS_PER_TASK;
-    unsigned bufferEmptyCount = THREADS_PER_TASK;
+    // Need to check number of warps here. FullBarrier is used for
+    // ProducerCommit and ConsumerWait, EmptyBarrier is used for ProducerAcquire
+    // and ConsumerRelease. Need to check number of warps for the partition
+    // containing ProducerCommit and ConsumerRelease. What if a token has
+    // multiple producers or consumers? Check if num_warps agree.
+    unsigned producerWarps = 0, consumerWarps = 0;
+    SmallVector<Operation *> usersForToken;
+    for (OpOperand &use : createTokenOp.getResult().getUses()) {
+      Operation *user = use.getOwner();
+      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+        unsigned opndNum = use.getOperandNumber();
+        // Handle the regions. Trace uses of the argument corresponding to the
+        // captured value.
+        for (Region *region : wsOp.getPartitionRegions()) {
+          LDBG("-- region " << region->getNumArguments());
+          auto tArg = region->getArgument(opndNum);
+          for (Operation *tUser : tArg.getUsers()) {
+            // Use of TokenOp via capture of warp_specialize.
+            usersForToken.push_back(tUser);
+          }
+        }
+      } else {
+        usersForToken.push_back(user);
+      }
+    }
+    for (Operation *user : usersForToken) {
+      if (dyn_cast<ttnvws::ProducerCommitOp>(user) ||
+          dyn_cast<ttnvws::ProducerAcquireOp>(user)) {
+        auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
+        assert(producerWarps == 0 || producerWarps == nWarps);
+        producerWarps = nWarps;
+      } else if (dyn_cast<ttnvws::ConsumerReleaseOp>(user) ||
+                 dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
+        auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
+        assert(consumerWarps == 0 || consumerWarps == nWarps);
+        consumerWarps = nWarps;
+      }
+    }
+
+    // Full barrier is for ProducerCommit and ConsumerWait.
+    unsigned bufferFullCount = loadType == ttnvws::TokenLoadType::TMALoadOp
+                                   ? 1
+                                   : THREADS_PER_WARP * producerWarps;
+    unsigned bufferEmptyCount = THREADS_PER_WARP * consumerWarps;
     for (unsigned i = 0; i < createTokenOp.getNumBuffers(); i++) {
       Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
       Value barrierFullView = builder.create<ttg::MemDescSubviewOp>(
@@ -219,28 +258,10 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
 
     // Process token users: ProducerAcquireOp, ProducerCommitOp, ConsumerWaitOp,
     // and ConsumerReleaseOp.
-    for (OpOperand &use : createTokenOp.getResult().getUses()) {
-      Operation *user = use.getOwner();
-      auto loc = user->getLoc();
+    for (Operation *user : usersForToken) {
       builder.setInsertionPoint(user);
-      bool handled = handleOneUser(user);
-      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
-        unsigned opndNum = use.getOperandNumber();
-        // Handle the regions. Trace uses of the argument corresponding to the
-        // captured value.
-        for (Region *region : wsOp.getPartitionRegions()) {
-          LDBG("-- region " << region->getNumArguments());
-          auto tArg = region->getArgument(opndNum);
-          for (Operation *tUser : tArg.getUsers()) {
-            builder.setInsertionPoint(tUser);
-            // Use of TokenOp via capture of warp_specialize.
-            handleOneUser(tUser);
-          }
-        }
-        warpSpecOps.insert(user);
-      } else if (!handled) {
-        llvm_unreachable("Unexpected user of token");
-      }
+      auto loc = user->getLoc();
+      handleOneUser(user);
     }
 
     deprecatedTokenOps.push_back(createTokenOp);
