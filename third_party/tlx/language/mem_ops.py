@@ -250,9 +250,7 @@ def async_descriptor_load(
     assert isinstance(desc, tl.tensor_descriptor_base)
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-
-    # Requires a row-major layout for TMA only supports continuous memory access
-    result_handle = require_nv_mma_shared_layout(result, [1, 0], _builder)
+    result_handle = require_nv_mma_shared_layout(result, _builder)
     offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
     cache = _str_to_load_cache_modifier(cache_modifier)
     eviction = _str_to_eviction_policy(eviction_policy)
@@ -269,8 +267,6 @@ def async_descriptor_store(
     assert isinstance(desc, tl.tensor_descriptor_base)
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-
-    # Requires a row-major layout for TMA only supports continuous memory access
-    source_handle = require_nv_mma_shared_layout(source, [1, 0], _builder)
+    source_handle = require_nv_mma_shared_layout(source, _builder)
     offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
     _builder.create_async_TMA_store(desc.handle, offsets, source_handle)
