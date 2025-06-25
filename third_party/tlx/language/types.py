@@ -157,17 +157,34 @@ class buffered_tensor(tl.base_value):
         )
 
 
-class mbarriers(buffered_tensor):
+class buffered_tensors(tl.base_value):
     """
-    Define mbarrier type derived from buffered_tensor to support barrier specific operations/validations
+    Define a list of buffered_tensor
+    """
+
+    def __init__(self, base_tensor : buffered_tensor, num : tl.constexpr):
+        self.base_tensor = base_tensor
+        self.num = num
+
+
+class mbarrier(buffered_tensor):
+    """
+    Define a mbarrier object
     """
 
     def __init__(self, handle):
-        # Temporarily use 1, as the shape must be a power of 2.
-        # TODO: use the actual barrier count to compute shape for precise boundary checks.
         block_type = tl.block_type(tl.int64, [1])
         super().__init__(handle, block_type, storage_kind.smem)
         pass
+
+class mbarriers(tl.base_value):
+    """
+    Define a list of mbarrier
+    """
+
+    def __init__(self, base_barrier : mbarrier, num : tl.constexpr):
+        self.base_tensor = base_barrier
+        self.num = num
 
 
 class async_token(tl.base_value):

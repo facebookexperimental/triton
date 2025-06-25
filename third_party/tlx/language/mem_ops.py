@@ -40,7 +40,7 @@ def local_alloc(
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     layout: Optional[tlx.shared_layout_encoding] = None,
     _builder=None,
-) -> tlx.buffered_tensor:
+) -> tlx.buffered_tensors:
     """
     Allocates buffer in shared memory and return a view of the buffer.
     """
@@ -52,7 +52,6 @@ def local_alloc(
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._unwrap_if_constexpr(dtype)
     elem_type = dtype.to_ir(_builder)
-    block_type = tl.block_type(dtype, full_shape)
     if layout is None:
         if storage == tlx.storage_kind.smem:
             layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
@@ -82,34 +81,42 @@ def local_alloc(
     else:
         tensor_handle = _builder.create_tmem_alloc(full_shape, elem_type, layout_handle)
 
-    return tlx.buffered_tensor(
+    block_type = tl.block_type(dtype, unwrapped_shape)
+    base_tensor = tlx.buffered_tensor(
         tensor_handle,
         block_type,
         storage,
         layout,
     )
 
+    return tlx.buffered_tensors(base_tensor, num)
+
 
 @tl.builtin
 def local_view(
-    local_allocated_buffers: tlx.buffered_tensor,
+    local_allocated_buffers: tlx.buffered_tensors | tlx.mbarriers,
     buffer_idx: int,
     _builder=None,
-) -> tlx.buffered_tensor:
+) -> tlx.buffered_tensor | tlx.mbarrier:
     """
     Returns a subview of the buffer.
     """
     buffer_idx = _convert_elem_to_ir_value(_builder, buffer_idx, require_i64=False)
-    buffer_type = local_allocated_buffers.type
-    # A subview of a one-dimensional buffer is still one-dimensional.
-    view_shape = (buffer_type.shape[1:] if len(buffer_type.shape) > 1 else buffer_type.shape)
-    view_type = tl.block_type(buffer_type.element_ty, view_shape)
-    return tlx.buffered_tensor(
-        _builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx),
-        view_type,
-        local_allocated_buffers.storage,
-        local_allocated_buffers.layout,
-    )
+    base_tensor = local_allocated_buffers.base_tensor
+    view_shape = base_tensor.shape
+    view_type = tl.block_type(base_tensor.type.element_ty, view_shape)
+    view_handle = _builder.create_memdesc_subview(base_tensor.handle, buffer_idx)
+    if isinstance(local_allocated_buffers, tlx.mbarriers):
+        return tlx.mbarrier(
+            view_handle,
+        )
+    else:
+        return tlx.buffered_tensor(
+            view_handle,
+            view_type,
+            base_tensor.storage,
+            base_tensor.layout,
+        )
 
 
 @tl.builtin
