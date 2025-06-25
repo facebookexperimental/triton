@@ -1,4 +1,3 @@
-
 import torch
 
 import triton
@@ -19,8 +18,9 @@ def is_hip_cdna2():
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'NUM_STAGES':3},
-                      num_warps=8),
+        triton.Config(
+            {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'NUM_STAGES': 3},
+            num_warps=8),
     ]
 
 
@@ -43,21 +43,19 @@ def get_hip_autotune_config():
             num_warps=4, num_stages=2),
     ]
 
+
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def matmul_kernel_pipelined_hopper(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,  #
-    stride_bk, stride_bn,  #
-    stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    NUM_STAGES: tl.constexpr  #
-):
+def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
+                                   stride_bk, stride_bn,  #
+                                   stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                   BLOCK_SIZE_K: tl.constexpr,  #
+                                   GROUP_SIZE_M: tl.constexpr,  #
+                                   NUM_STAGES: tl.constexpr  #
+                                   ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -109,7 +107,7 @@ def matmul_kernel_pipelined_hopper(
         a_next = tlx.local_view(buffers_A, i % NUM_STAGES)
         b_next = tlx.local_view(buffers_B, i % NUM_STAGES)
         # wait for the previous MMA using this buffer to complete
-        acc = tlx.async_dot_wait(NUM_STAGES-1, acc)
+        acc = tlx.async_dot_wait(NUM_STAGES - 1, acc)
         # prefetch
         token_a = tlx.async_load(a_ptrs, a_next, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
         token_b = tlx.async_load(b_ptrs, b_next, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
@@ -126,7 +124,6 @@ def matmul_kernel_pipelined_hopper(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
-
 
 
 def matmul(a, b):
@@ -148,6 +145,7 @@ def matmul(a, b):
     )
     return c
 
+
 torch.manual_seed(0)
 a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
 b = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
@@ -162,7 +160,6 @@ else:
     print("❌ Triton and Torch differ")
 
 TORCH_HAS_FP8 = False
-
 
 # %%
 # Benchmark

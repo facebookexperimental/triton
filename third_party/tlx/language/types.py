@@ -105,6 +105,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
 
+
 class storage_kind(enum.Enum):
     smem = "smem"
     tmem = "tmem"
@@ -162,7 +163,7 @@ class buffered_tensors(tl.base_value):
     Define a list of buffered_tensor
     """
 
-    def __init__(self, base_tensor : buffered_tensor, num : tl.constexpr):
+    def __init__(self, base_tensor: buffered_tensor, num: tl.constexpr):
         self.base_tensor = base_tensor
         self.num = num
 
@@ -177,12 +178,13 @@ class mbarrier(buffered_tensor):
         super().__init__(handle, block_type, storage_kind.smem)
         pass
 
+
 class mbarriers(tl.base_value):
     """
     Define a list of mbarrier
     """
 
-    def __init__(self, base_barrier : mbarrier, num : tl.constexpr):
+    def __init__(self, base_barrier: mbarrier, num: tl.constexpr):
         self.base_tensor = base_barrier
         self.num = num
 

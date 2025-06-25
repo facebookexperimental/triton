@@ -107,9 +107,7 @@ def local_view(
     view_type = tl.block_type(base_tensor.type.element_ty, view_shape)
     view_handle = _builder.create_memdesc_subview(base_tensor.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarriers):
-        return tlx.mbarrier(
-            view_handle,
-        )
+        return tlx.mbarrier(view_handle, )
     else:
         return tlx.buffered_tensor(
             view_handle,
