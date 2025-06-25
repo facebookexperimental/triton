@@ -64,11 +64,8 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     )
 
     # allocate NUM_STAGES buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_STAGES,
-                                order=[1, 0])  #todo: remove `order` when we have layout propagation
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_STAGES,
-                                order=[1, 0])  #todo: remove `order` when we have layout propagation
-
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_STAGES)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_STAGES)
     # allocate barriers
     dot_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
     load_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
@@ -104,8 +101,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
         # issue the async mma "with `phase`"
         dot_bar = tlx.local_view(dot_bars, buf)
         # mmav5 can take A and B from SMEM, and accumulate result into TMEM
-        tlx.async_dot(a_k, b_k, acc_tmem, mmav5=True, mBarrier=dot_bar, input_precision='tf32', out_dtype=tl.float32,
-                      col_input=0, col_other=1)
+        tlx.async_dot(a_k, b_k, acc_tmem, mBarrier=dot_bar, input_precision='tf32', out_dtype=tl.float32)
 
         # prefetch for i-th iteration, i.e, NUM_STAGES - 1 ahead
         i = k + NUM_STAGES - 1
@@ -141,8 +137,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     c = result.to(tl.float16)
 
     # store the result to SMEM to prepare for TMA store (TMEM -> GMEM)
-    c_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1),
-                                order=[1, 0])  #todo: remove `order` when we have layout propagation
+    c_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1))
     c_smem = tlx.local_view(c_buffers, 0)
     tlx.local_store(c_smem, c)
     tlx.async_descriptor_store(desc_c, c_smem, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N])
