@@ -479,8 +479,7 @@ def test_async_dot_blackwell(device):
 
     @triton.jit
     def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, out_dtype: tl.constexpr,
-                          COL_INPUT: tl.constexpr, COL_OTHER: tl.constexpr):
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, OUT_DTYPE: tl.constexpr):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -505,14 +504,12 @@ def test_async_dot_blackwell(device):
         tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
 
         # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
-        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=None, input_precision=INPUT_PRECISION,
-                      out_dtype=out_dtype)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=None, out_dtype=OUT_DTYPE)
 
         # given barrier, tcgen5 mma asynchronous semantic, need to explicitly wait for the barrier
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
-        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=bar, input_precision=INPUT_PRECISION,
-                      out_dtype=out_dtype)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=bar, out_dtype=OUT_DTYPE)
         tlx.barrier_wait(bar, tl.constexpr(0))
 
         # now result == a*b + a*b
@@ -528,7 +525,7 @@ def test_async_dot_blackwell(device):
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'out_dtype': tl.float32, 'COL_INPUT': 0, 'COL_OTHER': 0}
+    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
     kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                        z.stride(1), **kern_kwargs)
 
