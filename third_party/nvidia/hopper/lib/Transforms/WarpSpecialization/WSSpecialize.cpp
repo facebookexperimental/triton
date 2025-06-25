@@ -446,7 +446,7 @@ static void groupTasksToRegion(
       numWarpsForTask[asyncTaskId] = 4; // FIXME: hard-code to 4
     } else {
       tasksToRegion[mmaTaskId].push_back(asyncTaskId);
-      numWarpsForTask[asyncTaskId] = 1;
+      numWarpsForTask[asyncTaskId] = 1; // FIXME: hard-code to 1
     }
   }
 }
