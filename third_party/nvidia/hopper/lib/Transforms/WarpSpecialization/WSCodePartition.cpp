@@ -904,6 +904,7 @@ void insertAsyncComm(
     triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
+    const SmallVector<Channel *> &orderedChannels,
     const DenseMap<Channel *, CommChannel> &tokenMap,
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
     const DenseMap<Channel *, Value> &bufferMap,
@@ -982,14 +983,16 @@ void insertAsyncComm(
   // dependent before using it.
   SmallVector<std::pair<Channel *, SmallVector<Channel *>>>
       orderedChannelsGroupedByConsumers;
-  for (auto kv : channelsGroupedByConsumers) {
-    if (kv.first->channelKind == DataChannelKind::SMEM) {
-      orderedChannelsGroupedByConsumers.push_back({kv.first, kv.second});
+  for (auto *key : orderedChannels) {
+    if (key->channelKind == DataChannelKind::SMEM) {
+      auto kv = channelsGroupedByConsumers.find(key);
+      orderedChannelsGroupedByConsumers.push_back({key, kv->second});
     }
   }
-  for (auto kv : channelsGroupedByConsumers) {
-    if (kv.first->channelKind == DataChannelKind::TMEM) {
-      orderedChannelsGroupedByConsumers.push_back({kv.first, kv.second});
+  for (auto *key : orderedChannels) {
+    if (key->channelKind == DataChannelKind::TMEM) {
+      auto kv = channelsGroupedByConsumers.find(key);
+      orderedChannelsGroupedByConsumers.push_back({key, kv->second});
     }
   }
 
@@ -1289,8 +1292,8 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
 
   // Step 8: add async communication ops (ProducerAcquire etc). Also lower
   // TMA loads.
-  insertAsyncComm(funcOp, channelsGroupedByConsumers, tokenMap, barrierAllocMap,
-                  bufferMap, copyOpMap, regionsWithChannels);
+  insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
+                  barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels);
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
