@@ -64,6 +64,14 @@ public:
       TlxPropagateLayoutPass>::TlxPropagateLayoutBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
+    // We can terminate early if we don't have a layout constraint.
+    WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
+      if (isa<tlx::RequireLayoutOp>(op))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (!walkResult.wasInterrupted())
+      return;
 
     PatternRewriter rewriter(&getContext());
     SymbolTableCollection symbolTable;
@@ -77,27 +85,25 @@ public:
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
-    getOperation()->walk([&](triton::FuncOp funcOp) {
-      WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
-        if (isa<tlx::RequireLayoutOp>(op))
-          return WalkResult::advance();
-
-        for (auto [i, result] : llvm::enumerate(op->getResults())) {
-          auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
-          if (!lattice)
-            llvm_unreachable("Lattice not found.");
-          if (lattice->getValue().isUninitialized())
-            continue;
-          if (auto origType = dyn_cast<gpu::MemDescType>(result.getType())) {
-            auto newType = gpu::MemDescType::get(
-                origType.getShape(), origType.getElementType(),
-                lattice->getValue().getLayoutEncoding(),
-                origType.getMemorySpace(), origType.getMutableMemory());
-            op->getResult(i).setType(newType);
-          }
-        }
+    funcOp.walk([&](mlir::Operation *op) {
+      if (isa<tlx::RequireLayoutOp>(op))
         return WalkResult::advance();
-      });
+
+      for (auto [i, result] : llvm::enumerate(op->getResults())) {
+        auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
+        if (!lattice)
+          llvm_unreachable("Lattice not found.");
+        if (lattice->getValue().isUninitialized())
+          continue;
+        if (auto origType = dyn_cast<gpu::MemDescType>(result.getType())) {
+          auto newType = gpu::MemDescType::get(
+              origType.getShape(), origType.getElementType(),
+              lattice->getValue().getLayoutEncoding(),
+              origType.getMemorySpace(), origType.getMutableMemory());
+          op->getResult(i).setType(newType);
+        }
+      }
+      return WalkResult::advance();
     });
   }
 
