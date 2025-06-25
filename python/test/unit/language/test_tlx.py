@@ -547,24 +547,24 @@ def tlx_square_ws(
     with tlx.async_tasks():
         with tlx.async_task("default"):
 
-            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+            tlx.barrier_wait(bar=b1, phase=1)
 
             # Placeholder block to do something
 
-            tlx.barrier_arrive(bar=b0)  # Release
+            # tlx.barrier_arrive(bar=b0)  # Release
 
         with tlx.async_task(num_warps=4):
 
-            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
+            # tlx.barrier_wait(bar=b0, phase=phase)  # Wait
 
             # Some arith ops TODO. add WS
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_elements
-            x = tl.load(x_ptr + offsets, mask=mask)
-            z = x * x
-            tl.store(z_ptr + offsets, z, mask=mask)
+            # offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            # mask = offsets < n_elements
+            # x = tl.load(x_ptr + offsets, mask=mask)
+            # z = x * x
+            # tl.store(z_ptr + offsets, z, mask=mask)
 
-            tlx.barrier_arrive(bar=b0)  # Wait
+            tlx.barrier_arrive(bar=b1, arrive_count=3)  # Wait
 
 
 def run_tlx_square(func, BLOCK_SIZE, device):
