@@ -442,8 +442,7 @@ def test_async_dot(device):
 
         # TODO. initialize values or async load
 
-        z = tlx.async_dot(a_smem, b_smem, input_precision=INPUT_PRECISION, out_dtype=out_dtype, col_input=COL_INPUT,
-                          col_other=COL_OTHER)
+        z = tlx.async_dot(a_smem, b_smem, input_precision=INPUT_PRECISION, out_dtype=out_dtype)
         z = tlx.async_dot_wait(tl.constexpr(0), z)
         tl.store(Zs, z)
 
@@ -509,14 +508,14 @@ def test_async_dot_blackwell(device):
         tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
 
         # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
-        tlx.async_dot(a_smem, b_smem, acc_tmem, mmav5=True, mBarrier=None, input_precision=INPUT_PRECISION,
-                      out_dtype=out_dtype, col_input=COL_INPUT, col_other=COL_OTHER)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=None, input_precision=INPUT_PRECISION,
+                      out_dtype=out_dtype)
 
         # given barrier, tcgen5 mma asynchronous semantic, need to explicitly wait for the barrier
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
-        tlx.async_dot(a_smem, b_smem, acc_tmem, mmav5=True, mBarrier=bar, input_precision=INPUT_PRECISION,
-                      out_dtype=out_dtype, col_input=COL_INPUT, col_other=COL_OTHER)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=bar, input_precision=INPUT_PRECISION,
+                      out_dtype=out_dtype)
         tlx.barrier_wait(bar, tl.constexpr(0))
 
         # now result == a*b + a*b
@@ -757,8 +756,7 @@ def test_descriptor_load(device):
     grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     # TODO: remove exception handling once layout propagation is implemented
-    with pytest.raises(RuntimeError) as _:
-        kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
-        assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
-        assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
-        torch.testing.assert_close(x, y)
+    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
+    torch.testing.assert_close(x, y)

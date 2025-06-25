@@ -1,42 +1,39 @@
 import triton.language.core as tl
-from triton import knobs
 import triton.language.semantic as semantic
 
 from . import types as tlx
 from .utility import cuda_parse_arch
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, order, _builder=None):
-    if not isinstance(x.layout, tlx.nv_mma_shared_layout_encoding):
-        # TODO. why do we need this class object?
-        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=order, elemType=x.dtype, numCTAsPerCGA=[1, 1],
-                                                   numCTASplit=[1, 1], numCTAOrder=[1, 1], fp4Padded=False)
-
-    layout_handle = _builder.make_nv_mma_shared_encoding_attr(
-        [int(x) for x in layout.shape],
-        layout.order,
-        layout.elemType.to_ir(_builder),
-        layout.numCTAsPerCGA,
-        layout.numCTASplit,
-        layout.numCTAOrder,
-        layout.fp4Padded,
-    )
-    return _builder.create_require_layout(x.handle, layout_handle)
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
+    assert isinstance(x.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
+    if isinstance(x.layout, tlx.swizzled_shared_layout_encoding):
+        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.layout.order, elemType=x.dtype,
+                                                   numCTAsPerCGA=[1, 1], numCTASplit=[1, 1], numCTAOrder=[1, 1],
+                                                   fp4Padded=False)
+        layout_handle = _builder.make_nv_mma_shared_encoding_attr(
+            [int(x) for x in layout.shape],
+            layout.order,
+            layout.elemType.to_ir(_builder),
+            layout.numCTAsPerCGA,
+            layout.numCTASplit,
+            layout.numCTAOrder,
+            layout.fp4Padded,
+        )
+        return _builder.create_require_layout(x.handle, layout_handle)
+    else:
+        assert isinstance(x.layout, tlx.nv_mma_shared_layout_encoding), "input must be a shared mma tensor"
+        return x.handle
 
 
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
-    input: tlx.buffered_tensor,
-    other: tlx.buffered_tensor,
-    acc=None,  # tl.tensor,
-    mmav5: bool = False,
+    A: tlx.buffered_tensor | tl.tensor,
+    B: tlx.buffered_tensor,
+    acc: tlx.buffered_tensor | tl.tensor | None = None,
     mBarrier=None,
     input_precision=None,
-    allow_tf32=None,
-    max_num_imprecise_acc=None,
-    col_input=0,
-    col_other=0,
     out_dtype=tl.float32,
     _builder=None,
 ) -> tl.tensor:
@@ -63,28 +60,38 @@ def async_dot(
     """
 
     # Perform dot_precheck shared by tl.dot
-    (input, other, acc_handle, input_precision, max_num_imprecise_acc,
-     ret_ty) = semantic.dot_precheck(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype,
-                                     _builder)
+    (A, B, acc_handle, input_precision, max_num_imprecise_acc,
+     ret_ty) = semantic.dot_precheck(A, B, acc, input_precision, None, None, out_dtype, _builder)
+
+    assert A.shape[0] >= 64, "M must be at least 64"
+    assert A.shape[1] >= 16, "K must be at least 16"
+    assert B.shape[1] >= 32, "N must be at least 32"
+
+    cuda_compute_capability = int(cuda_parse_arch(_builder.options.arch))
+    version = 5 if cuda_compute_capability >= 100 else 3
 
     # TODO. batched dot is not supported yet
-    input = require_nv_mma_shared_layout(input, [0, 1] if col_input else [1, 0], _builder)
-    other = require_nv_mma_shared_layout(other, [0, 1] if col_other else [1, 0], _builder)
+    if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.smem:
+        A_handle = require_nv_mma_shared_layout(A, _builder)
+    else:
+        # Registers or TMEM buffer do not need mma shared layout
+        A_handle = A.handle
 
-    if mmav5:
-        assert int(cuda_parse_arch(_builder.options.arch)) >= 100, "mmav5 is only supported on Blackwell and above"
-        output = _builder.create_tcgen5_dot(input, other, acc.handle, mBarrier.handle if mBarrier else None)
+    B_handle = require_nv_mma_shared_layout(B, _builder)
+
+    if version == 5:
+        assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
+        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, mBarrier.handle if mBarrier else None)
         return tlx.async_token(output)
-
-    acc = _builder.create_require_layout(acc_handle, _builder.make_nv_mma_encoding_attr())
-
-    _builder.create_fence_async_shared()
-
-    output = _builder.create_warp_group_dot(input, other, acc, input_precision, max_num_imprecise_acc, True)
-
-    # Release the mma layout for the output to conform to what the user expects
-    output = _builder.create_release_layout(output)
-    return tl.tensor(output, ret_ty)
+    else:
+        acc = _builder.create_require_layout(
+            acc_handle, _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
+                                                           _builder.options.num_warps))
+        output = _builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision,
+         max_num_imprecise_acc, True)
+        # Release the mma layout for the output to conform to what the user expects
+        output = _builder.create_release_layout(output)
+        return tl.tensor(output, ret_ty)
 
 
 @tl.builtin
