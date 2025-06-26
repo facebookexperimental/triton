@@ -539,7 +539,7 @@ def tlx_square_ws(
     block_start = pid * BLOCK_SIZE
 
     # mbarrier ops
-    bars = tlx.alloc_barriers(num_barriers=2)  # create
+    bars = tlx.alloc_barriers(num_barriers=2, arrive_count=128)  # create
     b0 = tlx.local_view(bars, 0)
     b1 = tlx.local_view(bars, 1)
 
@@ -564,7 +564,7 @@ def tlx_square_ws(
             # z = x * x
             # tl.store(z_ptr + offsets, z, mask=mask)
 
-            tlx.barrier_arrive(bar=b1, arrive_count=3)  # Wait
+            tlx.barrier_arrive(bar=b1)  # Wait
 
 
 def run_tlx_square(func, BLOCK_SIZE, device):
