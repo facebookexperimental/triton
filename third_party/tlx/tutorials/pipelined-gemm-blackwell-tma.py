@@ -11,7 +11,11 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}),
+        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K" : BK, "GROUP_SIZE_M" : 8, "NUM_STAGES" : s}) \
+        for BM in [128] \
+        for BN in [128, 256] \
+        for BK in [64,128] \
+        for s in ([2,4])
     ]
 
 
@@ -101,7 +105,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
         # issue the async mma "with `phase`"
         dot_bar = tlx.local_view(dot_bars, buf)
         # mmav5 can take A and B from SMEM, and accumulate result into TMEM
-        tlx.async_dot(a_k, b_k, acc_tmem, mBarrier=dot_bar, input_precision='tf32', out_dtype=tl.float32)
+        tlx.async_dot(a_k, b_k, acc_tmem, mBarrier=dot_bar, out_dtype=tl.float32)
 
         # prefetch for i-th iteration, i.e, NUM_STAGES - 1 ahead
         i = k + NUM_STAGES - 1
@@ -163,7 +167,6 @@ def matmul(a, b):
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
-        NUM_STAGES=4  #
     )
     return c
 
