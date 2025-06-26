@@ -1,4 +1,3 @@
-
 import torch
 
 import triton
@@ -19,8 +18,9 @@ def is_hip_cdna2():
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=0,
-                      num_warps=8),
+        triton.Config(
+            {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'NUM_STAGES': 3},
+            num_warps=8),
     ]
 
 
@@ -43,21 +43,19 @@ def get_hip_autotune_config():
             num_warps=4, num_stages=2),
     ]
 
+
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def matmul_kernel_tma_pipelined_hopper(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,  #
-    stride_bk, stride_bn,  #
-    stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    NUM_STAGES: tl.constexpr  #
-):
+def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
+                                   stride_bk, stride_bn,  #
+                                   stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                   BLOCK_SIZE_K: tl.constexpr,  #
+                                   GROUP_SIZE_M: tl.constexpr,  #
+                                   NUM_STAGES: tl.constexpr  #
+                                   ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -91,7 +89,8 @@ def matmul_kernel_tma_pipelined_hopper(
 
     # main K loop
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    # Disable auto-pipelining with num_stages=0
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=0):
         # identify the buffer index for the current iteration
         buf = k % NUM_STAGES
         a_k = tlx.local_view(buffers_A, buf)
@@ -108,7 +107,7 @@ def matmul_kernel_tma_pipelined_hopper(
         a_next = tlx.local_view(buffers_A, i % NUM_STAGES)
         b_next = tlx.local_view(buffers_B, i % NUM_STAGES)
         # wait for the previous MMA using this buffer to complete
-        acc = tlx.async_dot_wait(NUM_STAGES-1, acc)
+        acc = tlx.async_dot_wait(NUM_STAGES - 1, acc)
         # prefetch
         token_a = tlx.async_load(a_ptrs, a_next, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
         token_b = tlx.async_load(b_ptrs, b_next, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
@@ -127,7 +126,6 @@ def matmul_kernel_tma_pipelined_hopper(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-
 def matmul(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -138,15 +136,15 @@ def matmul(a, b):
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel_tma_pipelined_hopper[grid](
+    matmul_kernel_pipelined_hopper[grid](
         a, b, c,  #
         M, N, K,  #
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
-        NUM_STAGES=2  #
     )
     return c
+
 
 torch.manual_seed(0)
 a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
@@ -162,7 +160,6 @@ else:
     print("❌ Triton and Torch differ")
 
 TORCH_HAS_FP8 = False
-
 
 # %%
 # Benchmark
