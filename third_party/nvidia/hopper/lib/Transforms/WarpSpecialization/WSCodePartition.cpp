@@ -144,9 +144,17 @@ static void createChannel(Operation *producerOp, Operation *op,
           // When traversing Gen5MMA, we create channel for the accumulator.
           if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(producerOp)) {
             // Always use two buffers for TMEM channels.
+            // Hacky: TaskIdProp has tmem_load with extra taskId
+            SmallVector<int> tConsumers;
+            tConsumers.push_back(consumerTaskIds[0]);
             channels.push_back(std::make_unique<ttng::TmemDataChannel>(
-                producerTaskId, consumerTaskIds, tmemAllocOp, dotOp, userOp,
+                producerTaskId, tConsumers, tmemAllocOp, dotOp, userOp,
                 user.second, NUM_TMEM_BUFFERS));
+          }
+          if (auto tAllocOp = dyn_cast<ttg::LocalAllocOp>(producerOp)) {
+            channels.push_back(std::make_unique<Channel>(
+                producerTaskId, consumerTaskIds, userOp, user.second,
+                producerNumBuffers));
           }
         } else {
           channels.push_back(
@@ -194,6 +202,9 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
         auto opndA = dotOp.getA();
         producerOp = opndA.getDefiningOp();
         if (isa<ttng::TMEMAllocOp>(producerOp))
+          createChannel(producerOp, op, dom, channels, true /*opndA*/,
+                        producerNumBuffers);
+        if (isa<ttg::LocalAllocOp>(producerOp))
           createChannel(producerOp, op, dom, channels, true /*opndA*/,
                         producerNumBuffers);
       } else {
@@ -651,6 +662,7 @@ void createToken(
       if (!isa<tt::DescriptorLoadOp>(producerOp) ||
           !useGen5Barrier) { // isa<ttng::TCGen5MMAOp>(consumerOp)) {
         ttnvws::TokenLoadType tokenLoadType;
+        assert(copyOpMap.count(channel));
         auto copyOp = copyOpMap.find(channel)->second.first;
         if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
@@ -707,6 +719,23 @@ void createToken(
                      << "\n";
     }
   });
+}
+
+static ttg::LocalAllocOp hoistLocalAlloc(OpBuilder &builder,
+                                         ttg::LocalAllocOp oldAlloc,
+                                         int numBuffers) {
+  auto oldRetType = oldAlloc.getType();
+  auto allocDescType = cast<triton::gpu::MemDescType>(oldRetType);
+  SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
+                                oldRetType.getShape().end()};
+  if (numBuffers >= 1) {
+    shape.insert(shape.begin(), numBuffers);
+  }
+
+  Type memdescType = ttg::MemDescType::get(
+      shape, allocDescType.getElementType(), allocDescType.getEncoding(),
+      allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
+  return builder.create<ttg::LocalAllocOp>(oldAlloc.getLoc(), memdescType);
 }
 
 static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
@@ -772,6 +801,9 @@ DenseMap<Channel *, Value> createBuffer(
           static_cast<ttng::TmemDataChannel *>(channel);
       auto oldTMemAllocOp = tmemChannel->getAllocOp();
       buffer = createTMemAlloc(builder, oldTMemAllocOp, numBuffers);
+    } else if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
+      // Move LocalAlloc to the beginning of the function.
+      buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       // Get basic information from tensorType
