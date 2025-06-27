@@ -105,9 +105,12 @@ LogicalResult LayoutForwardPropagation::visitOperation(
   if (!isa<triton::gpu::MemDescSubviewOp>(op))
     return success();
 
+  auto isScalar = [](Type type) { return type.isIntOrIndexOrFloat(); };
   auto memDescSubviewOp = cast<triton::gpu::MemDescSubviewOp>(op);
-  for (const auto operandLattice : operands) {
-    for (auto [i, resultLattice] : llvm::enumerate(results)) {
+  for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
+    if (isScalar(op->getOperand(operandIdx).getType()))
+      continue;
+    for (auto resultLattice : results) {
       ChangeResult changed = resultLattice->meet(operandLattice->getValue());
       propagateIfChanged(resultLattice, changed);
     }
