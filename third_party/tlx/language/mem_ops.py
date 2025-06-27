@@ -47,6 +47,19 @@ def local_alloc(
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_builder.options.arch)
 
+    if not isinstance(num, tl.constexpr):
+        user_error = """
+`num` must be a constexpr without introducing any `ast.Assign` nodes,
+otherwise its value will be wrapped as `tensor.handle`.
+For example, following will fail because `num` will be promoted to tl.tensor by semantics.py
+in visit_Assign
+    num = tl.constexpr(2)
+    local_alloc(..., num=num)
+
+To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc(..., num=2)`
+        """
+        raise ValueError(user_error)
+
     unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
     unwrapped_num = tl._unwrap_if_constexpr(num)
     full_shape = [unwrapped_num] + unwrapped_shape
