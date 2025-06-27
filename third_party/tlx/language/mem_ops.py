@@ -1,4 +1,3 @@
-from inspect import unwrap
 import triton.language.core as tl
 from triton.language.semantic import (
     _convert_elem_to_ir_value,
@@ -37,7 +36,7 @@ def _create_tmem_compatible_tensor_layout_encoding(
 def local_alloc(
     shape: tuple,
     dtype: tl.dtype,
-    num,
+    num: tl.constexpr,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     layout: Optional[tlx.shared_layout_encoding] = None,
     _builder=None,
