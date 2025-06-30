@@ -43,6 +43,6 @@ def dtype_of(v, _builder=None) -> tl.dtype:
             dtype = dtype.element_ty
         return dtype
     elif isinstance(v, tl.tensor_descriptor_base):
-        return v.type.element_ty
+        return v.dtype
     else:
         raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
