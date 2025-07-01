@@ -85,8 +85,13 @@ public:
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
+    auto isScalar = [](Operation *op) {
+      return op->getResults().size() == 1 &&
+             op->getResultTypes()[0].isIntOrIndexOrFloat();
+    };
+
     funcOp.walk([&](mlir::Operation *op) {
-      if (isa<tlx::RequireLayoutOp>(op))
+      if (isa<tlx::RequireLayoutOp>(op) || isScalar(op))
         return WalkResult::advance();
 
       for (auto [i, result] : llvm::enumerate(op->getResults())) {
