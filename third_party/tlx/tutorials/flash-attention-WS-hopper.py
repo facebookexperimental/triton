@@ -28,8 +28,8 @@ def _host_descriptor_pre_hook(nargs):
 
 
 configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=3, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [128]\
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN, 'NUM_BUFFERS': 2, 'NUM_WARPS': 4}, num_stages=0, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
+    for BM in [64]\
     for BN in [64]\
     for w in [4]\
 ]
@@ -42,64 +42,151 @@ def _attn_fwd(sm_scale, M,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
               FP8_OUTPUT: tl.constexpr,  #
+              NUM_BUFFERS: tl.constexpr,  #
+              NUM_WARPS: tl.constexpr,  #
               ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
-    # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    # load scales
-    qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
-    # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
+    # allocate buffers
+    q_tiles = tlx.local_alloc((BLOCK_M, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS)
+    k_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS)
+    v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS)
 
+    # allocate barriers
+    q_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
 
+    with tlx.async_tasks():
+        # producer group
+        with tlx.async_task("default"):
+            # initialize offsets
+            start_m = tl.program_id(0)
+            off_hz = tl.program_id(1)
+            off_z = off_hz // H
+            off_h = off_hz % H
+            offset_y = off_z * (N_CTX * H) + off_h * N_CTX
+            qo_offset_y = offset_y + start_m * BLOCK_M
+            lo, hi = 0, N_CTX
+            kv_offset_y = offset_y + lo
 
-    lo, hi = 0, N_CTX
-    offsetk_y = offset_y + lo
-    offsetv_y = offset_y + lo
-    # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- compute qk ----
-        k = desc_k.load([offsetk_y, 0]).T
-        qk = tl.dot(q, k)
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-        qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        # -- compute correction factor
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_ij = tl.sum(p, 1)
-        # -- update output accumulator --
-        acc = acc * alpha[:, None]
-        # prepare p and v for the dot
-        v = desc_v.load([offsetv_y, 0])
-        p = p.to(tlx.dtype_of(desc_k))
-        # note that this non transposed v for FP8 is only supported on Blackwell
-        acc = tl.dot(p, v, acc)
-        # update m_i and l_i
-        # place this at the end of the loop to reduce register pressure
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-        offsetk_y += BLOCK_N
-        offsetv_y += BLOCK_N
+            # load q: it will stay in SRAM throughout
+            q_full = tlx.local_view(q_fulls, 0)
+            tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M * HEAD_DIM)  # float16
+            q_tile = tlx.local_view(q_tiles, 0)
+            tlx.async_descriptor_load(desc_q, q_tile, [qo_offset_y, 0], q_full)
 
-    # epilogue
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
-    desc_o.store([qo_offset_y, 0], acc.to(tlx.dtype_of(desc_o)))
+            # loop over loading k, v
+            kv_phase = 1
+            buf_id = 0
+            for start_n in tl.range(lo, hi, BLOCK_N):
+                # wait for the K buffer to be released by the consumer
+                k_empty = tlx.local_view(k_empties, buf_id)
+                tlx.barrier_wait(k_empty, kv_phase)
+
+                # load K
+                k_full = tlx.local_view(k_fulls, buf_id)
+                k_tile = tlx.local_view(k_tiles, buf_id)
+                tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * HEAD_DIM)  # float16
+                tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
+
+                # wait for the V buffer to be released by the consumer
+                v_empty = tlx.local_view(v_empties, buf_id)
+                tlx.barrier_wait(v_empty, kv_phase)
+                # load V
+                v_full = tlx.local_view(v_fulls, buf_id)
+                v_tile = tlx.local_view(v_tiles, buf_id)
+                tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * HEAD_DIM)  # float16
+                tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
+
+                kv_offset_y += BLOCK_N
+
+                # buffers in a row share the same phase
+                kv_phase =  kv_phase ^ 1 if (buf_id == NUM_BUFFERS - 1) else kv_phase
+                buf_id = 0 if (buf_id == NUM_BUFFERS - 1) else buf_id + 1
+
+        # consumer group
+        with tlx.async_task(num_warps=4, registers=256):
+            # initialize pointer to m and l
+            m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+            l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+            acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+            # load scales
+            qk_scale = sm_scale
+            qk_scale *= 1.44269504  # 1/log(2)
+            # wait for the Q buffer to be populated by the producer
+            q_full = tlx.local_view(q_fulls, 0)
+            tlx.barrier_wait(q_full, 0)
+            q_tile = tlx.local_view(q_tiles, 0)
+
+            lo, hi = 0, N_CTX
+            kv_phase = 0
+            buf_id = 0
+
+            # loop over k, v and update accumulator
+            for start_n in tl.range(lo, hi, BLOCK_N):
+                # wait for the K buffer to be populated by the producer
+                k_full = tlx.local_view(k_fulls, buf_id)
+                tlx.barrier_wait(k_full, kv_phase)
+                k_tile = tlx.local_view(k_tiles, buf_id)
+
+                # -- compute qk ----
+                k_tile = tlx.local_trans(k_tile)
+                qk = tlx.async_dot(q_tile, k_tile)
+                # wait for the MMA using to complete
+                qk = tlx.async_dot_wait(0, qk)
+                # release the K buffer
+                k_empty = tlx.local_view(k_empties, buf_id)
+                tlx.barrier_arrive(k_empty, 1)
+
+                m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+                qk = qk * qk_scale - m_ij[:, None]
+                p = tl.math.exp2(qk)
+                # -- compute correction factor
+                alpha = tl.math.exp2(m_i - m_ij)
+                l_ij = tl.sum(p, 1)
+                # -- update output accumulator --
+                acc = acc * alpha[:, None]
+                # prepare p and v for the dot
+                p = p.to(tlx.dtype_of(desc_k))
+
+                # wait for the V buffer to be populated by the producer
+                v_full = tlx.local_view(v_fulls, buf_id)
+                tlx.barrier_wait(v_full, kv_phase)
+                v_tile = tlx.local_view(v_tiles, buf_id)
+                acc = tlx.async_dot(p, v_tile, acc)
+                # wait for the MMA using to complete
+                acc = tlx.async_dot_wait(0, acc)
+                # release the V buffer
+                v_empty = tlx.local_view(v_empties, buf_id)
+                tlx.barrier_arrive(v_empty, 1)
+
+                # update m_i and l_i
+                # place this at the end of the loop to reduce register pressure
+                l_i = l_i * alpha + l_ij
+                m_i = m_ij
+
+                # buffers in a row share the same phase
+                kv_phase =  kv_phase ^ 1 if (buf_id == NUM_BUFFERS - 1) else kv_phase
+                buf_id = 0 if (buf_id == NUM_BUFFERS - 1) else buf_id + 1
+
+            # epilogue
+            start_m = tl.program_id(0)
+            off_hz = tl.program_id(1)
+            off_z = off_hz // H
+            off_h = off_hz % H
+            offset_y = off_z * (N_CTX * H) + off_h * N_CTX
+            qo_offset_y = offset_y + start_m * BLOCK_M
+            m_i += tl.math.log2(l_i)
+            acc = acc / l_i[:, None]
+            offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            m_ptrs = M + off_hz * N_CTX + offs_m
+            tl.store(m_ptrs, m_i)
+            desc_o.store([qo_offset_y, 0], acc.to(tlx.dtype_of(desc_o)))
+
 
 class _attention(torch.autograd.Function):
 
