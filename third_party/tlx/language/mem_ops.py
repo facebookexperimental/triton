@@ -260,7 +260,7 @@ def async_descriptor_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
     offsets: list[tl.tensor],
-    barrier: tlx.mbarriers,
+    barrier: tlx.mbarrier,
     cache_modifier: str = "",
     eviction_policy: str = "",
     _builder=None,

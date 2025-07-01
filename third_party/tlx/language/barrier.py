@@ -24,7 +24,7 @@ def alloc_barriers(
 
 @tl.builtin
 def barrier_expect_bytes(
-    bar: tlx.mbarriers,
+    bar: tlx.mbarrier,
     size: tl.constexpr,
     _builder=None,
 ) -> None:
