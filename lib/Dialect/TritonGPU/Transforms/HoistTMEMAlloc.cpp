@@ -393,7 +393,8 @@ struct HoistTMEMAlloc
 
   // check whether we should bail early due to using TLX
   bool shouldBailForTLX(ModuleOp &mod) const {
-    auto hasTLX = mod->getAttrOfType<BoolAttr>(tlx::AttrHasTLXOpsName);
+    auto hasTLX =
+        mod->getAttrOfType<BoolAttr>(tlx::AttrHasExplicitLocalMemAccessName);
     return hasTLX != nullptr && hasTLX.getValue() == true;
   }
 

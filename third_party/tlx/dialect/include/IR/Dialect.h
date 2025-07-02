@@ -18,6 +18,8 @@
 namespace mlir {
 namespace triton {
 namespace tlx {
+constexpr static char AttrHasExplicitLocalMemAccessName[] =
+    "tlx.has_explicit_local_mem_access";
 constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
 } // namespace tlx
 } // namespace triton

@@ -34,19 +34,25 @@ public:
       if (op->getDialect()->getNamespace() == tlxDialectName) {
         return WalkResult::interrupt();
       }
-      // Ops that should not be in TTIR unless introduced by TLX
-      if (isa<ttg::LocalLoadOp, ttg::LocalStoreOp, ttg::AsyncCommitGroupOp,
-              ttg::AsyncWaitOp, ttg::MemDescTransOp, ttng::FenceAsyncSharedOp,
-              ttng::WarpGroupDotOp, ttng::WarpGroupDotWaitOp,
-              ttng::TensorDescToTMAPtrOp, ttng::AsyncTMACopyGlobalToLocalOp,
-              ttng::AsyncTMACopyLocalToGlobalOp, ttng::TMEMAllocOp,
-              ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TCGen5MMAOp>(op)) {
-        return WalkResult::interrupt();
-      }
       return WalkResult::advance();
     });
-    if (!result.wasInterrupted()) {
-      // No TLX op found, do nothing.
+    auto hasTLXOps = result.wasInterrupted();
+
+    auto hasExplicitLocalMemAccess =
+        mod.walk([&](Operation *op) {
+             // Ops that should not be in TTIR unless introduced by TLX
+             if (isa<ttg::LocalLoadOp, ttg::LocalStoreOp,
+                     ttng::AsyncTMACopyGlobalToLocalOp,
+                     ttng::AsyncTMACopyLocalToGlobalOp, ttng::TMEMAllocOp,
+                     ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TCGen5MMAOp>(
+                     op)) {
+               return WalkResult::interrupt();
+             }
+             return WalkResult::advance();
+           })
+            .wasInterrupted();
+
+    if (!hasTLXOps && !hasExplicitLocalMemAccess) {
       return;
     }
 
@@ -57,7 +63,10 @@ public:
                  b.getI32IntegerAttr(threadsPerWarp));
     mod->setAttr(ttg::AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
     mod->setAttr(ttg::AttrTargetName, b.getStringAttr(this->target.getValue()));
-    mod->setAttr(AttrHasTLXOpsName, b.getBoolAttr(true));
+    if (hasTLXOps)
+      mod->setAttr(AttrHasTLXOpsName, b.getBoolAttr(true));
+    if (hasExplicitLocalMemAccess)
+      mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
   }
 };
 
