@@ -166,6 +166,7 @@ class buffered_tensors(tl.base_value):
     def __init__(self, base_tensor: buffered_tensor, num: tl.constexpr):
         self.base_tensor = base_tensor
         self.num = num
+        self.handle = base_tensor.handle
 
 
 class mbarrier(buffered_tensor):
@@ -187,6 +188,7 @@ class mbarriers(tl.base_value):
     def __init__(self, base_barrier: mbarrier, num: tl.constexpr):
         self.base_tensor = base_barrier
         self.num = num
+        self.handle = base_barrier.handle
 
 
 class async_token(tl.base_value):
