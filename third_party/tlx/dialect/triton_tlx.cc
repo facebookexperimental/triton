@@ -124,6 +124,15 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, versionMajor, versionMinor, warpsPerCTA, CTALayout,
                  instrShape));
            })
+      .def("make_dot_operand_encoding_attr",
+           [](TritonOpBuilder &self, Value opnd, unsigned opIdx,
+              Attribute parentEnc) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             auto eltType =
+                 cast<RankedTensorType>(opnd.getType()).getElementType();
+             return ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
+                                                     eltType);
+           })
       .def("make_default_tmem_compatible_tensor_layout_encoding",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type elementType, int moduleNumWarps, int threadsPerWarp,
