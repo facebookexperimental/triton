@@ -392,7 +392,7 @@ struct HoistTMEMAlloc
       HoistTMEMAlloc>::TritonGPUHoistTMEMAllocBase;
 
   // check whether we should bail early due to using TLX
-  bool shouldBailForTLX(ModuleOp &mod) const {
+  bool shouldBail(ModuleOp &mod) const {
     auto hasTLX =
         mod->getAttrOfType<BoolAttr>(tlx::AttrHasExplicitLocalMemAccessName);
     return hasTLX != nullptr && hasTLX.getValue() == true;
@@ -400,7 +400,7 @@ struct HoistTMEMAlloc
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    if (shouldBailForTLX(m))
+    if (shouldBail(m))
       return;
     SmallVector<ttng::MMAv5OpInterface> mmaOps;
     m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });
