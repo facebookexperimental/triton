@@ -821,9 +821,10 @@ def test_ws_descriptor_load_store(device):
                 tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], mb0)
             with tlx.async_task(num_warps=4):
                 tlx.barrier_wait(bar=mb0, phase=0)
+                # TODO. TMA store doesn't work now
                 # tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
-                # tlx.barrier_arrive(bar=mb1)
-    
+                tlx.barrier_arrive(bar=mb1)
+            
 
     triton.set_allocator(alloc_fn)
     M, N = 128, 128
@@ -837,5 +838,3 @@ def test_ws_descriptor_load_store(device):
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
     torch.testing.assert_close(x, y)
-
-    assert(False)
