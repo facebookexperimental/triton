@@ -17,7 +17,9 @@
 
 namespace mlir {
 namespace triton {
-namespace tlx {} // namespace tlx
+namespace tlx {
+constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
+} // namespace tlx
 } // namespace triton
 } // namespace mlir
 

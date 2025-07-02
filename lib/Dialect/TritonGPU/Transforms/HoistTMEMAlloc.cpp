@@ -1,5 +1,6 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -12,6 +13,7 @@ using namespace mlir;
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace tlx = mlir::triton::tlx;
 
 namespace mlir {
 namespace triton {
@@ -390,23 +392,14 @@ struct HoistTMEMAlloc
       HoistTMEMAlloc>::TritonGPUHoistTMEMAllocBase;
 
   // check whether we should bail early due to using TLX
-  bool shouldRun(ModuleOp &mod) const {
-    auto result = mod.walk([&](Operation *op) {
-      return llvm::TypeSwitch<Operation *, WalkResult>(op)
-          .Case<ttng::TMEMLoadOp, ttng::TMEMStoreOp>([](auto specificOp) {
-            if (specificOp.getToken() == nullptr) {
-              return WalkResult::interrupt();
-            }
-            return WalkResult::advance();
-          })
-          .Default([&](auto) { return WalkResult::advance(); });
-    });
-    return !result.wasInterrupted();
+  bool shouldBailForTLX(ModuleOp &mod) const {
+    auto hasTLX = mod->getAttrOfType<BoolAttr>(tlx::AttrHasTLXOpsName);
+    return hasTLX != nullptr && hasTLX.getValue() == true;
   }
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    if (!shouldRun(m))
+    if (shouldBailForTLX(m))
       return;
     SmallVector<ttng::MMAv5OpInterface> mmaOps;
     m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });

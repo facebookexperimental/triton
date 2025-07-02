@@ -2,6 +2,7 @@
 // RUN: triton-opt -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=2 threads-per-warp=32})' %s| FileCheck %s
 
 // CHECK: module attributes {
+// CHECK-SAME: tlx.has_tlx_ops = true
 // CHECK-SAME: "ttg.num-ctas" = 2
 // CHECK-SAME: "ttg.num-warps" = 8
 // CHECK-SAME: ttg.target = "cuda:90"
