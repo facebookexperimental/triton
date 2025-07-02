@@ -3,7 +3,7 @@
 // CHECK: module {
 // CHECK-NOT: tlx.has_tlx_ops
 // CHECK-NOT: "ttg.num-ctas"
-// CHECK-NOT: "ttg.num-warps" = 8
+// CHECK-NOT: "ttg.num-warps"
 module {
     tt.func @kernel_no_tlx(%arg0: tensor<256x!tt.ptr<f32>>, %arg1: i32) {
     %c1_i32 = arith.constant 1 : i32
