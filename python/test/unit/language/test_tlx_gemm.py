@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.tlx.language as tlx
+from typing import Optional
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -25,6 +26,12 @@ def get_cuda_autotune_config():
     reason="Requires Nvidia Hopper",
 )
 def test_ws_gemm(device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+        
 
     @triton.jit
     def matmul_kernel_tlx_ws(
@@ -66,55 +73,45 @@ def test_ws_gemm(device):
         # where each set contains two for A and one for B.
         # Split A into two in M-dimension to have two consumer tasks for wgmma
         a = tlx.local_alloc((BM // 2, BK), tl.float16, NUM_STAGES * 2)
-        # b = tlx.local_alloc((BN, BK), tl.float16, NUM_STAGES)
-
-        # TODO. For same reason with https://github.com/facebookexperimental/triton/pull/171/
-        # size_a/size_b can't be passed to tlx.barrier_expect_bytes() because
-        # it will be casted to tl.tensor.
-        size_a = (BM//2) * BK * 2 # sizeof(dtype)
-        # size_b = BN * BK * 2 # * sizeof(dtype)
+        b = tlx.local_alloc((BN, BK), tl.float16, NUM_STAGES)
 
         # Need NUM_STAGES sets of mbarriers for A and B
         # where each set contains two for A and one for B.
         # Do the above for both empty states and full states respectively.
         bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2, arrive_count=128)
         bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2)
-        # bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
-        # bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
+        bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
+        bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
+                    
+        # data_a_1st = tlx.local_view(a, 0)  # smem data
+        # data_b = tlx.local_view(a, 0)
+        # data_a_2nd = tlx.local_view(a, 0+NUM_STAGES)  # smem data
 
-        empty_a_1st = tlx.local_view(bars_empty_a, 0) # noqa
-        full_a = tlx.local_view(bars_full_a, 0) # noqa
         # Warp specilization
         with tlx.async_tasks():
             # Producer (async load)
             with tlx.async_task("default"):
                 p = 1
 
-                for k in range(0, 1):
                 # for k in range(0, tl.cdiv(K, BK)):
-                    # buf = k % NUM_STAGES
-                    buf = 0
+                for k in range(0, 1):
+                    buf = k % NUM_STAGES
                     offset_k = k * BK
 
                     # Async load to a[buf]
-                    """
                     empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
                     full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
-                    """
-                    data_a_1st = tlx.local_view(a, 0)  # smem data
-                    tlx.barrier_wait(bar=empty_a_1st, phase=p)  # EmptyBar A1 wait
-                    tlx.barrier_expect_bytes(bar=full_a, size=(BM//2) * BK * 2)
+                    tlx.barrier_wait(empty_a_1st, p)  # EmptyBar A1 wait
+                    tlx.barrier_expect_bytes(full_a_1st, (BM//2) * BK )
                     tlx.async_descriptor_load(
                         tma_desc_a,
                         data_a_1st,
                         [offset_am, offset_k],
-                        full_a)
+                        full_a_1st)
 
-                    """
                     # Async load to b[buf]
                     empty_b = tlx.local_view(bars_empty_b, buf)
                     full_b = tlx.local_view(bars_full_b, buf)
-                    data_b = tlx.local_view(a, buf)
                     tlx.barrier_wait(bar=empty_b, phase=p)
                     tlx.barrier_expect_bytes(bar=full_b, size=BN * BK * 2)
                     tlx.async_descriptor_load(
@@ -126,7 +123,6 @@ def test_ws_gemm(device):
                     # Async load to a[buf+NUM_STAGES]
                     empty_a_2nd = tlx.local_view(bars_empty_a, buf+NUM_STAGES)
                     full_a_2nd = tlx.local_view(bars_full_a, buf+NUM_STAGES)
-                    data_a_2nd = tlx.local_view(a, buf+NUM_STAGES)
                     tlx.barrier_wait(bar=empty_a_2nd, phase=p)
                     tlx.barrier_expect_bytes(bar=full_a_2nd, size=(BM//2) * BK * 2)
                     tlx.async_descriptor_load(
@@ -134,44 +130,39 @@ def test_ws_gemm(device):
                         data_a_2nd,
                         [offset_am + (BM//2), offset_k],
                         full_a_2nd)
-                    """
 
                     # Flip phase after every NUM_STAGES iterations finish
                     p = p if (buf < (NUM_STAGES-1)) else (p^1)
 
             # consumers (wgmma + async store)
-            with tlx.async_task(num_warps=4, replicate=1):
+            with tlx.async_task(num_warps=4, replicate=2):
                 p = 1
-                # acc = tl.zeros((BM//2, BN), dtype=tl.bfloat16)
-                for k in range(0, 1):
+                acc = tl.zeros((BM//2, BN), dtype=tl.bfloat16)
                 # for k in range(0, tl.cdiv(K, BK)):
+                for k in range(0, 1):
                     buf = k % NUM_STAGES
                     # Flip phase before every NUM_STAGES iterations begin
                     p = p if (buf>0) else (p^1)
 
-                    # full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
-                    # empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
+                    full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
+                    empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
 
-                    # data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
-                    # full_b = tlx.local_view(bars_full_b, buf)
-                    # empty_b = tlx.local_view(bars_empty_b, buf)
-                    # data_b = tlx.local_view(b, buf)
+                    data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    data_b = tlx.local_view(b, buf)
 
                     # Wait
-                    tlx.barrier_wait(bar=full_a, phase=p)
+                    tlx.barrier_wait(bar=full_a, phase=0)
                     # tlx.barrier_wait(bar=full_b, phase=p)
 
-                    """
                     # async_dot
                     acc = tlx.async_dot(
                         data_a,
                         data_b,
-                        col_input=0,
-                        col_other=0,
                     )
                     # async_wait
                     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
-                    """
 
                     # Release buffers
                     # tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
@@ -202,6 +193,7 @@ def test_ws_gemm(device):
         )
         return c
 
+    triton.set_allocator(alloc_fn)
 
     torch.manual_seed(0)
     M, K, N = 512, 512, 512
