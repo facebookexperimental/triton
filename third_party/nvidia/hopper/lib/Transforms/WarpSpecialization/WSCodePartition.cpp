@@ -1224,6 +1224,7 @@ void insertAsyncComm(
       if (commChannel.consumerBarriers.empty()) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint = getSameLevelOp(headConsumer, headProducer);
+        builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
         builder.setInsertionPoint(producerAcquirePoint);
         builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
             headProducer->getLoc(), token.second, bufferIdx, phase);
@@ -1239,18 +1240,57 @@ void insertAsyncComm(
         // and ConsumerWait will be on the producerBarrier via WaitBarrierOp
         // which is handled else where.
         Operation *producerCommitPoint;
-        producerCommitPoint = getSameLevelOp(headConsumer, tailProducer);
-#if 0 // FIXME
         if (masterChannel->channelKind == DataChannelKind::TMEM) {
+          // There is one case where gen5 takes an input acc and an input for
+          // operand A from the same task. Delay the commit.
           ttng::TmemDataChannel *tmemChannel =
               static_cast<ttng::TmemDataChannel *>(masterChannel);
+#if 0
           assert(tmemWaitBarriers.count(tmemChannel->tmemMmaOp) &&
                  "Failed to find tmemWaitBarriers");
           producerCommitPoint = tmemWaitBarriers[tmemChannel->tmemMmaOp];
+#endif
+          bool handled = false;
+          // This TMEM channel's producer is TMEMStore, and it feeds into
+          // operand A of gen5.
+          if (auto producerSt = dyn_cast<ttng::TMEMStoreOp>(tailProducer)) {
+            auto producerAllocOp = producerSt.getDst().getDefiningOp();
+            if (producerAllocOp->getResult(0) ==
+                tmemChannel->tmemMmaOp.getA()) {
+              // Check for operand D of tmemMmaOp.
+              Value dOpnd = tmemChannel->tmemMmaOp.getD();
+              // Check for tmem_store of operand D.
+              auto allocOp = dOpnd.getDefiningOp();
+              for (auto user : allocOp->getUsers()) {
+                if (auto tmSt = dyn_cast<ttng::TMEMStoreOp>(user)) {
+                  if (user->getBlock() != tailProducer->getBlock())
+                    break;
+
+                  Operation *laterSt = nullptr;
+                  for (auto &op : reverse(user->getBlock()->getOperations())) {
+                    if (&op == tmSt || &op == tailProducer) {
+                      laterSt = &op;
+                      break;
+                    }
+                  }
+                  producerCommitPoint =
+                      laterSt; // later point of tailProducer or tmemStore.
+                  handled = true;
+                  LDBG("Insert ProducerCommitOp at the later tmem_store");
+                  break;
+                }
+              }
+            }
+          }
+          if (!handled)
+            producerCommitPoint = getSameLevelOp(headConsumer, tailProducer);
         } else {
           producerCommitPoint = getSameLevelOp(headConsumer, tailProducer);
         }
-#endif
+        LLVM_DEBUG({
+          LDBG("Insert ProducerCommitOp ");
+          producerCommitPoint->dump();
+        });
         builder.setInsertionPointAfter(producerCommitPoint);
         builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
             tailProducer->getLoc(), token.second, bufferIdx);
