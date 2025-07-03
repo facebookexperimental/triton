@@ -246,6 +246,22 @@ void init_triton_tlx_ir(py::module &&m) {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);
              self.create<ttng::TMEMStoreOp>(dst, src, pred);
            })
+      .def("create_tmem_subslice",
+           [](TritonOpBuilder &self, Value &src, int offset,
+              int size) -> mlir::Value {
+             // There're already checks for src and dst layouts in verifer
+             // TMEMSubSliceOp::verify()
+             // We do some reasonable extra checks here to make sure front end
+             // only passes valid inputs to the op
+             auto srcTy = dyn_cast<triton::gpu::MemDescType>(src.getType());
+             assert(srcTy != nullptr && "Expect MemDescType for src");
+             auto encoding =
+                 dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
+             auto blockN = encoding.getBlockN();
+             assert(offset >= 0 && offset < blockN && "Invalid offset");
+             assert(size > 0 && size <= blockN - offset && "Invalid size");
+             return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
+           })
       .def("create_tcgen5_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &d, std::optional<Value> mBarrier) -> mlir::Value {

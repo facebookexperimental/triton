@@ -131,6 +131,34 @@ def local_view(
 
 
 @tl.builtin
+def subslice(
+    local_allocated_buffer: tlx.buffered_tensor,
+    offset: int,
+    size: int,
+    _builder=None,
+) -> tlx.buffered_tensor:
+    """
+    Returns a subslice of the buffer (in TMEM). The source has to be 128xN and the slicing is
+    along the innermost dimension.
+
+    :param local_allocated_buffer: the source buffer
+    :param offset: the start offset of the subslice, in terms of number of elements
+    :param size: the size of the subslice, in terms of number of elements
+    """
+    # this is for TMEM subslice
+    assert local_allocated_buffer.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
+    assert isinstance(local_allocated_buffer.type, tl.block_type), "subslice src is not block type"
+    subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]] + [size]
+    subslice_type = tl.block_type(local_allocated_buffer.type.element_ty, subslice_shape)
+    return tlx.buffered_tensor(
+        _builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size),
+        subslice_type,
+        local_allocated_buffer.storage,
+        local_allocated_buffer.layout,
+    )
+
+
+@tl.builtin
 def async_load(
     src: tl.tensor,
     result: tlx.buffered_tensor,
