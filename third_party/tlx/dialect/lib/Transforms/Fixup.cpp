@@ -52,7 +52,16 @@ public:
            })
             .wasInterrupted();
 
-    if (!hasTLXOps && !hasExplicitLocalMemAccess) {
+    auto hasWarpSpecOps = mod.walk([&](Operation *op) {
+                               if (isa<ttg::WarpSpecializeOp, ttg::WarpYieldOp,
+                                       ttg::WarpReturnOp>(op)) {
+                                 return WalkResult::interrupt();
+                               }
+                               return WalkResult::advance();
+                             })
+                              .wasInterrupted();
+
+    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps) {
       return;
     }
 
@@ -67,6 +76,8 @@ public:
       mod->setAttr(AttrHasTLXOpsName, b.getBoolAttr(true));
     if (hasExplicitLocalMemAccess)
       mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
+    if (hasWarpSpecOps)
+      mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
   }
 };
 
