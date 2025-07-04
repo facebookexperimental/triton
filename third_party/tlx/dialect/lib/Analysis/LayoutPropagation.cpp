@@ -60,6 +60,8 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
 LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
+  if (isa<arith::ConstantOp>(op))
+    assert(op);
   if (auto requireLayoutOp = dyn_cast<triton::tlx::RequireLayoutOp>(op)) {
     Attribute layout = requireLayoutOp.getType().getEncoding();
     const auto layoutLattice = LayoutEncoding(layout);

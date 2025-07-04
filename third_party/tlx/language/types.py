@@ -105,6 +105,14 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
 
+    """
+    Create a new layout that is a permutation of the given layout.
+    """
+
+    def make_permute(self, dims) -> Self:
+        permuted_order = tuple(self.order[d] for d in dims)
+        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder, self.fp4Padded)
+
 
 class storage_kind(enum.Enum):
     smem = "smem"

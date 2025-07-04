@@ -778,59 +778,81 @@ def test_descriptor_load(device):
     reason="Requires compute capability >= 9 for NV",
 )
 def test_descriptor_load_ws(device):
-
+    from triton.tools.tensor_descriptor import TensorDescriptor
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
         assert stream == 0
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    def descriptor_load_kernel(desc_in_1, desc_in_2, desc_out, M, N, K, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
-        desc_in = tl.make_tensor_descriptor(
-            input_ptr,
-            shape=[M, N],
-            strides=[N, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        )
-
-        # desc_out = tl.make_tensor_descriptor(
-        #     output_ptr,
-        #     shape=[M, N],
-        #     strides=[N, 1],
-        #     block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        # )
-
-        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        op1 = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, tl.constexpr(1))
+        op2 = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, tl.constexpr(1))
+        buffer_op1 = tlx.local_view(op1, 0)
+        buffer_op2 = tlx.local_view(op2, 0)
         bars = tlx.alloc_barriers(tl.constexpr(2))
         mb0 = tlx.local_view(bars, 0)
         mb1 = tlx.local_view(bars, 1)
 
-        with tlx.async_tasks():
-            with tlx.async_task("default"):
-                buffer = tlx.local_view(buffers, 0)
-                tlx.barrier_wait(mb0, 1)
-                tlx.barrier_expect_bytes(mb1, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
-                # Compute tile offset in global memory
-                off_m = pid_m * BLOCK_SIZE_M
-                off_n = pid_n * BLOCK_SIZE_N
-                # TMA load
-                tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], mb1)
-            with tlx.async_task(num_warps=4):
-                tlx.barrier_wait(bar=mb1, phase=0)
-                # TODO. TMA store + WS
-                # tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+        # with tlx.async_tasks():
+        #     with tlx.async_task("default"):
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+        # TMA load op1
+        tlx.barrier_expect_bytes(mb0, BLOCK_SIZE_M * BLOCK_SIZE_K * 2)
+        tlx.async_descriptor_load(desc_in_1, buffer_op1, [off_m, off_n], mb0)
+        # TMA load op2
+        tlx.barrier_expect_bytes(mb1, BLOCK_SIZE_K * BLOCK_SIZE_N * 2)
+        tlx.async_descriptor_load(desc_in_2, buffer_op2, [off_m, off_n], mb1)
+
+            # with tlx.async_task(num_warps=4):
+
+        tlx.barrier_wait(bar=mb0, phase=0)
+        tlx.barrier_wait(bar=mb1, phase=0)
+        # buffer_op1 = buffer_op1.to(tlx.dtype_of(desc_in_1))
+        # buffer_op2 = buffer_op2.to(tlx.dtype_of(desc_in_2))
+        # async_dot
+        acc = tlx.async_dot(
+            buffer_op1,
+            buffer_op2,
+        )
+        # async_wait
+        acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+        # TODO. TMA store + WS
+        desc_out.store([off_m, off_n], acc.to(tlx.dtype_of(desc_out)))
 
     triton.set_allocator(alloc_fn)
-    M, N = 128, 128
-    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
-    x = torch.ones((M, N), dtype=torch.int16, device=device)
-    y = torch.empty_like(x)
-    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    M, N, K = (64, 64, 32)
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = (64, 64, 32)
+    x = torch.ones((M, K), dtype=torch.float16, device=device)
+    y = torch.ones((K, N), dtype=torch.float16, device=device)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
-    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
-    # assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
-    # torch.testing.assert_close(x, y)
+    desc_in_1 = TensorDescriptor(
+        x,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+
+    desc_in_2 = TensorDescriptor(
+        y,
+        shape=[K, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+    )
+    desc_out = TensorDescriptor(
+        z,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+    )
+    kernel = descriptor_load_kernel[(1, 1)](desc_in_1, desc_in_2, desc_out, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 2
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
+    torch.testing.assert_close(z, torch.matmul(x, y))

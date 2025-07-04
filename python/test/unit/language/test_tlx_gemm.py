@@ -42,9 +42,9 @@ def test_ws_gemm(device):
     ):
         # Descriptor
         pid_m = tl.program_id(axis=0)
-        # pid_n = tl.program_id(axis=1)
+        pid_n = tl.program_id(axis=1)
         offset_am = pid_m * BM
-        # offset_bn = pid_n * BN
+        offset_bn = pid_n * BN
 
         tma_desc_a = tl.make_tensor_descriptor(
                 a_ptr,
@@ -53,7 +53,6 @@ def test_ws_gemm(device):
                 block_shape=[BM, BK],
             )
 
-        """
         tma_desc_b = tl.make_tensor_descriptor(
                 b_ptr,
                 shape=[K, N],
@@ -61,6 +60,7 @@ def test_ws_gemm(device):
                 block_shape=[BK, BN],
             )
 
+        """
         tma_desc_c = tl.make_tensor_descriptor(
                 c_ptr,
                 shape=[M, N],
@@ -83,9 +83,9 @@ def test_ws_gemm(device):
         bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
         bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
                     
-        # data_a_1st = tlx.local_view(a, 0)  # smem data
-        # data_b = tlx.local_view(a, 0)
-        # data_a_2nd = tlx.local_view(a, 0+NUM_STAGES)  # smem data
+        data_a_1st = tlx.local_view(a, 0)  # smem data
+        data_b = tlx.local_view(a, 0)
+        data_a_2nd = tlx.local_view(a, 0+NUM_STAGES)  # smem data
 
         # Warp specilization
         with tlx.async_tasks():
@@ -93,80 +93,84 @@ def test_ws_gemm(device):
             with tlx.async_task("default"):
                 p = 1
 
-                # for k in range(0, tl.cdiv(K, BK)):
-                for k in range(0, 1):
-                    buf = k % NUM_STAGES
-                    offset_k = k * BK
+                # for k in range(1):
 
-                    # Async load to a[buf]
-                    empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
-                    full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
-                    tlx.barrier_wait(empty_a_1st, p)  # EmptyBar A1 wait
-                    tlx.barrier_expect_bytes(full_a_1st, (BM//2) * BK )
-                    tlx.async_descriptor_load(
-                        tma_desc_a,
-                        data_a_1st,
-                        [offset_am, offset_k],
-                        full_a_1st)
+                k = 0
 
-                    # Async load to b[buf]
-                    empty_b = tlx.local_view(bars_empty_b, buf)
-                    full_b = tlx.local_view(bars_full_b, buf)
-                    tlx.barrier_wait(bar=empty_b, phase=p)
-                    tlx.barrier_expect_bytes(bar=full_b, size=BN * BK * 2)
-                    tlx.async_descriptor_load(
-                        tma_desc_b,
-                        data_b,
-                        [offset_k, offset_bn],
-                        full_a_1st)
+                buf = k % NUM_STAGES
+                offset_k = k * BK
 
-                    # Async load to a[buf+NUM_STAGES]
-                    empty_a_2nd = tlx.local_view(bars_empty_a, buf+NUM_STAGES)
-                    full_a_2nd = tlx.local_view(bars_full_a, buf+NUM_STAGES)
-                    tlx.barrier_wait(bar=empty_a_2nd, phase=p)
-                    tlx.barrier_expect_bytes(bar=full_a_2nd, size=(BM//2) * BK * 2)
-                    tlx.async_descriptor_load(
-                        tma_desc_a,
-                        data_a_2nd,
-                        [offset_am + (BM//2), offset_k],
-                        full_a_2nd)
+                # Async load to a[buf]
+                empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
+                full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
+                tlx.barrier_wait(empty_a_1st, p)  # EmptyBar A1 wait
+                tlx.barrier_expect_bytes(full_a_1st, (BM//2) * BK )
+                tlx.async_descriptor_load(
+                    tma_desc_a,
+                    data_a_1st,
+                    [offset_am, offset_k],
+                    full_a_1st)
 
-                    # Flip phase after every NUM_STAGES iterations finish
-                    p = p if (buf < (NUM_STAGES-1)) else (p^1)
+                # Async load to b[buf]
+                empty_b = tlx.local_view(bars_empty_b, buf)
+                full_b = tlx.local_view(bars_full_b, buf)
+                tlx.barrier_wait(bar=empty_b, phase=p)
+                tlx.barrier_expect_bytes(bar=full_b, size=BN * BK * 2)
+                tlx.async_descriptor_load(
+                    tma_desc_b,
+                    data_b,
+                    [offset_k, offset_bn],
+                    full_a_1st)
+
+                """
+                # Async load to a[buf+NUM_STAGES]
+                empty_a_2nd = tlx.local_view(bars_empty_a, buf+NUM_STAGES)
+                full_a_2nd = tlx.local_view(bars_full_a, buf+NUM_STAGES)
+                tlx.barrier_wait(bar=empty_a_2nd, phase=p)
+                tlx.barrier_expect_bytes(bar=full_a_2nd, size=(BM//2) * BK * 2)
+                tlx.async_descriptor_load(
+                    tma_desc_a,
+                    data_a_2nd,
+                    [offset_am + (BM//2), offset_k],
+                    full_a_2nd)
+
+                # Flip phase after every NUM_STAGES iterations finish
+                """
+                p = p if (buf < (NUM_STAGES-1)) else (p^1)
 
             # consumers (wgmma + async store)
-            with tlx.async_task(num_warps=4, replicate=2):
+            with tlx.async_task(num_warps=4, replicate=1):
                 p = 1
-                acc = tl.zeros((BM//2, BN), dtype=tl.bfloat16)
-                # for k in range(0, tl.cdiv(K, BK)):
-                for k in range(0, 1):
-                    buf = k % NUM_STAGES
-                    # Flip phase before every NUM_STAGES iterations begin
-                    p = p if (buf>0) else (p^1)
+                # for k in range(0, 1):
 
-                    full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
-                    empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
+                k = 0
+                buf = k % NUM_STAGES
+                # Flip phase before every NUM_STAGES iterations begin
+                p = p if (buf>0) else (p^1)
 
-                    data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
-                    full_b = tlx.local_view(bars_full_b, buf)
-                    empty_b = tlx.local_view(bars_empty_b, buf)
-                    data_b = tlx.local_view(b, buf)
+                full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
+                empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
 
-                    # Wait
-                    tlx.barrier_wait(bar=full_a, phase=0)
-                    # tlx.barrier_wait(bar=full_b, phase=p)
+                data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
+                full_b = tlx.local_view(bars_full_b, buf)
+                # empty_b = tlx.local_view(bars_empty_b, buf)
+                data_b = tlx.local_view(b, buf)
 
-                    # async_dot
-                    acc = tlx.async_dot(
-                        data_a,
-                        data_b,
-                    )
-                    # async_wait
-                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                # Wait
+                tlx.barrier_wait(bar=full_a, phase=0)
+                tlx.barrier_wait(bar=full_b, phase=0)
 
-                    # Release buffers
-                    # tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
-                    # tlx.barrier_arrive(empty_b)
+                # async_dot
+                # acc = tlx.async_dot(
+                #     data_a,
+                #     data_b,
+                # )
+                # # async_wait
+                # acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+
+                # Release buffers
+                # tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
+                # tlx.barrier_arrive(empty_b)
 
                 # # tlx.async_descriptor_store(tma_desc_c, acc, [offset_am, offset_bn])
 

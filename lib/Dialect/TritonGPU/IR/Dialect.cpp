@@ -3,9 +3,12 @@
 #include <cstdint>
 #include <numeric>
 
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -807,8 +810,7 @@ Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void BlockedEncodingAttr::print(mlir::AsmPrinter &printer) const {
-  printer << "<{"
-          << "sizePerThread = [" << ArrayRef(getSizePerThread()) << "]"
+  printer << "<{" << "sizePerThread = [" << ArrayRef(getSizePerThread()) << "]"
           << ", threadsPerWarp = [" << ArrayRef(getThreadsPerWarp()) << "]"
           << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]"
           << ", order = [" << getOrder() << "]";
@@ -1260,8 +1262,7 @@ Attribute NvidiaMmaEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "versionMajor = " << getVersionMajor()
+  printer << "<{" << "versionMajor = " << getVersionMajor()
           << ", versionMinor = " << getVersionMinor() //
           << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]";
 
@@ -1343,8 +1344,7 @@ Attribute AMDMfmaEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void AMDMfmaEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "versionMajor = " << getVersionMajor()                      //
+  printer << "<{" << "versionMajor = " << getVersionMajor()              //
           << ", versionMinor = " << getVersionMinor()                    //
           << ", warpsPerCTA = [" << getWarpsPerCTA() << "]"              //
           << ", instrShape = [" << ArrayRef{getMDim(), getNDim()} << "]" //
@@ -1434,8 +1434,7 @@ Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void AMDWmmaEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "version = " << getVersion()
+  printer << "<{" << "version = " << getVersion()
           << ", isTranspose = " << getIsTransposed() << ", warpsPerCTA = ["
           << ArrayRef(getWarpsPerCTA()) << "]";
   maybePrintCTALayout(getContext(), printer, getCTALayout(),
@@ -1483,9 +1482,8 @@ Attribute SliceEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void SliceEncodingAttr::print(mlir::AsmPrinter &printer) const {
-  printer << "<{"
-          << "dim = " << getDim() << ", "
-          << "parent = " << getParent() << "}>";
+  printer << "<{" << "dim = " << getDim() << ", " << "parent = " << getParent()
+          << "}>";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1560,8 +1558,7 @@ Attribute SwizzledSharedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void SwizzledSharedEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "vec = " << getVec() //
+  printer << "<{" << "vec = " << getVec() //
           << ", perPhase = " << getPerPhase()
           << ", maxPhase = " << getMaxPhase() //
           << ", order = [" << getOrder() << "]";
@@ -1635,9 +1632,8 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "swizzlingByteWidth = " << getSwizzlingByteWidth() //
-          << ", transposed = " << getTransposed()               //
+  printer << "<{" << "swizzlingByteWidth = " << getSwizzlingByteWidth() //
+          << ", transposed = " << getTransposed()                       //
           << ", elementBitWidth = " << getElementBitWidth();
   if (getFp4Padded()) {
     // Print only in this case to reduce the noise for the more common case.
@@ -1689,8 +1685,7 @@ Attribute AMDRotatingSharedEncodingAttr::parse(AsmParser &parser, Type type) {
 }
 
 void AMDRotatingSharedEncodingAttr::print(AsmPrinter &printer) const {
-  printer << "<{"
-          << "vec = " << getVec() //
+  printer << "<{" << "vec = " << getVec() //
           << ", perPhase = " << getPerPhase()
           << ", maxPhase = " << getMaxPhase() //
           << ", order = [" << getOrder() << "]";
@@ -3071,6 +3066,60 @@ struct MemDescModel
 };
 } // namespace
 
+struct TritonGPUInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Operation *call, Operation *callable,
+                       bool wouldBeCloned) const final {
+    auto funcOp = dyn_cast<triton::FuncOp>(callable);
+    if (!funcOp)
+      return true;
+    if (funcOp->hasAttr("noinline"))
+      return !funcOp->getAttrOfType<BoolAttr>("noinline").getValue();
+    return true;
+  }
+
+  bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
+                       IRMapping &valueMapping) const final {
+    return true;
+  }
+
+  bool isLegalToInline(Operation *, Region *, bool wouldBeCloned,
+                       IRMapping &) const final {
+    return true;
+  }
+  //===--------------------------------------------------------------------===//
+  // Transformation Hooks
+  //===--------------------------------------------------------------------===//
+
+  /// Handle the given inlined terminator by replacing it with a new operation
+  /// as necessary.
+  void handleTerminator(Operation *op, Block *newDest) const final {
+    // Only return needs to be handled here.
+    auto returnOp = dyn_cast<triton::ReturnOp>(op);
+    if (!returnOp)
+      return;
+
+    // Replace the return with a branch to the dest.
+    OpBuilder builder(op);
+    builder.create<mlir::cf::BranchOp>(op->getLoc(), newDest,
+                                       returnOp.getOperands());
+    op->erase();
+  }
+
+  /// Handle the given inlined terminator by replacing it with a new operation
+  /// as necessary.
+  void handleTerminator(Operation *op, ValueRange valuesToRepl) const final {
+    // Only return needs to be handled here.
+    auto returnOp = cast<triton::ReturnOp>(op);
+
+    // Replace the values directly with the return operands.
+    assert(returnOp.getNumOperands() == valuesToRepl.size());
+    for (const auto &it : llvm::enumerate(returnOp.getOperands()))
+      valuesToRepl[it.index()].replaceAllUsesWith(it.value());
+  }
+};
+
 void TritonGPUDialect::initialize() {
   registerTypes();
 
@@ -3083,6 +3132,7 @@ void TritonGPUDialect::initialize() {
 #include "triton/Dialect/TritonGPU/IR/Ops.cpp.inc"
 #include "triton/Dialect/TritonGPU/IR/OpsEnums.cpp.inc"
       >();
+  addInterfaces<TritonGPUInlinerInterface>();
   addInterfaces<TritonGPUOpAsmInterface>();
   addInterfaces<TritonGPUInferLayoutInterface>();
   addInterfaces<TritonGPUVerifyTensorLayoutInterface>();
