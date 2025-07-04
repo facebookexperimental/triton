@@ -797,34 +797,31 @@ def test_descriptor_load_ws(device):
         mb0 = tlx.local_view(bars, 0)
         mb1 = tlx.local_view(bars, 1)
 
-        # with tlx.async_tasks():
-        #     with tlx.async_task("default"):
-
-        # Compute tile offset in global memory
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
-        # TMA load op1
-        tlx.barrier_expect_bytes(mb0, BLOCK_SIZE_M * BLOCK_SIZE_K * 2)
-        tlx.async_descriptor_load(desc_in_1, buffer_op1, [off_m, off_n], mb0)
-        # TMA load op2
-        tlx.barrier_expect_bytes(mb1, BLOCK_SIZE_K * BLOCK_SIZE_N * 2)
-        tlx.async_descriptor_load(desc_in_2, buffer_op2, [off_m, off_n], mb1)
 
-            # with tlx.async_task(num_warps=4):
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                # Compute tile offset in global memory
+                # TMA load op1
+                tlx.barrier_expect_bytes(mb0, BLOCK_SIZE_M * BLOCK_SIZE_K * 2)
+                tlx.async_descriptor_load(desc_in_1, buffer_op1, [off_m, off_n], mb0)
+                # TMA load op2
+                tlx.barrier_expect_bytes(mb1, BLOCK_SIZE_K * BLOCK_SIZE_N * 2)
+                tlx.async_descriptor_load(desc_in_2, buffer_op2, [off_m, off_n], mb1)
 
-        tlx.barrier_wait(bar=mb0, phase=0)
-        tlx.barrier_wait(bar=mb1, phase=0)
-        # buffer_op1 = buffer_op1.to(tlx.dtype_of(desc_in_1))
-        # buffer_op2 = buffer_op2.to(tlx.dtype_of(desc_in_2))
-        # async_dot
-        acc = tlx.async_dot(
-            buffer_op1,
-            buffer_op2,
-        )
-        # async_wait
-        acc = tlx.async_dot_wait(tl.constexpr(0), acc)
-        # TODO. TMA store + WS
-        desc_out.store([off_m, off_n], acc.to(tlx.dtype_of(desc_out)))
+            with tlx.async_task(num_warps=4):
+                tlx.barrier_wait(bar=mb0, phase=0)
+                tlx.barrier_wait(bar=mb1, phase=0)
+                # async_dot
+                acc = tlx.async_dot(
+                    buffer_op1,
+                    buffer_op2,
+                )
+                # async_wait
+                acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                # TODO. TMA store + WS
+                desc_out.store([off_m, off_n], acc.to(tlx.dtype_of(desc_out)))
 
     triton.set_allocator(alloc_fn)
     M, N, K = (64, 64, 32)
