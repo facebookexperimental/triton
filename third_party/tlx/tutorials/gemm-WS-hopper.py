@@ -38,8 +38,13 @@ def matmul_tma_set_block_size_hook(nargs):
 
 @triton.autotune(
     configs=[
-        triton.Config({'BM': 256, 'BN': 128, 'BK': 64, 'NUM_STAGES': 2,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
-        triton.Config({'BM': 256, 'BN': 128, 'BK': 32, 'NUM_STAGES': 4,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+        # triton.Config({'BM': 256, 'BN': 128, 'BK': 64, 'NUM_STAGES': 2,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+        # triton.Config({'BM': 256, 'BN': 128, 'BK': 32, 'NUM_STAGES': 4,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+        triton.Config({'BM': BM, 'BN': BN, 'BK': BK, 'NUM_STAGES': NUM_STAGES,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook) 
+        for BM in [256]
+        for BN in [64, 128, 256]
+        for BK in [32, 64]
+        for NUM_STAGES in [2, ]
     ],
     key=["K",],
 )
