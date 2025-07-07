@@ -66,8 +66,7 @@ def test_ws_gemm(device):
             with tlx.async_task("default"):
                 p = 1
 
-                # for k in range(0, tl.cdiv(K, BK)):
-                for k in range(0, 1):
+                for k in range(0, tl.cdiv(K, BK)):
                     buf = k % NUM_STAGES
                     offset_k = k * BK
 
@@ -113,8 +112,7 @@ def test_ws_gemm(device):
             # consumers (wgmma + async store)
             with tlx.async_task(num_warps=4, replicate=2):
                 p = 1
-                # for k in range(0, tl.cdiv(K, BK)):
-                for k in range(0, 1):
+                for k in range(0, tl.cdiv(K, BK)):
                     buf = k % NUM_STAGES
                     # Flip phase before every NUM_STAGES iterations begin
                     p = p if (buf > 0) else (p^1)
