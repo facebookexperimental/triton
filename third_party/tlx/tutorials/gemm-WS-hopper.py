@@ -143,7 +143,7 @@ def matmul_kernel_tlx_ws(
             desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
 
 
-def matmul(a, b, BM=128, BN=64, BK=32):
+def matmul(a, b, BM=256, BN=128, BK=64):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -188,7 +188,7 @@ triton.set_allocator(alloc_fn)
 
 torch.manual_seed(0)
 M, N, K = (8192, 8192, 8192)
-BM, BN, BK = (128, 64, 32)
+BM, BN, BK = (256, 64, 32)
 
 a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
 b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
@@ -244,4 +244,4 @@ def benchmark(M, N, K, provider, fp8_inputs):
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
-benchmark.run(show_plots=True, print_data=True)
+benchmark.run(show_plots=True, print_data=True, diff_col=True)
