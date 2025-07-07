@@ -10,19 +10,16 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 M, N, K = (8192, 8192, 8192)
-BM, BN, BK = (256, 128, 64)
+
 
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
 def is_hip_cdna2():
     target = triton.runtime.driver.active.get_current_target()
     return target.backend == 'hip' and target.arch == 'gfx90a'
 
-def get_cuda_autotune_config():
-    return [
-        triton.Config({'BM': 128, 'BK': 128, 'BN': 128},
-                      num_warps=8),
-    ]
 
 def alloc_fn(size: int, align: int, stream: Optional[int]):
     assert align == 128
@@ -30,10 +27,30 @@ def alloc_fn(size: int, align: int, stream: Optional[int]):
     return torch.empty(size, dtype=torch.int8, device=DEVICE)
 
 
+def matmul_tma_set_block_size_hook(nargs):
+    BLOCK_M = nargs["BM"]
+    BLOCK_N = nargs["BN"]
+    BLOCK_K = nargs["BK"]
+    nargs["desc_in_1"].block_shape = [BLOCK_M // 2, BLOCK_K]
+    nargs["desc_in_2"].block_shape = [BLOCK_K, BLOCK_N]
+    nargs["desc_out"].block_shape = [BLOCK_M // 2, BLOCK_N]
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({
+            'BM': BM, 'BN': BN, 'BK': BK, 'NUM_STAGES': 2,
+            }, num_warps=4, pre_hook=matmul_tma_set_block_size_hook)
+        for BM in [256, ]
+        for BN in [128, ]
+        for BK in [64, ]
+    ],
+    key=["K",],
+)
 @triton.jit
 def matmul_kernel_tlx_ws(
     desc_in_1, desc_in_2, desc_out, #
-    K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,  #
+    K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,  #
     NUM_STAGES: tl.constexpr,  #
 ):
     # Descriptor
@@ -145,7 +162,7 @@ def matmul_kernel_tlx_ws(
             desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
 
 
-def matmul(a, b, BM=BM, BN=BN, BK=BK):
+def matmul(a, b,):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -153,24 +170,25 @@ def matmul(a, b, BM=BM, BN=BN, BK=BK):
     (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
     c = torch.zeros((M, N), dtype=torch.float16, device=DEVICE, )
 
+    dummy_block = [1, 1]
     desc_in_1 = TensorDescriptor(
         a,
         shape=[M, K],
         strides=[K, 1],
-        block_shape=[BM // 2, BK],
+        block_shape=dummy_block,
     )
 
     desc_in_2 = TensorDescriptor(
         b,
         shape=[K, N],
         strides=[N, 1],
-        block_shape=[BK, BN],
+        block_shape=dummy_block,
     )
     desc_out = TensorDescriptor(
         c,
         shape=[M, N],
         strides=[N, 1],
-        block_shape=[BM // 2, BN],
+        block_shape=dummy_block,
     )
 
     grid = lambda META: (  # noqa E731
@@ -179,10 +197,6 @@ def matmul(a, b, BM=BM, BN=BN, BK=BK):
     matmul_kernel_tlx_ws[grid](
         desc_in_1, desc_in_2, desc_out,  #
         K=tl.constexpr(K),
-        BM=tl.constexpr(BM), 
-        BN=tl.constexpr(BN), 
-        BK=tl.constexpr(BK), 
-        NUM_STAGES=tl.constexpr(2),  #
     )
     return c
 
@@ -194,7 +208,7 @@ a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
 b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
 
 rtol = 1e-2 if is_hip_cdna2() else 0
-output = matmul(a, b, BM, BN, BK)
+output = matmul(a, b,)
 output_ref = torch.matmul(a, b)
 
 if torch.allclose(output, output_ref, atol=1e-2, rtol=rtol):
