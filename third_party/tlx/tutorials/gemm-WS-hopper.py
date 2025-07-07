@@ -116,6 +116,7 @@ def test_ws_gemm():
                 p = 0
                 # Assuming NUM_STAGES = 2
                 # p should be 0, 0, 1, 1, 0, 0, ...
+                acc = tl.zeros([BM//2, BN], dtype=tl.float32)
                 for k in range(0, tl.cdiv(K, BK)):
                     buf = k % NUM_STAGES
 
@@ -131,6 +132,7 @@ def test_ws_gemm():
                     acc = tlx.async_dot(
                         data_a,
                         data_b,
+                        acc,
                     )
                     # async_wait
                     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
@@ -141,10 +143,11 @@ def test_ws_gemm():
                     tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
                     tlx.barrier_arrive(empty_b)
 
-                    desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
-
                     # Flip phase after every NUM_STAGES iterations finish
                     p = (p^1) if (buf == (NUM_STAGES-1)) else p
+
+                desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
+
 
     def matmul(a, b, BM, BN, BK):
         # Check constraints.
@@ -190,7 +193,7 @@ def test_ws_gemm():
     triton.set_allocator(alloc_fn)
 
     torch.manual_seed(0)
-    M, N, K = (128, 64, 64)
+    M, N, K = (512, 512, 512)
     BM, BN, BK = (128, 64, 32)
 
     a = torch.ones((M, K), dtype=torch.float16, device=DEVICE)
