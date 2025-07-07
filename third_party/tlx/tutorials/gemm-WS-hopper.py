@@ -146,15 +146,13 @@ def test_ws_gemm():
                     # Flip phase after every NUM_STAGES iterations finish
                     p = (p^1) if (buf == (NUM_STAGES-1)) else p
 
-    def matmul(a, b):
+    def matmul(a, b, BM, BN, BK):
         # Check constraints.
         assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
         assert a.is_contiguous(), "Matrix A must be contiguous"
 
         (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
         c = torch.zeros((M, N), dtype=torch.float16, device=DEVICE, )
-
-        BM, BN, BK = (128, 64, 128)
 
         desc_in_1 = TensorDescriptor(
             a,
@@ -192,19 +190,19 @@ def test_ws_gemm():
     triton.set_allocator(alloc_fn)
 
     torch.manual_seed(0)
-    M, N, K = (512, 512, 128)
-    # BM, BN, BK = (128, 64, 32)
+    M, N, K = (128, 64, 64)
+    BM, BN, BK = (128, 64, 32)
 
-    a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
-    b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
+    a = torch.ones((M, K), dtype=torch.float16, device=DEVICE)
+    b = torch.ones((K, N), dtype=torch.float16, device=DEVICE)
 
     rtol = 1e-2 if is_hip_cdna2() else 0
-    output = matmul(a, b)
+    output = matmul(a, b, BM, BN, BK)
     output_ref = torch.matmul(a, b)
     print("output.shape", output.shape)
     print("output", output)
-    # print("output.split", torch.split(output, 64))
-    # print("output_ref.shape", output_ref.shape)
+    print("output.split", torch.split(output, 64))
+    print("output_ref.shape", output_ref.shape)
     print("output_ref", output_ref)
     # print("output - output_ref", output - output_ref)
     assert torch.allclose(output, output_ref, atol=1e-2, rtol=rtol), "❌ Triton and Torch differ"
