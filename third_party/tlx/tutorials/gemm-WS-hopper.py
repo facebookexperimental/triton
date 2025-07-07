@@ -38,12 +38,9 @@ def matmul_tma_set_block_size_hook(nargs):
 
 @triton.autotune(
     configs=[
-        triton.Config({
-            'BM': BM, 'BN': BN, 'BK': BK, 'NUM_STAGES': 2,
-            }, num_warps=4, pre_hook=matmul_tma_set_block_size_hook)
-        for BM in [256, ]
-        for BN in [128, ]
-        for BK in [64, ]
+        # triton.Config({'BM': 256, 'BN': 128, 'BK': 64, 'NUM_STAGES': 2,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+        triton.Config({'BM': 256, 'BN': 128, 'BK': 32, 'NUM_STAGES': 4,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+        # triton.Config({'BM': 128, 'BN': 256, 'BK': 64, 'NUM_STAGES': 2, 'NUM_CONSUMERS': 2, }, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
     ],
     key=["K",],
 )
@@ -251,9 +248,9 @@ def benchmark(M, N, K, provider, fp8_inputs):
         b = b.to(torch.float8_e5m2)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), rep=500, quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), rep=500, quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
