@@ -192,8 +192,8 @@ def test_ws_gemm():
     triton.set_allocator(alloc_fn)
 
     torch.manual_seed(0)
-    # M, N, K = (256, 128, 64)
-    M, N, K = (128, 64, 64)
+    M, N, K = (512, 512, 128)
+    # BM, BN, BK = (128, 64, 32)
 
     a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
     b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
