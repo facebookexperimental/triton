@@ -10,6 +10,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -3133,6 +3134,7 @@ void TritonGPUDialect::initialize() {
 #include "triton/Dialect/TritonGPU/IR/OpsEnums.cpp.inc"
       >();
   addInterfaces<TritonGPUInlinerInterface>();
+  addInterfaces<TritonInlinerInterface>();
   addInterfaces<TritonGPUOpAsmInterface>();
   addInterfaces<TritonGPUInferLayoutInterface>();
   addInterfaces<TritonGPUVerifyTensorLayoutInterface>();
