@@ -187,7 +187,7 @@ def matmul(a, b, BM=128, BN=64, BK=32):
 triton.set_allocator(alloc_fn)
 
 torch.manual_seed(0)
-M, N, K = (512, 512, 512)
+M, N, K = (8192, 8192, 8192)
 BM, BN, BK = (128, 64, 32)
 
 a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
