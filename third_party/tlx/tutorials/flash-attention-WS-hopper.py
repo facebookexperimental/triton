@@ -1,7 +1,5 @@
-
 import pytest
 import torch
-import os
 
 import triton
 import triton.language as tl
@@ -17,46 +15,51 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
+    HEAD_DIM = nargs["HEAD_DIM"]
+    NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
+    BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
+    nargs["desc_q"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
     if nargs["FP8_OUTPUT"]:
         nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
         nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
-
+    nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
 
 
 configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN, 'NUM_BUFFERS': 2, 'NUM_WARPS': 4}, num_stages=0, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [64]\
-    for BN in [64]\
-    for w in [4]\
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 4, 'NUM_MMA_GROUPS': 1},
+                  num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 8, 'NUM_MMA_GROUPS': 2},
+                  num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
 ]
+
 
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
-def _attn_fwd(sm_scale, M,  #
+def _attn_fwd_ws(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
               FP8_OUTPUT: tl.constexpr,  #
               NUM_BUFFERS: tl.constexpr,  #
-              NUM_WARPS: tl.constexpr,  #
+              NUM_MMA_WARPS: tl.constexpr,  #
+              NUM_MMA_GROUPS: tl.constexpr,  #
               ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
+    BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
     # allocate buffers
-    q_tiles = tlx.local_alloc((BLOCK_M, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS)
+    q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS)
     k_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS)
     v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS)
 
     # allocate barriers
-    q_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-    k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
+    k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS)
     k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
-    v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS)
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
 
     with tlx.async_tasks():
@@ -73,19 +76,24 @@ def _attn_fwd(sm_scale, M,  #
             kv_offset_y = offset_y + lo
 
             # load q: it will stay in SRAM throughout
-            q_full = tlx.local_view(q_fulls, 0)
-            tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M * HEAD_DIM)  # float16
-            q_tile = tlx.local_view(q_tiles, 0)
-            tlx.async_descriptor_load(desc_q, q_tile, [qo_offset_y, 0], q_full)
+            for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
+                q_full = tlx.local_view(q_fulls, cid)
+                tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
+                q_tile = tlx.local_view(q_tiles, cid)
+                qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
+                tlx.async_descriptor_load(desc_q, q_tile, [qo_offset_y_split, 0], q_full)
 
             # loop over loading k, v
-            kv_phase = 1
-            buf_id = 0
-            for start_n in tl.range(lo, hi, BLOCK_N):
+            kv_phase = 0
+            acc_cnt = 0
+            for _ in tl.range(lo, hi, BLOCK_N):
+                buf_id = acc_cnt % NUM_BUFFERS
+                # buffers in a row share the same phase
+                kv_phase = kv_phase ^ (buf_id == 0)
+
                 # wait for the K buffer to be released by the consumer
                 k_empty = tlx.local_view(k_empties, buf_id)
                 tlx.barrier_wait(k_empty, kv_phase)
-
                 # load K
                 k_full = tlx.local_view(k_fulls, buf_id)
                 k_tile = tlx.local_view(k_tiles, buf_id)
@@ -102,32 +110,35 @@ def _attn_fwd(sm_scale, M,  #
                 tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
 
                 kv_offset_y += BLOCK_N
-
-                # buffers in a row share the same phase
-                kv_phase =  kv_phase ^ 1 if (buf_id == NUM_BUFFERS - 1) else kv_phase
-                buf_id = 0 if (buf_id == NUM_BUFFERS - 1) else buf_id + 1
+                acc_cnt += 1
 
         # consumer group
-        with tlx.async_task(num_warps=4, registers=256):
+        with tlx.async_task(num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS, registers=232, replicate=NUM_MMA_GROUPS):
             # initialize pointer to m and l
-            m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-            l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-            acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+            m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
+            l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
+            acc = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=tl.float32)
 
             # load scales
             qk_scale = sm_scale
             qk_scale *= 1.44269504  # 1/log(2)
+
             # wait for the Q buffer to be populated by the producer
-            q_full = tlx.local_view(q_fulls, 0)
+            cid = tlx.async_task_replica_id()
+            q_full = tlx.local_view(q_fulls, cid)
             tlx.barrier_wait(q_full, 0)
-            q_tile = tlx.local_view(q_tiles, 0)
+            q_tile = tlx.local_view(q_tiles, cid)
 
             lo, hi = 0, N_CTX
-            kv_phase = 0
-            buf_id = 0
+            kv_phase = 1
+            acc_cnt = 0
 
             # loop over k, v and update accumulator
-            for start_n in tl.range(lo, hi, BLOCK_N):
+            for _ in tl.range(lo, hi, BLOCK_N):
+                buf_id = acc_cnt % NUM_BUFFERS
+                # buffers in a row share the same phase
+                kv_phase = kv_phase ^ (buf_id == 0)
+
                 # wait for the K buffer to be populated by the producer
                 k_full = tlx.local_view(k_fulls, buf_id)
                 tlx.barrier_wait(k_full, kv_phase)
@@ -168,10 +179,7 @@ def _attn_fwd(sm_scale, M,  #
                 # place this at the end of the loop to reduce register pressure
                 l_i = l_i * alpha + l_ij
                 m_i = m_ij
-
-                # buffers in a row share the same phase
-                kv_phase =  kv_phase ^ 1 if (buf_id == NUM_BUFFERS - 1) else kv_phase
-                buf_id = 0 if (buf_id == NUM_BUFFERS - 1) else buf_id + 1
+                acc_cnt += 1
 
             # epilogue
             start_m = tl.program_id(0)
@@ -180,12 +188,13 @@ def _attn_fwd(sm_scale, M,  #
             off_h = off_hz % H
             offset_y = off_z * (N_CTX * H) + off_h * N_CTX
             qo_offset_y = offset_y + start_m * BLOCK_M
+            qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
             m_i += tl.math.log2(l_i)
             acc = acc / l_i[:, None]
-            offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
             m_ptrs = M + off_hz * N_CTX + offs_m
             tl.store(m_ptrs, m_i)
-            desc_o.store([qo_offset_y, 0], acc.to(tlx.dtype_of(desc_o)))
+            desc_o.store([qo_offset_y_split, 0], acc.to(tlx.dtype_of(desc_o)))
 
 
 class _attention(torch.autograd.Function):
@@ -208,11 +217,9 @@ class _attention(torch.autograd.Function):
         dummy_block = [1, 1]
         desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         if q.dtype == torch.float8_e5m2:
-            desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
-                                        block_shape=dummy_block)
+            desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1], block_shape=dummy_block)
         else:
-            desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                        block_shape=dummy_block)
+            desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
 
@@ -225,7 +232,7 @@ class _attention(torch.autograd.Function):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
-        _attn_fwd[grid](
+        _attn_fwd_ws[grid](
             sm_scale, M,  #
             q.shape[0], q.shape[1],  #
             desc_q, desc_k, desc_v, desc_o,  #
@@ -291,3 +298,78 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, dtype=torch.float16):
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+
+
+try:
+    from flash_attn.flash_attn_interface import \
+        flash_attn_qkvpacked_func as flash_attn_func
+    HAS_FLASH = True
+except BaseException:
+    HAS_FLASH = False
+
+TORCH_HAS_FP8 = False
+BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
+# vary seq length for fixed head and batch=4
+configs = []
+configs.append(
+    triton.testing.Benchmark(
+        x_names=["N_CTX"],
+        x_vals=[2**i for i in range(10, 15)],
+        line_arg="provider",
+        line_vals=["triton-fp16"]  +
+        (["flash"] if HAS_FLASH else []),
+        line_names=["Triton [FP16]"] +
+        (["Flash-2"] if HAS_FLASH else []),
+        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+        ylabel="TFLOPS",
+        plot_name=
+        f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+        args={
+            "H": N_HEADS,
+            "BATCH": BATCH,
+            "HEAD_DIM": HEAD_DIM,
+            "mode": "fwd",
+        },
+    ))
+
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+    if "triton" in provider:
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        if mode == "fwd" and "fp8" in provider:
+            q = q.to(torch.float8_e5m2)
+            k = k.to(torch.float8_e5m2)
+            v = v.permute(0, 1, 3, 2).contiguous()
+            v = v.permute(0, 1, 3, 2)
+            v = v.to(torch.float8_e5m2)
+        sm_scale = 1.3
+        fn = lambda: attention(q, k, v, sm_scale)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn)
+
+    if provider == "flash":
+        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        fn = lambda: flash_attn_func(qkv)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn)
+    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+    total_flops = 2 * flops_per_matmul
+    if mode == "bwd":
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops * 1e-12 / (ms * 1e-3)
+
+
+if __name__ == "__main__":
+    # only works on post-Ampere GPUs right now
+    bench_flash_attention.run(save_path=".", print_data=True)
