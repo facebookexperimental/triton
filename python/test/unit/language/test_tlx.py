@@ -777,7 +777,7 @@ def test_descriptor_load(device):
     not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
     reason="Requires compute capability >= 9 for NV",
 )
-def test_descriptor_load_ws(device):
+def test_ws_async_dot(device):
     from triton.tools.tensor_descriptor import TensorDescriptor
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
@@ -794,8 +794,6 @@ def test_descriptor_load_ws(device):
         buffer_op1 = tlx.local_view(op1, 0)
         buffer_op2 = tlx.local_view(op2, 0)
         bars = tlx.alloc_barriers(tl.constexpr(2))
-        mb0 = tlx.local_view(bars, 0)
-        mb1 = tlx.local_view(bars, 1)
 
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
@@ -803,6 +801,8 @@ def test_descriptor_load_ws(device):
         with tlx.async_tasks():
             with tlx.async_task("default"):
                 # Compute tile offset in global memory
+                mb0 = tlx.local_view(bars, 0)
+                mb1 = tlx.local_view(bars, 1)
                 # TMA load op1
                 tlx.barrier_expect_bytes(mb0, BLOCK_SIZE_M * BLOCK_SIZE_K * 2)
                 tlx.async_descriptor_load(desc_in_1, buffer_op1, [off_m, off_n], mb0)
@@ -811,6 +811,8 @@ def test_descriptor_load_ws(device):
                 tlx.async_descriptor_load(desc_in_2, buffer_op2, [off_m, off_n], mb1)
 
             with tlx.async_task(num_warps=4):
+                mb0 = tlx.local_view(bars, 0)
+                mb1 = tlx.local_view(bars, 1)
                 tlx.barrier_wait(bar=mb0, phase=0)
                 tlx.barrier_wait(bar=mb1, phase=0)
                 # async_dot
@@ -820,14 +822,15 @@ def test_descriptor_load_ws(device):
                 )
                 # async_wait
                 acc = tlx.async_dot_wait(tl.constexpr(0), acc)
-                # TODO. TMA store + WS
+                # TMA store + WS
                 desc_out.store([off_m, off_n], acc.to(tlx.dtype_of(desc_out)))
+                # tlx.async_descriptor_store(desc_out, acc, [off_m, off_n])
 
     triton.set_allocator(alloc_fn)
     M, N, K = (64, 64, 32)
     BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = (64, 64, 32)
-    x = torch.ones((M, K), dtype=torch.float16, device=device)
-    y = torch.ones((K, N), dtype=torch.float16, device=device)
+    x = torch.randn((M, K), dtype=torch.float16, device=device)
+    y = torch.randn((K, N), dtype=torch.float16, device=device)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
     desc_in_1 = TensorDescriptor(
