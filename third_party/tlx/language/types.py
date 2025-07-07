@@ -1,5 +1,5 @@
 import triton.language.core as tl
-from typing import Optional, Self
+from typing import Optional, Self, List
 import enum
 from abc import abstractmethod
 
@@ -146,6 +146,9 @@ class buffered_tensor(tl.base_value):
         self.storage = storage
         # Layout encoding
         self.layout = layout
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
 
     def make_permute(self, handle, dims) -> Self:
         permuted_type = tl.block_type(self.type.scalar, [self.shape[d] for d in dims])

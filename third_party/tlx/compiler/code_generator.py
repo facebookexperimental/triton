@@ -110,13 +110,13 @@ def visit_withAsyncTasks(self, node):
         for stmt in stmts:
             assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
-
             if task.is_default:
                 task_body = ws_op.get_default_region()
 
                 block = self.builder.create_block_with_parent(task_body, [])
                 self.builder.set_insertion_point_to_start(block)
-                self.visit(stmt)
+                with enter_sub_region(self):
+                    self.visit(stmt)
 
                 self.builder.create_warp_yield_op()
             else:
@@ -128,7 +128,8 @@ def visit_withAsyncTasks(self, node):
 
                     block = self.builder.create_block_with_parent(task_body, [])
                     self.builder.set_insertion_point_to_start(block)
-                    self.visit(stmt)
+                    with enter_sub_region(self):
+                        self.visit(stmt)
 
                     for name in captures:
                         val = liveins[name]
