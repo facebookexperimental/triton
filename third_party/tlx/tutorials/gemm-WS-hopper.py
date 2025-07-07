@@ -9,6 +9,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+M, N, K = (8192, 8192, 8192)
+BM, BN, BK = (256, 128, 64)
 
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
@@ -103,7 +105,7 @@ def matmul_kernel_tlx_ws(
                     full_a_2nd)
 
                 # Flip phase after every NUM_STAGES iterations finish
-                p = (p^1) if (buf == (NUM_STAGES-1)) else p
+                p = p ^ (buf == (NUM_STAGES-1))
 
         # consumers (wgmma + async store)
         with tlx.async_task(num_warps=4, replicate=2):
@@ -138,12 +140,12 @@ def matmul_kernel_tlx_ws(
                 tlx.barrier_arrive(empty_b)
 
                 # Flip phase after every NUM_STAGES iterations finish
-                p = (p^1) if (buf == (NUM_STAGES-1)) else p
+                p = p ^ (buf == (NUM_STAGES-1))
 
             desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
 
 
-def matmul(a, b, BM=256, BN=128, BK=64):
+def matmul(a, b, BM=BM, BN=BN, BK=BK):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -187,8 +189,6 @@ def matmul(a, b, BM=256, BN=128, BK=64):
 triton.set_allocator(alloc_fn)
 
 torch.manual_seed(0)
-M, N, K = (8192, 8192, 8192)
-BM, BN, BK = (256, 64, 32)
 
 a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
 b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
