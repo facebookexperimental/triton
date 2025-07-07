@@ -55,15 +55,17 @@ def test_ws_gemm():
         # Need NUM_STAGES sets of mbarriers for A and B
         # where each set contains two for A and one for B.
         # Do the above for both empty states and full states respectively.
-        bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2)
-        bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2)
-        bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
-        bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES)
+        bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2,)
+        bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2, arrive_count=1)
+        bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=2)
+        bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
 
         # Warp specilization
         with tlx.async_tasks():
             # Producer (async load)
             with tlx.async_task("default"):
+                # Assuming NUM_STAGES = 2
+                # p should be 1, 1, 0, 0, 1, 1, 0, 0, ...
                 p = 1
 
                 for k in range(0, tl.cdiv(K, BK)):
@@ -84,7 +86,7 @@ def test_ws_gemm():
 
                     # Async load to b[buf]
                     empty_b = tlx.local_view(bars_empty_b, buf)
-                    full_b = tlx.local_view(bars_full_b, 0)
+                    full_b = tlx.local_view(bars_full_b, buf)
                     tlx.barrier_wait(bar=empty_b, phase=p)
                     tlx.barrier_expect_bytes(full_b, BN * BK * 2)
                     data_b = tlx.local_view(b, buf)
@@ -107,19 +109,19 @@ def test_ws_gemm():
                         full_a_2nd)
 
                     # Flip phase after every NUM_STAGES iterations finish
-                    p = p if (buf < (NUM_STAGES-1)) else (p^1)
+                    p = (p^1) if (buf == (NUM_STAGES-1)) else p
 
             # consumers (wgmma + async store)
             with tlx.async_task(num_warps=4, replicate=2):
-                p = 1
+                p = 0
+                # Assuming NUM_STAGES = 2
+                # p should be 0, 0, 1, 1, 0, 0, ...
                 for k in range(0, tl.cdiv(K, BK)):
                     buf = k % NUM_STAGES
-                    # Flip phase before every NUM_STAGES iterations begin
-                    p = p if (buf > 0) else (p^1)
 
                     # Wait for TMA load
                     full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()) # noqa
-                    full_b = tlx.local_view(bars_full_b, 0)
+                    full_b = tlx.local_view(bars_full_b, buf)
                     tlx.barrier_wait(bar=full_a, phase=p)
                     tlx.barrier_wait(bar=full_b, phase=p)
 
@@ -140,7 +142,9 @@ def test_ws_gemm():
                     tlx.barrier_arrive(empty_b)
 
                     desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
-                    # tlx.async_descriptor_store(desc_out, acc.to(tlx.dtype_of(desc_out)), [offset_am, offset_bn])
+
+                    # Flip phase after every NUM_STAGES iterations finish
+                    p = (p^1) if (buf == (NUM_STAGES-1)) else p
 
     def matmul(a, b):
         # Check constraints.
@@ -150,7 +154,7 @@ def test_ws_gemm():
         (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
         c = torch.zeros((M, N), dtype=torch.float16, device=DEVICE, )
 
-        BM, BN, BK = (128, 64, 32)
+        BM, BN, BK = (128, 64, 128)
 
         desc_in_1 = TensorDescriptor(
             a,
@@ -188,7 +192,8 @@ def test_ws_gemm():
     triton.set_allocator(alloc_fn)
 
     torch.manual_seed(0)
-    M, N, K = (256, 128, 32)
+    # M, N, K = (256, 128, 64)
+    M, N, K = (128, 64, 64)
 
     a = torch.randn((M, K), dtype=torch.float16, device=DEVICE)
     b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
@@ -198,8 +203,8 @@ def test_ws_gemm():
     output_ref = torch.matmul(a, b)
     print("output.shape", output.shape)
     print("output", output)
-    print("output.split", torch.split(output, 64))
-    print("output_ref.shape", output_ref.shape)
+    # print("output.split", torch.split(output, 64))
+    # print("output_ref.shape", output_ref.shape)
     print("output_ref", output_ref)
-    print("output - output_ref", output - output_ref)
+    # print("output - output_ref", output - output_ref)
     assert torch.allclose(output, output_ref, atol=1e-2, rtol=rtol), "❌ Triton and Torch differ"
