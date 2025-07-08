@@ -67,22 +67,15 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     elem_type = dtype.to_ir(_builder)
     if layout is None:
         if storage == tlx.storage_kind.smem:
-            layout = tlx.nv_mma_shared_layout_encoding(
-                    shape=shape, 
-                    order=[1, 0], 
-                    elemType=dtype,
-                    numCTAsPerCGA=[1, 1], 
-                    numCTASplit=[1, 1], 
-                    numCTAOrder=[1, 1],
-                    fp4Padded=False)
-            layout_handle = _builder.make_nv_mma_shared_encoding_attr(
-                [int(x) for x in layout.shape],
+            layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+            layout_handle = _builder.make_swizzled_shared_encoding_attr(
+                layout.vectorSize,
+                layout.perPhase,
+                layout.maxPhase,
                 layout.order,
-                layout.elemType.to_ir(_builder),
                 layout.numCTAsPerCGA,
                 layout.numCTASplit,
                 layout.numCTAOrder,
-                layout.fp4Padded,
             )
         else:
             layout = tlx.tensor_memory_layout_encoding.make_default(shape)

@@ -97,8 +97,7 @@ public:
       for (auto [i, result] : llvm::enumerate(op->getResults())) {
         auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
         if (!lattice)
-          continue;
-        // llvm_unreachable("Lattice not found.");
+          llvm_unreachable("Lattice not found.");
         if (lattice->getValue().isUninitialized())
           continue;
         if (auto origType = dyn_cast<gpu::MemDescType>(result.getType())) {
