@@ -470,6 +470,13 @@ LogicalResult MemDescReshapeOp::verify() {
   return success();
 }
 
+// MemDescReinterpretOp
+LogicalResult MemDescReinterpretOp::verify() {
+  if (getSrc().getType().getMemorySpace() != getType().getMemorySpace())
+    return emitError("source and destination memory space must match");
+  return success();
+}
+
 // LocalAllocOp
 void LocalAllocOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
