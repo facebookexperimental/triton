@@ -31,53 +31,99 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_M = nargs["BM"]
     BLOCK_N = nargs["BN"]
     BLOCK_K = nargs["BK"]
-    nargs["desc_in_1"].block_shape = [BLOCK_M // 2, BLOCK_K]
-    nargs["desc_in_2"].block_shape = [BLOCK_K, BLOCK_N]
-    nargs["desc_out"].block_shape = [BLOCK_M // 2, BLOCK_N]
+    NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
+    BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
+    nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
+    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
+    if EPILOGUE_SUBTILE:
+        nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N // 2]
+    else:
+        nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N]
 
 
 @triton.autotune(
     configs=[
-        # triton.Config({'BM': 256, 'BN': 128, 'BK': 64, 'NUM_STAGES': 2,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
-        # triton.Config({'BM': 256, 'BN': 128, 'BK': 32, 'NUM_STAGES': 4,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
-        triton.Config({'BM': BM, 'BN': BN, 'BK': BK, 'NUM_STAGES': NUM_STAGES,}, num_warps=4, pre_hook=matmul_tma_set_block_size_hook) 
-        for BM in [256]
-        for BN in [64, 128, 256]
-        for BK in [32, 64]
-        for NUM_STAGES in [2, ]
+        triton.Config(
+            {
+                "BM": 128,
+                "BN": 256,
+                "BK": 64,
+                "GROUP_SIZE_M": 8,
+                "NUM_STAGES": 4,
+                "NUM_MMA_WARPS": 8,
+                "NUM_MMA_GROUPS": 2,
+                "EPILOGUE_SUBTILE": True,
+            },
+            num_stages=1,
+            num_warps=4,
+            pre_hook=matmul_tma_set_block_size_hook
+        ),
+        triton.Config(
+            {
+                "BM": 128,
+                "BN": 256,
+                "BK": 64,
+                "GROUP_SIZE_M": 8,
+                "NUM_STAGES": 3,
+                "NUM_MMA_WARPS": 8,
+                "NUM_MMA_GROUPS": 2,
+                "EPILOGUE_SUBTILE": False,
+            },
+            num_stages=1,
+            num_warps=4,
+            pre_hook=matmul_tma_set_block_size_hook
+        ),
     ],
-    key=["K",],
+    key=["M", "N", "K"],
+    use_cuda_graph=True,
 )
 @triton.jit
 def matmul_kernel_tlx_ws(
-    desc_in_1, desc_in_2, desc_out, #
-    K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,  #
+    a_desc, b_desc, c_desc,  #
+    M, N, K,  #
+    BM: tl.constexpr,  #
+    BN: tl.constexpr,  #
+    BK: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
     NUM_STAGES: tl.constexpr,  #
+    NUM_MMA_WARPS: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,  #
 ):
     # Descriptor
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    offset_am = pid_m * BM
-    offset_bn = pid_n * BN
+    BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
 
     # Need NUM_STAGES sets of SMEM buffers for A and B
     # where each set contains two for A and one for B.
     # Split A into two in M-dimension to have two consumer tasks for wgmma
-    a = tlx.local_alloc((BM // 2, BK), tl.float16, NUM_STAGES * 2)
-    b = tlx.local_alloc((BK, BN), tl.float16, NUM_STAGES)
+    a = tlx.local_alloc((BLOCK_M_SPLIT, BK), tlx.dtype_of(a_desc), NUM_STAGES * NUM_MMA_GROUPS)
+    b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
 
     # Need NUM_STAGES sets of mbarriers for A and B
     # where each set contains two for A and one for B.
     # Do the above for both empty states and full states respectively.
-    bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2,)
-    bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * 2, arrive_count=1)
-    bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=2)
+    bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
+    bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
+    bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS)
     bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
 
     # Warp specilization
     with tlx.async_tasks():
         # Producer (async load)
         with tlx.async_task("default"):
+            pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BM)
+            num_pid_n = tl.cdiv(N, BN)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + (pid % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+            offset_am = pid_m * BM
+            offset_bn = pid_n * BN
+
             # Assuming NUM_STAGES = 2
             # p should be 1, 1, 0, 0, 1, 1, 0, 0, ...
             p = 1
@@ -90,10 +136,10 @@ def matmul_kernel_tlx_ws(
                 empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
                 full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
                 tlx.barrier_wait(bar=empty_a_1st, phase=p)  # EmptyBar A1 wait
-                tlx.barrier_expect_bytes(full_a_1st, (BM//2) * BK * 2)
+                tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * 2)
                 data_a_1st = tlx.local_view(a, buf)  # smem data
                 tlx.async_descriptor_load(
-                    desc_in_1,
+                    a_desc,
                     data_a_1st,
                     [offset_am, offset_k],
                     full_a_1st)
@@ -105,7 +151,7 @@ def matmul_kernel_tlx_ws(
                 tlx.barrier_expect_bytes(full_b, BN * BK * 2)
                 data_b = tlx.local_view(b, buf)
                 tlx.async_descriptor_load(
-                    desc_in_2,
+                    b_desc,
                     data_b,
                     [offset_k, offset_bn],
                     full_b)
@@ -114,12 +160,12 @@ def matmul_kernel_tlx_ws(
                 empty_a_2nd = tlx.local_view(bars_empty_a, buf+NUM_STAGES)
                 full_a_2nd = tlx.local_view(bars_full_a, buf+NUM_STAGES)
                 tlx.barrier_wait(bar=empty_a_2nd, phase=p)
-                tlx.barrier_expect_bytes(bar=full_a_2nd, size=(BM//2) * BK * 2)
+                tlx.barrier_expect_bytes(bar=full_a_2nd, size=BLOCK_M_SPLIT * BK * 2)
                 data_a_2nd = tlx.local_view(a, buf+NUM_STAGES)  # smem data
                 tlx.async_descriptor_load(
-                    desc_in_1,
+                    a_desc,
                     data_a_2nd,
-                    [offset_am + (BM//2), offset_k],
+                    [offset_am + BLOCK_M_SPLIT, offset_k],
                     full_a_2nd)
 
                 # Flip phase after every NUM_STAGES iterations finish
@@ -127,6 +173,18 @@ def matmul_kernel_tlx_ws(
 
         # consumers (wgmma + async store)
         with tlx.async_task(num_warps=4, replicate=2):
+            pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BM)
+            num_pid_n = tl.cdiv(N, BN)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + (pid % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+            offset_am = pid_m * BM
+            offset_bn = pid_n * BN
+
             p = 0
             # Assuming NUM_STAGES = 2
             # p should be 0, 0, 1, 1, 0, 0, ...
@@ -160,7 +218,17 @@ def matmul_kernel_tlx_ws(
                 # Flip phase after every NUM_STAGES iterations finish
                 p = p ^ (buf == (NUM_STAGES-1))
 
-            desc_out.store([offset_am + (BM // 2) * tlx.async_task_replica_id(), offset_bn], acc.to(tlx.dtype_of(desc_out)))  # noqa
+            offset_cm = offset_am + BLOCK_M_SPLIT * tlx.async_task_replica_id()
+            if EPILOGUE_SUBTILE:
+                acc = tl.reshape(acc, (BLOCK_M_SPLIT, 2, BN // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc0, acc1 = tl.split(acc)
+                c0 = acc0.to(tlx.dtype_of(c_desc))
+                c_desc.store([offset_cm, offset_bn], c0)
+                c1 = acc1.to(tlx.dtype_of(c_desc))
+                c_desc.store([offset_cm, offset_bn + BN // 2], c1)
+            else:
+                c_desc.store([offset_cm, offset_bn], acc.to(tlx.dtype_of(c_desc)))  # noqa
 
 
 def matmul(a, b,):
@@ -193,11 +261,11 @@ def matmul(a, b,):
     )
 
     grid = lambda META: (  # noqa E731
-        triton.cdiv(M, META['BM']), triton.cdiv(N, META['BN']),
+        triton.cdiv(M, META['BM']) * triton.cdiv(N, META['BN']),
     )
     matmul_kernel_tlx_ws[grid](
         desc_in_1, desc_in_2, desc_out,  #
-        K=K,
+        M, N, K,  #
     )
     return c
 
