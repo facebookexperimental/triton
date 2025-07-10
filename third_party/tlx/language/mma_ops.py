@@ -27,11 +27,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
 
 
 def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=None):
-    layout_handle = _builder.make_dot_operand_encoding_attr(
-        opnd.handle,
-        opIdx,
-        parent_layout
-    )
+    layout_handle = _builder.make_dot_operand_encoding_attr(opnd.handle, opIdx, parent_layout)
     return _builder.create_require_layout(opnd.handle, layout_handle)
 
 
@@ -82,6 +78,18 @@ def async_dot(
     # TODO. batched dot is not supported yet
     if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.smem:
         A_handle = require_nv_mma_shared_layout(A, _builder)
+    if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.tmem:
+        # require A's TMEM layout to have `unpacked` set to False
+        assert isinstance(A.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+        if A.layout.unpacked:
+            layout_handle = _builder.make_tensor_memory_encoding_attr(
+                A.layout.blockM,
+                A.layout.blockN,
+                False,  # unpacked == False
+                A.layout.CTASplitM,
+                A.layout.CTASplitN,
+            )
+            A_handle = _builder.create_require_layout(A.handle, layout_handle)
     elif isinstance(A, tl.tensor):
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
@@ -96,13 +104,11 @@ def async_dot(
         output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, mBarrier.handle if mBarrier else None)
         return tlx.async_token(output)
     else:
-        mma_layout = _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
-                                                           _builder.options.num_warps)
+        mma_layout = _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0, _builder.options.num_warps)
         acc = _builder.create_require_layout(acc_handle, mma_layout)
         if isinstance(A, tl.tensor):
             A_handle = require_dot_operand_layout(A, 0, mma_layout, _builder)
-        output = _builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision,
-         max_num_imprecise_acc, True)
+        output = _builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision, max_num_imprecise_acc, True)
         # Release the mma layout for the output to conform to what the user expects
         output = _builder.create_release_layout(output)
         return tl.tensor(output, ret_ty)

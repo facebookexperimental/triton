@@ -474,7 +474,7 @@ def test_async_dot(device):
 
     @triton.jit
     def wgmma_kernel_A_smem(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -500,10 +500,9 @@ def test_async_dot(device):
         c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
         tl.store(c_ptrs, c)
 
-
     @triton.jit
     def wgmma_kernel_A_reg(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -536,7 +535,7 @@ def test_async_dot(device):
     # test smem
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = wgmma_kernel_A_smem[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-                                       z.stride(1), **kern_kwargs)
+                                         z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttg.async_copy_global_to_local") == 2
     z_ref = torch.matmul(x, y)
@@ -545,7 +544,7 @@ def test_async_dot(device):
     # test reg
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = wgmma_kernel_A_reg[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-                                       z.stride(1), **kern_kwargs)
+                                        z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttg.async_copy_global_to_local") == 1
     torch.testing.assert_close(z, z_ref)
@@ -624,6 +623,79 @@ def test_async_dot_blackwell(device):
     assert ptx.count("tcgen05.dealloc") == 1
 
     ref_out = torch.matmul(x, y) + torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] != 10,
+    reason="Requires compute capability == 10 (Blackwell) for NV",
+)
+def test_async_dot_blackwell_tmem_A(device):
+    """
+    Test D = A*B where A is in TMEM instead of SMEM
+    """
+
+    @triton.jit
+    def tcgen5_dot_kernel_tmem_A(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
+                                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                                 OUT_DTYPE: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        # init acc in TMEM
+        acc_init = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(acc_buffers, 0)
+        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
+        a_smem = tlx.local_view(buf_alloc_a, 0)
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+        tlx.async_load(a_ptrs, a_smem)
+        tlx.async_load(b_ptrs, b_smem)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        # load A from SMEM to Reg
+        a_reg = tlx.local_load(a_smem)
+
+        # store A to TMEM
+        buffers_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
+        a_tmem = tlx.local_view(buffers_a, 0)
+        tlx.local_store(a_tmem, a_reg, tlx.storage_kind.tmem)
+
+        # acc_tmem = acc_tmem + a_tmem * b_smem
+        tlx.async_dot(a_tmem, b_smem, acc_tmem, mBarrier=None, out_dtype=OUT_DTYPE)
+        # load result from TMEM to Reg
+        result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+
+        c = result.to(tl.float16)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 32, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kernel = tcgen5_dot_kernel_tmem_A[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
+                                              z.stride(1), **kern_kwargs)
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.tmem_alloc") == 2
+    assert ttgir.count("ttng.tmem_store") == 2
+    assert ttgir.count("ttng.tc_gen5_mma") == 1
+
+    xy = torch.matmul(x, y)
+    ref_out = xy
     torch.testing.assert_close(z, ref_out)
 
 
