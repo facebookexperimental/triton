@@ -68,11 +68,11 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     if layout is None:
         if storage == tlx.storage_kind.smem:
             layout = tlx.nv_mma_shared_layout_encoding(
-                    shape=shape, 
-                    order=[1, 0], 
+                    shape=shape,
+                    order=[1, 0],
                     elemType=dtype,
-                    numCTAsPerCGA=[1, 1], 
-                    numCTASplit=[1, 1], 
+                    numCTAsPerCGA=[1, 1],
+                    numCTASplit=[1, 1],
                     numCTAOrder=[1, 1],
                     fp4Padded=False)
             layout_handle = _builder.make_nv_mma_shared_encoding_attr(
@@ -123,8 +123,8 @@ def local_view(
     """
     buffer_idx = _convert_elem_to_ir_value(_builder, buffer_idx, require_i64=False)
     base_tensor = local_allocated_buffers.base_tensor
-    view_shape = base_tensor.shape
-    view_type = tl.block_type(base_tensor.type.element_ty, view_shape)
+    view_shape = base_tensor.type.shape
+    view_type = tl.block_type(base_tensor.type.dtype, view_shape)
     view_handle = _builder.create_memdesc_subview(base_tensor.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarriers):
         return tlx.mbarrier(view_handle, )
@@ -132,8 +132,8 @@ def local_view(
         return tlx.buffered_tensor(
             view_handle,
             view_type,
-            base_tensor.storage,
-            base_tensor.layout,
+            base_tensor.type.storage,
+            base_tensor.type.layout,
         )
 
 
@@ -160,8 +160,8 @@ def subslice(
     return tlx.buffered_tensor(
         _builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size),
         subslice_type,
-        local_allocated_buffer.storage,
-        local_allocated_buffer.layout,
+        local_allocated_buffer.type.storage,
+        local_allocated_buffer.type.layout,
     )
 
 
@@ -247,7 +247,7 @@ def local_load(
         output = _builder.create_release_layout(load_handle)
         return tl.tensor(output, src.type)
 
-    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)
+    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type.type)
 
 
 @tl.builtin
@@ -281,7 +281,7 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _builder=
         :param dims: The desired ordering of dimensions.  For example,
             :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
     """
-    if len(input.shape) != len(dims):
+    if len(input.type.shape) != len(dims):
         raise ValueError("permute dims must have the same length as input shape")
     if sorted(tl._unwrap_if_constexpr(d) for d in dims) != list(range(len(dims))):
         raise ValueError(f"permute dims must be a permutation of 0, 1, ..., n-1, but were {dims}")

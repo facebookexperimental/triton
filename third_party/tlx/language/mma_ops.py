@@ -6,8 +6,8 @@ from .utility import cuda_parse_arch
 
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
-    assert isinstance(x.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
-    if isinstance(x.layout, tlx.swizzled_shared_layout_encoding):
+    assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
+    if isinstance(x.type.layout, tlx.swizzled_shared_layout_encoding):
         layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.layout.order, elemType=x.dtype,
                                                    numCTAsPerCGA=[1, 1], numCTASplit=[1, 1], numCTAOrder=[1, 1],
                                                    fp4Padded=False)
@@ -22,7 +22,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
         )
         return _builder.create_require_layout(x.handle, layout_handle)
     else:
-        assert isinstance(x.layout, tlx.nv_mma_shared_layout_encoding), "input must be a shared mma tensor"
+        assert isinstance(x.type.layout, tlx.nv_mma_shared_layout_encoding), "input must be a shared mma tensor"
         return x.handle
 
 
