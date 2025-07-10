@@ -61,6 +61,10 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
   if (auto requireLayoutOp = dyn_cast<triton::tlx::RequireLayoutOp>(op)) {
+
+    if (isa<RankedTensorType>(requireLayoutOp.getType()))
+      return success();
+
     Attribute layout = requireLayoutOp.getType().getEncoding();
     const auto layoutLattice = LayoutEncoding(layout);
     for (auto operandLattice : operands) {
