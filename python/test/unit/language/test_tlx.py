@@ -474,7 +474,7 @@ def test_async_dot(device):
 
     @triton.jit
     def wgmma_kernel_A_smem(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -500,9 +500,10 @@ def test_async_dot(device):
         c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
         tl.store(c_ptrs, c)
 
+
     @triton.jit
     def wgmma_kernel_A_reg(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -535,7 +536,7 @@ def test_async_dot(device):
     # test smem
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = wgmma_kernel_A_smem[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-                                         z.stride(1), **kern_kwargs)
+                                       z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttg.async_copy_global_to_local") == 2
     z_ref = torch.matmul(x, y)
@@ -544,7 +545,7 @@ def test_async_dot(device):
     # test reg
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = wgmma_kernel_A_reg[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-                                        z.stride(1), **kern_kwargs)
+                                       z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttg.async_copy_global_to_local") == 1
     torch.testing.assert_close(z, z_ref)

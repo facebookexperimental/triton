@@ -94,7 +94,7 @@ def async_dot(
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
     else:
-        # Registers or TMEM buffer do not need mma shared layout
+        # Registers do not need mma shared layout
         A_handle = A.handle
 
     B_handle = require_nv_mma_shared_layout(B, _builder)
