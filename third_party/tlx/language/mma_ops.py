@@ -31,6 +31,23 @@ def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=N
     return _builder.create_require_layout(opnd.handle, layout_handle)
 
 
+def require_tmem_layout_unpacked(src: tlx.buffered_tensor, unpacked: bool, _builder=None):
+    assert isinstance(src, tlx.buffered_tensor) and src.storage == tlx.storage_kind.tmem and isinstance(
+        src.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+    old_layout = src.layout
+    if old_layout.unpacked != unpacked:
+        layout_handle = _builder.make_tensor_memory_encoding_attr(
+            old_layout.blockM,
+            old_layout.blockN,
+            unpacked,
+            old_layout.CTASplitM,
+            old_layout.CTASplitN,
+        )
+        return _builder.create_require_layout(src.handle, layout_handle)
+    # if the layout is already correct, return the original handle
+    return src.handle
+
+
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
@@ -82,26 +99,16 @@ def async_dot(
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
     else:
-        assert isinstance(A, tlx.buffered_tensor) and A.type.storage == tlx.storage_kind.tmem and isinstance(
-            A.type.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
-        if A.type.layout.unpacked:
-            layout_handle = _builder.make_tensor_memory_encoding_attr(
-                A.type.layout.blockM,
-                A.type.layout.blockN,
-                False,  # unpacked == False
-                A.type.layout.CTASplitM,
-                A.type.layout.CTASplitN,
-            )
-            A_handle = _builder.create_require_layout(A.handle, layout_handle)
-        else:
-            # A already has `unpacked` set to False, no need for a require_layout
-            A_handle = A.handle
+        # set unpacked to False for A
+        A_handle = require_tmem_layout_unpacked(A, False, _builder)
 
     B_handle = require_nv_mma_shared_layout(B, _builder)
 
     if version == 5:
         assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
-        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, mBarrier.handle if mBarrier else None)
+        # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
+        acc_handle = require_tmem_layout_unpacked(acc, True, _builder)
+        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, mBarrier.handle if mBarrier else None)
         return tlx.async_token(output)
     else:
         mma_layout = _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0, _builder.options.num_warps)

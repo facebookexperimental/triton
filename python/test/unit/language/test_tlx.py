@@ -467,6 +467,80 @@ def test_local_trans(device):
 
 
 @pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires compute capability >= 10 for NV",
+)
+def test_local_reinterpret(device):
+
+    @triton.jit
+    def local_reinterpret_kernel(
+        x32_ptr,
+        y32_ptr,
+        x16_ptr,
+        y16_ptr,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        off_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        # Compute global offsets
+        input_offset = off_m[:, None] * BLOCK_SIZE_N + off_n[None, :]
+        output_offset = off_m[:, None] * BLOCK_SIZE_N + off_n[None, :]
+
+        tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        tmem_buffer_0 = tlx.local_view(tmem_buffers, 0)
+
+        # x32 GMEM -> x32 SMEM -> x32 Reg -> x32 TMEM -> x32 Reg -> y32 GMEM
+        smem_buffers32 = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1),
+                                         tlx.storage_kind.smem)
+        smem_buffer_32_0 = tlx.local_view(smem_buffers32, 0)
+        tlx.async_load(x32_ptr + input_offset, smem_buffer_32_0)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        x32_reg = tlx.local_load(smem_buffer_32_0)
+        tlx.local_store(tmem_buffer_0, x32_reg, tlx.storage_kind.tmem)
+        x32_reg_from_tmem = tlx.local_load(tmem_buffer_0, tlx.storage_kind.tmem)
+        tl.store(y32_ptr + output_offset, x32_reg_from_tmem)
+
+        # x16 GMEM -> x16 SMEM -> x16 Reg -> x16 TMEM -> x16 Reg -> y16 GMEM
+        smem_buffers16 = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1),
+                                         tlx.storage_kind.smem)
+        smem_buffer_16_0 = tlx.local_view(smem_buffers16, 0)
+        tlx.async_load(x16_ptr + input_offset, smem_buffer_16_0)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        reinterpreted = tlx.local_reinterpret(tmem_buffer_0, tl.float16)
+
+        x16_reg = tlx.local_load(smem_buffer_16_0)
+        tlx.local_store(reinterpreted, x16_reg, tlx.storage_kind.tmem)
+        x16_reg_from_tmem = tlx.local_load(reinterpreted, tlx.storage_kind.tmem)
+        tl.store(y16_ptr + output_offset, x16_reg_from_tmem)
+
+    torch.manual_seed(0)
+    M, N = 64, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = M, N
+    x32 = torch.rand((M, N), dtype=torch.float32, device=device)
+    y32 = torch.zeros((M, N), dtype=torch.float32, device=device)
+    x16 = torch.rand((M, N), dtype=torch.float16, device=device)
+    y16 = torch.zeros((M, N), dtype=torch.float16, device=device)
+    grid = lambda meta: (1, )
+    kernel = local_reinterpret_kernel[grid](x32, y32, x16, y16, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    assert kernel.asm["ttgir"].count("ttg.memdesc_reinterpret") == 1
+    assert kernel.asm["ttgir"].count("ttng.tmem_store") == 2
+    assert kernel.asm["ttgir"].count("ttng.tmem_alloc") == 1
+
+    torch.testing.assert_close(x32, y32)
+    torch.testing.assert_close(x16, y16)
+
+
+@pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
     reason="Requires compute capability == 9 for NV",
 )
