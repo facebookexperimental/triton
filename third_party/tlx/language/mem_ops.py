@@ -57,22 +57,37 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._unwrap_if_constexpr(dtype)
     elem_type = dtype.to_ir(_semantic.builder)
-    if layout is None:
-        if storage == tlx.storage_kind.smem:
-            layout = tlx.nv_mma_shared_layout_encoding(shape=shape, order=[1, 0], elemType=dtype, numCTAsPerCGA=[1, 1],
-                                                       numCTASplit=[1, 1], numCTAOrder=[1, 1], fp4Padded=False)
+    if storage == tlx.storage_kind.smem:
+        # if layout is given by user, continue to create layout_handle
+        # otherwise, create default NVMMA for 2D tensor and swizzled_shared for others, then continue to create layout_handle
+        if isinstance(layout, tlx.nv_mma_shared_layout_encoding) or (layout is None and len(shape) == 2):
+            layout = layout if layout else tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
             layout_handle = _semantic.builder.make_nv_mma_shared_encoding_attr(
-                [int(x) for x in layout.shape],
-                layout.order,
-                layout.elemType.to_ir(_semantic.builder),
-                layout.numCTAsPerCGA,
-                layout.numCTASplit,
-                layout.numCTAOrder,
-                layout.fp4Padded,
-            )
-        else:
-            layout = tlx.tensor_memory_layout_encoding.make_default(shape)
-            layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
+                    [int(x) for x in layout.shape],
+                    layout.order,
+                    layout.elemType.to_ir(_semantic.builder),
+                    layout.numCTAsPerCGA,
+                    layout.numCTASplit,
+                    layout.numCTAOrder,
+                    layout.fp4Padded,
+                )
+        elif isinstance(layout, tlx.swizzled_shared_layout_encoding) or (layout is None and len(shape) == 1):
+            # layout = layout if layout else tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+            layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+            layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
+                    layout.vectorSize,
+                    layout.perPhase,
+                    layout.maxPhase,
+                    layout.order,
+                    layout.numCTAsPerCGA,
+                    layout.numCTASplit,
+                    layout.numCTAOrder,
+                )
+    elif storage == tlx.storage_kind.tmem:
+        # if layout is given by user, continue to create layout_handle
+        # otherwise, create default tmem layout and continue to create layout_handle
+        layout = layout if layout else tlx.tensor_memory_layout_encoding.make_default(shape)
+        layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
                 layout.blockM,
                 layout.blockN,
                 layout.unpacked,
@@ -80,7 +95,50 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout.CTASplitN,
             )
     else:
-        raise NotImplementedError("User-specified layout encoding not yet implemented.")
+        raise NotImplementedError("Unsupported storage kind: " + str(storage))
+
+    # if layout is None:
+    #     if storage == tlx.storage_kind.smem:
+    #         if len(shape) == 2:
+    #             layout = tlx.nv_mma_shared_layout_encoding(
+    #                     shape=shape, 
+    #                     order=[1, 0], 
+    #                     elemType=dtype,
+    #                     numCTAsPerCGA=[1, 1], 
+    #                     numCTASplit=[1, 1], 
+    #                     numCTAOrder=[1, 1],
+    #                     fp4Padded=False)
+    #             layout_handle = _semantic.builder.make_nv_mma_shared_encoding_attr(
+    #                 [int(x) for x in layout.shape],
+    #                 layout.order,
+    #                 layout.elemType.to_ir(_semantic.builder),
+    #                 layout.numCTAsPerCGA,
+    #                 layout.numCTASplit,
+    #                 layout.numCTAOrder,
+    #                 layout.fp4Padded,
+    #             )
+    #         else:
+    #             layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+    #             layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
+    #                 layout.vectorSize,
+    #                 layout.perPhase,
+    #                 layout.maxPhase,
+    #                 layout.order,
+    #                 layout.numCTAsPerCGA,
+    #                 layout.numCTASplit,
+    #                 layout.numCTAOrder,
+    #             )
+    #     else:
+    #         layout = tlx.tensor_memory_layout_encoding.make_default(shape)
+    #         layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
+    #             layout.blockM,
+    #             layout.blockN,
+    #             layout.unpacked,
+    #             layout.CTASplitM,
+    #             layout.CTASplitN,
+    #         )
+    # else:
+    #     raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
     if storage == tlx.storage_kind.smem:
         tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle)
