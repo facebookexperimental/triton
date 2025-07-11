@@ -26,11 +26,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
 
 
 def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=None):
-    layout_handle = _builder.make_dot_operand_encoding_attr(
-        opnd.handle,
-        opIdx,
-        parent_layout
-    )
+    layout_handle = _builder.make_dot_operand_encoding_attr(opnd.handle, opIdx, parent_layout)
     return _builder.create_require_layout(opnd.handle, layout_handle)
 
 
@@ -85,8 +81,20 @@ def async_dot(
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
     else:
-        # Registers or TMEM buffer do not need mma shared layout
-        A_handle = A.handle
+        assert isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.tmem and isinstance(
+            A.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+        if A.layout.unpacked:
+            layout_handle = _builder.make_tensor_memory_encoding_attr(
+                A.layout.blockM,
+                A.layout.blockN,
+                False,  # unpacked == False
+                A.layout.CTASplitM,
+                A.layout.CTASplitN,
+            )
+            A_handle = _builder.create_require_layout(A.handle, layout_handle)
+        else:
+            # A already has `unpacked` set to False, no need for a require_layout
+            A_handle = A.handle
 
     B_handle = require_nv_mma_shared_layout(B, _semantic.builder)
 
