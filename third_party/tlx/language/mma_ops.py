@@ -78,9 +78,12 @@ def async_dot(
     # TODO. batched dot is not supported yet
     if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.smem:
         A_handle = require_nv_mma_shared_layout(A, _builder)
-    if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.tmem:
-        # require A's TMEM layout to have `unpacked` set to False
-        assert isinstance(A.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+    elif isinstance(A, tl.tensor):
+        assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
+        A_handle = A.handle
+    else:
+        assert isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.tmem and isinstance(
+            A.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
         if A.layout.unpacked:
             layout_handle = _builder.make_tensor_memory_encoding_attr(
                 A.layout.blockM,
@@ -90,12 +93,9 @@ def async_dot(
                 A.layout.CTASplitN,
             )
             A_handle = _builder.create_require_layout(A.handle, layout_handle)
-    elif isinstance(A, tl.tensor):
-        assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
-        A_handle = A.handle
-    else:
-        # Registers do not need mma shared layout
-        A_handle = A.handle
+        else:
+            # A already has `unpacked` set to False, no need for a require_layout
+            A_handle = A.handle
 
     B_handle = require_nv_mma_shared_layout(B, _builder)
 
