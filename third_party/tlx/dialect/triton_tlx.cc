@@ -275,15 +275,16 @@ void init_triton_tlx_ir(py::module &&m) {
                }
                // TODO: find the defining op properly - the defining op is not
                // necessarily MemDescSubviewOp
-               auto defineingOp = value.getDefiningOp();
+               auto definingOp = value.getDefiningOp();
                if (auto subviewOp =
-                       dyn_cast<ttg::MemDescSubviewOp>(defineingOp)) {
+                       dyn_cast<ttg::MemDescSubviewOp>(definingOp)) {
                  value = subviewOp.getSrc();
                } else {
                  auto requireLayoutOp =
                      value.getDefiningOp<tlx::RequireLayoutOp>();
-                 assert(subviewOp && "Failed to find TMEMAllocOp defining the "
-                                     "accumulator TMEM passed to dot op.");
+                 assert(requireLayoutOp &&
+                        "Failed to find TMEMAllocOp defining the "
+                        "accumulator TMEM passed to dot op.");
                  value = requireLayoutOp.getSrc();
                }
              }
