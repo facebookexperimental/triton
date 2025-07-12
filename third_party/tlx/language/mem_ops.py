@@ -295,17 +295,16 @@ def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, _builder=None) 
     """
         Reinterpret the dtype of a buffered tensor. Currently only support TMEM.
     """
-    assert isinstance(src, tlx.buffered_tensor) and src.storage == tlx.storage_kind.tmem and isinstance(
-        src.layout, tlx.tensor_memory_layout_encoding), "TLX local_reinterpret only supports TMEM"
-
-    block_type = tl.block_type(dtype, src.shape)
+    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem and isinstance(
+        src.type.layout, tlx.tensor_memory_layout_encoding), "TLX local_reinterpret only supports TMEM"
 
     reinterpreted_value_handle = _builder.create_memdesc_reinterpret(src.handle, dtype.to_ir(_builder), src.shape)
     return tlx.buffered_tensor(
         reinterpreted_value_handle,
-        block_type,
-        src.storage,
-        src.layout,
+        dtype,
+        src.shape,
+        src.type.storage,
+        src.type.layout,
     )
 
 
