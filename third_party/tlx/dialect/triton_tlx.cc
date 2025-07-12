@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/Casting.h"
 
 namespace py = pybind11;
 using namespace ir;
@@ -274,10 +275,18 @@ void init_triton_tlx_ir(py::module &&m) {
                }
                // TODO: find the defining op properly - the defining op is not
                // necessarily MemDescSubviewOp
-               auto subviewOp = value.getDefiningOp<ttg::MemDescSubviewOp>();
-               assert(subviewOp && "Failed to find TMEMAllocOp defining the "
-                                   "accumulator TMEM passed to dot op.");
-               value = subviewOp.getSrc();
+               auto definingOp = value.getDefiningOp();
+               if (auto subviewOp =
+                       dyn_cast<ttg::MemDescSubviewOp>(definingOp)) {
+                 value = subviewOp.getSrc();
+               } else {
+                 auto requireLayoutOp =
+                     value.getDefiningOp<tlx::RequireLayoutOp>();
+                 assert(requireLayoutOp &&
+                        "Failed to find TMEMAllocOp defining the "
+                        "accumulator TMEM passed to dot op.");
+                 value = requireLayoutOp.getSrc();
+               }
              }
 
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
@@ -307,6 +316,17 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &arg,
               std::vector<int32_t> order) -> mlir::Value {
              return self.create<ttg::MemDescTransOp>(arg, order);
+           })
+      .def("create_memdesc_reinterpret",
+           [](TritonOpBuilder &self, Value &src, Type &newElementType,
+              std::vector<int64_t> newShape) -> mlir::Value {
+             auto oldType = cast<ttg::MemDescType>(src.getType());
+             assert(oldType && "Expect MemDescType for src");
+
+             auto newType = ttg::MemDescType::get(
+                 newShape, newElementType, oldType.getEncoding(),
+                 oldType.getMemorySpace(), oldType.getMutableMemory());
+             return self.create<ttg::MemDescReinterpretOp>(newType, src);
            })
       .def("create_async_TMA_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,

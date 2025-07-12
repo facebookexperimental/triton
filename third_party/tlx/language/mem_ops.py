@@ -284,6 +284,24 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic
 
 
 @tl.builtin
+def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, _builder=None) -> tlx.buffered_tensor:
+    """
+        Reinterpret the dtype of a buffered tensor. Currently only support TMEM.
+    """
+    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem and isinstance(
+        src.type.layout, tlx.tensor_memory_layout_encoding), "TLX local_reinterpret only supports TMEM"
+
+    reinterpreted_value_handle = _builder.create_memdesc_reinterpret(src.handle, dtype.to_ir(_builder), src.shape)
+    return tlx.buffered_tensor(
+        reinterpreted_value_handle,
+        dtype,
+        src.shape,
+        src.type.storage,
+        src.type.layout,
+    )
+
+
+@tl.builtin
 def async_descriptor_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
