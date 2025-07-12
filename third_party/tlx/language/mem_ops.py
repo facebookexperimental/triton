@@ -101,10 +101,10 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _builder.create_tmem_alloc(full_shape, elem_type, layout_handle)
 
-    block_type = tl.block_type(dtype, unwrapped_shape)
     base_tensor = tlx.buffered_tensor(
         tensor_handle,
-        block_type,
+        dtype,
+        unwrapped_shape,
         storage,
         layout,
     )
@@ -124,14 +124,14 @@ def local_view(
     buffer_idx = _convert_elem_to_ir_value(_builder, buffer_idx, require_i64=False)
     base_tensor = local_allocated_buffers.base_tensor
     view_shape = base_tensor.type.shape
-    view_type = tl.block_type(base_tensor.type.dtype, view_shape)
     view_handle = _builder.create_memdesc_subview(base_tensor.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarriers):
         return tlx.mbarrier(view_handle, )
     else:
         return tlx.buffered_tensor(
             view_handle,
-            view_type,
+            base_tensor.type.scalar,
+            view_shape,
             base_tensor.type.storage,
             base_tensor.type.layout,
         )
@@ -156,10 +156,10 @@ def subslice(
     assert local_allocated_buffer.type.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
     assert isinstance(local_allocated_buffer.type, tl.block_type), "subslice src is not block type"
     subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]] + [size]
-    subslice_type = tl.block_type(local_allocated_buffer.type.element_ty, subslice_shape)
     return tlx.buffered_tensor(
         _builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size),
-        subslice_type,
+        local_allocated_buffer.type.element_ty,
+        subslice_shape,
         local_allocated_buffer.type.storage,
         local_allocated_buffer.type.layout,
     )
@@ -247,7 +247,7 @@ def local_load(
         output = _builder.create_release_layout(load_handle)
         return tl.tensor(output, src.type)
 
-    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type.type)
+    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)
 
 
 @tl.builtin
