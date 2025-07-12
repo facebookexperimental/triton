@@ -1,7 +1,8 @@
 import triton.language.core as tl
-from typing import Optional, Self, List
+from typing import Optional, Self, List, Tuple
 import enum
 from abc import abstractmethod
+from triton._C.libtriton import ir
 
 
 class layout_encoding:
@@ -140,33 +141,43 @@ class buffered_tensor(tl.base_value):
         handle: The backing IR value representing the buffer allocation.
     """
 
-    def __init__(self, handle, type: tl.dtype, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
+    def __init__(self, handle, element_ty: tl.dtype, shape: List, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
         """Not called by user code."""
         super().__init__()
         # IR handle
         self.handle = handle
         # Block shape
-        self.shape = type.shape if type.is_block() else ()
-        self.type = type  # Tensor type (can be block_type)
+        self.shape = shape
+        self.type = buffered_tensor_type(element_ty, shape, storage, layout)
         # Following the practice in pytorch, dtype is scalar type
-        self.dtype = type.scalar
-        # Storage
-        self.storage = storage
-        # Layout encoding
-        self.layout = layout
+        self.dtype = element_ty
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
 
     def make_permute(self, handle, dims) -> Self:
-        permuted_type = tl.block_type(self.type.scalar, [self.shape[d] for d in dims])
-        permuted_layout = self.layout.make_permute(dims)
+        permuted_layout = self.type.layout.make_permute(dims)
         return buffered_tensor(
             handle,
-            permuted_type,
-            self.storage,
+            self.dtype,
+            [self.shape[d] for d in dims],
+            self.type.storage,
             permuted_layout,
         )
+
+
+class buffered_tensor_type(tl.block_type):
+
+    def __init__(self, element_ty: tl.dtype, shape: List, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
+        super().__init__(element_ty, shape)
+        # Storage
+        self.storage = storage
+        # Layout encoding
+        self.layout = layout
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
+        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.storage, self.layout)
+        return value, cursor + 1
 
 
 class buffered_tensors(tl.base_value):
@@ -182,15 +193,34 @@ class buffered_tensors(tl.base_value):
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
 
-class mbarrier(buffered_tensor):
+class mbarrier(tl.base_value):
     """
     Define a mbarrier object
     """
 
     def __init__(self, handle):
-        block_type = tl.block_type(tl.int64, [1])
-        super().__init__(handle, block_type, storage_kind.smem)
-        pass
+        self.handle = handle
+        self.type = mbarrier_type()
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        """Build a frontend value with the current dtype, wrapping a list of existing handles.
+        cursor is the index of the first handle relevant to this value, and the function
+        should return the updated cursor position after any handles consumed by the created value.
+        """
+        raise NotImplementedError
+
+
+class mbarrier_type(buffered_tensor_type):
+
+    def __init__(self):
+        super().__init__(tl.int64, [1], storage_kind.smem)
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
+        value = mbarrier(handles[cursor])
+        return value, cursor + 1
 
 
 class mbarriers(tl.base_value):
