@@ -153,7 +153,7 @@ def subslice(
     :param size: the size of the subslice, in terms of number of elements
     """
     # this is for TMEM subslice
-    assert local_allocated_buffer.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
+    assert local_allocated_buffer.type.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
     assert isinstance(local_allocated_buffer.type, tl.block_type), "subslice src is not block type"
     subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]] + [size]
     subslice_type = tl.block_type(local_allocated_buffer.type.element_ty, subslice_shape)

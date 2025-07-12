@@ -8,7 +8,7 @@ from .utility import cuda_parse_arch
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     if isinstance(x.type.layout, tlx.swizzled_shared_layout_encoding):
-        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.layout.order, elemType=x.dtype,
+        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.type.layout.order, elemType=x.dtype,
                                                    numCTAsPerCGA=[1, 1], numCTASplit=[1, 1], numCTAOrder=[1, 1],
                                                    fp4Padded=False)
         layout_handle = _builder.make_nv_mma_shared_encoding_attr(
@@ -76,21 +76,21 @@ def async_dot(
     version = 5 if cuda_compute_capability >= 100 else 3
 
     # TODO. batched dot is not supported yet
-    if isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.smem:
+    if isinstance(A, tlx.buffered_tensor) and A.type.storage == tlx.storage_kind.smem:
         A_handle = require_nv_mma_shared_layout(A, _builder)
     elif isinstance(A, tl.tensor):
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
     else:
-        assert isinstance(A, tlx.buffered_tensor) and A.storage == tlx.storage_kind.tmem and isinstance(
-            A.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
-        if A.layout.unpacked:
+        assert isinstance(A, tlx.buffered_tensor) and A.type.storage == tlx.storage_kind.tmem and isinstance(
+            A.type.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+        if A.type.layout.unpacked:
             layout_handle = _builder.make_tensor_memory_encoding_attr(
-                A.layout.blockM,
-                A.layout.blockN,
+                A.type.layout.blockM,
+                A.type.layout.blockN,
                 False,  # unpacked == False
-                A.layout.CTASplitM,
-                A.layout.CTASplitN,
+                A.type.layout.CTASplitM,
+                A.type.layout.CTASplitN,
             )
             A_handle = _builder.create_require_layout(A.handle, layout_handle)
         else:
