@@ -262,6 +262,22 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
   let hasVerifier = 1;
 }
 
+def TTNG_NamedBarrierArriveOp : TTNG_Op<"arrive_barrier_named", []> {
+  let summary = "named barrier arrive";
+
+  let arguments = (ins I32:$bar, I32: $numThreads);
+
+  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
+}
+
+def TTNG_NamedBarrierWaitOp : TTNG_Op<"wait_barrier_named", []> {
+  let summary = "named barrier wait";
+
+  let arguments = (ins I32:$bar, I32: $numThreads);
+
+  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
+}
+
 def TTNG_TensorDescToTMAPtrOp : TTNG_Op<"tensor_desc_to_tma_ptr", [Pure]> {
   let summary = "Convert tensor descriptor to pointer to tma descriptor";
 

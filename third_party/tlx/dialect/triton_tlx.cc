@@ -220,6 +220,14 @@ void init_triton_tlx_ir(py::module &&m) {
              }
              return outputs;
            })
+      .def("create_named_barrier_wait",
+           [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
+             self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);
+           })
+      .def("create_named_barrier_arrive",
+           [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
+             self.create<ttng::NamedBarrierArriveOp>(barrier, numThreads);
+           })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding) -> mlir::Value {

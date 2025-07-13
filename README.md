@@ -122,6 +122,14 @@ Examples
 
     Perform the arrive operation on an mbarrier
 
+- `tlx.named_barrier_wait(bar_id, num_threads)`
+
+    Wait until `num_threads` threads have reached the specified named mbarrier phase.
+
+- `tlx.named_barrier_arrive(bar_id, num_threads)`
+
+    Signal arrival at a named mbarrier with the given thread count.
+
 - `tlx.barrier_expect_bytes(bar, bytes)`
 
   Signal a barrier of an expected number of bytes to be copied.
