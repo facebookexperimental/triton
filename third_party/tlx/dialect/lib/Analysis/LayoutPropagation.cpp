@@ -62,7 +62,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     ArrayRef<const LayoutEncodingLattice *> results) {
   if (auto requireLayoutOp = dyn_cast<triton::tlx::RequireLayoutOp>(op)) {
 
-    // skips the layout propagation for registers. require_layout ops on tensor
+    // Skip the layout propagation for registers. require_layout ops on tensor
     // types will be rewritten into convert_layout ops, and following passes
     // will handle them.
     if (isa<RankedTensorType>(requireLayoutOp.getType()))
