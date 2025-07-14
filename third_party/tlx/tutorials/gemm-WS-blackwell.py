@@ -24,7 +24,7 @@ def get_cuda_autotune_config():
             num_warps=4,
             num_stages=1,
             pre_hook=matmul_tma_set_block_size_hook,
-        ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in ([2, 3, 4]) for subtile in [True, False]
+        ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in ([2, 3, 4]) for subtile in [True]
     ]
 
 
@@ -167,7 +167,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 cur_tmem_buf = (cur_tmem_buf + 1) % 2
                 processed_k_iters += k_tiles
 
-        with tlx.async_task(num_warps=4, num_regs=232):
+        with tlx.async_task(num_warps=4, num_regs=232):  # epilogue consumer
             tmem_phase_first = 0
             tmem_phase_second = 0
             cur_tmem_buf = 0
@@ -260,7 +260,7 @@ configs = []
 configs.append(
     triton.testing.Benchmark(
         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-        x_vals=[128 * i for i in range(2, 34)],  # Different possible values for `x_name`
+        x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
