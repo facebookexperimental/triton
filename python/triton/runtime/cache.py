@@ -303,10 +303,11 @@ def triton_key():
             contents += [hashlib.sha256(f.read()).hexdigest()]
     # third-party TLX
     from pathlib import Path
-    tlx_path = str(Path(TRITON_PATH).parent.parent / "third_party" / "tlx" / "language")
-    for lib in pkgutil.walk_packages([tlx_path], prefix="tlx."):
-        with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-            contents += [hashlib.sha256(f.read()).hexdigest()]
+    for tlx_sub_folder in ["language", "compiler"]:
+        tlx_path = str(Path(TRITON_PATH).parent.parent / "third_party" / "tlx" / tlx_sub_folder)
+        for lib in pkgutil.walk_packages([tlx_path], prefix="tlx."):
+            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
+                contents += [hashlib.sha256(f.read()).hexdigest()]
     return f'{__version__}' + '-'.join(contents)
 
 
