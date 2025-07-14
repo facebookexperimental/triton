@@ -271,6 +271,21 @@ def TTNG_AsyncCopyMbarrierArriveOp : TTNG_Op<"async_copy_mbarrier_arrive"> {
   let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
 }
 
+def TTNG_NamedBarrierArriveOp : TTNG_Op<"arrive_barrier_named", []> {
+  let summary = "named barrier arrive";
+
+  let arguments = (ins I32:$bar, I32: $numThreads);
+
+  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
+}
+
+def TTNG_NamedBarrierWaitOp : TTNG_Op<"wait_barrier_named", []> {
+  let summary = "named barrier wait";
+
+  let arguments = (ins I32:$bar, I32: $numThreads);
+
+  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
+}
 
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";

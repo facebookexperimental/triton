@@ -28,8 +28,6 @@ def _host_descriptor_pre_hook(nargs):
 
 
 configs = [
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 4, 'NUM_MMA_GROUPS': 1},
-                  num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 8, 'NUM_MMA_GROUPS': 2},
                   num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
 ]
@@ -37,7 +35,7 @@ configs = [
 
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
-def _attn_fwd_ws_pipelined(sm_scale, M,  #
+def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
@@ -124,7 +122,7 @@ def _attn_fwd_ws_pipelined(sm_scale, M,  #
             qk_scale *= 1.44269504  # 1/log(2)
 
             # wait for the Q buffer to be populated by the producer
-            cid = tlx.async_task_replica_id()
+            cid: tl.constexpr = tlx.async_task_replica_id()
             q_full = tlx.local_view(q_fulls, cid)
             tlx.barrier_wait(q_full, 0)
             q_tile = tlx.local_view(q_tiles, cid)
@@ -142,7 +140,22 @@ def _attn_fwd_ws_pipelined(sm_scale, M,  #
 
             # -- compute qk[0] ----
             k_tile = tlx.local_trans(k_tile)
+
+            if cid == 0:
+                # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+                tlx.named_barrier_wait(9, 256)
+            else:
+                # Consumer 1 signals its arrival at barrier 9.
+                tlx.named_barrier_arrive(9, 256)
+                # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+                tlx.named_barrier_wait(10, 256)
+
             qk = tlx.async_dot(q_tile, k_tile)
+
+            if cid == 0:
+                # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+                tlx.named_barrier_arrive(10, 256)
+
             # wait for the MMA using to complete
             qk = tlx.async_dot_wait(0, qk)
             # release the K buffer
@@ -282,7 +295,7 @@ class _attention(torch.autograd.Function):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
-        _attn_fwd_ws_pipelined[grid](
+        _attn_fwd_ws_pipelined_pingpong[grid](
             sm_scale, M,  #
             q.shape[0], q.shape[1],  #
             desc_q, desc_k, desc_v, desc_o,  #
@@ -373,7 +386,7 @@ configs.append(
         styles=[("red", "-"), ("blue", "-"), ("green", "-")],
         ylabel="TFLOPS",
         plot_name=
-        f"fused-attention-ws-pipelined-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+        f"fused-attention-ws-pipelined-pingpong-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
         args={
             "H": N_HEADS,
             "BATCH": BATCH,
