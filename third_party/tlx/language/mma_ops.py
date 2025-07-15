@@ -99,7 +99,7 @@ def async_dot(
         A_handle = A.handle
     else:
         # set unpacked to False for A
-        A_handle = require_tmem_layout_unpacked(A, False, _builder)
+        A_handle = require_tmem_layout_unpacked(A, False, _semantic.builder)
 
     B_handle = require_nv_mma_shared_layout(B, _semantic.builder)
 
@@ -107,16 +107,17 @@ def async_dot(
         assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
         # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
         acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, mBarrier.handle if mBarrier else None)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle,
+                                                     mBarrier.handle if mBarrier else None)
         return tlx.async_token(output)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
-                                                           _semantic.builder.options.num_warps)
+                                                                 _semantic.builder.options.num_warps)
         acc = _semantic.builder.create_require_layout(acc_handle, mma_layout)
         if isinstance(A, tl.tensor):
             A_handle = require_dot_operand_layout(A, 0, mma_layout, _semantic.builder)
         output = _semantic.builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision,
-         max_num_imprecise_acc, True)
+                                                         max_num_imprecise_acc, True)
         # Release the mma layout for the output to conform to what the user expects
         output = _semantic.builder.create_release_layout(output)
         return tl.tensor(output, ret_ty)
