@@ -38,15 +38,15 @@ configs = [
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
 def _attn_fwd_ws_pipelined(sm_scale, M,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-              HEAD_DIM: tl.constexpr,  #
-              BLOCK_M: tl.constexpr,  #
-              BLOCK_N: tl.constexpr,  #
-              FP8_OUTPUT: tl.constexpr,  #
-              NUM_BUFFERS: tl.constexpr,  #
-              NUM_MMA_WARPS: tl.constexpr,  #
-              NUM_MMA_GROUPS: tl.constexpr,  #
-              ):
+                           Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+                           HEAD_DIM: tl.constexpr,  #
+                           BLOCK_M: tl.constexpr,  #
+                           BLOCK_N: tl.constexpr,  #
+                           FP8_OUTPUT: tl.constexpr,  #
+                           NUM_BUFFERS: tl.constexpr,  #
+                           NUM_MMA_WARPS: tl.constexpr,  #
+                           NUM_MMA_GROUPS: tl.constexpr,  #
+                           ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
@@ -161,7 +161,6 @@ def _attn_fwd_ws_pipelined(sm_scale, M,  #
             l_i = l_i * alpha + l_ij
             m_i = m_ij
             acc_cnt = 1
-
 
             # loop over k, v and update accumulator
             for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
@@ -366,14 +365,11 @@ configs.append(
         x_names=["N_CTX"],
         x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
-        line_vals=["triton-fp16"]  +
-        (["flash"] if HAS_FLASH else []),
-        line_names=["Triton [FP16]"] +
-        (["Flash-2"] if HAS_FLASH else []),
+        line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+        line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
         styles=[("red", "-"), ("blue", "-"), ("green", "-")],
         ylabel="TFLOPS",
-        plot_name=
-        f"fused-attention-ws-pipelined-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+        plot_name=f"fused-attention-ws-pipelined-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
         args={
             "H": N_HEADS,
             "BATCH": BATCH,

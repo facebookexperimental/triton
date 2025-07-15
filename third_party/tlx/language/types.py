@@ -112,7 +112,8 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def make_permute(self, dims) -> Self:
         permuted_order = tuple(self.order[d] for d in dims)
-        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder, self.fp4Padded)
+        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA,
+                                             self.numCTASplit, self.numCTAOrder, self.fp4Padded)
 
 
 class storage_kind(enum.Enum):
@@ -141,7 +142,8 @@ class buffered_tensor(tl.base_value):
         handle: The backing IR value representing the buffer allocation.
     """
 
-    def __init__(self, handle, element_ty: tl.dtype, shape: List, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
+    def __init__(self, handle, element_ty: tl.dtype, shape: List, storage: storage_kind,
+                 layout: Optional[shared_layout_encoding] = None):
         """Not called by user code."""
         super().__init__()
         # IR handle
@@ -168,7 +170,8 @@ class buffered_tensor(tl.base_value):
 
 class buffered_tensor_type(tl.block_type):
 
-    def __init__(self, element_ty: tl.dtype, shape: List, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
+    def __init__(self, element_ty: tl.dtype, shape: List, storage: storage_kind,
+                 layout: Optional[shared_layout_encoding] = None):
         super().__init__(element_ty, shape)
         # Storage
         self.storage = storage
@@ -192,6 +195,7 @@ class buffered_tensors(tl.base_value):
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
+
 
 class mbarrier(tl.base_value):
     """
@@ -235,6 +239,7 @@ class mbarriers(tl.base_value):
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
+
 
 class async_token(tl.base_value):
     """
