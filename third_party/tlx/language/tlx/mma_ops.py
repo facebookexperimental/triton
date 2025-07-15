@@ -53,10 +53,7 @@ def async_dot(
     A: tlx.buffered_tensor | tl.tensor,
     B: tlx.buffered_tensor,
     acc: tlx.buffered_tensor | tl.tensor | None = None,
-    use_acc: tl.constexpr
-    | tl.tensor = None,  # For blackwell, compute D = A @ B + D instead of D = A @ B. If None, default to True.
-    pred=None,
-    mBarriers: list[tlx.mbarrier] = [],
+    mBarrier=None,
     input_precision=None,
     out_dtype=tl.float32,
     _semantic=None,
@@ -110,17 +107,9 @@ def async_dot(
         assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
         # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
         acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
-        handles = [t.handle for t in mBarriers]
-        use_acc_handle = None
-        if use_acc is not None:
-            assert isinstance(use_acc, tl.tensor) or isinstance(
-                use_acc, tl.constexpr), f"use_acc must be a tensor or constexpr, but got {type(use_acc)}"
-            if isinstance(use_acc, tl.tensor):
-                use_acc_handle = use_acc.handle
-            else:
-                use_acc_handle = _semantic.builder.get_int1(use_acc.value)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, handles)
-        return tl.tensor(output, tl.void)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle,
+                                                     mBarrier.handle if mBarrier else None)
+        return tlx.async_token(output)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
                                                                  _semantic.builder.options.num_warps)
@@ -147,15 +136,3 @@ def async_dot_wait(
     """
     pendings = tl._unwrap_if_constexpr(pendings)
     return tl.tensor(_semantic.builder.create_warp_group_dot_wait([inp.handle], pendings)[0], inp.type)
-
-
-@tl.builtin
-def tcgen05_commit(
-    mBarrier: tlx.mbarrier,
-    _semantic=None,
-) -> tl.tensor:
-    """
-    Make the mbarrier track the completion of all prior asynchronous tcgen5 operations.
-    NOTE: DO NOT use the same mBarrier passed to async_dot. This op needs a separate dedicated mBarrier.
-    """
-    return tl.tensor(_semantic.builder.create_tcgen05_commit(mBarrier.handle), tl.void)

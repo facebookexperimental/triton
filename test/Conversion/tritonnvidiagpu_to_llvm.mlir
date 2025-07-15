@@ -74,7 +74,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %c256_i32 = arith.constant 256 : i32
     // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
     // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
-    // CHECK-NEXT: nvvm.barrier.arrive id = [[BAR_ID]] number_of_threads = [[NUM_THRADS]]
+    // CHECK-NEXT: "bar.arrive $0, $1;", "r,r" [[BAR_ID]], [[NUM_THRADS]]
     ttng.arrive_barrier_named %c9_i32, %c256_i32 : i32, i32
     tt.return
   }
@@ -85,7 +85,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %c256_i32 = arith.constant 256 : i32
     // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
     // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
-    // CHECK-NEXT: nvvm.barrier id = [[BAR_ID]] number_of_threads = [[NUM_THRADS]]
+    // CHECK-NEXT: "bar.sync $0, $1;", "r,r" [[BAR_ID]], [[NUM_THRADS]]
     ttng.wait_barrier_named %c9_i32, %c256_i32 : i32, i32
     tt.return
   }
