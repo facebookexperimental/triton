@@ -330,7 +330,9 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int64_t> newShape) -> mlir::Value {
              auto oldType = cast<ttg::MemDescType>(src.getType());
              assert(oldType && "Expect MemDescType for src");
-
+             // TODO: assert encoding should be compatible for oldType and
+             // newType. Performance loss should be acceptable but not
+             // correctness.
              auto newType = ttg::MemDescType::get(
                  newShape, newElementType, oldType.getEncoding(),
                  oldType.getMemorySpace(), oldType.getMutableMemory());

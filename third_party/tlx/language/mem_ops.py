@@ -288,19 +288,20 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic
 
 
 @tl.builtin
-def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, _semantic=None) -> tlx.buffered_tensor:
+def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, shape: list[tl.constexpr] = None,
+                      _semantic=None) -> tlx.buffered_tensor:
     """
-        Reinterpret the dtype of a buffered tensor. Currently only support TMEM.
+        Reinterpret the dtype and shape of a buffered tensor. Layout is preserved.
     """
-    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem and isinstance(
-        src.type.layout, tlx.tensor_memory_layout_encoding), "TLX local_reinterpret only supports TMEM"
+    if shape is None:
+        shape = src.type.shape
 
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
-                                                                              dtype.to_ir(_semantic.builder), src.shape)
+                                                                              dtype.to_ir(_semantic.builder), shape)
     return tlx.buffered_tensor(
         reinterpreted_value_handle,
         dtype,
-        src.shape,
+        shape,
         src.type.storage,
         src.type.layout,
     )

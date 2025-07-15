@@ -1066,16 +1066,16 @@ def test_local_gather(device):
 
         desc_in = tl.make_tensor_descriptor(
             input_ptr,
-            shape=[M, N],
-            strides=[N, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            shape=[1, M * N],
+            strides=[M * N, 1],
+            block_shape=[1, BLOCK_SIZE_M * BLOCK_SIZE_N],
         )
 
         desc_out = tl.make_tensor_descriptor(
             output_ptr,
-            shape=[M, N],
-            strides=[N, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            shape=[1, M * N],
+            strides=[M * N, 1],
+            block_shape=[1, BLOCK_SIZE_M * BLOCK_SIZE_N],
         )
 
         buffers_in = tlx.local_alloc((1, BLOCK_SIZE_N), tl.int16, BLOCK_SIZE_M)
@@ -1089,7 +1089,8 @@ def test_local_gather(device):
         # Gather once
         buffer_in = tlx.local_view(buffers_in, 0)
         tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
-        tlx.async_descriptor_load(desc_in, buffer_in, [off_m, off_n], bar)
+        reinterpreted = tlx.local_reinterpret(buffer_in, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
+        tlx.async_descriptor_load(desc_in, reinterpreted, [0, off_m * N + off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
 
         # Use sub tiles separately
@@ -1100,11 +1101,12 @@ def test_local_gather(device):
             tlx.local_store(buffer_out, in_local)
 
         buffer_out = tlx.local_view(buffers_out, 0)
-        tlx.async_descriptor_store(desc_out, buffer_out, [off_m, off_n])
+        reinterpreted = tlx.local_reinterpret(buffer_out, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
+        tlx.async_descriptor_store(desc_out, reinterpreted, [0, off_m * N + off_n])
 
     triton.set_allocator(alloc_fn)
-    M, N = 64, 64
-    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    M, N = 256, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 128
     x = torch.ones((M, N), dtype=torch.int16, device=device)
     y = torch.empty_like(x)
     grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
