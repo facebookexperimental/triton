@@ -38,6 +38,8 @@ public:
   mlir::LogicalResult
   matchAndRewrite(RequireLayoutOp requireLayoutOp,
                   mlir::PatternRewriter &rewriter) const override {
+    if (!isa<RankedTensorType>(requireLayoutOp.getSrc().getType()))
+      return failure();
     auto convertLayoutOp = rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
     return success();
@@ -94,15 +96,35 @@ public:
       if (isa<tlx::RequireLayoutOp>(op) || isScalar(op))
         return WalkResult::advance();
 
+      if (auto partitionOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(op)) {
+        for (Region &region : partitionOp->getRegions()) {
+          for (auto blockArg : region.getArguments()) {
+            auto lattice = solver.lookupState<LayoutEncodingLattice>(blockArg);
+            if (!lattice)
+              llvm_unreachable("Lattice not found.");
+            if (lattice->getValue().isUninitialized())
+              continue;
+            if (auto origType =
+                    dyn_cast<ttg::MemDescType>(blockArg.getType())) {
+              auto newType = ttg::MemDescType::get(
+                  origType.getShape(), origType.getElementType(),
+                  lattice->getValue().getLayoutEncoding(),
+                  origType.getMemorySpace(), origType.getMutableMemory());
+              blockArg.setType(newType);
+            }
+          }
+        }
+        return WalkResult::advance();
+      }
+
       for (auto [i, result] : llvm::enumerate(op->getResults())) {
         auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
         if (!lattice)
-          continue;
-        // llvm_unreachable("Lattice not found.");
+          llvm_unreachable("Lattice not found.");
         if (lattice->getValue().isUninitialized())
           continue;
-        if (auto origType = dyn_cast<gpu::MemDescType>(result.getType())) {
-          auto newType = gpu::MemDescType::get(
+        if (auto origType = dyn_cast<ttg::MemDescType>(result.getType())) {
+          auto newType = ttg::MemDescType::get(
               origType.getShape(), origType.getElementType(),
               lattice->getValue().getLayoutEncoding(),
               origType.getMemorySpace(), origType.getMutableMemory());
