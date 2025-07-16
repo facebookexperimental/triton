@@ -71,13 +71,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                                    NUM_SMS: tl.constexpr,  #
                                    EPILOGUE_SUBTILE: tl.constexpr,  #
                                    ):
-    start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    num_tiles = num_pid_m * num_pid_n
-    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
     buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
@@ -92,6 +85,15 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # producer, TMA load
+            # common code duplicated for each region to avoid SMEM overhead
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # end of common code
+
             load_phase = 0  # the current phase of TMA load
             # we virtually "flatten" the two layer loop as if we're performing tma loads on
             # one big list of data
@@ -119,6 +121,15 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
         with tlx.async_task(num_warps=4, num_regs=232):  # MMA consumer
+            # common code duplicated for each region to avoid SMEM overhead
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # end of common code
+
             dot_phase = 0  # the current phase of dot op
             tmem_write_phase = 1  # sync between epilogue consumer and MMA consumer
             cur_tmem_buf = 0
@@ -171,6 +182,15 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 processed_k_iters += k_tiles
 
         with tlx.async_task(num_warps=4, num_regs=232):  # epilogue consumer
+            # common code duplicated for each region to avoid SMEM overhead
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # end of common code
+
             tmem_read_phase = 0
             cur_tmem_buf = 0
 
