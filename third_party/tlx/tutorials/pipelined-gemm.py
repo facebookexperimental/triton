@@ -74,9 +74,8 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # allocate NUM_STAGES buffers
-    buffers_A = tlx.local_alloc(shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tlx.dtype_of(a_ptr), num=NUM_STAGES, layout=tlx.swizzled_shared_layout_encoding.make_default(rank=2))
-    buffers_B = tlx.local_alloc(shape=(BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tlx.dtype_of(b_ptr), num=NUM_STAGES, layout=tlx.swizzled_shared_layout_encoding.make_default(rank=2))
-
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_STAGES)
     # prefetch (pipelining) for NUM_STAGES - 1 buffers
     for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
         a = tlx.local_view(buffers_A, i)

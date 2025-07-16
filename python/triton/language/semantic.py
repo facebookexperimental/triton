@@ -1048,11 +1048,11 @@ class TritonSemantic(Generic[TensorTy]):
         if is_bool:
             elt_ty = tl.int8
             ptr_ty = tl.pointer_type(elt_ty, ptr_ty.address_space)
-            ptr = cast(ptr, ptr_ty, self.builder)
+            ptr = self.cast(ptr, ptr_ty, self.builder)
     
         # Cast `other` into `elt_ty` type
         if other is not None:
-            other = cast(other, elt_ty, self.builder)
+            other = self.cast(other, elt_ty, self.builder)
     
         # Create loaded result type `dst_ty`
         if ptr.type.is_block():

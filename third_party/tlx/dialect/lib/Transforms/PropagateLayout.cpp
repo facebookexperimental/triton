@@ -66,8 +66,9 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     // We can terminate early if we don't have a layout constraint.
     WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
-      if (isa<tlx::RequireLayoutOp>(op))
-        return WalkResult::interrupt();
+      if (auto requireLayoutOp = dyn_cast<tlx::RequireLayoutOp>(op))
+        if (isa<gpu::MemDescType>(requireLayoutOp.getType()))
+          return WalkResult::interrupt();
       return WalkResult::advance();
     });
     if (!walkResult.wasInterrupted())
@@ -111,6 +112,7 @@ public:
       }
       return WalkResult::advance();
     });
+    return;
   }
 
   void runOnOperation() override {
