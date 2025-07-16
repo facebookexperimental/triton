@@ -106,6 +106,19 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
 
+    @classmethod
+    def make_default(cls, shape, elemType):
+        rank = len(shape)
+        return cls(
+            shape=shape,
+            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
+            elemType=elemType,
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=[1] * rank,
+            fp4Padded=False
+        )
+
     """
     Create a new layout that is a permutation of the given layout.
     """
