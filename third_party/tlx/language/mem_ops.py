@@ -295,6 +295,10 @@ def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, shape: list[tl.
     """
     if shape is None:
         shape = src.type.shape
+    else:
+        assert isinstance(
+            src, tlx.buffered_tensor
+        ) and src.type.storage == tlx.storage_kind.smem, "TLX local_reinterpret with reshaping only supports SMEM"
 
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
                                                                               dtype.to_ir(_semantic.builder), shape)

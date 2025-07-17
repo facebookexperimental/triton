@@ -330,12 +330,26 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int64_t> newShape) -> mlir::Value {
              auto oldType = cast<ttg::MemDescType>(src.getType());
              assert(oldType && "Expect MemDescType for src");
-             // TODO: assert encoding should be compatible for oldType and
-             // newType. Performance loss should be acceptable but not
-             // correctness.
+             auto encoding = oldType.getEncoding();
+             if (!oldType.getShape().equals(newShape)) {
+               // Only accept unswizzled encoding for now.
+               if (auto mmaEncoding =
+                       dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding)) {
+                 if (mmaEncoding.getSwizzlingByteWidth() != 0)
+                   llvm_unreachable("Only accept unswizzled encoding");
+               } else if (auto swizzledEncoding =
+                              dyn_cast<ttg::SwizzledSharedEncodingAttr>(
+                                  encoding)) {
+                 if (!(swizzledEncoding.getVec() == 1 &&
+                       swizzledEncoding.getPerPhase() == 1 &&
+                       swizzledEncoding.getMaxPhase() == 1))
+                   llvm_unreachable("Only accept unswizzled encoding");
+               }
+             }
+
              auto newType = ttg::MemDescType::get(
-                 newShape, newElementType, oldType.getEncoding(),
-                 oldType.getMemorySpace(), oldType.getMutableMemory());
+                 newShape, newElementType, encoding, oldType.getMemorySpace(),
+                 oldType.getMutableMemory());
              return self.create<ttg::MemDescReinterpretOp>(newType, src);
            })
       .def("create_async_TMA_load",
