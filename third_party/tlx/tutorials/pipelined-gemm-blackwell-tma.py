@@ -105,7 +105,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
         # issue the async mma "with `phase`"
         dot_bar = tlx.local_view(dot_bars, buf)
         # mmav5 can take A and B from SMEM, and accumulate result into TMEM
-        tlx.async_dot(a_k, b_k, acc_tmem, mBarrier=dot_bar, out_dtype=tl.float32)
+        tlx.async_dot(a_k, b_k, acc_tmem, mBarriers=[dot_bar], out_dtype=tl.float32)
 
         # prefetch for i-th iteration, i.e, NUM_STAGES - 1 ahead
         i = k + NUM_STAGES - 1

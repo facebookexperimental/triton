@@ -548,7 +548,7 @@ def test_async_dot(device):
 
     @triton.jit
     def wgmma_kernel_A_smem(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -574,10 +574,9 @@ def test_async_dot(device):
         c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
         tl.store(c_ptrs, c)
 
-
     @triton.jit
     def wgmma_kernel_A_reg(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -610,7 +609,7 @@ def test_async_dot(device):
     # test smem
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = wgmma_kernel_A_smem[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-                                       z.stride(1), **kern_kwargs)
+                                         z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttg.async_copy_global_to_local") == 2
     z_ref = torch.matmul(x, y)
@@ -619,7 +618,7 @@ def test_async_dot(device):
     # test reg
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = wgmma_kernel_A_reg[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
-                                       z.stride(1), **kern_kwargs)
+                                        z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttg.async_copy_global_to_local") == 1
     torch.testing.assert_close(z, z_ref)
@@ -661,12 +660,12 @@ def test_async_dot_blackwell(device):
         tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
 
         # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
-        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=None, out_dtype=OUT_DTYPE)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarriers=[], out_dtype=OUT_DTYPE)
 
         # given barrier, tcgen5 mma asynchronous semantic, need to explicitly wait for the barrier
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
-        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarrier=bar, out_dtype=OUT_DTYPE)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, mBarriers=[bar], out_dtype=OUT_DTYPE)
         tlx.barrier_wait(bar, tl.constexpr(0))
 
         # now result == a*b + a*b
@@ -746,7 +745,7 @@ def test_async_dot_blackwell_tmem_A(device):
         tlx.local_store(a_tmem, a_reg, tlx.storage_kind.tmem)
 
         # acc_tmem = acc_tmem + a_tmem * b_smem
-        tlx.async_dot(a_tmem, b_smem, acc_tmem, mBarrier=None, out_dtype=OUT_DTYPE)
+        tlx.async_dot(a_tmem, b_smem, acc_tmem, mBarriers=[], out_dtype=OUT_DTYPE)
         # load result from TMEM to Reg
         result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
 
@@ -966,7 +965,6 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
                 output = a + b
                 tl.store(c_ptr + offsets, output, mask=mask)
 
-
     def dual_add(x, y, a, b):
         return x + y, a + b
 
@@ -991,6 +989,7 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)
     torch.testing.assert_close(output2, ref_out2, check_dtype=False)
+
 
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
@@ -1099,7 +1098,6 @@ def test_local_gather(device):
             buffer_out = tlx.local_view(buffers_out, k)
             in_local = tlx.local_load(buffer_in)
             tlx.local_store(buffer_out, in_local)
-
 
         buffer_out = tlx.local_view(buffers_out, 0)
         tlx.async_descriptor_store(desc_out, buffer_out, [off_m, off_n])

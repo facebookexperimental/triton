@@ -162,7 +162,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bar, dot_phase)
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(a, b, acc_tmem, mBarrier=smem_empty_bar, out_dtype=tl.float32)
+                    tlx.async_dot(a, b, acc_tmem, mBarriers=[smem_empty_bar], out_dtype=tl.float32)
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
