@@ -1427,7 +1427,8 @@ class CodeGenerator(ast.NodeVisitor):
                     raise
                 # Wrap the error in a CompilationError which contains the source
                 # of the @jit function.
-                raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
+                # preserve `e` for more detailed error message
+                raise CompilationError(self.jit_fn.src, self.cur_node, None) from e
 
             # Reset the location to the last one before the visit
             if last_loc:
