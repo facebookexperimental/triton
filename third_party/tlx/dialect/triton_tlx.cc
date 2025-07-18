@@ -299,6 +299,7 @@ void init_triton_tlx_ir(py::module &&m) {
              }
 
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
+             std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
              return self
                  .create<ttng::TCGen5MMAOp>(
