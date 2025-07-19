@@ -18,7 +18,7 @@ def tlx_enter_sub_region():
     try:
         yield
     finally:
-        assert region_replica_id_stack == replica_id_stack_backup
+        assert region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
 
 
 def _is_async_task(self, node) -> bool:
