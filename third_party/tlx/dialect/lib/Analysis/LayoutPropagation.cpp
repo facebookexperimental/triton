@@ -4,6 +4,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -58,62 +59,50 @@ LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
 // LayoutBackwardPropagation
 //===----------------------------------------------------------------------===//
 
+LogicalResult LayoutBackwardPropagation::visitRegionInReverse(Operation *op) {
+  for (Region &region : llvm::reverse(op->getRegions())) {
+    for (Block &block : llvm::reverse(region)) {
+      for (Operation &nestedOp : llvm::reverse(block)) {
+        SmallVector<LayoutEncodingLattice *> operands;
+        for (auto operand : nestedOp.getOperands())
+          operands.push_back(getLatticeElement(operand));
+        SmallVector<const LayoutEncodingLattice *> results;
+        for (const Value result : nestedOp.getResults())
+          results.push_back(getLatticeElement(result));
+        auto visitResult = visitOperation(&nestedOp, operands, results);
+        if (failed(visitResult))
+          return visitResult;
+      }
+    }
+  }
+  return success();
+}
+
 LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
-  if (isa<RegionBranchOpInterface>(op)) {
-    for (Region &region : llvm::reverse(op->getRegions())) {
-      for (Block &block : llvm::reverse(region)) {
-        for (Operation &nestedOp : llvm::reverse(block)) {
-          SmallVector<LayoutEncodingLattice *> operands;
-          for (auto operand : nestedOp.getOperands())
-            operands.push_back(getLatticeElement(operand));
-          SmallVector<const LayoutEncodingLattice *> results;
-          for (const Value result : nestedOp.getResults())
-            results.push_back(getLatticeElement(result));
-          auto visitResult = visitOperation(&nestedOp, operands, results);
-          if (failed(visitResult))
-            return visitResult;
-        }
-      }
-    }
-    return success();
-  }
+  LDBG("Visiting operation " << *op << "\n");
+  if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
+    return visitRegionInReverse(op);
 
   // Transpose op needs to be handled specially. When flowing backwards through
-  // it, we need to update the transposed field of the layout encoding.
+  // it, we need to update the layout encoding.
   if (auto memDescTransOp = dyn_cast<ttg::MemDescTransOp>(op)) {
     auto resultLattice = results[0];
     if (auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(
             resultLattice->getValue().getLayoutEncoding())) {
-      bool transposed = false;
       auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
-          mmaEncoding.getContext(), mmaEncoding.getSwizzlingByteWidth(),
-          transposed, mmaEncoding.getElementBitWidth(),
-          mmaEncoding.getFp4Padded(), getCTALayout(mmaEncoding));
+          mmaEncoding.getContext(),
+          memDescTransOp.getSrc().getType().getShape(),
+          ttg::getOrder(
+              memDescTransOp.getSrc().getType()), // src has the reversed order
+          mmaEncoding.getCTALayout(),
+          memDescTransOp.getSrc().getType().getElementType(),
+          mmaEncoding.getFp4Padded());
       const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
       auto operandLattice = operands[0];
       ChangeResult changed = operandLattice->meet(updatedResultLayoutEncoding);
       propagateIfChanged(operandLattice, changed);
-    }
-    return success();
-  }
-
-  if (isa<ttg::WarpSpecializePartitionsOp>(op)) {
-    for (Region &region : llvm::reverse(op->getRegions())) {
-      for (Block &block : llvm::reverse(region)) {
-        for (Operation &nestedOp : llvm::reverse(block)) {
-          SmallVector<LayoutEncodingLattice *> operands;
-          for (auto operand : nestedOp.getOperands())
-            operands.push_back(getLatticeElement(operand));
-          SmallVector<const LayoutEncodingLattice *> results;
-          for (const Value result : nestedOp.getResults())
-            results.push_back(getLatticeElement(result));
-          auto visitResult = visitOperation(&nestedOp, operands, results);
-          if (failed(visitResult))
-            return visitResult;
-        }
-      }
     }
     return success();
   }
@@ -161,21 +150,10 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
 
 void LayoutBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto branchOp = operand.getOwner();
+  LDBG("Visiting branch op " << *branchOp << "\n");
   if (isa<ttg::WarpSpecializeOp>(branchOp)) {
-    for (Region &region : llvm::reverse(branchOp->getRegions())) {
-      for (Block &block : llvm::reverse(region)) {
-        for (Operation &op : llvm::reverse(block)) {
-          SmallVector<LayoutEncodingLattice *> operands;
-          for (Value operand : op.getOperands())
-            operands.push_back(getLatticeElement(operand));
-          SmallVector<const LayoutEncodingLattice *> results;
-          for (const Value result : op.getResults())
-            results.push_back(getLatticeElement(result));
-          auto unused = visitOperation(&op, operands, results);
-          (void)unused;
-        }
-      }
-    }
+    auto unused = visitRegionInReverse(branchOp);
+    (void)unused;
   }
 }
 

@@ -7,6 +7,7 @@
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -92,6 +93,13 @@ public:
              op->getResultTypes()[0].isIntOrIndexOrFloat();
     };
 
+    auto getNewMemDescType = [&](ttg::MemDescType origType,
+                                 Attribute encoding) {
+      return ttg::MemDescType::get(
+          origType.getShape(), origType.getElementType(), encoding,
+          origType.getMemorySpace(), origType.getMutableMemory());
+    };
+
     funcOp.walk([&](mlir::Operation *op) {
       if (isa<tlx::RequireLayoutOp>(op) || isScalar(op))
         return WalkResult::advance();
@@ -106,10 +114,8 @@ public:
               continue;
             if (auto origType =
                     dyn_cast<ttg::MemDescType>(blockArg.getType())) {
-              auto newType = ttg::MemDescType::get(
-                  origType.getShape(), origType.getElementType(),
-                  lattice->getValue().getLayoutEncoding(),
-                  origType.getMemorySpace(), origType.getMutableMemory());
+              auto newType = getNewMemDescType(
+                  origType, lattice->getValue().getLayoutEncoding());
               blockArg.setType(newType);
             }
           }
@@ -124,10 +130,8 @@ public:
         if (lattice->getValue().isUninitialized())
           continue;
         if (auto origType = dyn_cast<ttg::MemDescType>(result.getType())) {
-          auto newType = ttg::MemDescType::get(
-              origType.getShape(), origType.getElementType(),
-              lattice->getValue().getLayoutEncoding(),
-              origType.getMemorySpace(), origType.getMutableMemory());
+          auto newType = getNewMemDescType(
+              origType, lattice->getValue().getLayoutEncoding());
           op->getResult(i).setType(newType);
         }
       }

@@ -78,6 +78,8 @@ public:
   void visitCallOperand(OpOperand &operand) override;
 
   void setToExitState(LayoutEncodingLattice *lattice) override;
+
+  LogicalResult visitRegionInReverse(Operation *op);
 };
 
 //===----------------------------------------------------------------------===//
