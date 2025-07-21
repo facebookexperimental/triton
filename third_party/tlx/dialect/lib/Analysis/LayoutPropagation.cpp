@@ -91,11 +91,12 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     auto resultLattice = results[0];
     if (auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(
             resultLattice->getValue().getLayoutEncoding())) {
+      SmallVector<unsigned, 4> newOrder;
+      llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
+                      [](int32_t x) { return static_cast<unsigned>(x); });
       auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
           mmaEncoding.getContext(),
-          memDescTransOp.getSrc().getType().getShape(),
-          ttg::getOrder(
-              memDescTransOp.getSrc().getType()), // src has the reversed order
+          memDescTransOp.getSrc().getType().getShape(), newOrder,
           mmaEncoding.getCTALayout(),
           memDescTransOp.getSrc().getType().getElementType(),
           mmaEncoding.getFp4Padded());
