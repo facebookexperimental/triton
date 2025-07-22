@@ -10,7 +10,7 @@ from triton.language.semantic import (
 from . import types as tlx
 from .utility import cuda_parse_arch
 from .mma_ops import require_nv_mma_shared_layout
-from typing import Optional, Tuple
+from typing import Optional, Tuple, overload
 
 
 def _assert_blackwell_for_tmem(arch):
@@ -115,6 +115,25 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     )
 
     return tlx.buffered_tensors(base_tensor, num)
+
+
+# overload declarations just to make linter happy
+@overload
+def local_view(
+    local_allocated_buffers: tlx.buffered_tensors,
+    buffer_idx: int,
+    _builder=None,
+) -> tlx.buffered_tensor:
+    ...
+
+
+@overload
+def local_view(
+    local_allocated_buffers: tlx.mbarriers,
+    buffer_idx: int,
+    _builder=None,
+) -> tlx.mbarrier:
+    ...
 
 
 @tl.builtin
