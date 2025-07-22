@@ -231,8 +231,6 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
               Value pred) -> void {
-            //  pred = self.create<arith::TruncIOp>(self.getBuilder().getI1Type(),
-            //                                      pred);
              self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
            })
       .def("create_tmem_alloc",
