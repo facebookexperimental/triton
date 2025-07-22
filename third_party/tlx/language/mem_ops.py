@@ -338,6 +338,7 @@ def async_descriptor_load(
     result: tlx.buffered_tensor,
     offsets: list[tl.tensor],
     barrier: tlx.mbarrier,
+    pred: tl.tensor = None,
     cache_modifier: str = "",
     eviction_policy: str = "",
     _builder=None,
@@ -349,7 +350,11 @@ def async_descriptor_load(
     offsets = _convert_to_ir_values(_builder, offsets, require_i64=False)
     cache = _str_to_load_cache_modifier(cache_modifier)
     eviction = _str_to_eviction_policy(eviction_policy)
-    _builder.create_async_TMA_load(desc.handle, offsets, barrier.handle, result_handle, cache, eviction, False)
+    if pred is None:
+        pred_handle = _builder.get_int1(True)
+    else:
+        pred_handle = pred.handle
+    _builder.create_async_TMA_load(desc.handle, offsets, barrier.handle, pred_handle, result_handle, cache, eviction, False)
 
 
 @tl.builtin

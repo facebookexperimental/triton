@@ -1839,12 +1839,6 @@ void init_triton_ir(py::module &&m) {
              // Return mlir::Value
              return bufferViews;
            })
-      .def(
-          "create_barrier_expect",
-          [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes) -> void {
-            Value pred = self.create<arith::ConstantIntOp>(1, 1);
-            self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
-          })
       .def("create_barrier_wait",
            [](TritonOpBuilder &self, Value mbarrerLoc, Value phase) -> void {
              self.create<ttng::WaitBarrierOp>(mbarrerLoc, phase);
