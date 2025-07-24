@@ -10,7 +10,7 @@ def alloc_barriers(
         num_barriers: tl.constexpr,
         arrive_count: tl.constexpr = tl.constexpr(1),
         _builder=None,
-) -> tlx.mbarriers:
+) -> tlx.mbarrier:
     """
     Allocates buffer in shared memory and initialize mbarriers with arrive_counts.
 
@@ -18,8 +18,18 @@ def alloc_barriers(
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
     """
-    base_barrier = tlx.mbarrier(_builder.create_alloc_barriers(num_barriers.value, arrive_count.value))
-    return tlx.mbarriers(base_barrier, num_barriers)
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
+    layout_handle = _builder.make_swizzled_shared_encoding_attr(
+        layout.vectorSize,
+        layout.perPhase,
+        layout.maxPhase,
+        layout.order,
+        layout.numCTAsPerCGA,
+        layout.numCTASplit,
+        layout.numCTAOrder,
+    )
+    return tlx.mbarrier(_builder.create_alloc_barriers(num_barriers.value, arrive_count.value, layout_handle),
+                        num_barriers, layout)
 
 
 @tl.builtin

@@ -357,6 +357,59 @@ void init_triton_tlx_ir(py::module &&m) {
                  oldType.getMutableMemory());
              return self.create<ttg::MemDescReinterpretOp>(newType, src);
            })
+      .def("get_memdesc_type",
+           [](TritonOpBuilder &self, std::vector<int64_t> shape,
+              Type &elementType, Attribute &encoding) -> Type {
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             return ttg::MemDescType::get(shape, elementType, encoding,
+                                          memorySpace, /*mutableMemory=*/true);
+           })
+      .def("create_local_alloc",
+           [](TritonOpBuilder &self, std::vector<int64_t> shape,
+              Type &elementType, Attribute &encoding) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             auto memDesc =
+                 ttg::MemDescType::get(shape, elementType, encoding,
+                                       memorySpace, /*mutableMemory=*/true);
+             return self.create<ttg::LocalAllocOp>(memDesc);
+           })
+      .def("create_alloc_barriers",
+           [](TritonOpBuilder &self, int numBarriers, int arriveCount,
+              Attribute barrierEncoding) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             auto barriersMemDescType = ttg::MemDescType::get(
+                 {numBarriers}, self.getBuilder().getI64Type(), barrierEncoding,
+                 memorySpace, /*mutableMemory=*/true);
+
+             auto singleBarrierMemDescType = ttg::MemDescType::get(
+                 {1}, self.getBuilder().getI64Type(), barrierEncoding,
+                 memorySpace, /*mutableMemory=*/true);
+
+             // Allocate buffer in shared memory
+             mlir::Value bufferViews =
+                 self.create<ttg::LocalAllocOp>(barriersMemDescType);
+
+             //  Init barrier in each slot
+             for (auto i = 0; i < numBarriers; i++) {
+               // Obtain the single buffer view
+               Value idx = self.getBuilder().create<arith::ConstantIntOp>(
+                   bufferViews.getLoc(), i, 32);
+               mlir::Value buf =
+                   self.create<mlir::triton::gpu::MemDescSubviewOp>(
+                       singleBarrierMemDescType, bufferViews, idx);
+
+               // Initialize mbarrier at buf view
+               self.create<ttng::InitBarrierOp>(buf,
+                                                /*number of arrives*/
+                                                arriveCount);
+             }
+
+             // Return mlir::Value
+             return bufferViews;
+           })
       .def("create_async_TMA_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value mbarrier, Value pred, Value result,

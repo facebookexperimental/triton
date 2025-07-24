@@ -13,6 +13,9 @@ class layout_encoding:
     def __repr__(self):
         return self.__class__.__name__
 
+    def to_ir(self, builder: ir.builder) -> None:
+        raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
+
 
 class shared_layout_encoding(layout_encoding):
 
@@ -27,6 +30,9 @@ class shared_layout_encoding(layout_encoding):
     @abstractmethod
     def make_permute(self, dims) -> Self:
         raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
+
+    def to_ir(self, builder: ir.builder) -> None:
+        raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
@@ -68,6 +74,17 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         return swizzled_shared_layout_encoding(self.vectorSize, self.perPhase, self.maxPhase, permuted_order,
                                                self.numCTAs, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder)
 
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_swizzled_shared_encoding_attr(
+            self.vectorSize,
+            self.perPhase,
+            self.maxPhase,
+            self.order,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
+
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
 
@@ -93,6 +110,15 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
             CTASplitN=1,
         )
 
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_tensor_memory_encoding_attr(
+            self.blockM,
+            self.blockN,
+            self.unpacked,
+            self.CTASplitM,
+            self.CTASplitN,
+        )
+
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
@@ -109,15 +135,9 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
     @classmethod
     def make_default(cls, shape, elemType):
         rank = len(shape)
-        return cls(
-            shape=shape,
-            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
-            elemType=elemType,
-            numCTAsPerCGA=[1] * rank,
-            numCTASplit=[1] * rank,
-            numCTAOrder=[1] * rank,
-            fp4Padded=False
-        )
+        return cls(shape=shape, order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
+                   elemType=elemType, numCTAsPerCGA=[1] * rank, numCTASplit=[1] * rank, numCTAOrder=[1] * rank,
+                   fp4Padded=False)
 
     """
     Create a new layout that is a permutation of the given layout.
@@ -125,7 +145,19 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def make_permute(self, dims) -> Self:
         permuted_order = tuple(self.order[d] for d in dims)
-        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder, self.fp4Padded)
+        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA,
+                                             self.numCTASplit, self.numCTAOrder, self.fp4Padded)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_nv_mma_shared_encoding_attr(
+            [int(x) for x in self.shape],
+            self.order,
+            self.elemType.to_ir(builder),
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+            self.fp4Padded,
+        )
 
 
 class storage_kind(enum.Enum):
@@ -154,14 +186,15 @@ class buffered_tensor(tl.base_value):
         handle: The backing IR value representing the buffer allocation.
     """
 
-    def __init__(self, handle, element_ty: tl.dtype, shape: List, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
+    def __init__(self, handle, element_ty: tl.dtype, shape: List, num: int, storage: storage_kind,
+                 layout: Optional[shared_layout_encoding] = None):
         """Not called by user code."""
         super().__init__()
         # IR handle
         self.handle = handle
         # Block shape
         self.shape = shape
-        self.type = buffered_tensor_type(element_ty, shape, storage, layout)
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
@@ -174,6 +207,7 @@ class buffered_tensor(tl.base_value):
             handle,
             self.dtype,
             [self.shape[d] for d in dims],
+            self.type.num,
             self.type.storage,
             permuted_layout,
         )
@@ -181,27 +215,39 @@ class buffered_tensor(tl.base_value):
 
 class buffered_tensor_type(tl.block_type):
 
-    def __init__(self, element_ty: tl.dtype, shape: List, storage: storage_kind, layout: Optional[shared_layout_encoding] = None):
+    def __init__(self, element_ty: tl.dtype, shape: List, num: int, storage: storage_kind,
+                 layout: Optional[shared_layout_encoding] = None):
         super().__init__(element_ty, shape)
         # Storage
         self.storage = storage
         # Layout encoding
         self.layout = layout
+        # Buffer number. 0 means a single buffer, 1+ means a buffer array.
+        self.num = num
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
-        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.storage, self.layout)
+        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.num, self.storage, self.layout)
         return value, cursor + 1
 
+    def mangle(self) -> str:
+        elt = self.scalar.mangle()
+        shape = '_'.join(map(str, self.shape))
+        if self.num > 0:
+            shape += f'_{self.num}'
+        return f'buffered_{elt}S{shape}'
 
-class buffered_tensors(tl.base_value):
-    """
-    Define a list of buffered_tensor
-    """
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(self.to_ir(builder))
 
-    def __init__(self, base_tensor: buffered_tensor, num: tl.constexpr):
-        self.base_tensor = base_tensor
-        self.num = num
-        self.handle = base_tensor.handle
+    def to_ir(self, builder: ir.builder) -> None:
+        shape = self.shape
+        if self.num > 0:
+            shape = [self.num] + shape
+        return builder.get_memdesc_type(
+            shape,
+            self.element_ty.to_ir(builder),
+            self.layout.to_ir(builder),
+        )
 
 
 class mbarrier(tl.base_value):
@@ -209,9 +255,10 @@ class mbarrier(tl.base_value):
     Define a mbarrier object
     """
 
-    def __init__(self, handle):
+    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding]):
         self.handle = handle
-        self.type = mbarrier_type()
+        self.type = mbarrier_type(num, layout)
+        self.num = num
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
@@ -226,23 +273,12 @@ class mbarrier(tl.base_value):
 
 class mbarrier_type(buffered_tensor_type):
 
-    def __init__(self):
-        super().__init__(tl.int64, [1], storage_kind.smem)
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
-        value = mbarrier(handles[cursor])
+        value = mbarrier(handles[cursor], self.num, self.layout)
         return value, cursor + 1
-
-
-class mbarriers(tl.base_value):
-    """
-    Define a list of mbarrier
-    """
-
-    def __init__(self, base_barrier: mbarrier, num: tl.constexpr):
-        self.base_tensor = base_barrier
-        self.num = num
-        self.handle = base_barrier.handle
 
 
 class async_token(tl.base_value):
