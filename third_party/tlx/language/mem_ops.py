@@ -270,8 +270,8 @@ def local_load(
         output = _builder.create_release_layout(load_handle)
         return tl.tensor(output, src.type)
 
-    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), src.type)
-
+    block_type = tl.block_type(src.type.element_ty, src.type.shape)
+    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), block_type)
 
 @tl.builtin
 def local_store(
