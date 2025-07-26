@@ -4,7 +4,7 @@ import torch
 
 import triton
 import triton.language as tl
-import triton.tlx.language as tlx
+import triton.language.extra.tlx as tlx
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 

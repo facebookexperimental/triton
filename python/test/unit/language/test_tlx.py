@@ -4,7 +4,7 @@ import re
 import triton
 import triton.language as tl
 from triton._internal_testing import is_cuda
-import triton.tlx.language as tlx
+import triton.language.extra.tlx as tlx
 from typing import Optional
 
 

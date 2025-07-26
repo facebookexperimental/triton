@@ -676,8 +676,8 @@ def add_link_to_proton():
 
 
 def add_link_to_tlx():
-    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx"))
-    install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "tlx")
+    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "language", "tlx"))
+    install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "language", "extra", "tlx")
     update_symlink(install_dir, src_dir)
 
 
