@@ -54,6 +54,7 @@ def async_dot(
     A: tlx.buffered_tensor | tl.tensor,
     B: tlx.buffered_tensor,
     acc: tlx.buffered_tensor | tl.tensor | None = None,
+    use_d: tl.constexpr = None,  # For blackwell, compute D = A @ B + D instead of D = A @ B. If None, default to True.
     pred=None,
     mBarriers: list[tlx.mbarrier] = [],
     input_precision=None,
@@ -110,7 +111,10 @@ def async_dot(
         # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
         acc_handle = require_tmem_layout_unpacked(acc, True, _builder)
         handles = [t.handle for t in mBarriers]
-        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, pred, handles)
+        use_d = tl._unwrap_if_constexpr(use_d)
+        assert use_d is None or isinstance(use_d, bool), f"use_d must be None or a bool, but got {type(use_d)}"
+        use_d_handle = None if use_d is None else _builder.get_int1(use_d)
+        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, use_d_handle, pred, handles)
         return tlx.async_token(output)
     else:
         mma_layout = _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0, _builder.options.num_warps)

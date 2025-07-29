@@ -278,7 +278,8 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_tcgen5_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
-              mlir::Value &d, std::optional<Value> pred,
+              mlir::Value &d, std::optional<Value> useD,
+              std::optional<Value> pred,
               std::vector<Value> mBarriers) -> mlir::Value {
              // try to find the TMEMAllocOp that created d
              ttng::TMEMAllocOp tmemAllocOp;
@@ -309,7 +310,7 @@ void init_triton_tlx_ir(py::module &&m) {
              return self
                  .create<ttng::TCGen5MMAOp>(
                      tokType, a, b, d, tmemAllocOp.getToken(),
-                     predTrue /*useD*/,
+                     useD.has_value() ? useD.value() : predTrue /*useD*/,
                      pred.has_value() ? pred.value() : predTrue /*pred */,
                      false /* two_ctas*/, ValueRange(mBarriers),
                      ValueRange(barrierPreds))

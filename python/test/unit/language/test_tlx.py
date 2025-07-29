@@ -704,6 +704,65 @@ def test_async_dot_blackwell(device):
     not is_cuda() or torch.cuda.get_device_capability()[0] != 10,
     reason="Requires compute capability == 10 (Blackwell) for NV",
 )
+def test_async_dot_blackwell_not_use_d(device):
+    """
+    Test D = A*B
+    """
+
+    @triton.jit
+    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, OUT_DTYPE: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        acc_init = tl.full((BLOCK_M, BLOCK_N), 1, dtype=tl.float32)
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
+        a_smem = tlx.local_view(buf_alloc_a, 0)
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+        tlx.async_load(a_ptrs, a_smem)
+        tlx.async_load(b_ptrs, b_smem)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(buffers, 0)
+
+        # fill tmem d with 1
+        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+        # do not use d (so that we get A*B instead of A*B+1)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, use_d=False, mBarriers=[], out_dtype=OUT_DTYPE)
+
+        result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+
+        c = result.to(tl.float16)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    _ = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1),
+                                  **kern_kwargs)
+
+    ref_out = torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] != 10,
+    reason="Requires compute capability == 10 (Blackwell) for NV",
+)
 def test_async_dot_blackwell_tmem_A(device):
     """
     Test D = A*B where A is in TMEM instead of SMEM
