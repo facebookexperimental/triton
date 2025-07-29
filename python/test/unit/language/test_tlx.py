@@ -710,16 +710,16 @@ def test_async_dot_blackwell_not_use_d(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
+                          c_ptr2, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                          OUT_DTYPE: tl.constexpr):
+        pid = tl.program_id(axis=0)
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
 
         a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
-        acc_init = tl.full((BLOCK_M, BLOCK_N), 1, dtype=tl.float32)
 
         # async load a and b into SMEM
         buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
@@ -735,28 +735,43 @@ def test_async_dot_blackwell_not_use_d(device):
         acc_tmem = tlx.local_view(buffers, 0)
 
         # fill tmem d with 1
+        acc_init = tl.full((BLOCK_M, BLOCK_N), 1, dtype=tl.float32)
         tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
         # do not use d (so that we get A*B instead of A*B+1)
-        tlx.async_dot(a_smem, b_smem, acc_tmem, use_d=False, mBarriers=[], out_dtype=OUT_DTYPE)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], out_dtype=OUT_DTYPE)
 
-        result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+        # c1 = A*B
+        c1 = tlx.local_load(acc_tmem, tlx.storage_kind.tmem).to(tl.float16)
+        c_ptrs = c_ptr1 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c1)
 
-        c = result.to(tl.float16)
-        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-        tl.store(c_ptrs, c)
+        # now use d, so c2 = A*B + c1 = A*B + A*B
+        tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=pid < 1000, mBarriers=[], out_dtype=OUT_DTYPE)
+        c2 = tlx.local_load(acc_tmem, tlx.storage_kind.tmem).to(tl.float16)
+        c_ptrs = c_ptr2 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c2)
 
     torch.manual_seed(0)
     M, N, K = (64, 64, 32)
     x = torch.randn((M, K), device=device, dtype=torch.float16)
     y = torch.randn((K, N), device=device, dtype=torch.float16)
-    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+    z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
+    z2 = torch.zeros((M, N), device=device, dtype=torch.float16)
 
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
-    _ = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0), z.stride(1),
-                                  **kern_kwargs)
+    kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
+                                       z1.stride(1), z2, **kern_kwargs)
+    ttgir = kernel.asm["ttgir"]
+    mma_ops = [i for i in ttgir.split("\n") if "tc_gen5_mma" in i]
+    assert len(mma_ops) == 2
+    # check <use_d, pred> in ttgir, mma_ops[1] should have <[var name], %true>
+    assert "%false, %true :" in mma_ops[0]
+    assert "%true, %true :" not in mma_ops[1]
+    assert "%false, %true :" not in mma_ops[1]
 
-    ref_out = torch.matmul(x, y)
-    torch.testing.assert_close(z, ref_out)
+    xy = torch.matmul(x, y)
+    torch.testing.assert_close(z1, xy)
+    torch.testing.assert_close(z2, xy + xy)
 
 
 @pytest.mark.skipif(
