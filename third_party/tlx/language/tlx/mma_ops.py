@@ -146,3 +146,14 @@ def async_dot_wait(
     """
     pendings = tl._unwrap_if_constexpr(pendings)
     return tl.tensor(_builder.create_warp_group_dot_wait([inp.handle], pendings)[0], inp.type)
+
+
+@tl.builtin
+def tcgen05_commit(
+    mBarrier: tlx.mbarrier,
+    _builder=None,
+) -> tl.tensor:
+    """
+    Make the mbarrier track the completion of prior asynchronous tcgen5 operations.
+    """
+    return tl.tensor(_builder.create_tcgen05_commit(mBarrier.handle), tl.void)

@@ -61,7 +61,17 @@ public:
                              })
                               .wasInterrupted();
 
-    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps) {
+    auto hasTCGen05CommitOps = mod.walk([&](Operation *op) {
+                                    if (isa<ttng::TCGen5CommitOp>(op)) {
+                                      return WalkResult::interrupt();
+                                    }
+                                    return WalkResult::advance();
+                                  })
+                                   .wasInterrupted();
+
+    // If there is no TLX related op, do nothing.
+    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
+        !hasTCGen05CommitOps) {
       return;
     }
 
@@ -78,6 +88,8 @@ public:
       mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
     if (hasWarpSpecOps)
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
+    if (hasTCGen05CommitOps)
+      mod->setAttr(AttrHasTCGen05CommitOpsName, b.getBoolAttr(true));
   }
 };
 

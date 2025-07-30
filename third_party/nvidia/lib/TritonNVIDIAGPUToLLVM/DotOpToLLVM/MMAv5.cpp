@@ -3,6 +3,7 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "Utility.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 
 using namespace mlir;
@@ -10,6 +11,7 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::NVIDIA;
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace tlx = mlir::triton::tlx;
 
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 using ::mlir::triton::gpu::NVMMASharedEncodingAttr;
@@ -373,7 +375,8 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
                     Value b, Value loadedA, Value loadedB,
                     MemDescType dTensorTy, Value useDFlag, Value pred,
                     ValueRange barriers, ValueRange barrierPreds, bool twoCTAs,
-                    bool opKindIsMXFP4, const DotConversion &op) {
+                    bool opKindIsMXFP4, const DotConversion &op,
+                    const ModuleOp mod) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
@@ -488,11 +491,15 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
     }
   }
 
-  for (auto [barrier, barrierPred] : llvm::zip(barriers, barrierPreds)) {
-    Value commitPred = tb.and_(barrierPred, elect);
-    auto smemObj =
-        LLVM::getSharedMemoryObjectFromStruct(loc, barrier, i64_ty, rewriter);
-    createMMACommit(rewriter, loc, smemObj.getBase(), commitPred, twoCTAs);
+  auto hasManualCommit =
+      mod->getAttrOfType<BoolAttr>(tlx::AttrHasTCGen05CommitOpsName);
+  if (!hasManualCommit) {
+    for (auto [barrier, barrierPred] : llvm::zip(barriers, barrierPreds)) {
+      Value commitPred = tb.and_(barrierPred, elect);
+      auto smemObj =
+          LLVM::getSharedMemoryObjectFromStruct(loc, barrier, i64_ty, rewriter);
+      createMMACommit(rewriter, loc, smemObj.getBase(), commitPred, twoCTAs);
+    }
   }
   rewriter.create<LLVM::BrOp>(loc, endBlock);
 }
@@ -538,11 +545,12 @@ void convertDot(const LLVMTypeConverter &typeConverter,
                   useInitAcc, desc.aInTmem, twoCTAs);
   };
 
+  auto mod = op->getParentOfType<mlir::ModuleOp>();
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
                  adaptor.getBarrierPreds(), twoCTAs, /*opKindIsMXFP4=*/false,
-                 dot);
+                 dot, mod);
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {
@@ -653,11 +661,12 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
                         mxfpInstKind);
   };
 
+  auto mod = op->getParentOfType<mlir::ModuleOp>();
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
                  adaptor.getBarrierPreds(), /*twoCTAs=*/false, opKindIsMXFP4,
-                 dot);
+                 dot, mod);
 }
 
 //===----------------------------------------------------------------------===//
