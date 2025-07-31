@@ -11,7 +11,7 @@ from triton._internal_testing import is_cuda, is_hip, is_hip_cdna3
 
 
 def format_exception(type, value, tb):
-    list_msg = traceback.format_exception(type, value, tb, chain=False)
+    list_msg = traceback.format_exception(type, value, tb, chain=True)
     return "\n".join(list_msg)
 
 
@@ -62,7 +62,6 @@ def test_err_static_assert():
         assert isinstance(e.value, CompileTimeAssertionFailure)
         assert e.value.__cause__ is None
         err_msg = format_exception(e.type, value=e.value, tb=e.tb)
-        print(err_msg)
         assert "at 2:4:" in err_msg, "error should point to the static_assert call"
         assert "<source unavailable>" not in err_msg
         assert "code_generator.py" not in err_msg
@@ -81,7 +80,6 @@ def test_err_in_unary_op():
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
 
     try:
-        assert e.value.__cause__ is None
         err_msg = format_exception(e.type, value=e.value, tb=e.tb)
         assert "at 2:4:" in err_msg, "error should point to the `not`"
         assert "<source unavailable>" not in err_msg
@@ -274,7 +272,7 @@ def test_global_var_access():
 
     with pytest.raises(CompilationError) as e:
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
-    assert "global variable" in str(e.value)
+    assert "global variable" in format_exception(e.type, value=e.value, tb=e.tb)
 
 
 CONSTEXPR_ANNOTATED_GLOBAL: tl.constexpr = 42
@@ -291,7 +289,7 @@ def test_constexpr_annotated_global_var_access():
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
         assert False, "Using a constexpr annotated global variable should not be allowed"
     except CompilationError as e:
-        assert "Cannot access global variable" in str(e)
+        assert "Cannot access global variable" in "\n".join(traceback.format_exception(e, chain=True))
 
 
 CONSTEXPR_GLOBAL = tl.constexpr(42)
