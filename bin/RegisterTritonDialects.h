@@ -94,6 +94,8 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TLX passes
   mlir::triton::tlx::registerPasses();
+  // Debug passes
+  mlir::triton::gpu::registerTritonPrintIRPass();
 
   registry.insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
                   mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
