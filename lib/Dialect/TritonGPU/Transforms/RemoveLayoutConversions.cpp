@@ -18,6 +18,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <deque>
@@ -1110,10 +1111,16 @@ static int64_t getByteCount(Value result, int64_t minElementCount = 0,
 
 void LayoutRematerialization::backwardRematerialization(
     ConvertLayoutOp convertOp) {
-  // DotOperand is hoisted by hoistDotOperand
   RankedTensorType targetType = convertOp.getType();
-  if (isa<DotOperandEncodingAttr>(targetType.getEncoding()))
-    return;
+  if (isa<DotOperandEncodingAttr>(targetType.getEncoding())) {
+    // DotOperand is hoisted by hoistDotOperand for pipelining purposes.
+    if (auto parentForOp = convertOp->getParentOfType<scf::ForOp>()) {
+      if (getNumStagesOrDefault(parentForOp, 3) > 1) {
+        return;
+      }
+    }
+  }
+
   Value oldV = convertOp.getSrc();
   LDBG("check backward remat with source " << oldV << " encoding "
                                            << targetType.getEncoding());
