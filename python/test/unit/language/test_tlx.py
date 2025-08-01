@@ -765,9 +765,9 @@ def test_async_dot_blackwell_not_use_d(device):
     mma_ops = [i for i in ttgir.split("\n") if "tc_gen5_mma" in i]
     assert len(mma_ops) == 2
     # check <use_d, pred> in ttgir, mma_ops[1] should have <[var name], %true>
-    assert "%false, %true :" in mma_ops[0]
-    assert "%true, %true :" not in mma_ops[1]
-    assert "%false, %true :" not in mma_ops[1]
+    assert "%false, %true" in mma_ops[0]
+    assert "%true, %true" not in mma_ops[1]
+    assert "%false, %true" not in mma_ops[1]
 
     xy = torch.matmul(x, y)
     torch.testing.assert_close(z1, xy)
