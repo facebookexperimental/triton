@@ -786,7 +786,7 @@ def test_tcgen05_commit(device):
     @triton.jit
     def tcgen5_commit_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                             OUT_DTYPE: tl.constexpr, NUM_ITER: tl.constexpr):
+                             OUT_DTYPE: tl.constexpr, NUM_DOT: tl.constexpr):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -811,13 +811,18 @@ def test_tcgen05_commit(device):
         acc_init = tl.full((BLOCK_M, BLOCK_N), 0, dtype=tl.float32)
         tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
 
-        # issue multiple mma ops but only commit (link mbarrier) once
-        bars = tlx.alloc_barriers(tl.constexpr(1))
-        bar = tlx.local_view(bars, 0)
-        for _ in range(NUM_ITER):
+        # issue multiple mma ops
+        bars = tlx.alloc_barriers(tl.constexpr(NUM_DOT))
+        bar_final = tlx.local_view(bars, NUM_DOT - 1)  # reserved for final wait
+        # make the first dot op sync by not giving a barrier (compiler will auto insert a barrier)
+        tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=True, mBarriers=[], out_dtype=OUT_DTYPE)
+        for k in range(0, NUM_DOT - 1):
+            bar = tlx.local_view(bars, k)
             tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=True, mBarriers=[bar], out_dtype=OUT_DTYPE)
-        tlx.tcgen05_commit(bar)
-        tlx.barrier_wait(bar, tl.constexpr(0))
+
+        # one dedicated barrier waiting for all previous mma ops
+        tlx.tcgen05_commit(bar_final)
+        tlx.barrier_wait(bar_final, tl.constexpr(0))
 
         # c1 = A*B
         c1 = tlx.local_load(acc_tmem, tlx.storage_kind.tmem).to(tl.float16)
@@ -834,11 +839,12 @@ def test_tcgen05_commit(device):
     num_dot = 4
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
     kernel = tcgen5_commit_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
-                                          z1.stride(1), NUM_ITER=num_dot, **kern_kwargs)
+                                          z1.stride(1), NUM_DOT=num_dot, **kern_kwargs)
     ptx = kernel.asm["ptx"]
     assert ptx.count("tcgen05.mma") == 4 * num_dot  # loop unrolled so 4 mma ops per dot
-    assert ptx.count("tcgen05.commit") == 1
-    assert ptx.count("mbarrier.try_wait") == 1
+    assert ptx.count(
+        "tcgen05.commit") == 1 + num_dot  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
+    assert ptx.count("mbarrier.try_wait") == 2  # one for first sync dot, one for final wait
     ref_out = torch.zeros_like(z1)
     for _ in range(num_dot):
         ref_out += torch.matmul(x, y)
@@ -847,11 +853,12 @@ def test_tcgen05_commit(device):
     num_dot = 3
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
     kernel = tcgen5_commit_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
-                                          z1.stride(1), NUM_ITER=num_dot, **kern_kwargs)
+                                          z1.stride(1), NUM_DOT=num_dot, **kern_kwargs)
     ptx = kernel.asm["ptx"]
     assert ptx.count("tcgen05.mma") == 4 * num_dot  # loop unrolled so 4 mma ops per dot
-    assert ptx.count("tcgen05.commit") == 1
-    assert ptx.count("mbarrier.try_wait") == 1
+    assert ptx.count(
+        "tcgen05.commit") == 1 + num_dot  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
+    assert ptx.count("mbarrier.try_wait") == 2  # one for first sync dot, one for final wait
     ref_out = torch.zeros_like(z1)
     for _ in range(num_dot):
         ref_out += torch.matmul(x, y)

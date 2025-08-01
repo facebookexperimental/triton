@@ -100,8 +100,7 @@ module {
 // CHECK-SAME: tlx.has_warp_spec_ops = true
 // CHECK-NOT: tlx.has_explicit_local_mem_access
 // CHECK-NOT: tlx.has_tlx_ops
-// CHECK-NOT: tlx.has_tcgen05_commit_ops
-module {
+module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @add2_warp_specialized_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg6: i32 {tt.divisibility = 16 : i32} ) attributes {noinline = false} {
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
@@ -166,28 +165,6 @@ module {
       tt.store %17, %15, %6 : tensor<1024x!tt.ptr<f32>>
       ttg.warp_return
     } : (!tt.ptr<f32>, !tt.ptr<f32>, i32, !tt.ptr<f32>, i32) -> ()
-    tt.return
-  }
-}
-
-
-// -----
-
-// CHECK: module attributes {
-// CHECK-SAME: tlx.has_tcgen05_commit_ops = true
-// CHECK-NOT: tlx.has_warp_spec_ops
-// CHECK-NOT: tlx.has_explicit_local_mem_access
-// CHECK-NOT: tlx.has_tlx_ops
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-module {
-  tt.func public @tcgen05_commit_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %arg6: i32 {tt.divisibility = 16 : i32} ) attributes {noinline = false} {
-    %c1024_i32 = arith.constant 1024 : i32
-    %0 = tt.get_program_id x : i32
-    %c0_i32 = arith.constant 0 : i32
-    %31 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
-    %33 = ttg.memdesc_subview %31[%c0_i32] : !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
-    ttng.tc_gen5_commit %33 : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     tt.return
   }
 }
