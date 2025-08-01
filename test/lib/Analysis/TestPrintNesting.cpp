@@ -18,7 +18,9 @@ struct TestPrintNestingPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestPrintNestingPass)
 
   StringRef getArgument() const final { return "test-print-nesting"; }
-  StringRef getDescription() const final { return "Test various printing."; }
+  StringRef getDescription() const final {
+    return "Test printing IR block/region/op structures.";
+  }
   // Entry point for the pass.
   void runOnOperation() override {
     Operation *op = getOperation();
