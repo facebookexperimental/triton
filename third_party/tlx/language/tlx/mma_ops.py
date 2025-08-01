@@ -154,6 +154,7 @@ def tcgen05_commit(
     _builder=None,
 ) -> tl.tensor:
     """
-    Make the mbarrier track the completion of prior asynchronous tcgen5 operations.
+    Make the mbarrier track the completion of all prior asynchronous tcgen5 operations.
+    NOTE: DO NOT use the same mBarrier passed to async_dot. This op needs a separate dedicated mBarrier.
     """
     return tl.tensor(_builder.create_tcgen05_commit(mBarrier.handle), tl.void)
