@@ -3,14 +3,6 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonPrintIR : Pass<"triton-print-ir-structure", "mlir::ModuleOp"> {
-  let summary = "print-ir-structure";
-
-  let description = [{
-    Test only pass to print Op/Block/Region structure of a TTIR/TTGIR for debugging.
-  }];
-}
-
 def TritonGPUPipeline : Pass<"tritongpu-pipeline", "mlir::ModuleOp"> {
   let summary = "pipeline";
 

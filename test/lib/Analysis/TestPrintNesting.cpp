@@ -1,18 +1,24 @@
-#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+//===- TestPrintNesting.cpp - Passes to illustrate the IR nesting ---------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
 
-namespace mlir {
-namespace triton {
-namespace gpu {
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
 
-#define GEN_PASS_DEF_TRITONPRINTIR
-#include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
+using namespace mlir;
 
-// copied from LLVM/MLIR test pass:
-// https://github.com/llvm/llvm-project/blob/2e36afc8d91e592a57b9b00d92607b0e999030b2/mlir/test/lib/IR/TestPrintNesting.cpp#L16
-class TritonPrintIRPass : public impl::TritonPrintIRBase<TritonPrintIRPass> {
-public:
-  using impl::TritonPrintIRBase<TritonPrintIRPass>::TritonPrintIRBase;
+namespace {
+/// This pass illustrates the IR nesting through printing.
+struct TestPrintNestingPass
+    : public PassWrapper<TestPrintNestingPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestPrintNestingPass)
 
+  StringRef getArgument() const final { return "test-print-nesting"; }
+  StringRef getDescription() const final { return "Test various printing."; }
   // Entry point for the pass.
   void runOnOperation() override {
     Operation *op = getOperation();
@@ -84,7 +90,12 @@ public:
     return llvm::outs();
   }
 };
+} // namespace
 
-} // namespace gpu
-} // namespace triton
+namespace mlir {
+namespace test {
+void registerTestPrintNestingPass() {
+  PassRegistration<TestPrintNestingPass>();
+}
+} // namespace test
 } // namespace mlir

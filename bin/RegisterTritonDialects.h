@@ -37,6 +37,7 @@ void registerTestAliasPass();
 void registerTestAlignmentPass();
 void registerTestAllocationPass();
 void registerTestMembarPass();
+void registerTestPrintNestingPass();
 void registerTestAMDGPUMembarPass();
 void registerTestTritonAMDGPURangeAnalysis();
 void registerTestLoopPeelingPass();
@@ -52,6 +53,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::test::registerTestAlignmentPass();
   mlir::test::registerTestAllocationPass();
   mlir::test::registerTestMembarPass();
+  mlir::test::registerTestPrintNestingPass();
   mlir::test::registerTestLoopPeelingPass();
   mlir::test::registerTestAMDGPUMembarPass();
   mlir::test::registerTestTritonAMDGPURangeAnalysis();
@@ -94,8 +96,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TLX passes
   mlir::triton::tlx::registerPasses();
-  // Debug passes
-  mlir::triton::gpu::registerTritonPrintIRPass();
 
   registry.insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
                   mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,

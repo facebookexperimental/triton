@@ -23,7 +23,6 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/PipeliningUtility.cpp
   Pipeliner/Schedule.cpp
   Prefetch.cpp
-  PrintIRStructure.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp
