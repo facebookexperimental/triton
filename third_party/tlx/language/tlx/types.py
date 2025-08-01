@@ -242,6 +242,13 @@ class buffered_tensor_type(tl.block_type):
             shape += f'_{self.num}'
         return f'buffered_{elt}S{shape}'
 
+    def __str__(self) -> str:
+        return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
+
+    def __eq__(self, other) -> bool:
+        return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
+                and self.num == other.num)
+
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
 
@@ -288,6 +295,17 @@ class mbarrier_type(buffered_tensor_type):
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
         value = mbarrier(handles[cursor], self.num, self.layout)
         return value, cursor + 1
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self.num > 1:
+            shape = [self.num]
+        else:
+            shape = self.shape
+        return builder.get_memdesc_type(
+            shape,
+            self.element_ty.to_ir(builder),
+            self.layout.to_ir(builder),
+        )
 
 
 class async_token(tl.base_value):
