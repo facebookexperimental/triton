@@ -156,6 +156,15 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx) {
     }
     values.push_back(ifOp->getResults()[resultIdx]);
     return values;
+  } else if (auto warpSpecializePartitionsOp =
+                 dyn_cast<mlir::triton::gpu::WarpSpecializePartitionsOp>(op)) {
+    // add arg for every partition
+    SmallVector<Value> values;
+    for (auto &region : warpSpecializePartitionsOp.getPartitionRegions()) {
+      auto &firstBlock = region.getBlocks().front();
+      values.push_back(firstBlock.getArguments()[resultIdx]);
+    }
+    return values;
   }
   return {};
 }
@@ -343,7 +352,8 @@ void assignMemoryLayouts(FuncOp &func) {
       }
     } else if (auto blockArg = dyn_cast<BlockArgument>(desc)) {
       auto parentOp = blockArg.getOwner()->getParentOp();
-      if (isa<scf::ForOp, scf::WhileOp>(parentOp)) {
+      if (isa<scf::ForOp, scf::WhileOp,
+              mlir::triton::gpu::WarpSpecializePartitionsOp>(parentOp)) {
         auto offset = isa<scf::ForOp>(parentOp);
         auto vals = getTiedArgs(parentOp, blockArg.getArgNumber() - offset);
         updateEncoding(vals, EncodingInfo{});
