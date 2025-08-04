@@ -120,7 +120,7 @@ def async_dot(
                 use_acc_handle = use_acc.handle
             else:
                 use_acc_handle = _builder.get_int1(use_acc.value)
-        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc.handle, use_acc_handle, pred, handles)
+        output = _builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, handles)
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0, _builder.options.num_warps)
