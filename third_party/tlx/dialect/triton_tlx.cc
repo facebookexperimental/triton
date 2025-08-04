@@ -349,41 +349,16 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_tcgen5_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &d, std::optional<Value> useD,
-              std::optional<Value> pred,
-              std::vector<Value> mBarriers) -> mlir::Value {
-             // try to find the TMEMAllocOp that created d
-             ttng::TMEMAllocOp tmemAllocOp;
-             auto value = d;
-             while (true) {
-               if ((tmemAllocOp = value.getDefiningOp<ttng::TMEMAllocOp>())) {
-                 break;
-               }
-               // TODO: find the defining op properly
-               auto definingOp = value.getDefiningOp();
-               if (auto subviewOp = dyn_cast<ttg::MemDescIndexOp>(definingOp)) {
-                 value = subviewOp.getSrc();
-               } else {
-                 auto requireLayoutOp =
-                     value.getDefiningOp<tlx::RequireLayoutOp>();
-                 assert(requireLayoutOp &&
-                        "Failed to find TMEMAllocOp defining the "
-                        "accumulator TMEM passed to dot op.");
-                 value = requireLayoutOp.getSrc();
-               }
-             }
-
+              std::optional<Value> pred, std::vector<Value> mBarriers) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
-             return self
-                 .create<ttng::TCGen5MMAOp>(
-                     tokType, a, b, d, tmemAllocOp.getToken(),
-                     useD.has_value() ? useD.value() : predTrue /*useD*/,
-                     pred.has_value() ? pred.value() : predTrue /*pred */,
-                     false /* two_ctas*/, ValueRange(mBarriers),
-                     ValueRange(barrierPreds),
-                     !mBarriers.empty() /* is_async */)
-                 .getToken();
+             self.create<ttng::TCGen5MMAOp>(
+                 tokType, a, b, d, Value(),
+                 useD.has_value() ? useD.value() : predTrue /*useD*/,
+                 pred.has_value() ? pred.value() : predTrue /*pred */,
+                 false /* two_ctas*/, ValueRange(mBarriers),
+                 ValueRange(barrierPreds), !mBarriers.empty() /* is_async */);
            })
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier) -> void {
