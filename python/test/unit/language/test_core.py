@@ -44,6 +44,7 @@ from triton._internal_testing import (
     to_triton,
     torch_dtype_name,
     to_numpy,
+    format_exception,
 )
 from triton.runtime.errors import InterpreterError
 
@@ -330,8 +331,9 @@ def test_scalar_overflow(device):
         x = tl.full((), 32, dtype=tl.int32)
         y = x + huge_int
 
-    with pytest.raises(triton.TritonError, match="out of range"):
+    with pytest.raises(triton.TritonError) as e:
         kernel[(1, )]()
+    assert re.search(r'out of range', format_exception(e), flags=re.DOTALL)
 
 
 # generic test functions
@@ -580,8 +582,9 @@ def test_bin_op(dtype_x, dtype_y, op, num_ctas, device):
 
     if (op in ('%', '/') and ((dtype_x in int_dtypes and dtype_y in uint_dtypes) or
                               (dtype_x in uint_dtypes and dtype_y in int_dtypes))):
-        with pytest.raises(triton.TritonError, match='Cannot use .* because they have different signedness'):
+        with pytest.raises(triton.TritonError) as e:
             _test_binary(dtype_x, dtype_y, expr, numpy_expr, device=device, num_ctas=num_ctas)
+        assert re.search(r'Cannot use .* because they have different signedness', format_exception(e), flags=re.DOTALL)
     else:
         # skip when bfloat16, as NumPy's ref performs the computation in float32
         # while Triton performs it in bfloat16
@@ -708,8 +711,9 @@ def test_bitwise_op(dtype_x, dtype_y, op, num_ctas, device):
         numpy_expr = None
     if 'float' in dtype_x + dtype_y:
         # The CompilationError must have been caused by a C++ exception with this text.
-        with pytest.raises(triton.TritonError, match='invalid operands of type'):
+        with pytest.raises(triton.TritonError) as e:
             _test_binary(dtype_x, dtype_y, expr, numpy_expr='np.array([])', device=device, num_ctas=num_ctas)
+        assert 'invalid operands of type' in format_exception(e)
     else:
         _test_binary(dtype_x, dtype_y, expr, numpy_expr, device=device, num_ctas=num_ctas)
 
