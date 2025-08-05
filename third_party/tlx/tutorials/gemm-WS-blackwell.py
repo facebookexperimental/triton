@@ -120,7 +120,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
-        with tlx.async_task(num_warps=4, num_regs=232):  # MMA consumer
+        with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
             # common code duplicated for each region to avoid SMEM overhead
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -141,15 +141,12 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
 
                 # init accumulator to 0 (in TMEM), block until the buffer is ready
-                zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 acc_tmem = tlx.local_view(tmem_buffers, cur_tmem_buf)
                 # wait epilogue consumer to be done with the buffer before reusing it
                 tmem_empty_bar = tlx.local_view(tmem_empty_bars, cur_tmem_buf)
                 tlx.barrier_wait(tmem_empty_bar, tmem_write_phase)
                 # flip phase at the end of a round of using TMEM barriers
                 tmem_write_phase = tmem_write_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
-
-                tlx.local_store(acc_tmem, zeros, tlx.storage_kind.tmem)
 
                 # now iterate along K to compute result for the block
                 for k in range(0, k_tiles):
@@ -162,7 +159,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bar, dot_phase)
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(a, b, acc_tmem, mBarriers=[smem_empty_bar], out_dtype=tl.float32)
+                    tlx.async_dot(a, b, acc_tmem, use_acc=k > 0, mBarriers=[smem_empty_bar], out_dtype=tl.float32)
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
