@@ -855,8 +855,9 @@ def test_invalid_slice(device):
     def _kernel(dst):
         dst[10:]
 
-    with pytest.raises(triton.TritonError, match='unsupported tensor index'):
+    with pytest.raises(triton.TritonError) as e:
         _kernel[(1, )](dst=dst)
+    assert re.search(r'unsupported tensor index', format_exception(e), flags=re.DOTALL)
 
 
 # ----------------
@@ -4516,7 +4517,7 @@ def test_const(device, choose_const, constexpr, mode):
             else:
                 assert mode == "direct" and choose_const
                 error = "Cannot store to a constant pointer"
-        error_msg = exc_info.value.error_message or str(exc_info.value.__cause__)
+        error_msg = format_exception(exc_info)
         assert error in error_msg, "Wrong error message!"
     else:
         patched_kernel[(1, )](input, output, output, choose_const, SIZE, SIZE)
