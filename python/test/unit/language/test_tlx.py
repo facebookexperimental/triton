@@ -1301,3 +1301,53 @@ def test_loop_carry_var_check(device):
         loop_carry_shadow[grid]()
     list_msg = traceback.format_exception(e.type, e.value, e.tb, chain=True)
     assert "Please make sure that the type stays consistent" in '\n'.join(list_msg)
+
+
+@triton.jit
+def _global_tmem_func(
+    buffers,
+    x_ptr,
+    stride_m,
+    stride_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    x_ptr_offsets = x_ptr + (offs_m[:, None] * stride_m + offs_n[None, :] * stride_n)
+
+    ones = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_N), 1.0, tl.float32)
+    buffer1 = tlx.local_view(buffers, 0)
+    tlx.local_store(buffer1, ones, tlx.storage_kind.tmem)
+    b = tlx.local_load(buffer1, tlx.storage_kind.tmem)
+
+    tl.store(x_ptr_offsets, b)
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires compute capability >= 10 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(64, 64)])
+def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
+
+    @triton.jit
+    def tmem_op_func_kernel(
+        x_ptr,
+        stride_m,
+        stride_n,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        # init tmem buffers here
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        # pass buffers to another func to do actual processing
+        _global_tmem_func(buffers, x_ptr, stride_m, stride_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+    x = torch.rand((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=torch.float32, device=device)
+    grid = lambda meta: (1, )
+    tmem_op_func_kernel[grid](x, x.stride(0), x.stride(1), BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+    ref_out = torch.ones_like(x)
+    torch.testing.assert_close(x, ref_out)

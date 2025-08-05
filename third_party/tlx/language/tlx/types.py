@@ -132,7 +132,6 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
 
-
     """
     Make a default NVMMA shared layout encoding.
     """
@@ -143,7 +142,6 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         return cls(shape=shape, order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
                    elemType=elemType, numCTAsPerCGA=[1] * rank, numCTASplit=[1] * rank, numCTAOrder=[1] * rank,
                    fp4Padded=False)
-
 
     """
     Create a new layout that is a permutation of the given layout.
@@ -254,12 +252,13 @@ class buffered_tensor_type(tl.block_type):
 
     def to_ir(self, builder: ir.builder) -> None:
         shape = self.shape
-        if self.num > 1:
+        if self.num >= 1:
             shape = [self.num] + list(shape)
         return builder.get_memdesc_type(
             shape,
             self.element_ty.to_ir(builder),
             self.layout.to_ir(builder),
+            self.storage.value,
         )
 
     def _flatten_ir(self, handles) -> None:
@@ -297,7 +296,7 @@ class mbarrier_type(buffered_tensor_type):
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
-        if self.num > 1:
+        if self.num >= 1:
             shape = [self.num]
         else:
             shape = self.shape
@@ -305,6 +304,7 @@ class mbarrier_type(buffered_tensor_type):
             shape,
             self.element_ty.to_ir(builder),
             self.layout.to_ir(builder),
+            self.storage.value,
         )
 
 
