@@ -1,6 +1,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "third_party/proton/dialect/include/Dialect/Proton/IR/Dialect.h"
@@ -838,25 +839,59 @@ void populateCFPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<CFCondBranchPattern, CFBranchPattern>(typeConverter, context);
 }
 
+// Take the body of a partition into a new `tt.func`. We can use this to run a
+// full compiler pipeline on the partition.
+static OwningOpRef<ModuleOp> takeIntoFunction(Region *partition, int numWarps) {
+  // Forward the module attributes (target, number of threads per warp, etc.)
+  // onto the container module.
+  auto wsOp = partition->getParentOfType<WarpSpecializeOp>();
+  ModuleOp mod = wsOp->getParentOfType<ModuleOp>();
+  OwningOpRef<ModuleOp> container = ModuleOp::create(mod.getLoc());
+  Block *containerBlock = container->getBody();
+
+  auto b = OpBuilder::atBlockBegin(containerBlock);
+  FunctionType funcType = b.getFunctionType(partition->getArgumentTypes(), {});
+  auto containerFunc = b.create<FuncOp>(mod.getLoc(), "container", funcType);
+  containerFunc.getBody().takeBody(*partition);
+  container.get()->setAttrs(mod->getAttrs());
+  container.get()->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
+
+  // Replace `ttg.warp_return` with `tt.return` to make the IR valid.
+  containerFunc.walk([&](WarpReturnOp op) {
+    b.setInsertionPoint(op);
+    b.create<ReturnOp>(op.getLoc());
+    op.erase();
+  });
+
+  // This should make valid IR.
+  if (failed(mlir::verify(*container)))
+    llvm::report_fatal_error("expected partition region to make valid IR");
+  return container;
+}
+
+// Take the partition body out of the container module and function.
+static void extractPartitionBody(OwningOpRef<ModuleOp> container,
+                                 Region *partition) {
+  auto containerFunc = cast<FuncOp>(container->lookupSymbol("container"));
+
+  // Rewrite the returns.
+  containerFunc.walk([](ReturnOp op) {
+    OpBuilder b(op);
+    b.create<WarpReturnOp>(op.getLoc());
+    op.erase();
+  });
+
+  partition->takeBody(containerFunc.getBody());
+}
+
 class ConvertTritonToTritonGPU
     : public triton::impl::ConvertTritonToTritonGPUBase<
           ConvertTritonToTritonGPU> {
 public:
   using ConvertTritonToTritonGPUBase::ConvertTritonToTritonGPUBase;
 
-  void runOnOperation() override {
-    if (target.getValue().empty()) {
-      mlir::emitError(
-          getOperation().getLoc(),
-          "'convert-triton-to-tritongpu' requires 'target' option to be set");
-      return signalPassFailure();
-    }
-
-    MLIRContext *context = &getContext();
-    ModuleOp mod = getOperation();
-    // type converter
-    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
-                                         numCTAs, enableSourceRemat);
+  void runOnModule(ModuleOp op, TritonGPUTypeConverter &typeConverter) {
+    MLIRContext *context = op->getContext();
     TritonGPUConversionTarget target(*context, typeConverter);
     // rewrite patterns
     RewritePatternSet patterns(context);
@@ -872,14 +907,55 @@ public:
     populateCFPatterns(typeConverter, patterns);
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
-    Builder b(&getContext());
+    if (failed(applyPartialConversion(op, target, std::move(patterns))))
+    return signalPassFailure();
+  }
+
+  void runOnOperation() override {
+    if (target.getValue().empty()) {
+      mlir::emitError(
+          getOperation().getLoc(),
+          "'convert-triton-to-tritongpu' requires 'target' option to be set");
+      return signalPassFailure();
+    }
+
+    MLIRContext *context = &getContext();
+    ModuleOp mod = getOperation();
+    Builder b(context);
     mod->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(AttrNumThreadsPerWarp, b.getI32IntegerAttr(threadsPerWarp));
     mod->setAttr(AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
-    if (failed(applyPartialConversion(mod, target, std::move(patterns))))
-      return signalPassFailure();
+    // Convert Warp specialized partition regions first as they may require different
+    // number of warps from the rest of the module.
+    mod.walk([&](WarpSpecializePartitionsOp wsPartitionsOp) {
+      for (Region &region : wsPartitionsOp->getRegions()) {
+        auto &firstBlock = region.getBlocks().front();
+        // Determine the number of warps for this region, falling back to the default if unspecified.
+        unsigned regionNumWarps =
+            triton::gpu::maybeLookupNumWarps(&firstBlock).value_or(numWarps);
+
+            // Lift the region into a function so it can be converted independently.
+        OwningOpRef<ModuleOp> container =
+            takeIntoFunction(&region, regionNumWarps);
+
+            // Create a type converter configured for this region.
+        TritonGPUTypeConverter typeConverter(
+            context, regionNumWarps, threadsPerWarp, numCTAs, enableSourceRemat);
+
+        // Run Triton->TritonGPU conversion on the lifted module.
+        runOnModule(*container, typeConverter);
+
+        // Replace the original region with the transformed result.
+        extractPartitionBody(std::move(container), &region);
+      }
+    });
+
+    // Module type converter
+    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
+      numCTAs, enableSourceRemat);
+    runOnModule(mod, typeConverter);
   }
 };
 

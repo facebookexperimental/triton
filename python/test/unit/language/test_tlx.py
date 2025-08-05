@@ -36,7 +36,7 @@ def test_async_tasks(BLOCK_SIZE, device):
                 y = tl.load(y_ptr + offsets, mask=mask)
                 output = x + y
                 tl.store(z_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=4, registers=100, replicate=2):
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
@@ -68,9 +68,9 @@ def test_async_tasks(BLOCK_SIZE, device):
 
     pattern_ws = (r'ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 100, 100>}')
     assert re.search(pattern_ws, ttgir, flags=re.DOTALL)
-    pattern_p0 = (r'partition0(.*) num_warps\(4\)')
+    pattern_p0 = (r'partition0(.*) num_warps\(1\)')
     assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
-    pattern_p1 = (r'partition1(.*) num_warps\(4\)')
+    pattern_p1 = (r'partition1(.*) num_warps\(1\)')
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
 
     # Check that the replica_id is correctly passed to non-default regions
