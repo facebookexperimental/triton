@@ -115,7 +115,8 @@ void init_gluon_ir(py::module &&m) {
       .def(
           "get_partition_region",
           [](ttg::WarpSpecializeOp self, unsigned idx) -> Region & {
-            if (idx >= self.getNumRegions())
+            auto numPartitions = self.getPartitionRegions().size();
+            if (idx >= numPartitions)
               throw pybind11::index_error("Op region index out of range");
             return *self.getPartitionRegions()[idx];
           },
