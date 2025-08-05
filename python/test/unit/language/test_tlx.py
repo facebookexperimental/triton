@@ -6,6 +6,7 @@ import triton.language as tl
 from triton._internal_testing import is_cuda
 import triton.language.extra.tlx as tlx
 from typing import Optional
+import traceback
 
 
 @pytest.mark.skipif(
@@ -1280,3 +1281,23 @@ def test_local_gather(device):
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
     torch.testing.assert_close(x, y)
+
+
+def test_loop_carry_var_check(device):
+
+    @triton.jit
+    def loop_carry_shadow():
+        x = tlx.local_alloc((16, 16), tl.int16, tl.constexpr(2))
+        y = x
+        for _ in range(0, 128):
+            zeros = tl.zeros((16, 16), dtype=tl.int16)
+            # shadow x with different type
+            x = tlx.local_view(y, 0)
+            tlx.local_store(x, zeros)
+
+    grid = lambda meta: (1, 1)
+
+    with pytest.raises(triton.CompilationError) as e:
+        loop_carry_shadow[grid]()
+    list_msg = traceback.format_exception(e.type, e.value, e.tb, chain=True)
+    assert "Please make sure that the type stays consistent" in '\n'.join(list_msg)
