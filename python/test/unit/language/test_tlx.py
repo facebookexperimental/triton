@@ -1422,5 +1422,4 @@ def test_inline_tmem(BLOCK_SIZE, device):
     y = torch.rand((64, 64), dtype=torch.float32, device=device)
     grid = lambda meta: (1, )
     kerenl_info = kernel[grid](y, BLOCK_SIZE)
-    # TODO: check numerics once tmem load/store is ready
     assert kerenl_info.asm["ttir"].count("store") == 1

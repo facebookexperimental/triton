@@ -1,4 +1,3 @@
-from torch import storage
 import triton.language.core as tl
 from triton.language.semantic import (
     _convert_elem_to_ir_value,
