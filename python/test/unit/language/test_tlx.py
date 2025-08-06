@@ -146,6 +146,80 @@ def test_local_load(BLOCK_SIZE, device):
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     torch.testing.assert_close(x + y, output)
 
+# Test tl.dot wit tlx smem ops 
+# Tests tl.load->tlx_local_store->tlx_local_load->tl.dot
+@pytest.mark.skipif(
+    is_cuda() and torch.cuda.get_device_capability()[0] == 10,
+    reason="Not tested on Blackwell",
+)
+def test_tl_dot_with_tlx_smem_load_store(device):
+
+    @triton.jit
+    def dot_kernel(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        off_m = tl.arange(0, BLOCK_M)
+        off_n = tl.arange(0, BLOCK_N)
+        off_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = X + (off_m[:, None] * stride_xm + off_k[None, :] * stride_xk)
+        b_ptrs = Y + (off_k[:, None] * stride_yk + off_n[None, :] * stride_yn)
+
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(X), 1)
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(Y), 1)
+        a_smem_view = buf_alloc_a[0]
+        b_smem_view = buf_alloc_b[0]
+
+        a_load_reg = tl.load(a_ptrs)
+        b_load_reg = tl.load(b_ptrs)
+
+        tlx.local_store(a_smem_view, a_load_reg)
+        tlx.local_store(b_smem_view, b_load_reg)
+
+        a_tile = tlx.local_load(a_smem_view)
+        b_tile = tlx.local_load(b_smem_view)
+
+        c_tile = tl.dot(a_tile, b_tile)
+
+        c = c_tile.to(tlx.dtype_of(Z))
+        c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    # Note: This test may fail for other shapes/kwargs until
+    # reg->shared layout propagation is implemented tlx layout propagation
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    # test smem
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
+    dot_kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        **kern_kwargs,
+    )
+    z_ref = torch.matmul(x, y)
+    torch.testing.assert_close(z, z_ref)
 
 # Tests tl.load->tlx_local_store->tlx_local_load
 # This is a smem load/store test variant that does not use
