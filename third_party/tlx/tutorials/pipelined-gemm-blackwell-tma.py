@@ -89,7 +89,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     # init accumulator to 0 (in TMEM)
     buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
     acc_tmem = tlx.local_view(buffers, 0)
-    tlx.local_store(acc_tmem, accumulator, tlx.storage_kind.tmem)
+    tlx.local_store(acc_tmem, accumulator)
 
     num_iter = tl.cdiv(K, BLOCK_SIZE_K)
     for k in range(0, num_iter):
@@ -137,7 +137,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     tlx.barrier_wait(prev_dot_bar, prev_phase)
 
     # load the result from TMEM to registers
-    result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+    result = tlx.local_load(acc_tmem)
     c = result.to(tl.float16)
 
     # store the result to SMEM to prepare for TMA store (TMEM -> GMEM)

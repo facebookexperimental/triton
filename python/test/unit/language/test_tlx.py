@@ -296,8 +296,8 @@ def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
         buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         buffer1 = tlx.local_view(buffers, 0)
-        tlx.local_store(buffer1, a, tlx.storage_kind.tmem)
-        b = tlx.local_load(buffer1, tlx.storage_kind.tmem)
+        tlx.local_store(buffer1, a)
+        b = tlx.local_load(buffer1)
         # b == a == tensor of 1.0
         tl.store(x_ptr_offsets, b + 2)
 
@@ -346,17 +346,17 @@ def test_tmem_subslice(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
         buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         buffer1 = tlx.local_view(buffers, 0)
-        tlx.local_store(buffer1, a, tlx.storage_kind.tmem)
+        tlx.local_store(buffer1, a)
 
         subslice1 = tlx.subslice(buffer1, 0, BLOCK_SIZE_N // 4)
         subslice2 = tlx.subslice(buffer1, BLOCK_SIZE_N // 4, BLOCK_SIZE_N // 4)
         subslice3 = tlx.subslice(buffer1, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 4)
         subslice4 = tlx.subslice(buffer1, 3 * BLOCK_SIZE_N // 4, BLOCK_SIZE_N // 4)
 
-        b1 = tlx.local_load(subslice1, tlx.storage_kind.tmem)
-        b2 = tlx.local_load(subslice2, tlx.storage_kind.tmem)
-        b3 = tlx.local_load(subslice3, tlx.storage_kind.tmem)
-        b4 = tlx.local_load(subslice4, tlx.storage_kind.tmem)
+        b1 = tlx.local_load(subslice1)
+        b2 = tlx.local_load(subslice2)
+        b3 = tlx.local_load(subslice3)
+        b4 = tlx.local_load(subslice4)
         # b == a == tensor of 1.0
         tl.store(x_ptr_offsets1, b1 + 2)
         tl.store(x_ptr_offsets2, b2 + 2)
@@ -553,8 +553,8 @@ def test_local_reinterpret(device):
         tlx.async_load_wait_group(tl.constexpr(0))
 
         x32_reg = tlx.local_load(smem_buffer_32_0)
-        tlx.local_store(tmem_buffer_0, x32_reg, tlx.storage_kind.tmem)
-        x32_reg_from_tmem = tlx.local_load(tmem_buffer_0, tlx.storage_kind.tmem)
+        tlx.local_store(tmem_buffer_0, x32_reg)
+        x32_reg_from_tmem = tlx.local_load(tmem_buffer_0)
         tl.store(y32_ptr + output_offset, x32_reg_from_tmem)
 
         # x16 GMEM -> x16 SMEM -> x16 Reg -> x16 TMEM -> x16 Reg -> y16 GMEM
@@ -568,8 +568,8 @@ def test_local_reinterpret(device):
         reinterpreted = tlx.local_reinterpret(tmem_buffer_0, tl.float16)
 
         x16_reg = tlx.local_load(smem_buffer_16_0)
-        tlx.local_store(reinterpreted, x16_reg, tlx.storage_kind.tmem)
-        x16_reg_from_tmem = tlx.local_load(reinterpreted, tlx.storage_kind.tmem)
+        tlx.local_store(reinterpreted, x16_reg)
+        x16_reg_from_tmem = tlx.local_load(reinterpreted)
         tl.store(y16_ptr + output_offset, x16_reg_from_tmem)
 
     torch.manual_seed(0)
@@ -706,7 +706,7 @@ def test_async_dot_blackwell(device):
 
         buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         acc_tmem = tlx.local_view(buffers, 0)
-        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+        tlx.local_store(acc_tmem, acc_init)
 
         # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
         tlx.async_dot(a_smem, b_smem, acc_tmem, mBarriers=[], out_dtype=OUT_DTYPE)
@@ -718,7 +718,7 @@ def test_async_dot_blackwell(device):
         tlx.barrier_wait(bar, tl.constexpr(0))
 
         # now result == a*b + a*b
-        result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+        result = tlx.local_load(acc_tmem)
 
         c = result.to(tl.float16)
         c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
@@ -785,18 +785,18 @@ def test_async_dot_blackwell_not_use_d(device):
 
         # fill tmem d with 1
         acc_init = tl.full((BLOCK_M, BLOCK_N), 1, dtype=tl.float32)
-        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+        tlx.local_store(acc_tmem, acc_init)
         # do not use d (so that we get A*B instead of A*B+1)
         tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], out_dtype=OUT_DTYPE)
 
         # c1 = A*B
-        c1 = tlx.local_load(acc_tmem, tlx.storage_kind.tmem).to(tl.float16)
+        c1 = tlx.local_load(acc_tmem).to(tl.float16)
         c_ptrs = c_ptr1 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
         tl.store(c_ptrs, c1)
 
         # now use d, so c2 = A*B + c1 = A*B + A*B
         tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=pid < 1000, mBarriers=[], out_dtype=OUT_DTYPE)
-        c2 = tlx.local_load(acc_tmem, tlx.storage_kind.tmem).to(tl.float16)
+        c2 = tlx.local_load(acc_tmem).to(tl.float16)
         c_ptrs = c_ptr2 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
         tl.store(c_ptrs, c2)
 
@@ -858,7 +858,7 @@ def test_tcgen05_commit(device):
 
         # fill tmem d with 0
         acc_init = tl.full((BLOCK_M, BLOCK_N), 0, dtype=tl.float32)
-        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+        tlx.local_store(acc_tmem, acc_init)
 
         # issue multiple mma ops
         bars = tlx.alloc_barriers(tl.constexpr(NUM_DOT))
@@ -874,7 +874,7 @@ def test_tcgen05_commit(device):
         tlx.barrier_wait(bar_final, tl.constexpr(0))
 
         # c1 = A*B
-        c1 = tlx.local_load(acc_tmem, tlx.storage_kind.tmem).to(tl.float16)
+        c1 = tlx.local_load(acc_tmem).to(tl.float16)
         c_ptrs = c_ptr1 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
         tl.store(c_ptrs, c1)
 
@@ -938,7 +938,7 @@ def test_async_dot_blackwell_tmem_A(device):
         acc_init = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         acc_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         acc_tmem = tlx.local_view(acc_buffers, 0)
-        tlx.local_store(acc_tmem, acc_init, tlx.storage_kind.tmem)
+        tlx.local_store(acc_tmem, acc_init)
 
         # async load a and b into SMEM
         buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
@@ -956,12 +956,12 @@ def test_async_dot_blackwell_tmem_A(device):
         # store A to TMEM
         buffers_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
         a_tmem = tlx.local_view(buffers_a, 0)
-        tlx.local_store(a_tmem, a_reg, tlx.storage_kind.tmem)
+        tlx.local_store(a_tmem, a_reg)
 
         # acc_tmem = acc_tmem + a_tmem * b_smem
         tlx.async_dot(a_tmem, b_smem, acc_tmem, mBarriers=[], out_dtype=OUT_DTYPE)
         # load result from TMEM to Reg
-        result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+        result = tlx.local_load(acc_tmem)
 
         c = result.to(tl.float16)
         c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
@@ -1367,11 +1367,10 @@ def _global_tmem_func(
 
     ones = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_N), 1.0, tl.float32)
     buffer1 = tlx.local_view(buffers, 0)
-    tlx.local_store(buffer1, ones, tlx.storage_kind.tmem)
-    b = tlx.local_load(buffer1, tlx.storage_kind.tmem)
+    tlx.local_store(buffer1, ones)
+    b = tlx.local_load(buffer1)
 
     tl.store(x_ptr_offsets, b)
-
 
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
@@ -1399,3 +1398,29 @@ def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
     ref_out = torch.ones_like(x)
     torch.testing.assert_close(x, ref_out)
+
+
+@triton.jit
+def math_kernel(x):
+    return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
+
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_inline_tmem(BLOCK_SIZE, device):
+    @triton.jit
+    def kernel(y_ptr, BLOCK_SIZE: tl.constexpr):
+        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
+        buffer0 = tlx.local_view(buffers, 0)  # noqa: F841
+        x = tlx.local_load(buffer0)  # noqa: F841
+        pid = tl.program_id(axis=0)
+        offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
+        offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
+        offsets = offsets_i * BLOCK_SIZE + offsets_j
+        y = math_kernel(x)  # noqa: F841
+        tl.store(y_ptr + offsets, y)
+
+
+    y = torch.rand((64, 64), dtype=torch.float32, device=device)
+    grid = lambda meta: (1, )
+    kerenl_info = kernel[grid](y, BLOCK_SIZE)
+    # TODO: check numerics once tmem load/store is ready
+    assert kerenl_info.asm["ttir"].count("store") == 1

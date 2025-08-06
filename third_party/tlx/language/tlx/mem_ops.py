@@ -1,3 +1,4 @@
+from torch import storage
 import triton.language.core as tl
 from triton.language.semantic import (
     _convert_elem_to_ir_value,
@@ -255,34 +256,36 @@ def async_load_wait_group(
 @tl.builtin
 def local_load(
     src: tlx.buffered_tensor,
-    storage: tlx.storage_kind = tlx.storage_kind.smem,
     token: tlx.async_token = None,
     _builder=None,
 ) -> tl.tensor:
     """
     Loads buffer from local or tensor memory into a distributed tensor.
     """
+    block_type = tl.block_type(src.type.element_ty, src.type.shape)
+    storage = src.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_builder.options.arch)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_builder, src)
         load_handle = _builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                 token.handle if token else None)
         output = _builder.create_release_layout(load_handle)
-        return tl.tensor(output, src.type)
+        return tl.tensor(output, block_type)
+    else:
+        output =_builder.create_local_load(src.handle, token.handle if token else None)
+        return tl.tensor(output, block_type)
 
-    block_type = tl.block_type(src.type.element_ty, src.type.shape)
-    return tl.tensor(_builder.create_local_load(src.handle, token.handle if token else None), block_type)
 
 @tl.builtin
 def local_store(
     dst: tlx.buffered_tensor,
     src: tl.tensor,
-    storage: tlx.storage_kind = tlx.storage_kind.smem,
     _builder=None,
 ) -> tl.tensor:
     """
     Store a distributed tensor into a buffer in local or tensor memory.
     """
+    storage = dst.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_builder.options.arch)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_builder, dst)

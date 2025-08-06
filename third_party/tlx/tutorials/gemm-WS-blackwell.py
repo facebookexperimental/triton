@@ -207,16 +207,16 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 if EPILOGUE_SUBTILE:
                     # We load/store the result half by half to reduce SMEM pressure
                     acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice1, tlx.storage_kind.tmem)
+                    result = tlx.local_load(acc_tmem_subslice1)
                     c = result.to(tl.float16)
                     c_desc.store([offs_am, offs_bn], c)
 
                     acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice2, tlx.storage_kind.tmem)
+                    result = tlx.local_load(acc_tmem_subslice2)
                     c = result.to(tl.float16)
                     c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
                 else:
-                    result = tlx.local_load(acc_tmem, tlx.storage_kind.tmem)
+                    result = tlx.local_load(acc_tmem)
                     c = result.to(tl.float16)
                     c_desc.store([offs_am, offs_bn], c)
 
