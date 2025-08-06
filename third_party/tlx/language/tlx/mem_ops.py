@@ -79,15 +79,18 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.numCTAOrder,
                 )
             else:
-                layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
+                layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype, _builder.options.num_ctas,
+                                                                        _builder.options.num_warps,
+                                                                        32  # threads_per_warp
+                                                                        )
                 layout_handle = _builder.make_nv_mma_shared_encoding_attr(
                     [int(x) for x in layout.shape],
                     layout.order,
                     layout.elemType.to_ir(_builder),
-                    layout.numCTAsPerCGA,
-                    layout.numCTASplit,
-                    layout.numCTAOrder,
                     layout.fp4Padded,
+                    layout.numCTAs,
+                    layout.moduleNumWarps,
+                    layout.threadsPerWarp,
                 )
         else:
             layout = tlx.tensor_memory_layout_encoding.make_default(shape)
@@ -271,7 +274,7 @@ def local_load(
         output = _builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
     else:
-        output =_builder.create_local_load(src.handle, token.handle if token else None)
+        output = _builder.create_local_load(src.handle, token.handle if token else None)
         return tl.tensor(output, block_type)
 
 

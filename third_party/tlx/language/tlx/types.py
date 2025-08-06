@@ -122,46 +122,47 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
+    def __init__(self, shape, order, elemType, fp4Padded, numCTAs, moduleNumWarps, threadsPerWarp):
         super().__init__()
         self.shape = shape
         self.order = order
         self.elemType = elemType
-        self.numCTAsPerCGA = numCTAsPerCGA
-        self.numCTASplit = numCTASplit
-        self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
+
+        # These are used to compute CTALayout, if None, then compiler might give a default CTALayout
+        self.numCTAs = numCTAs
+        self.moduleNumWarps = moduleNumWarps
+        self.threadsPerWarp = threadsPerWarp
+
+        assert self.numCTAs is None or self.numCTAs > 0, "numCTAs must be positive"
+        assert self.moduleNumWarps is None or self.moduleNumWarps > 0, "moduleNumWarps must be positive"
+        assert self.threadsPerWarp is None or self.threadsPerWarp > 0, "threadsPerWarp must be positive"
 
     """
     Make a default NVMMA shared layout encoding.
     """
 
     @classmethod
-    def make_default(cls, shape, elemType):
+    def make_default(cls, shape, elemType, numCTAs=None, moduleNumWarps=None, threadsPerWarp=None):
         rank = len(shape)
         return cls(shape=shape, order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
-                   elemType=elemType, numCTAsPerCGA=[1] * rank, numCTASplit=[1] * rank, numCTAOrder=[1] * rank,
-                   fp4Padded=False)
+                   elemType=elemType, fp4Padded=False, numCTAs=numCTAs, moduleNumWarps=moduleNumWarps,
+                   threadsPerWarp=threadsPerWarp)
 
     """
     Create a new layout that is a permutation of the given layout.
+    TODO: validate against multiple CTAs
     """
 
     def make_permute(self, dims) -> Self:
         permuted_order = tuple(self.order[d] for d in dims)
-        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA,
-                                             self.numCTASplit, self.numCTAOrder, self.fp4Padded)
+        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.fp4Padded, self.numCTAs,
+                                             self.moduleNumWarps, self.threadsPerWarp)
 
     def to_ir(self, builder: ir.builder) -> None:
-        return builder.make_nv_mma_shared_encoding_attr(
-            [int(x) for x in self.shape],
-            self.order,
-            self.elemType.to_ir(builder),
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
-            self.fp4Padded,
-        )
+        return builder.make_nv_mma_shared_encoding_attr([int(x) for x in self.shape], self.order,
+                                                        self.elemType.to_ir(builder), self.fp4Padded, self.numCTAs,
+                                                        self.moduleNumWarps, self.threadsPerWarp)
 
 
 class storage_kind(enum.Enum):
