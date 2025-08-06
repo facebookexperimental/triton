@@ -148,6 +148,7 @@ def test_local_load(BLOCK_SIZE, device):
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     torch.testing.assert_close(x + y, output)
 
+
 # Tests tl.load->tlx_local_store->tlx_local_load
 # This is a smem load/store test variant that does not use
 # async_load, so this test can be run on platforms where
@@ -168,7 +169,7 @@ def test_load_store_smem_with_tl_load(BLOCK_SIZE, device):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        smem_buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 3)
+        smem_buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 3)
         x_smem = tlx.local_view(smem_buffers, 0)
         y_smem = tlx.local_view(smem_buffers, 1)
 
@@ -189,13 +190,14 @@ def test_load_store_smem_with_tl_load(BLOCK_SIZE, device):
     y = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
     n_elements = x.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = smem_reg_store_load[grid](x, y, output, n_elements, BLOCK_SIZE)
     assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
     assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 2
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     assert kernel.asm["ttgir"].count("ttg.local_store") == 2
     torch.testing.assert_close(x + y, output)
+
 
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
@@ -1372,6 +1374,7 @@ def _global_tmem_func(
 
     tl.store(x_ptr_offsets, b)
 
+
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires compute capability >= 10 for NV",
@@ -1404,22 +1407,98 @@ def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 def math_kernel(x):
     return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
 
+
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_inline_tmem(BLOCK_SIZE, device):
+
     @triton.jit
     def kernel(y_ptr, BLOCK_SIZE: tl.constexpr):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
         buffer0 = tlx.local_view(buffers, 0)
         x = tlx.local_load(buffer0)
-        pid = tl.program_id(axis=0)
         offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
         offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
         offsets = offsets_i * BLOCK_SIZE + offsets_j
         y = math_kernel(x)
         tl.store(y_ptr + offsets, y)
 
-
     y = torch.rand((64, 64), dtype=torch.float32, device=device)
     grid = lambda meta: (1, )
     kerenl_info = kernel[grid](y, BLOCK_SIZE)
     assert kerenl_info.asm["ttir"].count("store") == 1
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 10,  # TODO: test for 9.0
+    reason="Requires compute capability >= 10 for NV",
+)
+def test_2cta_descriptor_load(device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_load_kernel(input_ptr1, input_ptr2, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr,
+                               BLOCK_SIZE_N: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in1 = tl.make_tensor_descriptor(
+            input_ptr1,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_in2 = tl.make_tensor_descriptor(
+            input_ptr2,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(2))
+        buffer1 = tlx.local_view(buffers, 0)
+        buffer2 = tlx.local_view(buffers, 1)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        # 2 float16 input tensors, divided by 2 cta
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2 * 2 // 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.async_descriptor_load(desc_in1, buffer1, [off_m, off_n], bar)
+        tlx.async_descriptor_load(desc_in2, buffer2, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+
+        result = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tensor1 = tlx.local_load(buffer1)
+        tensor2 = tlx.local_load(buffer2)
+        result += tensor1 + tensor2
+        result = result.to(tl.float16)
+        desc_out.store([off_m, off_n], result)
+
+    triton.set_allocator(alloc_fn)
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    M, N = 3 * BLOCK_SIZE_M, 2 * BLOCK_SIZE_N
+    x = torch.randn((M, N), dtype=torch.float16, device=device)
+    y = torch.randn_like(x)
+    z = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_load_kernel[grid](x, y, z, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                          num_ctas=2)
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 2
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
+    torch.testing.assert_close(z, x + y)

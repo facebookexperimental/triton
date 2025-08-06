@@ -83,22 +83,29 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              std::vector<unsigned> order, Type &elemType,
-              std::vector<unsigned> CTAsPerCGA,
-              std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
-              bool fp4Padded) {
-             /* Validation logic for user defined layout encoding begin */
-             assert(shape.size() == order.size());
-             assert(order.size() == CTAsPerCGA.size());
-             assert(CTAsPerCGA.size() == CTASplitNum.size());
-             assert(CTASplitNum.size() == CTAOrder.size());
-             /* Validation logic for user defined layout encoding end */
-
+              std::vector<unsigned> order, Type &elemType, bool fp4Padded,
+              std::optional<int> numCTAs, std::optional<int> moduleNumWarps,
+              std::optional<int> threadsPerWarp) {
+             assert(shape.size() == order.size() && "shape and order mismatch");
+             ttg::CTALayoutAttr ctaLayout;
              auto context = self.getBuilder().getContext();
-             auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
-                                                      CTASplitNum, CTAOrder);
+             if (numCTAs.has_value()) {
+               assert(moduleNumWarps.has_value() && "moduleNumWarps not set");
+               assert(threadsPerWarp.has_value() && "threadsPerWarp not set");
+               // use the numCTA to generate a default BlockedEncoding
+               // then use the BlockedEncoding to infer a CTALayout
+               ttg::BlockedEncodingAttr defaultBlockedEncoding =
+                   ttg::getDefaultBlockedEncoding(
+                       self.getContext(), shape, moduleNumWarps.value(),
+                       threadsPerWarp.value(), numCTAs.value());
+               ctaLayout = ttg::getCTALayout(defaultBlockedEncoding);
+             } else {
+               // generate default CTALayout
+               ctaLayout =
+                   ttg::CTALayoutAttr::getDefault(context, shape.size());
+             }
              return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
-                 context, shape, order, CTALayout, elemType, fp4Padded));
+                 context, shape, order, ctaLayout, elemType, fp4Padded));
            })
       .def("make_nv_mma_encoding_attr",
            [](TritonOpBuilder &self, Value opndA, Value opndAcc,
