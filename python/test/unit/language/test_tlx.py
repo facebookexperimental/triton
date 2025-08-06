@@ -1409,13 +1409,13 @@ def test_inline_tmem(BLOCK_SIZE, device):
     @triton.jit
     def kernel(y_ptr, BLOCK_SIZE: tl.constexpr):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
-        buffer0 = tlx.local_view(buffers, 0)  # noqa: F841
-        x = tlx.local_load(buffer0)  # noqa: F841
+        buffer0 = tlx.local_view(buffers, 0)
+        x = tlx.local_load(buffer0)
         pid = tl.program_id(axis=0)
         offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
         offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
         offsets = offsets_i * BLOCK_SIZE + offsets_j
-        y = math_kernel(x)  # noqa: F841
+        y = math_kernel(x)
         tl.store(y_ptr + offsets, y)
 
 
