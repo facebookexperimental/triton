@@ -148,6 +148,54 @@ def test_local_load(BLOCK_SIZE, device):
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     torch.testing.assert_close(x + y, output)
 
+# Tests tl.load->tlx_local_store->tlx_local_load
+# This is a smem load/store test variant that does not use
+# async_load, so this test can be run on platforms where
+# async_load has no/limited support
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_load_store_smem_with_tl_load(BLOCK_SIZE, device):
+
+    @triton.jit
+    def smem_reg_store_load(
+        x_ptr,
+        y_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        smem_buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 3)
+        x_smem = tlx.local_view(smem_buffers, 0)
+        y_smem = tlx.local_view(smem_buffers, 1)
+
+        x_tile = tl.load(x_ptr + offsets, mask=mask)
+        y_tile = tl.load(y_ptr + offsets, mask=mask)
+
+        tlx.local_store(x_smem, x_tile)
+        tlx.local_store(y_smem, y_tile)
+
+        x_reg = tlx.local_load(x_smem)
+        y_reg = tlx.local_load(y_smem)
+        local_add = x_reg + y_reg
+        tl.store(output_ptr + offsets, local_add, mask=mask)
+
+    torch.manual_seed(0)
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    y = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    kernel = smem_reg_store_load[grid](x, y, output, n_elements, BLOCK_SIZE)
+    assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
+    assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 2
+    assert kernel.asm["ttgir"].count("ttg.local_load") == 2
+    assert kernel.asm["ttgir"].count("ttg.local_store") == 2
+    torch.testing.assert_close(x + y, output)
 
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
