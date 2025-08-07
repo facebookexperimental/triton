@@ -1420,7 +1420,6 @@ def test_inline_tmem(BLOCK_SIZE, device):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
         buffer0 = tlx.local_view(buffers, 0)
         x = tlx.local_load(buffer0)
-        pid = tl.program_id(axis=0)
         offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
         offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
         offsets = offsets_i * BLOCK_SIZE + offsets_j
