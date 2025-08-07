@@ -52,8 +52,8 @@ ask() {
 }
 if [ "$(ask)" == "yes" ]; then
     echo "Running TLX tutorial kernels"
-    for kernels in third_party/tlx/tutorials/*.py; do
-        echo "Running $kernels"
-        pytest $kernels | pastry -t "TLX tutorial kernels: $kernel $USER"
+    for k in third_party/tlx/tutorials/*.py; do
+        echo "Running $k"
+        pytest $k | pastry -t "TLX tutorial kernels: $k $USER"
     done
 fi
