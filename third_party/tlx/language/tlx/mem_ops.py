@@ -152,7 +152,7 @@ def local_view(
         )
 
 
-def _buffered_tensor_getitem(self, buffer_idx, _builder=None):
+def _buffered_tensor_getitem(self, buffer_idx):
     return local_view(self, buffer_idx, _builder=self.type.builder)
 
 

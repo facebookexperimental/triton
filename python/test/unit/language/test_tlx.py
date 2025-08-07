@@ -1405,6 +1405,7 @@ def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 def math_kernel(x):
     return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
 
+
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires compute capability >= 10 for NV",
