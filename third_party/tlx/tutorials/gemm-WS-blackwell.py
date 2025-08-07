@@ -137,7 +137,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
 
-                # init accumulator to 0 (in TMEM), block until the buffer is ready
                 # wait epilogue consumer to be done with the buffer before reusing it
                 tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
                 # flip phase at the end of a round of using TMEM barriers
