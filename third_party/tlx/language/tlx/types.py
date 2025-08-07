@@ -163,6 +163,15 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             self.fp4Padded,
         )
 
+    def __str__(self) -> str:
+        return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}>"
+
+    def __eq__(self, other) -> bool:
+        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
+                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
+                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
+                and self.fp4Padded == other.fp4Padded)
+
 
 class storage_kind(enum.Enum):
     smem = "smem"
