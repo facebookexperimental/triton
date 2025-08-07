@@ -1789,15 +1789,6 @@ void init_triton_ir(py::module &&m) {
                  other.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile);
            })
-      .def("create_barrier_wait",
-           [](TritonOpBuilder &self, Value mbarrerLoc, Value phase) -> void {
-             self.create<ttng::WaitBarrierOp>(mbarrerLoc, phase);
-           })
-      .def(
-          "create_barrier_arrive",
-          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
-            self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
-          })
       .def("create_thread_id",
            [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
              static constexpr mlir::gpu::Dimension dims[] = {
