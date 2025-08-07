@@ -148,6 +148,7 @@ def test_local_load(BLOCK_SIZE, device):
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     torch.testing.assert_close(x + y, output)
 
+
 # Tests tl.load->tlx_local_store->tlx_local_load
 # This is a smem load/store test variant that does not use
 # async_load, so this test can be run on platforms where
@@ -168,7 +169,7 @@ def test_load_store_smem_with_tl_load(BLOCK_SIZE, device):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        smem_buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 3)
+        smem_buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 3)
         x_smem = tlx.local_view(smem_buffers, 0)
         y_smem = tlx.local_view(smem_buffers, 1)
 
@@ -189,13 +190,14 @@ def test_load_store_smem_with_tl_load(BLOCK_SIZE, device):
     y = torch.rand(size, dtype=torch.float32, device=device)
     output = torch.empty_like(x)
     n_elements = x.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = smem_reg_store_load[grid](x, y, output, n_elements, BLOCK_SIZE)
     assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
     assert kernel.asm["ttgir"].count("ttg.memdesc_subview") == 2
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     assert kernel.asm["ttgir"].count("ttg.local_store") == 2
     torch.testing.assert_close(x + y, output)
+
 
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
@@ -1372,6 +1374,7 @@ def _global_tmem_func(
 
     tl.store(x_ptr_offsets, b)
 
+
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires compute capability >= 10 for NV",
@@ -1404,12 +1407,14 @@ def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 def math_kernel(x):
     return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
 
+
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires compute capability >= 10 for NV",
 )
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_inline_tmem(BLOCK_SIZE, device):
+
     @triton.jit
     def kernel(y_ptr, BLOCK_SIZE: tl.constexpr):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
@@ -1421,7 +1426,6 @@ def test_inline_tmem(BLOCK_SIZE, device):
         offsets = offsets_i * BLOCK_SIZE + offsets_j
         y = math_kernel(x)
         tl.store(y_ptr + offsets, y)
-
 
     y = torch.rand((64, 64), dtype=torch.float32, device=device)
     grid = lambda meta: (1, )
