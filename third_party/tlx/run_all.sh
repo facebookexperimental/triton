@@ -41,7 +41,7 @@ fi
 ask() {
     retval=""
     while true; do
-        read -p "Run all TLX unit tests? {y|n}" yn
+        read -p "Run all TLX tutorial kernels? {y|n}" yn
         case $yn in
             [Yy]* ) retval="yes"; break;;
             [Nn]* ) retval="no"; break;;
