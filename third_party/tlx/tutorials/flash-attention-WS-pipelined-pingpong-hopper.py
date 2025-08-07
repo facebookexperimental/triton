@@ -75,11 +75,9 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
             # load q: it will stay in SRAM throughout
             for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
-                q_full = tlx.local_view(q_fulls, cid)
-                tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
-                q_tile = tlx.local_view(q_tiles, cid)
+                tlx.barrier_expect_bytes(q_fulls[cid], 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
                 qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
-                tlx.async_descriptor_load(desc_q, q_tile, [qo_offset_y_split, 0], q_full)
+                tlx.async_descriptor_load(desc_q, q_tiles[cid], [qo_offset_y_split, 0], q_fulls[cid])
 
             # loop over loading k, v
             kv_phase = 0
@@ -90,22 +88,16 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 kv_phase = kv_phase ^ (buf_id == 0)
 
                 # wait for the K buffer to be released by the consumer
-                k_empty = tlx.local_view(k_empties, buf_id)
-                tlx.barrier_wait(k_empty, kv_phase)
+                tlx.barrier_wait(k_empties[buf_id], kv_phase)
                 # load K
-                k_full = tlx.local_view(k_fulls, buf_id)
-                k_tile = tlx.local_view(k_tiles, buf_id)
-                tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * HEAD_DIM)  # float16
-                tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
+                tlx.barrier_expect_bytes(k_fulls[buf_id], 2 * BLOCK_N * HEAD_DIM)  # float16
+                tlx.async_descriptor_load(desc_k, k_tiles[buf_id], [kv_offset_y, 0], k_fulls[buf_id])
 
                 # wait for the V buffer to be released by the consumer
-                v_empty = tlx.local_view(v_empties, buf_id)
-                tlx.barrier_wait(v_empty, kv_phase)
+                tlx.barrier_wait(v_empties[buf_id], kv_phase)
                 # load V
-                v_full = tlx.local_view(v_fulls, buf_id)
-                v_tile = tlx.local_view(v_tiles, buf_id)
-                tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * HEAD_DIM)  # float16
-                tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
+                tlx.barrier_expect_bytes(v_fulls[buf_id], 2 * BLOCK_N * HEAD_DIM)  # float16
+                tlx.async_descriptor_load(desc_v, v_tiles[buf_id], [kv_offset_y, 0], v_fulls[buf_id])
 
                 kv_offset_y += BLOCK_N
                 acc_cnt += 1
@@ -123,9 +115,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
             # wait for the Q buffer to be populated by the producer
             cid: tl.constexpr = tlx.async_task_replica_id()
-            q_full = tlx.local_view(q_fulls, cid)
-            tlx.barrier_wait(q_full, 0)
-            q_tile = tlx.local_view(q_tiles, cid)
+            tlx.barrier_wait(q_fulls[cid], 0)
 
             lo, hi = 0, N_CTX
             k_phase = 0
@@ -134,12 +124,10 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             v_buf_id = 0
 
             # wait for the K[0] buffer to be populated by the producer
-            k_full = tlx.local_view(k_fulls, k_buf_id)
-            tlx.barrier_wait(k_full, k_phase)
-            k_tile = tlx.local_view(k_tiles, k_buf_id)
+            tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
 
             # -- compute qk[0] ----
-            k_tile = tlx.local_trans(k_tile)
+            k_tile = tlx.local_trans(k_tiles[k_buf_id])
 
             if cid == 0:
                 # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
@@ -150,7 +138,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
                 tlx.named_barrier_wait(10, 256)
 
-            qk = tlx.async_dot(q_tile, k_tile)
+            qk = tlx.async_dot(q_tiles[cid], k_tile)
 
             if cid == 0:
                 # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
@@ -159,8 +147,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             # wait for the MMA using to complete
             qk = tlx.async_dot_wait(0, qk)
             # release the K buffer
-            k_empty = tlx.local_view(k_empties, k_buf_id)
-            tlx.barrier_arrive(k_empty, 1)
+            tlx.barrier_arrive(k_empties[k_buf_id], 1)
 
             # -- compute m_i and l_i ----
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -183,30 +170,25 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 k_phase = k_phase ^ (k_buf_id == 0)
 
                 # wait for the K buffer to be populated by the producer
-                k_full = tlx.local_view(k_fulls, k_buf_id)
-                tlx.barrier_wait(k_full, k_phase)
-                k_tile = tlx.local_view(k_tiles, k_buf_id)
+                tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
 
                 # compute qk for the current iteration
-                k_tile = tlx.local_trans(k_tile)
-                qk = tlx.async_dot(q_tile, k_tile)
+                k_tile = tlx.local_trans(k_tiles[k_buf_id])
+                qk = tlx.async_dot(q_tiles[cid], k_tile)
 
                 # compute pv from the previous iteration
                 # wait for the previous V buffer to be populated by the producer
                 v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
                 v_phase = v_phase ^ (v_buf_id == 0)
-                v_full = tlx.local_view(v_fulls, v_buf_id)
-                tlx.barrier_wait(v_full, v_phase)
-                v_tile = tlx.local_view(v_tiles, v_buf_id)
+                tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
                 # prepare p and v for the dot
                 p = p.to(tlx.dtype_of(desc_k))
-                acc = tlx.async_dot(p, v_tile, acc)
+                acc = tlx.async_dot(p, v_tiles[v_buf_id], acc)
 
                 # wait for the current qk MMA to complete
                 qk = tlx.async_dot_wait(1, qk)
                 # release the K buffer
-                k_empty = tlx.local_view(k_empties, k_buf_id)
-                tlx.barrier_arrive(k_empty, 1)
+                tlx.barrier_arrive(k_empties[k_buf_id], 1)
 
                 # -- compute m_i and l_i ----
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -223,8 +205,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # wait for the previous pv MMA to complete
                 acc = tlx.async_dot_wait(0, acc)
                 # release the V buffer
-                v_empty = tlx.local_view(v_empties, v_buf_id)
-                tlx.barrier_arrive(v_empty, 1)
+                tlx.barrier_arrive(v_empties[v_buf_id], 1)
                 acc = acc * alpha[:, None]
                 acc_cnt += 1
 
@@ -232,17 +213,14 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             # wait for the V buffer to be populated by the producer
             v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
             v_phase = v_phase ^ (v_buf_id == 0)
-            v_full = tlx.local_view(v_fulls, v_buf_id)
-            tlx.barrier_wait(v_full, v_phase)
-            v_tile = tlx.local_view(v_tiles, v_buf_id)
+            tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
             # prepare p and v for the dot
             p = p.to(tlx.dtype_of(desc_k))
-            acc = tlx.async_dot(p, v_tile, acc)
+            acc = tlx.async_dot(p, v_tiles[v_buf_id], acc)
             # wait for the MMA using to complete
             acc = tlx.async_dot_wait(0, acc)
             # release the V buffer
-            v_empty = tlx.local_view(v_empties, v_buf_id)
-            tlx.barrier_arrive(v_empty, 1)
+            tlx.barrier_arrive(v_empties[v_buf_id], 1)
 
             # epilogue
             start_m = tl.program_id(0)

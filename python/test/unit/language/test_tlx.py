@@ -121,14 +121,12 @@ def test_local_load(BLOCK_SIZE, device):
         y_ptr_offsets = y_ptr + offsets
 
         buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 3)
-        buffer0 = tlx.local_view(buffers, 0)
-        buffer1 = tlx.local_view(buffers, 1)
-        tlx.async_load(x_ptr_offsets, buffer0, mask=mask)
-        tlx.async_load(y_ptr_offsets, buffer1, mask=mask)
+        tlx.async_load(x_ptr_offsets, buffers[0], mask=mask)
+        tlx.async_load(y_ptr_offsets, buffers[1], mask=mask)
         tlx.async_load_commit_group()
         tlx.async_load_wait_group(tl.constexpr(0))
-        x_local = tlx.local_load(buffer0)
-        y_local = tlx.local_load(buffer1)
+        x_local = tlx.local_load(buffers[0])
+        y_local = tlx.local_load(buffers[1])
         local_add = x_local + y_local
         tl.store(output_ptr + offsets, local_add, mask=mask)
 
@@ -1407,7 +1405,10 @@ def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 def math_kernel(x):
     return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
 
-
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires compute capability >= 10 for NV",
+)
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_inline_tmem(BLOCK_SIZE, device):
 
