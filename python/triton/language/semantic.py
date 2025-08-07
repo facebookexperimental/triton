@@ -1557,7 +1557,7 @@ class TritonSemantic(Generic[TensorTy]):
             acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
         else:
             acc_handle = acc.handle
-            assert acc.type == ret_ty
+            assert acc.type.shape == ret_ty.shape and acc.type.element_ty == ret_ty.element_ty, "acc must have same shape and dtype as output"
     
         # max_num_imprecise_acc only applies to fp8 -> fp32 dot on sm_90
         if max_num_imprecise_acc is None:
