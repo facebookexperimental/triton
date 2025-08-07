@@ -755,7 +755,8 @@ def test_async_dot_blackwell(device):
     not is_cuda() or torch.cuda.get_device_capability()[0] != 10,
     reason="Requires compute capability == 10 (Blackwell) for NV",
 )
-def test_async_dot_blackwell_not_use_d(device):
+@pytest.mark.parametrize("M, N, K", [(64, 64, 32), (64, 128, 64), (128, 128, 64), (128, 256, 128), (128, 256, 256)])
+def test_async_dot_blackwell_not_use_d(M, N, K, device):
     """
     Test D = A*B
     """
@@ -764,7 +765,7 @@ def test_async_dot_blackwell_not_use_d(device):
     def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
                           c_ptr2, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
                           OUT_DTYPE: tl.constexpr):
-        pid = tl.program_id(axis=0)
+        # pid = tl.program_id(axis=0)
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -788,22 +789,15 @@ def test_async_dot_blackwell_not_use_d(device):
         # fill tmem d with 1
         acc_init = tl.full((BLOCK_M, BLOCK_N), 1, dtype=tl.float32)
         tlx.local_store(acc_tmem, acc_init)
-        # do not use d (so that we get A*B instead of A*B+1)
+        # use D to compute A*B + 1
         tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=True, mBarriers=[], out_dtype=OUT_DTYPE)
 
-        # c1 = A*B
-        # c1 = tlx.local_load(acc_tmem).to(tl.float16)
-        # c_ptrs = c_ptr1 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-        # tl.store(c_ptrs, c1)
-
-        # now use d, so c2 = A*B + c1 = A*B + A*B
-        # tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=pid < 1000, mBarriers=[], out_dtype=OUT_DTYPE)
         c2 = tlx.local_load(acc_tmem).to(tl.float16)
         c_ptrs = c_ptr2 + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
         tl.store(c_ptrs, c2)
 
     torch.manual_seed(0)
-    M, N, K = (64, 64, 32)
+    # M, N, K = (64, 64, 32)
     x = torch.randn((M, K), device=device, dtype=torch.float16)
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
@@ -812,16 +806,8 @@ def test_async_dot_blackwell_not_use_d(device):
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
     kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
                                        z1.stride(1), z2, **kern_kwargs)
-    # ttgir = kernel.asm["ttgir"]
-    # mma_ops = [i for i in ttgir.split("\n") if "tc_gen5_mma" in i]
-    # assert len(mma_ops) == 2
-    # # check <use_d, pred> in ttgir, mma_ops[1] should have <[var name], %true>
-    # assert "%false, %true" in mma_ops[0]
-    # assert "%true, %true" not in mma_ops[1]
-    # assert "%false, %true" not in mma_ops[1]
 
     xy = torch.matmul(x, y)
-    # torch.testing.assert_close(z1, xy)
     torch.testing.assert_close(z2, xy + 1)
 
 
