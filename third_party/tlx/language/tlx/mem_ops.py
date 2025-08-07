@@ -106,14 +106,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _builder.create_tmem_alloc(full_shape, elem_type, layout_handle)
 
-    return tlx.buffered_tensor(
-        tensor_handle,
-        dtype,
-        unwrapped_shape,
-        unwrapped_num,
-        storage,
-        layout,
-    )
+    return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout, _builder)
 
 
 # overload declarations just to make linter happy
@@ -147,7 +140,7 @@ def local_view(
     buffer_idx = _convert_elem_to_ir_value(_builder, buffer_idx, require_i64=False)
     view_handle = _builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarrier):
-        return tlx.mbarrier(view_handle, 1, local_allocated_buffers.type.layout)
+        return tlx.mbarrier(view_handle, 0, local_allocated_buffers.type.layout)
     else:
         return tlx.buffered_tensor(
             view_handle,
@@ -157,6 +150,14 @@ def local_view(
             local_allocated_buffers.type.storage,
             local_allocated_buffers.type.layout,
         )
+
+
+def _buffered_tensor_getitem(self, buffer_idx, _builder=None):
+    return local_view(self, buffer_idx, _builder=self.type.builder)
+
+
+tlx.buffered_tensor.__getitem__ = _buffered_tensor_getitem
+tlx.mbarrier.__getitem__ = _buffered_tensor_getitem
 
 
 @tl.builtin
@@ -271,7 +272,7 @@ def local_load(
         output = _builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
     else:
-        output =_builder.create_local_load(src.handle, token.handle if token else None)
+        output = _builder.create_local_load(src.handle, token.handle if token else None)
         return tl.tensor(output, block_type)
 
 

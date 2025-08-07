@@ -106,17 +106,13 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 for k in range(0, k_tiles):
                     # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
                     buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
-                    a = tlx.local_view(buffers_A, buf)
-                    b = tlx.local_view(buffers_B, buf)
-                    smem_full_bar = tlx.local_view(smem_full_bars, buf)
-                    smem_empty_bar = tlx.local_view(smem_empty_bars, buf)
                     # wait for previous phase(round) of dot for this buf
-                    tlx.barrier_wait(smem_empty_bar, load_phase ^ 1)
+                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
                     # buffer is now ready to be used again
                     offs_k = k * BLOCK_SIZE_K
-                    tlx.barrier_expect_bytes(smem_full_bar, 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
-                    tlx.async_descriptor_load(a_desc, a, [offs_am, offs_k], smem_full_bar)
-                    tlx.async_descriptor_load(b_desc, b, [offs_k, offs_bn], smem_full_bar)
+                    tlx.barrier_expect_bytes(smem_full_bars[buf], 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
+                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
+                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
@@ -141,10 +137,8 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
 
                 # init accumulator to 0 (in TMEM), block until the buffer is ready
-                acc_tmem = tlx.local_view(tmem_buffers, cur_tmem_buf)
                 # wait epilogue consumer to be done with the buffer before reusing it
-                tmem_empty_bar = tlx.local_view(tmem_empty_bars, cur_tmem_buf)
-                tlx.barrier_wait(tmem_empty_bar, tmem_write_phase)
+                tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
                 # flip phase at the end of a round of using TMEM barriers
                 tmem_write_phase = tmem_write_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
 
@@ -152,27 +146,21 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 for k in range(0, k_tiles):
                     # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
                     buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
-                    a = tlx.local_view(buffers_A, buf)
-                    b = tlx.local_view(buffers_B, buf)
-                    smem_full_bar = tlx.local_view(smem_full_bars, buf)
-                    smem_empty_bar = tlx.local_view(smem_empty_bars, buf)
                     # wait for current phase(round) of load for this buf
-                    tlx.barrier_wait(smem_full_bar, dot_phase)
+                    tlx.barrier_wait(smem_full_bars[buf], dot_phase)
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(a, b, acc_tmem, use_acc=k > 0, mBarriers=[smem_empty_bar], out_dtype=tl.float32)
+                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0, mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
                 # wait for last mma to complete
                 last_buf = (processed_k_iters + k_tiles - 1) % NUM_SMEM_BUFFERS
-                last_smem_empty_bar = tlx.local_view(smem_empty_bars, last_buf)
                 # in case phase was flipped, we should use the phase value when dot op was issued
                 last_dot_phase = dot_phase ^ (last_buf == NUM_SMEM_BUFFERS - 1)
-                tlx.barrier_wait(last_smem_empty_bar, last_dot_phase)
+                tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
 
                 # done filling this buffer, signal epilogue consumer
-                tmem_full_bar = tlx.local_view(tmem_full_bars, cur_tmem_buf)
-                tlx.barrier_arrive(tmem_full_bar, 1)
+                tlx.barrier_arrive(tmem_full_bars[cur_tmem_buf], 1)
 
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
@@ -196,13 +184,12 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
 
-                tmem_full_bar = tlx.local_view(tmem_full_bars, cur_tmem_buf)
-                tlx.barrier_wait(tmem_full_bar, tmem_read_phase)
+                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
                 # flip phase at the end of a round of using TMEM barriers
                 tmem_read_phase = tmem_read_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
 
                 # load the result from TMEM to registers
-                acc_tmem = tlx.local_view(tmem_buffers, cur_tmem_buf)
+                acc_tmem = tmem_buffers[cur_tmem_buf]
 
                 if EPILOGUE_SUBTILE:
                     # We load/store the result half by half to reduce SMEM pressure
@@ -221,8 +208,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     c_desc.store([offs_am, offs_bn], c)
 
                 # done storing this buffer, signal MMA consumer to resume writing to it
-                tmem_empty_bar = tlx.local_view(tmem_empty_bars, cur_tmem_buf)
-                tlx.barrier_arrive(tmem_empty_bar, 1)
+                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
