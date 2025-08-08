@@ -105,19 +105,23 @@ public:
       if (isa<tlx::RequireLayoutOp>(op) || isScalar(op))
         return WalkResult::advance();
 
-      if (auto partitionOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(op)) {
-        for (Region &region : partitionOp->getRegions()) {
-          for (auto blockArg : region.getArguments()) {
-            auto lattice = solver.lookupState<LayoutEncodingLattice>(blockArg);
-            if (!lattice)
-              llvm_unreachable("Lattice not found.");
-            if (lattice->getValue().isUninitialized())
-              continue;
+      if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
+        Region *firstRegion = wsOp.getPartitionRegions()[0];
+        for (auto [i, blockArg] :
+             llvm::enumerate(firstRegion->getArguments())) {
+          if (blockArg.getType().isIntOrIndexOrFloat())
+            continue;
+          auto lattice = solver.lookupState<LayoutEncodingLattice>(blockArg);
+          if (!lattice)
+            llvm_unreachable("Lattice not found.");
+          if (lattice->getValue().isUninitialized())
+            continue;
+          for (Region *partitionRegion : wsOp.getPartitionRegions()) {
             if (auto origType =
                     dyn_cast<ttg::MemDescType>(blockArg.getType())) {
               auto newType = getNewMemDescType(
                   origType, lattice->getValue().getLayoutEncoding());
-              blockArg.setType(newType);
+              partitionRegion->getArgument(i).setType(newType);
             }
           }
         }

@@ -82,6 +82,9 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
   LDBG("Visiting operation " << *op << "\n");
+  if (isa<tlx::ReleaseLayoutOp>(op))
+    return success();
+
   if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
     return visitRegionInReverse(op);
 
@@ -122,13 +125,20 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       propagateIfChanged(operandLattice, changed);
       if (auto arg = dyn_cast<BlockArgument>(operand)) {
         if (auto warpSpecializePartitionsOp =
-                dyn_cast<ttg::WarpSpecializePartitionsOp>(
-                    requireLayoutOp->getParentOp())) {
+                op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
           auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
           auto blockArgumentLattice = getLatticeElement(
               warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
           ChangeResult changed = blockArgumentLattice->meet(layoutLattice);
           propagateIfChanged(blockArgumentLattice, changed);
+          // Propagate to all the partition regions
+          for (Region *partitionRegion :
+               warpSpecializeOp.getPartitionRegions()) {
+            auto blockArgumentLattice = getLatticeElement(
+                partitionRegion->getArgument(arg.getArgNumber()));
+            ChangeResult changed = blockArgumentLattice->meet(layoutLattice);
+            propagateIfChanged(blockArgumentLattice, changed);
+          }
         }
       }
     }
@@ -144,6 +154,26 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         continue;
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
       propagateIfChanged(operandLattice, changed);
+      if (auto arg = dyn_cast<BlockArgument>(op->getOpOperand(i).get())) {
+        if (auto warpSpecializePartitionsOp =
+                op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
+          auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
+          auto blockArgumentLattice = getLatticeElement(
+              warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
+          ChangeResult changed =
+              blockArgumentLattice->meet(resultLattice->getValue());
+          propagateIfChanged(blockArgumentLattice, changed);
+          // Propagate to all the partition regions
+          for (Region *partitionRegion :
+               warpSpecializeOp.getPartitionRegions()) {
+            auto blockArgumentLattice = getLatticeElement(
+                partitionRegion->getArgument(arg.getArgNumber()));
+            ChangeResult changed =
+                blockArgumentLattice->meet(resultLattice->getValue());
+            propagateIfChanged(blockArgumentLattice, changed);
+          }
+        }
+      }
     }
   }
   return success();
