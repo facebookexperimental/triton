@@ -140,14 +140,6 @@ def get_env_with_keys(key: list):
             return os.environ[k]
     return ""
 
-def set_permissions(directory):
-    try:
-        subprocess.run(["chmod", "-R", "777", directory], check=True)
-        print(f"Permissions set to 777 for {directory}")
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to set permissions: {e}")
-
-
 
 def is_offline_build() -> bool:
     """
@@ -320,7 +312,7 @@ def get_thirdparty_packages(packages: list):
         if p.sym_name is not None:
             sym_link_path = os.path.join(package_root_dir, p.sym_name)
             update_symlink(sym_link_path, package_dir)
-        set_permissions(package_root_dir)
+
     return thirdparty_cmake_args
 
 
