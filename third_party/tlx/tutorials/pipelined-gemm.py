@@ -107,7 +107,7 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
         a_next = tlx.local_view(buffers_A, i % NUM_STAGES)
         b_next = tlx.local_view(buffers_B, i % NUM_STAGES)
         # wait for the previous MMA using this buffer to complete
-        acc = tlx.async_dot_wait(NUM_STAGES - 1, acc)
+        acc = tlx.async_dot_wait(1, acc)
         # prefetch
         token_a = tlx.async_load(a_ptrs, a_next, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
         token_b = tlx.async_load(b_ptrs, b_next, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
