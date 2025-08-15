@@ -1,6 +1,7 @@
 import triton.language.core as tl
 
 from . import types as tlx
+from .utility import is_hip
 
 
 @tl.builtin
@@ -16,6 +17,7 @@ def alloc_barriers(
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
     """
+         
     layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
         layout.vectorSize,
@@ -84,6 +86,8 @@ def barrier_arrive(
     """
     Perform the arrive operation on an mbarrier
     """
+
+    assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
 
     # TODO. add validator logics
     _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)

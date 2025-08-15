@@ -4,7 +4,7 @@ import torch
 import re
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_blackwell, is_hopper
+from triton._internal_testing import is_hopper_or_newer, is_blackwell, is_hopper, is_hip
 import triton.language.extra.tlx as tlx
 from typing import Optional
 import traceback
@@ -1049,6 +1049,7 @@ def tlx_square_non_ws(
     z_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT:tl.constexpr,
 ):
     """
     Test pairs of arrive/wait using different phases
@@ -1077,8 +1078,8 @@ def tlx_square_non_ws(
     mask = offsets < n_elements
 
     # mbarrier ops
-
-    bars = tlx.alloc_barriers(num_barriers=1)  # create
+    
+    bars = tlx.alloc_barriers(num_barriers=1, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
     bar = tlx.local_view(bars, 0)
 
     x = tl.load(x_ptr + offsets, mask=mask)  # Do something
@@ -1106,13 +1107,14 @@ def tlx_square_ws(
     z_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT:tl.constexpr,
 ):
     # prologue
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
 
     # mbarrier ops
-    bars = tlx.alloc_barriers(num_barriers=2)  # create
+    bars = tlx.alloc_barriers(num_barriers=2, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
     b0 = tlx.local_view(bars, 0)
     b1 = tlx.local_view(bars, 1)
 
@@ -1140,7 +1142,7 @@ def tlx_square_ws(
             tlx.barrier_arrive(bar=b0)  # Wait
 
 
-def run_tlx_square(func, BLOCK_SIZE, device):
+def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
     # prepare inputs
     torch.manual_seed(0)
@@ -1153,7 +1155,7 @@ def run_tlx_square(func, BLOCK_SIZE, device):
 
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
 
-    kernel = func[grid](x, z, n_elements, BLOCK_SIZE)
+    kernel = func[grid](x, z, n_elements, BLOCK_SIZE, expected_arrival_count)
 
     z_ref = x * x
 
@@ -1162,16 +1164,20 @@ def run_tlx_square(func, BLOCK_SIZE, device):
 
 
 # Unit test for arrive/wait
-@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.skipif(not (is_hip() or is_hopper_or_newer()), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 # def test_mbarriers(BLOCK_SIZE, device):
 def test_wait_arrive_non_ws(BLOCK_SIZE, device):
-    kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device)
-
+    expected_arrival_count = 4 if is_hip() else 1
+    kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=expected_arrival_count)
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
-    assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3) and (
-        ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
+    if is_hip():
+        assert (ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3) and (
+          ttgir.count("amdgpu.arrive_barrier") == 3), f"TTGIR {ttgir}"
+    else:    
+        assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3) and (
+          ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

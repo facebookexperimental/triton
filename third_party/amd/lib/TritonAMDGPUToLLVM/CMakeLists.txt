@@ -2,6 +2,7 @@ add_triton_library(TritonAMDGPUToLLVM
     AsyncUtility.cpp
     AtomicRMWOpsEmitter.cpp
     AllocateSharedMemory.cpp
+    BarrierOpConversion.cpp
     BufferOpsEmitter.cpp
     ConvertLayoutOpToLLVM.cpp
     MemoryOpToLLVM.cpp

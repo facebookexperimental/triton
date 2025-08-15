@@ -129,6 +129,14 @@ def TritonAMDGPUReorderInstructions: Pass<"tritonamdgpu-reorder-instructions", "
   let dependentDialects = [];
 }
 
+def TritonAMDGPULowerBarrierOps: Pass<"tritonamdgpu-lower-barrier-ops", "mlir::ModuleOp"> {
+  let summary = "Lower barrier ops";
+
+  let description = "This pass lowers TTNG barrier ops to AMDGPU Barrier ops";
+
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
 def TritonAMDGPUConvertToBufferOps : Pass<"tritonamdgpu-convert-buffer-ops", "mlir::ModuleOp"> {
   let summary = "Convert memory operations to buffer operations";
 
