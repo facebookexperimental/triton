@@ -493,5 +493,63 @@ def InThreadTransposeOp : TT_AMDGPU_Op<"in_thread_transpose", [Pure]> {
                                  mlir::triton::gpu::BlockedEncodingAttr srcEncoding);
   }];
 }
+//===----------------------------------------------------------------------===//
+// ArriveBarrierOp
+//===----------------------------------------------------------------------===//
+def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier",  [MemoryEffects<[MemWrite<SharedMemory>, MemRead<SharedMemory>]>]> {
+  let summary = "barrier arrive";
 
+  let description = [{
+    This operation defines the arriving action for a named barrier.
+    `count` is the number by which the arrival count of the barrier is decremented
+    'expectedCount' is the expected arrival count of the barrier.
+     The count of the barrier is set to this value after all threads have arrived
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+    I32Attr:$count,
+    I32Attr:$expectedCount
+  );
+
+  let assemblyFormat = [{
+    $alloc `,` $count `,` $expectedCount attr-dict `:` qualified(type($alloc))
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// InitBarrierOp
+//===----------------------------------------------------------------------===//
+def InitBarrierOp : TT_AMDGPU_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>]> {
+  let summary = "Initialize a barrier in the given shared memory allocation.";
+  let description = [{
+      Initializes a shared memory allocation with mbarrier information.
+      `alloc` is a descriptor to the shared memory allocation. `count` is the
+      number of arrives expected by the barrier.
+
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+    I32Attr:$count
+  );
+  let assemblyFormat = "$alloc `,` $count attr-dict `:` qualified(type($alloc))";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ReadBarrierPhaseOp
+//===----------------------------------------------------------------------===//
+def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[MemRead<SharedMemory>]>]> {
+  let summary = "Read phase";
+
+  let description = [{ Read barrier phase}];
+
+  let arguments = (ins 
+                   Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$alloc
+                  );
+  let results = (outs I32:$result);
+  //let assemblyFormat = "operands attr-dict `:` type($result)";
+}
 #endif

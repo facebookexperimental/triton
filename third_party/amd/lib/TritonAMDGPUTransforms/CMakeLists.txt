@@ -4,6 +4,7 @@ add_triton_library(TritonAMDGPUTransforms
   CanonicalizePointers.cpp
   CoalesceAsyncCopy.cpp
   ConvertToBufferOps.cpp
+  LowerBarrierOps.cpp
   OptimizeEpilogue.cpp
   HoistLayoutConversions.cpp
   ReorderInstructions.cpp

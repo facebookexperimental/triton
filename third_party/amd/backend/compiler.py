@@ -221,7 +221,8 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
-        
+        amd.passes.ttgpuir.add_lower_barrier_ops(pm)
+
         # Maintain the order of the following three passes
         # for graphs with tlx.local_load -> tt.dot,
         # dot op specifics from add_accelerate_matmul are required
