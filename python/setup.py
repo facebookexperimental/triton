@@ -272,6 +272,13 @@ def update_symlink(link_path, source_path):
     link_path.absolute().parent.mkdir(parents=True, exist_ok=True)  # Ensure link's parent directory exists
     link_path.symlink_to(source_path, target_is_directory=True)
 
+def set_permissions(directory):
+    try:
+        subprocess.run(["chmod", "-R", "777", directory], check=True)
+        print(f"Permissions set to 777 for {directory}")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to set permissions: {e}")
+
 
 def get_thirdparty_packages(packages: list):
     triton_cache_path = get_triton_cache_path()
@@ -292,7 +299,7 @@ def get_thirdparty_packages(packages: list):
         if not is_offline_build() and not input_defined and not input_compatible:
             with contextlib.suppress(Exception):
                 shutil.rmtree(package_root_dir)
-            os.makedirs(package_root_dir, exist_ok=True)
+            os.makedirs(package_root_dir, mode=775, exist_ok=True)
             print(f'downloading and extracting {p.url} ...')
             with open_url(p.url) as response:
                 if p.url.endswith(".zip"):
@@ -312,7 +319,7 @@ def get_thirdparty_packages(packages: list):
         if p.sym_name is not None:
             sym_link_path = os.path.join(package_root_dir, p.sym_name)
             update_symlink(sym_link_path, package_dir)
-
+        set_permissions(package_root_dir)
     return thirdparty_cmake_args
 
 
@@ -349,6 +356,7 @@ def download_and_copy(name, src_func, dst_path, variable, version, url_func):
         shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
     else:
         shutil.copy(src_path, dst_path)
+    set_permissions(dst_path)
 
 
 # ---- cmake extension ----
