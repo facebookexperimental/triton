@@ -164,11 +164,11 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bars[buf], dot_phase)
                     if TRANSPOSE_A:
-                        arg1 = buffers_A[buf].T
+                        arg1 = tlx.local_trans(buffers_A[buf])
                     else:
                         arg1 = buffers_A[buf]
                     if TRANSPOSE_B:
-                        arg2 = buffers_B[buf].T
+                        arg2 = tlx.local_trans(buffers_B[buf])
                     else:
                         arg2 = buffers_B[buf]
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
