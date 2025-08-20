@@ -70,10 +70,18 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                                    NUM_TMEM_BUFFERS: tl.constexpr,  #
                                    NUM_SMS: tl.constexpr,  #
                                    EPILOGUE_SUBTILE: tl.constexpr,  #
+                                   TRANSPOSE_A: tl.constexpr,  #
+                                   TRANSPOSE_B: tl.constexpr,  #
                                    ):
     # allocate NUM_SMEM_BUFFERS buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
+    if TRANSPOSE_A:
+        buffers_A = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_M), tl.float16, NUM_SMEM_BUFFERS)
+    else:
+        buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
+    if TRANSPOSE_B:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_N, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
+    else:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
     # use multiple TMEM buffers to overlap MMA and epilogue
     tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
 
@@ -112,8 +120,15 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     offs_k = k * BLOCK_SIZE_K
                     tlx.barrier_expect_bytes(smem_full_bars[buf],
                                              2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
-                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
-                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
+                    if TRANSPOSE_A:
+                        tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_k, offs_am], smem_full_bars[buf])
+                    else:
+                        tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
+
+                    if TRANSPOSE_B:
+                        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], smem_full_bars[buf])
+                    else:
+                        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
@@ -148,8 +163,16 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bars[buf], dot_phase)
+                    if TRANSPOSE_A:
+                        arg1 = tlx.local_trans(buffers_A[buf])
+                    else:
+                        arg1 = buffers_A[buf]
+                    if TRANSPOSE_B:
+                        arg2 = tlx.local_trans(buffers_B[buf])
+                    else:
+                        arg2 = buffers_B[buf]
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,
+                    tlx.async_dot(arg1, arg2, tmem_buffers[cur_tmem_buf], use_acc=k > 0,
                                   mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
@@ -215,18 +238,41 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
 
 def matmul(a, b):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
+    # High-Level Options for B's layout
+    # 1. (K, N) contiguous in N
+    # 2. (K, N) contiguous in K
+    # 3. (N, K) contiguous in N
+    # 4. (N, K) contiguous in K
+    # In practice, since you always load in the contiguous dimension
+    # there are actually only 2 options
+    # 1. Load in the K stride 1 (2 and 4)
+    # 2. Load in the N stride 1 (1 and 3)
+    transpose_a = a.stride()[-1] != 1
+    transpose_b = (a.shape[1] != b.shape[1] and b.stride()[-1] != 1) or (
+        a.shape[1] == b.shape[1] and b.stride()[-1] == 1
+    )
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+
     M, K = a.shape
-    K, N = b.shape
+    if a.shape[1] != b.shape[1]:
+        K, N = b.shape
+    else:
+        N, K = b.shape
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
-    # A dummy block value that will be overwritten when we have the real block size
+        # A dummy block value that will be overwritten when we have the real block size
     dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
-    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
+    a_strides = [a.stride()[1] if transpose_a else a.stride()[0], 1]
+    if transpose_a:
+        a_desc = TensorDescriptor(a, [K, M], a_strides, dummy_block)
+    else:
+        a_desc = TensorDescriptor(a, [M, K], a_strides, dummy_block)
+    b_strides = [b.stride()[1] if b.stride()[0] == 1 else b.stride()[0], 1]
+    if transpose_b:
+        b_desc = TensorDescriptor(b, [N, K], b_strides, dummy_block)
+    else:
+        b_desc = TensorDescriptor(b, [K, N], b_strides, dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -236,10 +282,14 @@ def matmul(a, b):
         NUM_SMS,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     ), )
+    print("TRANSPOSE_A", transpose_a)
+    print("TRANSPOSE_B", transpose_b)
     matmul_kernel_tma_ws_blackwell[grid](
         a_desc, b_desc, c_desc,  #
         M, N, K,  #
         NUM_SMS=NUM_SMS,  #
+        TRANSPOSE_A=transpose_a,
+        TRANSPOSE_B=transpose_b,
     )
     return c
 
