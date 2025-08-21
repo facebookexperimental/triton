@@ -330,4 +330,8 @@ def benchmark(M, N, K, provider, fp8_inputs):
 
 
 if __name__ == "__main__":
-    benchmark.run(show_plots=True, print_data=True, diff_col=True)
+    if is_cuda() and torch.cuda.get_device_capability()[0] == 9:
+        print("Running benchmarks...")
+        benchmark.run(show_plots=True, print_data=True, diff_col=True)
+    else:
+        print("Skipping benchmarks, no Hopper GPU found.")

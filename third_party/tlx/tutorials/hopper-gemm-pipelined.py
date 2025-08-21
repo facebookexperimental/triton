@@ -214,5 +214,8 @@ def benchmark(M, N, K, provider, fp8_inputs):
     return perf(ms), perf(max_ms), perf(min_ms)
 
 if __name__ == "__main__":
-    # only works on post-Ampere GPUs right now
-    benchmark.run(show_plots=True, print_data=True)
+    if is_cuda() and torch.cuda.get_device_capability()[0] == 9:
+        print("Running benchmarks...")
+        benchmark.run(show_plots=True, print_data=True)
+    else:
+        print("Skipping benchmarks, no Hopper GPU found.")

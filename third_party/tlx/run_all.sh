@@ -62,17 +62,3 @@ case $user_choice in
         echo "Invalid choice. "
         ;;
 esac
-
-# if [ "$(ask)" == "correctness" ]; then
-#     echo "Verifying correctness of TLX tutorial kernels"
-#     for k in third_party/tlx/tutorials/*.py; do
-#         echo "Running $k"
-#         pytest $k
-#     done
-# elif [ $ans == "performance" ]; then
-#     echo "Measuring performance of TLX tutorial kernels"
-#     for k in third_party/tlx/tutorials/*.py; do
-#         echo "Running $k"
-#         python $k
-#     done
-# fi

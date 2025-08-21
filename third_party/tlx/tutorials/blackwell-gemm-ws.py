@@ -306,5 +306,8 @@ def benchmark(M, N, K, provider):
 
 
 if __name__ == "__main__":
-    print("Running benchmarks...")
-    benchmark.run(show_plots=True, print_data=True)
+    if is_cuda() and torch.cuda.get_device_capability()[0] == 10:
+        print("Running benchmarks...")
+        benchmark.run(show_plots=True, print_data=True)
+    else:
+        print("Skipping benchmarks, no Blackwell GPU found.")
