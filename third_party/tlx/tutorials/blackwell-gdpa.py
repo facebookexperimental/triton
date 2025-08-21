@@ -1329,5 +1329,12 @@ def bench_tlx_gdpa():
     print(f"GDPA TLX WS: {ms} ms")
 
 
+def is_cuda():
+    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
 if __name__ == "__main__":
-    bench_tlx_gdpa()
+    if is_cuda() and torch.cuda.get_device_capability()[0] == 10:
+        bench_tlx_gdpa()
+    else:
+        print("Skipping benchmarks")
