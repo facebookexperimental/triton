@@ -34,26 +34,45 @@ ask() {
 }
 if [ "$(ask)" == "yes" ]; then
     echo "Running TLX tutorial kernels"
-    pytest python/test/unit/language/test_tlx.py | pastry -t "TLX unit tests: $USER"
+    pytest python/test/unit/language/test_tlx.py
 fi
 
-# Run tutorial kernels
-ask() {
-    retval=""
-    while true; do
-        read -p "Run all TLX tutorial kernels? {y|n}" yn
-        case $yn in
-            [Yy]* ) retval="yes"; break;;
-            [Nn]* ) retval="no"; break;;
-            * ) echo "Please answer yes or no.";;
-        esac
-    done
-    echo "$retval"
-}
-if [ "$(ask)" == "yes" ]; then
-    echo "Running TLX tutorial kernels"
-    for k in third_party/tlx/tutorials/*.py; do
-        echo "Running $k"
-        pytest $k | pastry -t "TLX tutorial kernels: $k $USER"
-    done
-fi
+echo "Run TLX tutorial kernels (correctness|performance|no)? {c|p|n}"
+read user_choice
+
+case $user_choice in
+    c)
+        echo "Verifying correctness of TLX tutorial kernels"
+        for k in third_party/tlx/tutorials/*.py; do
+            echo "Running $k"
+            pytest $k
+        done
+        ;;
+    p)
+        echo "Measuring performance of TLX tutorial kernels"
+        for k in third_party/tlx/tutorials/*.py; do
+            echo "Running $k"
+            python $k
+        done
+        ;;
+    n)
+        break
+        ;;
+    *)
+        echo "Invalid choice. "
+        ;;
+esac
+
+# if [ "$(ask)" == "correctness" ]; then
+#     echo "Verifying correctness of TLX tutorial kernels"
+#     for k in third_party/tlx/tutorials/*.py; do
+#         echo "Running $k"
+#         pytest $k
+#     done
+# elif [ $ans == "performance" ]; then
+#     echo "Measuring performance of TLX tutorial kernels"
+#     for k in third_party/tlx/tutorials/*.py; do
+#         echo "Running $k"
+#         python $k
+#     done
+# fi

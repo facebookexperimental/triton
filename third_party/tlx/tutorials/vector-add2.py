@@ -12,6 +12,7 @@ two output vectors of the same shape.
 """
 
 import torch
+import pytest
 
 import triton
 import triton.language as tl
@@ -19,6 +20,8 @@ import triton.language.extra.tlx as tlx
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+def is_cuda():
+    return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 @triton.jit
 def add2_kernel(
@@ -98,25 +101,29 @@ def add2_warp_specialized(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: 
 def dual_add(x, y, a, b):
     return x + y, a + b
 
+@pytest.mark.skipUnless(
+    is_cuda() and torch.cuda.get_device_capability()[0] >= 9,
+    reason="Requires Hopper GPU or above",
+)
+def test_op():
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=DEVICE)
+    y = torch.rand(size, device=DEVICE)
+    a = torch.rand(size, device=DEVICE)
+    b = torch.rand(size, device=DEVICE)
+    output_torch_1, output_torch_2 = dual_add(x, y, a, b)
+    output_triton_1, output_triton_2 = add2(x, y, a, b)
+    output_triton_ws_1, output_triton_ws_2 = add2_warp_specialized(x, y, a, b)
 
-torch.manual_seed(0)
-size = 98432
-x = torch.rand(size, device=DEVICE)
-y = torch.rand(size, device=DEVICE)
-a = torch.rand(size, device=DEVICE)
-b = torch.rand(size, device=DEVICE)
-output_torch_1, output_torch_2 = dual_add(x, y, a, b)
-output_triton_1, output_triton_2 = add2(x, y, a, b)
-output_triton_ws_1, output_triton_ws_2 = add2_warp_specialized(x, y, a, b)
-
-print(f"The maximum difference between torch and triton is "
-      f"{torch.max(torch.abs(output_torch_1 - output_triton_1))}")
-print(f"The maximum difference between torch and triton is "
-      f"{torch.max(torch.abs(output_torch_2 - output_triton_2))}")
-print(f"The maximum difference between torch and triton is "
-      f"{torch.max(torch.abs(output_torch_1 - output_triton_ws_1))}")
-print(f"The maximum difference between torch and triton is "
-      f"{torch.max(torch.abs(output_torch_2 - output_triton_ws_2))}")
+    print(f"The maximum difference between torch and triton is "
+        f"{torch.max(torch.abs(output_torch_1 - output_triton_1))}")
+    print(f"The maximum difference between torch and triton is "
+        f"{torch.max(torch.abs(output_torch_2 - output_triton_2))}")
+    print(f"The maximum difference between torch and triton is "
+        f"{torch.max(torch.abs(output_torch_1 - output_triton_ws_1))}")
+    print(f"The maximum difference between torch and triton is "
+        f"{torch.max(torch.abs(output_torch_2 - output_triton_ws_2))}")
 # %%
 # Seems like we're good to go!
 
@@ -157,8 +164,8 @@ def benchmark(size, provider):
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
-
-# %%
-# We can now run the decorated function above. Pass `print_data=True` to see the performance number, `show_plots=True` to plot them, and/or
-# `save_path='/path/to/results/' to save them to disk along with raw CSV data:
-benchmark.run(print_data=True, show_plots=True)
+if __name__ == "__main__":
+    # %%
+    # We can now run the decorated function above. Pass `print_data=True` to see the performance number, `show_plots=True` to plot them, and/or
+    # `save_path='/path/to/results/' to save them to disk along with raw CSV data:
+    benchmark.run(print_data=True, show_plots=True)
