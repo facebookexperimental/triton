@@ -6,6 +6,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
 
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
@@ -23,8 +24,32 @@ class TritonTLXFixupPass : public impl::TritonTLXFixupBase<TritonTLXFixupPass> {
   using impl::TritonTLXFixupBase<TritonTLXFixupPass>::TritonTLXFixupBase;
 
 public:
+  // validate the module and error early for unsupported cases
+  LogicalResult verifyModule(ModuleOp &mod) {
+    // ws should not capture RankedTensorType
+    ttg::WarpSpecializeOp *invalidWSOp = nullptr;
+    auto result = mod.walk([&](ttg::WarpSpecializeOp op) {
+      for (auto argType : op.getOperandTypes()) {
+        if (isa<RankedTensorType>(argType)) {
+          invalidWSOp = &op;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted()) {
+      return invalidWSOp->emitError() << "WarpSpecializeOp should not capture "
+                                         "RankedTensorType. Try moving tensor "
+                                         "computation into async tasks.";
+    }
+    return success();
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    if (failed(verifyModule(mod))) {
+      return signalPassFailure();
+    }
 
     // First check if there is any TLX related op in the module. If not, do
     // nothing.
