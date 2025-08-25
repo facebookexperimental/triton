@@ -866,7 +866,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 //
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+<<<<<<< HEAD
   // COMMON-LABEL: all_false_mask
+=======
+  // CHECK-LABEL: all_false_mask
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
   tt.func public @all_false_mask(%in_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
                                  %idx_ptr: !tt.ptr<i64> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
                                  %out_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
@@ -885,12 +889,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %9 = tt.splat %8 : !tt.ptr<i64> -> tensor<64x!tt.ptr<i64>, #blocked>
     %10 = tt.addptr %9, %2 : tensor<64x!tt.ptr<i64>, #blocked>, tensor<64xi32, #blocked>
     %11 = tt.load %10, %cst : tensor<64x!tt.ptr<i64>, #blocked>
+<<<<<<< HEAD
     // COMMON: amdgpu.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]], %[[mask1:.*]] : tensor<64xi64, #blocked>
+=======
+    // CHECK: amdgpu.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]], %[[mask1:.*]] : tensor<64xi64, #blocked>
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
     %12 = tt.addptr %in_ptr, %1 : !tt.ptr<f32>, i32
     %13 = tt.splat %12 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
     %14 = tt.addptr %13, %2 : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
     %15 = tt.load %14, %cst : tensor<64x!tt.ptr<f32>, #blocked>
+<<<<<<< HEAD
     // COMMON: amdgpu.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]], %[[mask2:.*]] : tensor<64xf32, #blocked>
+=======
+    // CHECK: amdgpu.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]], %[[mask2:.*]] : tensor<64xf32, #blocked>
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
     %16 = arith.extsi %7 : tensor<64xi32, #blocked> to tensor<64xi64, #blocked>
     %17 = arith.addi %11, %16 : tensor<64xi64, #blocked>
     %18 = arith.trunci %17 : tensor<64xi64, #blocked> to tensor<64xi32, #blocked>
@@ -905,7 +917,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+<<<<<<< HEAD
   // COMMON-LABEL: all_true_mask
+=======
+  // CHECK-LABEL: all_true_mask
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
   tt.func public @all_true_mask(%in_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
                                 %idx_ptr: !tt.ptr<i64> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
                                 %out_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
@@ -924,12 +940,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %9 = tt.splat %8 : !tt.ptr<i64> -> tensor<64x!tt.ptr<i64>, #blocked>
     %10 = tt.addptr %9, %2 : tensor<64x!tt.ptr<i64>, #blocked>, tensor<64xi32, #blocked>
     %11 = tt.load %10, %cst : tensor<64x!tt.ptr<i64>, #blocked>
+<<<<<<< HEAD
     // COMMON: amdgpu.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]] : tensor<64xi64, #blocked>
+=======
+    // CHECK: amdgpu.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]] : tensor<64xi64, #blocked>
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
     %12 = tt.addptr %in_ptr, %1 : !tt.ptr<f32>, i32
     %13 = tt.splat %12 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
     %14 = tt.addptr %13, %2 : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
     %15 = tt.load %14, %cst : tensor<64x!tt.ptr<f32>, #blocked>
+<<<<<<< HEAD
     // COMMON: amdgpu.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]] : tensor<64xf32, #blocked>
+=======
+    // CHECK: amdgpu.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]] : tensor<64xf32, #blocked>
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
     %16 = arith.extsi %7 : tensor<64xi32, #blocked> to tensor<64xi64, #blocked>
     %17 = arith.addi %11, %16 : tensor<64xi64, #blocked>
     %18 = arith.trunci %17 : tensor<64xi64, #blocked> to tensor<64xi32, #blocked>

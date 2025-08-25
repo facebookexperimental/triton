@@ -44,6 +44,22 @@ namespace {
 bool isSplatOneConstTensor(const Value v) {
   auto constantOp = v.getDefiningOp<arith::ConstantOp>();
   if (!constantOp)
+<<<<<<< HEAD
+=======
+    return false;
+
+  if (auto denseAttr =
+          dyn_cast<DenseIntElementsAttr>(constantOp.getValueAttr()))
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APInt>().isOne();
+
+  return false;
+}
+
+bool verifyNonSmallerByAssumption(
+    Value expr, const DenseMap<Value, SetVector<Operation *>> &assumptions,
+    const std::function<bool(Value)> &matchesOther) {
+  if (!assumptions.contains(expr))
+>>>>>>> 7decd434a ([AMD] Fix buffer op mask operand removal (#7963))
     return false;
 
   if (auto denseAttr =
