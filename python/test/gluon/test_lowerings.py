@@ -535,6 +535,7 @@ def test_convert_mma2mma_layouts(M, N, mma_pair, dtype, device):
     torch.manual_seed(0)
     torch_dtype = getattr(torch, dtype)
     x = torch.randn((M, N), dtype=torch_dtype, device=device)
+<<<<<<< HEAD
 
     # Calculate num_warps based on layout
     num_warps = int(torch.prod(torch.tensor(ttgl._layouts.warps_per_cta(src_layout, (M, N)))))
@@ -544,6 +545,15 @@ def test_convert_mma2mma_layouts(M, N, mma_pair, dtype, device):
 
     y = torch.zeros_like(x)
     kernel[(1, )](x, y, M, N, dst_layout, src_layout, num_warps=num_warps)
+=======
+    y = torch.zeros_like(x)
+
+    # Calculate num_warps based on layout
+    num_warps = int(torch.prod(torch.tensor(ttgl._layouts.warps_per_cta(src_layout, (M, N)))))
+    kernel[(1, )](x, y, M, N, src_layout, dst_layout, num_warps=num_warps)
+    kernel[(1, )](x, y, M, N, dst_layout, src_layout, num_warps=num_warps)
+
+>>>>>>> 5e98c906a ([GLUON][TEST] Complete remaining convert layout tests (#7962))
     torch.testing.assert_close(y, x, rtol=0, atol=0)
 
 
@@ -604,6 +614,7 @@ def test_convert_warp_local_layouts(M, N, src_layout, dst_layout, dtype, device)
     kernel[(1, )](x, y, M, N, src_layout, dst_layout, num_warps=num_warps)
 
     torch.testing.assert_close(y, x, rtol=0, atol=0)
+<<<<<<< HEAD
 
 
 _ld_st_dot_layouts = _filter_layouts([
@@ -777,3 +788,5 @@ def test_local_load_store_3d_layouts(shape, dtype, dist_layout, shared_layout, d
     y = torch.zeros_like(x)
     kernel[(1, )](x, y, shape, dist_layout, blocked_layout, shared_layout, num_warps=num_warps)
     torch.testing.assert_close(y, x)
+=======
+>>>>>>> 5e98c906a ([GLUON][TEST] Complete remaining convert layout tests (#7962))
