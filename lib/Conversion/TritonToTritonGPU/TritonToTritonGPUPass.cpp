@@ -1,6 +1,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -484,9 +485,16 @@ public:
   matchAndRewrite(triton::FuncOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto converter = getTypeConverter();
-    TypeConverter::SignatureConversion result(op.getNumArguments());
-    auto newOp = rewriter.replaceOpWithNewOp<triton::FuncOp>(
-        op, op.getName(), op.getFunctionType());
+    TypeConverter::SignatureConversion result =
+        converter->convertBlockSignature(&op.getBody().front()).value();
+
+    auto newFuncType =
+        FunctionType::get(rewriter.getContext(), result.getConvertedTypes(),
+                          op.getFunctionType().getResults());
+
+    auto newOp =
+        rewriter.create<triton::FuncOp>(op.getLoc(), op.getName(), newFuncType);
+
     addNamedAttrs(newOp, adaptor.getAttributes());
     rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
                                 newOp.getBody().end());
@@ -495,6 +503,7 @@ public:
     if (!newOp.getBody().empty())
       rewriter.applySignatureConversion(&newOp.getBody().front(), result,
                                         converter);
+    rewriter.replaceOp(op, newOp);
     return success();
   }
 };
@@ -626,6 +635,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
       GenericOpPattern<triton::gpu::LocalStoreOp>,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
+      GenericOpPattern<triton::gpu::LocalAllocOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       TritonFuncOpPattern>(typeConverter, context);
 }
@@ -930,11 +940,17 @@ public:
     // Convert Warp specialized partition regions first as they may require different
     // number of warps from the rest of the module.
     mod.walk([&](WarpSpecializePartitionsOp wsPartitionsOp) {
+      auto wsOp = dyn_cast<WarpSpecializeOp>(wsPartitionsOp->getParentOp());
+      assert(wsOp);
+      // auto defaultRegion = &wsOp.getDefaultRegion();
       for (Region &region : wsPartitionsOp->getRegions()) {
         auto &firstBlock = region.getBlocks().front();
         // Determine the number of warps for this region, falling back to the default if unspecified.
         unsigned regionNumWarps =
             triton::gpu::maybeLookupNumWarps(&firstBlock).value_or(numWarps);
+
+        auto argTypesView = firstBlock.getArgumentTypes();
+        SmallVector<Type> argTypes(argTypesView.begin(), argTypesView.end());
 
             // Lift the region into a function so it can be converted independently.
         OwningOpRef<ModuleOp> container =
@@ -949,6 +965,15 @@ public:
 
         // Replace the original region with the transformed result.
         extractPartitionBody(std::move(container), &region);
+
+        // auto newArgTypes = region.getArgumentTypes();
+        // assert(argTypes.size() == newArgTypes.size() && "arg count should not change");
+        // for (int i = 0; i < argTypes.size(); i++) {
+        //   if(argTypes[i] != newArgTypes[i] ){
+        //     // defaultRegion->getArgument(i).setType(newArgTypes[i]);
+        //     wsOp.getOperand(i).setType(newArgTypes[i]);
+        //   }
+        // }
       }
     });
 

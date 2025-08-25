@@ -197,11 +197,11 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c1024_i32 : i32
-    ttg.warp_specialize(%arg3, %1, %arg5)
+    %3 = tt.splat %1 : i32 -> tensor<1024xi32>
+    ttg.warp_specialize(%arg3, %3, %arg5)
     // CHECK: default
     default {
       %2 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
-      %3 = tt.splat %1 : i32 -> tensor<1024xi32>
       %4 = arith.addi %3, %2 : tensor<1024xi32>
       %5 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
       %6 = tt.addptr %5, %4 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
@@ -213,10 +213,9 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
       ttg.warp_yield
     }
     // CHECK: partition0
-    partition0(%arg7: !tt.ptr<f32>, %arg8: i32, %arg9: !tt.ptr<f32>) num_warps(1) {
+    partition0(%arg7: !tt.ptr<f32>, %arg8: tensor<1024xi32>, %arg9: !tt.ptr<f32>) num_warps(1) {
       %2 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
-      %3 = tt.splat %arg8 : i32 -> tensor<1024xi32>
-      %4 = arith.addi %3, %2 : tensor<1024xi32>
+      %4 = arith.addi %arg8, %2 : tensor<1024xi32>
       %5 = tt.splat %arg7 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
       %6 = tt.addptr %5, %4 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
       // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f32>, [[WS1]]
@@ -225,7 +224,19 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
       %9 = tt.addptr %8, %4 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
       tt.store %9, %7 : tensor<1024x!tt.ptr<f32>>
       ttg.warp_return
-    } : (!tt.ptr<f32>, i32, !tt.ptr<f32>) -> ()
+    } : (!tt.ptr<f32>, tensor<1024xi32>, !tt.ptr<f32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, unpacked = true>
+module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @test_func1(%arg0: tensor<64x1xi32>,%arg1: !ttg.memdesc<1x64x64xf32, #tmem, #ttng.tensor_memory, mutable>) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %5 = tt.broadcast %arg0 : tensor<64x1xi32> -> tensor<64x64xi32>
+    %0 = ttg.memdesc_subview %arg1[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<1x64x64xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
 }
