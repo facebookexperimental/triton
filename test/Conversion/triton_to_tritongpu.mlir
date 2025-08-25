@@ -229,3 +229,15 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
     tt.return
   }
 }
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, unpacked = true>
+module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @test_func1(%arg0: tensor<64x1xi32>,%arg1: !ttg.memdesc<1x64x64xf32, #tmem, #ttng.tensor_memory, mutable>) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %5 = tt.broadcast %arg0 : tensor<64x1xi32> -> tensor<64x64xi32>
+    %0 = ttg.memdesc_subview %arg1[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<1x64x64xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}

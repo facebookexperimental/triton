@@ -1,6 +1,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -484,9 +485,16 @@ public:
   matchAndRewrite(triton::FuncOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto converter = getTypeConverter();
-    TypeConverter::SignatureConversion result(op.getNumArguments());
-    auto newOp = rewriter.replaceOpWithNewOp<triton::FuncOp>(
-        op, op.getName(), op.getFunctionType());
+    TypeConverter::SignatureConversion result =
+        converter->convertBlockSignature(&op.getBody().front()).value();
+
+    auto newFuncType =
+        FunctionType::get(rewriter.getContext(), result.getConvertedTypes(),
+                          op.getFunctionType().getResults());
+
+    auto newOp =
+        rewriter.create<triton::FuncOp>(op.getLoc(), op.getName(), newFuncType);
+
     addNamedAttrs(newOp, adaptor.getAttributes());
     rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
                                 newOp.getBody().end());
@@ -495,6 +503,7 @@ public:
     if (!newOp.getBody().empty())
       rewriter.applySignatureConversion(&newOp.getBody().front(), result,
                                         converter);
+    rewriter.replaceOp(op, newOp);
     return success();
   }
 };
