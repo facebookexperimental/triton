@@ -38,9 +38,10 @@ public:
       return WalkResult::advance();
     });
     if (result.wasInterrupted()) {
-      return invalidWSOp->emitError() << "WarpSpecializeOp should not capture "
-                                         "RankedTensorType. Try moving tensor "
-                                         "computation into async tasks.";
+      return invalidWSOp->emitError()
+             << "WarpSpecializeOp should not capture "
+                "RankedTensorType. Try moving tensor "
+                "computation into specific async task.";
     }
     return success();
   }
