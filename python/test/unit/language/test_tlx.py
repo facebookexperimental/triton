@@ -1,3 +1,4 @@
+import itertools
 import pytest
 import torch
 import re
@@ -146,13 +147,35 @@ def test_local_load(BLOCK_SIZE, device):
     assert kernel.asm["ttgir"].count("ttg.local_load") == 2
     torch.testing.assert_close(x + y, output)
 
+
+def _generate_test_params():
+    """Generate test parameters with filtering for memory constraints."""
+    dims = [16, 32, 64, 128, 256, 512]
+    dtype = torch.float16
+    params = []
+    
+    for M, N, K in itertools.product(dims, dims, dims):
+        # Check MI300 SMEM constraint (64K limit)
+        if torch.cuda.is_available():
+            device_props = str(torch.cuda.get_device_properties())
+            if "gfx942" in device_props and (M * K + K * N) * dtype.itemsize > 64 * 1024:
+                continue
+        # Skip specific problematic case
+        if M == 512 and N == 512 and K == 16:
+            params.append(pytest.param(M, N, K, marks=pytest.mark.xfail()))
+        else:
+            params.append((M, N, K))
+    
+    return params
+
 # Test tl.dot wit tlx smem ops 
 # Tests tl.load->tlx_local_store->tlx_local_load->tl.dot
 @pytest.mark.skipif(
     is_cuda() and torch.cuda.get_device_capability()[0] == 10,
     reason="Not tested on Blackwell",
 )
-def test_tl_dot_with_tlx_smem_load_store(device):
+@pytest.mark.parametrize("M,N,K", _generate_test_params())
+def test_tl_dot_with_tlx_smem_load_store(M, N, K, device):
 
     @triton.jit
     def dot_kernel(
@@ -196,13 +219,17 @@ def test_tl_dot_with_tlx_smem_load_store(device):
         c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
         tl.store(c_ptrs, c)
 
+
     torch.manual_seed(0)
     # Note: This test may fail for other shapes/kwargs until
     # reg->shared layout propagation is implemented tlx layout propagation
-    M, N, K = (64, 64, 32)
-    x = torch.randn((M, K), device=device, dtype=torch.float16)
-    y = torch.randn((K, N), device=device, dtype=torch.float16)
-    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+    dims = [16, 32, 64, 128, 256, 512]
+    dtype = torch.float16
+
+    print(f"{M=}, {N=}, {K=}")
+    x = torch.randn((M, K), device=device, dtype=dtype)
+    y = torch.randn((K, N), device=device, dtype=dtype)
+    z = torch.zeros((M, N), device=device, dtype=dtype)
 
     # test smem
     kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}

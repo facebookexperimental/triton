@@ -418,6 +418,7 @@ void init_triton_tlx_ir(py::module &&m) {
 
 void init_triton_tlx_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
+  ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout", tlx::createTLXInsertRequireLayout);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
                             std::string, int32_t, int32_t, int32_t);
 }
