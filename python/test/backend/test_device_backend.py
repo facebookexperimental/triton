@@ -15,6 +15,7 @@ import triton.language as tl
 
 import pytest
 
+<<<<<<< HEAD
 with pytest.raises(ImportError):
     # Facebook.
     # Following two imports should hit ImportError because functions
@@ -31,6 +32,17 @@ with pytest.raises(ImportError):
         suffix = sysconfig.get_config_var('EXT_SUFFIX')
         so = os.path.join(srcdir, '{name}{suffix}'.format(name=name, suffix=suffix))
         cc = os.environ.get("CC")
+=======
+def build_for_backend(name, src, srcdir):
+    suffix = sysconfig.get_config_var('EXT_SUFFIX')
+    so = os.path.join(srcdir, '{name}{suffix}'.format(name=name, suffix=suffix))
+    cc = os.environ.get("CC")
+    if cc is None:
+        # TODO: support more things here.
+        clang = shutil.which("clang")
+        gcc = shutil.which("gcc")
+        cc = gcc if gcc is not None else clang
+>>>>>>> 2ac060b8b (Remove setuptools requirement from setup.py (#7983))
         if cc is None:
             # TODO: support more things here.
             clang = shutil.which("clang")
