@@ -6,6 +6,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -19,6 +20,7 @@
 using namespace mlir;
 using namespace mlir::dataflow;
 namespace ttg = ::mlir::triton::gpu;
+namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::tlx {
 
@@ -107,6 +109,32 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       auto operandLattice = operands[0];
       ChangeResult changed = operandLattice->meet(updatedResultLayoutEncoding);
       propagateIfChanged(operandLattice, changed);
+    }
+    return success();
+  }
+
+  // Similar to MemDescTransOp, we need to specially handle TMEMSubSliceOp
+  if (auto tmemSliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
+    // Slice resultLayoutEncoding
+    auto resultLattice = results[0];
+    LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
+    if (!resultLayoutEncoding.isUninitialized()) {
+      if (auto tmemEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
+              resultLattice->getValue().getLayoutEncoding())) {
+        auto srcTy = cast<ttg::MemDescType>(tmemSliceOp.getSrc().getType());
+        auto srcEncoding =
+            dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
+        auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
+            tmemEncoding.getContext(), srcEncoding.getBlockM(),
+            srcEncoding.getBlockN(), tmemEncoding.getUnpacked(),
+            tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN());
+        const auto updatedResultLayoutEncoding =
+            LayoutEncoding(newTmemEncoding);
+        auto operandLattice = operands[0];
+        ChangeResult changed =
+            operandLattice->meet(updatedResultLayoutEncoding);
+        propagateIfChanged(operandLattice, changed);
+      }
     }
     return success();
   }
@@ -204,16 +232,32 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     Operation *op, ArrayRef<const LayoutEncodingLattice *> operands,
     ArrayRef<LayoutEncodingLattice *> results) {
 
-  if (!isa<triton::gpu::MemDescSubviewOp>(op))
+  if (!isa<ttg::MemDescSubviewOp, ttg::MemDescReinterpretOp,
+           ttng::TMEMSubSliceOp>(op))
     return success();
 
   auto isScalar = [](Type type) { return type.isIntOrIndexOrFloat(); };
-  auto memDescSubviewOp = cast<triton::gpu::MemDescSubviewOp>(op);
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
     if (isScalar(op->getOperand(operandIdx).getType()))
       continue;
+    LayoutEncoding operandLayoutEncoding = operandLattice->getValue();
+
+    // Slice operandLayoutEncoding
+    if (auto sliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
+      auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
+      auto dstEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
+          dstTy.getEncoding());
+      auto encoding = cast<ttng::TensorMemoryEncodingAttr>(
+          operandLayoutEncoding.getLayoutEncoding());
+      auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
+          op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
+          encoding.getUnpacked(), encoding.getCTASplitM(),
+          encoding.getCTASplitN());
+      operandLayoutEncoding = LayoutEncoding(newEncoding);
+    }
+
     for (auto resultLattice : results) {
-      ChangeResult changed = resultLattice->meet(operandLattice->getValue());
+      ChangeResult changed = resultLattice->meet(operandLayoutEncoding);
       propagateIfChanged(resultLattice, changed);
     }
   }
