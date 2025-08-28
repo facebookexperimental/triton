@@ -1824,9 +1824,10 @@ void init_triton_ir(py::module &&m) {
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
               std::vector<Value> &strides, std::vector<int32_t> &tensorShape,
-              bool isSignedInteger) -> Value {
+              bool isSignedInteger, PaddingOption paddingOption) -> Value {
              return self.create<MakeTensorDescOp>(base, shape, strides,
-                                                  tensorShape, isSignedInteger);
+                                                  tensorShape, isSignedInteger,
+                                                  paddingOption);
            })
       // Warp specialize ops
       .def("create_warp_specialize_op",
