@@ -1468,3 +1468,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK:           %[[VAL_21:.*]] = tt.load %[[VAL_20]], %[[VAL_11]] : tensor<256x!tt.ptr<i32>>
 // CHECK:           tt.return %[[VAL_21]] : tensor<256xi32>
 // CHECK:         }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @add2_warp_specialized_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    ttg.warp_specialize(%arg3, %arg4, %arg5)
+    default {
+      %0 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+      %1 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+      %2 = tt.addptr %1, %0 : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+      %3 = tt.load %2 : tensor<1024x!tt.ptr<f32>, #blocked>
+      %4 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+      %5 = tt.addptr %4, %0 : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+      %6 = tt.load %5 : tensor<1024x!tt.ptr<f32>, #blocked>
+      %7 = arith.addf %3, %6 : tensor<1024xf32, #blocked>
+      %8 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+      %9 = tt.addptr %8, %0 : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+      tt.store %9, %7 : tensor<1024x!tt.ptr<f32>, #blocked>
+      ttg.warp_yield
+    }
+    partition0(%arg7: !tt.ptr<f32>, %arg8: !tt.ptr<f32>, %arg9: !tt.ptr<f32>) num_warps(1) {
+      %0 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked1>
+      %1 = tt.splat %arg7 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+      %2 = tt.addptr %1, %0 : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+      %3 = tt.load %2 : tensor<1024x!tt.ptr<f32>, #blocked1>
+      %4 = tt.splat %arg8 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+      %5 = tt.addptr %4, %0 : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+      %6 = tt.load %5 : tensor<1024x!tt.ptr<f32>, #blocked1>
+      %7 = arith.addf %3, %6 : tensor<1024xf32, #blocked1>
+      %8 = tt.splat %arg9 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+      %9 = tt.addptr %8, %0 : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+      tt.store %9, %7 : tensor<1024x!tt.ptr<f32>, #blocked1>
+      ttg.warp_return
+    } : (!tt.ptr<f32>, !tt.ptr<f32>, !tt.ptr<f32>) -> ()
+    tt.return
+  }
+}
+
+// CHECK-LABEL:   tt.func @add2_warp_specialized_kernel(
+// CHECK:       %[[VAL_0:.*]] = arith.constant 0 : i32
+// CHECK:           ttg.warp_specialize(%arg3, %[[VAL_0]], %arg4, %arg5)
+// CHECK:           default {
+// CHECK:           }
+// CHECK:           partition0(%[[VAL_7:.*]]: !tt.ptr<f32>, %[[VAL_8:.*]]: i32, %[[VAL_9:.*]]: !tt.ptr<f32>, %[[VAL_10:.*]]: !tt.ptr<f32>)
+// CHECK:             %[[VAL_1:.*]] = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32
+// CHECK:             %[[VAL_2:.*]] = tt.splat %[[VAL_8]] : i32 -> tensor<1024xi32
+// CHECK:             %[[VAL_3:.*]] = arith.addi %[[VAL_1]], %[[VAL_2]] : tensor<1024xi32
