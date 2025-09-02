@@ -992,6 +992,7 @@ private:
       newOffset = createTruncIOffset(rewriter, curLoc, newOffset,
                                      rewriter.getI32Type());
     }
+<<<<<<< HEAD
 
     // If the newOffset is not created in this function, chances are it could
     // already be mapped to another value, say y. In that case, we need to
@@ -1010,6 +1011,8 @@ private:
         (remapped != nullptr) && (remapped != newOffset))
       newOffset = remapped;
 
+=======
+>>>>>>> 8a34c216a ([AMD] Accumulate into offset instead of pointer for jit specialized tensor (#7939))
     LDBG("   -- new offset: " << newOffset);
 
     rewriter.replaceOpWithMultiple(addPtrOp, {{fatPtrBase, newOffset}});
@@ -1722,11 +1725,15 @@ struct InitFuncPtrArgs : OpRewritePattern<tt::FuncOp> {
               newOp.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range"))
         bitness = pointerRangeAttr.getInt();
 
+<<<<<<< HEAD
       LDBG(idx << "-th argument: " << arg << ", bitness: " << bitness);
       if (!enableLargeTensorPtrCanon && (bitness == 64)) {
         LDBG("Do not init argument of large-tensor pointer: " << arg);
         continue;
       }
+=======
+      LDBG(idx << "-th argument: " << arg << ", bitness: " << bitness << "\n");
+>>>>>>> 8a34c216a ([AMD] Accumulate into offset instead of pointer for jit specialized tensor (#7939))
 
       Value zeroOffset =
           rewriter.create<arith::ConstantIntOp>(newOp.getLoc(), 0, bitness);
