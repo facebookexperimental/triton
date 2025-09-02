@@ -711,67 +711,6 @@ public:
   }
 };
 
-/// Rewrite warp parition args.
-class ConvertWarpSpecializeOp
-    : public PointerCanonicalizationPattern<ttg::WarpSpecializeOp> {
-  using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
-
-public:
-  LogicalResult
-  matchAndRewrite_(ttg::WarpSpecializeOp wsOp, OneToNOpAdaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
-    ArrayRef<ValueRange> remappedOperands = adaptor.getOperands();
-
-    TypeConverter::SignatureConversion sigConversion(remappedOperands.size());
-    for (unsigned i = 0; i < remappedOperands.size(); ++i) {
-      SmallVector<Type> remappedInitTypes =
-          llvm::to_vector(remappedOperands[i].getTypes());
-      sigConversion.addInputs(i, remappedInitTypes);
-    }
-
-    // TODO: handle the case where the result type is a pointer
-#ifndef NDEBUG
-    // Check that the result types do not contain pointers
-    for (auto resultType : wsOp.getResultTypes()) {
-      assert(!isa<triton::PointerType>(resultType) &&
-             "expected WarpSpecializeOp result type to not be a pointer");
-    }
-#endif
-
-    auto newWsOp = rewriter.create<ttg::WarpSpecializeOp>(
-        wsOp.getLoc(), wsOp.getResultTypes(), wsOp.getPartitionNumWarps(),
-        wsOp.getPartitionRegions().size());
-    newWsOp->setAttrs(wsOp->getAttrs());
-    newWsOp->setOperands(flattenValues(remappedOperands));
-
-    // The default region doesn't capture anything, so no need to rewrite it.
-    rewriter.inlineRegionBefore(wsOp.getDefaultRegion(),
-                                newWsOp.getDefaultRegion(),
-                                newWsOp.getDefaultRegion().end());
-
-    for (auto [oldRegion, newRegion] : llvm::zip_equal(
-             wsOp.getPartitionRegions(), newWsOp.getPartitionRegions())) {
-      // rewrite the args of parition regions
-      auto newBlock =
-          rewriter.applySignatureConversion(&oldRegion->front(), sigConversion);
-      // propagate fatPtrAttrs to bb arg fatPtrs in partition regions
-      int offset = 0;
-      for (auto operands : remappedOperands) {
-        if (operands.size() == 2) {
-          fatPtrs[{newBlock->getArgument(offset),
-                   newBlock->getArgument(offset + 1)}] =
-              fatPtrs.at({operands[0], operands[1]});
-        }
-        offset += operands.size();
-      }
-      rewriter.inlineRegionBefore(*oldRegion, *newRegion, newRegion->end());
-    }
-
-    rewriter.replaceOp(wsOp, newWsOp.getResults());
-    return success();
-  }
-};
-
 /// Rewrite with new remapped operands but also if the scf.yield is inside of
 /// scf.if (possibly) annotate the scf.if.
 class ConvertSCFYieldOp : public PointerCanonicalizationPattern<scf::YieldOp> {
@@ -849,6 +788,49 @@ static void convertSimpleBlockSignature(Block *oldBlock,
     offset += operands.size();
   }
 }
+
+/// Rewrite warp parition args.
+class ConvertWarpSpecializeOp
+    : public PointerCanonicalizationPattern<ttg::WarpSpecializeOp> {
+  using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite_(ttg::WarpSpecializeOp wsOp, OneToNOpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+    ArrayRef<ValueRange> remappedOperands = adaptor.getOperands();
+
+    // TODO: handle the case where the result type is a pointer
+#ifndef NDEBUG
+    // Check that the result types do not contain pointers
+    for (auto resultType : wsOp.getResultTypes()) {
+      assert(!isa<triton::PointerType>(resultType) &&
+             "expected WarpSpecializeOp result type to not be a pointer");
+    }
+#endif
+
+    auto newWsOp = rewriter.create<ttg::WarpSpecializeOp>(
+        wsOp.getLoc(), wsOp.getResultTypes(), wsOp.getPartitionNumWarps(),
+        wsOp.getPartitionRegions().size());
+    newWsOp->setAttrs(wsOp->getAttrs());
+    newWsOp->setOperands(flattenValues(remappedOperands));
+
+    // The default region doesn't capture anything, so no need to rewrite it.
+    rewriter.inlineRegionBefore(wsOp.getDefaultRegion(),
+                                newWsOp.getDefaultRegion(),
+                                newWsOp.getDefaultRegion().end());
+
+    for (auto [oldRegion, newRegion] : llvm::zip_equal(
+             wsOp.getPartitionRegions(), newWsOp.getPartitionRegions())) {
+      convertSimpleBlockSignature(&oldRegion->front(), remappedOperands,
+                                  rewriter, fatPtrs);
+      rewriter.inlineRegionBefore(*oldRegion, *newRegion, newRegion->end());
+    }
+
+    rewriter.replaceOp(wsOp, newWsOp.getResults());
+    return success();
+  }
+};
 
 /// Rewrite init_args, result type, before region bb args, after region bb args.
 class ConvertSCFWhileOp : public PointerCanonicalizationPattern<scf::WhileOp> {
