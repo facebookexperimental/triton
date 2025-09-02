@@ -42,4 +42,15 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
                            "mlir::arith::ArithDialect"];
 }
 
+def TLXInsertRequireLayout : Pass<"tlx-insert-require-layout", "mlir::ModuleOp"> {
+  let summary = "Inserts a tlx::RequireLayoutOp op before the LocalLoad that feeds a tl.dot";
+
+  let description = [{
+    This pass inserts a tlx::RequireLayoutOp op before the LocalLoad that feeds a tl.dot.
+    This layout will then be propagated to the local alloc, by the layout propagation pass.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+}
 #endif // TRITON_TLX_PASSES

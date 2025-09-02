@@ -36,7 +36,7 @@ namespace mlir {
 #define GEN_PASS_DEF_TRITONAMDGPUSTREAMPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
-namespace {
+namespace amdpipeliner {
 
 Operation *streamPredication(RewriterBase &rewriter, Operation *op,
                              Value pred) {
@@ -1096,7 +1096,7 @@ struct PipelinePass : impl::TritonAMDGPUStreamPipelineBase<PipelinePass> {
       // pingpong, which is the only use case of this scheduling variant.
       int numStagesThis = tt::getNumStagesOrDefault(forOp, numStages);
       bool waitAtTail = usePingpong && (numStagesThis == 3) && useAsyncCopy;
-      (void)pipelineLoop(forOp, numStagesThis, globalPrefetch, localPrefetch,
+      (void)amdpipeliner::pipelineLoop(forOp, numStagesThis, globalPrefetch, localPrefetch,
                          useAsyncCopy, waitAtTail);
     }
 
