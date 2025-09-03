@@ -157,6 +157,61 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
     if not isinstance(max_tflops, int):
         assert max_tflops == "cublas"
         max_tflops = get_cublas_tflops(flops_dtype)
+<<<<<<< HEAD:python/triton_kernels/bench/roofline.py
+=======
+
+    grey = "#7f7f7f"
+    opints = [f / b for f, b in zip(flops_ref, bytes_ref)]  # arithmetic intensity per sample
+    kappa = max_tflops / max_tbps  # intensity at the knee
+
+    # --- knee interpolation ---
+    knee_idx = bisect_left(opints, kappa)
+    if knee_idx <= 0:
+        x_knee = xs[0]
+    elif knee_idx >= n:
+        x_knee = xs[-1]
+    else:
+        i0, i1 = knee_idx - 1, knee_idx
+        t = (kappa - opints[i0]) / (opints[i1] - opints[i0])
+        x_knee = xs[i0] + t * (xs[i1] - xs[i0])
+
+    # --- piecewise roofline segments (for plotting the grey guideline) ---
+    if knee_idx >= n:
+        bw_x, bw_y = xs[:], [op * max_tbps for op in opints]
+        comp_x, comp_y = [], []
+    elif knee_idx <= 0:
+        bw_x, bw_y = [], []
+        comp_x, comp_y = xs[:], [max_tflops] * n
+    else:
+        bw_x = xs[:knee_idx] + [x_knee]
+        bw_y = [op * max_tbps for op in opints[:knee_idx]] + [max_tflops]
+        comp_x = [x_knee] + xs[knee_idx:]
+        comp_y = [max_tflops] * (1 + (n - knee_idx))
+
+    y_roof = [min(op * max_tbps, max_tflops) for op in opints]
+
+    # --- helpers ---
+    def interp(yxs, yys, x):
+        """Linear interpolation on (xs, ys), clamped at the ends."""
+        j = bisect_left(yxs, x)
+        if j <= 0:
+            return yys[0]
+        if j >= len(yxs):
+            return yys[-1]
+        x0, x1 = yxs[j - 1], yxs[j]
+        y0, y1 = yys[j - 1], yys[j]
+        t = (x - x0) / (x1 - x0) if x1 != x0 else 0.0
+        return y0 + t * (y1 - y0)
+
+    # Prepare series curves
+    series_perf, series_labels = [], []
+    for idx, (pth, (_, f, b, t)) in enumerate(zip(series, perfs)):
+        perf = [ff / tt * 1e-3 if tt > 0 else 0.0 for ff, tt in zip(f, t)]
+        series_perf.append(perf)
+        series_labels.append(labels[idx] if labels and idx < len(labels) else Path(pth).stem)
+
+    # --- draw ---
+>>>>>>> d4399a15c ([triton_kernels] minor rename (#8044)):python/triton_kernels/triton_kernels/roofline.py
     fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("performance  [TFLOP/s]")
@@ -164,6 +219,7 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
     xmin, xmax = min(xs), max(xs)
     dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
     ax.set_xlim(xmin - dx, xmax + dx)
+<<<<<<< HEAD:python/triton_kernels/bench/roofline.py
     ax.set_ylim(100, max_tflops + 500)
 
     # roofline from operational intensity (identical across series)
@@ -186,6 +242,18 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
         perf_tflops = [ff / tt * 1e-3 if tt > 0 else 0.0 for ff, tt in zip(f, t)]
         label = (labels[idx] if labels and idx < len(labels) else Path(pth).stem)
         ax.plot(xs, perf_tflops, label=label, linewidth=1.8, zorder=2)
+=======
+    ax.set_ylim(min(y_roof) * 0.8 if y_roof else 0.0, max_tflops * 1.05)
+
+    # Points of interest
+    if points_of_interest:
+        for x_pt, label in points_of_interest.items():
+            y_pt = interp(xs, series_perf[0], x_pt)
+            y_rf = interp(xs, y_roof, x_pt)
+            ax.plot([x_pt], [y_pt], marker="o", ms=4, mfc="white", mec="black", zorder=3)
+            ax.annotate(f"{label}\n{int(y_pt)} TFLOP/s ({int(y_pt/y_rf*100)}%)", xy=(x_pt, y_pt), xytext=(5, -25),
+                        textcoords="offset points", fontsize=7, ha="left", va="bottom")
+>>>>>>> d4399a15c ([triton_kernels] minor rename (#8044)):python/triton_kernels/triton_kernels/roofline.py
 
     ax.legend(frameon=False, loc="lower right")
     ax.grid(True, which="both", ls=":", lw=0.5)
