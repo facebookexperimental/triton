@@ -89,11 +89,6 @@ public:
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
-    auto isScalar = [](Operation *op) {
-      return op->getResults().size() == 1 &&
-             op->getResultTypes()[0].isIntOrIndexOrFloat();
-    };
-
     auto getNewMemDescType = [&](ttg::MemDescType origType,
                                  Attribute encoding) {
       return ttg::MemDescType::get(
@@ -102,14 +97,14 @@ public:
     };
 
     funcOp.walk([&](mlir::Operation *op) {
-      if (isa<tlx::RequireLayoutOp>(op) || isScalar(op))
+      if (isa<tlx::RequireLayoutOp>(op))
         return WalkResult::advance();
 
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
         Region *firstRegion = wsOp.getPartitionRegions()[0];
         for (auto [i, blockArg] :
              llvm::enumerate(firstRegion->getArguments())) {
-          if (blockArg.getType().isIntOrIndexOrFloat())
+          if (!isa<ttg::MemDescType>(blockArg.getType()))
             continue;
           auto lattice = solver.lookupState<LayoutEncodingLattice>(blockArg);
           if (!lattice)
@@ -129,6 +124,8 @@ public:
       }
 
       for (auto [i, result] : llvm::enumerate(op->getResults())) {
+        if (!isa<ttg::MemDescType>(result.getType()))
+          continue;
         auto *lattice = solver.lookupState<LayoutEncodingLattice>(result);
         if (!lattice)
           llvm_unreachable("Lattice not found.");

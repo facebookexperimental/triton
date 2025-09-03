@@ -139,6 +139,34 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     return success();
   }
 
+  // Reinterpret to fp32 type requires the tensor to be unpacked
+  if (auto reinterpretOp = dyn_cast<ttg::MemDescReinterpretOp>(op)) {
+    auto resultLattice = results[0];
+    LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
+    if (!resultLayoutEncoding.isUninitialized()) {
+      if (auto tmemEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
+              resultLattice->getValue().getLayoutEncoding())) {
+        auto srcTy = cast<ttg::MemDescType>(reinterpretOp.getSrc().getType());
+        auto srcEncoding =
+            dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
+        auto bitwidth = srcTy.getElementType().getIntOrFloatBitWidth();
+        bool unpacked = bitwidth > 16 ? srcEncoding.getUnpacked()
+                                      : tmemEncoding.getUnpacked();
+        auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
+            tmemEncoding.getContext(), srcEncoding.getBlockM(),
+            srcEncoding.getBlockN(), unpacked, tmemEncoding.getCTASplitM(),
+            tmemEncoding.getCTASplitN());
+        const auto updatedResultLayoutEncoding =
+            LayoutEncoding(newTmemEncoding);
+        auto operandLattice = operands[0];
+        ChangeResult changed =
+            operandLattice->meet(updatedResultLayoutEncoding);
+        propagateIfChanged(operandLattice, changed);
+      }
+    }
+    return success();
+  }
+
   if (auto requireLayoutOp = dyn_cast<triton::tlx::RequireLayoutOp>(op)) {
     // Skip the layout propagation for registers. require_layout ops on tensor
     // types will be rewritten into convert_layout ops, and following passes
@@ -173,12 +201,11 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     return success();
   }
 
-  auto isScalar = [](Type type) { return type.isIntOrIndexOrFloat(); };
   // Propagate from results to the operands
   for (const auto resultLattice : results) {
     for (auto [i, operandLattice] : llvm::enumerate(operands)) {
       // Don't propagate if the operand is a scalar
-      if (isScalar(op->getOpOperand(i).get().getType()))
+      if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))
         continue;
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
       propagateIfChanged(operandLattice, changed);
@@ -236,9 +263,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
            ttng::TMEMSubSliceOp>(op))
     return success();
 
-  auto isScalar = [](Type type) { return type.isIntOrIndexOrFloat(); };
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
-    if (isScalar(op->getOperand(operandIdx).getType()))
+    if (!isa<ttg::MemDescType>(op->getOperand(operandIdx).getType()))
       continue;
     LayoutEncoding operandLayoutEncoding = operandLattice->getValue();
 
