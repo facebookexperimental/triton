@@ -5,7 +5,6 @@ import re
 from typing import Optional
 import math
 import textwrap
-import pathlib
 
 import numpy as np
 import pytest
@@ -29,7 +28,6 @@ from triton._internal_testing import (
     is_cuda,
     is_interpreter,
     is_hopper,
-    is_hopper_or_newer,
     is_hip,
     is_hip_cdna,
     is_hip_cdna2,
@@ -144,6 +142,7 @@ def get_src_element_ty_size(dtype_str):
     raise ValueError(f"Unknown dtype {dtype_str}")
 
 
+<<<<<<< HEAD
 class MfmaLayout:
 
     def __init__(self, version, warps_per_cta, tiles_per_warp, instr_shape, is_transposed):
@@ -345,6 +344,8 @@ def filter_layouts(layouts):
     return [l for l in layouts if is_layout_applicable(l)]
 
 
+=======
+>>>>>>> 0ef5eae61 ([GLUON][TEST] Finish subslice test and remove all layout helpers from Triton's `test_core.py` (#8049))
 @pytest.mark.interpreter
 def test_scalar_overflow(device):
 
@@ -6098,6 +6099,7 @@ def test_smid(device):
     assert h.asm["ptx"].count("%smid") == 1
 
 
+<<<<<<< HEAD
 # -----------------------
 # test layout conversions
 # -----------------------
@@ -6406,6 +6408,8 @@ def test_local_load_store_mma(M, N, mma_layout, shared_layout, device, tmp_path:
         assert "stmatrix" in kernel.asm["ptx"]
 
 
+=======
+>>>>>>> 0ef5eae61 ([GLUON][TEST] Finish subslice test and remove all layout helpers from Triton's `test_core.py` (#8049))
 @pytest.mark.interpreter
 def test_load_scalar_with_mask(device):
 
