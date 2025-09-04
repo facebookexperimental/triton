@@ -204,7 +204,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
   // Propagate from results to the operands
   for (const auto resultLattice : results) {
     for (auto [i, operandLattice] : llvm::enumerate(operands)) {
-      // Don't propagate if the operand is a scalar
+      // Only propagate for memdesc types
       if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))
         continue;
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
@@ -271,8 +271,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     // Slice operandLayoutEncoding
     if (auto sliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
       auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
-      auto dstEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
-          dstTy.getEncoding());
+      auto dstEncoding =
+          dyn_cast<ttng::TensorMemoryEncodingAttr>(dstTy.getEncoding());
       auto encoding = cast<ttng::TensorMemoryEncodingAttr>(
           operandLayoutEncoding.getLayoutEncoding());
       auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
@@ -280,6 +280,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
           encoding.getUnpacked(), encoding.getCTASplitM(),
           encoding.getCTASplitN());
       operandLayoutEncoding = LayoutEncoding(newEncoding);
+    } else if (auto reinterpretOp = dyn_cast<ttg::MemDescReinterpretOp>(op)) {
+      op->dump();
     }
 
     for (auto resultLattice : results) {
