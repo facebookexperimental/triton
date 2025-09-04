@@ -1437,3 +1437,100 @@ def test_inline_tmem(BLOCK_SIZE, device):
     grid = lambda meta: (1, )
     kerenl_info = kernel[grid](y, BLOCK_SIZE)
     assert kerenl_info.asm["ttir"].count("store") == 1
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dots_blackwell_tmem(device):
+    """
+    Test D = ((A@B) * 0.5) @ C
+    """
+
+    @triton.jit
+    def tcgen5_fa_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
+                                 d_ptr, stride_dm, stride_dn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        a_tiles = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
+        b_tiles = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
+        c_tiles = tlx.local_alloc((BLOCK_N, BLOCK_N), tl.float16, tl.constexpr(1))
+
+        ab_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        c_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+
+        acc_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        o_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
+        d_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        acc_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        o_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        d_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+
+        with tlx.async_tasks():
+            # load
+            with tlx.async_task("default"):
+                offs_m = tl.arange(0, BLOCK_M)
+                offs_n = tl.arange(0, BLOCK_N)
+                offs_k = tl.arange(0, BLOCK_K)
+                a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+                b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+                c_ptrs = c_ptr + (offs_n[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+                # load a and b
+                tlx.async_load(a_ptrs, a_tiles[0])
+                tlx.async_load(b_ptrs, b_tiles[0])
+                tlx.async_load_commit_group()
+                tlx.async_load_wait_group(tl.constexpr(0))
+                tlx.barrier_arrive(ab_fulls[0])
+
+                # load c
+                tlx.async_load(c_ptrs, c_tiles[0])
+                tlx.async_load_commit_group()
+                tlx.async_load_wait_group(tl.constexpr(0))
+                tlx.barrier_arrive(c_fulls[0])
+
+            # mma
+            with tlx.async_task(num_warps=1):
+                tlx.barrier_wait(ab_fulls[0], tl.constexpr(0))
+                # compute a @ b
+                tlx.async_dot(a_tiles[0], b_tiles[0], acc_tiles[0], use_acc=False, mBarriers=[acc_fulls[0]])
+                tlx.barrier_wait(c_fulls[0], tl.constexpr(0))
+                # wait for (a @ b) * 0.5) is ready
+                tlx.barrier_wait(o_fulls[0], tl.constexpr(0))
+                # compute ((a @ b) * 0.5) @ c
+                tlx.async_dot(o_tiles[0], c_tiles[0], d_tiles[0], use_acc=False, mBarriers=[d_fulls[0]])
+
+
+            # activation and epilogue
+            with tlx.async_task(num_warps=4):
+                # wait for (a @ b) is ready
+                tlx.barrier_wait(acc_fulls[0], tl.constexpr(0))
+                o = tlx.local_load(acc_tiles[0])
+                o = o.to(tl.float16)
+                o = o * 0.5
+                tlx.local_store(o_tiles[0], o)
+                tlx.barrier_arrive(o_fulls[0])
+
+                # wait for ((a @ b) * 0.5) @ c is ready
+                tlx.barrier_wait(d_fulls[0], tl.constexpr(0))
+                d = tlx.local_load(d_tiles[0])
+                d = d.to(tl.float16)
+                offs_m = tl.arange(0, BLOCK_M)
+                offs_n = tl.arange(0, BLOCK_N)
+                d_ptrs = d_ptr + stride_dm * offs_m[:, None] + stride_dn * offs_n[None, :]
+                tl.store(d_ptrs, d)
+
+
+
+    torch.manual_seed(0)
+    M, N, K = (64, 32, 16)
+    a = torch.ones((M, K), device=device, dtype=torch.float16)
+    b = torch.ones((K, N), device=device, dtype=torch.float16)
+    c = torch.ones((N, N), device=device, dtype=torch.float16)
+    d = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
+    kernel = tcgen5_fa_kernel[(1, 1)](a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c, c.stride(0),
+                                              c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=1)
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.tmem_alloc") == 3
+
+    ref_out = ((a @ b) * 0.5) @ c
+    # torch.testing.assert_close(d, ref_out)

@@ -57,10 +57,10 @@ def visit_withAsyncTasks(self, node):
         if not _is_list_like(stmts):
             stmts = [stmts]
 
-        with tlx_enter_sub_region():  # dry visit async task body
+        # dry visit async task body to count the number of sub tasks
+        with tlx_enter_sub_region():
             block = self.builder.create_block()
             self.builder.set_insertion_point_to_start(block)
-            # Count the number of sub tasks and caculate captures
             taskNumWarps = []
             taskNumRegs = []
             taskReplica = []
@@ -78,13 +78,9 @@ def visit_withAsyncTasks(self, node):
                 else:
                     assert task.replicate is not None, "Replicate must be non-None for non-default task"
                     taskReplica.append(task.replicate)
-
-                    # Get used vars to be captured
                     taskNumWarps.extend([task.num_warps] * task.replicate)
                     if task.num_regs:
                         taskNumRegs.extend([task.num_regs] * task.replicate)
-                    with enter_sub_region(self):
-                        self.visit(stmt)
 
             region_replica_id_stack.pop()  # revert adding dummy placeholder
 
@@ -99,14 +95,37 @@ def visit_withAsyncTasks(self, node):
         ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs if len(taskNumRegs) > 0 else None,
                                                        sum(taskReplica))
 
+        # dry visit async task body to calculate captures
+        index = 0
+        for stmt in stmts:
+            assert _is_async_task(self, stmt)
+            task = _get_async_task(self, stmt)
+            assert task.is_explict
+            if task.is_default:
+                task_body = ws_op.get_default_region()
+                block = self.builder.create_block_with_parent(task_body, [])
+            else:
+                # Only need to calculate captures for the first replica.
+                region_replica_id_stack.append(0)
+                task_body = ws_op.get_partition_region(index)
+                index += task.replicate
+                block = self.builder.create_block_with_parent(task_body, [])
+                self.builder.set_insertion_point_to_start(block)
+                with enter_sub_region(self):
+                    self.visit(stmt)
+                region_replica_id_stack.pop()
+
+            block.erase()
+
         # Add captures
         captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))
         for name in captures:
             val = liveins[name]
             ws_op.append_operand(val.handle)
 
-        index = 1
 
+        # real codegen
+        index = 0
         for stmt in stmts:
             assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
@@ -123,7 +142,7 @@ def visit_withAsyncTasks(self, node):
                 for i in range(task.replicate):
                     region_replica_id_stack.append(i)
 
-                    task_body = ws_op.get_partition_region(index - 1)
+                    task_body = ws_op.get_partition_region(index)
                     index += 1
 
                     block = self.builder.create_block_with_parent(task_body, [])
