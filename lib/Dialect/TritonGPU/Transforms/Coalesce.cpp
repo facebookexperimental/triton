@@ -59,7 +59,7 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
       });
 
       auto contiguity = axisInfoAnalysis.getAxisInfo(ptr)->getContiguity();
-      order = getOrderFromContiguity(contiguity);
+      order = argSort(contiguity);
     }
 
     LDBG("order=[" << triton::join(order, ", ") << "]");
@@ -80,7 +80,7 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
           std::min<int>(maxPerThread, std::max<int>(numElems / numThreads, 1));
     } else {
       auto contiguity = axisInfoAnalysis.getAxisInfo(ptr)->getContiguity();
-      SmallVector<unsigned> order = getOrderFromContiguity(contiguity);
+      SmallVector<unsigned> order = argSort(contiguity);
       LDBG("order=[" << triton::join(order, ", ") << "]");
 
       auto matchesShape = [&refTensorType](const Value &val) {
@@ -97,7 +97,7 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
           Value val = getMemAccessPtr(use);
           if (!val || !matchesShape(val) || memAccessesSameOrder.contains(use))
             continue;
-          auto currOrder = getOrderFromContiguity(
+          auto currOrder = argSort(
               axisInfoAnalysis.getAxisInfo(val)->getContiguity());
           if (order == currOrder) {
             LDBG("multi-root-slice: insert to memAccessesSameOrder " << *use);
