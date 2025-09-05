@@ -228,7 +228,7 @@ class HIPBackend(BaseBackend):
 
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
-        amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
+        passes.ttgpuir.add_optimize_dot_operands(pm, True)
         amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
 
         passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -248,6 +248,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
             amd.passes.ttgpuir.insert_instruction_sched_hints(pm, options.schedule_hint)
+        passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
