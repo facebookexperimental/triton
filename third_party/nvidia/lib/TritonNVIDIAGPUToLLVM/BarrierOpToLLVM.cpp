@@ -26,6 +26,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 #include "Utility.h"
@@ -314,6 +315,98 @@ struct NamedBarrierWaitOpConversion
     return success();
   }
 };
+
+struct AsyncCLCTryCancelOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncCLCTryCancelOp> {
+  // TODO. check target infor for compute capability >= 100
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::AsyncCLCTryCancelOp>::ConvertOpToLLVMPattern;
+
+  // clc response is 16-byte opaque object available at the location specified
+  // by the 16-byte wide shared memory address (i.e. 1st operand of PTX inst)
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::AsyncCLCTryCancelOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    std::string ptxAsm =
+        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_"
+        "tx::bytes.multicast::cluster::all.b128 [$0], [$1];";
+
+    PTXBuilder ptxBuilder;
+    SmallVector<PTXBuilder::Operand *, 2> operands = {
+        ptxBuilder.newOperand(adaptor.getClcResAlloc(), "r"),
+        ptxBuilder.newOperand(adaptor.getMbarAlloc(), "r")};
+
+    auto clcOp = *ptxBuilder.create<>(ptxAsm);
+    clcOp(operands, /*onlyAttachMLIRArgs=*/true);
+    auto voidTy = void_ty(getContext());
+    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct AsyncCLCQueryCancelOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncCLCQueryCancelOp> {
+  // TODO. check target infor for compute capability >= 100
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::AsyncCLCQueryCancelOp>::ConvertOpToLLVMPattern;
+  // clc.query_cancel.is_cancel.is_canceled.pred
+  // check if inst succeeds
+
+  // clc.query_cancel.get_first_ctaid
+  // query ctaid from response if succeeds otherwise -1
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::AsyncCLCQueryCancelOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+
+    Value valid, xctaid, yctaid, zctaid;
+
+    std::string ptx = R"(
+    {
+      .reg .pred complete;
+      .reg .b128 clc_result;
+      ld.shared.b128 clc_result, [$0];
+      clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
+      selp.u32 $1, 1, 0, p1
+      @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$2,
+      $3, $4, _}, clc_result
+    }
+    )";
+
+    PTXBuilder ptxBuilder;
+    SmallVector<PTXBuilder::Operand *, 5> operands = {
+        ptxBuilder.newOperand(adaptor.getResponseAddr(), "r"),
+        ptxBuilder.newOperand(valid, "b"),  // 1-bit pred
+        ptxBuilder.newOperand(xctaid, "r"), // 32-bit int
+        ptxBuilder.newOperand(yctaid, "r"),
+        ptxBuilder.newOperand(zctaid, "r"),
+    };
+
+    auto queryOp = *ptxBuilder.create<>(ptx);
+    queryOp(operands, /*onlyAttachMLIRArgs=*/true);
+    auto voidTy = void_ty(getContext());
+    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
+
+    SmallVector<Value> resultVals;
+    resultVals.reserve(4);
+    resultVals.push_back(valid); // 0 or 1
+    resultVals.push_back(xctaid);
+    resultVals.push_back(yctaid);
+    resultVals.push_back(zctaid);
+    auto typeConverter = getTypeConverter();
+    auto resultTy = cast<RankedTensorType>(op.getType());
+    Value ret =
+        packLLElements(loc, typeConverter, resultVals, rewriter, resultTy);
+
+    rewriter.replaceOp(op, ret);
+    return success();
+  }
+};
 } // namespace
 
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
@@ -327,4 +420,6 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
   patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);
+  patterns.add<AsyncCLCTryCancelOpConversion>(typeConverter, benefit);
+  patterns.add<AsyncCLCQueryCancelOpConversion>(typeConverter, benefit);
 }
