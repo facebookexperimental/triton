@@ -379,7 +379,7 @@ void init_triton_tlx_ir(py::module &&m) {
                      useD.has_value() ? useD.value() : predTrue /*useD*/,
                      pred.has_value() ? pred.value() : predTrue /*pred */,
                      false /* two_ctas*/, ValueRange(mBarriers),
-                     ValueRange(barrierPreds), true /* is_async */)
+                     ValueRange(barrierPreds), !mBarriers.empty()/* is_async */)
                  .getToken();
            })
       .def("create_tcgen05_commit",
