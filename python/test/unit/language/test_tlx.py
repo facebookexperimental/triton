@@ -1568,4 +1568,4 @@ def test_async_dots_blackwell_tmem(device):
     assert ttgir.count("ttng.tmem_alloc") == 3
 
     ref_out = ((a @ b) * 0.5) @ c
-    # torch.testing.assert_close(d, ref_out)
+    torch.testing.assert_close(d, ref_out)

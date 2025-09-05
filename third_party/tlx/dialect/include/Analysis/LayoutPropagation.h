@@ -80,6 +80,9 @@ public:
   void setToExitState(LayoutEncodingLattice *lattice) override;
 
   LogicalResult visitRegionInReverse(Operation *op);
+
+  void visitWarpSpecRegionArgs(Operation *op, Value opnd,
+                               const LayoutEncoding &resultEncoding);
 };
 
 //===----------------------------------------------------------------------===//
@@ -97,6 +100,11 @@ public:
                  ArrayRef<LayoutEncodingLattice *> results) override;
 
   void setToEntryState(LayoutEncodingLattice *lattice) override;
+
+  LogicalResult visitRegion(Operation *op);
+
+  LogicalResult visitWarpSpecRegionArgs(Operation *op, Value opnd,
+                                        const LayoutEncoding &opndEncoding);
 };
 
 } // namespace mlir::triton::tlx

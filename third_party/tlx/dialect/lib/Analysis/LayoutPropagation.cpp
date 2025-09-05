@@ -80,6 +80,27 @@ LogicalResult LayoutBackwardPropagation::visitRegionInReverse(Operation *op) {
   return success();
 }
 
+void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
+    Operation *op, Value opnd, const LayoutEncoding &resultEncoding) {
+  if (auto arg = dyn_cast<BlockArgument>(opnd)) {
+    if (auto warpSpecializePartitionsOp =
+            op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
+      auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
+      auto blockArgumentLattice = getLatticeElement(
+          warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
+      ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
+      propagateIfChanged(blockArgumentLattice, changed);
+      // Propagate to all the partition regions
+      for (Region *partitionRegion : warpSpecializeOp.getPartitionRegions()) {
+        auto blockArgumentLattice =
+            getLatticeElement(partitionRegion->getArgument(arg.getArgNumber()));
+        ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
+        propagateIfChanged(blockArgumentLattice, changed);
+      }
+    }
+  }
+}
+
 LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
@@ -109,6 +130,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       auto operandLattice = operands[0];
       ChangeResult changed = operandLattice->meet(updatedResultLayoutEncoding);
       propagateIfChanged(operandLattice, changed);
+      visitWarpSpecRegionArgs(op, memDescTransOp.getSrc(),
+                              updatedResultLayoutEncoding);
     }
     return success();
   }
@@ -134,34 +157,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         ChangeResult changed =
             operandLattice->meet(updatedResultLayoutEncoding);
         propagateIfChanged(operandLattice, changed);
-      }
-    }
-    return success();
-  }
-
-  // Reinterpret to fp32 type requires the tensor to be unpacked
-  if (auto reinterpretOp = dyn_cast<ttg::MemDescReinterpretOp>(op)) {
-    auto resultLattice = results[0];
-    LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
-    if (!resultLayoutEncoding.isUninitialized()) {
-      if (auto tmemEncoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
-              resultLattice->getValue().getLayoutEncoding())) {
-        auto srcTy = cast<ttg::MemDescType>(reinterpretOp.getSrc().getType());
-        auto srcEncoding =
-            dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
-        auto bitwidth = srcTy.getElementType().getIntOrFloatBitWidth();
-        bool unpacked = bitwidth > 16 ? srcEncoding.getUnpacked()
-                                      : tmemEncoding.getUnpacked();
-        auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
-            tmemEncoding.getContext(), srcEncoding.getBlockM(),
-            srcEncoding.getBlockN(), unpacked, tmemEncoding.getCTASplitM(),
-            tmemEncoding.getCTASplitN());
-        const auto updatedResultLayoutEncoding =
-            LayoutEncoding(newTmemEncoding);
-        auto operandLattice = operands[0];
-        ChangeResult changed =
-            operandLattice->meet(updatedResultLayoutEncoding);
-        propagateIfChanged(operandLattice, changed);
+        visitWarpSpecRegionArgs(op, tmemSliceOp.getSrc(),
+                                updatedResultLayoutEncoding);
       }
     }
     return success();
@@ -179,24 +176,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
          llvm::zip_equal(operands, requireLayoutOp->getOperands())) {
       ChangeResult changed = operandLattice->meet(layoutLattice);
       propagateIfChanged(operandLattice, changed);
-      if (auto arg = dyn_cast<BlockArgument>(operand)) {
-        if (auto warpSpecializePartitionsOp =
-                op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
-          auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
-          auto blockArgumentLattice = getLatticeElement(
-              warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
-          ChangeResult changed = blockArgumentLattice->meet(layoutLattice);
-          propagateIfChanged(blockArgumentLattice, changed);
-          // Propagate to all the partition regions
-          for (Region *partitionRegion :
-               warpSpecializeOp.getPartitionRegions()) {
-            auto blockArgumentLattice = getLatticeElement(
-                partitionRegion->getArgument(arg.getArgNumber()));
-            ChangeResult changed = blockArgumentLattice->meet(layoutLattice);
-            propagateIfChanged(blockArgumentLattice, changed);
-          }
-        }
-      }
+      visitWarpSpecRegionArgs(op, operand, layoutLattice);
     }
     return success();
   }
@@ -209,26 +189,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         continue;
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
       propagateIfChanged(operandLattice, changed);
-      if (auto arg = dyn_cast<BlockArgument>(op->getOpOperand(i).get())) {
-        if (auto warpSpecializePartitionsOp =
-                op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
-          auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
-          auto blockArgumentLattice = getLatticeElement(
-              warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
-          ChangeResult changed =
-              blockArgumentLattice->meet(resultLattice->getValue());
-          propagateIfChanged(blockArgumentLattice, changed);
-          // Propagate to all the partition regions
-          for (Region *partitionRegion :
-               warpSpecializeOp.getPartitionRegions()) {
-            auto blockArgumentLattice = getLatticeElement(
-                partitionRegion->getArgument(arg.getArgNumber()));
-            ChangeResult changed =
-                blockArgumentLattice->meet(resultLattice->getValue());
-            propagateIfChanged(blockArgumentLattice, changed);
-          }
-        }
-      }
+      visitWarpSpecRegionArgs(op, op->getOpOperand(i).get(),
+                              resultLattice->getValue());
     }
   }
   return success();
@@ -236,7 +198,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
 
 void LayoutBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto branchOp = operand.getOwner();
-  LDBG("Visiting branch op " << *branchOp << "\n");
+  LDBG("Backward visiting branch op " << *branchOp << "\n");
   if (isa<ttg::WarpSpecializeOp>(branchOp)) {
     auto unused = visitRegionInReverse(branchOp);
     (void)unused;
@@ -258,9 +220,11 @@ void LayoutBackwardPropagation::setToExitState(LayoutEncodingLattice *lattice) {
 LogicalResult LayoutForwardPropagation::visitOperation(
     Operation *op, ArrayRef<const LayoutEncodingLattice *> operands,
     ArrayRef<LayoutEncodingLattice *> results) {
+  if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
+    return visitRegion(op);
 
-  if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescReinterpretOp,
-           ttng::TMEMSubSliceOp>(op))
+  if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp, ttng::TMEMSubSliceOp,
+           ttg::LocalAllocOp, ttng::TMEMAllocOp>(op))
     return success();
 
   for (const auto [operandIdx, operandLattice] : llvm::enumerate(operands)) {
@@ -280,13 +244,61 @@ LogicalResult LayoutForwardPropagation::visitOperation(
           encoding.getUnpacked(), encoding.getCTASplitM(),
           encoding.getCTASplitN());
       operandLayoutEncoding = LayoutEncoding(newEncoding);
-    } else if (auto reinterpretOp = dyn_cast<ttg::MemDescReinterpretOp>(op)) {
-      op->dump();
     }
 
     for (auto resultLattice : results) {
       ChangeResult changed = resultLattice->meet(operandLayoutEncoding);
       propagateIfChanged(resultLattice, changed);
+    }
+  }
+
+  for (const auto [resultIdx, resultLattice] : llvm::enumerate(results)) {
+    if (failed(visitWarpSpecRegionArgs(op, op->getResult(resultIdx),
+                                       resultLattice->getValue())))
+      return failure();
+  }
+
+  return success();
+}
+
+LogicalResult LayoutForwardPropagation::visitWarpSpecRegionArgs(
+    Operation *op, Value result, const LayoutEncoding &resultEncoding) {
+  // For all use of the result, propagate the resultEncoding to the
+  // corresponding warp spec region arg if it is a captured arg.
+  for (auto &use : result.getUses()) {
+    Operation *user = use.getOwner();
+    if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user)) {
+      unsigned idx = use.getOperandNumber();
+      // Propagate to the i-th argument of every partition region
+      // Propagate to all the partition regions
+      for (Region *partitionRegion : wsOp.getPartitionRegions()) {
+        auto blockArgumentLattice =
+            getLatticeElement(partitionRegion->getArgument(idx));
+        ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
+        propagateIfChanged(blockArgumentLattice, changed);
+      }
+      if (failed(visitRegion(wsOp)))
+        return failure();
+    }
+  }
+
+  return success();
+}
+
+LogicalResult LayoutForwardPropagation::visitRegion(Operation *op) {
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &nestedOp : block) {
+        SmallVector<const LayoutEncodingLattice *> operands;
+        for (const auto operand : nestedOp.getOperands())
+          operands.push_back(getLatticeElement(operand));
+        SmallVector<LayoutEncodingLattice *> results;
+        for (Value result : nestedOp.getResults())
+          results.push_back(getLatticeElement(result));
+        auto visitResult = visitOperation(&nestedOp, operands, results);
+        if (failed(visitResult))
+          return visitResult;
+      }
     }
   }
   return success();
