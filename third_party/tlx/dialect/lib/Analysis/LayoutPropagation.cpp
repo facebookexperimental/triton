@@ -259,7 +259,7 @@ LogicalResult LayoutForwardPropagation::visitOperation(
     Operation *op, ArrayRef<const LayoutEncodingLattice *> operands,
     ArrayRef<LayoutEncodingLattice *> results) {
 
-  if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+  if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescReinterpretOp,
            ttng::TMEMSubSliceOp>(op))
     return success();
 

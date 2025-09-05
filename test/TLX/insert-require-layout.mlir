@@ -14,10 +14,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %25 = ttg.local_alloc : () -> !ttg.memdesc<1x32x64xf16, #shared1, #smem, mutable>
     %c0_i32 = arith.constant 0 : i32
     %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked>
-    // CHECK: %[[mem_desc1:.*]] = ttg.memdesc_subview %{{.*}}
-    %26 = ttg.memdesc_subview %24[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<1x64x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
-    // CHECK: %[[mem_desc2:.*]] = ttg.memdesc_subview %{{.*}}
-    %27 = ttg.memdesc_subview %25[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<1x32x64xf16, #shared1, #smem, mutable> -> !ttg.memdesc<32x64xf16, #shared1, #smem, mutable>
+    // CHECK: %[[mem_desc1:.*]] = ttg.memdesc_index %{{.*}}
+    %26 = ttg.memdesc_index %24[%c0_i32] : !ttg.memdesc<1x64x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
+    // CHECK: %[[mem_desc2:.*]] = ttg.memdesc_index %{{.*}}
+    %27 = ttg.memdesc_index %25[%c0_i32] : !ttg.memdesc<1x32x64xf16, #shared1, #smem, mutable> -> !ttg.memdesc<32x64xf16, #shared1, #smem, mutable>
     %28 = tt.load %arg1 : tensor<64x32x!tt.ptr<f16>, #blocked>
     %29 = tt.load %arg2 : tensor<32x64x!tt.ptr<f16>, #blocked>
     ttg.local_store %28, %26 : tensor<64x32xf16, #blocked> -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
