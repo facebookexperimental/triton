@@ -324,6 +324,52 @@ class mbarrier_type(buffered_tensor_type):
         )
 
 
+class clc_response(tl.base_value):
+    """
+    Define a CLC response object
+    """
+
+    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        self.handle = handle
+        self.type = clc_response_type(num, layout)
+        self.num = num
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        """Build a frontend value with the current dtype, wrapping a list of existing handles.
+        cursor is the index of the first handle relevant to this value, and the function
+        should return the updated cursor position after any handles consumed by the created value.
+        """
+        raise NotImplementedError
+
+
+class clc_response_type(buffered_tensor_type):
+    # TODO. a more generic design about buffered tensor type
+    # since we have two concrete use cases now (mbarrier and clc_response)
+    # both of which are opaque objects with fixed size
+
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
+        value = mbarrier(handles[cursor], self.num, self.layout)
+        return value, cursor + 1
+
+    def to_ir(self, builder: ir.builder) -> None:
+        if self.num >= 1:
+            shape = [self.num]
+        else:
+            shape = self.shape
+        return builder.get_memdesc_type(
+            shape,
+            self.element_ty.to_ir(builder),
+            self.layout.to_ir(builder),
+            self.storage.value,
+        )
+
+
 class async_token(tl.base_value):
     """
     Defines a type of value used to track and synchronize asynchronous operations.

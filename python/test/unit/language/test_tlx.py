@@ -149,7 +149,7 @@ def _generate_test_params():
     dims_k = [16, 32, 64]
     dtype = torch.float16
     params = []
-    
+
     for M, N, K in itertools.product(dims_mn, dims_mn, dims_k):
         device_props = str(torch.cuda.get_device_properties())
         matmul_size = (M * K + K * N) * dtype.itemsize
@@ -164,7 +164,7 @@ def _generate_test_params():
             params.append((M, N, K))
     return params
 
-# Test tl.dot wit tlx smem ops 
+# Test tl.dot wit tlx smem ops
 # Tests tl.load->tlx_local_store->tlx_local_load->tl.dot
 @pytest.mark.skipif(is_blackwell(), reason="Not tested on Blackwell")
 @pytest.mark.parametrize("M,N,K", _generate_test_params())
@@ -1080,7 +1080,7 @@ def tlx_square_non_ws(
     mask = offsets < n_elements
 
     # mbarrier ops
-    
+
     bars = tlx.alloc_barriers(num_barriers=1, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
     bar = tlx.local_view(bars, 0)
 
@@ -1177,7 +1177,7 @@ def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     if is_hip():
         assert (ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3) and (
           ttgir.count("amdgpu.arrive_barrier") == 3), f"TTGIR {ttgir}"
-    else:    
+    else:
         assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3) and (
           ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
 
@@ -1569,3 +1569,121 @@ def test_async_dots_blackwell_tmem(device):
 
     ref_out = ((a @ b) * 0.5) @ c
     torch.testing.assert_close(d, ref_out)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("BLOCK_SIZE", [(256)])
+def test_cluster_launch_control(BLOCK_SIZE, device):
+
+    @triton.jit
+    def add2_clc(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # CTA ID of the first work load
+        ctaid = tl.program_id(axis=0)
+        block_start = ctaid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(z_ptr + offsets, output, mask=mask)
+
+        bars = tlx.alloc_barriers(num_barriers=1)
+        clc_mbar = tlx.local_view(bars, 0)
+
+        responses = tlx.alloc_clc_responses(num_responses=1)
+        clc_response = tlx.local_view(responses, 0)
+
+        # while True:
+
+        # CLC issue and wait
+        tlx.clc_issue(clc_response, clc_mbar)
+
+        # mbar completion and extract CTA ID
+        # response = tl.full([1, 1,1,1], -1, tl.int32)
+        # tlx.barrier_wait(cta_id, clc_mbar)
+
+            # if ctaid is NOT valid, exit
+            # if response[0] == 0:
+            #     return
+            # else:
+            #     ctaid = response[1]
+
+            #     offsets = ctaid + tl.range(0, BLOCK_SIZE)
+            #     mask = offsets < n_elements
+
+            #     x = tl.load(x_ptr + offsets, mask=mask)
+            #     y = tl.load(y_ptr + offsets, mask=mask)
+            #     output = x + y
+            #     tl.store(z_ptr + offsets, output, mask=mask)
+
+
+        # block_start = pid * BLOCK_SIZE
+        # with tlx.async_tasks():
+        #     with tlx.async_task("default"):
+        #         offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        #         mask = offsets < n_elements
+        #         x = tl.load(x_ptr + offsets, mask=mask)
+        #         y = tl.load(y_ptr + offsets, mask=mask)
+        #         output = x + y
+        #         tl.store(z_ptr + offsets, output, mask=mask)
+        #     with tlx.async_task(num_warps=1, registers=100, replicate=2):
+        #         offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        #         mask = offsets < n_elements
+        #         a = tl.load(a_ptr + offsets, mask=mask)
+        #         b = tl.load(b_ptr + offsets, mask=mask)
+        #         replica_id = tlx.async_task_replica_id()
+        #         # This no-op is just to test that replica_id
+        #         # is correctly passed to the kernel
+        #         a1 = a + replica_id
+        #         b1 = b - replica_id
+        #         output = a1 + b1
+        #         tl.store(c_ptr + offsets, output, mask=mask)
+
+    torch.manual_seed(0)
+    # number of kernels to launch in a non-persistent mode
+    size = 100000
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = add2_clc[grid](x, y, output, n_elements, BLOCK_SIZE)
+    # ttgir = kernel.asm["ttgir"]
+
+    # pattern_ws = (r'ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 100, 100>}')
+    # assert re.search(pattern_ws, ttgir, flags=re.DOTALL)
+    # pattern_p0 = (r'partition0(.*) num_warps\(1\)')
+    # assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
+    # pattern_p1 = (r'partition1(.*) num_warps\(1\)')
+    # assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
+
+    # Check that the replica_id is correctly passed to non-default regions
+    # TTIR/TTGIR should be something like:
+    #  partition0(...) {
+    #   %cst = arith.constant dense<0.000000e+00> : tensor<1024xf32, #blocked>
+    #   ...
+    #   %13 = arith.addf %9, %cst
+    #   ...}
+    #  partition1(...) {
+    #   %cst = arith.constant dense<1.000000e+00> : tensor<1024xf32, #blocked>
+    #   ...
+    #   %13 = arith.addf %9, %cst
+    #   %14 = arith.subf %12, %cst
+    #   ...}
+    # pattern_cst = (r'cst = arith.constant dense\<.*\>')
+    # found = re.findall(pattern_cst, ttgir)
+    # assert len(found) == 2, "Expected 2 cst by calling `tlx.async_task_replica_id()` in two regions"
+    # assert found[0] != found[1], "Two matches MUST be different"
+    # assert "dense<0.0" in found[0] and "dense<1.0" in found[1], "Expected 0.0 and 1.0 as replica_id"
+
+    torch.testing.assert_close(output, x+y, check_dtype=False)
+>>>>>>> c9d76ee71 (wip)

@@ -288,6 +288,45 @@ def TTNG_NamedBarrierWaitOp : TTNG_Op<"wait_barrier_named", []> {
   let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
 }
 
+def TTNG_AsyncCLCTryCancelOp : TTNG_Op<"async_clc_try_cancel", []> {
+  let summary = "Requests cancellation of cluster which is not launched yet";
+
+  let description = [{
+    Requests atomically cancelling the launch of a cluster that has not started running yet.
+
+    This lowers using PTX instruction
+    clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
+
+    It asynchronously writes an opaque response (16-byte CLC response) to shared memory. The completion of the asynchronous operation is tracked using the mbarrier object in `alloc`.
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarAlloc,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc
+  );
+
+  let assemblyFormat = "$mbarAlloc`,` $clcResAlloc attr-dict `:` type(operands)";
+}
+
+def TTNG_AsyncCLCQueryCancelOp : TTNG_Op<"async_clc_query_cancel", []> {
+  let summary = "Extract CTA ID from CLC response";
+
+  let description = [{
+    Extract CTA ID from CLC response stored at the SMEM address pointed
+    and return (xctaid, yctaid, zctaid).
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-query-cancel
+  }];
+
+  let arguments = (ins TT_PtrType:$responseAddr);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$responseAddr attr-dict `:` type($responseAddr) `->` type($result)";
+}
+
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 

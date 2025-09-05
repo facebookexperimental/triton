@@ -4,6 +4,7 @@ from .mem_ops import *
 from .barrier import *
 from .utility import *
 from .mma_ops import *
+from .dynamic_launch import *
 
 from . import compiler
 
@@ -30,6 +31,10 @@ __all__ = [
     "barrier_expect_bytes",
     "barrier_wait",
     "barrier_arrive",
+    # dynamic launcher ops
+    "alloc_clc_responses",
+    "clc_issue",
+    "clc_query",
     # debugging ops
     "thread_id"
 ]
