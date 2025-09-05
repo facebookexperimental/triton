@@ -370,4 +370,16 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUPrintTLX : Pass<"tritongpu-print-tlx", "mlir::ModuleOp"> {
+  let summary = "Print TLX representation of TritonGPU IR";
+
+  let description = [{
+    This pass walks through TritonGPU IR and prints the TLX (Triton Low-level eXtensions)
+    representation of each operation. This is useful for debugging and understanding 
+    the low-level structure of TritonGPU kernels.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
 #endif
