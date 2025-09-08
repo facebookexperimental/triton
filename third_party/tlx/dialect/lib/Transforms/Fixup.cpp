@@ -27,21 +27,20 @@ public:
   // validate the module and error early for unsupported cases
   LogicalResult verifyModule(ModuleOp &mod) {
     // ws should not capture RankedTensorType
-    ttg::WarpSpecializeOp *invalidWSOp = nullptr;
+    ttg::WarpSpecializeOp invalidWSOp = nullptr;
     auto result = mod.walk([&](ttg::WarpSpecializeOp op) {
       for (auto argType : op.getOperandTypes()) {
         if (isa<RankedTensorType>(argType)) {
-          invalidWSOp = &op;
+          invalidWSOp = op;
           return WalkResult::interrupt();
         }
       }
       return WalkResult::advance();
     });
     if (result.wasInterrupted()) {
-      return invalidWSOp->emitError()
-             << "WarpSpecializeOp should not capture "
-                "RankedTensorType. Try moving tensor "
-                "computation into specific async task.";
+      return invalidWSOp.emitError() << "WarpSpecializeOp should not capture "
+                                        "RankedTensorType. Try moving tensor "
+                                        "computation into specific async task.";
     }
     return success();
   }
