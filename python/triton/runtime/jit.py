@@ -12,14 +12,14 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Generic, Iterable, Optional, TypeVar, Union, overload, Dict, Any, Tuple
 
-from triton.tools.tensor_descriptor import TensorDescriptor
+from triton.backends import BaseBackend
 from types import ModuleType
 from .. import knobs
 from .driver import driver
 from . import _async_compile
-from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict, canonicalize_dtype
+from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict
 from .cache import get_cache_key
-from triton._C.libtriton import get_cache_invalidating_env_vars
+from triton._C.libtriton import get_cache_invalidating_env_vars, native_specialize_impl
 
 TRITON_MODULE = "triton.language"
 GLUON_MODULE = "triton.experimental.gluon.language"
@@ -341,6 +341,7 @@ class KernelParam:
         return self._param.default != inspect.Parameter.empty
 
 
+<<<<<<< HEAD
 dtype2str = {}
 specialize_impl_cache = []
 
@@ -402,11 +403,12 @@ def create_specialize_impl(specialize_extra):
     return specialize_impl
 
 
+=======
+>>>>>>> fb68aeaa9 ([IMP][Launch Latency] native specialize (#7771))
 def mangle_type(arg, specialize=False):
-    if len(specialize_impl_cache) == 0:
-        specialize_impl_cache.append(create_specialize_impl(lambda _, **kwargs: None))
-    specialize_impl = specialize_impl_cache[0]
-    return specialize_impl(arg, specialize_value=specialize)[0]
+    is_const = False
+    align = True
+    return native_specialize_impl(BaseBackend, arg, is_const, specialize, align)[0]
 
 
 class KernelInterface(Generic[T]):
@@ -452,7 +454,7 @@ def create_function_from_signature(sig, kparams, backend):
             is_const = 'True' if kp.is_const else 'False'
             specialize = 'False' if kp.do_not_specialize else 'True'
             align = 'False' if kp.do_not_specialize_on_alignment else 'True'
-            ret = f"specialize_impl({name}, {is_const}, {specialize}, {align})"
+            ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
             if kp.annotation_type:
                 if isinstance(kp.annotation_type, str):
                     if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
@@ -468,13 +470,13 @@ def create_function_from_signature(sig, kparams, backend):
 
     # compute argument string for a given parameter
     arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
-    # Join all arguments into a function definition string
     func_body = f"""
 def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options"])}):
     params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
     specialization = [{','.join(specialization)}]
     return params, specialization, options
 """
+
     # Prepare defaults to be inserted into function namespace
     func_namespace = {
         f"default_{name}": param.default
@@ -482,8 +484,10 @@ def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options
         if param.default is not inspect.Parameter.empty
     }
 
+    specialize_impl = native_specialize_impl
+    func_namespace["specialize_impl"] = specialize_impl
+    func_namespace["backend"] = backend
     func_namespace["JITCallable"] = JITCallable
-    func_namespace["specialize_impl"] = create_specialize_impl(backend.get_arg_specialization)
 
     # Execute the function string in func_namespace to create the function
     exec(func_body, func_namespace)
