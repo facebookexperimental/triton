@@ -234,16 +234,18 @@ LogicalResult LayoutForwardPropagation::visitOperation(
 
     // Slice operandLayoutEncoding
     if (auto sliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
-      auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
-      auto dstEncoding =
-          dyn_cast<ttng::TensorMemoryEncodingAttr>(dstTy.getEncoding());
-      auto encoding = cast<ttng::TensorMemoryEncodingAttr>(
-          operandLayoutEncoding.getLayoutEncoding());
-      auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
-          op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
-          encoding.getUnpacked(), encoding.getCTASplitM(),
-          encoding.getCTASplitN());
-      operandLayoutEncoding = LayoutEncoding(newEncoding);
+      if (!operandLayoutEncoding.isUninitialized()) {
+        auto dstTy = cast<ttg::MemDescType>(sliceOp.getType());
+        auto dstEncoding =
+            dyn_cast<ttng::TensorMemoryEncodingAttr>(dstTy.getEncoding());
+        auto encoding = dyn_cast<ttng::TensorMemoryEncodingAttr>(
+            operandLayoutEncoding.getLayoutEncoding());
+        auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
+            op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
+            encoding.getUnpacked(), encoding.getCTASplitM(),
+            encoding.getCTASplitN());
+        operandLayoutEncoding = LayoutEncoding(newEncoding);
+      }
     }
 
     for (auto resultLattice : results) {
