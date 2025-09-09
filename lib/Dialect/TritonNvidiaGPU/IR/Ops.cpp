@@ -24,6 +24,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
+#include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -99,6 +100,16 @@ LogicalResult WarpGroupDotOp::verify() {
     return emitOpError("Cannot use F32 as the accumulator element type when "
                        "the max_num_imprecise_acc is less than 32");
   }
+
+  if (auto aTensorTy = dyn_cast<RankedTensorType>(getA().getType())) {
+    auto aDotOpEnc = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
+    unsigned kWidth = 32 / aTensorTy.getElementTypeBitWidth();
+    if (aDotOpEnc.getKWidth() != kWidth) {
+      return emitOpError("in-register LHS operand must have a kWidth of ")
+             << kWidth << " but got " << aDotOpEnc.getKWidth();
+    }
+  }
+
   return success();
 }
 
