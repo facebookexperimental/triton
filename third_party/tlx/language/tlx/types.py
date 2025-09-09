@@ -329,9 +329,9 @@ class clc_response(tl.base_value):
     Define a CLC response object
     """
 
-    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic = None):
         self.handle = handle
-        self.type = clc_response_type(num, layout)
+        self.type = clc_response_type(num, layout, semantic)
         self.num = num
 
     def _flatten_ir(self, handles) -> None:
@@ -350,14 +350,15 @@ class clc_response_type(buffered_tensor_type):
     # since we have two concrete use cases now (mbarrier and clc_response)
     # both of which are opaque objects with fixed size
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
-        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic):
+        super().__init__(tl.int64, [1], num, storage_kind.smem, layout, semantic)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
         value = mbarrier(handles[cursor], self.num, self.layout)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
+        builder=semantic.builder
         if self.num >= 1:
             shape = [self.num]
         else:

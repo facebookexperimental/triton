@@ -1694,4 +1694,3 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     # assert "dense<0.0" in found[0] and "dense<1.0" in found[1], "Expected 0.0 and 1.0 as replica_id"
 
     torch.testing.assert_close(output, x+y, check_dtype=False)
->>>>>>> c9d76ee71 (wip)
