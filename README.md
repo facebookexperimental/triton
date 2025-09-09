@@ -2,7 +2,16 @@
 
 ## Introduction
 
+<<<<<<< HEAD
 TLX (Triton Low-level Language Extensions) is a low-level, warp-aware, hardware-near extension of the Triton DSL. It offers intrinsics and warp-specialized operations for fine-grained GPU control, hardware-oriented primitives for advanced kernel development, and explicit constructs for GPU memory, computation, and asynchronous control flow. TLX is designed for expert users pushing Triton closer to the metal.
+=======
+# Conference Registration
+
+The 3rd Triton conference is scheduled to take place on October 21, 2025. Click [here](https://tritonconference.eventbuilder.com/TritonDeveloperConference) to register!
+
+
+# Triton
+>>>>>>> 01d3c87a7 ([README] added conference registration link (#8114))
 
 Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:
 
