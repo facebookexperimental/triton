@@ -24,7 +24,8 @@ def alloc_clc_responses(
             num_responses.value,
             layout_handle),
         num_responses,
-        layout)
+        layout,
+        _semantic)
 
 
 @tl.builtin
