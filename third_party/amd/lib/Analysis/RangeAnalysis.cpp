@@ -384,6 +384,177 @@ TritonIntegerRangeAnalysis::maybeGetTripCount(LoopLikeOpInterface loop) {
   return {};
 }
 
+<<<<<<< HEAD
+=======
+namespace {
+
+constexpr int64_t kDefaultMaxTripCount = 1024;
+constexpr uint64_t kDefaultMaxPrograms = 1L << 31; // 2147483648
+
+void getEnclosingLoops(Operation &op, SmallVector<LoopLikeOpInterface> &ops) {
+  Operation *currOp = op.getParentOp();
+  while (currOp) {
+    if (isa<LoopLikeOpInterface>(currOp))
+      ops.push_back(llvm::cast<LoopLikeOpInterface>(currOp));
+    currOp = currOp->getParentOp();
+  }
+}
+
+void inferResultRangesPID(Operation *op, uint64_t max,
+                          SetIntRangeFn setResultRange) {
+  assert(op->getNumResults() == 1 && "expected op to have one result");
+  auto result = op->getResult(0);
+  assert(llvm::isa<IntegerType>(result.getType()) &&
+         "expected result type to be int");
+  IntegerType resTy = llvm::cast<IntegerType>(result.getType());
+  auto bitWidth = mlir::ConstantIntRanges::getStorageBitwidth(resTy);
+  setResultRange(result, ConstantIntRanges::range(
+                             /*min*/ {/*numBits*/ bitWidth, /*val*/ 0,
+                                      /*isSigned*/ resTy.isSigned()},
+                             /*max*/
+                             {/*numBits*/ bitWidth, /*val*/ max,
+                              /*isSigned*/ resTy.isSigned()},
+                             /*isSigned*/ resTy.isSigned()));
+}
+
+void inferResultRanges(tt::MakeRangeOp *op, SetIntRangeFn setResultRange) {
+  auto result = op->getResult();
+  RankedTensorType resTy = result.getType();
+  assert(llvm::isa<IntegerType>(resTy.getElementType()) && "expected int type");
+  IntegerType elTy = llvm::cast<IntegerType>(resTy.getElementType());
+  auto bitWidth = mlir::ConstantIntRanges::getStorageBitwidth(elTy);
+  setResultRange(result,
+                 ConstantIntRanges::range(
+                     /*min*/ {/*numBits*/ bitWidth, /*val*/ op->getStart(),
+                              /*isSigned*/ elTy.isSigned()},
+                     /*max*/
+                     {/*numBits*/ bitWidth, /*val*/ op->getEnd(),
+                      /*isSigned*/ elTy.isSigned()},
+                     /*isSigned*/ elTy.isSigned()));
+}
+
+void inferResultRanges(tt::GatherOp *op, ArrayRef<ConstantIntRanges> argRanges,
+                       SetIntRangeFn setResultRange) {
+  assert(argRanges.size() == 2 && "expected two arg ranges");
+  setResultRange(op->getResult(), argRanges[0]);
+}
+
+void inferResultRangesUnaryOpForwardArgRange(
+    Operation *op, ArrayRef<ConstantIntRanges> argRanges,
+    SetIntRangeFn setResultRange) {
+  for (const auto &result : op->getResults())
+    setResultRange(result, argRanges[0]);
+}
+
+void inferResultRangesBinaryOpUnionArgRanges(
+    Operation *op, ArrayRef<ConstantIntRanges> argRanges,
+    SetIntRangeFn setResultRange) {
+  assert(op->getNumOperands() == 2 && "expected op to have two operands");
+  assert(argRanges.size() == 2 && "expected two arg ranges");
+  for (const auto &result : op->getResults())
+    setResultRange(result, argRanges[0].rangeUnion(argRanges[1]));
+}
+
+void inferResultRangesMaxNonNegSigned(Operation *op,
+                                      SetIntRangeFn setResultRange) {
+  for (auto result : op->getResults()) {
+    auto bitWidth =
+        mlir::ConstantIntRanges::getStorageBitwidth(result.getType());
+    setResultRange(result, ConstantIntRanges::fromSigned(
+                               APInt::getZero(bitWidth).sext(bitWidth),
+                               APInt::getMaxValue(bitWidth).sext(bitWidth)));
+  }
+}
+
+std::optional<ConstantIntRanges> maybeGetAssumedRange(Operation *assumption,
+                                                      Value anchor) {
+  arith::CmpIOp cmpOp = llvm::dyn_cast<arith::CmpIOp>(assumption);
+  if (!cmpOp) {
+    emitRemark(assumption->getLoc(), "unsupported assumption operation");
+    return {};
+  }
+
+  bool isSigned = true;
+  switch (cmpOp.getPredicate()) {
+  case arith::CmpIPredicate::uge:
+  case arith::CmpIPredicate::ugt:
+  case arith::CmpIPredicate::ule:
+  case arith::CmpIPredicate::ult:
+    isSigned = false;
+  default:
+    break;
+  }
+
+  bool anchorIsLhs = cmpOp.getLhs() == anchor;
+  auto maybeConstantIntValue = getConstantIntValue(
+      getAsOpFoldResult(anchorIsLhs ? cmpOp.getRhs() : cmpOp.getLhs()));
+  if (auto constValue = maybeConstantIntValue) {
+    unsigned bitWidth = ConstantIntRanges::getStorageBitwidth(anchor.getType());
+    assert(bitWidth > 0 && "expected non-zero bitwdith");
+    APInt apVal = {bitWidth, static_cast<uint64_t>(*constValue), isSigned};
+    APInt min, max;
+    if (isSigned) {
+      min = APInt::getSignedMinValue(bitWidth);
+      if (llvm::isa_and_nonnull<mlir::triton::GetProgramIdOp,
+                                mlir::triton::GetNumProgramsOp>(
+              anchor.getDefiningOp())) {
+        min = APInt::getZero(bitWidth);
+      } else
+        min = APInt::getSignedMinValue(bitWidth);
+      max = APInt::getSignedMaxValue(bitWidth);
+    } else {
+      min = APInt::getMinValue(bitWidth);
+      max = APInt::getMaxValue(bitWidth);
+    }
+
+    switch (cmpOp.getPredicate()) {
+    case arith::CmpIPredicate::eq:
+      return mlir::ConstantIntRanges::constant(apVal);
+    case arith::CmpIPredicate::uge:
+    case arith::CmpIPredicate::sge: {
+      // K >= apVal implies K ∈ [apVal, max]
+      if (anchorIsLhs)
+        return mlir::ConstantIntRanges::range(apVal, max, isSigned);
+      // apVal >= K implies K ∈ [min, apVal]
+      return mlir::ConstantIntRanges::range(min, apVal, isSigned);
+    }
+    case arith::CmpIPredicate::ugt:
+    case arith::CmpIPredicate::sgt: {
+      // K > apVal implies K >= apVal + 1 implies K ∈ [apVal + 1, max]
+      if (anchorIsLhs)
+        return mlir::ConstantIntRanges::range(apVal + 1, max, isSigned);
+      // apVal > K implies apVal - 1 >= K implies K ∈ [min, apVal - 1]
+      return mlir::ConstantIntRanges::range(min, apVal - 1, isSigned);
+    }
+    case arith::CmpIPredicate::ule:
+    case arith::CmpIPredicate::sle: {
+      // K <= apVal implies K ∈ [min, apVal]
+      if (anchorIsLhs)
+        return mlir::ConstantIntRanges::range(min, apVal, isSigned);
+      // apVal <= K implies K ∈ [apVal, max]
+      return mlir::ConstantIntRanges::range(apVal, max, isSigned);
+    }
+    case arith::CmpIPredicate::ult:
+    case arith::CmpIPredicate::slt: {
+      // K < apVal implies K <= apVal -1 implies K ∈ [min, apVal - 1]
+      if (anchorIsLhs)
+        return mlir::ConstantIntRanges::range(min, apVal - 1, isSigned);
+      // apVal < K implies apVal + 1 <= K implies K ∈ [apVal + 1, max]
+      return mlir::ConstantIntRanges::range(apVal + 1, max, isSigned);
+    }
+    default:
+      emitRemark(cmpOp.getLoc(), "unsupported cmp predicate for assumption");
+      return {};
+    }
+  }
+  return {};
+}
+
+} // namespace
+
+namespace mlir::triton::AMD {
+
+>>>>>>> e1380d750 ([AMD] Fix program id/count range in RangeAnalysis (#8103))
 bool isEmptyInitializedRange(ConstantIntRanges rv) {
   if (!rv.umin().getBitWidth() || !rv.umax().getBitWidth() ||
       !rv.smin().getBitWidth() || !rv.smax().getBitWidth())
@@ -438,7 +609,24 @@ TritonIntegerRangeAnalysis::maybeGetAssumedRange(Value anchor,
   if (matchingAssumptions.empty())
     return {};
 
+<<<<<<< HEAD
   return ::maybeGetAssumedRange(matchingAssumptions, anchor, useBlock, domInfo);
+=======
+  unsigned bitWidth = ConstantIntRanges::getStorageBitwidth(anchor.getType());
+  assert(bitWidth > 0 && "expected non-zero bitwidth");
+  ConstantIntRanges constIntRange = ConstantIntRanges::maxRange(bitWidth);
+  if (llvm::isa_and_nonnull<GetProgramIdOp>(anchor.getDefiningOp())) {
+    constIntRange = ConstantIntRanges::range(
+        APInt::getZero(bitWidth),
+        APInt(bitWidth, kDefaultMaxPrograms - 1, true), true);
+  }
+
+  for (auto assumption : matchingAssumptions) {
+    if (auto constIntRange_ = ::maybeGetAssumedRange(assumption, anchor))
+      constIntRange = constIntRange.intersection(*constIntRange_);
+  }
+  return constIntRange;
+>>>>>>> e1380d750 ([AMD] Fix program id/count range in RangeAnalysis (#8103))
 }
 
 int64_t
