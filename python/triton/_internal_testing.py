@@ -7,7 +7,6 @@ import triton.language as tl
 from triton import knobs
 from typing import Optional, Set, Union
 import pytest
-import traceback
 
 from numpy.random import RandomState
 from triton.runtime.jit import TensorWrapper, reinterpret, type_canonicalisation_dict
