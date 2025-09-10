@@ -418,6 +418,73 @@ InThreadTransposeOp::deduceOutputLayout(ArrayRef<int64_t> shape,
   return transposedLL;
 }
 
+<<<<<<< HEAD
+=======
+LogicalResult ScaledUpcastFp4Op::verify() {
+  RankedTensorType inputTy = getInput().getType();
+  RankedTensorType outputTy = getOutput().getType();
+  RankedTensorType scaleTy = getScale().getType();
+  auto axis = getAxis();
+
+  if (outputTy.getShape() != scaleTy.getShape())
+    return emitError() << "scale and output should have the same shape";
+
+  // Reuse Fp4ToFpOp's verifier to check types of input and output
+  return triton::gpu::Fp4ToFpOp::verifyFp4ToFp(*this, inputTy, outputTy, axis);
+}
+
+Attribute ScaledUpcastFp4Op::inferDstEncoding(unsigned opIdx,
+                                              Attribute srcEnc) {
+  // The layout of scale is the same as that of the result
+  if (opIdx == 1)
+    return srcEnc;
+  Attribute dstEnc;
+  auto shape = getInput().getType().getShape();
+
+  auto iface =
+      srcEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  // Given the fp4 operand is packed, we can reuse the infer utility of
+  // Fp4ToFpOp
+  auto result =
+      iface->inferFp4ToFpOpEncoding(shape, getAxis(), srcEnc, dstEnc,
+                                    /*fwdInference*/ true, std::nullopt);
+  assert(succeeded(result));
+  return dstEnc;
+}
+
+Attribute ScaledUpcastFp4Op::inferSrcEncoding(unsigned opIdx,
+                                              Attribute dstEnc) {
+  // The layout of scale is the same as that of the result
+  if (opIdx == 1)
+    return dstEnc;
+  Attribute srcEnc;
+  auto shape = getInput().getType().getShape();
+
+  auto iface =
+      dstEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  // Given the fp4 operand is packed, we can reuse the infer utility of
+  // Fp4ToFpOp
+  if (succeeded(iface->inferFp4ToFpOpEncoding(shape, getAxis(), dstEnc, srcEnc,
+                                              /*fwdInference*/ false,
+                                              std::nullopt))) {
+    return srcEnc;
+  }
+  return {};
+}
+
+Attribute ScaledUpcastFp8Op::inferDstEncoding(unsigned opIdx,
+                                              Attribute srcEnc) {
+  return srcEnc;
+}
+
+Attribute ScaledUpcastFp8Op::inferSrcEncoding(unsigned opIdx,
+                                              Attribute dstEnc) {
+  return dstEnc;
+}
+
+>>>>>>> 85e99d639 ([AMD] Enable f16 * mxfp scaled dot decomposition for gfx950 (#7839))
 LogicalResult ConcatOp::verify() {
   auto sources = getSources();
   auto result = getResult();
