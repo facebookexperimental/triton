@@ -15,6 +15,11 @@ enum class ISAFamily {
   RDNA1,
   RDNA2,
   RDNA3,
+<<<<<<< HEAD
+=======
+  RDNA4,
+  GFX1250,
+>>>>>>> 5f4319469 ([AMD] Add gfx1250 skeleton (#8131))
 };
 
 // Deduces the corresponding ISA family for the given target gfx |arch|.
