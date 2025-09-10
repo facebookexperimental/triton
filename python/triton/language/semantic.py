@@ -1012,8 +1012,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Build IR
         return tl.tensor(
-            self.builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile), dst_ty)
-
+            self.builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile),
+            dst_ty)
 
     def _prepare_legacy_load(self, ptr, mask, other, boundary_check, padding):
         # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
@@ -1074,8 +1074,8 @@ class TritonSemantic(Generic[TensorTy]):
             ret = tl.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
         else:
             ret = tl.tensor(
-                self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache, eviction,
-                                           is_volatile), dst_ty)
+                self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache,
+                                                eviction, is_volatile), dst_ty)
         if ptr.type.scalar == tl.int1:
             ret = cast(ret, tl.int1)
         return ret
@@ -1476,9 +1476,8 @@ class TritonSemantic(Generic[TensorTy]):
         return getattr(ir.INPUT_PRECISION, input_precision)
 
     # def dot(self, lhs: TensorTy, rhs: TensorTy, acc: TensorTy, input_precision: Optional[str],
-     #        max_num_imprecise_acc: int, out_dtype: tl.dtype) -> TensorTy:
-      #   assert lhs.type.is_block() and rhs.type.is_block()
-
+    #        max_num_imprecise_acc: int, out_dtype: tl.dtype) -> TensorTy:
+    #   assert lhs.type.is_block() and rhs.type.is_block()
 
     def dot_precheck(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
                      max_num_imprecise_acc: int, out_dtype: tl.dtype) -> Tuple[Any]:
@@ -1488,8 +1487,9 @@ class TritonSemantic(Generic[TensorTy]):
             allow_tf32) is None, "Only one of input_precision and allow_tf32 can be specified"
         if input_precision is None:
             supports_tf32 = "tf32" in self.builder.options.allowed_dot_input_precisions
-            input_precision = knobs.language.fp32_default or ("tf32" if (supports_tf32 and
-                                                                         (allow_tf32 or allow_tf32 is None)) else "ieee")
+            input_precision = knobs.language.fp32_default or ("tf32" if
+                                                              (supports_tf32 and
+                                                               (allow_tf32 or allow_tf32 is None)) else "ieee")
 
         input_precision = tl._unwrap_if_constexpr(input_precision)
         out_dtype = tl._unwrap_if_constexpr(out_dtype)
@@ -1542,7 +1542,8 @@ class TritonSemantic(Generic[TensorTy]):
             rhs.shape[-2]
         ), f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
 
-        assert self.builder.codegen_fns.get("min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
+        assert self.builder.codegen_fns.get(
+            "min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
         min_dot_size = self.builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
         assert tl._unwrap_if_constexpr(lhs.shape[-2]) >= min_dot_size[0] and tl._unwrap_if_constexpr(lhs.shape[-1]) >= min_dot_size[2] \
             and tl._unwrap_if_constexpr(rhs.shape[-1]) >= min_dot_size[1], \
@@ -1553,7 +1554,8 @@ class TritonSemantic(Generic[TensorTy]):
             ret_scalar_ty = tl.int32
         elif out_dtype.is_bf16():
             raise ValueError(
-                "out_dtype=bfloat16 is unsupported. Please use out_dtype=float32/float16 and cast with `.to(tl.bfloat16)`")
+                "out_dtype=bfloat16 is unsupported. Please use out_dtype=float32/float16 and cast with `.to(tl.bfloat16)`"
+            )
         elif lhs.type.scalar.is_fp32() or lhs.type.scalar.is_bf16():
             _0 = self.builder.get_fp32(0)
             ret_scalar_ty = tl.float32
@@ -1587,18 +1589,19 @@ class TritonSemantic(Generic[TensorTy]):
                 raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
         return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
-    def dot(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32, max_num_imprecise_acc: int,
-            out_dtype: tl.dtype) -> tl.tensor:
+    def dot(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
+            max_num_imprecise_acc: int, out_dtype: tl.dtype) -> tl.tensor:
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
          ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
 
-        return tl.tensor(self.builder.create_dot(
-            lhs.handle,
-            rhs.handle,
-            acc_handle,
-            input_precision,
-            max_num_imprecise_acc,
-        ), ret_ty)
+        return tl.tensor(
+            self.builder.create_dot(
+                lhs.handle,
+                rhs.handle,
+                acc_handle,
+                input_precision,
+                max_num_imprecise_acc,
+            ), ret_ty)
 
     def _str_to_fp_type(self, float_format: str):
         ty_enum = getattr(ir.ScaleDotElemTypeTY, float_format.upper(), None)
