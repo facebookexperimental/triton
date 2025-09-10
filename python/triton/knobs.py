@@ -365,7 +365,6 @@ class compilation_knobs(base_knobs):
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
     allow_non_constexpr_globals: env_bool = env_bool("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS")
     enable_experimental_consan: env_bool = env_bool("TRITON_ENABLE_EXPERIMENTAL_CONSAN")
-    fb_ast_expose_full_exceptions: env_bool = env_bool("FBTRITON_AST_EXPOSE_FULL_EXCEPTIONS") # Facebook-only
     listener: Union[CompilationListener, None] = None
 
 

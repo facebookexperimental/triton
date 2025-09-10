@@ -1064,11 +1064,11 @@ class TritonSemantic(Generic[TensorTy]):
         else:
             # Load by de-referencing the pointer of scalar
             dst_ty = elt_ty
-        return dst_ty, mask, other
+        return dst_ty, ptr, mask, other
 
     def _load_legacy(self, ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile):
         # pre-check
-        dst_ty, mask, other = self._prepare_legacy_load(ptr, mask, other, boundary_check, padding)
+        dst_ty, ptr, mask, other = self._prepare_legacy_load(ptr, mask, other, boundary_check, padding)
         # Build IR
         if mask is None:
             ret = tl.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
@@ -1077,7 +1077,7 @@ class TritonSemantic(Generic[TensorTy]):
                 self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache,
                                                 eviction, is_volatile), dst_ty)
         if ptr.type.scalar == tl.int1:
-            ret = cast(ret, tl.int1)
+            ret = self.cast(ret, tl.int1)
         return ret
 
     def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,

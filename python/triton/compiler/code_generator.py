@@ -1536,12 +1536,10 @@ class CodeGenerator(ast.NodeVisitor):
                 raise
             except Exception as e:
                 if knobs.compilation.front_end_debugging:
-                    raise
-                # Wrap the error in a CompilationError which contains the source
-                # of the @jit function.
-                if knobs.compilation.fb_ast_expose_full_exceptions:
                     raise CompilationError(self.jit_fn.src, self.cur_node, None) from e
                 else:
+                # Wrap the error in a CompilationError which contains the source
+                # of the @jit function.
                     raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
 
             # Reset the location to the last one before the visit
