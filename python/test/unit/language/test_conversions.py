@@ -4,11 +4,10 @@
 import numpy as np
 import torch
 import pytest
-import re
 import triton
 import triton.language as tl
 
-from triton._internal_testing import is_cuda, is_hip, is_hip_cdna2, is_hip_cdna3, is_hip_cdna4, is_hip_gfx12, format_exception
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna2, is_hip_cdna3, is_hip_cdna4, is_hip_gfx12
 
 
 def matching_int(dtype):
@@ -280,18 +279,16 @@ def test_typeconvert_upcast(src_dtype, dst_dtype, device):
         if ((src_dtype == 'float8e4nv' and torch.cuda.get_device_capability(0) < (8, 9))
             or src_dtype in ('float8e4b8', 'float8e5b16')):
             # If the dtype should error out in the given device, we assert that and return
-            with pytest.raises(triton.CompilationError) as e:
+            with pytest.raises(triton.CompilationError, match="not supported in this architecture"):
                 launch_exhaustive_populate(getattr(tl, src_dtype), 0, 65536, False, 8, 0x7f, device=device)
-            assert re.search(r'not supported in this architecture', format_exception(e), flags=re.DOTALL)
             return
     elif is_hip():
         if  (src_dtype == 'float8e4nv' and not (is_hip_cdna3() or is_hip_cdna4())):
             pytest.skip(f"upcasting {src_dtype} to {dst_dtype} not supported in this architecture")
         if  src_dtype == 'float8e4b15':
             # If the dtype should error out in the given device, we assert that and return
-            with pytest.raises(triton.CompilationError) as e:
+            with pytest.raises(triton.CompilationError, match="not supported in this architecture"):
                 launch_exhaustive_populate(getattr(tl, src_dtype), 0, 65536, False, 8, 0x7f, device=device)
-            assert re.search(r'not supported in this architecture', format_exception(e), flags=re.DOTALL)
             return
         if src_dtype in ('float8e4b8', 'float8e5b16') and (is_hip_cdna2() or is_hip_gfx12()):
             pytest.skip(f"{src_dtype} is not supported on AMDGPU CDNA2 and RDNA4")
