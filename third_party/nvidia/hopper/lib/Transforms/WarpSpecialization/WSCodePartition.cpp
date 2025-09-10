@@ -151,6 +151,11 @@ static void createChannel(Operation *producerOp, Operation *op,
                 producerTaskId, consumerTaskIds, tmemAllocOp, dotOp, userOp,
                 user.second, NUM_TMEM_BUFFERS, channels.size()));
           }
+          if (auto tAllocOp = dyn_cast<ttg::LocalAllocOp>(producerOp)) {
+            channels.push_back(std::make_unique<Channel>(
+                producerTaskId, consumerTaskIds, userOp, user.second,
+                producerNumBuffers, channels.size()));
+          }
         } else {
           channels.push_back(std::make_unique<Channel>(
               producerTaskId, consumerTaskIds, userOp, user.second,
@@ -159,6 +164,22 @@ static void createChannel(Operation *producerOp, Operation *op,
       }
     }
   }
+}
+
+// Can be one end of the channel.
+static bool isChannelAnchorOp(Operation *op) {
+  if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
+      isa<mlir::triton::DotOpInterface>(op))
+    return true;
+  // Any computation tensor op?
+  if (dyn_cast<arith::ConstantOp>(op) || dyn_cast<scf::IfOp>(op) ||
+      dyn_cast<scf::ForOp>(op))
+    return false;
+  for (auto result : op->getResults()) {
+    if (auto tensorType = dyn_cast<RankedTensorType>(result.getType()))
+      return true;
+  }
+  return false;
 }
 
 // Loads will be in producer warp groups. For now, we only allow a single
@@ -170,8 +191,7 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
-    if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
-        isa<mlir::triton::DotOpInterface>(op)) {
+    if (isChannelAnchorOp(op)) {
       auto producerTaskIds = getAsyncTaskIds(op);
       if (producerTaskIds.empty() || producerTaskIds.size() > 1) {
         LLVM_DEBUG({
@@ -199,7 +219,11 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
         if (isa<ttng::TMEMAllocOp>(producerOp))
           createChannel(producerOp, op, dom, channels, true /*opndA*/,
                         producerNumBuffers);
+        if (isa<ttg::LocalAllocOp>(producerOp))
+          createChannel(producerOp, op, dom, channels, true /*opndA*/,
+                        producerNumBuffers);
       } else {
+        // If the consumer is in a different task, create a channel.
         createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
       }
     }
@@ -673,6 +697,7 @@ void createToken(
       if (!isa<tt::DescriptorLoadOp>(producerOp) ||
           !useGen5Barrier) { // isa<ttng::TCGen5MMAOp>(consumerOp)) {
         ttnvws::TokenLoadType tokenLoadType;
+        assert(copyOpMap.count(channel));
         auto copyOp = copyOpMap.find(channel)->second.first;
         if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
@@ -734,6 +759,23 @@ void createToken(
                      << "\n";
     }
   });
+}
+
+static ttg::LocalAllocOp hoistLocalAlloc(OpBuilder &builder,
+                                         ttg::LocalAllocOp oldAlloc,
+                                         int numBuffers) {
+  auto oldRetType = oldAlloc.getType();
+  auto allocDescType = cast<triton::gpu::MemDescType>(oldRetType);
+  SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
+                                oldRetType.getShape().end()};
+  if (numBuffers >= 1) {
+    shape.insert(shape.begin(), numBuffers);
+  }
+
+  Type memdescType = ttg::MemDescType::get(
+      shape, allocDescType.getElementType(), allocDescType.getEncoding(),
+      allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
+  return builder.create<ttg::LocalAllocOp>(oldAlloc.getLoc(), memdescType);
 }
 
 static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
@@ -800,6 +842,9 @@ DenseMap<Channel *, Value> createBuffer(
           static_cast<ttng::TmemDataChannel *>(channel);
       auto oldTMemAllocOp = tmemChannel->getAllocOp();
       buffer = createTMemAlloc(builder, oldTMemAllocOp, numBuffers);
+    } else if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
+      // Move LocalAlloc to the beginning of the function.
+      buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       // Get basic information from tensorType

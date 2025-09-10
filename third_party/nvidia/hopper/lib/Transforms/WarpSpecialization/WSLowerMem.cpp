@@ -93,6 +93,9 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
 
 // Create a local copy for a channel that is populated by the producer and
 // accessed by the consumer.
+// For the case where the value shared in (producer, consumer) is in tensor.
+// Global buffer for the channel is already created and passed in bufferMap.
+// This function creates LocalLoad at consumer and LocalStore at producer.
 static std::pair<Operation *, Operation *>
 createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
                 Value srcBufferIdx, Value dstBufferIdx) {
@@ -161,6 +164,47 @@ static Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
       /*allocShape=*/allocDescType.getAllocShape());
   return builder.create<triton::gpu::MemDescIndexOp>(alloc.getLoc(),
                                                      viewDescType, alloc, idx);
+}
+
+// For the case where the value shared in (producer, consumer) is in smem.
+static std::pair<Operation *, Operation *>
+createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
+               Value srcBufferIdx, Value dstBufferIdx) {
+  Operation *srcOp = channel->getSrcOp();
+  Operation *dstOp = channel->getDstOp();
+  auto buffer = bufferMap.find(channel)->second;
+  Value srcValue = channel->getSrcOperand();
+  auto memDesc = cast<triton::gpu::MemDescType>(srcValue.getType());
+
+  // Replace original smem alloc with smem_store.
+  auto oldAllocOp = cast<ttg::LocalAllocOp>(srcOp);
+  auto newAllocOp = cast<ttg::LocalAllocOp>(buffer.getDefiningOp());
+  OpBuilderWithAsyncTaskIds builder(oldAllocOp);
+  builder.setInsertionPointAfter(oldAllocOp);
+
+  assert(oldAllocOp.getSrc());
+  auto *actualSrc = oldAllocOp.getSrc().getDefiningOp();
+
+  SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(actualSrc);
+  for (auto *user : oldAllocOp->getUsers()) {
+    for (auto task : getAsyncTaskIds(user))
+      if (!llvm::is_contained(asyncTasksSubView, task))
+        asyncTasksSubView.push_back(task);
+  }
+  builder.setAsynTaskIdsFromArray(asyncTasksSubView);
+  // Will be used by both produer and consumer.
+  auto srcView = createBufferView(builder, newAllocOp, srcBufferIdx);
+
+  builder.setAsyncTaskIdsFromOp(actualSrc);
+  auto smemStoreOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+      oldAllocOp.getLoc(), oldAllocOp.getSrc(), srcView);
+
+  // Consumer will be updated.
+  oldAllocOp->getResult(0).replaceAllUsesWith(srcView);
+  oldAllocOp.erase();
+  // DstOp is the same, srcOp will be auto-adjusted to be the defining op of
+  // srcOpnd.
+  return {smemStoreOp, channel->getDstOp()};
 }
 
 static std::pair<Operation *, Operation *>
@@ -438,6 +482,9 @@ void insertAsyncCopy(
     } else if (domininatingChannel->channelKind == DataChannelKind::TMEM) {
       producerConsumerOps =
           createTMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
+    } else if (isa<ttg::LocalAllocOp>(srcOp)) {
+      producerConsumerOps =
+          createSMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
     } else {
       assert(!isa<ttg::LocalLoadOp>(srcOp) &&
              "LocalLoadOp buffer should be reused");
