@@ -1008,7 +1008,7 @@ class TritonSemantic(Generic[TensorTy]):
         dst_ty = ptr.type.element_ty
 
         # Check `boundary_check` argument
-        boundary_check = _canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())
+        boundary_check = self._canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())
 
         # Build IR
         return tl.tensor(
