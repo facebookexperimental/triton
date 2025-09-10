@@ -163,6 +163,82 @@ static Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                                                      viewDescType, alloc, idx);
 }
 
+static std::pair<Operation *, Operation *>
+createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
+               Value srcBufferIdx, Value dstBufferIdx) {
+  // Replace original tmem alloc with tmem_store.
+  ttng::TmemDataChannel *tmemChannel =
+      static_cast<ttng::TmemDataChannel *>(channel);
+  auto oldTMemAllocOp = cast<ttng::TMEMAllocOp>(tmemChannel->getAllocOp());
+  auto newTMemAllocOp =
+      cast<ttng::TMEMAllocOp>(bufferMap.find(channel)->second.getDefiningOp());
+  OpBuilderWithAsyncTaskIds builder(oldTMemAllocOp);
+  builder.setInsertionPointAfter(oldTMemAllocOp);
+
+  // A tmemChannel is usually centered around a gen5 dotOp. There are two
+  // cases, one is that the channel is for the accumulator, the other is
+  // the channel is for operand A of the gen5.
+  // Here we replace tmem_alloc with tmem_store when applicable and create a
+  // subView that is used by tmem_store and also all users of tmem_alloc.
+  // Calculate the taskIds for the subView, and tmem_store.
+  // tmemStore's taskId can be the mmaOp's taskId if alloc.getSrc is available
+  // for mmaOp's taskId, otherwise, it should happen in alloc.getsrc.
+  Operation *opForStoreTask = tmemChannel->getMmaOp();
+  if (oldTMemAllocOp.getSrc()) {
+    auto taskIds = getAsyncTaskIds(opForStoreTask);
+    assert(taskIds.size() == 1);
+    // Check to see if alloc.getSrc is available for mmaOp's taskId.
+    auto *srcOp = oldTMemAllocOp.getSrc().getDefiningOp();
+    if (!hasAsyncTaskId(srcOp, taskIds[0]))
+      opForStoreTask = oldTMemAllocOp.getSrc().getDefiningOp();
+  }
+  // TaskIds for subView should be the union of tmem_store and all users of
+  // tmem_alloc.
+  SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(opForStoreTask);
+  for (auto *user : oldTMemAllocOp->getUsers()) {
+    for (auto task : getAsyncTaskIds(user))
+      if (!llvm::is_contained(asyncTasksSubView, task))
+        asyncTasksSubView.push_back(task);
+  }
+  builder.setAsynTaskIdsFromArray(asyncTasksSubView);
+
+  auto srcView = createBufferView(builder, newTMemAllocOp, srcBufferIdx);
+  LLVM_DEBUG({
+    LDBG("createTMEMCopy: srcView ");
+    srcView.dump();
+  });
+
+  if (oldTMemAllocOp.getSrc()) {
+    builder.setAsyncTaskIdsFromOp(opForStoreTask);
+    Value vTrue = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        oldTMemAllocOp.getLoc(), 1, 1);
+    // Promote TMEMAlloc to start, create TMEMStore.
+    // auto tokType = builder.getType<AsyncTokenType>();
+    // tokType, srcView, oldTMemAllocOp.getToken()
+    // We used to have token from Alloc, then to other users.
+    // FIXME: Type(), srcView, Value(),
+    // OAI's warpspec does the above.
+    auto tmemStoreOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
+        oldTMemAllocOp.getLoc(), Type(), srcView, Value(),
+        oldTMemAllocOp.getSrc(), vTrue);
+    oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
+    if (oldTMemAllocOp.getToken())
+      oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
+    oldTMemAllocOp.erase();
+    tmemChannel->tmemProducerOp = tmemStoreOp;
+    return {tmemStoreOp, channel->getDstOp()};
+  }
+  // Handle the case where there is no value for tmem_alloc.
+  oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
+  if (oldTMemAllocOp.getToken())
+    oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
+  oldTMemAllocOp.erase();
+  // We need a new srcOp now that tmemAlloc is erased, the new SrcOp will be
+  // the mmaOp.
+  tmemChannel->tmemProducerOp = tmemChannel->getMmaOp();
+  return {tmemChannel->getMmaOp(), channel->getDstOp()};
+}
+
 static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
   auto tensorTy = cast<RankedTensorType>(tmaLoad->getResult(0).getType());
   int loadSize = product(tensorTy.getShape());
@@ -360,7 +436,8 @@ void insertAsyncCopy(
                                             domininatingChannel->getSrcOp(),
                                             asyncTasksPC, bufferIdx, bufferIdx);
     } else if (domininatingChannel->channelKind == DataChannelKind::TMEM) {
-      // TODO: will be added in a separate PR.
+      producerConsumerOps =
+          createTMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
     } else {
       assert(!isa<ttg::LocalLoadOp>(srcOp) &&
              "LocalLoadOp buffer should be reused");
