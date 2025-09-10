@@ -873,13 +873,15 @@ DenseMap<Channel *, Value> createBuffer(
 // Make TCGen5MMAOp fully asynchronous by de-synchronizing it. This leverages
 // its inline barrier to synchronize with both the producer (TMA load) and the
 // consumer (TMEM load). Return the WaitBarrierOp inserted before the consumer
-// (TMEM load).
+// (TMEM load). If the inline barrier is used for A/B operands of gen5,
+// insert WaitBarrier as ProducerAquire; If it is used for D operand, insert
+// WaitBarrier as ConsumerWait.
 ttng::WaitBarrierOp
 desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
                   Value barrierAlloc, Value bufferIdx, Value inPhase,
                   unsigned numBuffers, Operation *producerOrConsumer,
                   DenseSet<Operation *> &regionsWithChannels,
-                  mlir::DominanceInfo &dom, ReuseConfig *config) {
+                  mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
   // Attach the barrier as an operand of the mma op.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
@@ -897,11 +899,15 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   auto producerBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   // curPhase = curPhase xor True for emptyBarrier.
+  Value phase = inPhase;
   auto loc = producerOrConsumer->getLoc();
-  Value _1_1b = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  // Creating phase for producerOrConsumer.
-  Value phase =
-      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase, _1_1b);
+  if (asProducerAcquire) {
+    Value _1_1b =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+    // Creating phase for producerOrConsumer.
+    phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
+                                                                _1_1b);
+  }
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, producerBarrier,
@@ -1184,7 +1190,7 @@ void insertAsyncComm(
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
                           *commChannel.producerBarrier, bufferIdx, phase,
                           masterChannel->numBuffers, headConsumer,
-                          regionsWithChannels, dom, config);
+                          regionsWithChannels, dom, false, config);
       }
     }
     // Channel can have multiple consumers.
@@ -1209,7 +1215,7 @@ void insertAsyncComm(
         auto tmemWaitBarrier =
             desyncTCGen5MMAOp(builder, mmaOp, consumerBarrier, bufferIdx, phase,
                               masterChannel->numBuffers, headProducer,
-                              regionsWithChannels, dom, config);
+                              regionsWithChannels, dom, true, config);
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
@@ -1221,6 +1227,10 @@ void insertAsyncComm(
         builder.setInsertionPoint(producerAcquirePoint);
         builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
             headProducer->getLoc(), token.second, bufferIdx, phase);
+        LLVM_DEBUG({
+          LDBG("Insert ProducerAcquireOp ");
+          producerAcquirePoint->dump();
+        });
       }
 
       if (!commChannel.producerBarrier) {
