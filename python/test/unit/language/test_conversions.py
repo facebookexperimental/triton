@@ -279,17 +279,7 @@ def test_typeconvert_upcast(src_dtype, dst_dtype, device):
         if ((src_dtype == 'float8e4nv' and torch.cuda.get_device_capability(0) < (8, 9))
             or src_dtype in ('float8e4b8', 'float8e5b16')):
             # If the dtype should error out in the given device, we assert that and return
-            # Facebook begin:
-            # TODO.
-            # pytest python/test/unit/language/test_conversions.py::test_typeconvert_upcast[float8e4b8-bfloat16]
-            # fails the original regex match
-            # `with pytest.raises(triton.CompilationError, match="not supported in this architecture"):`
-            # we see ValueError in log as below:
-            # ValueError: type fp8e4b8 not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e4nv', 'fp8e5')
-            # however the final check is done against following error msg:
-            # Input: 'at 1:0:\ndef exhaustive_populate ...'
-            # Facebook end:
-            with pytest.raises(triton.CompilationError):
+            with pytest.raises(triton.CompilationError, match="not supported in this architecture"):
                 launch_exhaustive_populate(getattr(tl, src_dtype), 0, 65536, False, 8, 0x7f, device=device)
             return
     elif is_hip():
