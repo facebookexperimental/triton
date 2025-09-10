@@ -55,9 +55,14 @@ ask() {
 }
 if [ "$(ask)" == "yes" ]; then
     echo "Running core Triton python unit tests"
-    pytest python/test/unit/language/test_conversions.py
-    pytest python/test/unit/language/test_standard.py
-    pytest python/test/unit/language/test_block_pointer.py
+    pytest python/test/unit/language/*.py
+    pytest python/test/unit/runtime/*.py
+    pytest python/test/unit/cuda/*.py
+    pytest python/test/unit/tools/*.py
+    pytest python/test/unit/instrumentation/*.py
+    pytest python/test/unit/*.py
+    pytest python/test/regression/*.py
+    pytest python/test/backend/test_device_backend.py
 fi
 
 
