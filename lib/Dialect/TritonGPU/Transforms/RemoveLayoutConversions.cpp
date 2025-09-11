@@ -285,6 +285,18 @@ bool isLayoutAnchor(Operation *op) {
 void LayoutPropagation::initAnchorLayout() {
   auto addAnchor = [&](Value v) {
     if (auto tensorType = dyn_cast<RankedTensorType>(v.getType())) {
+      // Facebook begin
+      // Workaround, don't popagate MMA layout unless there is a convert
+      // back to mma further down to avoid generating reduction with MMA
+      // layout that may have lower performance.
+      // This can be improved with more aggressive backward propagation.
+      if (isa<MmaEncodingTrait>(tensorType.getEncoding()) &&
+          v.getDefiningOp() &&
+          !hasConvertToMMATransisitiveUse(v.getDefiningOp(),
+                                          tensorType.getEncoding())) {
+        return;
+      }
+      // Facebook end
       layouts.insert({v, LayoutInfo(tensorType.getEncoding())});
     }
   };
