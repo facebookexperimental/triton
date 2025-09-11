@@ -1321,11 +1321,13 @@ def TT_DescriptorStoreOp : TT_Op<"descriptor_store", [TT_DescriptorStoreLikeOpIn
   let arguments = (ins
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
     TT_Tensor:$src,
-    Variadic<I32>:$indices
+    Variadic<I32>:$indices,
+    DefaultValuedAttr<TT_DescriptorReduceKindAttr, "::mlir::triton::DescriptorReduceKind::NONE">:$reduce_kind
   );
 
   let assemblyFormat = [{
     $desc `[` $indices `]` `,` $src
+    oilist(`reduce_kind` `=` $reduce_kind)
     attr-dict `:` qualified(type($desc)) `,` type($src)
   }];
   let hasVerifier = 1;

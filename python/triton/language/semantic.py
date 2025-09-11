@@ -1094,6 +1094,10 @@ class TritonSemantic(Generic[TensorTy]):
             # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
             return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
 
+    def reinterpret_tensor_descriptor(desc_ptr: tl.tensor, block_ty: tl.block_type):
+        handle = self.builder.create_reinterpret_tensor_descriptor(desc_ptr.handle, block_ty.to_ir(self.builder))
+        return tl.tensor_descriptor_base(handle, block_ty)
+
     def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str,
                         eviction_policy: str) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base)
@@ -1111,12 +1115,25 @@ class TritonSemantic(Generic[TensorTy]):
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
         assert value.shape == desc.block_shape
 
-    def descriptor_store(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> TensorTy:
-        self.validate_store_like(desc, value, offsets)
-        # implicitly cast to the descriptor's type
-        value = self.cast(value, desc.dtype)
-        offsets = self._convert_to_ir_values(offsets, require_i64=False)
-        return self.tensor(self.builder.create_descriptor_store(desc.handle, value.handle, offsets), tl.void)
+    def descriptor_store(self, desc: tl.tensor_descriptor_base, value: tl.tensor, offsets, store_reduce : str) -> tl.tensor:
+        if store_reduce == "":
+            self.validate_store_like(desc, value, offsets)
+            offsets = self._convert_to_ir_values(offsets, require_i64=False)
+            return tl.tensor(self.builder.create_descriptor_store(desc.handle, value.handle, offsets, ir.DESCRIPTOR_REDUCE_KIND.NONE), tl.void)
+        elif store_reduce == "add":
+            return self.descriptor_atomic_add(desc, value, offsets)
+        elif store_reduce == "min":
+            return self.descriptor_atomic_min(desc, value, offsets)
+        elif store_reduce == "max":
+            return self.descriptor_atomic_max(desc, value, offsets)
+        elif store_reduce == "and":
+            return self.descriptor_atomic_and(desc, value, offsets)
+        elif store_reduce == "or":
+            return self.descriptor_atomic_or(desc, value, offsets)
+        elif store_reduce == "xor":
+            return self.descriptor_atomic_xor(desc, value, offsets)
+        else:
+            raise ValueError("Unsupported reduction kind")
 
     def descriptor_atomic_add(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> TensorTy:
         self.validate_store_like(desc, value, offsets)
@@ -1213,6 +1230,40 @@ class TritonSemantic(Generic[TensorTy]):
         y_offset = self._convert_to_ir_values((y_offset, ), require_i64=False)[0]
         self.builder.create_descriptor_scatter(desc.handle, value.handle, x_offsets.handle, y_offset)
         return self.tensor(None, tl.void)
+
+
+    def tensormap_create(
+        desc_ptr: tl.tensor,
+        global_address: tl.tensor,
+        box_dim: List[tl.tensor],
+        global_dim: List[tl.tensor],
+        global_stride: List[tl.tensor],
+        element_stride: List[tl.tensor],
+        elem_type: int,
+        interleave_layout: int,
+        swizzle_mode: int,
+        fill_mode: int,
+    ) -> self.tensor:
+        assert not global_stride or global_stride[0].dtype == tl.int64
+        return self.tensor(
+            self.builder.create_tensormap_create(
+                desc_ptr.handle,
+                global_address.handle,
+                [x.handle for x in box_dim],
+                [x.handle for x in global_dim],
+                [x.handle for x in global_stride],
+                [x.handle for x in element_stride],
+                elem_type,
+                interleave_layout,
+                swizzle_mode,
+                fill_mode,
+            ),
+            tl.void,
+        )
+
+    def tensormap_fenceproxy_acquire(desc_ptr: tl.tensor) -> self.tensor:
+        return self.tensor(self.builder.create_tensormap_fenceproxy_acquire(desc_ptr.handle), tl.void)
+
 
     def _store_block_pointer(self, ptr, val, mask, boundary_check, cache, eviction):
         # Store by a block pointer: `pointer_type<block_type<>>`

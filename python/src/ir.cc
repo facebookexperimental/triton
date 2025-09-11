@@ -275,6 +275,7 @@ void init_triton_ir(py::module &&m) {
 
   py::enum_<DescriptorReduceKind>(m, "DESCRIPTOR_REDUCE_KIND",
                                   py::module_local())
+      .value("NONE", DescriptorReduceKind::NONE)
       .value("ADD", DescriptorReduceKind::ADD)
       .value("AND", DescriptorReduceKind::AND)
       .value("OR", DescriptorReduceKind::OR)
@@ -1471,6 +1472,13 @@ void init_triton_ir(py::module &&m) {
              return triton::TensorDescType::get(
                  ctx, cast<RankedTensorType>(blockTy), isSigned);
            })
+      .def("create_reinterpret_tensor_descriptor",
+           [](TritonOpBuilder &self, Value desc_ptr, Type blockTy) -> Value {
+             auto ctx = self.getContext();
+             auto resultTy = triton::TensorDescType::get(
+                 ctx, cast<RankedTensorType>(blockTy));
+             return self.create<ReinterpretTensorDescOp>(resultTy, desc_ptr);
+           })
       .def("create_descriptor_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
               CacheModifier cacheModifier,
@@ -1488,8 +1496,10 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_descriptor_store",
            [](TritonOpBuilder &self, Value desc, Value value,
-              std::vector<Value> &indices) -> void {
-             self.create<DescriptorStoreOp>(desc, value, indices);
+              std::vector<Value> &indices,
+              DescriptorReduceKind descriptorReduceKind) -> void {
+             self.create<DescriptorStoreOp>(desc, value, indices,
+                                            descriptorReduceKind);
            })
       .def("create_descriptor_reduce",
            [](TritonOpBuilder &self, DescriptorReduceKind kind, Value desc,
@@ -1500,6 +1510,22 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value desc, Value value, Value x_indices,
               Value y_index) -> void {
              self.create<DescriptorScatterOp>(desc, x_indices, y_index, value);
+           })
+      .def("create_tensormap_create",
+           [](TritonOpBuilder &self, Value desc_ptr, Value global_address,
+              std::vector<Value> box_dim, std::vector<Value> global_dim,
+              std::vector<Value> global_stride,
+              std::vector<Value> element_stride, int32_t elem_type,
+              int32_t interleave_layout, int32_t swizzle_mode,
+              int32_t fill_mode) {
+             self.create<ExperimentalTensormapCreateOp>(
+                 desc_ptr, global_address, box_dim, global_dim, global_stride,
+                 element_stride, elem_type, interleave_layout, swizzle_mode,
+                 fill_mode);
+           })
+      .def("create_tensormap_fenceproxy_acquire",
+           [](TritonOpBuilder &self, Value desc_ptr) {
+             self.create<ExperimentalTensormapFenceproxyAcquireOp>(desc_ptr);
            })
       .def("create_reshape",
            [](TritonOpBuilder &self, Value &arg, std::vector<int64_t> &shape,

@@ -378,6 +378,244 @@ cleanup:
   return result;
 }
 
+// Simple helper to experiment creating TMA descriptors on the host.
+// This is a useful to test TMA operations independently.
+static PyObject *fill1DTMADescriptor(PyObject *self, PyObject *args) {
+  unsigned long long global_address;
+  uint64_t dim;
+  uint32_t tensorDim;
+  int elementSize;
+  unsigned long long desc_address;
+  if (!PyArg_ParseTuple(args, "KKiiK", &global_address, &dim, &tensorDim,
+                        &elementSize, &desc_address)) {
+    return NULL;
+  }
+  uint64_t dims[1] = {dim};
+  uint64_t globalStrides[1] = {dim * elementSize};
+  uint32_t boxDim[1] = {tensorDim};
+  uint32_t elementStrides[1] = {1};
+  CUtensorMapDataType type;
+  switch (elementSize) {
+  case 1:
+    type = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    break;
+  case 2:
+    type = CU_TENSOR_MAP_DATA_TYPE_UINT16;
+    break;
+  case 4:
+    type = CU_TENSOR_MAP_DATA_TYPE_UINT32;
+    break;
+  default:
+    PyErr_SetString(PyExc_ValueError, "elementSize must be 1, 2, or 4");
+    return NULL;
+  }
+  assert((elementSize * tensorDim) >= 32 && "block size too small.");
+  int rank = 1;
+  static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled = NULL;
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeTiled,
+                                      getCuTensorMapEncodeTiledHandle);
+  CUDA_CHECK_AND_RETURN_NULL(cuTensorMapEncodeTiled(
+      (CUtensorMap *)desc_address, type, rank, (void *)global_address, dims,
+      globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+
+// Simple helper to experiment creating TMA descriptors on the host.
+// This is a useful to test TMA operations independently.
+static PyObject *fill2DTMADescriptor(PyObject *self, PyObject *args) {
+  unsigned long long global_address;
+  uint64_t dims[2];
+  uint32_t tensorDims[2];
+  int elementSize;
+  unsigned long long desc_address;
+  if (!PyArg_ParseTuple(args, "KKKiiiK", &global_address, &dims[1], &dims[0],
+                        &tensorDims[1], &tensorDims[0], &elementSize,
+                        &desc_address)) {
+    return NULL;
+  }
+  uint64_t globalStrides[2] = {dims[0] * elementSize,
+                               dims[0] * dims[1] * elementSize};
+  uint32_t elementStrides[2] = {1, 1};
+  CUtensorMapDataType type;
+  switch (elementSize) {
+  case 1:
+    type = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    break;
+  case 2:
+    type = CU_TENSOR_MAP_DATA_TYPE_UINT16;
+    break;
+  case 4:
+    type = CU_TENSOR_MAP_DATA_TYPE_UINT32;
+    break;
+  default:
+    PyErr_SetString(PyExc_ValueError, "elementSize must be 1, 2, or 4");
+  }
+  int rank = 2;
+  // Swizzling should be picked in codegen but since we need to set it on the
+  // descriptor we rely on a convention between this function and codegen.
+  CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+  uint32_t contigDimSizeInByte = elementSize * tensorDims[0];
+  if (tensorDims[1] < 8 || contigDimSizeInByte < 32) {
+    swizzle = CU_TENSOR_MAP_SWIZZLE_NONE;
+  } else if (contigDimSizeInByte >= 128) {
+    swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+  } else if (contigDimSizeInByte >= 64) {
+    swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
+  } else {
+    assert(contigDimSizeInByte >= 32);
+    swizzle = CU_TENSOR_MAP_SWIZZLE_32B;
+  }
+  // The bounding box inner dimension must be less than or equal to the swizzle
+  // size.
+  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
+  // We clamp the block size and the codegen will emit multiple copy operations.
+  if (contigDimSizeInByte > 128) {
+    tensorDims[0] = 128 / elementSize;
+  }
+  static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled = NULL;
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeTiled,
+                                      getCuTensorMapEncodeTiledHandle);
+  CUDA_CHECK_AND_RETURN_NULL(cuTensorMapEncodeTiled(
+      (CUtensorMap *)desc_address, type, rank, (void *)global_address, dims,
+      globalStrides, tensorDims, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+
+// Simple helper to experiment creating TMA descriptors on the host.
+// This is a useful to test TMA operations independently.
+static PyObject *fill1DTMADescriptorType(PyObject *self, PyObject *args) {
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
+  unsigned long long global_address;
+  uint64_t dim;
+  uint32_t tensorDim;
+  int dataType;
+  unsigned long long desc_address;
+  if (!PyArg_ParseTuple(args, "KKiiK", &global_address, &dim, &tensorDim,
+                        &dataType, &desc_address)) {
+    return NULL;
+  }
+  uint64_t dims[1] = {dim};
+  uint32_t boxDim[1] = {tensorDim};
+  uint32_t elementStrides[1] = {1};
+  CUtensorMapDataType type;
+  uint32_t elementSize = 0;
+  switch (dataType) {
+  case 0:
+    type = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    elementSize = 2;
+    break;
+  case 1:
+    type = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    elementSize = 2;
+    break;
+  case 2:
+    type = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    elementSize = 4;
+    break;
+  case 3:
+    type = CU_TENSOR_MAP_DATA_TYPE_INT32;
+    elementSize = 4;
+    break;
+  default:
+    PyErr_SetString(PyExc_ValueError, "dataType must be 0, 1, 2, or 3");
+    return NULL;
+  }
+  uint64_t globalStrides[1] = {dim * elementSize};
+  assert((elementSize * tensorDim) >= 32 && "block size too small.");
+  int rank = 1;
+  static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled = NULL;
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeTiled,
+                                      getCuTensorMapEncodeTiledHandle);
+  CUDA_CHECK_AND_RETURN_NULL(cuTensorMapEncodeTiled(
+      (CUtensorMap *)desc_address, type, rank, (void *)global_address, dims,
+      globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  Py_INCREF(Py_None);
+#endif
+  return Py_None;
+}
+
+// Simple helper to experiment creating TMA descriptors on the host.
+// This is a useful to test TMA operations independently.
+static PyObject *fill2DTMADescriptorType(PyObject *self, PyObject *args) {
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
+  unsigned long long global_address;
+  uint64_t dims[2];
+  uint32_t tensorDims[2];
+  int dataType;
+  unsigned long long desc_address;
+  if (!PyArg_ParseTuple(args, "KKKiiiK", &global_address, &dims[1], &dims[0],
+                        &tensorDims[1], &tensorDims[0], &dataType,
+                        &desc_address)) {
+    return NULL;
+  }
+  int elementSize = 0;
+  CUtensorMapDataType type;
+  switch (dataType) {
+  case 0:
+    type = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    elementSize = 2;
+    break;
+  case 1:
+    type = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    elementSize = 2;
+    break;
+  case 2:
+    type = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    elementSize = 4;
+    break;
+  case 3:
+    type = CU_TENSOR_MAP_DATA_TYPE_INT32;
+    elementSize = 4;
+    break;
+  default:
+    PyErr_SetString(PyExc_ValueError, "dataType must be 0, 1, 2, or 3");
+    return NULL;
+  }
+  uint64_t globalStrides[2] = {dims[0] * elementSize,
+                               dims[0] * dims[1] * elementSize};
+  uint32_t elementStrides[2] = {1, 1};
+  int rank = 2;
+  // Swizzling should be picked in codegen but since we need to set it on the
+  // descriptor we rely on a convention between this function and codegen.
+  CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+  uint32_t contigDimSizeInByte = elementSize * tensorDims[0];
+  if (contigDimSizeInByte >= 128) {
+    swizzle = CU_TENSOR_MAP_SWIZZLE_128B;
+  } else if (contigDimSizeInByte >= 64) {
+    swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
+  } else if (contigDimSizeInByte >= 32) {
+    swizzle = CU_TENSOR_MAP_SWIZZLE_32B;
+  } else {
+    assert(false && "block size too small.");
+  }
+  // The bounding box inner dimension must be less than or equal to the swizzle
+  // size.
+  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
+  // We clamp the block size and the codegen will emit multiple copy operations.
+  if (contigDimSizeInByte > 128) {
+    tensorDims[0] = 128 / elementSize;
+  }
+  static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled = NULL;
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeTiled,
+                                      getCuTensorMapEncodeTiledHandle);
+  CUDA_CHECK_AND_RETURN_NULL(cuTensorMapEncodeTiled(
+      (CUtensorMap *)desc_address, type, rank, (void *)global_address, dims,
+      globalStrides, tensorDims, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  Py_INCREF(Py_None);
+#endif
+  return Py_None;
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -392,6 +630,12 @@ static PyMethodDef ModuleMethods[] = {
      "particular it's an error to change this value after launching any kernel "
      "that calls printf()."},
     {"fill_tma_descriptor", fillTMADescriptor, METH_VARARGS, "doc"},
+    {"fill_1d_tma_descriptor", fill1DTMADescriptor, METH_VARARGS, "doc"},
+    {"fill_2d_tma_descriptor", fill2DTMADescriptor, METH_VARARGS, "doc"},
+    {"fill_1d_tma_descriptor_type", fill1DTMADescriptorType, METH_VARARGS,
+     "doc"},
+    {"fill_2d_tma_descriptor_type", fill2DTMADescriptorType, METH_VARARGS,
+     "doc"},
 
     {NULL, NULL, 0, NULL} // sentinel
 };
