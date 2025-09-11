@@ -1,7 +1,6 @@
 from typing import Sequence
 
 from triton.language import core
-from triton.language import semantic
 from triton._C.libtriton import ir
 
 __all__ = [
@@ -43,17 +42,17 @@ def experimental_device_tensormap_create1d(
     load_size: core.tensor,
     global_size: core.tensor,
     element_ty: core.dtype,
-    _builder: ir.builder = None,
+    _semantic=None,
 ):
-    load_size = core._constexpr_to_value(load_size)
-    global_size = semantic.to_tensor(global_size, _builder)
-    element_ty = core._constexpr_to_value(element_ty)
-    element_stride = [core.full([], 1, core.int32, _builder=_builder)]
+    load_size = core._unwrap_if_constexpr(load_size)
+    global_size = _semantic.to_tensor(global_size)
+    element_ty = core._unwrap_if_constexpr(element_ty)
+    element_stride = [core.full([], 1, core.int32, _semantic=_semantic)]
 
-    semantic.tensormap_create(
+    _semantic.tensormap_create(
         desc_ptr=desc_ptr,
         global_address=global_address,
-        box_dim=[semantic.to_tensor(load_size, _builder)],
+        box_dim=[_semantic.to_tensor(load_size)],
         global_dim=[global_size],
         global_stride=[],
         element_stride=element_stride,
@@ -61,7 +60,6 @@ def experimental_device_tensormap_create1d(
         interleave_layout=0,
         swizzle_mode=0,
         fill_mode=0,
-        builder=_builder,
     )
 
 
@@ -72,27 +70,27 @@ def experimental_device_tensormap_create2d(
     load_size: Sequence[core.constexpr],
     global_size: Sequence[core.tensor],
     element_ty: core.dtype,
-    _builder: ir.builder = None,
+    _semantic=None,
 ):
     assert len(load_size) == 2
     assert len(global_size) == 2
-    load_size = [core._constexpr_to_value(x) for x in load_size]
-    global_size = [semantic.to_tensor(x, _builder) for x in global_size]
+    load_size = [core._unwrap_if_constexpr(x) for x in load_size]
+    global_size = [_semantic.to_tensor(x) for x in global_size]
 
     element_size = element_ty.primitive_bitwidth // 8
-    element_size_t = core.full([], element_size, core.int64, _builder=_builder)
-    global_stride = semantic.mul(element_size_t, global_size[-1], True, _builder)
+    element_size_t = core.full([], element_size, core.int64, _semantic=_semantic)
+    global_stride = _semantic.mul(element_size_t, global_size[-1], True)
 
     contig_dim_size_in_bytes = element_size * load_size[-1]
     if contig_dim_size_in_bytes > 128:
         load_size[-1] = 128 // element_size
 
-    elem_stride = core.full([], 1, core.int32, _builder=_builder)
+    elem_stride = core.full([], 1, core.int32, _semantic=_semantic)
 
-    semantic.tensormap_create(
+    _semantic.tensormap_create(
         desc_ptr=desc_ptr,
         global_address=global_address,
-        box_dim=[semantic.to_tensor(x, _builder) for x in load_size[::-1]],
+        box_dim=[_semantic.to_tensor(x) for x in load_size[::-1]],
         global_dim=global_size[::-1],
         global_stride=[global_stride],
         element_stride=[elem_stride, elem_stride],
@@ -100,7 +98,6 @@ def experimental_device_tensormap_create2d(
         interleave_layout=0,
         swizzle_mode=_determine_swizzle_mode_2d(contig_dim_size_in_bytes, load_size),
         fill_mode=0,
-        builder=_builder,
     )
 
 
@@ -116,5 +113,5 @@ def _determine_swizzle_mode_2d(contig_dim_size_in_bytes, load_size):
 
 
 @core.builtin
-def experimental_tensormap_fenceproxy_acquire(desc_ptr: core.tensor, _builder: ir.builder = None):
-    semantic.tensormap_fenceproxy_acquire(desc_ptr, _builder)
+def experimental_tensormap_fenceproxy_acquire(desc_ptr: core.tensor, _semantic = None):
+    _semantic.tensormap_fenceproxy_acquire(desc_ptr)
