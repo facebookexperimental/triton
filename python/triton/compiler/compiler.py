@@ -217,6 +217,13 @@ class CompileTimer:
             store_results=delta(stage_start, self.store_results_end),
         )
 
+# Facebook begin T207797237
+def _sanitize_extern_libs(options):
+    options = dict(options)
+    options["extern_libs"] = [name for name, path in options.get("extern_libs", [])]
+    return options
+# Facebook end T207797237
+
 
 def compile(src, target=None, options=None, _env_vars=None):
     compilation_listener = knobs.compilation.listener
@@ -343,6 +350,11 @@ def compile(src, target=None, options=None, _env_vars=None):
         if compilation_listener:
             timer.stage_finished(ext)
     # write-back metadata
+    # facebook begin T207797237
+    # Sanitize the metadata; extern_libs comes in (name, path) pairs, but the path is
+    # some semi-random temporary location that we do not want to write to cache.
+    metadata = _sanitize_extern_libs(metadata)
+    # facebook end T207797237
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
     fn_cache_manager.put_group(metadata_filename, metadata_group)
