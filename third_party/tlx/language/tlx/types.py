@@ -1,5 +1,5 @@
 import triton.language.core as tl
-from typing import Optional, Self, List, Tuple
+from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
 from triton._C.libtriton import ir
@@ -29,7 +29,7 @@ class shared_layout_encoding(layout_encoding):
     """
 
     @abstractmethod
-    def make_permute(self, dims) -> Self:
+    def make_permute(self, dims):
         raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
 
     def to_ir(self, builder: ir.builder) -> None:
@@ -70,7 +70,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
     Create a new layout that is a permutation of the given layout.
     """
 
-    def make_permute(self, dims) -> Self:
+    def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
         return swizzled_shared_layout_encoding(self.vectorSize, self.perPhase, self.maxPhase, permuted_order,
                                                self.numCTAs, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder)
@@ -148,7 +148,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
     Create a new layout that is a permutation of the given layout.
     """
 
-    def make_permute(self, dims) -> Self:
+    def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
         return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA,
                                              self.numCTASplit, self.numCTAOrder, self.fp4Padded)
@@ -215,7 +215,7 @@ class buffered_tensor(tl.base_value):
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
 
-    def make_permute(self, handle, dims) -> Self:
+    def make_permute(self, handle, dims):
         permuted_layout = self.type.layout.make_permute(dims)
         return buffered_tensor(
             handle,
