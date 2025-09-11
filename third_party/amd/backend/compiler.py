@@ -261,7 +261,13 @@ class HIPBackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             amd.passes.ttgpuir.add_convert_to_buffer_ops(pm, options.arch, knobs.amd.use_buffer_atomics)
 
-        amd.passes.ttgpuir.add_fold_true_cmpi(pm)
+        # Facebook begin
+        # D79814483: Disable amd.passes.ttgpuir.add_fold_true_cmpi
+        # based on two SEVs related to IMAs. We are not re-enabling
+        # this pass until we get explicit reassurances from AMD
+        # that it is more robust.
+        # amd.passes.ttgpuir.add_fold_true_cmpi(pm)
+        # Facebook end
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
