@@ -1094,7 +1094,7 @@ class TritonSemantic(Generic[TensorTy]):
             # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
             return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
 
-    def reinterpret_tensor_descriptor(desc_ptr: tl.tensor, block_ty: tl.block_type):
+    def reinterpret_tensor_descriptor(self, desc_ptr: tl.tensor, block_ty: tl.block_type):
         handle = self.builder.create_reinterpret_tensor_descriptor(desc_ptr.handle, block_ty.to_ir(self.builder))
         return tl.tensor_descriptor_base(handle, block_ty)
 
@@ -1233,6 +1233,7 @@ class TritonSemantic(Generic[TensorTy]):
 
 
     def tensormap_create(
+        self,
         desc_ptr: tl.tensor,
         global_address: tl.tensor,
         box_dim: List[tl.tensor],
@@ -1261,7 +1262,7 @@ class TritonSemantic(Generic[TensorTy]):
             tl.void,
         )
 
-    def tensormap_fenceproxy_acquire(desc_ptr: tl.tensor) -> self.tensor:
+    def tensormap_fenceproxy_acquire(self, desc_ptr: tl.tensor) -> self.tensor:
         return self.tensor(self.builder.create_tensormap_fenceproxy_acquire(desc_ptr.handle), tl.void)
 
 
