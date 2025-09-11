@@ -29,9 +29,12 @@ from .standard import (
 from .core import (
     PropagateNan,
     TRITON_MAX_TENSOR_NUMEL,
+    _experimental_descriptor_load,
+    _experimental_descriptor_store,
     load_tensor_descriptor,
     store_tensor_descriptor,
     make_tensor_descriptor,
+    _experimental_reinterpret_tensor_descriptor,
     tensor_descriptor,
     tensor_descriptor_type,
     add,
@@ -39,6 +42,7 @@ from .core import (
     arange,
     associative_scan,
     assume,
+    async_task,
     atomic_add,
     atomic_and,
     atomic_cas,
@@ -95,6 +99,7 @@ from .core import (
     permute,
     pi32_t,
     pointer_type,
+    nv_tma_desc_type,
     program_id,
     range,
     reduce,
@@ -136,9 +141,12 @@ from . import target_info
 __all__ = [
     "PropagateNan",
     "TRITON_MAX_TENSOR_NUMEL",
+    "_experimental_descriptor_load",
+    "_experimental_descriptor_store",
     "load_tensor_descriptor",
     "store_tensor_descriptor",
     "make_tensor_descriptor",
+    "_experimental_reinterpret_tensor_descriptor",
     "tensor_descriptor",
     "abs",
     "add",
@@ -228,6 +236,7 @@ __all__ = [
     "philox_impl",
     "pi32_t",
     "pointer_type",
+    "nv_tma_desc_type",
     "program_id",
     "rand",
     "rand4x",
@@ -311,6 +320,9 @@ def str_to_ty(name, c):
             assert isinstance(layout, NVMMASharedLayout)
             return gluon_tensor_descriptor_type(block, shape_type, stride_type, layout)
         return tensor_descriptor_type(block, shape_type, stride_type)
+
+    if name.startswith("nvTmaDesc"):
+        return nv_tma_desc_type()
 
     if name.startswith("constexpr"):
         return constexpr_type(c)
