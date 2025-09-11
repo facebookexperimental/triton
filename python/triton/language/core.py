@@ -2129,7 +2129,7 @@ def _experimental_reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype, _s
     """
     Reinterpret a generic pointer as a TMA-backed tensor descriptor object.
     """
-    block_ty = block_type(_constexpr_to_value(dtype), block_shape)
+    block_ty = block_type(_unwrap_if_constexpr(dtype), block_shape)
     return _semantic.reinterpret_tensor_descriptor(desc_ptr, block_ty)
 
 
@@ -2153,7 +2153,7 @@ def _experimental_descriptor_store(desc_pointer, value, offsets, store_reduce=""
 
     This stores a tensor of data based on the descriptor and offsets.
     """
-    store_reduce = _constexpr_to_value(store_reduce)
+    store_reduce = _unwrap_if_constexpr(store_reduce)
     desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, value.shape, value.dtype, _semantic=_semantic)
     return desc.store(offsets, value, store_reduce=store_reduce, _semantic=_semantic)
 
