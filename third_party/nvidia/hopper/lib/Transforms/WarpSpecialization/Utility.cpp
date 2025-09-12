@@ -19,6 +19,8 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
         asyncTaskIds.push_back(asyncTaskId);
     }
   }
+  if (auto partitionId = op->getAttrOfType<IntegerAttr>("ttg.partition"))
+    asyncTaskIds.push_back(partitionId.getInt());
   return asyncTaskIds;
 }
 
