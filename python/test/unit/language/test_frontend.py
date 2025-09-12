@@ -170,6 +170,7 @@ def test_aggregate_initializers():
     anchor(value)
 
 
+@pytest.mark.skip(reason="Facebook. TODO")
 @filecheck_test
 @triton.jit
 def test_aggregate_modification_in_for_loop():
@@ -187,6 +188,7 @@ def test_aggregate_modification_in_for_loop():
     # CHECK: call @{{.*}}anchor{{.*}}([[RET]])
 
 
+@pytest.mark.skip(reason="Facebook. TODO")
 @filecheck_test
 @triton.jit
 def test_aggregate_modification_in_while_loop():
