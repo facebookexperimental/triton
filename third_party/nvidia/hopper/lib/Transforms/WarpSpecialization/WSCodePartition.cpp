@@ -168,7 +168,8 @@ static void createChannel(Operation *producerOp, Operation *op,
 
 // Can be one end of the channel.
 static bool isChannelAnchorOp(Operation *op) {
-  if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
+  if (isa<tt::LoadOp, tt::DescriptorLoadOp, ttg::LocalAllocOp,
+          ttng::TMEMAllocOp>(op) ||
       isa<mlir::triton::DotOpInterface>(op))
     return true;
   // Any computation tensor op?
@@ -195,7 +196,7 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       auto producerTaskIds = getAsyncTaskIds(op);
       if (producerTaskIds.empty() || producerTaskIds.size() > 1) {
         LLVM_DEBUG({
-          LDBG(" ignoring load ops without async task id or with multiple task "
+          LDBG(" ignoring ops without async task id or with multiple task "
                "ids: ");
           op->dump();
         });
@@ -213,15 +214,6 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
         // Here producerOp is tmem_alloc.
         producerOp = accumulator.getDefiningOp();
         createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
-        // We may need to create a TMEM channel for A operand.
-        auto opndA = dotOp.getA();
-        producerOp = opndA.getDefiningOp();
-        if (isa<ttng::TMEMAllocOp>(producerOp))
-          createChannel(producerOp, op, dom, channels, true /*opndA*/,
-                        producerNumBuffers);
-        if (isa<ttg::LocalAllocOp>(producerOp))
-          createChannel(producerOp, op, dom, channels, true /*opndA*/,
-                        producerNumBuffers);
       } else {
         // If the consumer is in a different task, create a channel.
         createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
@@ -230,14 +222,17 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 
   LLVM_DEBUG({
-    LDBG("Async channels:");
-    for (auto &channel : channels) {
+    LDBG("\n\n");
+    LDBG(channels.size() << " async channels:");
+    for (unsigned i = 0; i < channels.size(); i++) {
+      const auto &channel = channels[i];
+      LDBG("channel [" << i << "]");
       LDBG("producer op: " << channel->relation.first);
       channel->getSrcOp()->dump();
       for (auto &asyncTaskId : channel->relation.second)
         LDBG("consumer: " << asyncTaskId);
       channel->getDstOp()->dump();
-      LDBG("numBuffers: " << channel->numBuffers);
+      LDBG("numBuffers: " << channel->numBuffers << "\n");
     }
   });
 }
