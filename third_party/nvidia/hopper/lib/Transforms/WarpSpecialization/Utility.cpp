@@ -23,8 +23,6 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
     if (idx >= 0)
       asyncTaskIds.push_back(idx);
   }
-  if (auto partitionId = op->getAttrOfType<IntegerAttr>("ttg.partition"))
-    asyncTaskIds.push_back(partitionId.getInt());
   return asyncTaskIds;
 }
 
@@ -79,12 +77,16 @@ void addAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTasks) {
 void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
   auto origAsyncTaskIds = getAsyncTaskIds(op);
   llvm::erase(origAsyncTaskIds, asyncTaskId);
-  if (origAsyncTaskIds.empty())
+  if (origAsyncTaskIds.empty()) {
     op->removeAttr("async_task_id");
-  else
+    op->removeAttr("ttg.partition");
+  } else
     setAsyncTaskIds(op, origAsyncTaskIds);
 }
 
-void removeAsyncTaskIds(Operation *op) { op->removeAttr("async_task_id"); }
+void removeAsyncTaskIds(Operation *op) {
+  op->removeAttr("async_task_id");
+  op->removeAttr("ttg.partition");
+}
 
 } // namespace mlir
