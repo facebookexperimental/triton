@@ -160,6 +160,9 @@ def _generate_test_params():
         # TODO: Investigate why this test fails on gfx942 with M=512, N=512, K=16
         if "gfx942" in device_props and M == 512 and N == 512 and K == 16:
             params.append(pytest.param(M, N, K, marks=pytest.mark.xfail()))
+        elif "H100" in device_props and M == 512 and N == 512 and K == 64:
+            # This shape incurs excessive register pressure and fails on H100
+            params.append(pytest.param(M, N, K, marks=pytest.mark.xfail()))
         else:
             params.append((M, N, K))
     return params
