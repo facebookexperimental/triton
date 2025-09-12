@@ -115,24 +115,29 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
   // it, we need to update the layout encoding.
   if (auto memDescTransOp = dyn_cast<ttg::MemDescTransOp>(op)) {
     auto resultLattice = results[0];
-    if (auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(
-            resultLattice->getValue().getLayoutEncoding())) {
-      SmallVector<unsigned, 4> newOrder;
-      llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
-                      [](int32_t x) { return static_cast<unsigned>(x); });
-      auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
-          mmaEncoding.getContext(),
-          memDescTransOp.getSrc().getType().getShape(), newOrder,
-          mmaEncoding.getCTALayout(),
-          memDescTransOp.getSrc().getType().getElementType(),
-          mmaEncoding.getFp4Padded());
-      const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
-      auto operandLattice = operands[0];
-      ChangeResult changed = operandLattice->meet(updatedResultLayoutEncoding);
-      propagateIfChanged(operandLattice, changed);
-      visitWarpSpecRegionArgs(op, memDescTransOp.getSrc(),
-                              updatedResultLayoutEncoding);
+    LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
+    if (!resultLayoutEncoding.isUninitialized()) {
+      if (auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(
+              resultLattice->getValue().getLayoutEncoding())) {
+        SmallVector<unsigned, 4> newOrder;
+        llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
+                        [](int32_t x) { return static_cast<unsigned>(x); });
+        auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
+            mmaEncoding.getContext(),
+            memDescTransOp.getSrc().getType().getShape(), newOrder,
+            mmaEncoding.getCTALayout(),
+            memDescTransOp.getSrc().getType().getElementType(),
+            mmaEncoding.getFp4Padded());
+        const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
+        auto operandLattice = operands[0];
+        ChangeResult changed =
+            operandLattice->meet(updatedResultLayoutEncoding);
+        propagateIfChanged(operandLattice, changed);
+        visitWarpSpecRegionArgs(op, memDescTransOp.getSrc(),
+                                updatedResultLayoutEncoding);
+      }
     }
+
     return success();
   }
 
