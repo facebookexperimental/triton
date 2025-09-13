@@ -388,7 +388,8 @@ void insertAsyncCopy(
         &channelsGroupedByProducers,
     const DenseMap<Channel *, Value> &bufferMap,
     DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
+    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
+    bool isPost) {
   // For each producer op, create a async_copy or local_store from the producer
   // to the buffer. Create a local_load from the buffer at the dominating
   // consumer.
@@ -479,13 +480,14 @@ void insertAsyncCopy(
       producerConsumerOps = createAsyncCopy(bufferMap, domininatingChannel,
                                             domininatingChannel->getSrcOp(),
                                             asyncTasksPC, bufferIdx, bufferIdx);
-    } else if (domininatingChannel->channelKind == DataChannelKind::TMEM) {
+    } else if (domininatingChannel->channelKind == DataChannelKind::TMEM &&
+               !isPost) {
       producerConsumerOps =
           createTMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
-    } else if (isa<ttg::LocalAllocOp>(srcOp)) {
+    } else if (isa<ttg::LocalAllocOp>(srcOp) && !isPost) {
       producerConsumerOps =
           createSMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
-    } else {
+    } else if (!isPost) {
       assert(!isa<ttg::LocalLoadOp>(srcOp) &&
              "LocalLoadOp buffer should be reused");
       producerConsumerOps =

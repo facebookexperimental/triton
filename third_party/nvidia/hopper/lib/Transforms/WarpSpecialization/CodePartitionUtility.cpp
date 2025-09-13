@@ -25,6 +25,66 @@ bool enclosing(scf::ForOp forOp, Operation *op) {
   return forOp->isProperAncestor(op);
 }
 
+Operation *ChannelPost::getSrcOp() {
+  for (auto user : allocOp->getUsers()) {
+    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(user))
+      return user;
+  }
+  return nullptr;
+}
+
+// A few assumptions, a channel can have multiple consumers, but the consumers
+// must be in the same region and the taskIds must be the same. We can have
+// a representative consumer in the channel.
+Operation *ChannelPost::getDstOp() {
+  SmallVector<Operation *> consumers;
+  for (auto user : allocOp->getUsers()) {
+    if (!isa<ttg::LocalStoreOp>(user))
+      consumers.push_back(user);
+  }
+  if (consumers.size() == 1) return consumers[0];
+  assert(consumers.size() != 0);
+  auto taskIds = getAsyncTaskIds(consumers[0]);
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    auto taskIds2 = getAsyncTaskIds(consumers[i]);
+    assert(taskIds == taskIds2 && consumers[i]->getBlock() == consumers[0]->getBlock());
+  }
+  return consumers.back();
+}
+
+Operation *ttng::TmemDataChannelPost::getSrcOp() {
+  if (isOperandD) return nullptr;
+  for (auto user : allocOp->getUsers()) {
+    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user))
+      return user;
+  }
+  return nullptr;
+}
+
+Operation *ttng::TmemDataChannelPost::getDstOp() {
+  if (isOperandD) return nullptr;
+  SmallVector<Operation *> consumers;
+  for (auto user : allocOp->getUsers()) {
+    if (!isa<ttng::TMEMStoreOp>(user) && !isa<ttng::TMEMStoreOp>(user))
+      consumers.push_back(user);
+  }
+  if (consumers.size() == 1) return consumers[0];
+  assert(consumers.size() != 0);
+  auto taskIds = getAsyncTaskIds(consumers[0]);
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    auto taskIds2 = getAsyncTaskIds(consumers[i]);
+    assert(taskIds == taskIds2 && consumers[i]->getBlock() == consumers[0]->getBlock());
+  }
+  return consumers.back();
+}
+
+unsigned ChannelPost::getNumBuffers() {
+  // get buffer.copy
+  if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
+    return copy.getInt();
+  return 1;
+}
+
 // Check to see if there is no outer loop that is enclosed under ifOp.
 bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
   auto pOp = subOp->getParentOfType<scf::ForOp>();
