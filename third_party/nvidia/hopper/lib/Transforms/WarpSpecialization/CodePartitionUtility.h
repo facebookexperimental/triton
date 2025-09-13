@@ -147,8 +147,6 @@ struct TmemDataChannelPost : Channel {
                       Operation *allocOp, bool isOperandD, unsigned uniqID)
       : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, uniqID),
         isOperandD(isOperandD), allocOp(allocOp) {
-    assert(consumers.size() == 1 &&
-           "TmemDataChannelPost must have a single consumer");
     channelKind = DataChannelKind::TMEMPost;
   }
 

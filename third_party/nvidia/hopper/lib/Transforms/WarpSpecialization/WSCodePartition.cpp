@@ -237,18 +237,31 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   // gen5
   Operation *producerOp = nullptr;
   SmallVector<Operation *> consumers;
+  SmallVector<Operation *> producers;
+  auto isConstTrue = [](Value v) {
+    if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+      if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
+        return attr.getValue();
+      }
+    }
+    return false;
+  };
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
     bool isOperandD = false;
-    for (auto user : allocOp->getUsers()) {
+    // Go through users of the first result (i.e exclude token).
+    for (auto user : tmemAllocOp.getResult().getUsers()) {
       if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        // Alloc associated with operand D can have multiple producers.
-        if (mmaOp.getD() == allocOp->getResult(0) && mmaOp.useAccumulator())
-          isOperandD = true;
-        else
+        if (mmaOp.getD() == allocOp->getResult(0)) {
+          if (isConstTrue(mmaOp.useAccumulator()))
+            isOperandD = true;
+          else
+            producers.push_back(user);
+        } else // other operands are consumers
           consumers.push_back(user);
       } else if (isa<ttng::TMEMStoreOp>(user)) {
-        assert(producerOp == nullptr);
-        producerOp = user;
+        producers.push_back(user);
+      } else if (isa<ttng::TMEMLoadOp>(user)) {
+        consumers.push_back(user);
       } else
         assert(0);
     }
@@ -257,6 +270,19 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
           -1, consumers, allocOp, isOperandD, channels.size()));
       return;
+    }
+
+    producerOp = producers[0];
+    if (producers.size() > 1) {
+      assert(consumers.size() == 1);
+      producerOp = nullptr;
+      for (auto *prod : producers) {
+        // Ignore the one that is not in the same block as consumer.
+        if (prod->getBlock() != consumers[0]->getBlock())
+          continue;
+        assert(producerOp == nullptr);
+        producerOp = prod;
+      }
     }
   } else {
     assert(isa<ttg::LocalAllocOp>(allocOp));
@@ -1736,7 +1762,7 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     // Disable code partitioning when numBuffers is 0.
     if (numBuffers > 0)
-      doCodePartition(funcOp, numBuffers);
+      doCodePartitionPost(funcOp, numBuffers);
   }
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
