@@ -540,6 +540,38 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
   }
 }
 
+void collectRegionsWithChannelsPost(
+    const SmallVector<Channel *> &channels,
+    DenseSet<Operation *> &regionsWithChannels) {
+  for (auto *channel : channels) {
+    if (channel->channelKind == DataChannelKind::TMEMPost) {
+      ttng::TmemDataChannelPost *tmemChannel =
+          static_cast<ttng::TmemDataChannelPost *>(channel);
+      if (tmemChannel->isOperandD) {
+        // Go through all dst ops and src ops.
+        for (auto user : cast<ttng::TMEMAllocOp>(tmemChannel->allocOp)
+                             .getResult()
+                             .getUsers()) {
+          auto *pOp = user->getParentOp();
+          if (auto forOp = dyn_cast<scf::ForOp>(pOp))
+            regionsWithChannels.insert(pOp);
+          if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
+            regionsWithChannels.insert(pOp);
+        }
+        continue;
+      }
+    }
+    auto *dst = channel->getDstOp();
+    auto *pOp = dst->getParentOp();
+    if (!pOp)
+      continue;
+    if (auto forOp = dyn_cast<scf::ForOp>(pOp))
+      regionsWithChannels.insert(pOp);
+    if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
+      regionsWithChannels.insert(pOp);
+  }
+}
+
 // Go through a list of operations in opList, recursively call into
 // createNewLoopWrapper or rewriteIfOp.
 void updateAccumLoopCount(SmallVector<Operation *> &opList,
@@ -635,6 +667,14 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
+    if (config->getGroup(idx)->channels.size() <= 1)
+      continue;
+    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+      continue;
+    Operation *parentOp = origForOp->getParentOp();
+    if (!isa<scf::ForOp>(parentOp) && !isa<scf::IfOp>(parentOp))
+      continue;
+
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
     // that is directly in forOp.
@@ -646,7 +686,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     // Find prevAccum right before the forOp.
     Value prevAccum;
     SmallVector<Operation *> parentChList;
-    Operation *parentOp = origForOp->getParentOp();
     // Get a list of ops directly under parentOp that contain channels in the
     // reuse group.
     getReuseChannels(config->getGroup(idx), parentOp, parentChList);

@@ -152,6 +152,7 @@ struct TmemDataChannelPost : Channel {
 
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
+  virtual unsigned getNumBuffers();
 };
 } // namespace nvidia_gpu
 } // namespace triton
@@ -190,6 +191,8 @@ void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
 
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels);
+void collectRegionsWithChannelsPost(const SmallVector<Channel *> &channels,
+                                    DenseSet<Operation *> &regionsWithChannels);
 void insertAsyncCopy(
     triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>

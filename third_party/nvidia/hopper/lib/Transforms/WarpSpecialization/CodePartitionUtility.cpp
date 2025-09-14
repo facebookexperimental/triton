@@ -42,43 +42,66 @@ Operation *ChannelPost::getDstOp() {
     if (!isa<ttg::LocalStoreOp>(user))
       consumers.push_back(user);
   }
-  if (consumers.size() == 1) return consumers[0];
+  if (consumers.size() == 1)
+    return consumers[0];
   assert(consumers.size() != 0);
   auto taskIds = getAsyncTaskIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
     auto taskIds2 = getAsyncTaskIds(consumers[i]);
-    assert(taskIds == taskIds2 && consumers[i]->getBlock() == consumers[0]->getBlock());
+    assert(taskIds == taskIds2 &&
+           consumers[i]->getBlock() == consumers[0]->getBlock());
   }
   return consumers.back();
 }
 
+static bool isTmemProducer(Operation *allocOp, Operation *user) {
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+    if (mmaOp.getD() == allocOp->getResult(0))
+      return true;
+  }
+  if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user))
+    return true;
+  return false;
+}
+
 Operation *ttng::TmemDataChannelPost::getSrcOp() {
-  if (isOperandD) return nullptr;
-  for (auto user : allocOp->getUsers()) {
-    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user))
+  if (isOperandD) // is inout
+    return nullptr;
+  for (auto user : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
+    if (isTmemProducer(allocOp, user))
       return user;
   }
   return nullptr;
 }
 
 Operation *ttng::TmemDataChannelPost::getDstOp() {
-  if (isOperandD) return nullptr;
+  if (isOperandD)
+    return nullptr;
   SmallVector<Operation *> consumers;
-  for (auto user : allocOp->getUsers()) {
-    if (!isa<ttng::TMEMStoreOp>(user) && !isa<ttng::TMEMStoreOp>(user))
+  for (auto user : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
+    if (!isTmemProducer(allocOp, user))
       consumers.push_back(user);
   }
-  if (consumers.size() == 1) return consumers[0];
+  if (consumers.size() == 1)
+    return consumers[0];
   assert(consumers.size() != 0);
   auto taskIds = getAsyncTaskIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
     auto taskIds2 = getAsyncTaskIds(consumers[i]);
-    assert(taskIds == taskIds2 && consumers[i]->getBlock() == consumers[0]->getBlock());
+    assert(taskIds == taskIds2 &&
+           consumers[i]->getBlock() == consumers[0]->getBlock());
   }
   return consumers.back();
 }
 
 unsigned ChannelPost::getNumBuffers() {
+  // get buffer.copy
+  if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
+    return copy.getInt();
+  return 1;
+}
+
+unsigned ttng::TmemDataChannelPost::getNumBuffers() {
   // get buffer.copy
   if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
     return copy.getInt();

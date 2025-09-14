@@ -1060,8 +1060,8 @@ DenseMap<Channel *, Value> createBufferPost(
     Value buffer;
 
     // For TMEM channel, multi-buffer TMEM alloc
-    if (channel->channelKind == DataChannelKind::TMEM) {
-    } else {
+    if (channel->channelKind == DataChannelKind::TMEMPost) {
+    } else { // must be SMEMPost
     }
     // Channels in the group share the same buffer.
     for (auto c : channels)
@@ -1675,6 +1675,12 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
             [&](Channel *a, Channel *b) { return a->uniqID < b->uniqID; });
   DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
   DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
+  for (auto *ch : orderedChannels) {
+    channelsGroupedByProducers[ch].push_back(ch);
+  }
+  for (auto *ch : orderedChannels) {
+    channelsGroupedByConsumers[ch].push_back(ch);
+  }
   // Step 2: find top-level ops that contain a channel, also create new ForOps
   // by adding phase and bufferIdx to the original ForOps, erase the original
   // ForOps.
@@ -1688,8 +1694,37 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       opList.push_back(op);
   }
   DenseSet<Operation *> regionsWithChannels;
-  collectRegionsWithChannels(channels, regionsWithChannels);
+  collectRegionsWithChannelsPost(channels, regionsWithChannels);
   ReuseConfig config;
+  DenseMap<unsigned, std::vector<Channel *>> bufferIdToChannels;
+  for (auto *ch : orderedChannels) {
+    Operation *allocOp;
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      ttng::TmemDataChannelPost *tmemChannel =
+          static_cast<ttng::TmemDataChannelPost *>(ch);
+      allocOp = tmemChannel->allocOp;
+    } else {
+      ChannelPost *smemChannel = static_cast<ChannelPost *>(ch);
+      allocOp = smemChannel->allocOp;
+    }
+    if (auto bufferId = allocOp->getAttrOfType<IntegerAttr>("buffer.id")) {
+      bufferIdToChannels[bufferId.getInt()].push_back(ch);
+      LLVM_DEBUG({
+        LDBG("\nchannel with allocOp: ");
+        allocOp->dump();
+      });
+    } else
+      assert(false);
+  }
+  for (auto kv : bufferIdToChannels) {
+    if (kv.second.size() > 1) {
+      ReuseGroup group;
+      group.channels = kv.second;
+      LDBG("ReuseGroup with size " << kv.second.size() << " buffer.id "
+                                   << kv.first << "\n");
+      config.groups.push_back(group);
+    }
+  }
   appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
                         &config);
   LLVM_DEBUG({
