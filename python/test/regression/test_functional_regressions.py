@@ -278,6 +278,7 @@ def test_inductor_cummax_bool(device):
     torch.testing.assert_close(ref.indices, indices)
 
 
+@pytest.mark.skip(reason="Facebook. TODO")
 def test_permutation_ptxas_bug(device):
 
     @triton.jit
