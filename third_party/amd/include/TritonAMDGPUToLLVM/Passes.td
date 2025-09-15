@@ -77,4 +77,21 @@ def TritonAMDGPULowerInstructionSchedHints : Pass<"triton-amdgpu-lower-insert-in
     ];
 }
 
+def ConvertAMDWarpSpecializeToLLVM : Pass<"convert-amdwarp-specialize-to-llvm", "mlir::ModuleOp"> {
+  let summary = "lower `ttg.warp_specialize` to LLVM";
+    let constructor = "mlir::triton::createConvertAMDWarpSpecializeToLLVMPass()";
+  let description = [{
+    The `convert-amdwarp-specialize-to-llvm` pass performs codegen for warp
+    specialization. It is a function-level transformation that rewrites
+    warp-specialized kernels by using shared memory and barriers to communicate
+    states between the default warpgroup and the worker warps.
+  }];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+  // let options = [
+  //   Option<"archGenerationName", "arch-generation-name",
+  //          "std::string", /*default=*/"std::string{}",
+  //          "GFX generation name of target device.">,
+  // ];
+}
+
 #endif

@@ -305,6 +305,7 @@ class HIPBackend(BaseBackend):
         ## 3. __HIP_FTZ is default to 1 and not exposed as a kernel argument.
         ##    For now it is used as a controller for developers only.
         __HIP_FTZ = True
+        amd.passes.ttgpuir.add_amdwarp_specialize_to_llvm(pm)
         amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)

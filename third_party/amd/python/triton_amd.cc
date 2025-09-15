@@ -37,6 +37,10 @@ const char *const amdTargetTriple = "amdgcn-amd-amdhsa";
 
 void init_triton_amd_passes_ttgpuir(py::module &&m) {
   using namespace mlir::triton;
+  m.def("add_amdwarp_specialize_to_llvm",
+        [](mlir::PassManager &pm) {
+          pm.addPass(mlir::triton::createConvertAMDWarpSpecializeToLLVMPass());
+        });
   m.def("add_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
