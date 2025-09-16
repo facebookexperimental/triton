@@ -74,28 +74,29 @@ static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, Operation *producer) {
   if (!oldRetType || oldRetType.getShape().size() != 1) {
     assert("Producer should only be a 1D Tensor");
   }
-  builder.setInsertionPoint(producer);
+  builder.setInsertionPointAfter(producer);
   auto expandDims =
       builder.create<tt::ExpandDimsOp>(producer->getLoc(), producerOutput, 1);
   auto allocOp = alloc1DTMEMBuffer(builder, expandDims);
   auto tmemDesc = allocOp.getType();
+  auto expandType = expandDims.getType();
 
   // Verify that these layouts are compatible.
   bool layoutTmemCompatible =
-      ttng::isDistributedLayoutTMemCompatible(expandDims, oldRetType, tmemDesc);
+      ttng::isDistributedLayoutTMemCompatible(expandDims, expandType, tmemDesc);
   auto oldLayout = expandDims.getType().getEncoding();
   auto newLayout = oldLayout;
   if (!layoutTmemCompatible) {
-    // TODO: Can this ever be reached?
+    // Is this necessary?
     int numWarps = ttg::lookupNumWarps(expandDims);
     newLayout = ttng::getTmemCompatibleLayout(
-        tmemDesc.getShape()[0], tmemDesc.getShape()[1], oldRetType, numWarps);
+        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
   }
   mlir::Operation *src = expandDims;
   if (newLayout != oldLayout) {
-    auto ty = cast<RankedTensorType>(oldRetType);
+    auto ty = cast<RankedTensorType>(expandType);
     auto newTy = ty.cloneWithEncoding(newLayout);
-    builder.setInsertionPoint(expandDims);
+    builder.setInsertionPointAfter(expandDims);
     src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
                                                expandDims);
   }
