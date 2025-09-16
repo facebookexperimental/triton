@@ -79,10 +79,9 @@ public:
       auto consumer = tmemEnds[i];
       assert(producer != nullptr);
       assert(consumer != nullptr);
+      // Actual generate the TMEM operations.
       replaceWith1DTMEM(moduleOp, producer, consumer);
-      auto allocOp = alloc1DTMEMBuffer(moduleOp, producer, consumer);
     }
-    // Allocate the Global TMEM alloc calls.
   }
 };
 
