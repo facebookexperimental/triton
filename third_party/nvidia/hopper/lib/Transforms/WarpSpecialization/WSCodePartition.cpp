@@ -874,12 +874,12 @@ void createToken(
     LLVM_DEBUG({
       LDBG("createToken key:");
       LDBG("consumer: ");
-      key->getRepOp()->dump();
+      key->getDstOp()->dump();
 
       LDBG("createToken channelsGroupedByConsumers:");
       for (auto map_key : make_first_range(channelsGroupedByConsumers)) {
         LDBG("representative consumer: ");
-        map_key->getRepOp()->dump();
+        map_key->getDstOp()->dump();
       }
     });
     assert(it != channelsGroupedByConsumers.end());
@@ -895,8 +895,7 @@ void createToken(
     auto producerOp = it->second.front()->getSrcOp();
     auto dstOp = it->second.front()->getDstOp();
 
-    // Also create producerBarrier for TMEM channel where producer is the D
-    // operand of gen5.
+    // Pre-allocate TMA barrier, do not use token for producer.
     if (isa<tt::DescriptorLoadOp>(producerOp)) {
       commChannel.producerBarrier =
           createBarrierAlloc(funcOp, channel->numBuffers);
@@ -936,12 +935,141 @@ void createToken(
       if (!isa<tt::DescriptorLoadOp>(producerOp) ||
           !useGen5Barrier) { // isa<ttng::TCGen5MMAOp>(consumerOp)) {
         ttnvws::TokenLoadType tokenLoadType;
-#if 0
         assert(copyOpMap.count(channel));
         auto copyOp = copyOpMap.find(channel)->second.first;
-#else
+        if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
+          tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
+        } else if (isa<tt::DescriptorLoadOp>(copyOp)) {
+          tokenLoadType = ttnvws::TokenLoadType::TMALoadOp;
+        } else if (isa<ttg::LocalStoreOp>(copyOp)) {
+          tokenLoadType = ttnvws::TokenLoadType::LocalStoreOp;
+        } else if (isa<ttng::TMEMLoadOp>(consumerOp)) {
+          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
+        } else if (isa<ttng::TCGen5MMAOp>(consumerOp)) {
+          // For operand A of gen5, we have tmem_store + gen5.
+          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
+        } else {
+          llvm_unreachable("Unexpected load type");
+        }
+        Value v;
+        if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
+          v = builder.create<ttnvws::CreateTokenOp>(
+              funcOp.getLoc(), channel->numBuffers, tokenLoadType);
+        else
+          v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
+                                                    tokenLoadType);
+        commChannel.tokens[consumerAsyncTaskId] = v;
+      }
+
+      if (useGen5Barrier) {
+        Value v = createBarrierAlloc(funcOp, channel->numBuffers);
+        commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+        gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
+      }
+    }
+
+    // Channels in the group share the same set of tokens.
+    for (auto &c : it->second) {
+      tokenMap[c] = commChannel;
+    }
+    // For channels in the same reuse group as channel, use the same token.
+    if (reuseGrp >= 0) {
+      for (auto *reuse : config->getGroup(reuseGrp)->channels)
+        tokenMap[reuse] = commChannel;
+    }
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "Communication Channels: \n";
+    for (auto &item : tokenMap) {
+      llvm::dbgs() << "\ndata channel: \n";
+      llvm::dbgs() << *item.first->getSrcOp() << "\n";
+      llvm::dbgs() << *item.first->getDstOp() << "\n";
+      llvm::dbgs() << "communication channel: \n";
+      for (auto &kv : item.second.tokens) {
+        llvm::dbgs() << "token: " << kv.first << " " << kv.second << "\n";
+      }
+      if (item.second.producerBarrier)
+        llvm::dbgs() << "producer barrier: " << *item.second.producerBarrier
+                     << "\n";
+      for (auto &kv : item.second.consumerBarriers)
+        llvm::dbgs() << "consumer barrier: " << kv.first << " " << kv.second
+                     << "\n";
+    }
+  });
+}
+
+void createTokenPost(
+    const DenseMap<Channel *, SmallVector<Channel *>>
+        &channelsGroupedByConsumers,
+    const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp,
+    const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
+    DenseMap<Channel *, CommChannel> &tokenMap, ReuseConfig *config) {
+  OpBuilder builder(funcOp);
+  builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+  DenseMap<ttng::TCGen5MMAOp, Channel *> gen5Barriers;
+  for (auto *key : orderedChannels) {
+    auto it = channelsGroupedByConsumers.find(key);
+    LLVM_DEBUG({
+      LDBG("createToken key:");
+      LDBG("consumer: ");
+      key->getDstOp()->dump();
+      LDBG("producer: ");
+      key->getSrcOp()->dump();
+    });
+    assert(it != channelsGroupedByConsumers.end());
+    Channel *channel = it->second.front();
+    // For each reuse group, choose a representative channel.
+    int reuseGrp = channelInReuseGroup(channel, config);
+    if (reuseGrp >= 0) {
+      if (channel != config->getGroup(reuseGrp)->channels[0])
+        continue;
+    }
+
+    CommChannel commChannel;
+    auto producerOp = it->second.front()->getSrcOp();
+    auto dstOp = it->second.front()->getDstOp();
+
+    // Pre-allocate TMA barrier, do not use token for producer.
+    if (isa<tt::DescriptorLoadOp>(producerOp)) {
+      commChannel.producerBarrier =
+          createBarrierAlloc(funcOp, channel->numBuffers);
+    }
+    // If channel is from a gen5, pre-allocate gen5 barrier.
+    bool hasProdBar = false;
+    if (isa<ttng::TCGen5MMAOp>(producerOp)) {
+      commChannel.producerBarrier =
+          createBarrierAlloc(funcOp, channel->numBuffers);
+      hasProdBar = true;
+    }
+    assert(channel->relation.second.size() == 1);
+    for (auto consumerAsyncTaskId : channel->relation.second) {
+      // It is possible that this channel has two consumer taskIds.
+      Operation *consumerOp =
+          getUniqueActualConsumer(dstOp, consumerAsyncTaskId);
+
+      // If it is used by gen5, we can create a gen5 barrier for consumer
+      // release.
+      bool useGen5Barrier = isa<ttng::TCGen5MMAOp>(consumerOp) &&
+                            producerOp->getBlock() == consumerOp->getBlock();
+      LLVM_DEBUG({
+        LDBG("-- createToken: useGen5Barrier = " << useGen5Barrier);
+        producerOp->dump();
+        dstOp->dump();
+        consumerOp->dump();
+      });
+      if (useGen5Barrier) {
+        // FIXME: check to see if there is another conflict of using inline
+        // barrier.
+        auto mmaOp = cast<ttng::TCGen5MMAOp>(consumerOp);
+        if (gen5Barriers.count(mmaOp) && gen5Barriers[mmaOp] != channel) {
+          // Set useGen5Barrier to false if necessary.
+        }
+      }
+      // Need token only when we are not using inline barriers
+      if (!hasProdBar || !useGen5Barrier) {
+        ttnvws::TokenLoadType tokenLoadType;
         auto copyOp = channel->getSrcOp();
-#endif
         if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
         } else if (isa<tt::DescriptorLoadOp>(copyOp)) {
@@ -1906,8 +2034,8 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   // each channel.
   DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
   DenseMap<Channel *, CommChannel> tokenMap;
-  createToken(channelsGroupedByConsumers, orderedChannels, funcOp, copyOpMap,
-              tokenMap, &config);
+  createTokenPost(channelsGroupedByConsumers, orderedChannels, funcOp,
+                  copyOpMap, tokenMap, &config);
   LLVM_DEBUG({
     LDBG("\n\nafter createToken");
     funcOp.dump();
