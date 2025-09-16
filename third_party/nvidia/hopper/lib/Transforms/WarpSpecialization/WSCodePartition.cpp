@@ -749,13 +749,21 @@ void createToken(
   });
 }
 
-static ttg::LocalAllocOp hoistLocalAlloc(OpBuilder &builder,
-                                         ttg::LocalAllocOp oldAlloc,
-                                         int numBuffers) {
-  auto oldRetType = oldAlloc.getType();
-  auto allocDescType = cast<triton::gpu::MemDescType>(oldRetType);
-  SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
-                                oldRetType.getShape().end()};
+static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
+                             int numBuffers) {
+
+  Type oldAllocType;
+
+  if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
+    oldAllocType = localAlloc.getType();
+  } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
+    oldAllocType = tmemAlloc.getType();
+  } else {
+    llvm_unreachable("Unexpected alloc type");
+  }
+
+  auto allocDescType = cast<triton::gpu::MemDescType>(oldAllocType);
+  SmallVector<int64_t> shape(allocDescType.getShape());
   if (numBuffers >= 1) {
     shape.insert(shape.begin(), numBuffers);
   }
@@ -763,33 +771,51 @@ static ttg::LocalAllocOp hoistLocalAlloc(OpBuilder &builder,
   Type memdescType = ttg::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
-  return builder.create<ttg::LocalAllocOp>(oldAlloc.getLoc(), memdescType);
-}
-
-static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
-                                         ttng::TMEMAllocOp oldTMemAllocOp,
-                                         int numBuffers) {
-  Location loc = oldTMemAllocOp.getLoc();
-  auto oldRetType = oldTMemAllocOp.getType();
-  SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
-                                oldRetType.getShape().end()};
-  // We can still use subView in createTMEMCopy even if numBuffers is 1.
-  if (numBuffers >= 1) {
-    shape.insert(shape.begin(), numBuffers);
+  Operation *newAlloc;
+  if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
+    newAlloc =
+        builder.create<ttg::LocalAllocOp>(oldAlloc->getLoc(), memdescType);
+  } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
+    newAlloc = builder.create<ttng::TMEMAllocOp>(
+        oldAlloc->getLoc(), memdescType, tmemAlloc.getToken());
+  } else {
+    llvm_unreachable("Unexpected alloc type");
   }
-  Type accMemDescType = triton::gpu::MemDescType::get(
-      shape, oldRetType.getElementType(), oldRetType.getEncoding(),
-      oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return builder.create<ttng::TMEMAllocOp>(oldTMemAllocOp.getLoc(),
-                                           accMemDescType, nullptr);
+
+  auto idx = builder.create<arith::ConstantIntOp>(oldAlloc->getLoc(), 0, 32);
+  auto newBuf = builder.create<ttg::MemDescIndexOp>(
+      oldAlloc->getLoc(), oldAllocType, newAlloc->getResult(0), idx);
+  idx->moveBefore(oldAlloc);
+  newBuf->moveBefore(oldAlloc);
+
+  if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
+    if (localAlloc.getSrc() != nullptr) {
+      auto storeOp = builder.create<ttg::LocalStoreOp>(
+          oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
+      storeOp->moveBefore(oldAlloc);
+    }
+  } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
+    if (tmemAlloc.getSrc() != nullptr) {
+      auto pred =
+          builder.create<arith::ConstantIntOp>(oldAlloc->getLoc(), 1, 1);
+      auto storeOp = builder.create<ttng::TMEMStoreOp>(
+          oldAlloc->getLoc(), tmemAlloc.getSrc(), newBuf, pred);
+      pred->moveBefore(oldAlloc);
+      storeOp->moveBefore(oldAlloc);
+    }
+  }
+
+  // Replace oldAlloc with newAlloc.
+  oldAlloc->replaceAllUsesWith(newBuf);
+  oldAlloc->erase();
+  return newAlloc->getResult(0);
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
 // the buffer array will contain numBuffers.
 DenseMap<Channel *, Value> createBuffer(
     DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
-    const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp,
-    ReuseConfig *config) {
+    const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp) {
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
@@ -816,7 +842,8 @@ DenseMap<Channel *, Value> createBuffer(
     Value buffer;
 
     LLVM_DEBUG({
-      LDBG("Creating buffers for channel:");
+      LDBG("Creating buffers for channel [" << channel->uniqID << "] "
+                                            << to_string(channel->channelKind));
       LDBG("Producer:");
       DBGS() << *srcOp << "\n";
       LDBG("Consumer:");
@@ -826,13 +853,14 @@ DenseMap<Channel *, Value> createBuffer(
     // For TMEM channel, multi-buffer TMEM alloc
     if (channel->channelKind == DataChannelKind::TMEM) {
       // Move TMEM alloc to the beginning of the function.
-      ttng::TmemDataChannel *tmemChannel =
-          static_cast<ttng::TmemDataChannel *>(channel);
-      auto oldTMemAllocOp = tmemChannel->getAllocOp();
-      buffer = createTMemAlloc(builder, oldTMemAllocOp, numBuffers);
-    } else if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
+      if (auto oldAlloc = dyn_cast<ttng::TMEMAllocOp>(srcOp)) {
+        buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+      }
+    } else if (channel->channelKind == DataChannelKind::SMEM) {
       // Move LocalAlloc to the beginning of the function.
-      buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+      if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
+        buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+      }
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       // Get basic information from tensorType
@@ -891,15 +919,6 @@ DenseMap<Channel *, Value> createBuffer(
     for (auto c : channels)
       bufferMap[c] = buffer;
   }
-  unsigned groupId = 0;
-  for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    for (auto *c : config->getGroup(idx)->channels) {
-      bufferMap[c].getDefiningOp()->setAttr(
-          "allocation.shareGroup",
-          IntegerAttr::get(IntegerType::get(context, 32), groupId));
-    }
-    ++groupId;
-  }
   return bufferMap;
 }
 
@@ -909,11 +928,10 @@ DenseMap<Channel *, Value> createBuffer(
 // (TMEM load). If the inline barrier is used for A/B operands of gen5,
 // insert WaitBarrier as ProducerAquire; If it is used for D operand, insert
 // WaitBarrier as ConsumerWait.
-ttng::WaitBarrierOp
-desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
-                  Value barrierAlloc, Value bufferIdx, Value inPhase,
-                  unsigned numBuffers, Operation *producerOrConsumer,
-                  DenseSet<Operation *> &regionsWithChannels,
+ttng::WaitBarrierOp desyncTCGen5MMAOp(
+    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
+    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
+    Operation *producerOrConsumer, DenseSet<Operation *> &regionsWithChannels,
     mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
   // Attach the barrier as an operand of the mma op.
   builder.setInsertionPoint(mmaOp);
@@ -1404,6 +1422,14 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   groupChannels(channels, channelsGroupedByProducers,
                 channelsGroupedByConsumers, orderedChannels);
 
+  // Step 3: Create buffers. An array of buffers for each channel.
+  DenseMap<Channel *, Value> bufferMap =
+      createBuffer(channelsGroupedByProducers, channels, funcOp);
+  LLVM_DEBUG({
+    LDBG("\n\nafter createBuffer");
+    funcOp.dump();
+  });
+
   // Step 3: reorder producer ops and the backward slices of the producer ops.
   reorderProducerOps(channels);
 
@@ -1426,14 +1452,6 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
                         &config);
   LLVM_DEBUG({
     LDBG("\n\nafter appendAccumCntsForOps");
-    funcOp.dump();
-  });
-
-  // Step 5: Create buffers. An array of buffers for each channel.
-  DenseMap<Channel *, Value> bufferMap =
-      createBuffer(channelsGroupedByProducers, channels, funcOp, &config);
-  LLVM_DEBUG({
-    LDBG("\n\nafter createBuffer");
     funcOp.dump();
   });
 
