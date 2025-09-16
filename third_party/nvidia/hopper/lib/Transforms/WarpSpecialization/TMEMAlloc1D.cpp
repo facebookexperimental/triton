@@ -22,6 +22,7 @@ namespace mlir {
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 static ttng::TMEMAllocOp alloc1DTMEMBuffer(OpBuilder &builder,
+                                           ModuleOp &moduleOp,
                                            Operation *expandedInput) {
   // Assume we are only every transferring single output ops.
   auto oldRetType =
@@ -56,14 +57,15 @@ static ttng::TMEMAllocOp alloc1DTMEMBuffer(OpBuilder &builder,
       ttg::MemDescType::get(shape, elemType, encoding, tensorMemorySpace,
                             /*mutableMemory=*/true);
 
-  builder.clearInsertionPoint();
+  builder.setInsertionPointToStart(&moduleOp.getBodyRegion().front());
   auto allocCall = builder.create<ttng::TMEMAllocOp>(
       expandedInput->getLoc(), tmemDesc, builder.getType<gpu::AsyncTokenType>(),
       /*src=*/Value());
   return allocCall;
 }
 
-static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, Operation *producer) {
+static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, ModuleOp &moduleOp,
+                                     Operation *producer) {
   assert(producer->hasAttr("tmem.start") &&
          "Producer must have tmem.start. We only support 1 producer per "
          "consumer.");
@@ -77,7 +79,7 @@ static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, Operation *producer) {
   builder.setInsertionPointAfter(producer);
   auto expandDims =
       builder.create<tt::ExpandDimsOp>(producer->getLoc(), producerOutput, 1);
-  auto allocOp = alloc1DTMEMBuffer(builder, expandDims);
+  auto allocOp = alloc1DTMEMBuffer(builder, moduleOp, expandDims);
   auto tmemDesc = allocOp.getType();
   auto expandType = expandDims.getType();
 
@@ -101,6 +103,10 @@ static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, Operation *producer) {
                                                expandDims);
   }
   // Generate the store
+  // TODO: What value should the predciate be?
+  Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
+  builder.create<ttng::TMEMStoreOp>(src->getLoc(), src->getResult(0), allocOp,
+                                    trueVal);
   // Remove the attribute. There may be multiple users, possibly within
   // the same partition, so we can't remove the OP entirely.
   producer->removeAttr("tmem.start");
@@ -115,9 +121,9 @@ static void TMEMLoad1D(OpBuilder &builder, ttng::TMEMAllocOp allocOP,
   return;
 }
 
-static void replaceWith1DTMEM(OpBuilder &builder, Operation *producer,
-                              Operation *consumer) {
-  auto allocOp = TMEMStore1D(builder, producer);
+static void replaceWith1DTMEM(OpBuilder &builder, ModuleOp &moduleOp,
+                              Operation *producer, Operation *consumer) {
+  auto allocOp = TMEMStore1D(builder, moduleOp, producer);
   TMEMLoad1D(builder, allocOp, consumer);
 }
 
@@ -152,15 +158,16 @@ public:
     });
     assert(tmemStarts.size() == tmemEnds.size());
     // Generate the actual TMEM operations.
-    OpBuilder builder(moduleOp);
+    OpBuilder builder(moduleOp.getContext());
     for (size_t i = 0; i < tmemStarts.size(); i++) {
       auto producer = tmemStarts[i];
       auto consumer = tmemEnds[i];
       assert(producer != nullptr);
       assert(consumer != nullptr);
       // Actual generate the TMEM operations.
-      replaceWith1DTMEM(builder, producer, consumer);
+      replaceWith1DTMEM(builder, moduleOp, producer, consumer);
     }
+    std::cout << "REACHED END" << std::endl;
   }
 };
 
