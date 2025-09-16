@@ -460,6 +460,30 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttng::AsyncCLCQueryCancelOp>(retType,
                                                              response_addr);
            })
+      .def("create_alloc_clc_responses",
+           [](TritonOpBuilder &self, int numResponses, Attribute clcResEncoding) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             auto memDescType = ttg::MemDescType::get(
+                 {numResponses}, self.getBuilder().getIntegerType(128, /*signed=*/false),
+                 clcResEncoding, memorySpace, /*mutableMemory=*/true);
+
+             mlir::Value bufferViews =
+                 self.create<ttg::LocalAllocOp>(memDescType);
+
+             return bufferViews;
+           })
+      .def("clc_issue",
+           [](TritonOpBuilder &self, Value responseAddr, Value mbar) -> void {
+             self.create<ttng::AsyncCLCTryCancelOp>(mbar, responseAddr);
+           })
+      .def("clc_query",
+           [](TritonOpBuilder &self, Value cta_id,
+              Value response_addr) -> Value {
+             auto retType = cast<RankedTensorType>(cta_id.getType());
+             return self.create<ttng::AsyncCLCQueryCancelOp>(retType,
+                                                             response_addr);
+           })
       .def("create_async_TMA_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value mbarrier, Value pred, Value result,
