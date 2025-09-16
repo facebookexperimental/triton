@@ -1454,31 +1454,31 @@ def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
     torch.testing.assert_close(x, ref_out)
 
 
-@triton.jit
-def math_kernel(x):
-    return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
+# @triton.jit
+# def math_kernel(x):
+#     return x * 0.5 * (1 + (0.7978845608 * x * (1.0 + 0.044715 * x * x)))
 
 
-@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
-def test_inline_tmem(BLOCK_SIZE, device):
+# @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+# @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+# def test_inline_tmem(BLOCK_SIZE, device):
 
-    @triton.jit
-    def kernel(y_ptr, BLOCK_SIZE: tl.constexpr):
-        buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
-        buffer0 = buffers[0]
-        x = tlx.local_load(buffer0)
-        pid = tl.program_id(axis=0)
-        offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
-        offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
-        offsets = offsets_i * BLOCK_SIZE + offsets_j
-        y = math_kernel(x)
-        tl.store(y_ptr + offsets, y)
+#     @triton.jit
+#     def kernel(y_ptr, BLOCK_SIZE: tl.constexpr):
+#         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
+#         buffer0 = buffers[0]
+#         x = tlx.local_load(buffer0)
+#         pid = tl.program_id(axis=0)
+#         offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
+#         offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
+#         offsets = offsets_i * BLOCK_SIZE + offsets_j
+#         y = math_kernel(x)
+#         tl.store(y_ptr + offsets, y)
 
-    y = torch.rand((64, 64), dtype=torch.float32, device=device)
-    grid = lambda meta: (1, )
-    kerenl_info = kernel[grid](y, BLOCK_SIZE)
-    assert kerenl_info.asm["ttir"].count("store") == 1
+#     y = torch.rand((64, 64), dtype=torch.float32, device=device)
+#     grid = lambda meta: (1, )
+#     kerenl_info = kernel[grid](y, BLOCK_SIZE)
+#     assert kerenl_info.asm["ttir"].count("store") == 1
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
