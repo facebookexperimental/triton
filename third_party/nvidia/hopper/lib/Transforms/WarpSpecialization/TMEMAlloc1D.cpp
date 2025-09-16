@@ -64,8 +64,9 @@ static ttng::TMEMAllocOp alloc1DTMEMBuffer(OpBuilder &builder,
   return allocCall;
 }
 
-static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, ModuleOp &moduleOp,
-                                     Operation *producer) {
+static ttng::TMEMAllocOp
+TMEMStore1D(OpBuilder &builder, ModuleOp &moduleOp, Operation *producer,
+            std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt) {
   assert(producer->hasAttr("tmem.start") &&
          "Producer must have tmem.start. We only support 1 producer per "
          "consumer.");
@@ -79,7 +80,12 @@ static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, ModuleOp &moduleOp,
   builder.setInsertionPointAfter(producer);
   auto expandDims =
       builder.create<tt::ExpandDimsOp>(producer->getLoc(), producerOutput, 1);
-  auto allocOp = alloc1DTMEMBuffer(builder, moduleOp, expandDims);
+  ttng::TMEMAllocOp allocOp;
+  if (allocOpBuffer.has_value()) {
+    allocOp = allocOpBuffer.value();
+  } else {
+    allocOp = alloc1DTMEMBuffer(builder, moduleOp, expandDims);
+  }
   auto tmemDesc = allocOp.getType();
   auto expandType = expandDims.getType();
 
@@ -113,18 +119,43 @@ static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, ModuleOp &moduleOp,
   return allocOp;
 }
 
-static void TMEMLoad1D(OpBuilder &builder, ttng::TMEMAllocOp allocOP,
-                       Operation *consumer) {
+static void TMEMLoad1D(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
+                       Operation *producer, Operation *consumer) {
   assert(consumer->hasAttr("tmem.end") &&
          "Consumer must have tmem.start. We only support 1 consumer per "
          "producer.");
-  return;
+  // Generate the load
+  builder.setInsertionPoint(consumer);
+  auto producerOutput = producer->getResult(0);
+  auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
+  auto targetEncoding = oldInputType.getEncoding();
+  // auto ld = rewriter.create<triton::nvidia_gpu::TMEMLoadOp>(
+  //   loc, newAccType, tokType, acc, /*dep=*/mma.getToken());
+  // TODO: Determine what to set for result type.
+  auto loadOp = builder.create<ttng::TMEMLoadOp>(
+      consumer->getLoc(), nullptr, builder.getType<gpu::AsyncTokenType>(),
+      allocOp);
+  // Generate the reshape
+  auto reshape = builder.create<tt::ReshapeOp>(consumer->getLoc(),
+                                               oldInputType.getShape(), loadOp);
+  // Generate a convert layout.
+  auto newInput = builder.create<ttg::ConvertLayoutOp>(consumer->getLoc(),
+                                                       targetEncoding, reshape);
+  // Replace the uses in the consumer
+  size_t numOperands = consumer->getNumOperands();
+  for (unsigned i = 0; i < numOperands; i++) {
+    if (consumer->getOperand(i) == producerOutput) {
+      consumer->setOperand(i, newInput);
+    }
+  }
+  // Remove the attribute since we reuse the consumer.
+  consumer->removeAttr("tmem.end");
 }
 
 static void replaceWith1DTMEM(OpBuilder &builder, ModuleOp &moduleOp,
                               Operation *producer, Operation *consumer) {
   auto allocOp = TMEMStore1D(builder, moduleOp, producer);
-  TMEMLoad1D(builder, allocOp, consumer);
+  TMEMLoad1D(builder, allocOp, producer, consumer);
 }
 
 class NVGPUTest1DTMEMAllocPass
@@ -164,6 +195,7 @@ public:
       auto consumer = tmemEnds[i];
       assert(producer != nullptr);
       assert(consumer != nullptr);
+      builder.setInsertionPointToStart(&moduleOp.getBodyRegion().front());
       // Actual generate the TMEM operations.
       replaceWith1DTMEM(builder, moduleOp, producer, consumer);
     }
