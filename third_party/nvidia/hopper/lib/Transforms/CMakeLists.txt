@@ -3,6 +3,7 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/CodePartitionUtility.cpp
   WarpSpecialization/PingPong.cpp
   WarpSpecialization/TaskIdPropagation.cpp
+  WarpSpecialization/TMEMAlloc1D.cpp
   WarpSpecialization/Utility.cpp
   WarpSpecialization/WSBuffer.cpp
   WarpSpecialization/WSCodePartition.cpp
