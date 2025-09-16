@@ -103,13 +103,12 @@ void getTransitiveUsers(Value root,
 
 // When traversing gen5, producerOp can be either the defining op of operand
 // A or the accumulator.
-static void createChannel(Operation *producerOp, Operation *op,
-                          mlir::DominanceInfo &dom,
+static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
                           SmallVector<std::unique_ptr<Channel>> &channels,
                           bool opndAOfGen5, unsigned producerNumBuffers) {
   // For TMEM channels, op is Gen5 op, producerOp can be either A operand
   // or accumulator.
-  auto producerTaskIds = getAsyncTaskIds(opndAOfGen5 ? producerOp : op);
+  auto producerTaskIds = getAsyncTaskIds(producerOp);
   auto producerTaskId = producerTaskIds.front();
   for (auto result : producerOp->getResults()) {
     if (result.use_empty()) {
@@ -120,15 +119,15 @@ static void createChannel(Operation *producerOp, Operation *op,
     getTransitiveUsers(result, users);
     for (auto user : users) {
       auto userOp = user.first;
-      if (op == userOp && !opndAOfGen5)
+      if (producerOp == userOp && !opndAOfGen5)
         continue;
       // rule out users that are not dominated by op
-      if (op->getBlock() != userOp->getBlock()) {
-        if (!dom.properlyDominates(op->getParentOp(), userOp)) {
+      if (producerOp->getBlock() != userOp->getBlock()) {
+        if (!dom.properlyDominates(producerOp->getParentOp(), userOp)) {
           continue;
         }
       } else {
-        if (!dom.properlyDominates(op, userOp) && op != userOp)
+        if (!dom.properlyDominates(producerOp, userOp) && producerOp != userOp)
           continue;
       }
 
@@ -143,24 +142,18 @@ static void createChannel(Operation *producerOp, Operation *op,
       const unsigned NUM_TMEM_BUFFERS = 2;
       // Add a channel from the single producer task to consumerTaskIds.
       if (consumerTaskIds.size() > 0) {
-        if (auto dotOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
-          // When traversing Gen5MMA, we create channel for the accumulator.
-          if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(producerOp)) {
-            // Always use two buffers for TMEM channels.
-            channels.push_back(std::make_unique<ttng::TmemDataChannel>(
-                producerTaskId, consumerTaskIds, tmemAllocOp, dotOp, userOp,
-                user.second, NUM_TMEM_BUFFERS, channels.size()));
-          }
-          if (auto tAllocOp = dyn_cast<ttg::LocalAllocOp>(producerOp)) {
-            channels.push_back(std::make_unique<Channel>(
-                producerTaskId, consumerTaskIds, userOp, user.second,
-                producerNumBuffers, channels.size()));
-          }
+        DataChannelKind channelKind = DataChannelKind::SMEM;
+        if (isa<ttng::TMEMAllocOp, ttng::TCGen5MMAOp>(producerOp)) {
+          channelKind = DataChannelKind::TMEM;
+        } else if (auto tAllocOp = dyn_cast<ttg::LocalAllocOp>(producerOp)) {
+          channelKind = DataChannelKind::SMEM;
         } else {
-          channels.push_back(std::make_unique<Channel>(
-              producerTaskId, consumerTaskIds, userOp, user.second,
-              producerNumBuffers, channels.size()));
+          channelKind = DataChannelKind::REG;
         }
+
+        channels.push_back(std::make_unique<Channel>(
+            producerTaskId, consumerTaskIds, userOp, user.second,
+            producerNumBuffers, channels.size(), channelKind));
       }
     }
   }
@@ -168,10 +161,18 @@ static void createChannel(Operation *producerOp, Operation *op,
 
 // Can be one end of the channel.
 static bool isChannelAnchorOp(Operation *op) {
-  if (isa<tt::LoadOp, tt::DescriptorLoadOp, ttg::LocalAllocOp,
-          ttng::TMEMAllocOp>(op) ||
+  if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
       isa<mlir::triton::DotOpInterface>(op))
     return true;
+  // Local alloc op with a register operand can be the producer of a channel.
+  if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
+    if (allocOp.getSrc())
+      return true;
+  }
+  if (auto allocOp = dyn_cast<ttng::TMEMAllocOp>(op)) {
+    if (allocOp.getSrc())
+      return true;
+  }
   // Any computation tensor op?
   if (dyn_cast<arith::ConstantOp>(op) || dyn_cast<scf::IfOp>(op) ||
       dyn_cast<scf::ForOp>(op))
@@ -189,35 +190,27 @@ static bool isChannelAnchorOp(Operation *op) {
 void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                           triton::FuncOp &funcOp, unsigned numBuffers) {
   mlir::DominanceInfo dom(funcOp);
-  funcOp.walk([&](Operation *op) {
+  funcOp.walk([&](Operation *producerOp) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
-    if (isChannelAnchorOp(op)) {
-      auto producerTaskIds = getAsyncTaskIds(op);
+    if (isChannelAnchorOp(producerOp)) {
+      auto producerTaskIds = getAsyncTaskIds(producerOp);
       if (producerTaskIds.empty() || producerTaskIds.size() > 1) {
         LLVM_DEBUG({
           LDBG(" ignoring ops without async task id or with multiple task "
                "ids: ");
-          op->dump();
+          producerOp->dump();
         });
         return;
       }
       auto producerTaskId = producerTaskIds.front();
       unsigned producerNumBuffers = numBuffers;
-      if (auto forOp = op->getParentOfType<scf::ForOp>()) {
+      if (auto forOp = producerOp->getParentOfType<scf::ForOp>()) {
         producerNumBuffers = getNumBuffersOrDefault(forOp, numBuffers);
       }
 
-      auto producerOp = op;
-      if (auto dotOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
-        auto accumulator = dotOp.getD();
-        // Here producerOp is tmem_alloc.
-        producerOp = accumulator.getDefiningOp();
-        createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
-      } else {
-        // If the consumer is in a different task, create a channel.
-        createChannel(producerOp, op, dom, channels, false, producerNumBuffers);
-      }
+      // If the consumer is in a different task, create a channel.
+      createChannel(producerOp, dom, channels, false, producerNumBuffers);
     }
   });
 
@@ -226,7 +219,7 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
     LDBG(channels.size() << " async channels:");
     for (unsigned i = 0; i < channels.size(); i++) {
       const auto &channel = channels[i];
-      LDBG("channel [" << i << "]");
+      LDBG("channel [" << i << "]  " << to_string(channel->channelKind));
       LDBG("producer op: " << channel->relation.first);
       channel->getSrcOp()->dump();
       for (auto &asyncTaskId : channel->relation.second)
@@ -921,7 +914,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
                   Value barrierAlloc, Value bufferIdx, Value inPhase,
                   unsigned numBuffers, Operation *producerOrConsumer,
                   DenseSet<Operation *> &regionsWithChannels,
-                  mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
+    mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
   // Attach the barrier as an operand of the mma op.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);

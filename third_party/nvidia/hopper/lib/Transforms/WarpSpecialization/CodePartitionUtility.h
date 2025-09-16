@@ -14,16 +14,29 @@ namespace mlir {
 
 namespace tt = mlir::triton;
 
-enum class DataChannelKind { SMEM, TMEM };
+enum class DataChannelKind { SMEM, TMEM, REG };
+
+static inline std::string to_string(DataChannelKind k) {
+  switch (k) {
+  case DataChannelKind::SMEM:
+    return "smem";
+  case DataChannelKind::TMEM:
+    return "tmem";
+  case DataChannelKind::REG:
+    return "reg";
+  }
+  return "Unknown";
+}
 
 struct Channel {
 public:
   using Relation = std::pair<int, SmallVector<int>>;
 
   Channel(int producer, SmallVector<int> &consumers, Operation *op,
-          unsigned operandIdx, unsigned numBuffers, unsigned ID)
+          unsigned operandIdx, unsigned numBuffers, unsigned ID,
+          DataChannelKind channelKind = DataChannelKind::SMEM)
       : relation(producer, consumers), op(op), operandIdx(operandIdx),
-        numBuffers(numBuffers), uniqID(ID) {}
+        numBuffers(numBuffers), uniqID(ID), channelKind(channelKind) {}
 
   bool operator==(const Channel &c) {
     return relation == c.relation && operandIdx == c.operandIdx && op == c.op;
