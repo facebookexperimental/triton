@@ -31,16 +31,35 @@ static ttng::TMEMAllocOp alloc1DTMEMBuffer(OpBuilder &builder,
   }
   SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
                                 oldRetType.getShape().end()};
+  auto context = builder.getContext();
+  auto oldEncoding = oldRetType.getEncoding();
   Attribute tensorMemorySpace =
-      triton::nvidia_gpu::TensorMemorySpaceAttr::get(builder.getContext());
-  // TODO: FIXME
-  Attribute encoding = oldRetType.getEncoding();
-  Type accMemDescType = triton::gpu::MemDescType::get(
-      shape, oldRetType.getElementType(), encoding, tensorMemorySpace,
-      /*mutableMemory=*/true);
+      ttng::TensorMemorySpaceAttr::get(builder.getContext());
+  // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
+  // case at all from TCGen5MMAScaledOp::getBlockM? My assumption is no
+  // because we are just using TMEM to transfer data and not necessarily
+  // in a MMA operation.
+  auto blockM = shape[0];
+  auto elemType = oldRetType.getElementType();
+  unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
+  assert((elemBitWidth == 16 || elemBitWidth == 32) &&
+         "TMEM Layout don't support fp8");
+  // TODO: Does this matter? I assume this is only relevant for
+  // selecting valid layouts.
+  bool unpacked = elemBitWidth != 16;
+  ArrayRef<unsigned> CTASplitNum =
+      ttg::getCTALayout(oldEncoding).getCTASplitNum();
+  auto encoding = ttng::TensorMemoryEncodingAttr::get(
+      builder.getContext(), blockM, shape[1],
+      /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
+  auto tmemDesc =
+      ttg::MemDescType::get(shape, elemType, encoding, tensorMemorySpace,
+                            /*mutableMemory=*/true);
+
+  builder.clearInsertionPoint();
   auto allocCall = builder.create<ttng::TMEMAllocOp>(
-      expandedInput->getLoc(), accMemDescType,
-      builder.getType<gpu::AsyncTokenType>(), /*src=*/Value());
+      expandedInput->getLoc(), tmemDesc, builder.getType<gpu::AsyncTokenType>(),
+      /*src=*/Value());
   return allocCall;
 }
 
@@ -56,13 +75,35 @@ static ttng::TMEMAllocOp TMEMStore1D(OpBuilder &builder, Operation *producer) {
     assert("Producer should only be a 1D Tensor");
   }
   builder.setInsertionPoint(producer);
-  auto expandDims = builder.create<triton::ExpandDimsOp>(producer->getLoc(),
-                                                         producerOutput, 1);
-  auto alloc = alloc1DTMEMBuffer(builder, expandDims);
+  auto expandDims =
+      builder.create<tt::ExpandDimsOp>(producer->getLoc(), producerOutput, 1);
+  auto allocOp = alloc1DTMEMBuffer(builder, expandDims);
+  auto tmemDesc = allocOp.getType();
+
+  // Verify that these layouts are compatible.
+  bool layoutTmemCompatible =
+      ttng::isDistributedLayoutTMemCompatible(expandDims, oldRetType, tmemDesc);
+  auto oldLayout = expandDims.getType().getEncoding();
+  auto newLayout = oldLayout;
+  if (!layoutTmemCompatible) {
+    // TODO: Can this ever be reached?
+    int numWarps = ttg::lookupNumWarps(expandDims);
+    newLayout = ttng::getTmemCompatibleLayout(
+        tmemDesc.getShape()[0], tmemDesc.getShape()[1], oldRetType, numWarps);
+  }
+  mlir::Operation *src = expandDims;
+  if (newLayout != oldLayout) {
+    auto ty = cast<RankedTensorType>(oldRetType);
+    auto newTy = ty.cloneWithEncoding(newLayout);
+    builder.setInsertionPoint(expandDims);
+    src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
+                                               expandDims);
+  }
+  // Generate the store
   // Remove the attribute. There may be multiple users, possibly within
   // the same partition, so we can't remove the OP entirely.
   producer->removeAttr("tmem.start");
-  return alloc;
+  return allocOp;
 }
 
 static void TMEMLoad1D(OpBuilder &builder, ttng::TMEMAllocOp allocOP,
