@@ -674,7 +674,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     Operation *parentOp = origForOp->getParentOp();
     if (!isa<scf::ForOp>(parentOp) && !isa<scf::IfOp>(parentOp))
       continue;
-
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
     // that is directly in forOp.

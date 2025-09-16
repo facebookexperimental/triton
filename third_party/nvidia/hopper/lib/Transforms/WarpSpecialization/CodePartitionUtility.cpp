@@ -64,9 +64,26 @@ static bool isTmemProducer(Operation *allocOp, Operation *user) {
   return false;
 }
 
+static Operation *findTmemStartEnd(ttng::TmemDataChannelPost *ch,
+                                   std::string attrName) {
+  for (auto user : ch->allocOp->getResult(0).getUsers()) {
+    DenseSet<int> asyncTaskIds;
+    if (auto attr = user->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
+      for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
+        asyncTaskIds.insert(asyncTaskId);
+      }
+      if (asyncTaskIds.count(ch->uniqID))
+        return user;
+    }
+  }
+  return nullptr;
+}
+
 Operation *ttng::TmemDataChannelPost::getSrcOp() {
-  if (isOperandD) // is inout
-    return nullptr;
+  if (isOperandD) { // is inout
+    // Find tmem.start for this channel ID.
+    return findTmemStartEnd(this, "tmem.start");
+  }
   for (auto user : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
     if (isTmemProducer(allocOp, user))
       return user;
@@ -75,8 +92,10 @@ Operation *ttng::TmemDataChannelPost::getSrcOp() {
 }
 
 Operation *ttng::TmemDataChannelPost::getDstOp() {
-  if (isOperandD)
-    return nullptr;
+  if (isOperandD) {
+    // Find tmem.end for this channel ID.
+    return findTmemStartEnd(this, "tmem.end");
+  }
   SmallVector<Operation *> consumers;
   for (auto user : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
     if (!isTmemProducer(allocOp, user))
@@ -119,6 +138,8 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
+  if (group->channels[0]->getNumBuffers() <= 1)
+    return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
   for (auto *ch : group->channels) {
@@ -220,19 +241,36 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 // that is directly in regionOp and encloses the channel.
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
+  if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp))
+    return;
+  if (group->channels.size() <= 1 || group->channels[0]->getNumBuffers() <= 1)
+    return;
   // Goes through body of regionOp, if the body op is a regionOp, check
   // to see if it contains a channel in the reuse group.
+  auto parentForOp = regionOp->getParentOfType<scf::ForOp>();
+  if (!parentForOp)
+    LDBG("getReuseChannels for group: " << group->channels.size()
+                                        << " no outer for");
+  else
+    LDBG("getReuseChannels for group: " << group->channels.size()
+                                        << " with outer for");
   if (auto ifOp = dyn_cast<scf::IfOp>(regionOp)) {
     for (Operation &op : ifOp.thenBlock()->getOperations()) {
       if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
-        if (needAccumCntForReuse(&op, group))
+        if (needAccumCntForReuse(&op, group)) {
           chList.push_back(&op);
+        }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
         // dstOp has the same enclosing parentOp.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp())
+          if (&op == ch->getDstOp()) {
+            LLVM_DEBUG({
+              LDBG("\nchannel with DstOp: ");
+              op.dump();
+            });
             chList.push_back(&op);
+          }
         }
       }
     }
@@ -241,14 +279,21 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
   if (auto forOp = dyn_cast<scf::ForOp>(regionOp)) {
     for (Operation &op : forOp.getBody()->without_terminator()) {
       if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
-        if (needAccumCntForReuse(&op, group))
+        if (needAccumCntForReuse(&op, group)) {
+          LDBG("\ninserting ctrlOp in chList");
           chList.push_back(&op);
+        }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
         // dstOp has the same enclosing parentOp.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp())
+          if (&op == ch->getDstOp()) {
+            LLVM_DEBUG({
+              LDBG("\nchannel with DstOp: ");
+              op.dump();
+            });
             chList.push_back(&op);
+          }
         }
       }
     }
@@ -268,7 +313,7 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
     if (needAccumCntForReuse(regionOp, config->getGroup(reuseGroupIdx)))
       ++argIdx;
   }
-  return cnts + argIdx;
+  return cnts + argIdx - 1;
 }
 
 // Compute and return the buffer index and phase for a given accumulate count.

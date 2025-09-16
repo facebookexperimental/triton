@@ -47,6 +47,7 @@ public:
   unsigned getDstOperandIdx() { return operandIdx; }
   Value getSrcOperand() { return op->getOperand(operandIdx); }
   virtual Operation *getSrcOp() { return getSrcOperand().getDefiningOp(); }
+  virtual Operation *getRepOp() { return getDstOp(); }
   virtual unsigned getNumBuffers() { return numBuffers; }
 
   Relation relation; // producer task Id, a list of consumer task Ids
@@ -81,6 +82,7 @@ public:
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
   Operation *getAllocOp() { return allocOp; }
+  virtual Operation *getRepOp() { return allocOp; }
   virtual unsigned getNumBuffers();
 
   Operation *allocOp;
@@ -153,6 +155,7 @@ struct TmemDataChannelPost : Channel {
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
   virtual unsigned getNumBuffers();
+  virtual Operation *getRepOp() { return allocOp; }
 };
 } // namespace nvidia_gpu
 } // namespace triton
