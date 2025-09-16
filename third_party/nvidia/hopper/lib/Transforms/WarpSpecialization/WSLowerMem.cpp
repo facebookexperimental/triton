@@ -453,7 +453,7 @@ void insertAsyncCopy(
         LDBG("call getBufferIdxAndPhase ");
         srcOp->dump();
       });
-      getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->numBuffers,
+      getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will

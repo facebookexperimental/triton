@@ -225,7 +225,7 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       for (auto &asyncTaskId : channel->relation.second)
         LDBG("consumer: " << asyncTaskId);
       channel->getDstOp()->dump();
-      LDBG("numBuffers: " << channel->numBuffers << "\n");
+      LDBG("numBuffers: " << channel->getNumBuffers() << "\n");
     }
   });
 }
@@ -464,7 +464,7 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
 }
 
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp, unsigned numBuffers) {
+                         triton::FuncOp &funcOp) {
   mlir::DominanceInfo dom(funcOp);
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
@@ -564,9 +564,9 @@ void groupChannels(
   // Some sanity checks.
   for (auto &item : producerChannels) {
     auto &channels = item.second;
-    unsigned numBuffers = channels.front()->numBuffers;
+    unsigned numBuffers = channels.front()->getNumBuffers();
     for (auto c : channels) {
-      assert(c->numBuffers == numBuffers && "Unmatched number of buffers");
+      assert(c->getNumBuffers() == numBuffers && "Unmatched number of buffers");
     }
   }
 #endif
@@ -656,7 +656,7 @@ void groupChannels(
         DBGS() << "consumer: ";
         channel->getDstOp()->dump();
         DBGS() << "] ";
-        LDBG("numBuffers: " << channel->numBuffers);
+        LDBG("numBuffers: " << channel->getNumBuffers());
         DBGS() << "\n";
       }
     }
@@ -674,7 +674,7 @@ void groupChannels(
         for (auto &asyncTaskId : channel->relation.second)
           DBGS() << asyncTaskId << ", ";
         DBGS() << "] ";
-        LDBG("numBuffers: " << channel->numBuffers);
+        LDBG("numBuffers: " << channel->getNumBuffers());
         DBGS() << "\n";
       }
       DBGS() << "\n";
@@ -898,13 +898,13 @@ void createToken(
     // Pre-allocate TMA barrier, do not use token for producer.
     if (isa<tt::DescriptorLoadOp>(producerOp)) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->numBuffers);
+          createBarrierAlloc(funcOp, channel->getNumBuffers());
     }
     // Pattern matching for tmem_store --> getD --> tmem_load (gen5 is the
     // actual producer) or gen5 --> tmem_load
     if (ProducerIsGen5(producerOp))
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->numBuffers);
+          createBarrierAlloc(funcOp, channel->getNumBuffers());
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
@@ -954,7 +954,7 @@ void createToken(
         Value v;
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
           v = builder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), channel->numBuffers, tokenLoadType);
+              funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
         else
           v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
                                                     tokenLoadType);
@@ -962,7 +962,7 @@ void createToken(
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->numBuffers);
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
@@ -999,6 +999,22 @@ void createToken(
   });
 }
 
+static Operation *isProducerTMA(Channel *ch, bool isPost) {
+  if (!isPost && isa<tt::DescriptorLoadOp>(ch->getSrcOp()))
+    return ch->getSrcOp();
+  if (!isPost)
+    return nullptr;
+  auto producerOp = ch->getSrcOp();
+  // Pre-allocate TMA barrier, do not use token for producer.
+  // We have a chain of descriptor_load -> local_store.
+  if (auto ls = dyn_cast<ttg::LocalStoreOp>(producerOp)) {
+    Operation *def = ls.getSrc().getDefiningOp();
+    if (isa<tt::DescriptorLoadOp>(def))
+      return def;
+  }
+  return nullptr;
+}
+
 void createTokenPost(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -1031,15 +1047,15 @@ void createTokenPost(
     auto dstOp = it->second.front()->getDstOp();
 
     // Pre-allocate TMA barrier, do not use token for producer.
-    if (isa<tt::DescriptorLoadOp>(producerOp)) {
+    if (isProducerTMA(it->second.front(), true)) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->numBuffers);
+          createBarrierAlloc(funcOp, channel->getNumBuffers());
     }
     // If channel is from a gen5, pre-allocate gen5 barrier.
     bool hasProdBar = false;
     if (isa<ttng::TCGen5MMAOp>(producerOp)) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->numBuffers);
+          createBarrierAlloc(funcOp, channel->getNumBuffers());
       hasProdBar = true;
     }
     assert(channel->relation.second.size() == 1);
@@ -1072,7 +1088,7 @@ void createTokenPost(
         auto copyOp = channel->getSrcOp();
         if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::AsyncLoadOp;
-        } else if (isa<tt::DescriptorLoadOp>(copyOp)) {
+        } else if (isProducerTMA(channel, true)) {
           tokenLoadType = ttnvws::TokenLoadType::TMALoadOp;
         } else if (isa<ttg::LocalStoreOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::LocalStoreOp;
@@ -1085,17 +1101,13 @@ void createTokenPost(
           llvm_unreachable("Unexpected load type");
         }
         Value v;
-        if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
-          v = builder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), channel->numBuffers, tokenLoadType);
-        else
-          v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
-                                                    tokenLoadType);
+        v = builder.create<ttnvws::CreateTokenOp>(
+            funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->numBuffers);
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
@@ -1222,7 +1234,7 @@ DenseMap<Channel *, Value> createBuffer(
     auto srcOp = channelInOrder->getSrcOp();
     auto dstOp = channelInOrder->getDstOp();
     auto *channel = channels.front();
-    unsigned numBuffers = channel->numBuffers;
+    unsigned numBuffers = channel->getNumBuffers();
     Value buffer;
 
     LLVM_DEBUG({
@@ -1364,6 +1376,11 @@ DenseMap<Channel *, Value> createBufferPost(
 // (TMEM load). If the inline barrier is used for A/B operands of gen5,
 // insert WaitBarrier as ProducerAquire; If it is used for D operand, insert
 // WaitBarrier as ConsumerWait.
+// Set up inline barrier for gen5 based on barrierAlloc. When asProducerAcquire
+// is false, mmaOp is the producer, producerOrConsumer is the consumer, and
+// we will add WaitBarrier as consumerWait in the same partition as
+// producerOrConsumer. When asProducerAcquire is true, mmaOp is the consumer,
+// producerOrConsumer is the producer.
 ttng::WaitBarrierOp desyncTCGen5MMAOp(
     OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
     Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
@@ -1380,7 +1397,7 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
   mmaOp.addCompletionBarrier(consumerBarrier, pred);
   mmaOp.setIsAsync(true);
 
-  // Create a wait_barrier before the producer.
+  // Create a wait_barrier before producerOrConsumer.
   builder.setInsertionPoint(producerOrConsumer);
   builder.setAsyncTaskIdsFromOp(producerOrConsumer);
   auto producerBarrier =
@@ -1466,7 +1483,8 @@ void insertAsyncComm(
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
     const DenseMap<Channel *, Value> &bufferMap,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
+    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
+    bool isPost) {
 
   // Find the operation that is along producer's parent chain, and its parent
   // is the same op as producer's parent. Here p is producer, and c is consumer.
@@ -1559,9 +1577,13 @@ void insertAsyncComm(
     DenseSet<Operation *> producerOps;
     DenseSet<Operation *> consumerOps;
     for (auto &c : kv.second) {
-      auto pcOp = copyOpMap.find(c)->second;
-      producerOps.insert(pcOp.first);
-      consumerOps.insert(pcOp.second);
+      if (isPost) {
+        producerOps.insert(c->getSrcOp());
+      } else {
+        auto pcOp = copyOpMap.find(c)->second;
+        producerOps.insert(pcOp.first);
+        consumerOps.insert(pcOp.second);
+      }
       consumerOps.insert(c->getDstOp());
       consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
     }
@@ -1628,7 +1650,8 @@ void insertAsyncComm(
         LDBG("call getBufferIdxAndPhase2 ");
         headProducer->dump();
       });
-      getBufferIdxAndPhase(builder, headProducer, kv.second.front()->numBuffers,
+      getBufferIdxAndPhase(builder, headProducer,
+                           kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here.
@@ -1644,7 +1667,8 @@ void insertAsyncComm(
     SmallVector<Value> buffers;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
-      if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(c->getSrcOp())) {
+      if (auto *tmaLoadOp = isProducerTMA(c, isPost)) {
+        auto tmaLoad = cast<tt::DescriptorLoadOp>(tmaLoadOp);
         tmaLoads.push_back(tmaLoad);
         buffers.push_back(bufferMap.find(c)->second);
       }
@@ -1668,22 +1692,24 @@ void insertAsyncComm(
     builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
 
     if (commChannel.producerBarrier) {
-      // Check to see if gen5 is the producer.
-      Operation *mmaOp = ProducerIsGen5(headProducer);
+      // If we are using producer barrier, it is either TMA or gen5. Handle gen5
+      // here, TMA will be handled later.
+      Operation *mmaOp = dyn_cast<ttng::TCGen5MMAOp>(headProducer);
       if (mmaOp) {
-        // Add one barrier to gen5, also insert WaitBarrier at headConsumer
-        // to wait till gen5 is done so we can start using the D operand.
+        // Add one barrier to gen5 for producer_commit, also insert WaitBarrier
+        // (consumer_wait) at headConsumer to wait till gen5 is done so we can
+        // start using the output (D operand).
         LLVM_DEBUG({ LDBG("channel has gen5 mma as producer "); });
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
                           *commChannel.producerBarrier, bufferIdx, phase,
-                          masterChannel->numBuffers, headConsumer,
+                          masterChannel->getNumBuffers(), headConsumer,
                           regionsWithChannels, dom, false, config);
       }
     }
     // Channel can have multiple consumers.
     for (auto &consumerTaskId : masterChannel->relation.second) {
-      // Desynchronize TCGen5MMAOp. Set up consumer release and producer
-      // acquire.
+      // Set up consumer release and producer acquire for channel where consumer
+      // is gen5.
       auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(
           getUniqueActualConsumer(masterChannel->getDstOp(), consumerTaskId));
       // Assume a single task for mmaOp.
@@ -1701,13 +1727,14 @@ void insertAsyncComm(
         // Use consumerBarrier as gen5 inline barrier.
         auto tmemWaitBarrier =
             desyncTCGen5MMAOp(builder, mmaOp, consumerBarrier, bufferIdx, phase,
-                              masterChannel->numBuffers, headProducer,
+                              masterChannel->getNumBuffers(), headProducer,
                               regionsWithChannels, dom, true, config);
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
 
     for (const auto &token : commChannel.tokens) {
+      // Use token for producer acquire and consumer release.
       if (commChannel.consumerBarriers.empty()) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint = getSameLevelOp(headConsumer, headProducer);
@@ -1916,7 +1943,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   // TMA loads.
   insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
                   barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels,
-                  &config);
+                  &config, false);
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
@@ -1940,7 +1967,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
-  collectPostChannels(channelsOrigin, funcOp, numBuffers);
+  collectPostChannels(channelsOrigin, funcOp);
   SmallVector<Channel *> channels;
   for (const auto &c : channelsOrigin) {
     channels.push_back(c.get());
@@ -2045,7 +2072,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   // TMA loads.
   insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
                   barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels,
-                  &config);
+                  &config, true);
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();

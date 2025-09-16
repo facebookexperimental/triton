@@ -36,7 +36,7 @@ public:
           unsigned operandIdx, unsigned numBuffers, unsigned ID,
           DataChannelKind channelKind = DataChannelKind::SMEM)
       : relation(producer, consumers), op(op), operandIdx(operandIdx),
-        numBuffers(numBuffers), uniqID(ID), channelKind(channelKind) {}
+        _numBuffers(numBuffers), uniqID(ID), channelKind(channelKind) {}
 
   bool operator==(const Channel &c) {
     return relation == c.relation && operandIdx == c.operandIdx && op == c.op;
@@ -48,12 +48,12 @@ public:
   Value getSrcOperand() { return op->getOperand(operandIdx); }
   virtual Operation *getSrcOp() { return getSrcOperand().getDefiningOp(); }
   virtual Operation *getRepOp() { return getDstOp(); }
-  virtual unsigned getNumBuffers() { return numBuffers; }
+  virtual unsigned getNumBuffers() { return _numBuffers; }
 
   Relation relation; // producer task Id, a list of consumer task Ids
   Operation *op;
   unsigned operandIdx;
-  unsigned numBuffers;
+  unsigned _numBuffers;
   DataChannelKind channelKind = DataChannelKind::SMEM;
   unsigned uniqID;
 };
