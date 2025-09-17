@@ -30,6 +30,17 @@ public:
         numWarps(ttg::lookupNumWarps(moduleOp)) {}
 
 private:
+  void copyAttrs(Operation *oldOp, Operation *newOp) {
+    // Right now we copy over loop.cluster, loop.stage,
+    // and ttg.partition
+    auto clusterAttr = oldOp->getAttr("loop.cluster");
+    auto stageAttr = oldOp->getAttr("loop.stage");
+    auto partitionAttr = oldOp->getAttr("ttg.partition");
+    newOp->setAttr("loop.cluster", clusterAttr);
+    newOp->setAttr("loop.stage", stageAttr);
+    newOp->setAttr("ttg.partition", partitionAttr);
+  }
+
   void setExpandedInput(tt::ExpandDimsOp expandedInput) {
     this->expandedInput = expandedInput;
   }
@@ -93,12 +104,13 @@ private:
     assert(producer->hasAttr("tmem.start") &&
            "Producer must have tmem.start. We only support 1 producer per "
            "consumer.");
-
     // Expand from 1D -> 2D
     auto oldRetType = getResultTensorType(producer, 1);
     builder.setInsertionPointAfter(producer);
     auto expandDims = builder.create<tt::ExpandDimsOp>(
         producer->getLoc(), producer->getResult(0), 1);
+    copyAttrs(producer, expandDims);
+    setExpandedInput(expandDims);
     ttng::TMEMAllocOp allocOp;
     if (allocOpBuffer.has_value()) {
       allocOp = allocOpBuffer.value();
@@ -125,11 +137,13 @@ private:
       builder.setInsertionPointAfter(expandDims);
       src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
                                                  expandDims);
+      copyAttrs(producer, src);
     }
     // Generate the store
     Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-    builder.create<ttng::TMEMStoreOp>(src->getLoc(), allocOp, src->getResult(0),
-                                      trueVal);
+    auto storeOp = builder.create<ttng::TMEMStoreOp>(
+        src->getLoc(), allocOp, src->getResult(0), trueVal);
+    copyAttrs(producer, storeOp);
     // Remove the attribute. There may be multiple users, possibly within
     // the same partition, so we can't remove the OP entirely.
     producer->removeAttr("tmem.start");
@@ -153,12 +167,15 @@ private:
     auto loadOp = builder.create<ttng::TMEMLoadOp>(
         consumer->getLoc(), newExpandType,
         builder.getType<ttg::AsyncTokenType>(), allocOp, Value());
+    copyAttrs(consumer, loadOp);
     // Generate the reshape
     auto reshape = builder.create<tt::ReshapeOp>(
         consumer->getLoc(), oldInputType.getShape(), loadOp);
+    copyAttrs(consumer, reshape);
     // Generate a convert layout.
     auto newInput = builder.create<ttg::ConvertLayoutOp>(consumer->getLoc(),
                                                          oldInputType, reshape);
+    copyAttrs(consumer, newInput);
     // Replace the uses in the consumer
     size_t numOperands = consumer->getNumOperands();
     for (unsigned i = 0; i < numOperands; i++) {

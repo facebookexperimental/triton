@@ -4,6 +4,10 @@
 
 module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @_attn_fwd_persist(%arg0: f32, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: i32, %arg4: !tt.tensordesc<tensor<64x128xbf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>, %arg5: i32, %arg6: i32, %arg7: i64, %arg8: i64, %arg9: !tt.tensordesc<tensor<128x128xbf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>, %arg10: i32, %arg11: i32, %arg12: i64, %arg13: i64, %arg14: !tt.tensordesc<tensor<128x128xbf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>, %arg15: i32, %arg16: i32, %arg17: i64, %arg18: i64, %arg19: !tt.tensordesc<tensor<64x128xbf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>, %arg20: i32, %arg21: i32, %arg22: i64, %arg23: i64, %arg24: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    // Verify two new tmem_allocs are allocated on the top
+    // CHECK: ttng.tmem_alloc
+    // CHECK: ttng.tmem_alloc
+    // CHECK: arith.constant false
     %false = arith.constant false
     %true = arith.constant true
     %c127_i32 = arith.constant 127 : i32
@@ -91,7 +95,12 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
         %66 = arith.subf %63, %65 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 1 : i32} : tensor<64x128xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %67 = math.exp2 %66 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 1 : i32} : tensor<64x128xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %68 = arith.subf %arg29, %62 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 1 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>>
+        // CHECK-NOT: tmem.start
         %69 = math.exp2 %68 {tmem.start = 0 : i32, loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 1 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>>
+        // CHECK: tt.expand_dims
+        // CHECK: ttg.convert_layout
+        // CHECK: ttng.tmem_store
+        // CHECK: tt.reduce
         %70 = "tt.reduce"(%67) <{axis = 1 : i32}> ({
         ^bb0(%arg36: f32, %arg37: f32):
           %116 = arith.addf %arg36, %arg37 : f32
@@ -104,6 +113,14 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
         %73 = ttg.convert_layout %72 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x64x2xf32, #ttg.blocked<{sizePerThread = [1, 64, 1], threadsPerWarp = [16, 1, 2], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>> -> tensor<64x64x2xf32, #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [16, 2, 1], warpsPerCTA = [4, 1, 1], order = [2, 0, 1]}>>
         %outLHS, %outRHS = tt.split %73 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x64x2xf32, #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [16, 2, 1], warpsPerCTA = [4, 1, 1], order = [2, 0, 1]}>> -> tensor<64x64xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         // consumer of %69 (alpha) in correction
+        // CHECK: ttng.tmem_load
+        // CHECK: tt.reshape
+        // CHECK: ttg.convert_layout
+        // Note: The existing tt.expand_dims should be unchanged.
+        // If we want to optimize the IR to optimize out the tt.expand_dims
+        // that should be done in a separate pass.
+        // CHECK: tt.expand_dims
+        // CHECK-NOT: tmem.end
         %74 = tt.expand_dims %69 {tmem.end = 0 : i32, axis = 1 : i32, loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>> -> tensor<64x1xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %75 = tt.broadcast %74 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x1xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>> -> tensor<64x64xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %76 = arith.mulf %outLHS, %75 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x64xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
@@ -140,7 +157,12 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
         %94 = arith.subf %91, %93 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 2 : i32} : tensor<64x128xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %95 = math.exp2 %94 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 2 : i32} : tensor<64x128xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %96 = arith.subf %arg30, %90 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 2 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>>
+        // CHECK-NOT: tmem.start
         %97 = math.exp2 %96 {tmem.start = 1 : i32, loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 2 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>>
+        // CHECK: tt.expand_dims
+        // CHECK: ttg.convert_layout
+        // CHECK: ttng.tmem_store
+        // CHECK: tt.reduce
         %98 = "tt.reduce"(%95) <{axis = 1 : i32}> ({
         ^bb0(%arg36: f32, %arg37: f32):
           %116 = arith.addf %arg36, %arg37 : f32
@@ -153,6 +175,14 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
         %101 = ttg.convert_layout %100 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x64x2xf32, #ttg.blocked<{sizePerThread = [1, 64, 1], threadsPerWarp = [16, 1, 2], warpsPerCTA = [4, 1, 1], order = [0, 1, 2]}>> -> tensor<64x64x2xf32, #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [16, 2, 1], warpsPerCTA = [4, 1, 1], order = [2, 0, 1]}>>
         %outLHS_22, %outRHS_23 = tt.split %101 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x64x2xf32, #ttg.blocked<{sizePerThread = [1, 64, 2], threadsPerWarp = [16, 2, 1], warpsPerCTA = [4, 1, 1], order = [2, 0, 1]}>> -> tensor<64x64xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         // consumer of alpha in correction
+        // CHECK: ttng.tmem_load
+        // CHECK: tt.reshape
+        // CHECK: ttg.convert_layout
+        // Note: The existing tt.expand_dims should be unchanged.
+        // If we want to optimize the IR to optimize out the tt.expand_dims
+        // that should be done in a separate pass.
+        // CHECK: tt.expand_dims
+        // CHECK-NOT: tmem.end
         %102 = tt.expand_dims %97 {tmem.end = 1 : i32, axis = 1 : i32, loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>> -> tensor<64x1xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %103 = tt.broadcast %102 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x1xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>> -> tensor<64x64xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
         %104 = arith.mulf %outLHS_22, %103 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = 0 : i32} : tensor<64x64xf32, #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>>
