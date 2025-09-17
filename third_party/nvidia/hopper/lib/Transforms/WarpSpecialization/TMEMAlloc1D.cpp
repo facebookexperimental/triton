@@ -169,6 +169,7 @@ public:
       Operation *producer, Operation *consumer,
       std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt) {
     this->numWarps = ttg::lookupNumWarps(producer);
+    assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
     TMEMStore1D(producer, allocOpBuffer);
     TMEMLoad1D(producer, consumer);
   }
