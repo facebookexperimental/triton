@@ -7,8 +7,6 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
-#include <iostream>
-
 #define DEBUG_TYPE "nvgpu-1D-tmem-alloc"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
@@ -28,12 +26,11 @@ namespace mlir {
 class TMEM1DAllocator {
 private:
   OpBuilder builder;
-  Operation *globalStart;
+  Block *globalStart;
 
 public:
-  TMEM1DAllocator(ModuleOp &moduleOp) : builder(moduleOp.getContext()) {
-    globalStart = &moduleOp.getBodyRegion().front().front();
-  }
+  TMEM1DAllocator(ModuleOp &moduleOp, Block *globalStart)
+      : builder(moduleOp.getContext()), globalStart(globalStart) {}
 
 private:
   ttng::TMEMAllocOp alloc1DTMEMBuffer(Operation *expandedInput) {
@@ -71,10 +68,10 @@ private:
         ttg::MemDescType::get(shape, elemType, encoding, tensorMemorySpace,
                               /*mutableMemory=*/true);
 
-    builder.setInsertionPoint(globalStart);
+    builder.setInsertionPointToStart(globalStart);
     auto allocCall = builder.create<ttng::TMEMAllocOp>(
         expandedInput->getLoc(), tmemDesc,
-        builder.getType<gpu::AsyncTokenType>(),
+        builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
     return allocCall;
   }
@@ -127,7 +124,7 @@ private:
     // Generate the store
     // TODO: What value should the predciate be?
     Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-    builder.create<ttng::TMEMStoreOp>(src->getLoc(), src->getResult(0), allocOp,
+    builder.create<ttng::TMEMStoreOp>(src->getLoc(), allocOp, src->getResult(0),
                                       trueVal);
     // Remove the attribute. There may be multiple users, possibly within
     // the same partition, so we can't remove the OP entirely.
@@ -153,7 +150,7 @@ private:
     builder.setInsertionPoint(consumer);
     auto loadOp = builder.create<ttng::TMEMLoadOp>(
         consumer->getLoc(), newExpandType,
-        builder.getType<gpu::AsyncTokenType>(), allocOp, Value());
+        builder.getType<ttg::AsyncTokenType>(), allocOp, Value());
     // Generate the reshape
     auto reshape = builder.create<tt::ReshapeOp>(
         consumer->getLoc(), oldInputType.getShape(), loadOp);
@@ -210,8 +207,13 @@ public:
       }
     });
     assert(tmemStarts.size() == tmemEnds.size());
+    // Find the location for inserting globals
+    Block *globalStart;
+    moduleOp->walk([&](triton::FuncOp funcOp) {
+      globalStart = &funcOp.getBody().front();
+    });
     // Generate the actual TMEM operations.
-    auto allocator = TMEM1DAllocator(moduleOp);
+    auto allocator = TMEM1DAllocator(moduleOp, globalStart);
     for (size_t i = 0; i < tmemStarts.size(); i++) {
       auto producer = tmemStarts[i];
       auto consumer = tmemEnds[i];
@@ -220,7 +222,6 @@ public:
       // Actually generate the TMEM operations.
       allocator.replaceWith1DTMEM(producer, consumer);
     }
-    std::cout << "REACHED END" << std::endl;
   }
 };
 
