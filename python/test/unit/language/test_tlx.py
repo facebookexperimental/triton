@@ -1664,7 +1664,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     output = torch.empty_like(x)
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = add2_clc[grid](x, y, output, n_elements, BLOCK_SIZE)
+    kernel = add2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
     # ttgir = kernel.asm["ttgir"]
 
     # pattern_ws = (r'ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 100, 100>}')

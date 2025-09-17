@@ -118,7 +118,7 @@ FLOAT_PACK_FUNCTION = {
     "fp64": "pack_fp64",
 }
 
-_BASE_ARGS_FORMAT = "iiiKKppOOOOOO"
+_BASE_ARGS_FORMAT = "iiiKKpppOOOOOO"
 
 
 def make_launcher(constants, signature, tensordesc_meta):
@@ -302,7 +302,7 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   return cuLaunchKernelExHandle;
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
   void *params[] = {{ {', '.join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
     // 4 attributes that we can currently pass maximum
@@ -342,7 +342,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       ++num_attrs;
     }}
 
-    if (num_ctas != 1) {{
+    if (launch_cluster || num_ctas != 1) {{
       CUlaunchAttribute clusterAttr = {{}};
       clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
       clusterAttr.value.clusterDim.x = clusterDimX;
@@ -492,6 +492,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   uint64_t _stream;
   uint64_t _function;
   int launch_cooperative_grid;
+  int launch_cluster;
   int launch_pdl;
   PyObject *launch_enter_hook = NULL;
   PyObject *launch_exit_hook = NULL;
@@ -501,7 +502,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *profile_scratch_obj = NULL;
   {newline.join([f"{_extracted_type(ty)} _arg{i};" for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ,
-                                           &_stream, &_function, &launch_cooperative_grid, &launch_pdl, &global_scratch_obj, &profile_scratch_obj,
+                                           &_stream, &_function, &launch_cooperative_grid, &launch_cluster, &launch_pdl, &global_scratch_obj, &profile_scratch_obj,
                                            &kernel_metadata, &launch_metadata,
                                            &launch_enter_hook, &launch_exit_hook{args_list})) {{
     return NULL;
@@ -544,7 +545,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {newline.join(tma_decls)}
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -661,6 +662,7 @@ def wrap_handle_tensordesc(launcher, tensordesc_meta):
         raw_kernel_args = args[len(_BASE_ARGS_FORMAT):]
         tensordesc_idx = 0
         final_args = []
+        import pdb; pdb.set_trace()
         for i, arg in enumerate(raw_kernel_args):
             if isinstance(arg, (TensorDescriptor, GluonTensorDescriptor)):
                 meta = tensordesc_meta[tensordesc_idx] if tensordesc_meta else None
@@ -699,6 +701,7 @@ class CudaLauncher(object):
         self.profile_scratch_size = metadata.profile_scratch_size
         self.profile_scratch_align = metadata.profile_scratch_align
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
+        self.launch_cluster = metadata.launch_cluster
         self.launch_pdl = metadata.launch_pdl
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
@@ -714,7 +717,7 @@ class CudaLauncher(object):
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
-        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
+        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_cluster, self.launch_pdl,
                     global_scratch, profile_scratch, *args)
 
 
