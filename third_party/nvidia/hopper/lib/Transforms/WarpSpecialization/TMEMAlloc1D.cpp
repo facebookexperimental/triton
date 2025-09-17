@@ -1,8 +1,5 @@
-#include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -16,13 +13,8 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
-#define GEN_PASS_DEF_NVGPUTEST1DTMEMALLOC
-#include "nvidia/hopper/include/Transforms/Passes.h.inc"
-
-/**
- * Wrapper class to hold the context for handling
- * TMEM Allocation logic.
- */
+// Wrapper class to hold the context for handling
+// 1D TMEM Allocation.
 class TMEM1DAllocator {
 private:
   OpBuilder builder;
@@ -48,9 +40,7 @@ private:
     Attribute tensorMemorySpace =
         ttng::TensorMemorySpaceAttr::get(builder.getContext());
     // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
-    // case at all from TCGen5MMAScaledOp::getBlockM? My assumption is no
-    // because we are just using TMEM to transfer data and not necessarily
-    // in a MMA operation.
+    // case at all from TCGen5MMAScaledOp::getBlockM?
     auto blockM = shape[0];
     auto elemType = oldRetType.getElementType();
     unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
@@ -176,6 +166,9 @@ public:
     TMEMLoad1D(allocOp, expandOp, producer, consumer);
   }
 };
+
+#define GEN_PASS_DEF_NVGPUTEST1DTMEMALLOC
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 class NVGPUTest1DTMEMAllocPass
     : public impl::NVGPUTest1DTMEMAllocBase<NVGPUTest1DTMEMAllocPass> {
