@@ -1430,10 +1430,10 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  // Step 3: reorder producer ops and the backward slices of the producer ops.
+  // Step 4: reorder producer ops and the backward slices of the producer ops.
   reorderProducerOps(channels);
 
-  // Step 4: find top-level ops that contain a channel, also create new ForOps
+  // Step 5: find top-level ops that contain a channel, also create new ForOps
   // by adding phase and bufferIdx to the original ForOps, erase the original
   // ForOps.
   SmallVector<Operation *> asyncTaskTopOps = getTaskTopRegion(funcOp, channels);
