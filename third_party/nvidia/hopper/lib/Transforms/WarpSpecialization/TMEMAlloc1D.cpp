@@ -18,16 +18,13 @@ namespace mlir {
 class TMEM1DAllocator {
 private:
   OpBuilder &builder;
-  Block *globalStart;
-  int numWarps;
   // Intermediate info to minimize code reuse across functions.
-  tt::ExpandDimsOp expandedInput = nullptr;
-  ttng::TMEMAllocOp allocOp = nullptr;
+  int numWarps = -1;
+  tt::ExpandDimsOp _expandedInput = nullptr;
+  ttng::TMEMAllocOp _allocOp = nullptr;
 
 public:
-  TMEM1DAllocator(OpBuilder &builder, Block *globalStart)
-      : builder(builder), globalStart(globalStart),
-        numWarps(ttg::lookupNumWarps(&globalStart->front())) {}
+  TMEM1DAllocator(OpBuilder &builder) : builder(builder) {}
 
 private:
   void copyAttrs(Operation *oldOp, Operation *newOp) {
@@ -39,19 +36,19 @@ private:
   }
 
   void setExpandedInput(tt::ExpandDimsOp expandedInput) {
-    this->expandedInput = expandedInput;
+    this->_expandedInput = expandedInput;
   }
 
   tt::ExpandDimsOp getExpandedInput() {
-    assert(expandedInput != nullptr && "Must call setExpandedInput");
-    return expandedInput;
+    assert(_expandedInput != nullptr && "Must call setExpandedInput");
+    return _expandedInput;
   }
 
-  void setAllocOp(ttng::TMEMAllocOp allocOp) { this->allocOp = allocOp; }
+  void setAllocOp(ttng::TMEMAllocOp allocOp) { this->_allocOp = allocOp; }
 
   ttng::TMEMAllocOp getAllocOp() {
-    assert(allocOp != nullptr && "Must call getAllocOp()");
-    return allocOp;
+    assert(_allocOp != nullptr && "Must call getAllocOp()");
+    return _allocOp;
   }
 
   RankedTensorType getResultTensorType(Operation *op, size_t expectedSize) {
@@ -88,7 +85,6 @@ private:
         ttg::MemDescType::get(shape, elemType, encoding, tensorMemorySpace,
                               /*mutableMemory=*/true);
 
-    builder.setInsertionPointToStart(globalStart);
     auto allocCall = builder.create<ttng::TMEMAllocOp>(
         expandedInput->getLoc(), tmemDesc,
         builder.getType<ttg::AsyncTokenType>(),
@@ -128,7 +124,6 @@ private:
     if (newLayout != oldLayout) {
       auto ty = cast<RankedTensorType>(expandType);
       auto newTy = ty.cloneWithEncoding(newLayout);
-      builder.setInsertionPointAfter(expandDims);
       src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
                                                  expandDims);
       copyAttrs(producer, src);
@@ -141,6 +136,7 @@ private:
   }
 
   void TMEMLoad1D(Operation *producer, Operation *consumer) {
+    auto allocOp = getAllocOp();
     auto producerOutput = producer->getResult(0);
     auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
     auto targetEncoding = oldInputType.getEncoding();
@@ -177,13 +173,13 @@ public:
   void replaceWith1DTMEM(
       Operation *producer, Operation *consumer,
       std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt) {
+    this->numWarps = ttg::lookupNumWarps(producer);
     TMEMStore1D(producer, allocOpBuffer);
     TMEMLoad1D(producer, consumer);
   }
 };
 
-void generate1DAllocations(OpBuilder &builder, Block *globalStart,
-                           Operation *producer) {
+void generate1DAllocations(OpBuilder &builder, Operation *producer) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
   auto producerPartition =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("ttg.partition"))
@@ -193,8 +189,7 @@ void generate1DAllocations(OpBuilder &builder, Block *globalStart,
         mlir::cast<mlir::IntegerAttr>(consumer->getAttr("ttg.partition"))
             .getInt();
     if (producerPartition != consumerParition) {
-      TMEM1DAllocator(builder, globalStart)
-          .replaceWith1DTMEM(producer, consumer);
+      TMEM1DAllocator(builder).replaceWith1DTMEM(producer, consumer);
     }
   }
   // Delete tmem.start
@@ -212,15 +207,10 @@ public:
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    // Find the location for inserting globals
-    Block *globalStart;
-    moduleOp->walk([&](triton::FuncOp funcOp) {
-      globalStart = &funcOp.getBody().front();
-    });
     OpBuilder builder(moduleOp.getContext());
     moduleOp->walk([&](mlir::Operation *irOp) {
       if (irOp->hasAttr("tmem.start")) {
-        generate1DAllocations(builder, globalStart, irOp);
+        generate1DAllocations(builder, irOp);
       }
     });
   }
