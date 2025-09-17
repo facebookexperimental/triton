@@ -19,20 +19,44 @@ class TMEM1DAllocator {
 private:
   OpBuilder builder;
   Block *globalStart;
+  int numWarps;
+  // Intermediate info to minimize code reuse across functions.
+  tt::ExpandDimsOp expandedInput = nullptr;
+  ttng::TMEMAllocOp allocOp = nullptr;
 
 public:
   TMEM1DAllocator(ModuleOp &moduleOp, Block *globalStart)
-      : builder(moduleOp.getContext()), globalStart(globalStart) {}
+      : builder(moduleOp.getContext()), globalStart(globalStart),
+        numWarps(ttg::lookupNumWarps(moduleOp)) {}
 
 private:
-  ttng::TMEMAllocOp alloc1DTMEMBuffer(Operation *expandedInput) {
-    assert(expandedInput != nullptr &&
-           "Must call expand1DInput before calling alloc1DTMEMBuffer");
-    auto oldRetType =
-        dyn_cast<RankedTensorType>(expandedInput->getResult(0).getType());
-    if (!oldRetType || oldRetType.getShape().size() != 2) {
-      assert("Producer must be expanded to a 2D Tensor");
+  void setExpandedInput(tt::ExpandDimsOp expandedInput) {
+    this->expandedInput = expandedInput;
+  }
+
+  tt::ExpandDimsOp getExpandedInput() {
+    assert(expandedInput != nullptr && "Must call setExpandedInput");
+    return expandedInput;
+  }
+
+  void setAllocOp(ttng::TMEMAllocOp allocOp) { this->allocOp = allocOp; }
+
+  ttng::TMEMAllocOp getAllocOp() {
+    assert(allocOp != nullptr && "Must call getAllocOp()");
+    return allocOp;
+  }
+
+  RankedTensorType getResultTensorType(Operation *op, size_t expectedSize) {
+    auto outputType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!outputType || outputType.getShape().size() != 2) {
+      assert("Invalid tensor input");
     }
+    return outputType;
+  }
+
+  ttng::TMEMAllocOp alloc1DTMEMBuffer() {
+    auto expandedInput = getExpandedInput();
+    auto oldRetType = getResultTensorType(expandedInput, 2);
     SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
                                   oldRetType.getShape().end()};
     auto context = builder.getContext();
@@ -46,8 +70,6 @@ private:
     unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
     assert((elemBitWidth == 16 || elemBitWidth == 32) &&
            "TMEM Layout don't support fp8");
-    // TODO: Does this matter? I assume this is only relevant for
-    // selecting valid layouts.
     bool unpacked = elemBitWidth != 16;
     ArrayRef<unsigned> CTASplitNum =
         ttg::getCTALayout(oldEncoding).getCTASplitNum();
@@ -66,40 +88,33 @@ private:
     return allocCall;
   }
 
-  std::tuple<ttng::TMEMAllocOp, tt::ExpandDimsOp>
-  TMEMStore1D(Operation *producer,
-              std::optional<ttng::TMEMAllocOp> allocOpBuffer) {
+  void TMEMStore1D(Operation *producer,
+                   std::optional<ttng::TMEMAllocOp> allocOpBuffer) {
     assert(producer->hasAttr("tmem.start") &&
            "Producer must have tmem.start. We only support 1 producer per "
            "consumer.");
 
     // Expand from 1D -> 2D
-    auto producerOutput = producer->getResult(0);
-    auto oldRetType = dyn_cast<RankedTensorType>(producerOutput.getType());
-    if (!oldRetType || oldRetType.getShape().size() != 1) {
-      assert("Producer should only be a 1D Tensor");
-    }
+    auto oldRetType = getResultTensorType(producer, 1);
     builder.setInsertionPointAfter(producer);
-    auto expandDims =
-        builder.create<tt::ExpandDimsOp>(producer->getLoc(), producerOutput, 1);
+    auto expandDims = builder.create<tt::ExpandDimsOp>(
+        producer->getLoc(), producer->getResult(0), 1);
     ttng::TMEMAllocOp allocOp;
     if (allocOpBuffer.has_value()) {
       allocOp = allocOpBuffer.value();
     } else {
-      allocOp = alloc1DTMEMBuffer(expandDims);
+      allocOp = alloc1DTMEMBuffer();
     }
-    auto tmemDesc = allocOp.getType();
-    auto expandType = expandDims.getType();
+    setAllocOp(allocOp);
 
     // Verify that these layouts are compatible.
+    auto tmemDesc = allocOp.getType();
+    auto expandType = expandDims.getType();
     bool layoutTmemCompatible = ttng::isDistributedLayoutTMemCompatible(
         expandDims, expandType, tmemDesc);
     auto oldLayout = expandDims.getType().getEncoding();
     auto newLayout = oldLayout;
     if (!layoutTmemCompatible) {
-      // Is this necessary? This path is taken, but its unclear
-      // if the TMEM restrictions are needed.
-      int numWarps = ttg::lookupNumWarps(expandDims);
       newLayout = ttng::getTmemCompatibleLayout(
           tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
     }
@@ -112,25 +127,22 @@ private:
                                                  expandDims);
     }
     // Generate the store
-    // TODO: What value should the predciate be?
     Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
     builder.create<ttng::TMEMStoreOp>(src->getLoc(), allocOp, src->getResult(0),
                                       trueVal);
     // Remove the attribute. There may be multiple users, possibly within
     // the same partition, so we can't remove the OP entirely.
     producer->removeAttr("tmem.start");
-    return {allocOp, expandDims};
   }
-  void TMEMLoad1D(ttng::TMEMAllocOp allocOp, tt::ExpandDimsOp expandOp,
-                  Operation *producer, Operation *consumer) {
+
+  void TMEMLoad1D(Operation *producer, Operation *consumer) {
     assert(consumer->hasAttr("tmem.end") &&
            "Consumer must have tmem.start. We only support 1 consumer per "
            "producer.");
     auto producerOutput = producer->getResult(0);
     auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
     auto targetEncoding = oldInputType.getEncoding();
-    auto oldExpandType = expandOp.getType();
-    int numWarps = ttg::lookupNumWarps(expandOp);
+    auto oldExpandType = getExpandedInput().getType();
     Attribute newDistributedEncoding = ttng::getTmemCompatibleLayout(
         oldExpandType.getShape()[0], oldExpandType.getShape()[1], oldExpandType,
         numWarps);
@@ -162,8 +174,8 @@ public:
   void replaceWith1DTMEM(
       Operation *producer, Operation *consumer,
       std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt) {
-    auto [allocOp, expandOp] = TMEMStore1D(producer, allocOpBuffer);
-    TMEMLoad1D(allocOp, expandOp, producer, consumer);
+    TMEMStore1D(producer, allocOpBuffer);
+    TMEMLoad1D(producer, consumer);
   }
 };
 
@@ -206,13 +218,13 @@ public:
       globalStart = &funcOp.getBody().front();
     });
     // Generate the actual TMEM operations.
-    auto allocator = TMEM1DAllocator(moduleOp, globalStart);
     for (size_t i = 0; i < tmemStarts.size(); i++) {
       auto producer = tmemStarts[i];
       auto consumer = tmemEnds[i];
       assert(producer != nullptr);
       assert(consumer != nullptr);
       // Actually generate the TMEM operations.
+      auto allocator = TMEM1DAllocator(moduleOp, globalStart);
       allocator.replaceWith1DTMEM(producer, consumer);
     }
   }
