@@ -17,7 +17,7 @@ namespace mlir {
 // 1D TMEM Allocation.
 class TMEM1DAllocator {
 private:
-  OpBuilder builder;
+  OpBuilder &builder;
   Block *globalStart;
   int numWarps;
   // Intermediate info to minimize code reuse across functions.
@@ -25,19 +25,16 @@ private:
   ttng::TMEMAllocOp allocOp = nullptr;
 
 public:
-  TMEM1DAllocator(ModuleOp &moduleOp, Block *globalStart)
-      : builder(moduleOp.getContext()), globalStart(globalStart),
-        numWarps(ttg::lookupNumWarps(moduleOp)) {}
+  TMEM1DAllocator(OpBuilder &builder, Block *globalStart)
+      : builder(builder), globalStart(globalStart),
+        numWarps(ttg::lookupNumWarps(&globalStart->front())) {}
 
 private:
   void copyAttrs(Operation *oldOp, Operation *newOp) {
-    // Right now we copy over loop.cluster, loop.stage,
-    // and ttg.partition
-    auto clusterAttr = oldOp->getAttr("loop.cluster");
-    auto stageAttr = oldOp->getAttr("loop.stage");
+    // Right now we just copy over ttg.partition per
+    // the example.
+    // TODO: Should we copy over loop information?
     auto partitionAttr = oldOp->getAttr("ttg.partition");
-    newOp->setAttr("loop.cluster", clusterAttr);
-    newOp->setAttr("loop.stage", stageAttr);
     newOp->setAttr("ttg.partition", partitionAttr);
   }
 
@@ -101,9 +98,6 @@ private:
 
   void TMEMStore1D(Operation *producer,
                    std::optional<ttng::TMEMAllocOp> allocOpBuffer) {
-    assert(producer->hasAttr("tmem.start") &&
-           "Producer must have tmem.start. We only support 1 producer per "
-           "consumer.");
     // Expand from 1D -> 2D
     auto oldRetType = getResultTensorType(producer, 1);
     builder.setInsertionPointAfter(producer);
@@ -144,15 +138,9 @@ private:
     auto storeOp = builder.create<ttng::TMEMStoreOp>(
         src->getLoc(), allocOp, src->getResult(0), trueVal);
     copyAttrs(producer, storeOp);
-    // Remove the attribute. There may be multiple users, possibly within
-    // the same partition, so we can't remove the OP entirely.
-    producer->removeAttr("tmem.start");
   }
 
   void TMEMLoad1D(Operation *producer, Operation *consumer) {
-    assert(consumer->hasAttr("tmem.end") &&
-           "Consumer must have tmem.start. We only support 1 consumer per "
-           "producer.");
     auto producerOutput = producer->getResult(0);
     auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
     auto targetEncoding = oldInputType.getEncoding();
@@ -183,8 +171,6 @@ private:
         consumer->setOperand(i, newInput);
       }
     }
-    // Remove the attribute since we reuse the consumer.
-    consumer->removeAttr("tmem.end");
   }
 
 public:
@@ -195,6 +181,25 @@ public:
     TMEMLoad1D(producer, consumer);
   }
 };
+
+void generate1DAllocations(OpBuilder &builder, Block *globalStart,
+                           Operation *producer) {
+  assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
+  auto producerPartition =
+      mlir::cast<mlir::IntegerAttr>(producer->getAttr("ttg.partition"))
+          .getInt();
+  for (auto consumer : producer->getUsers()) {
+    auto consumerParition =
+        mlir::cast<mlir::IntegerAttr>(consumer->getAttr("ttg.partition"))
+            .getInt();
+    if (producerPartition != consumerParition) {
+      TMEM1DAllocator(builder, globalStart)
+          .replaceWith1DTMEM(producer, consumer);
+    }
+  }
+  // Delete tmem.start
+  producer->removeAttr("tmem.start");
+}
 
 #define GEN_PASS_DEF_NVGPUTEST1DTMEMALLOC
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -207,43 +212,17 @@ public:
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    // Collect all pairs of (tmem.start, tmem.end)
-    SmallVector<Operation *> tmemStarts;
-    SmallVector<Operation *> tmemEnds;
-    moduleOp->walk([&](mlir::Operation *irOp) {
-      if (irOp->hasAttr("tmem.start")) {
-        auto id =
-            mlir::cast<mlir::IntegerAttr>(irOp->getAttr("tmem.start")).getInt();
-        while (tmemStarts.size() <= id)
-          tmemStarts.push_back(nullptr);
-        assert(tmemStarts[id] == nullptr);
-        tmemStarts[id] = irOp;
-      }
-      if (irOp->hasAttr("tmem.end")) {
-        auto id =
-            mlir::cast<mlir::IntegerAttr>(irOp->getAttr("tmem.end")).getInt();
-        while (tmemEnds.size() <= id)
-          tmemEnds.push_back(nullptr);
-        assert(tmemEnds[id] == nullptr);
-        tmemEnds[id] = irOp;
-      }
-    });
-    assert(tmemStarts.size() == tmemEnds.size());
     // Find the location for inserting globals
     Block *globalStart;
     moduleOp->walk([&](triton::FuncOp funcOp) {
       globalStart = &funcOp.getBody().front();
     });
-    // Generate the actual TMEM operations.
-    for (size_t i = 0; i < tmemStarts.size(); i++) {
-      auto producer = tmemStarts[i];
-      auto consumer = tmemEnds[i];
-      assert(producer != nullptr);
-      assert(consumer != nullptr);
-      // Actually generate the TMEM operations.
-      auto allocator = TMEM1DAllocator(moduleOp, globalStart);
-      allocator.replaceWith1DTMEM(producer, consumer);
-    }
+    OpBuilder builder(moduleOp.getContext());
+    moduleOp->walk([&](mlir::Operation *irOp) {
+      if (irOp->hasAttr("tmem.start")) {
+        generate1DAllocations(builder, globalStart, irOp);
+      }
+    });
   }
 };
 
