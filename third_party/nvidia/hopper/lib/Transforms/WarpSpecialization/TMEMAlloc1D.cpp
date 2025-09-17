@@ -161,12 +161,7 @@ private:
                                                          oldInputType, reshape);
     copyAttrs(consumer, newInput);
     // Replace the uses in the consumer
-    size_t numOperands = consumer->getNumOperands();
-    for (unsigned i = 0; i < numOperands; i++) {
-      if (consumer->getOperand(i) == producerOutput) {
-        consumer->setOperand(i, newInput);
-      }
-    }
+    consumer->replaceUsesOfWith(producerOutput, newInput);
   }
 
 public:
