@@ -1,8 +1,8 @@
 # FB-only:
 
-this PR will be imported to fbcode diff. ensure all internal tests passed.
+This PR will be imported to fbcode diff. Ensure all internal tests passed.
 
-run `third_party/tlx/run_all.sh` to cover TLX unit tests and TLX kernel correctness verification:
+For TLX, run `third_party/tlx/run_all.sh` to cover TLX unit tests and TLX kernel correctness verification:
 
 ```
 Need to build triton in this script? {y|n}n
