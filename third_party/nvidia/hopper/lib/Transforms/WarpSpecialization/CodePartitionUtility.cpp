@@ -25,9 +25,29 @@ bool enclosing(scf::ForOp forOp, Operation *op) {
   return forOp->isProperAncestor(op);
 }
 
+// After createBufferPost, MemDescIndexOp will be used.
+Operation *skipIdxOp(Operation *op) {
+  if (auto idx = dyn_cast<triton::gpu::MemDescIndexOp>(op)) {
+    unsigned numUsers = 0;
+    Operation *first = nullptr;
+    for (auto *user : idx.getOperation()->getUsers()) {
+      ++numUsers;
+      first = user;
+    }
+    assert(numUsers <= 1);
+    return first;
+  }
+  return op;
+}
+
 Operation *ChannelPost::getSrcOp() {
-  for (auto user : allocOp->getUsers()) {
+  for (auto usr : allocOp->getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
     if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(user))
+      return user;
+    if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
   }
   return nullptr;
@@ -38,8 +58,12 @@ Operation *ChannelPost::getSrcOp() {
 // a representative consumer in the channel.
 Operation *ChannelPost::getDstOp() {
   SmallVector<Operation *> consumers;
-  for (auto user : allocOp->getUsers()) {
-    if (!isa<ttg::LocalStoreOp>(user))
+  for (auto usr : allocOp->getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (!isa<ttg::LocalStoreOp>(user) &&
+        !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
   if (consumers.size() == 1)
@@ -66,13 +90,16 @@ static bool isTmemProducer(Operation *allocOp, Operation *user) {
 
 static Operation *findTmemStartEnd(ttng::TmemDataChannelPost *ch,
                                    std::string attrName) {
-  for (auto user : ch->allocOp->getResult(0).getUsers()) {
-    DenseSet<int> asyncTaskIds;
+  for (auto usr : ch->allocOp->getResult(0).getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    DenseSet<int> channelIds;
     if (auto attr = user->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
       for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-        asyncTaskIds.insert(asyncTaskId);
+        channelIds.insert(asyncTaskId);
       }
-      if (asyncTaskIds.count(ch->uniqID))
+      if (channelIds.count(ch->uniqID))
         return user;
     }
   }
@@ -84,8 +111,14 @@ Operation *ttng::TmemDataChannelPost::getSrcOp() {
     // Find tmem.start for this channel ID.
     return findTmemStartEnd(this, "tmem.start");
   }
-  for (auto user : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
-    if (isTmemProducer(allocOp, user))
+  for (auto usr : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
+    // If there is no subview, user will be the same as usr and we check if opnd
+    // D of user is from alloc If there is a subview, alloc -> subview -> user,
+    // we check if opnd D of user is from subview.
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (isTmemProducer(user == usr ? allocOp : usr, user))
       return user;
   }
   return nullptr;
@@ -97,8 +130,11 @@ Operation *ttng::TmemDataChannelPost::getDstOp() {
     return findTmemStartEnd(this, "tmem.end");
   }
   SmallVector<Operation *> consumers;
-  for (auto user : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
-    if (!isTmemProducer(allocOp, user))
+  for (auto usr : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (!isTmemProducer(user == usr ? allocOp : usr, user))
       consumers.push_back(user);
   }
   if (consumers.size() == 1)

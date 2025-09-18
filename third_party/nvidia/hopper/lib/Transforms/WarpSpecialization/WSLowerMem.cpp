@@ -148,8 +148,8 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   return {copy, sharedLoad};
 }
 
-static Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
-                              Value idx) {
+Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
+                       Value idx) {
   assert(isa<triton::gpu::MemDescType>(alloc.getType()) &&
          "Expected MemDescType");
   auto allocDescType = cast<triton::gpu::MemDescType>(alloc.getType());
@@ -160,8 +160,8 @@ static Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                allocDescType.getShape().end());
   auto viewDescType = triton::gpu::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
-      allocDescType.getMemorySpace(), allocDescType.getMutableMemory(),
-      /*allocShape=*/allocDescType.getAllocShape());
+      allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
+  //    /*allocShape=*/allocDescType.getAllocShape());
   return builder.create<triton::gpu::MemDescIndexOp>(alloc.getLoc(),
                                                      viewDescType, alloc, idx);
 }
@@ -322,7 +322,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
-                            Operation *headConsumer) {
+                            Operation *headConsumer, bool isPost) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -368,6 +368,22 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
+    if (isPost) {
+      // consumer is the user of the smem. We can't insert local_load here
+      // and use the result in local_store that is the producer for the smem
+      // channel. descriptor_load has a single user which is local_store.
+      unsigned cnt = 0;
+      Operation *localSt = nullptr;
+      for (auto *usr : tmaLoad->getUsers()) {
+        assert(isa<ttg::LocalStoreOp>(usr));
+        localSt = usr;
+        ++cnt;
+      }
+      assert(cnt == 1);
+      localSt->erase();
+      tmaLoad.erase();
+      continue;
+    }
     auto pipelineBuffer = getBufferForPipelineStage(
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(

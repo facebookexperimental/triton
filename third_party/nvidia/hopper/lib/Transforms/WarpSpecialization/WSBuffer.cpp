@@ -254,7 +254,18 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
   }
   Operation *ctrlOp = op->getParentOp();
   OpBuilderWithAsyncTaskIds builder(ctrlOp->getContext());
-  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(op));
+  auto taskIds = getNestedAsyncTaskIds(ctrlOp);
+  // HACK
+#if 0
+  {
+    auto parentForOp = ctrlOp->getParentOfType<scf::ForOp>();
+    if (!parentForOp) {
+      taskIds.pop_back();
+      LDBG("getAccumForReuseGroup hack to remove last taskId");
+    }
+  }
+#endif
+  builder.setAsynTaskIdsFromArray(taskIds);
   builder.setInsertionPoint(op);
   if (lastRegionIdx >= 0) {
     auto *lastRegionOp = chList[lastRegionIdx];
@@ -672,8 +683,10 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
       continue;
     Operation *parentOp = origForOp->getParentOp();
+#if 0
     if (!isa<scf::ForOp>(parentOp) && !isa<scf::IfOp>(parentOp))
       continue;
+#endif
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
     // that is directly in forOp.
@@ -688,6 +701,9 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     // Get a list of ops directly under parentOp that contain channels in the
     // reuse group.
     getReuseChannels(config->getGroup(idx), parentOp, parentChList);
+    if (parentChList.empty())
+      // There are channels in the reuse group that are under origForOp.
+      parentChList.push_back(origForOp.getOperation());
     prevAccum = getAccumForReuseGroup(origForOp.getOperation(), parentChList,
                                       regionsWithChannels, config, idx, true);
     initialAccums.push_back(prevAccum);

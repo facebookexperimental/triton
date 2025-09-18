@@ -14,7 +14,13 @@ namespace mlir {
 
 namespace tt = mlir::triton;
 
-enum class DataChannelKind { SMEM, TMEM, REG, SMEMPost, TMEMPost };
+enum class DataChannelKind : int {
+  SMEM = 0,
+  TMEM = 1,
+  REG = 2,
+  SMEMPost = 3,
+  TMEMPost = 4
+};
 
 static inline std::string to_string(DataChannelKind k) {
   switch (k) {
@@ -47,7 +53,7 @@ public:
   unsigned getDstOperandIdx() { return operandIdx; }
   Value getSrcOperand() { return op->getOperand(operandIdx); }
   virtual Operation *getSrcOp() { return getSrcOperand().getDefiningOp(); }
-  virtual Operation *getRepOp() { return getDstOp(); }
+  virtual Operation *getAllocOp() { return nullptr; }
   virtual unsigned getNumBuffers() { return _numBuffers; }
 
   Relation relation; // producer task Id, a list of consumer task Ids
@@ -69,9 +75,9 @@ public:
   // local_load
   ChannelPost(int producer, SmallVector<int> &consumers, Operation *allocOp,
               unsigned ID)
-      : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, uniqID),
+      : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, ID),
         allocOp(allocOp) {
-    DataChannelKind channelKind = DataChannelKind::SMEMPost;
+    channelKind = DataChannelKind::SMEMPost;
   }
 
   bool operator==(const ChannelPost &c) {
@@ -81,8 +87,7 @@ public:
 
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
-  Operation *getAllocOp() { return allocOp; }
-  virtual Operation *getRepOp() { return allocOp; }
+  virtual Operation *getAllocOp() { return allocOp; }
   virtual unsigned getNumBuffers();
 
   Operation *allocOp;
@@ -134,7 +139,8 @@ struct TmemDataChannel : Channel {
     channelKind = DataChannelKind::TMEM;
   }
 
-  ttng::TMEMAllocOp getAllocOp() { return tmemAllocOp; }
+  ttng::TMEMAllocOp getTmemAllocOp() { return tmemAllocOp; }
+  virtual Operation *getAllocOp() { return nullptr; }
   ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
   virtual Operation *getSrcOp() { return tmemProducerOp; }
 };
@@ -155,7 +161,7 @@ struct TmemDataChannelPost : Channel {
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
   virtual unsigned getNumBuffers();
-  virtual Operation *getRepOp() { return allocOp; }
+  virtual Operation *getAllocOp() { return allocOp; }
 };
 } // namespace nvidia_gpu
 } // namespace triton
@@ -225,8 +231,10 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
-                            Operation *headConsumer);
+                            Operation *headConsumer, bool isPost = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
+Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
+                       Value idx);
 
 } // namespace mlir
 

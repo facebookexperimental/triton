@@ -248,6 +248,13 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            AsyncTaskId asyncTaskId) {
   // Create newForOp for each task Id.
   auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
+  if (asyncTaskId == 5) { // HACK
+    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
+    if (!parentForOp) {
+      usedArgs.pop_back();
+      LDBG("SpecializeForOp hack to remove last argIdx");
+    }
+  }
 
   // Prepare newLoopArgs.
   SmallVector<Value> newLoopArgs;
@@ -271,9 +278,18 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 
   // Initialize Value mapping from forOp to newForOp
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  {
+    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
+    if (parentForOp)
+      LDBG("-- inner ForOp");
+    else
+      LDBG("-- outer ForOp");
+  }
   for (unsigned i = 0; i < usedArgs.size(); ++i) {
     auto oldArg = forOp.getRegionIterArgs()[usedArgs[i]];
     auto newArg = newForOp.getRegionIterArgs()[i];
+    LDBG("ForOp args mapping of task " << asyncTaskId << " argIdx "
+                                       << usedArgs[i]);
     mapping.map(oldArg, newArg);
   }
 
@@ -476,6 +492,22 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     LDBG("\n\nWith task Id checks");
     funcOp.dump();
   });
+
+  SmallVector<Operation *> toErase;
+  wsOp.walk([&](Operation *op) {
+    unsigned numUsers = std::distance(op->user_begin(), op->user_end());
+    bool isYield = isa<scf::YieldOp>(op);
+    bool isAdd = isa<arith::AddIOp>(op);
+    if (numUsers == 0 && !isYield && isAdd && op->getNumRegions() == 0)
+      toErase.push_back(op);
+  });
+  for (auto *op : toErase) {
+    LLVM_DEBUG({
+      LDBG("erasing op due to no use ");
+      op->dump();
+    });
+    op->erase();
+  }
 
   // Remove original operations that have been cloned in reverse order.
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
