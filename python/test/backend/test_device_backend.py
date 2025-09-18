@@ -21,9 +21,9 @@ with pytest.raises(ImportError):
     # added by https://github.com/triton-lang/triton/pull/2476
     # no longer exist even in upstream
     # We disable the whole test for now
+
     from triton.common.backend import (BaseBackend, compute_core_version_key, register_backend)
     from triton.compiler.make_launcher import make_so_cache_key
-
     from triton.runtime.cache import get_cache_manager
     from triton.runtime.driver import DriverBase
 
