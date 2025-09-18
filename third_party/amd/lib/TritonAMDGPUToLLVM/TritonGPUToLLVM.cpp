@@ -174,7 +174,7 @@ struct ConvertTritonAMDGPUToLLVM
                                              axisInfoAnalysis, allocation,
                                              targetInfo, AMDBenefit);
     AMD::populateBarrierOpToLLVMPatterns(typeConverter, targetInfo, patterns,
-                                           axisInfoAnalysis, AMDBenefit);
+                                         axisInfoAnalysis, AMDBenefit);
     AMD::populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo, patterns,
                                            axisInfoAnalysis, AMDBenefit);
     populatePatterns7(mlir::triton::populateReduceOpToLLVMPatterns,

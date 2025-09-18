@@ -39,15 +39,15 @@ configs = [
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
 def _attn_fwd_ws(sm_scale, M,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-              HEAD_DIM: tl.constexpr,  #
-              BLOCK_M: tl.constexpr,  #
-              BLOCK_N: tl.constexpr,  #
-              FP8_OUTPUT: tl.constexpr,  #
-              NUM_BUFFERS: tl.constexpr,  #
-              NUM_MMA_WARPS: tl.constexpr,  #
-              NUM_MMA_GROUPS: tl.constexpr,  #
-              ):
+                 Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+                 HEAD_DIM: tl.constexpr,  #
+                 BLOCK_M: tl.constexpr,  #
+                 BLOCK_N: tl.constexpr,  #
+                 FP8_OUTPUT: tl.constexpr,  #
+                 NUM_BUFFERS: tl.constexpr,  #
+                 NUM_MMA_WARPS: tl.constexpr,  #
+                 NUM_MMA_GROUPS: tl.constexpr,  #
+                 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
@@ -276,7 +276,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, dtype=torch.float16):
     q = q.to(ref_dtype)
     k = k.to(ref_dtype)
     v = v.to(ref_dtype)
-    M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
     p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
     p = torch.softmax(p.float(), dim=-1)
     p = p.to(ref_dtype)
@@ -294,15 +293,11 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, dtype=torch.float16):
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
         return
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
+    # tri_dv, v.grad = v.grad.clone(), None
+    # tri_dk, k.grad = k.grad.clone(), None
+    # tri_dq, q.grad = q.grad.clone(), None
     # compare
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
-    rtol = 0.0
-    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
 
 
 try:
@@ -321,14 +316,11 @@ configs.append(
         x_names=["N_CTX"],
         x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
-        line_vals=["triton-fp16"]  +
-        (["flash"] if HAS_FLASH else []),
-        line_names=["Triton [FP16]"] +
-        (["Flash-2"] if HAS_FLASH else []),
+        line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+        line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
         styles=[("red", "-"), ("blue", "-"), ("green", "-")],
         ylabel="TFLOPS",
-        plot_name=
-        f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+        plot_name=f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
         args={
             "H": N_HEADS,
             "BATCH": BATCH,

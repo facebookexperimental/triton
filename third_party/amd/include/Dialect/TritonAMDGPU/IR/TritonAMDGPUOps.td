@@ -637,7 +637,7 @@ def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[Mem
 
   let description = [{ Read barrier phase}];
 
-  let arguments = (ins 
+  let arguments = (ins
                    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$alloc
                   );
   let results = (outs I32:$result);

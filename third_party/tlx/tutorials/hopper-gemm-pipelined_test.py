@@ -4,7 +4,7 @@ import pytest
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_cuda,is_hip_cdna2
+from triton._internal_testing import is_cuda, is_hip_cdna2
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -138,6 +138,7 @@ def matmul(a, b):
     )
     return c
 
+
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
     reason="Requires Hopper GPU",
@@ -153,6 +154,7 @@ def test_op():
     rtol = 1e-2 if is_hip_cdna2() else 1e-4
     # TODO. rtol 1e-5 failed while 1e-4 passed on Hopper
     torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol)
+
 
 TORCH_HAS_FP8 = False
 
@@ -204,6 +206,7 @@ def benchmark(M, N, K, provider, fp8_inputs):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
+
 
 if __name__ == "__main__":
     if is_cuda() and torch.cuda.get_device_capability()[0] == 9:

@@ -656,6 +656,7 @@ def get_packages():
 
     yield f"triton.language.extra.tlx"
 
+
 def add_link_to_backends(external_only):
     for backend in backends:
         if external_only and not backend.is_external:

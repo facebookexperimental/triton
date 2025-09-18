@@ -1,13 +1,13 @@
 #include "IR/Dialect.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Transforms/Passes.h"
 
 #define DEBUG_TYPE "tlx-rewrite-local-alias"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -31,7 +31,7 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
   LDBG("rewriteLocalAlias\n");
 
   // Forward map: alloc op -> alias ops
-  DenseMap<Operation*, SmallVector<tlx::LocalAliasOp, 4>> aliasClasses;
+  DenseMap<Operation *, SmallVector<tlx::LocalAliasOp, 4>> aliasClasses;
   // Reverse map: alias op -> base alloc op
   DenseMap<tlx::LocalAliasOp, Operation *> aliasToAlloc;
 

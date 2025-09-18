@@ -6,6 +6,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "passes.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -30,7 +31,6 @@
 #include "llvm/TargetParser/TargetParser.h"
 #include <array>
 #include <pybind11/pybind11.h>
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <stdexcept>
 
 namespace py = pybind11;
@@ -84,7 +84,7 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_reorder_instructions",
                      mlir::createTritonAMDGPUReorderInstructions);
   ADD_PASS_WRAPPER_0("add_lower_barrier_ops",
-                     mlir::createTritonAMDGPULowerBarrierOps);                   
+                     mlir::createTritonAMDGPULowerBarrierOps);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
   ADD_PASS_OPTION_WRAPPER_1("add_block_pingpong",
                             mlir::createTritonAMDGPUBlockPingpong, int32_t);

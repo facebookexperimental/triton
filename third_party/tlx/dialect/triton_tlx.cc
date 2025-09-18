@@ -38,7 +38,8 @@ void init_triton_tlx_ir(py::module &&m) {
                   localAllocType.getEncoding(), localAllocType.getMemorySpace(),
                   /*mutableMemory=*/localAllocType.getMutableMemory());
             }
-            return self.create<ttg::MemDescIndexOp>(memDescType, localAlloc, bufferIdx);
+            return self.create<ttg::MemDescIndexOp>(memDescType, localAlloc,
+                                                    bufferIdx);
           })
       .def("create_require_layout",
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
@@ -463,7 +464,8 @@ void init_triton_tlx_ir(py::module &&m) {
 
 void init_triton_tlx_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
-  ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout", tlx::createTLXInsertRequireLayout);
+  ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout",
+                     tlx::createTLXInsertRequireLayout);
   ADD_PASS_WRAPPER_0("add_tlx_rewrite_local_alias",
                      tlx::createTLXRewriteLocalAlias);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,

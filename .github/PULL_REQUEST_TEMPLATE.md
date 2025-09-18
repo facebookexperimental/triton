@@ -7,6 +7,12 @@ tasks and include the filled-out checklist in your PR description.**
 Complete the following tasks before sending your PR, and replace `[ ]` with
 `[x]` to indicate you have done them.
 -->
+# FB-only:
+
+run `third_party/tlx/run_all.sh`
+
+this PR will be imported to fbcode diff. ensure all internal tests passed.
+
 
 # New contributor declaration
 - [ ] I am not making a trivial change, such as fixing a typo in a comment.

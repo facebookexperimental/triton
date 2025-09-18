@@ -398,9 +398,7 @@ def async_descriptor_store_wait(
 
 
 @tl.builtin
-def fence_async_shared(
-    _semantic=None,
-) -> None:
+def fence_async_shared(_semantic=None, ) -> None:
     """
     Order memory operations that go through the shared memory.
     """
