@@ -430,20 +430,3 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 ```
-
-## Build and install TLX from source
-
-```
-git clone https://github.com/facebookexperimental/triton.git
-cd triton
-git checkout origin/tlx
-
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .
-```
-
-Run the tutorials after the build finishes, e.g,
-```
-python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong.py
-```
-
