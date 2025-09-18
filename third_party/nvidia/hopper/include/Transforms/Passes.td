@@ -102,4 +102,12 @@ def NVGPUTestPingPongSync : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> 
   ];
 }
 
+def NVGPUTest1DTMEMAlloc : Pass<"nvgpu-test-1D-tmem-alloc", "mlir::ModuleOp"> {
+  let summary = "test allocating tmem for a 1D tensor that should be passed across partitions.";
+
+  let description = "This pass takes producers with tmem.start and establishes a TMEM allocation for communication with other partitions.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES
