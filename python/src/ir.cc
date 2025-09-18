@@ -1476,7 +1476,8 @@ void init_triton_ir(py::module &&m) {
              auto ctx = self.getContext();
              auto resultTy = triton::TensorDescType::get(
                  ctx, cast<RankedTensorType>(blockTy));
-             return self.create<ttng::ReinterpretTensorDescOp>(resultTy, desc_ptr);
+             return self.create<ttng::ReinterpretTensorDescOp>(resultTy,
+                                                               desc_ptr);
            })
       .def("create_descriptor_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
@@ -1517,14 +1518,14 @@ void init_triton_ir(py::module &&m) {
               std::vector<Value> element_stride, int32_t elem_type,
               int32_t interleave_layout, int32_t swizzle_mode,
               int32_t fill_mode) {
-             self.create<ExperimentalTensormapCreateOp>(
+             self.create<ttng::TensormapCreateOp>(
                  desc_ptr, global_address, box_dim, global_dim, global_stride,
                  element_stride, elem_type, interleave_layout, swizzle_mode,
                  fill_mode);
            })
       .def("create_tensormap_fenceproxy_acquire",
            [](TritonOpBuilder &self, Value desc_ptr) {
-             self.create<ExperimentalTensormapFenceproxyAcquireOp>(desc_ptr);
+             self.create<ttng::TensormapFenceproxyAcquireOp>(desc_ptr);
            })
       .def("create_reshape",
            [](TritonOpBuilder &self, Value &arg, std::vector<int64_t> &shape,
