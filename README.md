@@ -443,5 +443,5 @@ pip install -e .
 
 Run the tutorials after the build finishes, e.g,
 ```
-python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong.py
+python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py
 ```
