@@ -436,7 +436,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 ```
 git clone https://github.com/facebookexperimental/triton.git
 cd triton
-git checkout origin/tlx
 
 pip install -r python/requirements.txt # build-time dependencies
 pip install -e .
