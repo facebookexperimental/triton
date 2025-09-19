@@ -436,10 +436,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 ```
 git clone https://github.com/facebookexperimental/triton.git
 cd triton
-<<<<<<< HEAD
-=======
-git checkout origin/tlx
->>>>>>> b84b48063 (refresh __init__.py)
 
 pip install -r python/requirements.txt # build-time dependencies
 pip install -e .
@@ -447,9 +443,5 @@ pip install -e .
 
 Run the tutorials after the build finishes, e.g,
 ```
-<<<<<<< HEAD
 python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py
-=======
-python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong.py
->>>>>>> b84b48063 (refresh __init__.py)
 ```
