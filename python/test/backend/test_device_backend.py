@@ -27,7 +27,6 @@ with pytest.raises(ImportError):
     from triton.runtime.cache import get_cache_manager
     from triton.runtime.driver import DriverBase
 
-
     def build_for_backend(name, src, srcdir):
         suffix = sysconfig.get_config_var('EXT_SUFFIX')
         so = os.path.join(srcdir, '{name}{suffix}'.format(name=name, suffix=suffix))
@@ -52,7 +51,6 @@ with pytest.raises(ImportError):
 
         subprocess.check_call([cc, src, f"-I{py_include_dir}", f"-I{srcdir}", "-shared", "-fPIC", "-o", so])
         return so
-
 
     class ExtensionUtils:
 
@@ -83,7 +81,6 @@ with pytest.raises(ImportError):
             self.load_binary = mod.load_binary
             self.get_device_properties = mod.get_device_properties
 
-
     class ExtensionDriver(DriverBase):
 
         def __new__(cls):
@@ -93,7 +90,6 @@ with pytest.raises(ImportError):
 
         def __init__(self):
             self.utils = ExtensionUtils()
-
 
     class ExtensionBackend(BaseBackend):
         stub_so_path = ""
@@ -213,7 +209,6 @@ with pytest.raises(ImportError):
             """
 
             return src
-
 
     def test_dummy_backend():
         register_backend("cpu", ExtensionBackend)

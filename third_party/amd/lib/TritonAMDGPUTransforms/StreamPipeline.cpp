@@ -1060,7 +1060,7 @@ FailureOr<scf::ForOp> pipelineLoop(scf::ForOp forOp, int numStages,
   IRRewriter rewriter(forOp);
   return tt::pipelineForLoop(rewriter, forOp, options);
 }
-} // namespace
+} // namespace amdpipeliner
 
 struct PipelinePass : impl::TritonAMDGPUStreamPipelineBase<PipelinePass> {
   using Base::Base;
@@ -1096,8 +1096,8 @@ struct PipelinePass : impl::TritonAMDGPUStreamPipelineBase<PipelinePass> {
       // pingpong, which is the only use case of this scheduling variant.
       int numStagesThis = tt::getNumStagesOrDefault(forOp, numStages);
       bool waitAtTail = usePingpong && (numStagesThis == 3) && useAsyncCopy;
-      (void)amdpipeliner::pipelineLoop(forOp, numStagesThis, globalPrefetch, localPrefetch,
-                         useAsyncCopy, waitAtTail);
+      (void)amdpipeliner::pipelineLoop(forOp, numStagesThis, globalPrefetch,
+                                       localPrefetch, useAsyncCopy, waitAtTail);
     }
 
     // NOTE: Leave empty for now, until we utilize customEpiloguePeeling

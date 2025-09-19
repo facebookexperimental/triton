@@ -153,8 +153,7 @@ def _generate_test_params():
     for M, N, K in itertools.product(dims_mn, dims_mn, dims_k):
         device_props = str(torch.cuda.get_device_properties())
         matmul_size = (M * K + K * N) * dtype.itemsize
-        max_shared_mem = driver.active.utils.get_device_properties(
-            driver.active.get_current_device())["max_shared_mem"]
+        max_shared_mem = driver.active.utils.get_device_properties(driver.active.get_current_device())["max_shared_mem"]
         if matmul_size > max_shared_mem:
             continue
         # TODO: Investigate why this test fails on gfx942 with M=512, N=512, K=16
@@ -166,6 +165,7 @@ def _generate_test_params():
         else:
             params.append((M, N, K))
     return params
+
 
 # Test tl.dot wit tlx smem ops
 # Tests tl.load->tlx_local_store->tlx_local_load->tl.dot
@@ -215,11 +215,9 @@ def test_tl_dot_with_tlx_smem_load_store(M, N, K, device):
         c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
         tl.store(c_ptrs, c)
 
-
     torch.manual_seed(0)
     # Note: This test may fail for other shapes/kwargs until
     # reg->shared layout propagation is implemented tlx layout propagation
-    dims = [16, 32, 64, 128, 256, 512]
     dtype = torch.float16
 
     print(f"{M=}, {N=}, {K=}")
@@ -243,6 +241,7 @@ def test_tl_dot_with_tlx_smem_load_store(M, N, K, device):
     )
     z_ref = torch.matmul(x, y)
     torch.testing.assert_close(z, z_ref)
+
 
 # Tests tl.load->tlx_local_store->tlx_local_load
 # This is a smem load/store test variant that does not use
@@ -1054,7 +1053,7 @@ def tlx_square_non_ws(
     z_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
-    EXPECTED_ARRIVAL_COUNT:tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT: tl.constexpr,
 ):
     """
     Test pairs of arrive/wait using different phases
@@ -1112,7 +1111,7 @@ def tlx_square_ws(
     z_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
-    EXPECTED_ARRIVAL_COUNT:tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT: tl.constexpr,
 ):
     # prologue
     pid = tl.program_id(axis=0)
@@ -1178,11 +1177,12 @@ def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
     if is_hip():
-        assert (ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3) and (
-          ttgir.count("amdgpu.arrive_barrier") == 3), f"TTGIR {ttgir}"
+        assert (ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase")
+                                                              == 3) and (ttgir.count("amdgpu.arrive_barrier")
+                                                                         == 3), f"TTGIR {ttgir}"
     else:
         assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3) and (
-          ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
+            ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -1468,7 +1468,6 @@ def test_inline_tmem(BLOCK_SIZE, device):
         buffers = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(4), tlx.storage_kind.tmem)
         buffer0 = buffers[0]
         x = tlx.local_load(buffer0)
-        pid = tl.program_id(axis=0)
         offsets_i = tl.arange(0, BLOCK_SIZE)[:, None]
         offsets_j = tl.arange(0, BLOCK_SIZE)[None, :]
         offsets = offsets_i * BLOCK_SIZE + offsets_j
@@ -1488,8 +1487,8 @@ def test_async_dots_blackwell_tmem(device):
     """
 
     @triton.jit
-    def tcgen5_fa_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                                 d_ptr, stride_dm, stride_dn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def tcgen5_fa_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn, d_ptr,
+                         stride_dm, stride_dn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         a_tiles = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
         b_tiles = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
         c_tiles = tlx.local_alloc((BLOCK_N, BLOCK_N), tl.float16, tl.constexpr(1), reuse=a_tiles)
@@ -1498,7 +1497,8 @@ def test_async_dots_blackwell_tmem(device):
         c_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
 
         acc_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
-        o_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem, reuse=acc_tiles)
+        o_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem,
+                                  reuse=acc_tiles)
         d_tiles = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
 
         acc_fulls = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
@@ -1539,7 +1539,6 @@ def test_async_dots_blackwell_tmem(device):
                 # compute ((a @ b) * 0.5) @ c
                 tlx.async_dot(o_tiles[0], c_tiles[0], d_tiles[0], use_acc=False, mBarriers=[d_fulls[0]])
 
-
             # activation and epilogue
             with tlx.async_task(num_warps=4):
                 # wait for (a @ b) is ready
@@ -1559,8 +1558,6 @@ def test_async_dots_blackwell_tmem(device):
                 d_ptrs = d_ptr + stride_dm * offs_m[:, None] + stride_dn * offs_n[None, :]
                 tl.store(d_ptrs, d)
 
-
-
     torch.manual_seed(0)
     M, N, K = (64, 32, 16)
     a = torch.ones((M, K), device=device, dtype=torch.float16)
@@ -1570,7 +1567,7 @@ def test_async_dots_blackwell_tmem(device):
 
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = tcgen5_fa_kernel[(1, 1)](a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c, c.stride(0),
-                                              c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=1)
+                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=1)
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.tmem_alloc") == 2

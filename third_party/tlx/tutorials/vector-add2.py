@@ -21,6 +21,7 @@ from triton._internal_testing import is_hopper_or_newer
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+
 @triton.jit
 def add2_kernel(
     x_ptr,
@@ -99,6 +100,7 @@ def add2_warp_specialized(x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: 
 def dual_add(x, y, a, b):
     return x + y, a + b
 
+
 @pytest.mark.skipif(
     not is_hopper_or_newer(),
     reason="Requires Hopper GPU or above",
@@ -115,13 +117,15 @@ def test_op():
     output_triton_ws_1, output_triton_ws_2 = add2_warp_specialized(x, y, a, b)
 
     print(f"The maximum difference between torch and triton is "
-        f"{torch.max(torch.abs(output_torch_1 - output_triton_1))}")
+          f"{torch.max(torch.abs(output_torch_1 - output_triton_1))}")
     print(f"The maximum difference between torch and triton is "
-        f"{torch.max(torch.abs(output_torch_2 - output_triton_2))}")
+          f"{torch.max(torch.abs(output_torch_2 - output_triton_2))}")
     print(f"The maximum difference between torch and triton is "
-        f"{torch.max(torch.abs(output_torch_1 - output_triton_ws_1))}")
+          f"{torch.max(torch.abs(output_torch_1 - output_triton_ws_1))}")
     print(f"The maximum difference between torch and triton is "
-        f"{torch.max(torch.abs(output_torch_2 - output_triton_ws_2))}")
+          f"{torch.max(torch.abs(output_torch_2 - output_triton_ws_2))}")
+
+
 # %%
 # Seems like we're good to go!
 
@@ -161,6 +165,7 @@ def benchmark(size, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add2_warp_specialized(x, y, a, b), quantiles=quantiles)
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
+
 
 if __name__ == "__main__":
     # %%

@@ -172,6 +172,7 @@ def matmul(a, b):
     )
     return c
 
+
 @pytest.mark.skipif(
     not is_blackwell(),
     reason="Requires Blackwell GPU",
@@ -187,6 +188,7 @@ def test_op():
     print(f"triton_output_with_fp16_inputs={triton_output}")
     rtol = 0
     torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol)
+
 
 ref_lib = 'cuBLAS'
 

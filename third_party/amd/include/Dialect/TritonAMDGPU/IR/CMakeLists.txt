@@ -16,4 +16,3 @@ mlir_tablegen(TritonAMDGPUEnums.cpp.inc -gen-enum-defs)
 mlir_tablegen(TritonAMDGPUAttrDefs.h.inc -gen-attrdef-decls)
 mlir_tablegen(TritonAMDGPUAttrDefs.cpp.inc -gen-attrdef-defs)
 add_public_tablegen_target(TritonAMDGPUAttrDefsIncGen)
-

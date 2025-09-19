@@ -123,7 +123,6 @@ def visit_withAsyncTasks(self, node):
             val = liveins[name]
             ws_op.append_operand(val.handle)
 
-
         # real codegen
         index = 0
         for stmt in stmts:

@@ -17,7 +17,7 @@ def alloc_barriers(
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
     """
-         
+
     layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
         layout.vectorSize,

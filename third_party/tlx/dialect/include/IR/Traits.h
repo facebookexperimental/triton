@@ -16,8 +16,7 @@ namespace OpTrait {
 // instantiated/duplicated.
 namespace impl {
 
-LogicalResult
-verifySameOperandAndResultMemorySpace(Operation *op);
+LogicalResult verifySameOperandAndResultMemorySpace(Operation *op);
 
 } // namespace impl
 

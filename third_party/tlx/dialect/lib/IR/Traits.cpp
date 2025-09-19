@@ -17,11 +17,9 @@ OpTrait::impl::verifySameOperandAndResultMemorySpace(Operation *op) {
     return failure();
 
   // Only mem descs can have memory spaces.
-  auto operandType =
-      dyn_cast<ttg::MemDescType>(op->getOperand(0).getType());
+  auto operandType = dyn_cast<ttg::MemDescType>(op->getOperand(0).getType());
 
-  auto resultType =
-      dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+  auto resultType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
 
   if (operandType && resultType) {
     if (operandType.getMemorySpace() != resultType.getMemorySpace()) {

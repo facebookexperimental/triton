@@ -9,7 +9,6 @@ import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple
 from dataclasses import dataclass
 import builtins
-from .. import knobs
 from ..runtime.jit import JITCallable
 import inspect
 

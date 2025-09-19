@@ -217,11 +217,14 @@ class CompileTimer:
             store_results=delta(stage_start, self.store_results_end),
         )
 
+
 # Facebook begin T207797237
 def _sanitize_extern_libs(options):
     options = dict(options)
     options["extern_libs"] = [name for name, path in options.get("extern_libs", [])]
     return options
+
+
 # Facebook end T207797237
 
 

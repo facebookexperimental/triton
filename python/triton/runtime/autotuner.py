@@ -240,11 +240,12 @@ class Autotuner(KernelInterface):
                         waitcounter.__exit__()
                     if knobs.autotuning.print:
                         print(
-                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:', flush=True
-                        )
+                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
+                            flush=True)
                         sorted_configs = builtins.sorted(timings, key=timings.get)
                         for config in sorted_configs:
-                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}', flush=True)
+                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
+                                  flush=True)
                     # facebook end T203283446
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}

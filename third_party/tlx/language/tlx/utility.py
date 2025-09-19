@@ -1,15 +1,14 @@
 import triton.language.core as tl
 
-from . import types as tlx
 import re
 import triton.runtime.driver as driver
-
 
 
 def is_hip():
     target = driver.active.get_current_target()
     return target.backend == 'hip'
-    
+
+
 def cuda_parse_arch(arch):
     pattern = r"^sm(\d+)$"
     match = re.fullmatch(pattern, arch)
