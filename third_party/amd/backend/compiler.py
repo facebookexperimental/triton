@@ -48,6 +48,7 @@ class HIPOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", )
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
+    launch_cluster: bool = False  # No-op placeholder
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False

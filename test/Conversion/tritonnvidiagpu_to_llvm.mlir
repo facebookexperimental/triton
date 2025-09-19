@@ -89,6 +89,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     ttng.wait_barrier_named %c9_i32, %c256_i32 : i32, i32
     tt.return
   }
+
+  // CHECK-LABEL: async_clc_try_cancel
+  tt.func @async_clc_try_cancel(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
+    %c9_i32 = arith.constant 9 : i32
+    %c256_i32 = arith.constant 256 : i32
+    // CHECK-NEXT: [[CLC_RESPONSE:%.*]] = llvm.mlir.constant(9 : i32) : i32
+    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
+    // CHECK-NEXT: "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 $0, $1;", "r,r" [[CLC_RESPONSE]], [[BAR_ID]]
+    ttng.async_clc_try_cancel %c9_i32, %c256_i32 : i32, i32
+    tt.return
+  }
 }
 
 

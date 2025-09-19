@@ -131,12 +131,21 @@ def local_view(
     ...
 
 
+@overload
+def local_view(
+    local_allocated_buffers: tlx.clc_response,
+    buffer_idx: int,
+    _builder=None,
+) -> tlx.clc_response:
+    ...
+
+
 @tl.builtin
 def local_view(
-    local_allocated_buffers: tlx.buffered_tensor | tlx.mbarrier,
+    local_allocated_buffers: tlx.buffered_tensor | tlx.mbarrier | tlx.clc_response,
     buffer_idx: int,
     _semantic=None,
-) -> tlx.buffered_tensor | tlx.mbarrier:
+) -> tlx.buffered_tensor | tlx.mbarrier | tlx.clc_response:
     """
     Returns a subview of the buffer.
     """
@@ -144,6 +153,8 @@ def local_view(
     view_handle = _semantic.builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarrier):
         return tlx.mbarrier(view_handle, 0, local_allocated_buffers.type.layout)
+    elif isinstance(local_allocated_buffers, tlx.clc_response):
+        return tlx.clc_response(view_handle, 0, local_allocated_buffers.type.layout)
     else:
         return tlx.buffered_tensor(
             view_handle,
