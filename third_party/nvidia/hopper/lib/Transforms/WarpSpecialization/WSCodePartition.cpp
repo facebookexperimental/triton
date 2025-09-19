@@ -598,9 +598,6 @@ void groupChannels(
   }
 #endif
 
-  // Group channels by consumer op.
-  DenseMap<Operation *, SmallVector<Channel *>> consumerChannels;
-
   // Two channels can be combined if
   //   src1 and src2 are in the same block and
   //   (dst1 == dst2 or
@@ -629,29 +626,34 @@ void groupChannels(
       return false;
     return dst1User == dst2User && dst1User->getBlock() == dst1->getBlock();
   };
+
+  // Group channels by consumer if they can be merged.
+  SmallVector<SmallVector<Channel *>> consumerChannels;
+
   assert(channels.size() > 0 && "channel size is zero");
   // Compare with existing channels in the consumerChannels to see if
   // it can be combined.
   for (auto *c0 : channels) {
     bool merged = false;
-    for (auto &kv : consumerChannels) {
-      if (kv.second.size() > 0 && channelCanBeMerged(c0, kv.second.front())) {
-        kv.second.push_back(c0);
+    for (auto &c : consumerChannels) {
+      if (channelCanBeMerged(c0, c.front())) {
+        c.push_back(c0);
         merged = true;
         break;
       }
     }
     if (!merged) { // Create a new entry.
-      auto *keyOp = c0->getDstOp();
-      if (!consumerChannels.count(keyOp))
-        orderedChannels.push_back(c0);
-      consumerChannels[keyOp].push_back(c0);
+      orderedChannels.push_back(c0);
+      // TODO: Even if the channels fail the channelCanBeMerged check, there may
+      // be some benefit to tracking the channels that have the same consumer op
+      // so they can share the same arrive op.
+      consumerChannels.push_back({c0});
     }
   }
 
   // Reorder channels associated with one entry based on program order of the
   // producers.
-  for (auto &group : make_second_range(consumerChannels)) {
+  for (auto &group : consumerChannels) {
     auto &allOps = group.front()->getSrcOp()->getBlock()->getOperations();
     DenseMap<Operation *, size_t> opIdx;
     opIdx.reserve(allOps.size());
@@ -667,8 +669,11 @@ void groupChannels(
   for (auto &kv : producerChannels) {
     channelsGroupedByProducers[kv.second.front()] = kv.second;
   }
-  for (auto &kv : consumerChannels) {
-    channelsGroupedByConsumers[kv.second.front()] = kv.second;
+  for (auto &c : consumerChannels) {
+    auto *keyChannel = c.front();
+    auto [it, inserted] =
+        channelsGroupedByConsumers.try_emplace(keyChannel, std::move(c));
+    assert(inserted && "Channel in multiple groups");
   }
 
   LLVM_DEBUG({
