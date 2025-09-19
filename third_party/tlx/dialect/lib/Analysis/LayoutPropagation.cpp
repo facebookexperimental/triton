@@ -130,7 +130,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             mmaEncoding.getFp4Padded());
         const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
         auto operandLattice = operands[0];
-        ChangeResult changed = operandLattice->meet(updatedResultLayoutEncoding);
+        ChangeResult changed =
+            operandLattice->meet(updatedResultLayoutEncoding);
         propagateIfChanged(operandLattice, changed);
         visitWarpSpecRegionArgs(op, memDescTransOp.getSrc(),
                                 updatedResultLayoutEncoding);

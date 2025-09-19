@@ -4,6 +4,7 @@ from typing import List, Any
 import torch
 import triton
 
+
 def _fill_desc(desc, ptr, dims, block_dims, element_size):
     assert len(dims) == len(block_dims)
     assert 1 <= len(dims) <= 2
@@ -11,10 +12,10 @@ def _fill_desc(desc, ptr, dims, block_dims, element_size):
 
     if len(dims) == 1:
         triton.runtime.driver.active.utils.fill_1d_tma_descriptor(ptr, dims[0], block_dims[0], element_size,
-                                                                    desc.tma_desc_cpu_ptr())
+                                                                  desc.tma_desc_cpu_ptr())
     else:
-        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(ptr, dims[0], dims[1], block_dims[0],
-                                                                    block_dims[1], element_size, desc.tma_desc_cpu_ptr())
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(ptr, dims[0], dims[1], block_dims[0], block_dims[1],
+                                                                  element_size, desc.tma_desc_cpu_ptr())
 
 
 def create_1d_tma_descriptor(ptr, dim, block_dim, element_size):
@@ -55,9 +56,8 @@ class TmaDescKernelParamType:
         assert self.desc.data_ptr() % 64 == 0
 
         if len(dims) == 1:
-            triton.runtime.driver.active.utils.fill_1d_tma_descriptor_type(
-                ptr, dims[0], block_dims[0], dtype, self.desc.data_ptr()
-            )
+            triton.runtime.driver.active.utils.fill_1d_tma_descriptor_type(ptr, dims[0], block_dims[0], dtype,
+                                                                           self.desc.data_ptr())
         else:
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor_type(
                 ptr,
