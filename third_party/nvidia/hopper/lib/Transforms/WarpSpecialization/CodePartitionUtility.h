@@ -14,7 +14,13 @@ namespace mlir {
 
 namespace tt = mlir::triton;
 
-enum class DataChannelKind { SMEM, TMEM, REG };
+enum class DataChannelKind : int {
+  SMEM = 0,
+  TMEM = 1,
+  REG = 2,
+  SMEMPost = 3,
+  TMEMPost = 4
+};
 
 static inline std::string to_string(DataChannelKind k) {
   switch (k) {
@@ -36,24 +42,55 @@ public:
           unsigned operandIdx, unsigned numBuffers, unsigned ID,
           DataChannelKind channelKind = DataChannelKind::SMEM)
       : relation(producer, consumers), op(op), operandIdx(operandIdx),
-        numBuffers(numBuffers), uniqID(ID), channelKind(channelKind) {}
+        _numBuffers(numBuffers), uniqID(ID), channelKind(channelKind) {}
 
   bool operator==(const Channel &c) {
     return relation == c.relation && operandIdx == c.operandIdx && op == c.op;
   }
   virtual ~Channel() = default;
 
-  Operation *getDstOp() { return op; }
+  virtual Operation *getDstOp() { return op; }
   unsigned getDstOperandIdx() { return operandIdx; }
-  virtual Value getSrcOperand() { return op->getOperand(operandIdx); }
+  Value getSrcOperand() { return op->getOperand(operandIdx); }
   virtual Operation *getSrcOp() { return getSrcOperand().getDefiningOp(); }
+  virtual Operation *getAllocOp() { return nullptr; }
+  virtual unsigned getNumBuffers() { return _numBuffers; }
 
   Relation relation; // producer task Id, a list of consumer task Ids
   Operation *op;
   unsigned operandIdx;
-  unsigned numBuffers;
+  unsigned _numBuffers;
   DataChannelKind channelKind = DataChannelKind::SMEM;
   unsigned uniqID;
+};
+
+// A few assumptions, a channel can have multiple consumers, but the consumers
+// must be in the same region and the taskIds must be the same. We can have
+// a representative consumer in the channel.
+struct ChannelPost : Channel {
+public:
+  using Relation = std::pair<int, SmallVector<int>>;
+
+  // source can be local_store, consumer can be gen5, ttg.memdesc_trans,
+  // local_load
+  ChannelPost(int producer, SmallVector<int> &consumers, Operation *allocOp,
+              unsigned ID)
+      : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, ID),
+        allocOp(allocOp) {
+    channelKind = DataChannelKind::SMEMPost;
+  }
+
+  bool operator==(const ChannelPost &c) {
+    return relation == c.relation && allocOp == c.allocOp;
+  }
+  virtual ~ChannelPost() = default;
+
+  virtual Operation *getSrcOp();
+  virtual Operation *getDstOp();
+  virtual Operation *getAllocOp() { return allocOp; }
+  virtual unsigned getNumBuffers();
+
+  Operation *allocOp;
 };
 
 struct ReuseGroup {
@@ -102,9 +139,29 @@ struct TmemDataChannel : Channel {
     channelKind = DataChannelKind::TMEM;
   }
 
-  ttng::TMEMAllocOp getAllocOp() { return tmemAllocOp; }
+  ttng::TMEMAllocOp getTmemAllocOp() { return tmemAllocOp; }
+  virtual Operation *getAllocOp() { return nullptr; }
   ttng::TCGen5MMAOp getMmaOp() { return tmemMmaOp; }
   virtual Operation *getSrcOp() { return tmemProducerOp; }
+};
+
+struct TmemDataChannelPost : Channel {
+  bool isOperandD;
+  Operation *allocOp;
+
+  // Can be produced by tmem_store or operand D of gen5, consumed by tmem_load
+  // or gen5
+  TmemDataChannelPost(int producer, SmallVector<int> &consumers,
+                      Operation *allocOp, bool isOperandD, unsigned uniqID)
+      : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, uniqID),
+        isOperandD(isOperandD), allocOp(allocOp) {
+    channelKind = DataChannelKind::TMEMPost;
+  }
+
+  virtual Operation *getSrcOp();
+  virtual Operation *getDstOp();
+  virtual unsigned getNumBuffers();
+  virtual Operation *getAllocOp() { return allocOp; }
 };
 } // namespace nvidia_gpu
 } // namespace triton
@@ -143,13 +200,16 @@ void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
 
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels);
+void collectRegionsWithChannelsPost(const SmallVector<Channel *> &channels,
+                                    DenseSet<Operation *> &regionsWithChannels);
 void insertAsyncCopy(
     triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByProducers,
     const DenseMap<Channel *, Value> &bufferMap,
     DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config);
+    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
+    bool isPost = false);
 
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
@@ -171,8 +231,10 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
-                            Operation *headConsumer);
+                            Operation *headConsumer, bool isPost = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
+Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
+                       Value idx);
 
 } // namespace mlir
 

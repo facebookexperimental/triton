@@ -25,6 +25,144 @@ bool enclosing(scf::ForOp forOp, Operation *op) {
   return forOp->isProperAncestor(op);
 }
 
+// After createBufferPost, MemDescIndexOp will be used.
+Operation *skipIdxOp(Operation *op) {
+  if (auto idx = dyn_cast<triton::gpu::MemDescIndexOp>(op)) {
+    unsigned numUsers = 0;
+    Operation *first = nullptr;
+    for (auto *user : idx.getOperation()->getUsers()) {
+      ++numUsers;
+      first = user;
+    }
+    assert(numUsers <= 1);
+    return first;
+  }
+  return op;
+}
+
+Operation *ChannelPost::getSrcOp() {
+  for (auto usr : allocOp->getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(user))
+      return user;
+    if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
+      return user;
+  }
+  return nullptr;
+}
+
+// A few assumptions, a channel can have multiple consumers, but the consumers
+// must be in the same region and the taskIds must be the same. We can have
+// a representative consumer in the channel.
+Operation *ChannelPost::getDstOp() {
+  SmallVector<Operation *> consumers;
+  for (auto usr : allocOp->getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (!isa<ttg::LocalStoreOp>(user) &&
+        !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
+      consumers.push_back(user);
+  }
+  if (consumers.size() == 1)
+    return consumers[0];
+  assert(consumers.size() != 0);
+  auto taskIds = getAsyncTaskIds(consumers[0]);
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    auto taskIds2 = getAsyncTaskIds(consumers[i]);
+    assert(taskIds == taskIds2 &&
+           consumers[i]->getBlock() == consumers[0]->getBlock());
+  }
+  return consumers.back();
+}
+
+static bool isTmemProducer(Operation *allocOp, Operation *user) {
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+    if (mmaOp.getD() == allocOp->getResult(0))
+      return true;
+  }
+  if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user))
+    return true;
+  return false;
+}
+
+static Operation *findTmemStartEnd(ttng::TmemDataChannelPost *ch,
+                                   std::string attrName) {
+  for (auto usr : ch->allocOp->getResult(0).getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    DenseSet<int> channelIds;
+    if (auto attr = user->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
+      for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
+        channelIds.insert(asyncTaskId);
+      }
+      if (channelIds.count(ch->uniqID))
+        return user;
+    }
+  }
+  return nullptr;
+}
+
+Operation *ttng::TmemDataChannelPost::getSrcOp() {
+  if (isOperandD) { // is inout
+    // Find tmem.start for this channel ID.
+    return findTmemStartEnd(this, "tmem.start");
+  }
+  for (auto usr : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
+    // If there is no subview, user will be the same as usr and we check if opnd
+    // D of user is from alloc If there is a subview, alloc -> subview -> user,
+    // we check if opnd D of user is from subview.
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (isTmemProducer(user == usr ? allocOp : usr, user))
+      return user;
+  }
+  return nullptr;
+}
+
+Operation *ttng::TmemDataChannelPost::getDstOp() {
+  if (isOperandD) {
+    // Find tmem.end for this channel ID.
+    return findTmemStartEnd(this, "tmem.end");
+  }
+  SmallVector<Operation *> consumers;
+  for (auto usr : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
+    Operation *user = skipIdxOp(usr);
+    if (!user)
+      continue;
+    if (!isTmemProducer(user == usr ? allocOp : usr, user))
+      consumers.push_back(user);
+  }
+  if (consumers.size() == 1)
+    return consumers[0];
+  assert(consumers.size() != 0);
+  auto taskIds = getAsyncTaskIds(consumers[0]);
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    auto taskIds2 = getAsyncTaskIds(consumers[i]);
+    assert(taskIds == taskIds2 &&
+           consumers[i]->getBlock() == consumers[0]->getBlock());
+  }
+  return consumers.back();
+}
+
+unsigned ChannelPost::getNumBuffers() {
+  // get buffer.copy
+  if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
+    return copy.getInt();
+  return 1;
+}
+
+unsigned ttng::TmemDataChannelPost::getNumBuffers() {
+  // get buffer.copy
+  if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
+    return copy.getInt();
+  return 1;
+}
+
 // Check to see if there is no outer loop that is enclosed under ifOp.
 bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
   auto pOp = subOp->getParentOfType<scf::ForOp>();
@@ -36,6 +174,8 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
+  if (group->channels[0]->getNumBuffers() <= 1)
+    return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
   for (auto *ch : group->channels) {
@@ -137,19 +277,36 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 // that is directly in regionOp and encloses the channel.
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
+  if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp))
+    return;
+  if (group->channels.size() <= 1 || group->channels[0]->getNumBuffers() <= 1)
+    return;
   // Goes through body of regionOp, if the body op is a regionOp, check
   // to see if it contains a channel in the reuse group.
+  auto parentForOp = regionOp->getParentOfType<scf::ForOp>();
+  if (!parentForOp)
+    LDBG("getReuseChannels for group: " << group->channels.size()
+                                        << " no outer for");
+  else
+    LDBG("getReuseChannels for group: " << group->channels.size()
+                                        << " with outer for");
   if (auto ifOp = dyn_cast<scf::IfOp>(regionOp)) {
     for (Operation &op : ifOp.thenBlock()->getOperations()) {
       if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
-        if (needAccumCntForReuse(&op, group))
+        if (needAccumCntForReuse(&op, group)) {
           chList.push_back(&op);
+        }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
         // dstOp has the same enclosing parentOp.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp())
+          if (&op == ch->getDstOp()) {
+            LLVM_DEBUG({
+              LDBG("\nchannel with DstOp: ");
+              op.dump();
+            });
             chList.push_back(&op);
+          }
         }
       }
     }
@@ -158,14 +315,21 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
   if (auto forOp = dyn_cast<scf::ForOp>(regionOp)) {
     for (Operation &op : forOp.getBody()->without_terminator()) {
       if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
-        if (needAccumCntForReuse(&op, group))
+        if (needAccumCntForReuse(&op, group)) {
+          LDBG("\ninserting ctrlOp in chList");
           chList.push_back(&op);
+        }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
         // dstOp has the same enclosing parentOp.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp())
+          if (&op == ch->getDstOp()) {
+            LLVM_DEBUG({
+              LDBG("\nchannel with DstOp: ");
+              op.dump();
+            });
             chList.push_back(&op);
+          }
         }
       }
     }
@@ -185,7 +349,7 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
     if (needAccumCntForReuse(regionOp, config->getGroup(reuseGroupIdx)))
       ++argIdx;
   }
-  return cnts + argIdx;
+  return cnts + argIdx - 1;
 }
 
 // Compute and return the buffer index and phase for a given accumulate count.
