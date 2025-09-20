@@ -64,7 +64,7 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   auto loc = op.getLoc();
   ttng::ArriveBarrierOp arriveOp;
 
-  if (loadType == ttnvws::TokenLoadType::TMALoadOp) {
+  if (true) { // loadType == ttnvws::TokenLoadType::TMALoadOp) {
     // Get the count from the barriers: trace the local_alloc for the barrier
     // then find the count from init_barrier
     arriveOp = builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, fullCnt);

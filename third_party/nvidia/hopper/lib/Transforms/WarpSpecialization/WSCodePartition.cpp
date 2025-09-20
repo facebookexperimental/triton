@@ -484,28 +484,39 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
 // look ahead for the actual consumers, usually dot ops, that can directly
 // use shared memory. The local_alloc will be removed later.
 static SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
+  // TransOp is not a real consumer. It caculates the shared memory
+  // address for the real consumer. Continue to find its transitive users
+  // recursively. Return all transitive users;
+  auto goThroughTrans = [&](Operation *user) -> DenseSet<Operation *> {
+    DenseSet<Operation *> users;
+    DenseSet<Operation *> visited;
+    SmallVector<Operation *> transUsers;
+    transUsers.push_back(user);
+    while (!transUsers.empty()) {
+      auto transUser = transUsers.pop_back_val();
+      visited.insert(transUser);
+      if (isa<tt::TransOp, ttg::MemDescTransOp>(transUser)) {
+        for (auto transitiveUser : transUser->getUsers()) {
+          if (!visited.count(transitiveUser))
+            transUsers.push_back(transitiveUser);
+        }
+      } else {
+        users.insert(transUser);
+      }
+    }
+    return users;
+  };
+  if (isa<ttg::MemDescTransOp>(consumerOp)) {
+    auto users = goThroughTrans(consumerOp);
+    return SmallVector<Operation *>(users.begin(), users.end());
+  }
   if (isa<ttg::LocalAllocOp>(consumerOp)) {
     DenseSet<Operation *> users;
     for (auto user : consumerOp->getUsers()) {
       if (isa<tt::TransOp, ttg::MemDescTransOp>(user)) {
-        // TransOp is not a real consumer. It caculates the shared memory
-        // address for the real consumer. Continue to find its transitive users
-        // recursively.
-        DenseSet<Operation *> visited;
-        SmallVector<Operation *> transUsers;
-        transUsers.push_back(user);
-        while (!transUsers.empty()) {
-          auto transUser = transUsers.pop_back_val();
-          visited.insert(transUser);
-          if (isa<tt::TransOp, ttg::MemDescTransOp>(transUser)) {
-            for (auto transitiveUser : transUser->getUsers()) {
-              if (!visited.count(transitiveUser))
-                transUsers.push_back(transitiveUser);
-            }
-          } else {
-            users.insert(transUser);
-          }
-        }
+        auto transUsers = goThroughTrans(user);
+        for (auto *tUsr : transUsers)
+          users.insert(tUsr);
       } else {
         users.insert(user);
       }
@@ -1039,8 +1050,10 @@ void createTokenPost(
     // For each reuse group, choose a representative channel.
     int reuseGrp = channelInReuseGroup(channel, config);
     if (reuseGrp >= 0) {
-      if (channel != config->getGroup(reuseGrp)->channels[0])
+      if (channel != config->getGroup(reuseGrp)->channels[0]) {
+        LDBG("createToken ignore channel due to reuse " << channel->uniqID);
         continue;
+      }
     }
 
     CommChannel commChannel;
