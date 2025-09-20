@@ -553,6 +553,19 @@ static Operation *getUniqueActualConsumer(Operation *consumerOp,
   return uniqOp ? uniqOp : consumerOp;
 }
 
+static Operation *getLastOpInBlock(DenseSet<Operation *> &ops) {
+  Operation *tailConsumer = nullptr;
+  Operation *first = *(ops.begin());
+  auto cBlock = first->getBlock();
+  for (auto &op : reverse(cBlock->getOperations())) {
+    if (ops.count(&op)) {
+      tailConsumer = &op;
+      break;
+    }
+  }
+  return tailConsumer;
+}
+
 // Group channels in two ways:
 //  - by producer ops. One producer corresponds to multiple channels. This
 //    grouping will be used to create buffers per shared producer.
@@ -1050,6 +1063,9 @@ void createTokenPost(
     // For each reuse group, choose a representative channel.
     int reuseGrp = channelInReuseGroup(channel, config);
     if (reuseGrp >= 0) {
+      // FIXME: check that the other channels in the reuse group have the same
+      // choice about producerBarrier, and consumerBarriers. If not, we should
+      // not set producerBarrier, and consumerBarriers.
       if (channel != config->getGroup(reuseGrp)->channels[0]) {
         LDBG("createToken ignore channel due to reuse " << channel->uniqID);
         continue;
@@ -1075,15 +1091,38 @@ void createTokenPost(
     assert(channel->relation.second.size() == 1);
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
-      Operation *consumerOp =
-          getUniqueActualConsumer(dstOp, consumerAsyncTaskId);
-
+      // We can have multiple consumer ops for ChannelPost, or one consumer op
+      // has multiple actual consumers. Here we collect all consumer ops.
+      DenseSet<Operation *> actualConsumers;
+      SmallVector<Operation *> dstOps;
+      if (channel->channelKind == DataChannelKind::SMEMPost) {
+        auto *cPost = static_cast<ChannelPost *>(channel);
+        cPost->getDstOps(dstOps);
+      } else {
+        dstOps.push_back(dstOp);
+      }
       // If it is used by gen5, we can create a gen5 barrier for consumer
       // release.
-      bool useGen5Barrier = isa<ttng::TCGen5MMAOp>(consumerOp) &&
-                            producerOp->getBlock() == consumerOp->getBlock();
+      bool useGen5Barrier = true;
+      for (auto *dst : dstOps) {
+        auto consumers = getActualConsumers(dst);
+        for (auto *t : consumers) {
+          SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
+          assert(asyncTasks.size() == 1);
+          if (asyncTasks[0] == consumerAsyncTaskId) {
+            actualConsumers.insert(t);
+            if (!isa<ttng::TCGen5MMAOp>(t) ||
+                producerOp->getBlock() != t->getBlock())
+              useGen5Barrier = false;
+          }
+        }
+      }
+      assert(!actualConsumers.empty());
+      Operation *consumerOp = getLastOpInBlock(actualConsumers);
+
       LLVM_DEBUG({
-        LDBG("-- createToken: useGen5Barrier = " << useGen5Barrier);
+        LDBG("-- createToken: useGen5Barrier = "
+             << useGen5Barrier << " channel " << channel->uniqID);
         producerOp->dump();
         dstOp->dump();
         consumerOp->dump();
@@ -1807,6 +1846,7 @@ void insertAsyncComm(
     // Find head and tail ops.
     DenseSet<Operation *> producerOps;
     DenseSet<Operation *> consumerOps;
+    DenseSet<Operation *> actualConsumerOps;
     for (auto &c : kv.second) {
       if (isPost) {
         producerOps.insert(c->getSrcOp());
@@ -1815,19 +1855,29 @@ void insertAsyncComm(
         producerOps.insert(pcOp.first);
         consumerOps.insert(pcOp.second);
       }
-      consumerOps.insert(c->getDstOp());
-      consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
       if (c->channelKind == DataChannelKind::SMEMPost) {
         auto *cPost = static_cast<ChannelPost *>(c);
-        consumerOps.insert(cPost->getDstOpLast());
-        consumerOps.insert(getUniqueActualConsumer(cPost->getDstOpLast()));
+        SmallVector<Operation *> dsts;
+        cPost->getDstOps(dsts);
+        for (auto *dst : dsts) {
+          consumerOps.insert(dst);
+          auto consumers = getActualConsumers(dst);
+          for (auto *t : consumers) {
+            consumerOps.insert(t);
+            actualConsumerOps.insert(t);
+          }
+        }
+      } else {
+        consumerOps.insert(c->getDstOp());
+        consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
+        actualConsumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
       }
     }
 
-    // Assuming all ops
-    auto getHeadOp = [&](DenseSet<Operation *> ops,
-                         Operation *firstOp) -> Operation * {
-      auto block = firstOp->getBlock();
+    // Assuming all ops are under the same block.
+    auto getFirstOpInBlock = [&](DenseSet<Operation *> ops) -> Operation * {
+      Operation *first = *(ops.begin());
+      auto block = first->getBlock();
       Operation *headOp = nullptr;
       for (auto &op : block->getOperations()) {
         if (ops.count(&op)) {
@@ -1836,6 +1886,18 @@ void insertAsyncComm(
         }
       }
       return headOp;
+    };
+    auto getLastOpInBlock = [&](DenseSet<Operation *> ops) -> Operation * {
+      Operation *first = *(ops.begin());
+      auto block = first->getBlock();
+      Operation *tailOp = nullptr;
+      for (auto &op : reverse(block->getOperations())) {
+        if (ops.count(&op)) {
+          tailOp = &op;
+          break;
+        }
+      }
+      return tailOp;
     };
     auto appearsBefore = [&](Operation *A, Operation *B) -> bool {
       assert(A->getBlock() == B->getBlock());
@@ -1927,7 +1989,7 @@ void insertAsyncComm(
       for (auto tOp : tmaLoads)
         tOps.insert(tOp.getOperation());
       tOps.insert(headProducer);
-      tmaHeadProducer = getHeadOp(tOps, headProducer);
+      tmaHeadProducer = getFirstOpInBlock(tOps);
     }
     // Check to see if producer and consumer are in the same block.
     if (headProducer->getBlock() != headConsumer->getBlock()) {
@@ -2011,14 +2073,24 @@ void insertAsyncComm(
     for (auto &consumerTaskId : masterChannel->relation.second) {
       // Set up consumer release and producer acquire for channel where consumer
       // is gen5.
-      auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(
-          getUniqueActualConsumer(masterChannel->getDstOp(), consumerTaskId));
-      // Assume a single task for mmaOp.
-      if (mmaOp) {
+      if (commChannel.consumerBarriers.count(consumerTaskId)) {
+        // filter with consumerTaskId
+        DenseSet<Operation *> filteredOps;
+        for (auto *tCon : actualConsumerOps) {
+          SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(tCon);
+          assert(asyncTasks.size() == 1);
+          if (asyncTasks[0] == consumerTaskId) {
+            filteredOps.insert(tCon);
+          }
+        }
+        // Get the last mmaOp.
+        auto *lastConsumer = getLastOpInBlock(filteredOps);
+        auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(lastConsumer);
+        if (!mmaOp)
+          continue;
+        // Assume a single task for mmaOp.
         SmallVector<AsyncTaskId> asyncTasksMma = getAsyncTaskIds(mmaOp);
         assert(asyncTasksMma.size() == 1 && asyncTasksMma[0] == consumerTaskId);
-      }
-      if (mmaOp && commChannel.consumerBarriers.count(consumerTaskId)) {
         LLVM_DEBUG({
           LDBG("unique actual consumer is gen5 mma " << masterChannel->uniqID
                                                      << " ");

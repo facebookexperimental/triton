@@ -120,6 +120,10 @@ Operation *ChannelPost::getDstOpLast() {
   return tail;
 }
 
+void ChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
+  getAllConsumers(this, dsts);
+}
+
 static bool isTmemProducer(Operation *allocOp, Operation *user) {
   if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
     if (mmaOp.getD() == allocOp->getResult(0))

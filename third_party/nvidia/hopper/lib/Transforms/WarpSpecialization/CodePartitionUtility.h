@@ -88,6 +88,7 @@ public:
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
   Operation *getDstOpLast();
+  void getDstOps(SmallVector<Operation *> &dsts);
   virtual Operation *getAllocOp() { return allocOp; }
   virtual unsigned getNumBuffers();
 
