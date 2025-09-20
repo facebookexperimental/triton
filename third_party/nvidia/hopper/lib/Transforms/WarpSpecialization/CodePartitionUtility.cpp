@@ -53,12 +53,9 @@ Operation *ChannelPost::getSrcOp() {
   return nullptr;
 }
 
-// A few assumptions, a channel can have multiple consumers, but the consumers
-// must be in the same region and the taskIds must be the same. We can have
-// a representative consumer in the channel.
-Operation *ChannelPost::getDstOp() {
-  SmallVector<Operation *> consumers;
-  for (auto usr : allocOp->getUsers()) {
+static void getAllConsumers(ChannelPost *ch,
+                            SmallVector<Operation *> &consumers) {
+  for (auto usr : ch->allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
@@ -66,16 +63,61 @@ Operation *ChannelPost::getDstOp() {
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
-  if (consumers.size() == 1)
-    return consumers[0];
-  assert(consumers.size() != 0);
+  // assume all consumers are in the same block, with same taskId
   auto taskIds = getAsyncTaskIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
     auto taskIds2 = getAsyncTaskIds(consumers[i]);
     assert(taskIds == taskIds2 &&
            consumers[i]->getBlock() == consumers[0]->getBlock());
   }
-  return consumers.back();
+}
+
+static bool appearsBefore(Operation *A, Operation *B) {
+  assert(A->getBlock() == B->getBlock());
+  auto block = A->getBlock();
+  int AIdx = -1, BIdx = -1, cnt = 0;
+  for (auto &op : block->getOperations()) {
+    if (&op == A) {
+      AIdx = cnt;
+    }
+    if (&op == B) {
+      BIdx = cnt;
+    }
+    ++cnt;
+  }
+  assert(AIdx >= 0 && BIdx >= 0);
+  return AIdx < BIdx;
+}
+
+// A few assumptions, a channel can have multiple consumers, but the consumers
+// must be in the same region and the taskIds must be the same. We can have
+// a representative consumer in the channel.
+Operation *ChannelPost::getDstOp() {
+  SmallVector<Operation *> consumers;
+  getAllConsumers(this, consumers);
+  if (consumers.size() == 1)
+    return consumers[0];
+  assert(consumers.size() != 0);
+  Operation *head = consumers[0];
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    if (appearsBefore(consumers[i], head))
+      head = consumers[i];
+  }
+  return head;
+}
+
+Operation *ChannelPost::getDstOpLast() {
+  SmallVector<Operation *> consumers;
+  getAllConsumers(this, consumers);
+  if (consumers.size() == 1)
+    return consumers[0];
+  assert(consumers.size() != 0);
+  Operation *tail = consumers[0];
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    if (!appearsBefore(consumers[i], tail))
+      tail = consumers[i];
+  }
+  return tail;
 }
 
 static bool isTmemProducer(Operation *allocOp, Operation *user) {

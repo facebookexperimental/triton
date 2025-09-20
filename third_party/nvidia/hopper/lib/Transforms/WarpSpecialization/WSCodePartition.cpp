@@ -1817,6 +1817,11 @@ void insertAsyncComm(
       }
       consumerOps.insert(c->getDstOp());
       consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
+      if (c->channelKind == DataChannelKind::SMEMPost) {
+        auto *cPost = static_cast<ChannelPost *>(c);
+        consumerOps.insert(cPost->getDstOpLast());
+        consumerOps.insert(getUniqueActualConsumer(cPost->getDstOpLast()));
+      }
     }
 
     // Assuming all ops
@@ -2141,9 +2146,11 @@ void insertAsyncComm(
 
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
+      // Instead of headConsumer, need to lift out to the same scope.
+      auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
       optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
-                       headConsumer, isPost);
+                       headConsumer, consumerWaitPoint, isPost);
     }
   }
 }
