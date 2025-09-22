@@ -1,13 +1,13 @@
 from typing import Sequence
 
 from triton.language import core
-from triton._C.libtriton import ir
 
 __all__ = [
     "experimental_device_tensormap_create1d",
     "experimental_device_tensormap_create2d",
     "experimental_tensormap_fenceproxy_acquire",
 ]
+
 
 # https://docs.nvidia.com/cuda/parallel-thread-execution/#tensormap-new-val-validity
 def _determine_elem_type(element_ty: core.dtype):
@@ -113,5 +113,5 @@ def _determine_swizzle_mode_2d(contig_dim_size_in_bytes, load_size):
 
 
 @core.builtin
-def experimental_tensormap_fenceproxy_acquire(desc_ptr: core.tensor, _semantic = None):
+def experimental_tensormap_fenceproxy_acquire(desc_ptr: core.tensor, _semantic=None):
     _semantic.tensormap_fenceproxy_acquire(desc_ptr)

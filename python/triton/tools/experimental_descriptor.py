@@ -4,6 +4,7 @@ from typing import List, Any
 import torch
 import triton
 
+
 def _fill_desc(desc, ptr, dims, block_dims, element_size):
     assert len(dims) == len(block_dims)
     assert 1 <= len(dims) <= 2
