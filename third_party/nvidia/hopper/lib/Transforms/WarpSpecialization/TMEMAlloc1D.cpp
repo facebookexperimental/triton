@@ -63,29 +63,8 @@ private:
   ttng::TMEMAllocOp alloc1DTMEMBuffer() {
     auto expandedInput = getExpandedInput();
     auto oldRetType = getResultTensorType(expandedInput, 2);
-    SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
-                                  oldRetType.getShape().end()};
-    auto context = builder.getContext();
-    auto oldEncoding = oldRetType.getEncoding();
-    Attribute tensorMemorySpace =
-        ttng::TensorMemorySpaceAttr::get(builder.getContext());
-    // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
-    // case at all from TCGen5MMAScaledOp::getBlockM?
-    auto blockM = shape[0];
-    auto elemType = oldRetType.getElementType();
-    unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
-    assert((elemBitWidth == 16 || elemBitWidth == 32) &&
-           "TMEM Layout don't support fp8");
-    bool unpacked = elemBitWidth != 16;
-    ArrayRef<unsigned> CTASplitNum =
-        ttg::getCTALayout(oldEncoding).getCTASplitNum();
-    auto encoding = ttng::TensorMemoryEncodingAttr::get(
-        builder.getContext(), blockM, shape[1],
-        /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
-    auto tmemDesc =
-        ttg::MemDescType::get(shape, elemType, encoding, tensorMemorySpace,
-                              /*mutableMemory=*/true);
-
+    auto shape = oldRetType.getShape();
+    auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
     auto allocCall = builder.create<ttng::TMEMAllocOp>(
         expandedInput->getLoc(), tmemDesc,
         builder.getType<ttg::AsyncTokenType>(),
@@ -198,21 +177,48 @@ sliceAndReinterpretTMEMBuffer(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
                               int offset) {
   auto allocType = allocOp.getType();
   auto shape = allocType.getShape();
-  assert(shape.size() == 2 && "Expected 2D shape");
-  ArrayRef<unsigned> CTASplitNum =
-      ttg::getCTALayout(allocType.getEncoding()).getCTASplitNum();
-  auto unpacked = allocType.getElementTypeBitWidth() != 16;
+  auto tmemDesc = createTMEMDesc(builder, allocType, shape[0], 1);
   auto subSlice = builder.create<ttng::TMEMSubSliceOp>(allocOp->getLoc(),
                                                        allocOp, offset, 1);
-  auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      builder.getContext(), shape[0], 1,
-      /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
-  auto tmemDesc =
-      ttg::MemDescType::get(shape, allocType.getElementType(), outputEncoding,
-                            allocType.getMemorySpace(),
-                            /*mutableMemory=*/true);
   return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
                                                    subSlice);
+}
+
+ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
+                                size_t blockM, size_t blockN) {
+  size_t elemBitWidth = 0;
+  llvm::ArrayRef<int64_t> shape;
+  Type elemType;
+  Attribute memSpace;
+  Attribute encoding;
+  auto context = builder.getContext();
+  if (auto tensorType = dyn_cast<RankedTensorType>(inputType)) {
+    elemBitWidth = tensorType.getElementTypeBitWidth();
+    shape = tensorType.getShape();
+    elemType = tensorType.getElementType();
+    memSpace = ttng::TensorMemorySpaceAttr::get(context);
+    encoding = tensorType.getEncoding();
+  } else if (auto allocType = dyn_cast<ttg::MemDescType>(inputType)) {
+    elemBitWidth = allocType.getElementTypeBitWidth();
+    shape = allocType.getShape();
+    elemType = allocType.getElementType();
+    memSpace = allocType.getMemorySpace();
+    encoding = allocType.getEncoding();
+  } else {
+    assert(false && "Expected RankedTensorType or ttg::MemDescType");
+  }
+  assert(shape.size() == 2 && "Expected 2D shape");
+  ArrayRef<unsigned> CTASplitNum = ttg::getCTALayout(encoding).getCTASplitNum();
+  assert((elemBitWidth == 16 || elemBitWidth == 32) &&
+         "TMEM Layout don't support fp8");
+  auto unpacked = elemBitWidth != 16;
+  // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
+  // case at all from TCGen5MMAScaledOp::getBlockM?
+  auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
+      context, blockM, blockN,
+      /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
+  return ttg::MemDescType::get(shape, elemType, outputEncoding, memSpace,
+                               /*mutableMemory=*/true);
 }
 
 #define GEN_PASS_DEF_NVGPUTEST1DTMEMALLOC

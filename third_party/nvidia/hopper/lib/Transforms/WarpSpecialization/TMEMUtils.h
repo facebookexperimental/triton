@@ -12,6 +12,11 @@ namespace mlir {
 ttg::MemDescReinterpretOp
 sliceAndReinterpretTMEMBuffer(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
                               int offset);
+// Create a TMEM descriptor that is sufficient for the given
+// TMEM Allocation Operator.
+ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
+                                size_t blockM, size_t blockN);
+
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_TMEMUTILS_H_
