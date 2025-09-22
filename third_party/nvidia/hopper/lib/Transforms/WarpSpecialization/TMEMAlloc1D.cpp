@@ -1,3 +1,4 @@
+#include "TMEMUtils.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
@@ -190,6 +191,12 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer) {
   }
   // Delete tmem.start
   producer->removeAttr("tmem.start");
+}
+
+ttg::MemDescReinterpretOp
+reinterpretTMEMBufferDroppingDim(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
+                                 size_t dim) {
+  return nullptr;
 }
 
 #define GEN_PASS_DEF_NVGPUTEST1DTMEMALLOC
