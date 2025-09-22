@@ -658,11 +658,6 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       // Create a list of virtual channels for this case. Each virtual channel
       // has a single producer.
       handleOperandD(tmemAllocOp, mmaOp, channels);
-#if 0
-      SmallVector<int> consumers;
-      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-          -1, consumers, allocOp, isOperandD, channels.size()));
-#endif
       return;
     }
 
@@ -700,11 +695,6 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   auto consumerTaskIds = getAsyncTaskIds(consumers[0]);
   if (consumerTaskIds.size() > 1)
     assert(consumers.size() == 1);
-  if (consumers.size() > 1) {
-    for (unsigned i = 1; i < consumers.size(); ++i) {
-      auto tIds = getAsyncTaskIds(consumers[i]);
-    }
-  }
   // Remove producer task id from consumerTaskIds.
   auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
                           producerTaskId);
