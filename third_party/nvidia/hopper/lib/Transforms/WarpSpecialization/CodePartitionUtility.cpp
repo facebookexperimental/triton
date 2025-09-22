@@ -1,5 +1,6 @@
 #include "CodePartitionUtility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -483,6 +484,24 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   // Create barrierForTMA from barrierAlloc.
   return builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       barrierAlloc.getLoc(), barrierTy, barrierAlloc, bufferIdx);
+}
+
+static void setTmemChannelAttr(Operation *op, int channelId,
+                               std::string attrName) {
+  SmallVector<int> asyncTaskIds;
+  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
+    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
+      asyncTaskIds.push_back(asyncTaskId);
+    }
+  }
+  asyncTaskIds.push_back(channelId);
+  SmallVector<int> sortedAsyncTaskIds(asyncTaskIds.begin(), asyncTaskIds.end());
+  sort(sortedAsyncTaskIds);
+  auto i32Ty = IntegerType::get(op->getContext(), 32);
+  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
+  auto vecTy = VectorType::get(size, i32Ty);
+  op->setAttr(attrName,
+              DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
 static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,

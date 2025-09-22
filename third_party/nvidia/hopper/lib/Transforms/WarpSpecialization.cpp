@@ -112,7 +112,8 @@ public:
         signalPassFailure();
     }
 
-    doMemoryPlanner(funcOp, numStages) : if (dumpIntermediateSteps) {
+    doMemoryPlanner(funcOp, numStages);
+    if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"
           << moduleOp << "\n\n\n";

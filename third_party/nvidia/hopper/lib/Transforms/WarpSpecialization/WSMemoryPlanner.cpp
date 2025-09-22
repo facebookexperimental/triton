@@ -1,5 +1,4 @@
 #include "CodePartitionUtility.h"
-#include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -18,19 +17,7 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
-// Compute a partition schedule for later passes to actually partition the
-// program into async tasks.
 void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
-
-  // Bail out in the presence of user annotations.
-  DenseSet<int> allAsyncTasks;
-  funcOp->walk([&](Operation *op) {
-    auto asyncTasks = getAsyncTaskIds(op);
-    allAsyncTasks.insert_range(getAsyncTaskIds(op));
-  });
-
-  if (!allAsyncTasks.empty())
-    return;
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -42,6 +29,9 @@ void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
   if (channels.empty()) {
     return;
   }
+  // Step 2: figure out smem/tmem sizes and liveness.
+  // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
+  // otherwise, the liveness can't overlap.
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSMEMORYPLANNER
