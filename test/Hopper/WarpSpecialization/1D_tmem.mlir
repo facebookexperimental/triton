@@ -255,6 +255,8 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
 module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 520 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   tt.func public @_dummy_repro(%in_desc: !tt.tensordesc<tensor<128xf32, #shared>>, %in_desc_0: i32, %in_desc_1: i64, %out_desc: !tt.tensordesc<tensor<128x1xf32, #shared1>>, %out_desc_2: i32, %out_desc_3: i32, %out_desc_4: i64, %out_desc_5: i64) attributes {noinline = false, ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32} {
     %result, %token = ttng.tmem_alloc {tmem.start_buffer = 0 : i32}  : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    // CHECK: ttng.tmem_subslice
+    // CHECK: ttg.memdesc_reinterpret
     %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
     %c0_i32 = arith.constant 0 : i32
     %true = arith.constant true
@@ -268,7 +270,15 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
     ttng.inval_barrier %alpha_6 : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     %alpha_7 = ttg.local_load %alpha : !ttg.memdesc<128xf32, #shared, #smem, mutable> -> tensor<128xf32, #blocked>
     %alpha_i = arith.mulf %alpha_7, %cst : tensor<128xf32, #blocked>
+    // CHECK-NOT: tmem.start
     %0 = ttg.convert_layout %alpha_i {tmem.start = 0 : i32, ttg.partition = 0 : i32} : tensor<128xf32, #blocked> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>
+    // CHECK: tt.expand_dims
+    // CHECK: ttg.convert_layout
+    // CHECK: ttng.tmem_store
+    // CHECK: ttng.tmem_load
+    // CHECK: tt.reshape
+    // CHECK: ttg.convert_layout
+    // CHECK: tt.expand_dims
     %1 = tt.expand_dims %0 {axis = 1 : i32, ttg.partition = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>> -> tensor<128x1xf32, #blocked1>
     %2 = ttg.local_alloc %1 {allocation.offset = 0 : i32} : (tensor<128x1xf32, #blocked1>) -> !ttg.memdesc<128x1xf32, #shared1, #smem>
     ttng.fence_async_shared {bCluster = false}

@@ -15,7 +15,7 @@ sliceAndReinterpretTMEMBuffer(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
 // Create a TMEM descriptor that is sufficient for the given
 // TMEM Allocation Operator.
 ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
-                                size_t blockM, size_t blockN);
+                                int64_t blockM, int64_t blockN);
 
 } // namespace mlir
 
