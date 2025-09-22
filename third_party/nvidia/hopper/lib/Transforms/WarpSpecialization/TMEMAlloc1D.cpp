@@ -194,9 +194,25 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer) {
 }
 
 ttg::MemDescReinterpretOp
-reinterpretTMEMBufferDroppingDim(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
-                                 size_t dim) {
-  return nullptr;
+sliceAndReinterpretTMEMBuffer(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
+                              int offset) {
+  auto allocType = allocOp.getType();
+  auto shape = allocType.getShape();
+  assert(shape.size() == 2 && "Expected 2D shape");
+  ArrayRef<unsigned> CTASplitNum =
+      ttg::getCTALayout(allocType.getEncoding()).getCTASplitNum();
+  auto unpacked = allocType.getElementTypeBitWidth() != 16;
+  auto subSlice = builder.create<ttng::TMEMSubSliceOp>(allocOp->getLoc(),
+                                                       allocOp, offset, 1);
+  auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
+      builder.getContext(), shape[0], 1,
+      /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
+  auto tmemDesc =
+      ttg::MemDescType::get(shape, allocType.getElementType(), outputEncoding,
+                            allocType.getMemorySpace(),
+                            /*mutableMemory=*/true);
+  return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
+                                                   subSlice);
 }
 
 #define GEN_PASS_DEF_NVGPUTEST1DTMEMALLOC
