@@ -557,6 +557,8 @@ static Operation *getLastOpInBlock(DenseSet<Operation *> &ops) {
   Operation *tailConsumer = nullptr;
   Operation *first = *(ops.begin());
   auto cBlock = first->getBlock();
+  for (auto *op : ops)
+    assert(op->getBlock() == cBlock);
   for (auto &op : reverse(cBlock->getOperations())) {
     if (ops.count(&op)) {
       tailConsumer = &op;
@@ -1875,7 +1877,8 @@ void insertAsyncComm(
     }
 
     // Assuming all ops are under the same block.
-    auto getFirstOpInBlock = [&](DenseSet<Operation *> ops) -> Operation * {
+    auto getFirstOpInBlock =
+        [&](const DenseSet<Operation *> &ops) -> Operation * {
       Operation *first = *(ops.begin());
       auto block = first->getBlock();
       Operation *headOp = nullptr;
@@ -1886,18 +1889,6 @@ void insertAsyncComm(
         }
       }
       return headOp;
-    };
-    auto getLastOpInBlock = [&](DenseSet<Operation *> ops) -> Operation * {
-      Operation *first = *(ops.begin());
-      auto block = first->getBlock();
-      Operation *tailOp = nullptr;
-      for (auto &op : reverse(block->getOperations())) {
-        if (ops.count(&op)) {
-          tailOp = &op;
-          break;
-        }
-      }
-      return tailOp;
     };
     auto appearsBefore = [&](Operation *A, Operation *B) -> bool {
       assert(A->getBlock() == B->getBlock());

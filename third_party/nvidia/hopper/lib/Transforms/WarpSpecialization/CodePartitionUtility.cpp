@@ -75,18 +75,16 @@ static void getAllConsumers(ChannelPost *ch,
 static bool appearsBefore(Operation *A, Operation *B) {
   assert(A->getBlock() == B->getBlock());
   auto block = A->getBlock();
-  int AIdx = -1, BIdx = -1, cnt = 0;
   for (auto &op : block->getOperations()) {
     if (&op == A) {
-      AIdx = cnt;
+      // A appears first.
+      return true;
     }
     if (&op == B) {
-      BIdx = cnt;
+      return false;
     }
-    ++cnt;
   }
-  assert(AIdx >= 0 && BIdx >= 0);
-  return AIdx < BIdx;
+  llvm_unreachable("appearsBefore");
 }
 
 // A few assumptions, a channel can have multiple consumers, but the consumers
