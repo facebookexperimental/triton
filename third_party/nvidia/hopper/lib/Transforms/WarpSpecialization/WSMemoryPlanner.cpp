@@ -1,3 +1,4 @@
+#include "CodePartitionUtility.h"
 #include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/Pass.h"
@@ -30,6 +31,17 @@ void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
 
   if (!allAsyncTasks.empty())
     return;
+
+  // Step 1: collect all communications between producers and consumers.
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectPostChannels(channelsOrigin, funcOp);
+  SmallVector<Channel *> channels;
+  for (const auto &c : channelsOrigin) {
+    channels.push_back(c.get());
+  }
+  if (channels.empty()) {
+    return;
+  }
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSMEMORYPLANNER

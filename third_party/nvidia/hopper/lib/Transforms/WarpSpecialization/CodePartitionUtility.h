@@ -243,6 +243,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
+void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
+                         triton::FuncOp &funcOp);
 
 } // namespace mlir
 
