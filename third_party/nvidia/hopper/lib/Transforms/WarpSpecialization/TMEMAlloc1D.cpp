@@ -160,7 +160,7 @@ public:
     TMEMStore1D(producer, allocOpBuffer);
     TMEMLoad1D(producer, consumer);
   }
-}; // namespace mlir
+};
 
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
                            llvm::SmallVector<Operation *> &allocOps) {
