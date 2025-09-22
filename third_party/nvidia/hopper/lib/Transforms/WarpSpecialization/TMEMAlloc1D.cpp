@@ -22,7 +22,7 @@ private:
   // Intermediate info to minimize code reuse across functions.
   int numWarps = -1;
   tt::ExpandDimsOp _expandedInput = nullptr;
-  ttng::TMEMAllocOp _allocOp = nullptr;
+  Operation *_allocOp = nullptr;
 
 public:
   TMEM1DAllocator(OpBuilder &builder) : builder(builder) {}
@@ -45,9 +45,9 @@ private:
     return _expandedInput;
   }
 
-  void setAllocOp(ttng::TMEMAllocOp allocOp) { this->_allocOp = allocOp; }
+  void setAllocOp(Operation *allocOp) { this->_allocOp = allocOp; }
 
-  ttng::TMEMAllocOp getAllocOp() {
+  Operation *getAllocOp() {
     assert(_allocOp != nullptr && "Must call getAllocOp()");
     return _allocOp;
   }
@@ -73,7 +73,7 @@ private:
   }
 
   void TMEMStore1D(Operation *producer,
-                   std::optional<ttng::TMEMAllocOp> allocOpBuffer) {
+                   std::optional<Operation *> allocOpBuffer) {
     // Expand from 1D -> 2D
     auto oldRetType = getResultTensorType(producer, 1);
     builder.setInsertionPointAfter(producer);
@@ -84,7 +84,7 @@ private:
         producer->getLoc(), producer->getResult(0), 1);
     copyAttrs(producer, expandDims);
     setExpandedInput(expandDims);
-    ttng::TMEMAllocOp allocOp;
+    Operation *allocOp;
     if (allocOpBuffer.has_value()) {
       allocOp = allocOpBuffer.value();
     } else {
@@ -93,7 +93,7 @@ private:
     setAllocOp(allocOp);
 
     // Verify that these layouts are compatible.
-    auto tmemDesc = allocOp.getType();
+    auto tmemDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
     auto expandType = expandDims.getType();
     bool layoutTmemCompatible = ttng::isDistributedLayoutTMemCompatible(
         expandDims, expandType, tmemDesc);
@@ -114,7 +114,7 @@ private:
     // Generate the store
     Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
     auto storeOp = builder.create<ttng::TMEMStoreOp>(
-        src->getLoc(), allocOp, src->getResult(0), trueVal);
+        src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
     copyAttrs(producer, storeOp);
   }
 
@@ -133,7 +133,7 @@ private:
     builder.setInsertionPoint(consumer);
     auto loadOp = builder.create<ttng::TMEMLoadOp>(
         consumer->getLoc(), newExpandType,
-        builder.getType<ttg::AsyncTokenType>(), allocOp, Value());
+        builder.getType<ttg::AsyncTokenType>(), allocOp->getResult(0), Value());
     copyAttrs(consumer, loadOp);
     // Generate the reshape
     auto reshape = builder.create<tt::ReshapeOp>(
@@ -148,9 +148,9 @@ private:
   }
 
 public:
-  void replaceWith1DTMEM(
-      Operation *producer, Operation *consumer,
-      std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt) {
+  void
+  replaceWith1DTMEM(Operation *producer, Operation *consumer,
+                    std::optional<Operation *> allocOpBuffer = std::nullopt) {
     this->numWarps = ttg::lookupNumWarps(producer);
     assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
     TMEMStore1D(producer, allocOpBuffer);
@@ -161,11 +161,20 @@ public:
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
                            llvm::SmallVector<ttng::TMEMAllocOp> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
-  std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt;
+  std::optional<Operation *> allocOpBuffer = std::nullopt;
   auto producerTMEMStart =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("tmem.start")).getInt();
   if (producerTMEMStart < allocOps.size()) {
-    allocOpBuffer = allocOps[producerTMEMStart];
+    auto allocOp = allocOps[producerTMEMStart];
+    auto allocShape = allocOp.getType().getShape();
+    if (allocShape[1] != 1) {
+      builder.setInsertionPointAfter(allocOp);
+      // Hardcode allocShape[0] / 2 for testing.
+      allocOpBuffer =
+          sliceAndReinterpretTMEMBuffer(builder, allocOp, allocShape[0] / 2, 1);
+    } else {
+      allocOpBuffer = allocOp;
+    }
   }
   auto producerPartition =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("ttg.partition"))
