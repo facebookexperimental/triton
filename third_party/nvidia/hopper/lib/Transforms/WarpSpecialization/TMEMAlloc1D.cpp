@@ -159,14 +159,15 @@ public:
 };
 
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
-                           llvm::SmallVector<ttng::TMEMAllocOp> &allocOps) {
+                           llvm::SmallVector<Operation *> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
   std::optional<Operation *> allocOpBuffer = std::nullopt;
   auto producerTMEMStart =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("tmem.start")).getInt();
   if (producerTMEMStart < allocOps.size()) {
     auto allocOp = allocOps[producerTMEMStart];
-    auto allocShape = allocOp.getType().getShape();
+    auto allocShape =
+        dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType()).getShape();
     if (allocShape[allocShape.size() - 1] != 1) {
       builder.setInsertionPointAfter(allocOp);
       // Hardcode allocShape[0] / 2 for testing.
@@ -192,20 +193,22 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
   producer->removeAttr("tmem.start");
 }
 
-ttg::MemDescReinterpretOp
-sliceAndReinterpretTMEMBuffer(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
-                              int offset, size_t blockN) {
-  auto allocType = allocOp.getType();
+ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
+                                                        Operation *allocOp,
+                                                        int offset,
+                                                        size_t blockN) {
+  auto allocResult = allocOp->getResult(0);
+  auto allocType = dyn_cast<ttg::MemDescType>(allocResult.getType());
+  assert(allocType && "Expected MemDescType");
   auto shape = allocType.getShape();
   auto oldBlockN = shape[1];
-  // TODO(njriasan): Support 1x128x128?
   assert(oldBlockN >= blockN && "Invalid blockN size");
   assert(oldBlockN % blockN == 0 && "Invalid blockN divisibility");
   assert((offset + blockN) <= oldBlockN && "Invalid offset");
   auto tmemDesc =
       createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
-  auto subSlice = builder.create<ttng::TMEMSubSliceOp>(allocOp->getLoc(),
-                                                       allocOp, offset, blockN);
+  auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
+      allocOp->getLoc(), allocResult, offset, blockN);
   return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
                                                    subSlice);
 }
@@ -271,8 +274,8 @@ public:
   void runOnOperation() override {
     auto moduleOp = getOperation();
     OpBuilder builder(moduleOp.getContext());
-    llvm::SmallVector<ttng::TMEMAllocOp> allocOps;
-    moduleOp->walk([&](ttng::TMEMAllocOp allocOp) {
+    llvm::SmallVector<Operation *> allocOps;
+    moduleOp->walk([&](Operation *allocOp) {
       if (allocOp->hasAttr("tmem.start_buffer")) {
         allocOps.push_back(allocOp);
       }
