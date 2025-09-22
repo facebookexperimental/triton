@@ -749,8 +749,7 @@ void createToken(
   });
 }
 
-static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
-                             int numBuffers) {
+static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
 
   Type oldAllocType;
 
@@ -764,10 +763,6 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
 
   auto allocDescType = cast<triton::gpu::MemDescType>(oldAllocType);
   SmallVector<int64_t> shape(allocDescType.getShape());
-  if (numBuffers >= 1) {
-    shape.insert(shape.begin(), numBuffers);
-  }
-
   Type memdescType = ttg::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
@@ -776,17 +771,19 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
     newAlloc =
         builder.create<ttg::LocalAllocOp>(oldAlloc->getLoc(), memdescType);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
-    newAlloc = builder.create<ttng::TMEMAllocOp>(
-        oldAlloc->getLoc(), memdescType, tmemAlloc.getToken());
+    if (tmemAlloc.getToken()) {
+      newAlloc = builder.create<ttng::TMEMAllocOp>(
+          oldAlloc->getLoc(), memdescType, tmemAlloc.getToken().getType(),
+          Value());
+    } else {
+      newAlloc = builder.create<ttng::TMEMAllocOp>(
+          oldAlloc->getLoc(), memdescType, mlir::Type(), Value());
+    }
   } else {
     llvm_unreachable("Unexpected alloc type");
   }
 
-  auto idx = builder.create<arith::ConstantIntOp>(oldAlloc->getLoc(), 0, 32);
-  auto newBuf = builder.create<ttg::MemDescIndexOp>(
-      oldAlloc->getLoc(), oldAllocType, newAlloc->getResult(0), idx);
-  idx->moveBefore(oldAlloc);
-  newBuf->moveBefore(oldAlloc);
+  auto newBuf = newAlloc->getResult(0);
 
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     if (localAlloc.getSrc() != nullptr) {
@@ -805,10 +802,9 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
     }
   }
 
-  // Replace oldAlloc with newAlloc.
-  oldAlloc->replaceAllUsesWith(newBuf);
+  oldAlloc->replaceAllUsesWith(newAlloc);
   oldAlloc->erase();
-  return newAlloc->getResult(0);
+  return newBuf;
 }
 
 static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
@@ -943,7 +939,6 @@ DenseMap<Channel *, Value> createBuffer(
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
-  builder.setInsertionPointToStart(&(funcOp.getBody().front()));
 
   for (auto *channelInOrder : orderedChannels) {
     if (channelsGroupedByProducers.find(channelInOrder) ==
@@ -967,16 +962,21 @@ DenseMap<Channel *, Value> createBuffer(
       DBGS() << *dstOp << "\n";
     });
 
+    builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+
     // For TMEM channel, multi-buffer TMEM alloc
     if (channel->channelKind == DataChannelKind::TMEM) {
       // Move TMEM alloc to the beginning of the function.
       if (auto oldAlloc = dyn_cast<ttng::TMEMAllocOp>(srcOp)) {
-        buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+        buffer = hoistLocalAlloc(builder, oldAlloc);
+      } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(srcOp)) {
+        auto oldAlloc = mmaOp.getAccumulator().getDefiningOp();
+        buffer = hoistLocalAlloc(builder, oldAlloc);
       }
     } else if (channel->channelKind == DataChannelKind::SMEM) {
       // Move LocalAlloc to the beginning of the function.
       if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
-        buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+        buffer = hoistLocalAlloc(builder, oldAlloc);
       }
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
