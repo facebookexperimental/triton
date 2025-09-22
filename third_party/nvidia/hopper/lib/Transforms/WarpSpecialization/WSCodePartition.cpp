@@ -1200,8 +1200,7 @@ void createTokenPost(
   });
 }
 
-static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
-                             int numBuffers) {
+static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
 
   Type oldAllocType;
 
@@ -1215,10 +1214,6 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
 
   auto allocDescType = cast<triton::gpu::MemDescType>(oldAllocType);
   SmallVector<int64_t> shape(allocDescType.getShape());
-  if (numBuffers >= 1) {
-    shape.insert(shape.begin(), numBuffers);
-  }
-
   Type memdescType = ttg::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
@@ -1227,17 +1222,19 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
     newAlloc =
         builder.create<ttg::LocalAllocOp>(oldAlloc->getLoc(), memdescType);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
-    newAlloc = builder.create<ttng::TMEMAllocOp>(
-        oldAlloc->getLoc(), memdescType, tmemAlloc.getToken());
+    if (tmemAlloc.getToken()) {
+      newAlloc = builder.create<ttng::TMEMAllocOp>(
+          oldAlloc->getLoc(), memdescType, tmemAlloc.getToken().getType(),
+          Value());
+    } else {
+      newAlloc = builder.create<ttng::TMEMAllocOp>(
+          oldAlloc->getLoc(), memdescType, mlir::Type(), Value());
+    }
   } else {
     llvm_unreachable("Unexpected alloc type");
   }
 
-  auto idx = builder.create<arith::ConstantIntOp>(oldAlloc->getLoc(), 0, 32);
-  auto newBuf = builder.create<ttg::MemDescIndexOp>(
-      oldAlloc->getLoc(), oldAllocType, newAlloc->getResult(0), idx);
-  idx->moveBefore(oldAlloc);
-  newBuf->moveBefore(oldAlloc);
+  auto newBuf = newAlloc->getResult(0);
 
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     if (localAlloc.getSrc() != nullptr) {
@@ -1256,10 +1253,132 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc,
     }
   }
 
-  // Replace oldAlloc with newAlloc.
-  oldAlloc->replaceAllUsesWith(newBuf);
+  oldAlloc->replaceAllUsesWith(newAlloc);
   oldAlloc->erase();
-  return newAlloc->getResult(0);
+  return newBuf;
+}
+
+static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
+                              Channel *channel, bool useTMEM) {
+  auto srcResult = channel->getSrcOperand();
+  auto srcOp = channel->getSrcOp();
+  auto dstOp = channel->getDstOp();
+  auto tensorType = dyn_cast<RankedTensorType>(srcResult.getType());
+  auto context = builder.getContext();
+
+  // Get basic information from tensorType
+  auto order = ttg::getOrderForMemory(tensorType);
+  auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
+  auto elemType = tensorType.getElementType();
+
+  // Check the consumer type
+  auto actualConsumers = getActualConsumers(dstOp);
+  LLVM_DEBUG({
+    DBGS() << "actual consumers: \n";
+    for (auto consumerOp : actualConsumers) {
+      DBGS() << *consumerOp << "\n";
+    }
+  });
+
+  Value buffer;
+
+  if (useTMEM) {
+    builder.setAsyncTaskIdsFromOp(srcOp);
+    auto expandDimsOp = builder.createWithAsyncTaskIds<tt::ExpandDimsOp>(
+        srcOp->getLoc(), srcResult, 1);
+
+    tensorType = dyn_cast<RankedTensorType>(expandDimsOp.getResult().getType());
+    // Get shape, layout and type of a slice
+    auto shape = tensorType.getShape();
+
+    // Get shape, layout and type of the complete buffer
+    SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
+    if (srcOp->getParentOfType<scf::ForOp>())
+      bufferShape.insert(bufferShape.begin(), channel->numBuffers);
+    else
+      bufferShape.insert(bufferShape.begin(), 1);
+    Attribute tensorMemorySpace = ttng::TensorMemorySpaceAttr::get(context);
+    auto blockM = shape[0];
+    auto elemType = tensorType.getElementType();
+    unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
+    bool unpacked = elemBitWidth != 16;
+    auto encoding = ttng::TensorMemoryEncodingAttr::get(
+        context, blockM, shape[1],
+        /*unpacked=*/unpacked, /*CTASplitM=*/1, /*CTASplitN=*/1);
+    Type memdescType =
+        ttg::MemDescType::get(bufferShape, elemType, encoding,
+                              tensorMemorySpace, /*mutableMemory*/ true);
+    auto allocOp = builder.create<ttng::TMEMAllocOp>(
+        srcOp->getLoc(), memdescType, builder.getType<ttg::AsyncTokenType>(),
+        /*src=*/Value());
+
+    // Generate the local store
+    auto trueVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        srcOp->getLoc(), 1, 1);
+    auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
+        srcOp->getLoc(), allocOp, srcResult, trueVal);
+    storeOp->moveAfter(srcOp);
+    trueVal->moveAfter(srcOp);
+
+    // local load
+    builder.setAsyncTaskIdsFromOp(dstOp);
+    auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
+        dstOp->getLoc(), srcResult.getType(),
+        builder.getType<ttg::AsyncTokenType>(), allocOp, Value());
+    loadOp->moveBefore(dstOp);
+    dstOp->replaceUsesOfWith(srcResult, loadOp);
+  } else {
+    builder.setAsyncTaskIdsFromOp(srcOp);
+    bool requireMMASharedEncoding =
+        llvm::any_of(actualConsumers, [](Operation *op) {
+          return isa<mlir::triton::DotOpInterface>(op);
+        });
+
+    // Get shape, layout and type of a slice
+    auto sliceShape = tensorType.getShape();
+    Attribute sharedLayout;
+    if (requireMMASharedEncoding) {
+      sharedLayout = ttg::NVMMASharedEncodingAttr::get(
+          context, sliceShape, order, CTALayout, elemType,
+          /*fp4Padded*/ false);
+    } else if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(srcOp)) {
+      sharedLayout = ttng::getEncodingFromDescriptor(tmaLoad, tmaLoad.getType(),
+                                                     tmaLoad.getDesc());
+    } else {
+      // Create an unswizzled layout for now.
+      // TODO: optimize it based on the consumer.
+      sharedLayout = ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1,
+                                                          order, CTALayout);
+    }
+
+    // Get shape, layout and type of the complete buffer
+    SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
+    if (srcOp->getParentOfType<scf::ForOp>())
+      bufferShape.insert(bufferShape.begin(), channel->numBuffers);
+    else
+      bufferShape.insert(bufferShape.begin(), 1);
+    Attribute sharedMemorySpace =
+        triton::gpu::SharedMemorySpaceAttr::get(context);
+    Type memdescType =
+        ttg::MemDescType::get(bufferShape, elemType, sharedLayout,
+                              sharedMemorySpace, /*mutableMemory*/ true);
+    auto allocOp =
+        builder.create<ttg::LocalAllocOp>(srcOp->getLoc(), memdescType);
+
+    // Generate the local store
+    auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+        srcOp->getLoc(), allocOp, srcResult);
+    storeOp->moveAfter(srcOp);
+
+    // local load
+    builder.setAsyncTaskIdsFromOp(dstOp);
+    auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
+        srcOp->getLoc(), srcResult.getType(), allocOp, Value());
+    loadOp->moveBefore(dstOp);
+    dstOp->replaceUsesOfWith(srcResult, loadOp);
+  }
+
+  return buffer;
 }
 
 static ttg::LocalAllocOp hoistLocalAllocPost(OpBuilder &builder,
@@ -1306,16 +1425,8 @@ DenseMap<Channel *, Value> createBuffer(
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
-  OpBuilder builder(funcOp);
-  builder.setInsertionPointToStart(&(funcOp.getBody().front()));
-  DenseSet<Channel *> visited;
-  for (auto &item : channelsGroupedByProducers) {
-    auto &channels = item.second;
-    for (auto c : channels) {
-      assert(!visited.count(c));
-      visited.insert(c);
-    }
-  }
+  OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+
   for (auto *channelInOrder : orderedChannels) {
     if (channelsGroupedByProducers.find(channelInOrder) ==
         channelsGroupedByProducers.end())
@@ -1329,6 +1440,7 @@ DenseMap<Channel *, Value> createBuffer(
     Value buffer;
 
     LLVM_DEBUG({
+      DBGS() << "\n";
       LDBG("Creating buffers for channel [" << channel->uniqID << "] "
                                             << to_string(channel->channelKind));
       LDBG("Producer:");
@@ -1337,67 +1449,26 @@ DenseMap<Channel *, Value> createBuffer(
       DBGS() << *dstOp << "\n";
     });
 
+    builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+
     // For TMEM channel, multi-buffer TMEM alloc
     if (channel->channelKind == DataChannelKind::TMEM) {
       // Move TMEM alloc to the beginning of the function.
       if (auto oldAlloc = dyn_cast<ttng::TMEMAllocOp>(srcOp)) {
-        buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+        buffer = hoistLocalAlloc(builder, oldAlloc);
+      } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(srcOp)) {
+        auto oldAlloc = mmaOp.getAccumulator().getDefiningOp();
+        buffer = hoistLocalAlloc(builder, oldAlloc);
       }
     } else if (channel->channelKind == DataChannelKind::SMEM) {
       // Move LocalAlloc to the beginning of the function.
       if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
-        buffer = hoistLocalAlloc(builder, oldAlloc, numBuffers);
+        buffer = hoistLocalAlloc(builder, oldAlloc);
       }
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
-      // Get basic information from tensorType
-      auto order = ttg::getOrderForMemory(tensorType);
-      auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
-      auto elemType = tensorType.getElementType();
-
-      // Get shape, layout and type of a slice
-      auto sliceShape = tensorType.getShape();
-      // Check the consumer type
-      auto actualConsumers = getActualConsumers(dstOp);
-      LLVM_DEBUG({
-        DBGS() << "actual consumers: \n";
-        for (auto consumerOp : actualConsumers) {
-          DBGS() << *consumerOp << "\n";
-        }
-      });
-
-      bool requireMMASharedEncoding =
-          llvm::any_of(actualConsumers, [](Operation *op) {
-            return isa<mlir::triton::DotOpInterface>(op);
-          });
-
-      Attribute sharedLayout;
-      if (requireMMASharedEncoding) {
-        sharedLayout = ttg::NVMMASharedEncodingAttr::get(
-            context, sliceShape, order, CTALayout, elemType,
-            /*fp4Padded*/ false);
-      } else if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(srcOp)) {
-        sharedLayout = ttng::getEncodingFromDescriptor(
-            tmaLoad, tmaLoad.getType(), tmaLoad.getDesc());
-      } else {
-        // Create an unswizzled layout for now.
-        // TODO: optimize it based on the consumer.
-        sharedLayout = ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1,
-                                                            order, CTALayout);
-      }
-
-      // Get shape, layout and type of the complete buffer
-      SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
-      if (srcOp->getParentOfType<scf::ForOp>())
-        bufferShape.insert(bufferShape.begin(), numBuffers);
-      else
-        bufferShape.insert(bufferShape.begin(), 1);
-      Attribute sharedMemorySpace =
-          triton::gpu::SharedMemorySpaceAttr::get(context);
-      Type memdescType =
-          ttg::MemDescType::get(bufferShape, elemType, sharedLayout,
-                                sharedMemorySpace, /*mutableMemory*/ true);
-      buffer = builder.create<ttg::LocalAllocOp>(funcOp.getLoc(), memdescType);
+      buffer = createLocalAlloc(builder, channelInOrder,
+                                tensorType.getShape().size() == 1);
     } else {
       llvm_unreachable("Unexpected result type");
     }
