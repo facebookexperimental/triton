@@ -232,15 +232,29 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
     assert(false && "Expected RankedTensorType or ttg::MemDescType");
   }
   assert(shape.size() == 2 && "Expected 2D shape");
-  ArrayRef<unsigned> CTASplitNum = ttg::getCTALayout(encoding).getCTASplitNum();
   assert((elemBitWidth == 16 || elemBitWidth == 32) &&
          "TMEM Layout don't support fp8");
   auto unpacked = elemBitWidth != 16;
   // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
   // case at all from TCGen5MMAScaledOp::getBlockM?
+  size_t CTASplitM;
+  size_t CTASplitN;
+  if (auto ttgLayout = mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
+    ArrayRef<unsigned> CTASplitNum =
+        ttg::getCTALayout(encoding).getCTASplitNum();
+    CTASplitM = CTASplitNum[0];
+    CTASplitN = CTASplitNum[1];
+  } else if (auto tmemLayout =
+                 mlir::dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+                     encoding)) {
+    CTASplitM = tmemLayout.getCTASplitM();
+    CTASplitN = tmemLayout.getCTASplitN();
+  } else {
+    assert(false && "Unsupported encoding");
+  }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
       context, blockM, blockN,
-      /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
+      /*unpacked=*/unpacked, CTASplitM, CTASplitN);
   return ttg::MemDescType::get(shape, elemType, outputEncoding, memSpace,
                                /*mutableMemory=*/true);
 }
