@@ -30,6 +30,10 @@ static inline std::string to_string(DataChannelKind k) {
     return "tmem";
   case DataChannelKind::REG:
     return "reg";
+  case DataChannelKind::SMEMPost:
+    return "smem_post";
+  case DataChannelKind::TMEMPost:
+    return "tmem_post";
   }
   return "Unknown";
 }
