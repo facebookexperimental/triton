@@ -167,11 +167,11 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
   if (producerTMEMStart < allocOps.size()) {
     auto allocOp = allocOps[producerTMEMStart];
     auto allocShape = allocOp.getType().getShape();
-    if (allocShape[1] != 1) {
+    if (allocShape[allocShape.size() - 1] != 1) {
       builder.setInsertionPointAfter(allocOp);
       // Hardcode allocShape[0] / 2 for testing.
-      allocOpBuffer =
-          sliceAndReinterpretTMEMBuffer(builder, allocOp, allocShape[0] / 2, 1);
+      allocOpBuffer = sliceAndReinterpretTMEMBuffer(
+          builder, allocOp, allocShape[allocShape.size() - 2] / 2, 1);
     } else {
       allocOpBuffer = allocOp;
     }
@@ -199,11 +199,11 @@ sliceAndReinterpretTMEMBuffer(OpBuilder &builder, ttng::TMEMAllocOp allocOp,
   auto shape = allocType.getShape();
   auto oldBlockN = shape[1];
   // TODO(njriasan): Support 1x128x128?
-  assert(shape.size() == 2 && "Invalid shape");
   assert(oldBlockN >= blockN && "Invalid blockN size");
   assert(oldBlockN % blockN == 0 && "Invalid blockN divisibility");
   assert((offset + blockN) <= oldBlockN && "Invalid offset");
-  auto tmemDesc = createTMEMDesc(builder, allocType, shape[0], 1);
+  auto tmemDesc =
+      createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
   auto subSlice = builder.create<ttng::TMEMSubSliceOp>(allocOp->getLoc(),
                                                        allocOp, offset, blockN);
   return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
