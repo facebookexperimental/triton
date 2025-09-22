@@ -240,3 +240,40 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
     tt.return
   }
 }
+
+// CHECK the ability to reuse result, as specified tmem.start_buffer to
+// reuse the same buffer via a reinterpret.
+// CHECK-LABEL: @_dummy_repro
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = true, elementBitWidth = 32, CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 32}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 520 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
+  tt.func public @_dummy_repro(%in_desc: !tt.tensordesc<tensor<128xf32, #shared>>, %in_desc_0: i32, %in_desc_1: i64, %out_desc: !tt.tensordesc<tensor<128x1xf32, #shared1>>, %out_desc_2: i32, %out_desc_3: i32, %out_desc_4: i64, %out_desc_5: i64) attributes {noinline = false, ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32} {
+    %result, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %true = arith.constant true
+    %pid = tt.get_program_id x : i32
+    %alpha = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    %alpha_6 = ttg.local_alloc {allocation.offset = 512 : i32} : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+    ttng.init_barrier %alpha_6, 1 : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+    ttng.barrier_expect %alpha_6, 512, %true : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %in_desc[%pid] %alpha, %alpha_6, %true : !tt.tensordesc<tensor<128xf32, #shared>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    ttng.wait_barrier %alpha_6, %c0_i32 : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+    ttng.inval_barrier %alpha_6 : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+    %alpha_7 = ttg.local_load %alpha : !ttg.memdesc<128xf32, #shared, #smem, mutable> -> tensor<128xf32, #blocked>
+    %alpha_i = arith.mulf %alpha_7, %cst : tensor<128xf32, #blocked>
+    %0 = ttg.convert_layout %alpha_i {tmem.start = 0 : i32, ttg.partition = 0 : i32} : tensor<128xf32, #blocked> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>
+    %1 = tt.expand_dims %0 {axis = 1 : i32, ttg.partition = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>> -> tensor<128x1xf32, #blocked1>
+    %2 = ttg.local_alloc %1 {allocation.offset = 0 : i32} : (tensor<128x1xf32, #blocked1>) -> !ttg.memdesc<128x1xf32, #shared1, #smem>
+    ttng.fence_async_shared {bCluster = false}
+    ttng.async_tma_copy_local_to_global %out_desc[%pid, %c0_i32] %2 : !tt.tensordesc<tensor<128x1xf32, #shared1>>, !ttg.memdesc<128x1xf32, #shared1, #smem>
+    ttng.async_tma_store_wait {pendings = 0 : i32}
+    tt.return
+  }
+}

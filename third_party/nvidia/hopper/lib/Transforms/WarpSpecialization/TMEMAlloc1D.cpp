@@ -77,6 +77,9 @@ private:
     // Expand from 1D -> 2D
     auto oldRetType = getResultTensorType(producer, 1);
     builder.setInsertionPointAfter(producer);
+    // TODO(njriasan): This only works because
+    // producer->getResult(0) already has a ttg.slice attribute.
+    // We will probably need to update this to work more generally.
     auto expandDims = builder.create<tt::ExpandDimsOp>(
         producer->getLoc(), producer->getResult(0), 1);
     copyAttrs(producer, expandDims);
