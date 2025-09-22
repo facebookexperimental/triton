@@ -26,12 +26,17 @@ static inline std::string to_string(DataChannelKind k) {
   switch (k) {
   case DataChannelKind::SMEM:
     return "smem";
+  case mlir::DataChannelKind::SMEMPost:
+    return "smemPost";
   case DataChannelKind::TMEM:
     return "tmem";
+  case mlir::DataChannelKind::TMEMPost:
+    return "tmemPost";
   case DataChannelKind::REG:
     return "reg";
+  default:
+    return "Unknown";
   }
-  return "Unknown";
 }
 
 struct Channel {
