@@ -39,6 +39,19 @@ def NVGPUTestWSTaskPartition : Pass<"nvgpu-test-ws-task-partition", "mlir::Modul
   ];
 }
 
+def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::ModuleOp"> {
+  let summary = "test warp specialization memory planner";
+
+  let description = "This pass computes a memory configuration for autoWS";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+  let options = [
+    Option<"numBuffers", "num-buffers",
+           "int32_t", /*default*/"0",
+           "number of buffering for warp specialization">
+  ];
+}
+
 def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::ModuleOp"> {
   let summary = "test warp specialization task id propagation";
 
