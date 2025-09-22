@@ -22,6 +22,11 @@ private:
   // Intermediate info to minimize code reuse across functions.
   int numWarps = -1;
   tt::ExpandDimsOp _expandedInput = nullptr;
+  // _allocOp should be one of the following types:
+  // 1. ttng::TMEMAllocOp: A direct memory allocation
+  // 2. ttng::MemDescReinterpretOp: A reinterpret of a
+  // memory allocation.
+  // 3. ttg.MemDescIndexOp: An index into a memory allocation.
   Operation *_allocOp = nullptr;
 
 public:
@@ -72,8 +77,7 @@ private:
     return allocCall;
   }
 
-  void TMEMStore1D(Operation *producer,
-                   std::optional<Operation *> allocOpBuffer) {
+  void TMEMStore1D(Operation *producer, Operation *allocOpBuffer) {
     // Expand from 1D -> 2D
     auto oldRetType = getResultTensorType(producer, 1);
     builder.setInsertionPointAfter(producer);
@@ -85,8 +89,8 @@ private:
     copyAttrs(producer, expandDims);
     setExpandedInput(expandDims);
     Operation *allocOp;
-    if (allocOpBuffer.has_value()) {
-      allocOp = allocOpBuffer.value();
+    if (allocOpBuffer) {
+      allocOp = allocOpBuffer;
     } else {
       allocOp = alloc1DTMEMBuffer();
     }
@@ -94,6 +98,7 @@ private:
 
     // Verify that these layouts are compatible.
     auto tmemDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+    assert(tmemDesc && "Expected MemDescType");
     auto expandType = expandDims.getType();
     bool layoutTmemCompatible = ttng::isDistributedLayoutTMemCompatible(
         expandDims, expandType, tmemDesc);
@@ -148,9 +153,8 @@ private:
   }
 
 public:
-  void
-  replaceWith1DTMEM(Operation *producer, Operation *consumer,
-                    std::optional<Operation *> allocOpBuffer = std::nullopt) {
+  void replaceWith1DTMEM(Operation *producer, Operation *consumer,
+                         Operation *allocOpBuffer = nullptr) {
     this->numWarps = ttg::lookupNumWarps(producer);
     assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
     TMEMStore1D(producer, allocOpBuffer);
@@ -161,9 +165,11 @@ public:
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
                            llvm::SmallVector<ttng::TMEMAllocOp> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
-  std::optional<Operation *> allocOpBuffer = std::nullopt;
+  Operation *allocOpBuffer = nullptr;
   auto producerTMEMStart =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("tmem.start")).getInt();
+  // If producerTMEMStart < allocOps.size() then we will be testing reusing
+  // an existing allocation. Otherwise we will be testing a new allocation.
   if (producerTMEMStart < allocOps.size()) {
     auto allocOp = allocOps[producerTMEMStart];
     auto allocShape = allocOp.getType().getShape();
