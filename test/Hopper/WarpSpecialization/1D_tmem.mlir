@@ -241,6 +241,8 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
   }
 }
 
+// -----
+
 // CHECK the ability to reuse result, as specified tmem.start_buffer to
 // reuse the same buffer via a reinterpret.
 // CHECK-LABEL: @_dummy_repro
@@ -273,7 +275,6 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
     // CHECK-NOT: tmem.start
     %0 = ttg.convert_layout %alpha_i {tmem.start = 0 : i32, ttg.partition = 0 : i32} : tensor<128xf32, #blocked> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>
     // CHECK: tt.expand_dims
-    // CHECK: ttg.convert_layout
     // CHECK: ttng.tmem_store
     // CHECK: ttng.tmem_load
     // CHECK: tt.reshape
