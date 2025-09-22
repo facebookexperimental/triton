@@ -254,7 +254,7 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
 #smem = #ttg.shared_memory
 module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 520 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   tt.func public @_dummy_repro(%in_desc: !tt.tensordesc<tensor<128xf32, #shared>>, %in_desc_0: i32, %in_desc_1: i64, %out_desc: !tt.tensordesc<tensor<128x1xf32, #shared1>>, %out_desc_2: i32, %out_desc_3: i32, %out_desc_4: i64, %out_desc_5: i64) attributes {noinline = false, ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32} {
-    %result, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %result, %token = ttng.tmem_alloc {tmem.start_buffer = 0 : i32}  : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
     %c0_i32 = arith.constant 0 : i32
     %true = arith.constant true

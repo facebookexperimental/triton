@@ -79,7 +79,7 @@ private:
     builder.setInsertionPointAfter(producer);
     // TODO(njriasan): This only works because
     // producer->getResult(0) already has a ttg.slice attribute.
-    // We will probably need to update this to work more generally.
+    // We will need to update this to work more generally.
     auto expandDims = builder.create<tt::ExpandDimsOp>(
         producer->getLoc(), producer->getResult(0), 1);
     copyAttrs(producer, expandDims);
@@ -158,8 +158,15 @@ public:
   }
 };
 
-void generate1DAllocations(OpBuilder &builder, Operation *producer) {
+void generate1DAllocations(OpBuilder &builder, Operation *producer,
+                           llvm::SmallVector<ttng::TMEMAllocOp> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
+  std::optional<ttng::TMEMAllocOp> allocOpBuffer = std::nullopt;
+  auto producerTMEMStart =
+      mlir::cast<mlir::IntegerAttr>(producer->getAttr("tmem.start")).getInt();
+  if (producerTMEMStart < allocOps.size()) {
+    allocOpBuffer = allocOps[producerTMEMStart];
+  }
   auto producerPartition =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("ttg.partition"))
           .getInt();
@@ -168,7 +175,8 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer) {
         mlir::cast<mlir::IntegerAttr>(consumer->getAttr("ttg.partition"))
             .getInt();
     if (producerPartition != consumerParition) {
-      TMEM1DAllocator(builder).replaceWith1DTMEM(producer, consumer);
+      TMEM1DAllocator(builder).replaceWith1DTMEM(producer, consumer,
+                                                 allocOpBuffer);
     }
   }
   // Delete tmem.start
@@ -240,9 +248,15 @@ public:
   void runOnOperation() override {
     auto moduleOp = getOperation();
     OpBuilder builder(moduleOp.getContext());
+    llvm::SmallVector<ttng::TMEMAllocOp> allocOps;
+    moduleOp->walk([&](ttng::TMEMAllocOp allocOp) {
+      if (allocOp->hasAttr("tmem.start_buffer")) {
+        allocOps.push_back(allocOp);
+      }
+    });
     moduleOp->walk([&](mlir::Operation *irOp) {
       if (irOp->hasAttr("tmem.start")) {
-        generate1DAllocations(builder, irOp);
+        generate1DAllocations(builder, irOp, allocOps);
       }
     });
   }
