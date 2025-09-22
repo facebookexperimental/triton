@@ -91,6 +91,8 @@ public:
 
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
+  Operation *getDstOpLast();
+  void getDstOps(SmallVector<Operation *> &dsts);
   virtual Operation *getAllocOp() { return allocOp; }
   virtual unsigned getNumBuffers();
 
@@ -235,7 +237,9 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
-                            Operation *headConsumer, bool isPost = false);
+                            Operation *headConsumer,
+                            Operation *headConsumerSameLevel,
+                            bool isPost = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);

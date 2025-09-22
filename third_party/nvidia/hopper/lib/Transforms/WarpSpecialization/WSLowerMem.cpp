@@ -322,7 +322,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
-                            Operation *headConsumer, bool isPost) {
+                            Operation *headConsumer,
+                            Operation *headConsumerSameLevel, bool isPost) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -357,7 +358,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   }
 
   // Create a wait_barrier before the first consumer.
-  builder.setInsertionPoint(headConsumer);
+  builder.setInsertionPoint(headConsumerSameLevel);
   builder.setAsyncTaskIdsFromOp(headConsumer);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);

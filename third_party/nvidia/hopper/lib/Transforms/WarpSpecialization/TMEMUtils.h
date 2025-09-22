@@ -2,7 +2,6 @@
 #define NV_DIALECT_HOPPER_TRANSFORMS_TMEMUTILS_H_
 
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace ttg = mlir::triton::gpu;
 namespace mlir {
