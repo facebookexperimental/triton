@@ -64,13 +64,8 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   auto loc = op.getLoc();
   ttng::ArriveBarrierOp arriveOp;
 
-  if (true) { // loadType == ttnvws::TokenLoadType::TMALoadOp) {
-    // Get the count from the barriers: trace the local_alloc for the barrier
-    // then find the count from init_barrier
-    arriveOp = builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, fullCnt);
-  } else {
-    assert(false);
-  }
+  assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
+  arriveOp = builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, fullCnt);
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
