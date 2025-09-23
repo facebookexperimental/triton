@@ -625,10 +625,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   Operation *producerOp = nullptr;
   SmallVector<Operation *> consumers;
   SmallVector<Operation *> producers;
-  auto isConstTrue = [](Value v) {
+  auto isConstFalse = [](Value v) {
     if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
       if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
-        return attr.getValue();
+        return !attr.getValue();
       }
     }
     return false;
@@ -640,7 +640,7 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     for (auto user : tmemAllocOp.getResult().getUsers()) {
       if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(user)) {
         if (mmaOpT.getD() == allocOp->getResult(0)) {
-          if (isConstTrue(mmaOpT.useAccumulator())) {
+          if (!isConstFalse(mmaOpT.useAccumulator())) {
             mmaOp = mmaOpT;
             isOperandD = true;
           } else
