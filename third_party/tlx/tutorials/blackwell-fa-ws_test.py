@@ -35,11 +35,13 @@ configs = [
                   num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
 ]
 
+
 @triton.jit
 def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     bufIdx = accum_cnt % NUM_BUFFERS_KV
     phase = (accum_cnt // NUM_BUFFERS_KV) & 1
     return bufIdx, phase
+
 
 @triton.jit
 def _compute_offsets(H, N_CTX, BLOCK_M):
@@ -57,15 +59,15 @@ def _compute_offsets(H, N_CTX, BLOCK_M):
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
 def _attn_fwd_ws(sm_scale, M,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-              HEAD_DIM: tl.constexpr,  #
-              BLOCK_M: tl.constexpr,  #
-              BLOCK_N: tl.constexpr,  #
-              FP8_OUTPUT: tl.constexpr,  #
-              NUM_BUFFERS_KV: tl.constexpr,  #
-              NUM_BUFFERS_QK: tl.constexpr,  #
-              NUM_MMA_GROUPS: tl.constexpr,  #
-              ):
+                 Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+                 HEAD_DIM: tl.constexpr,  #
+                 BLOCK_M: tl.constexpr,  #
+                 BLOCK_N: tl.constexpr,  #
+                 FP8_OUTPUT: tl.constexpr,  #
+                 NUM_BUFFERS_KV: tl.constexpr,  #
+                 NUM_BUFFERS_QK: tl.constexpr,  #
+                 NUM_MMA_GROUPS: tl.constexpr,  #
+                 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
@@ -78,16 +80,18 @@ def _attn_fwd_ws(sm_scale, M,  #
     kv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
     # allocate TMEM buffers and barriers
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK, tlx.storage_kind.tmem)
+    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                               tlx.storage_kind.tmem)
     # Shared buffer for QK, P and Alpha, l, and m.
     # Alpha/l/m lives in the lower half of qk_buf, and P lives in the upper half.
-    p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_v), NUM_MMA_GROUPS * NUM_BUFFERS_QK * 2, tlx.storage_kind.tmem, reuse=qk_tiles)
+    p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_v), NUM_MMA_GROUPS * NUM_BUFFERS_QK * 2,
+                              tlx.storage_kind.tmem, reuse=qk_tiles)
     alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem, reuse=qk_tiles)
     l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * 2, tlx.storage_kind.tmem, reuse=qk_tiles)
     m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * 4, tlx.storage_kind.tmem, reuse=qk_tiles)
 
-
-    acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK, tlx.storage_kind.tmem)
+    acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                                tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
@@ -140,7 +144,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                 desc_o.store([qo_offset_y_split, 0], acc.to(tlx.dtype_of(desc_o)))
 
-
         # softmax groups
         with tlx.async_task(num_warps=4, registers=152, replicate=NUM_MMA_GROUPS):
             # initialize offsets
@@ -181,7 +184,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.local_store(p_tiles[p_bufIdx], p)
                 tlx.barrier_arrive(p_fulls[qk_bufIdx])
 
-
                 l_i = l_i * alpha + l_ij
                 m_i = m_ij
                 accum_cnt_qk += 1
@@ -190,7 +192,6 @@ def _attn_fwd_ws(sm_scale, M,  #
             tlx.local_store(l_tiles[cid + NUM_MMA_GROUPS], l_i[:, None])
             tlx.local_store(m_tiles[cid + NUM_MMA_GROUPS * 2], m_i[:, None])
             tlx.barrier_arrive(l_fulls[cid])
-
 
         # mma group
         with tlx.async_task(num_warps=1, registers=24):
@@ -216,10 +217,21 @@ def _attn_fwd_ws(sm_scale, M,  #
                     qk_bufIdx += cid * NUM_BUFFERS_QK
                     tlx.barrier_wait(qk_empties[qk_bufIdx], qk_phase ^ 1)
                     if cid == NUM_MMA_GROUPS - 1:
-                        tlx.async_dot(q_tiles[cid], k_tile, qk_tiles[qk_bufIdx], use_acc=False, mBarriers=[qk_fulls[qk_bufIdx], kv_empties[k_bufIdx]],)
+                        tlx.async_dot(
+                            q_tiles[cid],
+                            k_tile,
+                            qk_tiles[qk_bufIdx],
+                            use_acc=False,
+                            mBarriers=[qk_fulls[qk_bufIdx], kv_empties[k_bufIdx]],
+                        )
                     else:
-                        tlx.async_dot(q_tiles[cid], k_tile, qk_tiles[qk_bufIdx], use_acc=False, mBarriers=[qk_fulls[qk_bufIdx]],)
-
+                        tlx.async_dot(
+                            q_tiles[cid],
+                            k_tile,
+                            qk_tiles[qk_bufIdx],
+                            use_acc=False,
+                            mBarriers=[qk_fulls[qk_bufIdx]],
+                        )
 
                 # -- compute p @ v ----
                 # wait for the V buffer to be populated by the producer
@@ -231,9 +243,21 @@ def _attn_fwd_ws(sm_scale, M,  #
                     tlx.barrier_wait(acc_fulls[qk_bufIdx], qk_phase)
                     p_bufIdx = qk_bufIdx + NUM_MMA_GROUPS * NUM_BUFFERS_QK
                     if cid == NUM_MMA_GROUPS - 1:
-                        tlx.async_dot(p_tiles[p_bufIdx], kv_tiles[v_bufIdx], acc_tiles[qk_bufIdx], use_acc=i>0, mBarriers=[acc_empties[qk_bufIdx], kv_empties[v_bufIdx]],)
+                        tlx.async_dot(
+                            p_tiles[p_bufIdx],
+                            kv_tiles[v_bufIdx],
+                            acc_tiles[qk_bufIdx],
+                            use_acc=i > 0,
+                            mBarriers=[acc_empties[qk_bufIdx], kv_empties[v_bufIdx]],
+                        )
                     else:
-                        tlx.async_dot(p_tiles[p_bufIdx], kv_tiles[v_bufIdx], acc_tiles[qk_bufIdx], use_acc=i>0, mBarriers=[acc_empties[qk_bufIdx]],)
+                        tlx.async_dot(
+                            p_tiles[p_bufIdx],
+                            kv_tiles[v_bufIdx],
+                            acc_tiles[qk_bufIdx],
+                            use_acc=i > 0,
+                            mBarriers=[acc_empties[qk_bufIdx]],
+                        )
 
                 accum_cnt_qk += 1
                 accum_cnt_kv += 2
@@ -354,7 +378,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, dtype=torch.float16):
     q = q.to(ref_dtype)
     k = k.to(ref_dtype)
     v = v.to(ref_dtype)
-    M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
     p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
     p = torch.softmax(p.float(), dim=-1)
     p = p.to(ref_dtype)
@@ -390,14 +413,11 @@ configs.append(
         x_names=["N_CTX"],
         x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
-        line_vals=["triton-fp16"]  +
-        (["flash"] if HAS_FLASH else []),
-        line_names=["Triton [FP16]"] +
-        (["Flash-2"] if HAS_FLASH else []),
+        line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+        line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
         styles=[("red", "-"), ("blue", "-"), ("green", "-")],
         ylabel="TFLOPS",
-        plot_name=
-        f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+        plot_name=f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
         args={
             "H": N_HEADS,
             "BATCH": BATCH,
