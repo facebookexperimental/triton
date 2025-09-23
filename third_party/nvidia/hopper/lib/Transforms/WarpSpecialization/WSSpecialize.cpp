@@ -273,8 +273,15 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   // Create newForOp.
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
       forOp.getLoc(), newLowerBound, newUpperBound, newStep, newLoopArgs);
-  if (forOp->getAttr("tt.loop_schedule"))
-    newForOp->setAttr("tt.loop_schedule", forOp->getAttr("tt.loop_schedule"));
+  // Propagate the attributes of forOp to newForOp.
+  // This is needed to preserve tt.warp_specialize,
+  // and tt.loop_schedule among others.
+  for (auto attr : forOp->getAttrs()) {
+    // async_task_id is set in the creation step.
+    if (attr.getName() != "async_task_id") {
+      newForOp->setAttr(attr.getName(), attr.getValue());
+    }
+  }
 
   // Initialize Value mapping from forOp to newForOp
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
@@ -320,15 +327,6 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
     auto newYieldOp =
         forBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
     setAsyncTaskIds(newYieldOp, {asyncTaskId});
-  }
-
-  // Propagate the attributes of forOp to newForOp.
-  // This is needed to preserve tt.warp_specialize.
-  for (auto attr : forOp->getAttrs()) {
-    // We actually use async_task_id above.
-    if (attr.getName() != "async_task_id") {
-      newForOp->setAttr(attr.getName(), attr.getValue());
-    }
   }
 
   // Replace results of forOp with results of newForOp.
