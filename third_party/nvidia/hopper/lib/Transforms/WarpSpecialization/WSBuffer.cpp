@@ -527,7 +527,13 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
       newLoopArgs);
   newForOp.getRegion().takeBody(forOp.getRegion());
 
-  // Step 5: Replace forOp with newForOp.
+  // Step 5: Copy over the existing attributes.
+  // This is needed to preserve tt.warp_specialize.
+  for (auto attr : forOp->getAttrs()) {
+    newForOp->setAttr(attr.getName(), attr.getValue());
+  }
+
+  // Step 6: Replace forOp with newForOp.
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)
     forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
   forOp.erase();
