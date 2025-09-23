@@ -245,6 +245,16 @@ static std::optional<int> tryGetMaxStage(scf::ForOp &forOp) {
         .getValue()
         .getSExtValue();
   }
+  forOp.getBodyRegion().walk([&](scf::ForOp nestedFor) {
+    auto nestedMaxStage = tryGetMaxStage(nestedFor);
+    if (!nestedMaxStage.has_value())
+      return;
+    else if (!maxStage.has_value())
+      maxStage = nestedMaxStage.value();
+    else
+      maxStage = std::max(maxStage.value(), nestedMaxStage.value());
+  });
+
   return maxStage;
 }
 

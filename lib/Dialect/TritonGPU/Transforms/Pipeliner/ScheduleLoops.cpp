@@ -30,12 +30,12 @@ bool hasGpuBarriers(scf::ForOp forOp) {
 }
 
 // Return true if the preconditions for pipelining the loop are met.
-bool isSafeToPipeline(scf::ForOp forOp) {
+bool isSafeToPipeline(scf::ForOp forOp, bool allowOuter) {
   // Skip loop with distance > 1.
   if (loopHasDistGreaterThanOne(forOp))
     return false;
   // Don't pipeline outer loops.
-  if (isOuterLoop(forOp))
+  if (!allowOuter && isOuterLoop(forOp))
     return false;
   // Skip loops with barriers.
   if (hasGpuBarriers(forOp))
@@ -246,7 +246,12 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency) {
-  if (!isSafeToPipeline(forOp))
+
+  // If the loop is already warp-specialized, we will use the existing
+  // schedule, even if we are in the outer loop. This shouldn't ever be called
+  // twice because the inner loop doesn't have the tt.warp_specialized.
+  auto allowOuter = forOp->hasAttr(kWarpSpecializeAttrName);
+  if (!isSafeToPipeline(forOp, allowOuter))
     return CoarseSchedule(0);
 
   // If the loop has assigned latencies, use them to determine the initial
@@ -256,8 +261,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
 
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
-  if (forOp->hasAttr(kWarpSpecializeAttrName) &&
-      succeeded(schedule.deSerialize(forOp))) {
+  if (allowOuter && succeeded(schedule.deSerialize(forOp))) {
     // The loop was partitioned from a warp-specialized loop, meaning it can
     // have a partial view of the original loop stages. Re-schedule the loop
     // root at the stages of the latency ops to prune unnecessary stages.
