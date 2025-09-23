@@ -1,6 +1,106 @@
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
+#include "triton/Analysis/Allocation.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include <cstdlib>
+#include <string>
 
 namespace mlir::triton::gpu {
+
+// Helper function to compute allocation size from MemDescType
+inline size_t computeAllocationSize(MemDescType memdescTy) {
+  auto elemTy = memdescTy.getElementType();
+  auto shape = memdescTy.getShape();
+  size_t elemSize = elemTy.getIntOrFloatBitWidth() / 8;
+  size_t totalElements = 1;
+  for (auto dim : shape) {
+    totalElements *= dim;
+  }
+  return totalElements * elemSize;
+}
+
+// Helper function to add allocation information as IR annotations
+void addAllocationAnnotations(Operation *op) {
+  MLIRContext *ctx = op->getContext();
+  IntegerAttr offsetAttr;
+  MemDescType memdescTy;
+
+  // Try to get allocation.offset from the operation itself
+  if (auto attr = op->getAttrOfType<IntegerAttr>("allocation.offset")) {
+    offsetAttr = attr;
+    // Find MemDescType from result or operands
+    for (auto result : op->getResults()) {
+      if (auto ty = dyn_cast<MemDescType>(result.getType())) {
+        memdescTy = ty;
+        break;
+      }
+    }
+    if (!memdescTy) {
+      for (auto operand : op->getOperands()) {
+        if (auto ty = dyn_cast<MemDescType>(operand.getType())) {
+          memdescTy = ty;
+          break;
+        }
+      }
+    }
+  } else {
+    // Try to find it through operands
+    for (auto operand : op->getOperands()) {
+      if (auto definingOp = operand.getDefiningOp()) {
+        if (auto allocOp = dyn_cast<triton::gpu::LocalAllocOp>(definingOp)) {
+          if (auto attr =
+                  allocOp->getAttrOfType<IntegerAttr>("allocation.offset")) {
+            offsetAttr = attr;
+            memdescTy = cast<MemDescType>(allocOp.getType());
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (!offsetAttr || !memdescTy) {
+    return;
+  }
+
+  auto offset = offsetAttr.getInt();
+  size_t totalSize = computeAllocationSize(memdescTy);
+  auto elemTy = memdescTy.getElementType();
+  auto shape = memdescTy.getShape();
+  size_t elemSize = elemTy.getIntOrFloatBitWidth() / 8;
+  size_t totalElements = totalSize / elemSize;
+
+  // Add annotations
+  op->setAttr("shared_memory.access_offset",
+              IntegerAttr::get(IntegerType::get(ctx, 64), offset));
+  op->setAttr("shared_memory.access_size_bytes",
+              IntegerAttr::get(IntegerType::get(ctx, 64), totalSize));
+  op->setAttr("shared_memory.access_element_count",
+              IntegerAttr::get(IntegerType::get(ctx, 64), totalElements));
+  op->setAttr("shared_memory.access_element_size_bytes",
+              IntegerAttr::get(IntegerType::get(ctx, 32), elemSize));
+}
+
+// Function to add shared memory access annotations to all operations that use
+// shared memory
+void addSharedMemoryAnnotations(ModuleOp mod) {
+  // Check if MLIR_ENABLE_DUMP env is set to 1
+  static bool dumpEnabled = []() {
+    if (const char *env = std::getenv("MLIR_ENABLE_DUMP")) {
+      return std::string(env) == "1";
+    }
+    return false;
+  }();
+  if (!dumpEnabled) {
+    return;
+  }
+
+  mod.walk([&](Operation *op) {
+    if (isa<triton::gpu::LocalStoreOp, triton::gpu::LocalLoadOp,
+            triton::gpu::MemDescSubsliceOp, triton::gpu::MemDescIndexOp>(op)) {
+      addAllocationAnnotations(op);
+    }
+  });
+}
 
 void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
                                        ModuleAllocation &allocation) {
