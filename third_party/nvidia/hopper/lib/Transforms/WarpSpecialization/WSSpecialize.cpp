@@ -325,7 +325,10 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   // Propagate the attributes of forOp to newForOp.
   // This is needed to preserve tt.warp_specialize.
   for (auto attr : forOp->getAttrs()) {
-    newForOp->setAttr(attr.getName(), attr.getValue());
+    // We actually use async_task_id above.
+    if (attr.getName() != "async_task_id") {
+      newForOp->setAttr(attr.getName(), attr.getValue());
+    }
   }
 
   // Replace results of forOp with results of newForOp.
