@@ -1294,7 +1294,7 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     // Get shape, layout and type of the complete buffer
     SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
     if (srcOp->getParentOfType<scf::ForOp>())
-      bufferShape.insert(bufferShape.begin(), channel->numBuffers);
+      bufferShape.insert(bufferShape.begin(), channel->getNumBuffers());
     else
       bufferShape.insert(bufferShape.begin(), 1);
     Attribute tensorMemorySpace = ttng::TensorMemorySpaceAttr::get(context);
@@ -1354,7 +1354,7 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     // Get shape, layout and type of the complete buffer
     SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
     if (srcOp->getParentOfType<scf::ForOp>())
-      bufferShape.insert(bufferShape.begin(), channel->numBuffers);
+      bufferShape.insert(bufferShape.begin(), channel->getNumBuffers());
     else
       bufferShape.insert(bufferShape.begin(), 1);
     Attribute sharedMemorySpace =

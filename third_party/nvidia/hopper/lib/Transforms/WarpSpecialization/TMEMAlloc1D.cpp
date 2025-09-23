@@ -165,7 +165,7 @@ public:
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
                            llvm::SmallVector<Operation *> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
-  std::optional<Operation *> allocOpBuffer = std::nullopt;
+  Operation *allocOpBuffer = nullptr;
   auto producerTMEMStart =
       mlir::cast<mlir::IntegerAttr>(producer->getAttr("tmem.start")).getInt();
   // If producerTMEMStart < allocOps.size() then we will be testing reusing
