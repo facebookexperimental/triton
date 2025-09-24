@@ -204,8 +204,7 @@ ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
                                                         int offset,
                                                         size_t blockN) {
   auto allocResult = allocOp->getResult(0);
-  auto allocType = dyn_cast<ttg::MemDescType>(allocResult.getType());
-  assert(allocType && "Expected MemDescType");
+  auto allocType = cast<ttg::MemDescType>(allocResult.getType());
   auto shape = allocType.getShape();
   auto oldBlockN = shape[1];
   assert(oldBlockN >= blockN && "Invalid blockN size");
