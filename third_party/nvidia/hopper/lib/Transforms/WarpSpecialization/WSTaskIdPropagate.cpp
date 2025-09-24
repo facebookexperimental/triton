@@ -30,6 +30,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
       int64_t idx = attr.getInt();
       assert(idx >= 0);
       setAsyncTaskIds(op, idx);
+      op->removeAttr("ttg.partition");
     }
   });
 
