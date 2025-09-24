@@ -15,180 +15,189 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 // Wrapper class to hold the context for handling
-// 1D TMEM Allocation.
-class TMEM1DAllocator {
-private:
-  OpBuilder &builder;
-  // Intermediate info to minimize code reuse across functions.
-  int numWarps = -1;
-  tt::ExpandDimsOp _expandedInput = nullptr;
-  // _allocOp should be one of the following types:
-  // 1. ttng::TMEMAllocOp: A direct memory allocation
-  // 2. ttng::MemDescReinterpretOp: A reinterpret of a
-  // memory allocation.
-  // 3. ttg.MemDescIndexOp: An index into a memory allocation.
-  Operation *_allocOp = nullptr;
+//
 
-public:
-  TMEM1DAllocator(OpBuilder &builder) : builder(builder) {}
+void TMEM1DAllocator::replaceWith1DTMEM(Operation *producer,
+                                        Operation *consumer,
+                                        Operation *allocOpBuffer) {
+  this->numWarps = ttg::lookupNumWarps(producer);
+  assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
+  TMEMStore1D(producer, allocOpBuffer);
+  TMEMLoad1D(producer, consumer);
+}
 
-private:
-  void copyAttrs(Operation *oldOp, Operation *newOp) {
-    // Right now we just copy over ttg.partition per
-    // the example.
-    // TODO: Should we copy over loop information?
-    auto partitionAttr = oldOp->getAttr("ttg.partition");
-    newOp->setAttr("ttg.partition", partitionAttr);
+ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
+  auto expandedInput = getExpandedInput();
+  auto oldRetType = getResultTensorType(expandedInput, 2);
+  auto shape = oldRetType.getShape();
+  auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
+  auto allocCall = builder.create<ttng::TMEMAllocOp>(
+      expandedInput->getLoc(), tmemDesc, builder.getType<ttg::AsyncTokenType>(),
+      /*src=*/Value());
+  return allocCall;
+}
+
+void TMEM1DAllocator::TMEMStore1D(Operation *producer,
+                                  Operation *allocOpBuffer) {
+  // Expand from 1D -> 2D
+  auto oldRetType = getResultTensorType(producer, 1);
+  builder.setInsertionPointAfter(producer);
+  // TODO(njriasan): This only works because
+  // producer->getResult(0) already has a ttg.slice attribute.
+  // We will need to update this to work more generally.
+  auto expandDims = builder.create<tt::ExpandDimsOp>(producer->getLoc(),
+                                                     producer->getResult(0), 1);
+  copyAttrs(producer, expandDims);
+  setExpandedInput(expandDims);
+  Operation *allocOp;
+  if (allocOpBuffer) {
+    allocOp = allocOpBuffer;
+  } else {
+    allocOp = alloc1DTMEMBuffer();
   }
+  setAllocOp(allocOp);
 
-  void setExpandedInput(tt::ExpandDimsOp expandedInput) {
-    this->_expandedInput = expandedInput;
+  // Verify that these layouts are compatible.
+  auto tmemDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  assert(tmemDesc && "Expected MemDescType");
+  auto expandType = expandDims.getType();
+  bool layoutTmemCompatible =
+      ttng::isDistributedLayoutTMemCompatible(expandDims, expandType, tmemDesc);
+  auto oldLayout = expandDims.getType().getEncoding();
+  auto newLayout = oldLayout;
+  if (!layoutTmemCompatible) {
+    newLayout = ttng::getTmemCompatibleLayout(
+        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
   }
-
-  tt::ExpandDimsOp getExpandedInput() {
-    assert(_expandedInput != nullptr && "Must call setExpandedInput");
-    return _expandedInput;
+  mlir::Operation *src = expandDims;
+  if (newLayout != oldLayout) {
+    auto ty = cast<RankedTensorType>(expandType);
+    auto newTy = ty.cloneWithEncoding(newLayout);
+    src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
+                                               expandDims);
+    copyAttrs(producer, src);
   }
+  // Generate the store
+  Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
+  auto storeOp = builder.create<ttng::TMEMStoreOp>(
+      src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
+  copyAttrs(producer, storeOp);
+}
 
-  void setAllocOp(Operation *allocOp) { this->_allocOp = allocOp; }
+ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
+  auto expandedInput = getExpandedInput();
+  auto oldRetType = getResultTensorType(expandedInput, 2);
+  auto shape = oldRetType.getShape();
+  auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
+  auto allocCall = builder.create<ttng::TMEMAllocOp>(
+      expandedInput->getLoc(), tmemDesc, builder.getType<ttg::AsyncTokenType>(),
+      /*src=*/Value());
+  return allocCall;
+}
 
-  Operation *getAllocOp() {
-    assert(_allocOp != nullptr && "Must call getAllocOp()");
-    return _allocOp;
-  }
-
-  RankedTensorType getResultTensorType(Operation *op, size_t expectedSize) {
-    auto outputType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-    if (!outputType || outputType.getShape().size() != 2) {
-      assert("Invalid tensor input");
+void TMEM1DAllocator::TMEMStore1D(Operation *producer,
+                                  Operation *allocOpBuffer) {
+  // Expand from 1D -> 2D
+  auto oldRetType = getResultTensorType(producer, 1);
+  builder.setInsertionPointAfter(producer);
+  auto encoding = oldRetType.getEncoding();
+  Value expandDimsInput = producer->getResult(0);
+  unsigned axis = 1;
+  auto context = builder.getContext();
+  // Handle blocked encoding which isn't a slice attribute.
+  if (auto blockedEnc = dyn_cast<ttg::BlockedEncodingAttr>(encoding)) {
+    auto rank = oldRetType.getRank();
+    if (rank == 1) {
+      // create return encoding with rank 2
+      auto retSizePerThread = llvm::to_vector(blockedEnc.getSizePerThread());
+      retSizePerThread.insert(retSizePerThread.begin() + axis, 1);
+      auto retThreadsPerWarp = to_vector(blockedEnc.getThreadsPerWarp());
+      retThreadsPerWarp.insert(retThreadsPerWarp.begin() + axis, 1);
+      auto retWarpsPerCTA = to_vector(blockedEnc.getWarpsPerCTA());
+      retWarpsPerCTA.insert(retWarpsPerCTA.begin() + axis, 1);
+      auto retOrder = {axis, blockedEnc.getOrder()[0]};
+      auto argCTALayout = blockedEnc.getCTALayout();
+      auto retCTAsPerCGA = {argCTALayout.getCTAsPerCGA()[0], axis};
+      auto retCTASplitNum = {argCTALayout.getCTASplitNum()[0], axis};
+      auto retCTAOrder = {axis, argCTALayout.getCTAOrder()[0]};
+      auto retCTALayout = triton::gpu::CTALayoutAttr::get(
+          context, retCTAsPerCGA, retCTASplitNum, retCTAOrder);
+      blockedEnc = triton::gpu::BlockedEncodingAttr::get(
+          context, retSizePerThread, retThreadsPerWarp, retWarpsPerCTA,
+          retOrder, retCTALayout);
     }
-    return outputType;
+    auto sliceEnc = ttg::SliceEncodingAttr::get(
+        builder.getContext(), oldRetType.getRank(), blockedEnc);
+    auto sliceType = oldRetType.cloneWithEncoding(sliceEnc);
+    expandDimsInput = builder.create<ttg::ConvertLayoutOp>(
+        expandDimsInput.getLoc(), sliceType, expandDimsInput);
   }
-
-  ttng::TMEMAllocOp alloc1DTMEMBuffer() {
-    auto expandedInput = getExpandedInput();
-    auto oldRetType = getResultTensorType(expandedInput, 2);
-    auto shape = oldRetType.getShape();
-    auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
-    auto allocCall = builder.create<ttng::TMEMAllocOp>(
-        expandedInput->getLoc(), tmemDesc,
-        builder.getType<ttg::AsyncTokenType>(),
-        /*src=*/Value());
-    return allocCall;
+  auto expandDims = builder.create<tt::ExpandDimsOp>(producer->getLoc(),
+                                                     expandDimsInput, axis);
+  copyAttrs(producer, expandDims);
+  setExpandedInput(expandDims);
+  Operation *allocOp;
+  if (allocOpBuffer) {
+    allocOp = allocOpBuffer;
+  } else {
+    allocOp = alloc1DTMEMBuffer();
   }
+  setAllocOp(allocOp);
 
-  void TMEMStore1D(Operation *producer, Operation *allocOpBuffer) {
-    // Expand from 1D -> 2D
-    auto oldRetType = getResultTensorType(producer, 1);
-    builder.setInsertionPointAfter(producer);
-    auto encoding = oldRetType.getEncoding();
-    Value expandDimsInput = producer->getResult(0);
-    unsigned axis = 1;
-    auto context = builder.getContext();
-    // Handle blocked encoding which isn't a slice attribute.
-    if (auto blockedEnc = dyn_cast<ttg::BlockedEncodingAttr>(encoding)) {
-      auto rank = oldRetType.getRank();
-      if (rank == 1) {
-        // create return encoding with rank 2
-        auto retSizePerThread = llvm::to_vector(blockedEnc.getSizePerThread());
-        retSizePerThread.insert(retSizePerThread.begin() + axis, 1);
-        auto retThreadsPerWarp = to_vector(blockedEnc.getThreadsPerWarp());
-        retThreadsPerWarp.insert(retThreadsPerWarp.begin() + axis, 1);
-        auto retWarpsPerCTA = to_vector(blockedEnc.getWarpsPerCTA());
-        retWarpsPerCTA.insert(retWarpsPerCTA.begin() + axis, 1);
-        auto retOrder = {axis, blockedEnc.getOrder()[0]};
-        auto argCTALayout = blockedEnc.getCTALayout();
-        auto retCTAsPerCGA = {argCTALayout.getCTAsPerCGA()[0], axis};
-        auto retCTASplitNum = {argCTALayout.getCTASplitNum()[0], axis};
-        auto retCTAOrder = {axis, argCTALayout.getCTAOrder()[0]};
-        auto retCTALayout = triton::gpu::CTALayoutAttr::get(
-            context, retCTAsPerCGA, retCTASplitNum, retCTAOrder);
-        blockedEnc = triton::gpu::BlockedEncodingAttr::get(
-            context, retSizePerThread, retThreadsPerWarp, retWarpsPerCTA,
-            retOrder, retCTALayout);
-      }
-      auto sliceEnc = ttg::SliceEncodingAttr::get(
-          builder.getContext(), oldRetType.getRank(), blockedEnc);
-      auto sliceType = oldRetType.cloneWithEncoding(sliceEnc);
-      expandDimsInput = builder.create<ttg::ConvertLayoutOp>(
-          expandDimsInput.getLoc(), sliceType, expandDimsInput);
-    }
-    auto expandDims = builder.create<tt::ExpandDimsOp>(producer->getLoc(),
-                                                       expandDimsInput, axis);
-    copyAttrs(producer, expandDims);
-    setExpandedInput(expandDims);
-    Operation *allocOp;
-    if (allocOpBuffer) {
-      allocOp = allocOpBuffer;
-    } else {
-      allocOp = alloc1DTMEMBuffer();
-    }
-    setAllocOp(allocOp);
-
-    // Verify that these layouts are compatible.
-    auto tmemDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
-    assert(tmemDesc && "Expected MemDescType");
-    auto expandType = expandDims.getType();
-    bool layoutTmemCompatible = ttng::isDistributedLayoutTMemCompatible(
-        expandDims, expandType, tmemDesc);
-    auto oldLayout = expandDims.getType().getEncoding();
-    auto newLayout = oldLayout;
-    if (!layoutTmemCompatible) {
-      newLayout = ttng::getTmemCompatibleLayout(
-          tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
-    }
-    mlir::Operation *src = expandDims;
-    if (newLayout != oldLayout) {
-      auto ty = cast<RankedTensorType>(expandType);
-      auto newTy = ty.cloneWithEncoding(newLayout);
-      src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
-                                                 expandDims);
-      copyAttrs(producer, src);
-    }
-    // Generate the store
-    Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-    auto storeOp = builder.create<ttng::TMEMStoreOp>(
-        src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
-    copyAttrs(producer, storeOp);
+  // Verify that these layouts are compatible.
+  auto tmemDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  assert(tmemDesc && "Expected MemDescType");
+  auto expandType = expandDims.getType();
+  bool layoutTmemCompatible =
+      ttng::isDistributedLayoutTMemCompatible(expandDims, expandType, tmemDesc);
+  auto oldLayout = expandDims.getType().getEncoding();
+  auto newLayout = oldLayout;
+  if (!layoutTmemCompatible) {
+    newLayout = ttng::getTmemCompatibleLayout(
+        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
   }
-
-  void TMEMLoad1D(Operation *producer, Operation *consumer) {
-    auto allocOp = getAllocOp();
-    auto producerOutput = producer->getResult(0);
-    auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
-    auto targetEncoding = oldInputType.getEncoding();
-    auto oldExpandType = getExpandedInput().getType();
-    Attribute newDistributedEncoding = ttng::getTmemCompatibleLayout(
-        oldExpandType.getShape()[0], oldExpandType.getShape()[1], oldExpandType,
-        numWarps);
-    auto newExpandType =
-        oldExpandType.cloneWithEncoding(newDistributedEncoding);
-    // Generate the load
-    builder.setInsertionPoint(consumer);
-    auto loadOp = builder.create<ttng::TMEMLoadOp>(
-        consumer->getLoc(), newExpandType,
-        builder.getType<ttg::AsyncTokenType>(), allocOp->getResult(0), Value());
-    copyAttrs(consumer, loadOp);
-    // Generate the reshape
-    auto reshape = builder.create<tt::ReshapeOp>(
-        consumer->getLoc(), oldInputType.getShape(), loadOp);
-    copyAttrs(consumer, reshape);
-    // Generate a convert layout.
-    auto newInput = builder.create<ttg::ConvertLayoutOp>(consumer->getLoc(),
-                                                         oldInputType, reshape);
-    copyAttrs(consumer, newInput);
-    // Replace the uses in the consumer
-    consumer->replaceUsesOfWith(producerOutput, newInput);
+  mlir::Operation *src = expandDims;
+  if (newLayout != oldLayout) {
+    auto ty = cast<RankedTensorType>(expandType);
+    auto newTy = ty.cloneWithEncoding(newLayout);
+    src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
+                                               expandDims);
+    copyAttrs(producer, src);
   }
+  // Generate the store
+  Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
+  auto storeOp = builder.create<ttng::TMEMStoreOp>(
+      src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
+  copyAttrs(producer, storeOp);
+}
 
-public:
-  void replaceWith1DTMEM(Operation *producer, Operation *consumer,
-                         Operation *allocOpBuffer = nullptr) {
-    this->numWarps = ttg::lookupNumWarps(producer);
-    assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
-    TMEMStore1D(producer, allocOpBuffer);
-    TMEMLoad1D(producer, consumer);
-  }
+void TMEM1DAllocator::TMEMLoad1D(Operation *producer, Operation *consumer) {
+  auto allocOp = getAllocOp();
+  auto producerOutput = producer->getResult(0);
+  auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
+  auto targetEncoding = oldInputType.getEncoding();
+  auto oldExpandType = getExpandedInput().getType();
+  Attribute newDistributedEncoding = ttng::getTmemCompatibleLayout(
+      oldExpandType.getShape()[0], oldExpandType.getShape()[1], oldExpandType,
+      numWarps);
+  auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
+  // Generate the load
+  builder.setInsertionPoint(consumer);
+  auto loadOp = builder.create<ttng::TMEMLoadOp>(
+      consumer->getLoc(), newExpandType, builder.getType<ttg::AsyncTokenType>(),
+      allocOp->getResult(0), Value());
+  copyAttrs(consumer, loadOp);
+  // Generate the reshape
+  auto reshape = builder.create<tt::ReshapeOp>(consumer->getLoc(),
+                                               oldInputType.getShape(), loadOp);
+  copyAttrs(consumer, reshape);
+  // Generate a convert layout.
+  auto newInput = builder.create<ttg::ConvertLayoutOp>(consumer->getLoc(),
+                                                       oldInputType, reshape);
+  copyAttrs(consumer, newInput);
+  // Replace the uses in the consumer
+  consumer->replaceUsesOfWith(producerOutput, newInput);
+}
 };
 
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
