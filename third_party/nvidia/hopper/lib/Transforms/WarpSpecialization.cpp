@@ -114,6 +114,11 @@ public:
       int retCode = doTaskIdPropagate(funcOp);
       if (retCode == -1)
         signalPassFailure();
+      if (dumpIntermediateSteps) {
+        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                        "doTaskIdPropagate\n"
+                     << moduleOp << "\n\n\n";
+      }
     }
 
     doMemoryPlanner(funcOp, numStages);
