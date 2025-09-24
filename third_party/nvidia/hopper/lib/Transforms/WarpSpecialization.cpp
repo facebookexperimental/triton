@@ -110,6 +110,10 @@ public:
       }
       if (!success)
         signalPassFailure();
+    } else {
+      int retCode = doTaskIdPropagate(funcOp);
+      if (retCode == -1)
+        signalPassFailure();
     }
 
     doMemoryPlanner(funcOp, numStages);

@@ -24,6 +24,15 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
+  // Convert ttg.partition to async_task_id
+  funcOp.walk([&](mlir::Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      int64_t idx = attr.getInt();
+      assert(idx >= 0);
+      setAsyncTaskIds(op, idx);
+    }
+  });
+
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
   DataFlowSolver solver;
