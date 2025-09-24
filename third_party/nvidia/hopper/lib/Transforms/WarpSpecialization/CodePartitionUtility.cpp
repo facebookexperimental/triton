@@ -169,12 +169,9 @@ Operation *ttng::TmemDataChannelPost::getSrcOp() {
   return nullptr;
 }
 
-Operation *ttng::TmemDataChannelPost::getDstOp() {
-  if (isOperandD) {
-    // Find tmem.end for this channel ID.
-    return findTmemStartEnd(this, "tmem.end");
-  }
-  SmallVector<Operation *> consumers;
+static void getAllConsumers(ttng::TmemDataChannelPost *ch,
+                            SmallVector<Operation *> &consumers) {
+  auto *allocOp = ch->getAllocOp();
   for (auto usr : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -182,16 +179,46 @@ Operation *ttng::TmemDataChannelPost::getDstOp() {
     if (!isTmemProducer(user == usr ? allocOp : usr, user))
       consumers.push_back(user);
   }
-  if (consumers.size() == 1)
-    return consumers[0];
-  assert(consumers.size() != 0);
+  // assume all consumers are in the same block, with same taskId
   auto taskIds = getAsyncTaskIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
     auto taskIds2 = getAsyncTaskIds(consumers[i]);
     assert(taskIds == taskIds2 &&
            consumers[i]->getBlock() == consumers[0]->getBlock());
   }
+}
+
+Operation *ttng::TmemDataChannelPost::getDstOp() {
+  if (isOperandD) {
+    // Find tmem.end for this channel ID.
+    return findTmemStartEnd(this, "tmem.end");
+  }
+  SmallVector<Operation *> consumers;
+  getAllConsumers(this, consumers);
+  if (consumers.size() == 1)
+    return consumers[0];
+  assert(consumers.size() != 0);
   return consumers.back();
+}
+
+Operation *ttng::TmemDataChannelPost::getDstOpLast() {
+  assert(!isOperandD);
+  SmallVector<Operation *> consumers;
+  getAllConsumers(this, consumers);
+  if (consumers.size() == 1)
+    return consumers[0];
+  assert(consumers.size() != 0);
+  Operation *tail = consumers[0];
+  for (unsigned i = 1; i < consumers.size(); ++i) {
+    if (!appearsBefore(consumers[i], tail))
+      tail = consumers[i];
+  }
+  return tail;
+}
+
+void ttng::TmemDataChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
+  assert(!isOperandD);
+  getAllConsumers(this, dsts);
 }
 
 unsigned ChannelPost::getNumBuffers() {
@@ -536,7 +563,7 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         auto channelID = channels.size();
         channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, channels.size()));
+            true /*isOperandD*/, true, channels.size()));
         // Mark producer and consumer.
         setTmemChannelAttr(currentProd, channelID, "tmem.start");
         setTmemChannelAttr(&op, channelID, "tmem.end");
@@ -553,7 +580,7 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         auto consumerIds = getAsyncTaskIds(&op);
         channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, channels.size()));
+            true /*isOperandD*/, true, channels.size()));
         // Mark producer and consumer.
         setTmemChannelAttr(currentProd, channelID, "tmem.start");
         setTmemChannelAttr(&op, channelID, "tmem.end");
@@ -570,7 +597,7 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         auto consumerIds = getAsyncTaskIds(&op);
         channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, channels.size()));
+            true /*isOperandD*/, true, channels.size()));
         // Mark producer and consumer.
         setTmemChannelAttr(currentProd, channelID, "tmem.start");
         setTmemChannelAttr(&op, channelID, "tmem.end");
@@ -580,7 +607,7 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         auto consumerIds = getAsyncTaskIds(&op);
         channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
             -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
-            channels.size()));
+            true, channels.size()));
         // Mark producer and consumer.
         setTmemChannelAttr(&op, channelID, "tmem.end");
       }
@@ -609,7 +636,7 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
       auto consumerIds = getAsyncTaskIds(user);
       channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
           producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-          true /*isOperandD*/, channels.size()));
+          true /*isOperandD*/, true, channels.size()));
       // Mark producer and consumer.
       setTmemChannelAttr(currentProd, channelID, "tmem.start");
       setTmemChannelAttr(user, channelID, "tmem.end");
@@ -633,6 +660,7 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     }
     return false;
   };
+  bool isOperandDNoAcc = false;
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
     bool isOperandD = false;
     ttng::TCGen5MMAOp mmaOp;
@@ -643,8 +671,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
           if (!isConstFalse(mmaOpT.useAccumulator())) {
             mmaOp = mmaOpT;
             isOperandD = true;
-          } else
+          } else {
+            isOperandDNoAcc = true;
             producers.push_back(user);
+          }
         } else // other operands are consumers
           consumers.push_back(user);
       } else if (isa<ttng::TMEMStoreOp>(user)) {
@@ -703,7 +733,7 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp))
     channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
         producerTaskIds.front(), consumerTaskIds, allocOp, false,
-        channels.size()));
+        isOperandDNoAcc, channels.size()));
   else
     channels.push_back(std::make_unique<ChannelPost>(
         producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
@@ -723,6 +753,78 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       createChannelPost(op, dom, channels);
     }
   });
+}
+
+// Find the operation that is along producer's parent chain, and its parent
+// is the same op as producer's parent. Here p is producer, and c is consumer.
+Operation *getSameLevelOp(Operation *p, Operation *c) {
+  Operation *op = c;
+  // Go along consumer's parent chain until it is in the same scope as
+  // producer, return the current scope of consumer.
+  while (!isa<triton::FuncOp>(op)) {
+    if (op->getParentOp() == p->getParentOp()) {
+      // consumer is in the nested region.
+      return op;
+    }
+    op = op->getParentOp();
+  }
+  op = p;
+  // Go along producer's parent chain until it is in the same scope as
+  // consumer, return the current scope of producer.
+  while (!isa<triton::FuncOp>(op)) {
+    if (c->getParentOp() == op->getParentOp()) {
+      return c;
+    }
+    op = op->getParentOp();
+  }
+  llvm_unreachable("Failed to find consumer's same level Op with producer");
+};
+
+// When the consumer is a local_alloc loading from shared memory to registers,
+// look ahead for the actual consumers, usually dot ops, that can directly
+// use shared memory. The local_alloc will be removed later.
+SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
+  // TransOp is not a real consumer. It caculates the shared memory
+  // address for the real consumer. Continue to find its transitive users
+  // recursively. Return all transitive users;
+  auto goThroughTrans = [&](Operation *user) -> DenseSet<Operation *> {
+    DenseSet<Operation *> users;
+    DenseSet<Operation *> visited;
+    SmallVector<Operation *> transUsers;
+    transUsers.push_back(user);
+    while (!transUsers.empty()) {
+      auto transUser = transUsers.pop_back_val();
+      visited.insert(transUser);
+      if (isa<tt::TransOp, ttg::MemDescTransOp>(transUser)) {
+        for (auto transitiveUser : transUser->getUsers()) {
+          if (!visited.count(transitiveUser))
+            transUsers.push_back(transitiveUser);
+        }
+      } else {
+        users.insert(transUser);
+      }
+    }
+    return users;
+  };
+  if (isa<ttg::MemDescTransOp>(consumerOp)) {
+    auto users = goThroughTrans(consumerOp);
+    return SmallVector<Operation *>(users.begin(), users.end());
+  }
+  if (isa<ttg::LocalAllocOp>(consumerOp)) {
+    DenseSet<Operation *> users;
+    for (auto user : consumerOp->getUsers()) {
+      if (isa<tt::TransOp, ttg::MemDescTransOp>(user)) {
+        auto transUsers = goThroughTrans(user);
+        for (auto *tUsr : transUsers)
+          users.insert(tUsr);
+      } else {
+        users.insert(user);
+      }
+    }
+
+    return SmallVector<Operation *>(users.begin(), users.end());
+  }
+  return {consumerOp};
 }
 
 } // namespace mlir
