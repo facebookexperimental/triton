@@ -1,5 +1,6 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Iterators.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -122,6 +123,7 @@ static void scheduleDependencies(scf::ForOp loop, WarpSchedule &schedule,
 
 // Recursively schedule the users of an operation, stopping when
 // encountering an operation that is already assigned.
+// If \p partition is null, a new partition will be created if needed.
 static void scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
                           Partition *partition, Operation *op) {
   SmallVector<OpOperand *> uses;
@@ -138,8 +140,11 @@ static void scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
       continue;
     }
 
-    if (!schedule.trySchedule(partition, user))
+    if (schedule.isScheduled(user))
       continue;
+    if (!partition)
+      partition = schedule.addPartition(/* stage is unused */ 0);
+    schedule.trySchedule(partition, user);
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
   }
@@ -148,9 +153,9 @@ static void scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
 // Given a partitioning scheme, determine an initial schedule by performing a
 // first-order partition assignment to the operations in the scheme and its
 // users and/or dependencies. This sets up the initial partitioning of the ops.
-static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp loop) {
+static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
   // Check for an existing schedule.
-  if (FailureOr<WarpSchedule> scheduleOr = WarpSchedule::deserialize(loop);
+  if (FailureOr<WarpSchedule> scheduleOr = WarpSchedule::deserialize(mainLoop);
       succeeded(scheduleOr))
     return {std::move(*scheduleOr)};
 
@@ -161,71 +166,85 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp loop) {
   Partition *mmaPartition = schedule.addPartition(1);
   Partition *loadPartition = schedule.addPartition(0);
 
+  SmallVector<scf::ForOp> loops{mainLoop.getOps<scf::ForOp>()};
+  loops.push_back(mainLoop);
+
   // Find loads to pipeline.
   SmallVector<Operation *> loadsAndAllocs;
-  for (Operation &op : loop.getOps()) {
-    // Only TMA loads are supported at the moment.
-    if (!isa<DescriptorLoadOp, DescriptorGatherOp>(op))
-      continue;
-    schedule.trySchedule(loadPartition, &op);
-    loadsAndAllocs.push_back(&op);
+  for (auto loop : loops) {
+    for (Operation &op : loop.getOps()) {
+      // Only TMA loads are supported at the moment.
+      if (!isa<DescriptorLoadOp, DescriptorGatherOp>(op))
+        continue;
+      schedule.trySchedule(loadPartition, &op);
+      loadsAndAllocs.push_back(&op);
 
-    // Local alloc users of the load with matching encoding will cause the
-    // underlying buffer to be pass through. Keep track of them.
-    SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
-    for (Operation *user : op.getUsers()) {
-      if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
-        if (sharedEnc == alloc.getType().getEncoding()) {
-          schedule.trySchedule(loadPartition, alloc);
-          loadsAndAllocs.push_back(alloc);
+      // Local alloc users of the load with matching encoding will cause the
+      // underlying buffer to be pass through. Keep track of them.
+      SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
+      for (Operation *user : op.getUsers()) {
+        if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
+          if (sharedEnc == alloc.getType().getEncoding()) {
+            schedule.trySchedule(loadPartition, alloc);
+            loadsAndAllocs.push_back(alloc);
+          }
+        } else if (isa<ttng::TMEMAllocOp>(user)) {
+          schedule.trySchedule(loadPartition, user);
+          loadsAndAllocs.push_back(user);
         }
-      } else if (isa<ttng::TMEMAllocOp>(user)) {
-        schedule.trySchedule(loadPartition, user);
-        loadsAndAllocs.push_back(user);
       }
     }
   }
 
+  // Ensure the epilogue stores are in a separate partition.
+  auto epiloguePartition = schedule.addPartition(/* stage is unused */ 0);
+  for (auto loop : loops)
+    for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
+      schedule.trySchedule(epiloguePartition, op);
+
   // Find MMAs to pipeline.
   SmallVector<ttng::MMAv5OpInterface> mmas;
-  for (auto mmaOp : loop.getOps<ttng::MMAv5OpInterface>()) {
-    schedule.trySchedule(mmaPartition, mmaOp);
-    mmas.push_back(mmaOp);
+  for (auto loop : loops) {
+    for (auto mmaOp : loop.getOps<ttng::MMAv5OpInterface>()) {
+      schedule.trySchedule(mmaPartition, mmaOp);
+      mmas.push_back(mmaOp);
 
-    // If the store is unrelated to the use of the MMA, then it gets placed in
-    // the MMA partition.
-    auto storeOp = dyn_cast_or_null<ttng::TMEMStoreOp>(
-        findDefOpInLoop(loop, mmaOp.getAccDep()));
-    if (!ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
-        loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
-      schedule.trySchedule(mmaPartition, storeOp);
-
-    // Look for views into the operands.
-    SmallVector<Operation *> operandViews;
-    for (Value operand : mmaOp->getOperands()) {
-      if (Operation *defOp = operand.getDefiningOp())
-        operandViews.push_back(defOp);
+      // If the store is unrelated to the use of the MMA, then it gets placed in
+      // the MMA partition.
+      auto storeOp = dyn_cast_or_null<ttng::TMEMStoreOp>(
+          findDefOpInLoop(loop, mmaOp.getAccDep()));
+      if (!ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
+          loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
+        schedule.trySchedule(mmaPartition, storeOp);
     }
-    while (!operandViews.empty()) {
-      Operation *op = operandViews.pop_back_val();
-      if (!op->hasTrait<OpTrait::MemDescViewTrait>())
-        continue;
-
-      // Duplicate the op if necessary to ensure that the MMA partition is the
-      // only user.
-      if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-            return schedule.getPartition(user) == mmaPartition;
-          })) {
-        Operation *newOp = OpBuilder(op).clone(*op);
-        op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-          return schedule.getPartition(use.getOwner()) == mmaPartition;
-        });
-        op = newOp;
+    for (auto mmaOp : mmas) {
+      // Look for views into the operands.
+      SmallVector<Operation *> operandViews;
+      for (Value operand : mmaOp->getOperands()) {
+        if (Operation *defOp = operand.getDefiningOp())
+          operandViews.push_back(defOp);
       }
+      while (!operandViews.empty()) {
+        Operation *op = operandViews.pop_back_val();
+        if (!op->hasTrait<OpTrait::MemDescViewTrait>())
+          continue;
 
-      schedule.trySchedule(mmaPartition, op);
-      if (Operation *defOp = op->getOperand(0).getDefiningOp())
-        operandViews.push_back(defOp);
+        // Duplicate the op if necessary to ensure that the MMA partition is the
+        // only user.
+        if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
+              return schedule.getPartition(user) == mmaPartition;
+            })) {
+          Operation *newOp = OpBuilder(op).clone(*op);
+          op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
+            return schedule.getPartition(use.getOwner()) == mmaPartition;
+          });
+          op = newOp;
+        }
+
+        schedule.trySchedule(mmaPartition, op);
+        if (Operation *defOp = op->getOperand(0).getDefiningOp())
+          operandViews.push_back(defOp);
+      }
     }
   }
 
@@ -233,32 +252,52 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp loop) {
   if (loadsAndAllocs.empty() && mmas.empty())
     return std::nullopt;
 
+  // Disable scheduling exp on the default partition for now, because we want
+  // softmax on separate partitions.
   // Propagate defs of exp.
-  for (Operation &op : loop.getOps()) {
-    if (!isa<math::Exp2Op, ElementwiseInlineAsmOp>(op))
-      continue;
-    int elementCount = 0;
-    for (Type type : op.getResultTypes()) {
-      if (auto tensorTy = dyn_cast<RankedTensorType>(type))
-        elementCount += tensorTy.getNumElements();
-    }
-    if (elementCount > 256) {
-      schedule.trySchedule(defaultPartition, &op);
-      scheduleDependencies(loop, schedule, defaultPartition, &op);
-    }
-  }
+  // for (scf::ForOp loop : loops) {
+  //   for (Operation &op : loop.getOps()) {
+  //     if (!isa<math::Exp2Op, ElementwiseInlineAsmOp>(op))
+  //       continue;
+  //     int elementCount = 0;
+  //     for (Type type : op.getResultTypes()) {
+  //       if (auto tensorTy = dyn_cast<RankedTensorType>(type))
+  //         elementCount += tensorTy.getNumElements();
+  //     }
+  //     if (elementCount > 256) {
+  //       schedule.trySchedule(defaultPartition, &op);
+  //       scheduleDependencies(loop, schedule, defaultPartition, &op);
+  //     }
+  //   }
+  // }
 
   // Propagate users of loads and MMAs.
+  // Load users go to the default partition.
   for (Operation *loadOrAlloc : loadsAndAllocs)
-    scheduleUsers(loop, schedule, defaultPartition, loadOrAlloc);
+    scheduleUsers(loadOrAlloc->getParentOfType<scf::ForOp>(), schedule,
+                  defaultPartition, loadOrAlloc);
 
-  SmallVector<Partition *> userPartitions{defaultPartition};
-  while (userPartitions.size() < mmas.size()) {
-    userPartitions.push_back(schedule.addPartition(userPartitions.size()));
+  // HACK: If the user is in the next iteration, put it in the default
+  // partition. This ensures that the correction goes to the default partition,
+  // because it uses acc.
+  for (auto mmaOp : mmas) {
+    for (OpOperand &use : mmaOp->getUses()) {
+      auto loop = mmaOp->getParentOfType<scf::ForOp>();
+      if (use.getOwner() != loop.getBody()->getTerminator())
+        continue;
+      for (OpOperand &use :
+           loop.getRegionIterArg(use.getOperandNumber()).getUses()) {
+        schedule.trySchedule(defaultPartition, use.getOwner());
+        scheduleUsers(loop, schedule, defaultPartition, use.getOwner());
+      }
+      break;
+    }
   }
-  for (auto [mmaOp, userPartition] :
-       llvm::reverse(llvm::zip(mmas, userPartitions))) {
-    scheduleUsers(loop, schedule, userPartition, mmaOp);
+
+  // The users of MMAs go to a new partition for each MMA.
+  for (auto mmaOp : llvm::reverse(mmas)) {
+    scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule, nullptr,
+                  mmaOp);
   }
 
   return schedule;
@@ -503,17 +542,39 @@ void rematerializeBroadcasts(WarpSchedule &schedule, OpOperand *use) {
   }
 }
 
+/// Walk over \p loop and clone Broadcast/ExpandDims ops into each partition
+/// that they have users in. This reduces the amount of data that needs to be
+/// transferred through memory.
 void optimizeSchedule(scf::ForOp loop, WarpSchedule &schedule) {
-  for (Partition &partition : schedule.getPartitions()) {
-    SmallVector<OpOperand *> uses;
-    schedule.iterateOutputs(loop, &partition,
-                            [&](Operation *defOp, OpOperand &use) {
-                              if (!isa<scf::YieldOp>(use.getOwner()))
-                                uses.push_back(&use);
-                            });
-    for (OpOperand *use : uses)
-      rematerializeBroadcasts(schedule, use);
-  }
+  // Walk everything in reverse so that operations are visited before their
+  // operands.
+  loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
+    if (!isa<BroadcastOp, ExpandDimsOp>(op))
+      return;
+
+    Partition *partition = schedule.getPartition(op);
+    if (!partition)
+      return;
+
+    // Record all the other partitions in which we have users.
+    llvm::SmallDenseSet<Partition *, 2> userPartitions;
+    for (OpOperand &use : op->getUses()) {
+      Partition *userPartition = schedule.getPartition(use.getOwner());
+      if (!userPartition || userPartition == partition)
+        continue;
+      userPartitions.insert(userPartition);
+    }
+
+    for (auto *userPartition : userPartitions) {
+      // Clone the instruction into each user partition.
+      Operation *clone = OpBuilder(op).clone(*op);
+      schedule.insert(userPartition, clone);
+      // Replace all users in that partition with the clone.
+      op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
+        return schedule.getPartition(otherUse.getOwner()) == userPartition;
+      });
+    }
+  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -549,6 +610,16 @@ void PartitionScheduling::runOnOperation() {
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
+      // Clean Broadcast/ExpandDims that were left with no users after
+      // optimizeSchedule. We wait until after the schedule is serialized to
+      // avoid invalidating pointers stored in the schedule.
+      loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
+        // By default, the walk is in postorder so it is safe to delete ops
+        // while we walk.
+        if (isa<BroadcastOp, ExpandDimsOp>(op))
+          if (op->use_empty())
+            op->erase();
+      });
     }
   }
 }
