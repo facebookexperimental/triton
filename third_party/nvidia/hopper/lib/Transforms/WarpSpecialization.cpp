@@ -125,6 +125,11 @@ public:
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n"
+          << moduleOp << "\n\n\n";
+    }
 
     doMemoryPlanner(funcOp, numStages);
     if (dumpIntermediateSteps) {

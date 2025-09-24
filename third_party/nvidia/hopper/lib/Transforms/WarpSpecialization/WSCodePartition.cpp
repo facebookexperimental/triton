@@ -2110,10 +2110,6 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
   // Step 3: Create buffers. A buffer for each channel.
   DenseMap<Channel *, Value> bufferMap =
       createBuffer(channelsGroupedByProducers, channels, funcOp);
-  LLVM_DEBUG({
-    LDBG("\n\nafter createBuffer");
-    funcOp.dump();
-  });
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
