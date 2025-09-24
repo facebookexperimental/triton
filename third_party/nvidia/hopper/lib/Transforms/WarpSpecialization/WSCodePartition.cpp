@@ -2086,6 +2086,36 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
   });
 }
 
+void doBufferAllocation(triton::FuncOp &funcOp) {
+  // Step 1: collect all communications between producers and consumers.
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
+  SmallVector<Channel *> channels;
+  for (const auto &c : channelsOrigin) {
+    channels.push_back(c.get());
+  }
+  if (channels.empty()) {
+    return;
+  }
+
+  // Step 2: group channels
+  // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
+  // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
+  SmallVector<Channel *> orderedChannels;
+  groupChannels(channels, channelsGroupedByProducers,
+                channelsGroupedByConsumers, orderedChannels);
+
+  // Step 3: Create buffers. A buffer for each channel.
+  DenseMap<Channel *, Value> bufferMap =
+      createBuffer(channelsGroupedByProducers, channels, funcOp);
+  LLVM_DEBUG({
+    LDBG("\n\nafter createBuffer");
+    funcOp.dump();
+  });
+}
+
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
