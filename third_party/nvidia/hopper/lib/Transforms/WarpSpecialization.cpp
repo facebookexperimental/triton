@@ -4,7 +4,9 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -132,6 +134,19 @@ public:
             << moduleOp << "\n\n\n";
       }
     }
+    triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doLoopSchedulePreprocessing\n"
+                   << moduleOp << "\n\n\n";
+    }
+    triton::gpu::scheduleLoops(moduleOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doLoopSchedule\n"
+                   << moduleOp << "\n\n\n";
+    }
+
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (!ForBlackWell) {
       // Clear num_stages to disable SWP.

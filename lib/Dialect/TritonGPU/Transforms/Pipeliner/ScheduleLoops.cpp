@@ -43,6 +43,56 @@ bool isSafeToPipeline(scf::ForOp forOp) {
   return true;
 }
 
+// Process an inner loop inside a warp-specialized loop. This validates
+// the preconditions for finding the inner most loop.
+void preprocesssWarpSpecializedInnerLoop(scf::ForOp &forOp, Builder &builder) {
+  if (isOuterLoop(forOp)) {
+
+  } else {
+    // Check that this is a loop that already ran loop scheduling once.
+    // If so apply the same attribute to the inner loop.
+    if (forOp->hasAttr(kScheduledMaxStageAttrName)) {
+      forOp->setAttr(kWarpSpecializeAttrName, builder.getUnitAttr());
+    }
+  }
+}
+
+// Process the given function to propagate the warp-specialize attribute
+// from the outer loop to the inner loops. This is done to enable the loop
+// scheduler to run on the inner loops after we have finished warp
+// specialization.
+void preprocesssWarpSpecializedOuterLoop(scf::ForOp &forOp, Builder &builder) {
+  if (!isOuterLoop(forOp))
+    return;
+  // We reuse the same attribute because nothing in the compiler depends on
+  // it after loop scheduling as warp specialization is already done. In the
+  // future we should make this more robust by using a separate attribute
+  // to verify that the loop is already warp-specialized.
+  bool hasWarpSpecializeAttr = forOp->hasAttr(kWarpSpecializeAttrName);
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (auto innerForOp = dyn_cast<scf::ForOp>(op)) {
+      if (hasWarpSpecializeAttr) {
+        preprocesssWarpSpecializedInnerLoop(innerForOp, builder);
+      } else {
+        preprocesssWarpSpecializedOuterLoop(innerForOp, builder);
+      }
+    }
+  }
+}
+
+void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder) {
+  // Process the given function to propagate the warp-specialize attribute
+  // from the outer loop to the inner loops. This is done to enable the loop
+  // scheduler to run on the inner loops after we have finished warp
+  // specialization.
+  //
+  // To avoid issues with the first invocation, we only propagate the
+  // attribute when the inner loop already has the max stage count.
+  moduleOp.walk([&](scf::ForOp forOp) {
+    preprocesssWarpSpecializedOuterLoop(forOp, builder);
+  });
+}
+
 // Find dependencies with distance of 1. They will go to the next stage,
 // but in the cluster before the current op.
 void scheduleDistanceOneDependencies(scf::ForOp forOp,
@@ -229,9 +279,10 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If the `scf.if` op itself is a latency op, skip it.
     if (opLatency.contains(ifOp))
       continue;
-    // Ensure this does not create scheduling conflicts by ensuring the forward
-    // slice of the `scf.if` does not contain ops that are already scheduled, as
-    // this will cause the `scf.if` to be scheduled after its dependents.
+    // Ensure this does not create scheduling conflicts by ensuring the
+    // forward slice of the `scf.if` does not contain ops that are already
+    // scheduled, as this will cause the `scf.if` to be scheduled after its
+    // dependents.
     SetVector<Operation *> slice;
     getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
@@ -270,9 +321,9 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
     };
 
-    // If there are no latency ops or all latency ops are in the same stage, we
-    // don't need to pipeline the loop. Return a new schedule with everything
-    // assigned to the same stage.
+    // If there are no latency ops or all latency ops are in the same stage,
+    // we don't need to pipeline the loop. Return a new schedule with
+    // everything assigned to the same stage.
     DenseSet<int> latencyStages;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
@@ -380,6 +431,7 @@ void scheduleLoop(scf::ForOp forOp,
   // Write the schedule to the IR
   schedule.serialize(forOp);
 }
+} // namespace
 
 /// Schedule the loops based on the latencies assigned to the operations.
 void scheduleLoops(ModuleOp moduleOp) {
@@ -392,9 +444,6 @@ void scheduleLoops(ModuleOp moduleOp) {
     scheduleLoop(forOp, opLatency);
   }
 }
-
-} // namespace
-
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -405,7 +454,7 @@ void scheduleLoops(ModuleOp moduleOp) {
 struct ScheduleLoops : public impl::TritonGPUScheduleLoopsBase<ScheduleLoops> {
   using TritonGPUScheduleLoopsBase::TritonGPUScheduleLoopsBase;
 
-  void runOnOperation() override { scheduleLoops(getOperation()); }
+  void runOnOperation() override { ttg::scheduleLoops(getOperation()); }
 };
 
 } // namespace mlir::triton::gpu
