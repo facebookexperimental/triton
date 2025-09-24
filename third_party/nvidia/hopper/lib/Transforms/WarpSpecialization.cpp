@@ -16,6 +16,7 @@ namespace mlir {
 
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
+void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
@@ -111,6 +112,12 @@ public:
         signalPassFailure();
     }
 
+    doMemoryPlanner(funcOp, numStages);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"
+          << moduleOp << "\n\n\n";
+    }
     doCodePartitionPost(funcOp, numStages);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
