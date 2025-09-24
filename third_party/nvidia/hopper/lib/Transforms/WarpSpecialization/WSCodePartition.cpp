@@ -140,11 +140,11 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
                               producerTaskId);
       consumerTaskIds.erase(iter, consumerTaskIds.end());
 
-      const unsigned NUM_TMEM_BUFFERS = 2;
       // Add a channel from the single producer task to consumerTaskIds.
       if (consumerTaskIds.size() > 0) {
         DataChannelKind channelKind = DataChannelKind::SMEM;
-        if (isa<ttng::TMEMAllocOp, ttng::TCGen5MMAOp>(producerOp)) {
+        if (isa<ttng::TMEMAllocOp, ttng::TMEMStoreOp, ttng::TCGen5MMAOp>(
+                producerOp)) {
           channelKind = DataChannelKind::TMEM;
         } else if (auto tAllocOp = dyn_cast<ttg::LocalAllocOp>(producerOp)) {
           channelKind = DataChannelKind::SMEM;
@@ -163,7 +163,7 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
 // Can be one end of the channel.
 static bool isChannelAnchorOp(Operation *op) {
   if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
-      isa<mlir::triton::DotOpInterface>(op))
+      isa<mlir::triton::DotOpInterface, ttng::TMEMStoreOp>(op))
     return true;
   // Local alloc op with a register operand can be the producer of a channel.
   if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
@@ -1215,6 +1215,9 @@ DenseMap<Channel *, Value> createBuffer(
       } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(srcOp)) {
         auto oldAlloc = mmaOp.getAccumulator().getDefiningOp();
         buffer = hoistLocalAlloc(builder, oldAlloc);
+      } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(srcOp)) {
+        auto oldAlloc = storeOp.getDst().getDefiningOp();
+        buffer = hoistLocalAlloc(builder, oldAlloc);
       }
     } else if (channel->channelKind == DataChannelKind::SMEM) {
       // Move LocalAlloc to the beginning of the function.
@@ -2084,6 +2087,32 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
         mmaOp.getToken().replaceAllUsesWith(replTok);
     }
   });
+}
+
+void doBufferAllocation(triton::FuncOp &funcOp) {
+  // Step 1: collect all communications between producers and consumers.
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
+  SmallVector<Channel *> channels;
+  for (const auto &c : channelsOrigin) {
+    channels.push_back(c.get());
+  }
+  if (channels.empty()) {
+    return;
+  }
+
+  // Step 2: group channels
+  // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
+  // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
+  SmallVector<Channel *> orderedChannels;
+  groupChannels(channels, channelsGroupedByProducers,
+                channelsGroupedByConsumers, orderedChannels);
+
+  // Step 3: Create buffers. A buffer for each channel.
+  DenseMap<Channel *, Value> bufferMap =
+      createBuffer(channelsGroupedByProducers, channels, funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
