@@ -1317,9 +1317,9 @@ def test_descriptor_load(device):
 
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
-        tlx.fence_async_shared()
 
     triton.set_allocator(alloc_fn)
     M, N = 128, 128
