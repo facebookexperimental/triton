@@ -140,11 +140,11 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
                               producerTaskId);
       consumerTaskIds.erase(iter, consumerTaskIds.end());
 
-      const unsigned NUM_TMEM_BUFFERS = 2;
       // Add a channel from the single producer task to consumerTaskIds.
       if (consumerTaskIds.size() > 0) {
         DataChannelKind channelKind = DataChannelKind::SMEM;
-        if (isa<ttng::TMEMAllocOp, ttng::TCGen5MMAOp>(producerOp)) {
+        if (isa<ttng::TMEMAllocOp, ttng::TMEMStoreOp, ttng::TCGen5MMAOp>(
+                producerOp)) {
           channelKind = DataChannelKind::TMEM;
         } else if (auto tAllocOp = dyn_cast<ttg::LocalAllocOp>(producerOp)) {
           channelKind = DataChannelKind::SMEM;
@@ -163,7 +163,7 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
 // Can be one end of the channel.
 static bool isChannelAnchorOp(Operation *op) {
   if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
-      isa<mlir::triton::DotOpInterface>(op))
+      isa<mlir::triton::DotOpInterface, ttng::TMEMStoreOp>(op))
     return true;
   // Local alloc op with a register operand can be the producer of a channel.
   if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
@@ -229,302 +229,6 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       LDBG("numBuffers: " << channel->getNumBuffers() << "\n");
     }
   });
-}
-
-static void setTmemChannelAttr(Operation *op, int channelId,
-                               std::string attrName) {
-  SmallVector<int> asyncTaskIds;
-  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-      asyncTaskIds.push_back(asyncTaskId);
-    }
-  }
-  asyncTaskIds.push_back(channelId);
-  SmallVector<int> sortedAsyncTaskIds(asyncTaskIds.begin(), asyncTaskIds.end());
-  sort(sortedAsyncTaskIds);
-  auto i32Ty = IntegerType::get(op->getContext(), 32);
-  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
-  auto vecTy = VectorType::get(size, i32Ty);
-  op->setAttr(attrName,
-              DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
-}
-
-static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
-                           ttng::TCGen5MMAOp mmaOp,
-                           SmallVector<std::unique_ptr<Channel>> &channels) {
-  SmallVector<Operation *> consumers;
-  SmallVector<Operation *> producers;
-  // Go through ops in the body to figure out producer/consumer of the tmem.
-  // FIXME: assuming mmaOp is inside a ForOp.
-  DenseSet<Operation *> users;
-  DenseSet<Operation *> handledUsers;
-  for (auto user : tmemAllocOp.getResult().getUsers()) {
-    users.insert(user);
-  }
-  auto forOp = mmaOp->getParentOfType<scf::ForOp>();
-  Operation *currentProd = nullptr;
-  auto ctx = forOp.getContext();
-  SmallVector<int> channelsToBeUpdate;
-  for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (!users.count(&op))
-      continue;
-    handledUsers.insert(&op);
-    if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(&op)) {
-      if (&op == mmaOp.getOperation()) {
-        // This uses and defines D. Will be both producer and consumer.
-        assert(currentProd != nullptr);
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
-        auto consumerIds = getAsyncTaskIds(&op);
-        assert(producerTaskIds.size() == 1);
-        auto producerTaskId = producerTaskIds.front();
-        auto channelID = channels.size();
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
-        currentProd = &op;
-      } else {
-        assert(mmaOpT.getD() != tmemAllocOp.getResult());
-        // This uses tmem. mark as tmem.end = channel_id
-        assert(currentProd != nullptr);
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
-        assert(producerTaskIds.size() == 1);
-        auto producerTaskId = producerTaskIds.front();
-        auto channelID = channels.size();
-        auto consumerIds = getAsyncTaskIds(&op);
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
-      }
-    } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(&op)) {
-      currentProd = &op; // mark as tmem.start = channel_id
-    } else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(&op)) {
-      if (currentProd) {
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
-        assert(producerTaskIds.size() == 1);
-        auto producerTaskId = producerTaskIds.front();
-        auto channelID = channels.size();
-        auto consumerIds = getAsyncTaskIds(&op);
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
-      } else {
-        channelsToBeUpdate.push_back(channels.size());
-        auto channelID = channels.size();
-        auto consumerIds = getAsyncTaskIds(&op);
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
-            channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(&op, channelID, "tmem.end");
-      }
-    } else {
-      assert(0);
-    }
-  }
-  // Update channel's producer here.
-  for (auto idx : channelsToBeUpdate) {
-    assert(currentProd); // assuming ForOp runs at least one iteration.
-    channels[idx]->relation.first = getAsyncTaskIds(currentProd).front();
-    setTmemChannelAttr(currentProd, channels[idx]->uniqID, "tmem.start");
-  }
-  // For consumers outside of ForOp.
-  for (auto *user : users) {
-    if (handledUsers.count(user))
-      continue;
-    // only handle tmem_load. FIXME: check if it is after the ForOp
-    if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(user)) {
-      assert(currentProd);
-      // Start a channel from currentProd to user
-      auto producerTaskIds = getAsyncTaskIds(currentProd);
-      assert(producerTaskIds.size() == 1);
-      auto producerTaskId = producerTaskIds.front();
-      auto channelID = channels.size();
-      auto consumerIds = getAsyncTaskIds(user);
-      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-          producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-          true /*isOperandD*/, channels.size()));
-      // Mark producer and consumer.
-      setTmemChannelAttr(currentProd, channelID, "tmem.start");
-      setTmemChannelAttr(user, channelID, "tmem.end");
-    }
-  }
-}
-
-static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
-                              SmallVector<std::unique_ptr<Channel>> &channels) {
-  // source can be local_store, consumer can be gen5, ttg.memdesc_trans,
-  // local_load Can be produced by tmem_store or gen5, consumed by tmem_load or
-  // gen5
-  Operation *producerOp = nullptr;
-  SmallVector<Operation *> consumers;
-  SmallVector<Operation *> producers;
-  auto isConstTrue = [](Value v) {
-    if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
-      if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
-        return attr.getValue();
-      }
-    }
-    return false;
-  };
-  if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
-    bool isOperandD = false;
-    ttng::TCGen5MMAOp mmaOp;
-    // Go through users of the first result (i.e exclude token).
-    for (auto user : tmemAllocOp.getResult().getUsers()) {
-      if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        if (mmaOpT.getD() == allocOp->getResult(0)) {
-          if (isConstTrue(mmaOpT.useAccumulator())) {
-            mmaOp = mmaOpT;
-            isOperandD = true;
-          } else
-            producers.push_back(user);
-        } else // other operands are consumers
-          consumers.push_back(user);
-      } else if (isa<ttng::TMEMStoreOp>(user)) {
-        producers.push_back(user);
-      } else if (isa<ttng::TMEMLoadOp>(user)) {
-        consumers.push_back(user);
-      } else
-        assert(0);
-    }
-    if (isOperandD) {
-      // Create a list of virtual channels for this case. Each virtual channel
-      // has a single producer.
-      handleOperandD(tmemAllocOp, mmaOp, channels);
-#if 0
-      SmallVector<int> consumers;
-      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-          -1, consumers, allocOp, isOperandD, channels.size()));
-#endif
-      return;
-    }
-
-    producerOp = producers[0];
-    if (producers.size() > 1) {
-      assert(consumers.size() == 1);
-      producerOp = nullptr;
-      for (auto *prod : producers) {
-        // Ignore the one that is not in the same block as consumer.
-        if (prod->getBlock() != consumers[0]->getBlock())
-          continue;
-        assert(producerOp == nullptr);
-        producerOp = prod;
-      }
-    }
-  } else {
-    assert(isa<ttg::LocalAllocOp>(allocOp));
-    for (auto user : allocOp->getUsers()) {
-      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        // Alloc associated with operand D can have multiple producers.
-        assert(mmaOp.getD() != allocOp->getResult(0));
-        consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp>(user)) {
-        assert(producerOp == nullptr);
-        producerOp = user;
-      } else
-        consumers.push_back(user);
-    }
-  }
-  auto producerTaskIds = getAsyncTaskIds(producerOp);
-  assert(producerTaskIds.size() == 1);
-  auto producerTaskId = producerTaskIds.front();
-  // Either a single consumer op with multiple taskIds, or multiple consumer ops
-  // with the same taskId.
-  auto consumerTaskIds = getAsyncTaskIds(consumers[0]);
-  if (consumerTaskIds.size() > 1)
-    assert(consumers.size() == 1);
-  if (consumers.size() > 1) {
-    for (unsigned i = 1; i < consumers.size(); ++i) {
-      auto tIds = getAsyncTaskIds(consumers[i]);
-    }
-  }
-  // Remove producer task id from consumerTaskIds.
-  auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
-                          producerTaskId);
-  consumerTaskIds.erase(iter, consumerTaskIds.end());
-
-  if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp))
-    channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-        producerTaskIds.front(), consumerTaskIds, allocOp, false,
-        channels.size()));
-  else
-    channels.push_back(std::make_unique<ChannelPost>(
-        producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
-}
-
-void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp) {
-  mlir::DominanceInfo dom(funcOp);
-  funcOp.walk([&](Operation *op) {
-    // FIXME: It is possible that a local_alloc can start a channel, when a
-    // gemm's operand is in smem and comes from local_alloc.
-    // All buffers have been allocated, a channel will be created based on
-    // the alloc.
-    if (dyn_cast<ttng::TMEMAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
-    } else if (dyn_cast<ttg::LocalAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
-    }
-  });
-}
-
-// When the consumer is a local_alloc loading from shared memory to registers,
-// look ahead for the actual consumers, usually dot ops, that can directly
-// use shared memory. The local_alloc will be removed later.
-static SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
-  // TransOp is not a real consumer. It caculates the shared memory
-  // address for the real consumer. Continue to find its transitive users
-  // recursively. Return all transitive users;
-  auto goThroughTrans = [&](Operation *user) -> DenseSet<Operation *> {
-    DenseSet<Operation *> users;
-    DenseSet<Operation *> visited;
-    SmallVector<Operation *> transUsers;
-    transUsers.push_back(user);
-    while (!transUsers.empty()) {
-      auto transUser = transUsers.pop_back_val();
-      visited.insert(transUser);
-      if (isa<tt::TransOp, ttg::MemDescTransOp>(transUser)) {
-        for (auto transitiveUser : transUser->getUsers()) {
-          if (!visited.count(transitiveUser))
-            transUsers.push_back(transitiveUser);
-        }
-      } else {
-        users.insert(transUser);
-      }
-    }
-    return users;
-  };
-  if (isa<ttg::MemDescTransOp>(consumerOp)) {
-    auto users = goThroughTrans(consumerOp);
-    return SmallVector<Operation *>(users.begin(), users.end());
-  }
-  if (isa<ttg::LocalAllocOp>(consumerOp)) {
-    DenseSet<Operation *> users;
-    for (auto user : consumerOp->getUsers()) {
-      if (isa<tt::TransOp, ttg::MemDescTransOp>(user)) {
-        auto transUsers = goThroughTrans(user);
-        for (auto *tUsr : transUsers)
-          users.insert(tUsr);
-      } else {
-        users.insert(user);
-      }
-    }
-
-    return SmallVector<Operation *>(users.begin(), users.end());
-  }
-  return {consumerOp};
 }
 
 static Operation *getUniqueActualConsumer(Operation *consumerOp) {
@@ -598,9 +302,6 @@ void groupChannels(
   }
 #endif
 
-  // Group channels by consumer op.
-  DenseMap<Operation *, SmallVector<Channel *>> consumerChannels;
-
   // Two channels can be combined if
   //   src1 and src2 are in the same block and
   //   (dst1 == dst2 or
@@ -629,29 +330,34 @@ void groupChannels(
       return false;
     return dst1User == dst2User && dst1User->getBlock() == dst1->getBlock();
   };
+
+  // Group channels by consumer if they can be merged.
+  SmallVector<SmallVector<Channel *>> consumerChannels;
+
   assert(channels.size() > 0 && "channel size is zero");
   // Compare with existing channels in the consumerChannels to see if
   // it can be combined.
   for (auto *c0 : channels) {
     bool merged = false;
-    for (auto &kv : consumerChannels) {
-      if (kv.second.size() > 0 && channelCanBeMerged(c0, kv.second.front())) {
-        kv.second.push_back(c0);
+    for (auto &c : consumerChannels) {
+      if (channelCanBeMerged(c0, c.front())) {
+        c.push_back(c0);
         merged = true;
         break;
       }
     }
     if (!merged) { // Create a new entry.
-      auto *keyOp = c0->getDstOp();
-      if (!consumerChannels.count(keyOp))
-        orderedChannels.push_back(c0);
-      consumerChannels[keyOp].push_back(c0);
+      orderedChannels.push_back(c0);
+      // TODO: Even if the channels fail the channelCanBeMerged check, there may
+      // be some benefit to tracking the channels that have the same consumer op
+      // so they can share the same arrive op.
+      consumerChannels.push_back({c0});
     }
   }
 
   // Reorder channels associated with one entry based on program order of the
   // producers.
-  for (auto &group : make_second_range(consumerChannels)) {
+  for (auto &group : consumerChannels) {
     auto &allOps = group.front()->getSrcOp()->getBlock()->getOperations();
     DenseMap<Operation *, size_t> opIdx;
     opIdx.reserve(allOps.size());
@@ -667,8 +373,11 @@ void groupChannels(
   for (auto &kv : producerChannels) {
     channelsGroupedByProducers[kv.second.front()] = kv.second;
   }
-  for (auto &kv : consumerChannels) {
-    channelsGroupedByConsumers[kv.second.front()] = kv.second;
+  for (auto &c : consumerChannels) {
+    auto *keyChannel = c.front();
+    auto [it, inserted] =
+        channelsGroupedByConsumers.try_emplace(keyChannel, std::move(c));
+    assert(inserted && "Channel in multiple groups");
   }
 
   LLVM_DEBUG({
@@ -1458,6 +1167,9 @@ DenseMap<Channel *, Value> createBuffer(
         buffer = hoistLocalAlloc(builder, oldAlloc);
       } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(srcOp)) {
         auto oldAlloc = mmaOp.getAccumulator().getDefiningOp();
+        buffer = hoistLocalAlloc(builder, oldAlloc);
+      } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(srcOp)) {
+        auto oldAlloc = storeOp.getDst().getDefiningOp();
         buffer = hoistLocalAlloc(builder, oldAlloc);
       }
     } else if (channel->channelKind == DataChannelKind::SMEM) {
@@ -2328,6 +2040,32 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
         mmaOp.getToken().replaceAllUsesWith(replTok);
     }
   });
+}
+
+void doBufferAllocation(triton::FuncOp &funcOp) {
+  // Step 1: collect all communications between producers and consumers.
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
+  SmallVector<Channel *> channels;
+  for (const auto &c : channelsOrigin) {
+    channels.push_back(c.get());
+  }
+  if (channels.empty()) {
+    return;
+  }
+
+  // Step 2: group channels
+  // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
+  // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
+  SmallVector<Channel *> orderedChannels;
+  groupChannels(channels, channelsGroupedByProducers,
+                channelsGroupedByConsumers, orderedChannels);
+
+  // Step 3: Create buffers. A buffer for each channel.
+  DenseMap<Channel *, Value> bufferMap =
+      createBuffer(channelsGroupedByProducers, channels, funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {

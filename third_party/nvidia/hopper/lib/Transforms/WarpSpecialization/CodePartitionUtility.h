@@ -59,6 +59,8 @@ public:
   virtual Operation *getSrcOp() { return getSrcOperand().getDefiningOp(); }
   virtual Operation *getAllocOp() { return nullptr; }
   virtual unsigned getNumBuffers() { return _numBuffers; }
+  virtual Operation *getDstOpLast() { return nullptr; }
+  virtual void getDstOps(SmallVector<Operation *> &dsts) {}
 
   Relation relation; // producer task Id, a list of consumer task Ids
   Operation *op;
@@ -91,8 +93,8 @@ public:
 
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
-  Operation *getDstOpLast();
-  void getDstOps(SmallVector<Operation *> &dsts);
+  virtual Operation *getDstOpLast();
+  virtual void getDstOps(SmallVector<Operation *> &dsts);
   virtual Operation *getAllocOp() { return allocOp; }
   virtual unsigned getNumBuffers();
 
@@ -153,14 +155,17 @@ struct TmemDataChannel : Channel {
 
 struct TmemDataChannelPost : Channel {
   bool isOperandD;
+  bool isOperandDNoAcc;
   Operation *allocOp;
 
   // Can be produced by tmem_store or operand D of gen5, consumed by tmem_load
   // or gen5
   TmemDataChannelPost(int producer, SmallVector<int> &consumers,
-                      Operation *allocOp, bool isOperandD, unsigned uniqID)
+                      Operation *allocOp, bool isOperandD, bool isOperandDNoAcc,
+                      unsigned uniqID)
       : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, uniqID),
-        isOperandD(isOperandD), allocOp(allocOp) {
+        isOperandD(isOperandD), isOperandDNoAcc(isOperandDNoAcc),
+        allocOp(allocOp) {
     channelKind = DataChannelKind::TMEMPost;
   }
 
@@ -168,6 +173,8 @@ struct TmemDataChannelPost : Channel {
   virtual Operation *getDstOp();
   virtual unsigned getNumBuffers();
   virtual Operation *getAllocOp() { return allocOp; }
+  virtual Operation *getDstOpLast();
+  virtual void getDstOps(SmallVector<Operation *> &dsts);
 };
 } // namespace nvidia_gpu
 } // namespace triton
@@ -243,7 +250,11 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
+void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
+                         triton::FuncOp &funcOp);
 
+Operation *getSameLevelOp(Operation *p, Operation *c);
+SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_

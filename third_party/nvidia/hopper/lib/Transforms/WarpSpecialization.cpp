@@ -16,7 +16,9 @@ namespace mlir {
 
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
+void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
+void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
@@ -109,6 +111,31 @@ public:
       }
       if (!success)
         signalPassFailure();
+    } else {
+      int retCode = doTaskIdPropagate(funcOp);
+      if (retCode == -1)
+        signalPassFailure();
+      if (dumpIntermediateSteps) {
+        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                        "doTaskIdPropagate\n"
+                     << moduleOp << "\n\n\n";
+      }
+    }
+
+    // Canonicalize the SMEM/TEM buffers.
+    // Create buffers for register channels.
+    doBufferAllocation(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n"
+          << moduleOp << "\n\n\n";
+    }
+
+    doMemoryPlanner(funcOp, numStages);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"
+          << moduleOp << "\n\n\n";
     }
 
     doCodePartitionPost(funcOp, numStages);

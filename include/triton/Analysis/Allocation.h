@@ -13,6 +13,7 @@ namespace mlir {
 
 namespace triton {
 class AllocationAnalysis;
+class MemoryPlanner;
 
 /// Callback to allow backends to specify target-specific scratch sizes for
 /// some operations.
@@ -208,6 +209,7 @@ private:
   size_t bufferIdCounter = 0;
 
   friend class triton::AllocationAnalysis;
+  friend class triton::MemoryPlanner;
 };
 
 /// Static analysis that computes the allocation of shared memory buffers
