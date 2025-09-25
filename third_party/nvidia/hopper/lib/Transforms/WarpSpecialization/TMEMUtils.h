@@ -5,9 +5,10 @@
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace ttg = mlir::triton::gpu;
-namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttng = mlir::triton::nvidia_gpu;
 namespace tt = mlir::triton;
 namespace mlir {
 // Generate code to reintepret a TMEM buffer operation by converting
