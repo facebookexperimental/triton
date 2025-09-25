@@ -197,7 +197,8 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
           if (output != argOutput) {
             return std::nullopt;
           }
-          argOutput = output.value();
+        } else {
+          output = argOutput.value();
         }
       } else {
         return std::nullopt;
