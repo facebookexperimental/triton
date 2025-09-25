@@ -166,6 +166,24 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
   producer->removeAttr("tmem.start");
 }
 
+ttg::MemDescReinterpretOp
+sliceAndReinterpretTMEMBuffer2(OpBuilderWithAsyncTaskIds &builder,
+                               Operation *allocOp, int offset, size_t blockN) {
+  auto allocResult = allocOp->getResult(0);
+  auto allocType = cast<ttg::MemDescType>(allocResult.getType());
+  auto shape = allocType.getShape();
+  auto oldBlockN = shape[1];
+  assert(oldBlockN >= blockN && "Invalid blockN size");
+  assert(oldBlockN % blockN == 0 && "Invalid blockN divisibility");
+  assert((offset + blockN) <= oldBlockN && "Invalid offset");
+  auto tmemDesc =
+      createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
+  auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
+      allocOp->getLoc(), allocResult, offset, blockN);
+  return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(), tmemDesc,
+                                                   subSlice);
+}
+
 ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
                                                         Operation *allocOp,
                                                         int offset,
