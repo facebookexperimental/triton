@@ -274,7 +274,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                     mBarriers=[qk_fulls[qk_bufIdx]],
                 )
 
-
                 # -- compute p1 @ v from the previous iteration----
                 cid = 1
                 qk_bufIdx_1 += cid * NUM_BUFFERS_QK
@@ -304,7 +303,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                     mBarriers=[qk_fulls[qk_bufIdx], kv_empties[k_bufIdx]],
                 )
 
-
                 # -- compute p0 @ v ----
                 cid = 0
                 # wait for the V buffer to be populated by the producer
@@ -321,7 +319,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                     use_acc=True,
                     mBarriers=[acc_empties[qk_bufIdx]],
                 )
-
 
             # -- compute p1 @ v ----
             cid = 1
@@ -363,7 +360,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
 
             # load q1
-            for cid in tl.range(1, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS-1):
+            for cid in tl.range(1, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS - 1):
                 tlx.barrier_expect_bytes(q_fulls[cid], 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
                 qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                 tlx.async_descriptor_load(desc_q, q_tiles[cid], [qo_offset_y_split, 0], q_fulls[cid])
