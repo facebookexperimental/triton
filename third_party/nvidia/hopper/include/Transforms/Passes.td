@@ -129,4 +129,12 @@ def NVGPUTest1DTMEMAlloc : Pass<"nvgpu-test-1D-tmem-alloc", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir::ModuleOp"> {
+  let summary = "test buffer allocation";
+
+  let description = "This pass creates buffers for each async task channel.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES

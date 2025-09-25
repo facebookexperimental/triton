@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "TMEMUtils.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -921,11 +922,16 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
     llvm_unreachable("Unexpected alloc type");
   }
 
+  // If the alloc is already hoisted, return the buffer.
+  if (isa<triton::FuncOp>(oldAlloc->getParentOp())) {
+    return oldAlloc->getResult(0);
+  }
+
   auto allocDescType = cast<triton::gpu::MemDescType>(oldAllocType);
   SmallVector<int64_t> shape(allocDescType.getShape());
   Type memdescType = ttg::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
-      allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
+      allocDescType.getMemorySpace(), /*mutableMemory*/ true);
   Operation *newAlloc;
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     newAlloc =
@@ -951,18 +957,19 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
           oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
       storeOp->moveBefore(oldAlloc);
     }
+    mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     if (tmemAlloc.getSrc() != nullptr) {
       auto pred =
           builder.create<arith::ConstantIntOp>(oldAlloc->getLoc(), 1, 1);
       auto storeOp = builder.create<ttng::TMEMStoreOp>(
-          oldAlloc->getLoc(), tmemAlloc.getSrc(), newBuf, pred);
+          oldAlloc->getLoc(), newBuf, tmemAlloc.getSrc(), pred);
       pred->moveBefore(oldAlloc);
       storeOp->moveBefore(oldAlloc);
     }
+    oldAlloc->replaceAllUsesWith(newAlloc);
   }
 
-  oldAlloc->replaceAllUsesWith(newAlloc);
   oldAlloc->erase();
   return newBuf;
 }
@@ -993,26 +1000,17 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
 
   if (useTMEM) {
     builder.setAsyncTaskIdsFromOp(srcOp);
-    auto expandDimsOp = builder.createWithAsyncTaskIds<tt::ExpandDimsOp>(
-        srcOp->getLoc(), srcResult, 1);
-
-    tensorType = dyn_cast<RankedTensorType>(expandDimsOp.getResult().getType());
-    // Get shape, layout and type of a slice
-    auto shape = tensorType.getShape();
-
     // Get shape, layout and type of the complete buffer
+    auto shape = tensorType.getShape();
     SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
-    if (srcOp->getParentOfType<scf::ForOp>())
-      bufferShape.insert(bufferShape.begin(), channel->getNumBuffers());
-    else
-      bufferShape.insert(bufferShape.begin(), 1);
+    bufferShape.push_back(1);
     Attribute tensorMemorySpace = ttng::TensorMemorySpaceAttr::get(context);
-    auto blockM = shape[0];
+    auto blockM = bufferShape[0];
     auto elemType = tensorType.getElementType();
     unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
     bool unpacked = elemBitWidth != 16;
     auto encoding = ttng::TensorMemoryEncodingAttr::get(
-        context, blockM, shape[1],
+        context, blockM, bufferShape[1],
         /*unpacked=*/unpacked, /*CTASplitM=*/1, /*CTASplitN=*/1);
     Type memdescType =
         ttg::MemDescType::get(bufferShape, elemType, encoding,
@@ -1020,22 +1018,7 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     auto allocOp = builder.create<ttng::TMEMAllocOp>(
         srcOp->getLoc(), memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
-
-    // Generate the local store
-    auto trueVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        srcOp->getLoc(), 1, 1);
-    auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
-        srcOp->getLoc(), allocOp, srcResult, trueVal);
-    storeOp->moveAfter(srcOp);
-    trueVal->moveAfter(srcOp);
-
-    // local load
-    builder.setAsyncTaskIdsFromOp(dstOp);
-    auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
-        dstOp->getLoc(), srcResult.getType(),
-        builder.getType<ttg::AsyncTokenType>(), allocOp, Value());
-    loadOp->moveBefore(dstOp);
-    dstOp->replaceUsesOfWith(srcResult, loadOp);
+    TMEM1DAllocator(builder).replaceWith1DTMEM(srcOp, dstOp, allocOp);
   } else {
     builder.setAsyncTaskIdsFromOp(srcOp);
     bool requireMMASharedEncoding =
@@ -1062,21 +1045,18 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
 
     // Get shape, layout and type of the complete buffer
     SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
-    if (srcOp->getParentOfType<scf::ForOp>())
-      bufferShape.insert(bufferShape.begin(), channel->getNumBuffers());
-    else
-      bufferShape.insert(bufferShape.begin(), 1);
     Attribute sharedMemorySpace =
         triton::gpu::SharedMemorySpaceAttr::get(context);
     Type memdescType =
-        ttg::MemDescType::get(bufferShape, elemType, sharedLayout,
+        ttg::MemDescType::get(sliceShape, elemType, sharedLayout,
                               sharedMemorySpace, /*mutableMemory*/ true);
     auto allocOp =
         builder.create<ttg::LocalAllocOp>(srcOp->getLoc(), memdescType);
+    buffer = allocOp->getResult(0);
 
     // Generate the local store
     auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
-        srcOp->getLoc(), allocOp, srcResult);
+        srcOp->getLoc(), srcResult, allocOp);
     storeOp->moveAfter(srcOp);
 
     // local load
@@ -1128,23 +1108,25 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
 // the buffer array will contain numBuffers.
-DenseMap<Channel *, Value> createBuffer(
-    DenseMap<Channel *, SmallVector<Channel *>> &channelsGroupedByProducers,
-    const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp) {
+DenseMap<Channel *, Value>
+createBuffer(const SmallVector<Channel *> &orderedChannels,
+             triton::FuncOp funcOp) {
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+  DenseMap<Value, SmallVector<Channel *>> channelsGroupedByProducers;
 
+  // Group channels by source values
   for (auto *channelInOrder : orderedChannels) {
-    if (channelsGroupedByProducers.find(channelInOrder) ==
-        channelsGroupedByProducers.end())
-      continue;
-    auto &channels = channelsGroupedByProducers[channelInOrder];
     auto srcValue = channelInOrder->getSrcOperand();
-    auto srcOp = channelInOrder->getSrcOp();
-    auto dstOp = channelInOrder->getDstOp();
+    channelsGroupedByProducers[srcValue].push_back(channelInOrder);
+  }
+
+  for (auto &[srcValue, channels] : channelsGroupedByProducers) {
     auto *channel = channels.front();
+    auto srcOp = channel->getSrcOp();
+    auto dstOp = channel->getDstOp();
     unsigned numBuffers = channel->getNumBuffers();
     Value buffer;
 
@@ -1171,19 +1153,29 @@ DenseMap<Channel *, Value> createBuffer(
       } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(srcOp)) {
         auto oldAlloc = storeOp.getDst().getDefiningOp();
         buffer = hoistLocalAlloc(builder, oldAlloc);
-      }
+      } else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(dstOp)) {
+        auto oldAlloc = loadOp.getSrc().getDefiningOp();
+        buffer = hoistLocalAlloc(builder, oldAlloc);
+      } else
+        llvm_unreachable("Unexpected srcOp type");
     } else if (channel->channelKind == DataChannelKind::SMEM) {
       // Move LocalAlloc to the beginning of the function.
       if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
         buffer = hoistLocalAlloc(builder, oldAlloc);
-      }
+      } else
+        llvm_unreachable("Unexpected srcOp type");
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
-      buffer = createLocalAlloc(builder, channelInOrder,
-                                tensorType.getShape().size() == 1);
+      buffer =
+          createLocalAlloc(builder, channel, tensorType.getShape().size() == 1);
     } else {
       llvm_unreachable("Unexpected result type");
     }
+
+    LLVM_DEBUG({
+      LDBG("resulting buffer:");
+      DBGS() << buffer << "\n";
+    });
 
     // Channels in the group share the same buffer.
     for (auto c : channels)
@@ -2054,18 +2046,8 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
     return;
   }
 
-  // Step 2: group channels
-  // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
-  // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
-  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
-  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
-  SmallVector<Channel *> orderedChannels;
-  groupChannels(channels, channelsGroupedByProducers,
-                channelsGroupedByConsumers, orderedChannels);
-
-  // Step 3: Create buffers. A buffer for each channel.
-  DenseMap<Channel *, Value> bufferMap =
-      createBuffer(channelsGroupedByProducers, channels, funcOp);
+  // Step 2: Create buffers. A buffer for each channel.
+  createBuffer(channels, funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
@@ -2090,8 +2072,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
                 channelsGroupedByConsumers, orderedChannels);
 
   // Step 3: Create buffers. An array of buffers for each channel.
-  DenseMap<Channel *, Value> bufferMap =
-      createBuffer(channelsGroupedByProducers, channels, funcOp);
+  DenseMap<Channel *, Value> bufferMap = createBuffer(channels, funcOp);
   LLVM_DEBUG({
     LDBG("\n\nafter createBuffer");
     funcOp.dump();
@@ -2331,6 +2312,23 @@ public:
       getOperation()->dump();
     });
     return;
+  }
+};
+
+#define GEN_PASS_DEF_NVGPUTESTWSBUFFERALLOCATION
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestWSBufferAllocationPass
+    : public impl::NVGPUTestWSBufferAllocationBase<
+          NVGPUTestWSBufferAllocationPass> {
+public:
+  using impl::NVGPUTestWSBufferAllocationBase<
+      NVGPUTestWSBufferAllocationPass>::NVGPUTestWSBufferAllocationBase;
+
+  void runOnFuncOp(triton::FuncOp funcOp) { doBufferAllocation(funcOp); }
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
   }
 };
 
