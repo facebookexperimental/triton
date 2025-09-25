@@ -274,10 +274,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If the `scf.if` op itself is a latency op, skip it.
     if (opLatency.contains(ifOp))
       continue;
-    // Ensure this does not create scheduling conflicts by ensuring the
-    // forward slice of the `scf.if` does not contain ops that are already
-    // scheduled, as this will cause the `scf.if` to be scheduled after its
-    // dependents.
+    // Ensure this does not create scheduling conflicts by ensuring the forward
+    // slice of the `scf.if` does not contain ops that are already scheduled, as
+    // this will cause the `scf.if` to be scheduled after its dependents.
     SetVector<Operation *> slice;
     getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
@@ -316,9 +315,9 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
     };
 
-    // If there are no latency ops or all latency ops are in the same stage,
-    // we don't need to pipeline the loop. Return a new schedule with
-    // everything assigned to the same stage.
+    // If there are no latency ops or all latency ops are in the same stage, we
+    // don't need to pipeline the loop. Return a new schedule with everything
+    // assigned to the same stage.
     DenseSet<int> latencyStages;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
