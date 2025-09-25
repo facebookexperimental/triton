@@ -447,7 +447,7 @@ def gdpa_kernel_tma_ws_blackwell(
                         consumer_qk_view = tlx.local_view(producer_commit_qk0, bufIdx)
                         # tl.device_print("default producer_commit_qk0", accum_cnt)
                         # tl.device_print("default producer_commit_qk0_phase", phase)
-                        
+
                         tlx.barrier_wait(consumer_qk_view, phase)
 
                         # qk_view: BLOCK_M // 2, HEAD_DIM
