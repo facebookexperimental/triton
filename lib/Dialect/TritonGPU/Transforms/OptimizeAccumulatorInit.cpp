@@ -168,6 +168,43 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
       return std::make_pair(ifOp, resultIndex);
     }
   }
+  if (auto multOp = dyn_cast<arith::MulFOp>(defOp)) {
+    auto output1 = findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
+    if (output1.has_value()) {
+      return output1;
+    }
+    return findZeroInitOp(defOp->getOperand(1), forOp, loopArgIsZero);
+  }
+  // Handle values that just propagate the value without changing
+  // data when its all zeros.
+  auto firstOperandDataPreserving = [](Operation *op) {
+    return isa<ConvertLayoutOp, ReshapeOp, TransOp, BroadcastOp, ExpandDimsOp,
+               SplitOp>(op);
+  };
+  // Values that require all operands to be 0.
+  auto allOperandDataPreserving = [](Operation *op) { return isa<JoinOp>(op); };
+  if (firstOperandDataPreserving(defOp)) {
+    return findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
+  }
+  if (allOperandDataPreserving(defOp)) {
+    std::optional<std::pair<Operation *, int>> output = std::nullopt;
+    for (auto &op : defOp->getOpOperands()) {
+      auto argOutput = findZeroInitOp(op.get(), forOp, loopArgIsZero);
+      if (argOutput.has_value()) {
+        if (output.has_value()) {
+          // We only support a single initialization right now.
+          // TODO: Relax this constraint.
+          if (output != argOutput) {
+            return std::nullopt;
+          }
+          argOutput = output.value();
+        }
+      } else {
+        return std::nullopt;
+      }
+    }
+    return output;
+  }
   return std::nullopt;
 }
 
