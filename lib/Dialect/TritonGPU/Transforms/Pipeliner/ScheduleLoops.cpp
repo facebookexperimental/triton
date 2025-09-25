@@ -46,9 +46,8 @@ bool isSafeToPipeline(scf::ForOp forOp) {
 // Process an inner loop inside a warp-specialized loop. This validates
 // the preconditions for finding the inner most loop.
 void preprocesssWarpSpecializedInnerLoop(scf::ForOp &forOp, Builder &builder) {
-  if (isOuterLoop(forOp)) {
-
-  } else {
+  // Only update the innermost loop.
+  if (!isOuterLoop(forOp)) {
     // Check that this is a loop that already ran loop scheduling once.
     // If so apply the same attribute to the inner loop.
     if (forOp->hasAttr(kScheduledMaxStageAttrName)) {
@@ -69,14 +68,10 @@ void preprocesssWarpSpecializedOuterLoop(scf::ForOp &forOp, Builder &builder) {
   // future we should make this more robust by using a separate attribute
   // to verify that the loop is already warp-specialized.
   bool hasWarpSpecializeAttr = forOp->hasAttr(kWarpSpecializeAttrName);
-  for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (auto innerForOp = dyn_cast<scf::ForOp>(op)) {
-      if (hasWarpSpecializeAttr) {
-        preprocesssWarpSpecializedInnerLoop(innerForOp, builder);
-      } else {
-        preprocesssWarpSpecializedOuterLoop(innerForOp, builder);
-      }
-    }
+  if (hasWarpSpecializeAttr) {
+    forOp.walk([&](scf::ForOp innerLoop) {
+      preprocesssWarpSpecializedInnerLoop(innerLoop, builder);
+    });
   }
 }
 
@@ -454,7 +449,7 @@ void scheduleLoops(ModuleOp moduleOp) {
 struct ScheduleLoops : public impl::TritonGPUScheduleLoopsBase<ScheduleLoops> {
   using TritonGPUScheduleLoopsBase::TritonGPUScheduleLoopsBase;
 
-  void runOnOperation() override { ttg::scheduleLoops(getOperation()); }
+  void runOnOperation() override { scheduleLoops(getOperation()); }
 };
 
 } // namespace mlir::triton::gpu
