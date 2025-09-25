@@ -62,8 +62,8 @@ private:
     return _allocOp;
   }
 
-  RankedTensorType getResultTensorType(Operation *op, size_t expectedSize) {
-    auto outputType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  RankedTensorType getResultTensorType(Value result, size_t expectedSize) {
+    auto outputType = dyn_cast<RankedTensorType>(result.getType());
     if (!outputType || outputType.getShape().size() != 2) {
       assert("Invalid tensor input");
     }
@@ -72,14 +72,14 @@ private:
 
   ttng::TMEMAllocOp alloc1DTMEMBuffer();
 
-  void TMEMStore1D(Operation *producer, Operation *allocOpBuffer);
+  void TMEMStore1D(OpResult producer, Operation *allocOpBuffer);
 
-  void TMEMLoad1D(Operation *producer, Operation *consumer);
+  void TMEMLoad1D(OpResult producer, Operation *consumer);
 
 public:
-  void replaceWith1DTMEM(Operation *producer, Operation *consumer,
+  void replaceWith1DTMEM(OpResult producer, Operation *consumer,
                          Operation *allocOpBuffer = nullptr) {
-    this->numWarps = ttg::lookupNumWarps(producer);
+    this->numWarps = ttg::lookupNumWarps(producer.getDefiningOp());
     assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
     TMEMStore1D(producer, allocOpBuffer);
     TMEMLoad1D(producer, consumer);

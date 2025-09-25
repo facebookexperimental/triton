@@ -16,7 +16,7 @@ namespace mlir {
 
 ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   auto expandedInput = getExpandedInput();
-  auto oldRetType = getResultTensorType(expandedInput, 2);
+  auto oldRetType = getResultTensorType(expandedInput->getResult(0), 2);
   auto shape = oldRetType.getShape();
   auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
   auto allocCall = builder.create<ttng::TMEMAllocOp>(
@@ -25,13 +25,13 @@ ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   return allocCall;
 }
 
-void TMEM1DAllocator::TMEMStore1D(Operation *producer,
-                                  Operation *allocOpBuffer) {
+void TMEM1DAllocator::TMEMStore1D(OpResult producer, Operation *allocOpBuffer) {
   // Expand from 1D -> 2D
+  auto producerOp = producer.getDefiningOp();
   auto oldRetType = getResultTensorType(producer, 1);
-  builder.setInsertionPointAfter(producer);
+  builder.setInsertionPointAfter(producerOp);
   auto encoding = oldRetType.getEncoding();
-  Value expandDimsInput = producer->getResult(0);
+  Value expandDimsInput = producer;
   unsigned axis = 1;
   auto context = builder.getContext();
   // Handle blocked encoding which isn't a slice attribute.
@@ -62,9 +62,9 @@ void TMEM1DAllocator::TMEMStore1D(Operation *producer,
     expandDimsInput = builder.create<ttg::ConvertLayoutOp>(
         expandDimsInput.getLoc(), sliceType, expandDimsInput);
   }
-  auto expandDims = builder.create<tt::ExpandDimsOp>(producer->getLoc(),
+  auto expandDims = builder.create<tt::ExpandDimsOp>(producerOp->getLoc(),
                                                      expandDimsInput, axis);
-  copyAttrs(producer, expandDims);
+  copyAttrs(producerOp, expandDims);
   setExpandedInput(expandDims);
   Operation *allocOp;
   if (allocOpBuffer) {
@@ -92,19 +92,19 @@ void TMEM1DAllocator::TMEMStore1D(Operation *producer,
     auto newTy = ty.cloneWithEncoding(newLayout);
     src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
                                                expandDims);
-    copyAttrs(producer, src);
+    copyAttrs(producerOp, src);
   }
   // Generate the store
   Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
   auto storeOp = builder.create<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
-  copyAttrs(producer, storeOp);
+  copyAttrs(producerOp, storeOp);
 }
 
-void TMEM1DAllocator::TMEMLoad1D(Operation *producer, Operation *consumer) {
+void TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto allocOp = getAllocOp();
-  auto producerOutput = producer->getResult(0);
-  auto oldInputType = dyn_cast<RankedTensorType>(producerOutput.getType());
+  auto producerOp = producer.getDefiningOp();
+  auto oldInputType = dyn_cast<RankedTensorType>(producer.getType());
   auto targetEncoding = oldInputType.getEncoding();
   auto oldExpandType = getExpandedInput().getType();
   Attribute newDistributedEncoding = ttng::getTmemCompatibleLayout(
@@ -126,7 +126,7 @@ void TMEM1DAllocator::TMEMLoad1D(Operation *producer, Operation *consumer) {
                                                        oldInputType, reshape);
   copyAttrs(consumer, newInput);
   // Replace the uses in the consumer
-  consumer->replaceUsesOfWith(producerOutput, newInput);
+  consumer->replaceUsesOfWith(producer, newInput);
 }
 
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
@@ -158,8 +158,8 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
         mlir::cast<mlir::IntegerAttr>(consumer->getAttr("ttg.partition"))
             .getInt();
     if (producerPartition != consumerParition) {
-      TMEM1DAllocator(builder).replaceWith1DTMEM(producer, consumer,
-                                                 allocOpBuffer);
+      TMEM1DAllocator(builder).replaceWith1DTMEM(producer->getOpResult(0),
+                                                 consumer, allocOpBuffer);
     }
   }
   // Delete tmem.start

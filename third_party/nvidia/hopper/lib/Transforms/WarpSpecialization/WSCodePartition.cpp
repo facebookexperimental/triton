@@ -1018,7 +1018,8 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     auto allocOp = builder.create<ttng::TMEMAllocOp>(
         srcOp->getLoc(), memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
-    TMEM1DAllocator(builder).replaceWith1DTMEM(srcOp, dstOp, allocOp);
+    TMEM1DAllocator(builder).replaceWith1DTMEM(
+        dyn_cast<mlir::OpResult>(srcResult), dstOp, allocOp);
   } else {
     builder.setAsyncTaskIdsFromOp(srcOp);
     bool requireMMASharedEncoding =
