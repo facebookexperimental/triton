@@ -43,6 +43,51 @@ bool isSafeToPipeline(scf::ForOp forOp) {
   return true;
 }
 
+// Process an inner loop inside a warp-specialized loop. This validates
+// the preconditions for finding the inner most loop.
+void preprocesssWarpSpecializedInnerLoop(scf::ForOp &forOp, Builder &builder) {
+  // Only update the innermost loop.
+  if (!isOuterLoop(forOp)) {
+    // Check that this is a loop that already ran loop scheduling once.
+    // If so apply the same attribute to the inner loop.
+    if (forOp->hasAttr(kScheduledMaxStageAttrName)) {
+      forOp->setAttr(kWarpSpecializeAttrName, builder.getUnitAttr());
+    }
+  }
+}
+
+// Process the given function to propagate the warp-specialize attribute
+// from the outer loop to the inner loops. This is done to enable the loop
+// scheduler to run on the inner loops after we have finished warp
+// specialization.
+void preprocesssWarpSpecializedOuterLoop(scf::ForOp &forOp, Builder &builder) {
+  if (!isOuterLoop(forOp))
+    return;
+  // We reuse the same attribute because nothing in the compiler depends on
+  // it after loop scheduling as warp specialization is already done. In the
+  // future we should make this more robust by using a separate attribute
+  // to verify that the loop is already warp-specialized.
+  bool hasWarpSpecializeAttr = forOp->hasAttr(kWarpSpecializeAttrName);
+  if (hasWarpSpecializeAttr) {
+    forOp.walk([&](scf::ForOp innerLoop) {
+      preprocesssWarpSpecializedInnerLoop(innerLoop, builder);
+    });
+  }
+}
+
+void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder) {
+  // Process the given function to propagate the warp-specialize attribute
+  // from the outer loop to the inner loops. This is done to enable the loop
+  // scheduler to run on the inner loops after we have finished warp
+  // specialization.
+  //
+  // To avoid issues with the first invocation, we only propagate the
+  // attribute when the inner loop already has the max stage count.
+  moduleOp.walk([&](scf::ForOp forOp) {
+    preprocesssWarpSpecializedOuterLoop(forOp, builder);
+  });
+}
+
 // Find dependencies with distance of 1. They will go to the next stage,
 // but in the cluster before the current op.
 void scheduleDistanceOneDependencies(scf::ForOp forOp,
@@ -380,6 +425,7 @@ void scheduleLoop(scf::ForOp forOp,
   // Write the schedule to the IR
   schedule.serialize(forOp);
 }
+} // namespace
 
 /// Schedule the loops based on the latencies assigned to the operations.
 void scheduleLoops(ModuleOp moduleOp) {
@@ -392,9 +438,6 @@ void scheduleLoops(ModuleOp moduleOp) {
     scheduleLoop(forOp, opLatency);
   }
 }
-
-} // namespace
-
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
