@@ -1688,7 +1688,7 @@ def profile_tlx_gdpa(config):
         # all warps
         mode = proton.mode.Default(metric_type="cycle", optimizations="clock32,time_shift")
     proton.start("gdpa", data="trace", backend="instrumentation", mode=mode)
-    print(fn()[-1][3][0])
+    print(fn())
     proton.finalize()
 
 
