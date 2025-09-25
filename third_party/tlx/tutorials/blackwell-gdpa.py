@@ -90,8 +90,8 @@ def get_cuda_autotune_config():
             for bqk in [1]  # in tmem
             for bo in [1]  # in tmem
             for SUBTILE in [True]  # doesn't support False
-            for pp in [False]
-            for ar in [232]
+            for pp in [True, False]
+            for ar in [192, 232]
         ]
 
 
