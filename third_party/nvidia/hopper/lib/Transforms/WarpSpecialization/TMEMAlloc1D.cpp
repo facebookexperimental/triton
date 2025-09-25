@@ -14,76 +14,6 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
-// Wrapper class to hold the context for handling
-//
-
-void TMEM1DAllocator::replaceWith1DTMEM(Operation *producer,
-                                        Operation *consumer,
-                                        Operation *allocOpBuffer) {
-  this->numWarps = ttg::lookupNumWarps(producer);
-  assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
-  TMEMStore1D(producer, allocOpBuffer);
-  TMEMLoad1D(producer, consumer);
-}
-
-ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
-  auto expandedInput = getExpandedInput();
-  auto oldRetType = getResultTensorType(expandedInput, 2);
-  auto shape = oldRetType.getShape();
-  auto tmemDesc = createTMEMDesc(builder, oldRetType, shape[0], shape[1]);
-  auto allocCall = builder.create<ttng::TMEMAllocOp>(
-      expandedInput->getLoc(), tmemDesc, builder.getType<ttg::AsyncTokenType>(),
-      /*src=*/Value());
-  return allocCall;
-}
-
-void TMEM1DAllocator::TMEMStore1D(Operation *producer,
-                                  Operation *allocOpBuffer) {
-  // Expand from 1D -> 2D
-  auto oldRetType = getResultTensorType(producer, 1);
-  builder.setInsertionPointAfter(producer);
-  // TODO(njriasan): This only works because
-  // producer->getResult(0) already has a ttg.slice attribute.
-  // We will need to update this to work more generally.
-  auto expandDims = builder.create<tt::ExpandDimsOp>(producer->getLoc(),
-                                                     producer->getResult(0), 1);
-  copyAttrs(producer, expandDims);
-  setExpandedInput(expandDims);
-  Operation *allocOp;
-  if (allocOpBuffer) {
-    allocOp = allocOpBuffer;
-  } else {
-    allocOp = alloc1DTMEMBuffer();
-  }
-  setAllocOp(allocOp);
-
-  // Verify that these layouts are compatible.
-  auto tmemDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
-  assert(tmemDesc && "Expected MemDescType");
-  auto expandType = expandDims.getType();
-  bool layoutTmemCompatible =
-      ttng::isDistributedLayoutTMemCompatible(expandDims, expandType, tmemDesc);
-  auto oldLayout = expandDims.getType().getEncoding();
-  auto newLayout = oldLayout;
-  if (!layoutTmemCompatible) {
-    newLayout = ttng::getTmemCompatibleLayout(
-        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
-  }
-  mlir::Operation *src = expandDims;
-  if (newLayout != oldLayout) {
-    auto ty = cast<RankedTensorType>(expandType);
-    auto newTy = ty.cloneWithEncoding(newLayout);
-    src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
-                                               expandDims);
-    copyAttrs(producer, src);
-  }
-  // Generate the store
-  Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-  auto storeOp = builder.create<ttng::TMEMStoreOp>(
-      src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
-  copyAttrs(producer, storeOp);
-}
-
 ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   auto expandedInput = getExpandedInput();
   auto oldRetType = getResultTensorType(expandedInput, 2);
@@ -198,7 +128,6 @@ void TMEM1DAllocator::TMEMLoad1D(Operation *producer, Operation *consumer) {
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producerOutput, newInput);
 }
-};
 
 void generate1DAllocations(OpBuilder &builder, Operation *producer,
                            llvm::SmallVector<Operation *> &allocOps) {
