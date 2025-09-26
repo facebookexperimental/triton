@@ -2370,7 +2370,17 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
       ReuseGroup group;
-      group.channels = kv.second;
+      // make sure the channel without buffer.offset is the first one (i.e the
+      // representative channel)
+      std::vector<Channel *> ordered(kv.second);
+      std::stable_partition(ordered.begin(), ordered.end(), [](Channel *ch) {
+        auto bufferOffset =
+            ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
+        if (bufferOffset)
+          return false;
+        return true;
+      });
+      group.channels = ordered;
       LDBG("ReuseGroup with size " << kv.second.size() << " buffer.id "
                                    << kv.first << "\n");
       config.groups.push_back(group);
