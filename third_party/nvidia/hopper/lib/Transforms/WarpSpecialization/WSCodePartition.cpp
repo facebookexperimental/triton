@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "TMEMUtils.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -1516,22 +1517,39 @@ void replaceBufferReuse(triton::FuncOp funcOp,
       if (channel->channelKind == DataChannelKind::SMEMPost) {
         assert(channel->getAllocOp()->getResult(0).getType() ==
                repCh->getAllocOp()->getResult(0).getType());
+        SmallVector<Operation *> users;
         for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
+          users.push_back(user);
+        }
+        for (auto *user : users) {
           user->replaceUsesOfWith(channel->getAllocOp()->getResult(0),
                                   repCh->getAllocOp()->getResult(0));
         }
+        channel->getAllocOp()->erase();
         continue;
       }
       // Remove alloc for the channel, create reinterpret from the
       // representative buffer.
+      SmallVector<Operation *> users;
       for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
+        users.push_back(user);
+      }
+      for (auto *user : users) {
         OpBuilderWithAsyncTaskIds builder(user->getContext());
         builder.setInsertionPoint(user);
         builder.setAsyncTaskIdsFromOp(user);
         auto reinter = sliceAndReinterpretTMEMBuffer2(
             builder, repCh->getAllocOp(), channel->getAllocOp(), user,
             0 /*offset*/);
+        LLVM_DEBUG({
+          LDBG("replace users for channel user ");
+          user->dump();
+        });
         user->replaceUsesOfWith(channel->getAllocOp()->getResult(0), reinter);
+        LLVM_DEBUG({
+          LDBG("replace users for channel user after replacing ");
+          user->dump();
+        });
       }
       channel->getAllocOp()->erase();
     }
