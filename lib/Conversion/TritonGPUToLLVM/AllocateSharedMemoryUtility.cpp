@@ -1,6 +1,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include <cstdlib>
 #include <string>
 
@@ -70,14 +71,10 @@ void addAllocationAnnotations(Operation *op) {
   size_t totalElements = totalSize / elemSize;
 
   // Add annotations
-  op->setAttr("shared_memory.access_offset",
+  op->setAttr("shared_memory.offset",
               IntegerAttr::get(IntegerType::get(ctx, 64), offset));
-  op->setAttr("shared_memory.access_size_bytes",
+  op->setAttr("shared_memory.size_bytes",
               IntegerAttr::get(IntegerType::get(ctx, 64), totalSize));
-  op->setAttr("shared_memory.access_element_count",
-              IntegerAttr::get(IntegerType::get(ctx, 64), totalElements));
-  op->setAttr("shared_memory.access_element_size_bytes",
-              IntegerAttr::get(IntegerType::get(ctx, 32), elemSize));
 }
 
 // Function to add shared memory access annotations to all operations that use
@@ -85,8 +82,8 @@ void addAllocationAnnotations(Operation *op) {
 void addSharedMemoryAnnotations(ModuleOp mod) {
   // Check if MLIR_ENABLE_DUMP env is set to 1
   static bool dumpEnabled = []() {
-    if (const char *env = std::getenv("MLIR_ENABLE_DUMP")) {
-      return std::string(env) == "1";
+    if (triton::tools::getBoolEnv("MLIR_ENABLE_DUMP")) {
+      return true;
     }
     return false;
   }();
