@@ -101,7 +101,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, Operation *allocOpBuffer) {
   copyAttrs(producerOp, storeOp);
 }
 
-void TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
+Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto allocOp = getAllocOp();
   auto producerOp = producer.getDefiningOp();
   auto oldInputType = dyn_cast<RankedTensorType>(producer.getType());
@@ -127,6 +127,7 @@ void TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   copyAttrs(consumer, newInput);
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
+  return newInput.getResult();
 }
 
 void generate1DAllocations(OpBuilder &builder, Operation *producer,

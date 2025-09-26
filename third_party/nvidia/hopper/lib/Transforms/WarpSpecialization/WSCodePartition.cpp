@@ -974,8 +974,9 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
   return newBuf;
 }
 
-static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
-                              Channel *channel, bool useTMEM) {
+static std::pair<Value, Value>
+createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
+                 bool useTMEM) {
   auto srcResult = channel->getSrcOperand();
   auto srcOp = channel->getSrcOp();
   auto dstOp = channel->getDstOp();
@@ -997,6 +998,7 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
   });
 
   Value buffer;
+  Value newProducer;
 
   if (useTMEM) {
     builder.setAsyncTaskIdsFromOp(srcOp);
@@ -1018,7 +1020,7 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     auto allocOp = builder.create<ttng::TMEMAllocOp>(
         srcOp->getLoc(), memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
-    TMEM1DAllocator(builder).replaceWith1DTMEM(
+    newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
         dyn_cast<mlir::OpResult>(srcResult), dstOp, allocOp);
   } else {
     builder.setAsyncTaskIdsFromOp(srcOp);
@@ -1065,10 +1067,11 @@ static Value createLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
         srcOp->getLoc(), srcResult.getType(), allocOp, Value());
     loadOp->moveBefore(dstOp);
-    dstOp->replaceUsesOfWith(srcResult, loadOp);
+    dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
+    newProducer = loadOp->getResult(0);
   }
 
-  return buffer;
+  return {buffer, newProducer};
 }
 
 static ttg::LocalAllocOp hoistLocalAllocPost(OpBuilder &builder,
@@ -1124,8 +1127,35 @@ createBuffer(const SmallVector<Channel *> &orderedChannels,
     channelsGroupedByProducers[srcValue].push_back(channelInOrder);
   }
 
+  mlir::DominanceInfo dom(funcOp);
+
   for (auto &[srcValue, channels] : channelsGroupedByProducers) {
+    // Find a common place for all users of the producer, which would be the
+    // common dominator.
+    std::unordered_set<Channel *> mutuallyNonDominatingUsers;
+    for (auto user : channels) {
+      auto it = mutuallyNonDominatingUsers.begin();
+      while (it != mutuallyNonDominatingUsers.end()) {
+        if (dom.properlyDominates(user->getDstOp(), (*it)->getDstOp())) {
+          it = mutuallyNonDominatingUsers.erase(it);
+        } else if (dom.properlyDominates((*it)->getDstOp(), user->getDstOp())) {
+          break;
+        } else {
+          ++it;
+        }
+      }
+      if (it == mutuallyNonDominatingUsers.end())
+        mutuallyNonDominatingUsers.insert(user);
+    }
+
     auto *channel = channels.front();
+    if (mutuallyNonDominatingUsers.size() == 1) {
+      // Find the common parent of this user and c
+      channel = *mutuallyNonDominatingUsers.begin();
+    } else {
+      assert(false && "Non-dominating consumers unsupported");
+    }
+
     auto srcOp = channel->getSrcOp();
     auto dstOp = channel->getDstOp();
     unsigned numBuffers = channel->getNumBuffers();
@@ -1142,6 +1172,8 @@ createBuffer(const SmallVector<Channel *> &orderedChannels,
     });
 
     builder.setInsertionPointToStart(&(funcOp.getBody().front()));
+
+    Value newProducer;
 
     // For TMEM channel, multi-buffer TMEM alloc
     if (channel->channelKind == DataChannelKind::TMEM) {
@@ -1167,8 +1199,10 @@ createBuffer(const SmallVector<Channel *> &orderedChannels,
         llvm_unreachable("Unexpected srcOp type");
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
-      buffer =
+      auto res =
           createLocalAlloc(builder, channel, tensorType.getShape().size() == 1);
+      buffer = res.first;
+      newProducer = res.second;
     } else {
       llvm_unreachable("Unexpected result type");
     }
@@ -1179,8 +1213,18 @@ createBuffer(const SmallVector<Channel *> &orderedChannels,
     });
 
     // Channels in the group share the same buffer.
-    for (auto c : channels)
+    for (auto c : channels) {
       bufferMap[c] = buffer;
+    }
+
+    // Replace all rest consumers with the loadOp
+    if (newProducer) {
+      for (auto c : channels) {
+        auto dstOp = c->getDstOp();
+        dstOp->replaceUsesOfWith(dstOp->getOperand(c->getDstOperandIdx()),
+                                 newProducer);
+      }
+    }
   }
   return bufferMap;
 }
