@@ -65,12 +65,6 @@ void addAllocationAnnotations(Operation *op) {
 
   auto offset = offsetAttr.getInt();
   size_t totalSize = computeAllocationSize(memdescTy);
-  auto elemTy = memdescTy.getElementType();
-  auto shape = memdescTy.getShape();
-  size_t elemSize = elemTy.getIntOrFloatBitWidth() / 8;
-  size_t totalElements = totalSize / elemSize;
-
-  // Add annotations
   op->setAttr("shared_memory.offset",
               IntegerAttr::get(IntegerType::get(ctx, 64), offset));
   op->setAttr("shared_memory.size_bytes",
