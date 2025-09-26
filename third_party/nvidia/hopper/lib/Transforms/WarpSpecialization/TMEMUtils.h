@@ -16,7 +16,8 @@ namespace mlir {
 // the N dimension to the given value that must be less the current size.
 ttg::MemDescReinterpretOp
 sliceAndReinterpretTMEMBuffer2(OpBuilderWithAsyncTaskIds &builder,
-                               Operation *allocOp, int offset, size_t blockN);
+                               Operation *allocOp, Operation *newAlloc,
+                               Operation *user, int offset);
 ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
                                                         Operation *allocOp,
                                                         int offset,

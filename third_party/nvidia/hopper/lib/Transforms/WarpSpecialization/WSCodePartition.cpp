@@ -1,5 +1,4 @@
 #include "CodePartitionUtility.h"
-#include "TMEMUtils.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -1523,10 +1522,6 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         }
         continue;
       }
-      auto allocResult = channel->getAllocOp()->getResult(0);
-      auto allocType = cast<ttg::MemDescType>(allocResult.getType());
-      auto shape = allocType.getShape();
-      auto newBlockN = shape[1];
       // Remove alloc for the channel, create reinterpret from the
       // representative buffer.
       for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
@@ -1534,9 +1529,11 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         builder.setInsertionPoint(user);
         builder.setAsyncTaskIdsFromOp(user);
         auto reinter = sliceAndReinterpretTMEMBuffer2(
-            builder, repCh->getAllocOp(), 0 /*offset*/, newBlockN);
+            builder, repCh->getAllocOp(), channel->getAllocOp(), user,
+            0 /*offset*/);
         user->replaceUsesOfWith(channel->getAllocOp()->getResult(0), reinter);
       }
+      channel->getAllocOp()->erase();
     }
   }
 }
