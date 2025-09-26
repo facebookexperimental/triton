@@ -114,7 +114,6 @@ public:
       if (!success)
         signalPassFailure();
     } else {
-#if 0
       int retCode = doTaskIdPropagate(funcOp);
       if (retCode == -1)
         signalPassFailure();
@@ -123,10 +122,8 @@ public:
                         "doTaskIdPropagate\n"
                      << moduleOp << "\n\n\n";
       }
-#endif
     }
 
-#if 0
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
@@ -135,7 +132,6 @@ public:
           << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n"
           << moduleOp << "\n\n\n";
     }
-#endif
 
     doMemoryPlanner(funcOp, numStages);
     if (dumpIntermediateSteps) {
