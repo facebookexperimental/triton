@@ -167,9 +167,9 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
 }
 
 ttg::MemDescReinterpretOp
-sliceAndReinterpretTMEMBuffer2(OpBuilderWithAsyncTaskIds &builder,
-                               Operation *allocOp, Operation *newAlloc,
-                               Operation *user, int offset) {
+sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+                          Operation *allocOp, Operation *newAlloc,
+                          Operation *user, int offset) {
   // user is the index into newAlloc.
   // create a new index based on allocOp to reduce from 1xMxN to MxN.
   // then subslice + interpret

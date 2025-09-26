@@ -15,9 +15,9 @@ namespace mlir {
 // Generate code to reintepret a TMEM buffer operation by converting
 // the N dimension to the given value that must be less the current size.
 ttg::MemDescReinterpretOp
-sliceAndReinterpretTMEMBuffer2(OpBuilderWithAsyncTaskIds &builder,
-                               Operation *allocOp, Operation *newAlloc,
-                               Operation *user, int offset);
+sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+                          Operation *allocOp, Operation *newAlloc,
+                          Operation *user, int offset);
 ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
                                                         Operation *allocOp,
                                                         int offset,
