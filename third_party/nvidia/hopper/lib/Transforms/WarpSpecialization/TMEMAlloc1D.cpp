@@ -166,6 +166,55 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
   producer->removeAttr("tmem.start");
 }
 
+ttg::MemDescReinterpretOp
+sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+                          Operation *allocOp, Operation *newAlloc,
+                          Operation *user, int offset) {
+  // user is the index into newAlloc.
+  // create a new index based on allocOp to reduce from 1xMxN to MxN.
+  // then subslice + interpret
+  // or subslice on 3D, then interpret then index
+  auto index = cast<ttg::MemDescIndexOp>(user);
+  auto allocResult = allocOp->getResult(0);
+  auto allocType = cast<ttg::MemDescType>(allocResult.getType());
+  auto shape = allocType.getShape();
+  // We can have 3D shapes: 1x64x128, shape[0] will be "1".
+  // This assumes a 2D shape, maybe we should start with the index and
+  // reinterpet the index.
+  auto oldBlockN = shape[shape.size() - 1];
+
+  auto newResult = newAlloc->getResult(0);
+  auto newType = cast<ttg::MemDescType>(newResult.getType());
+  auto newShape = newType.getShape();
+  auto blockN = newShape[shape.size() - 1];
+
+  assert(oldBlockN >= blockN && "Invalid blockN size");
+  assert(oldBlockN % blockN == 0 && "Invalid blockN divisibility");
+  assert((offset + blockN) <= oldBlockN && "Invalid offset");
+  // We convert from allocOp's type to another allocOp's type.
+  // When the data type is different, we need to construct another TMEMDesc. For
+  // example from 128x128xf32 to 128x128xbf16, we subslice to 128x64xf32, then
+  // reinterpret to 128x64xbf16.
+  auto tmemDesc = createTMEMDesc(builder, newType, newShape[shape.size() - 2],
+                                 newShape[shape.size() - 1]);
+  // slice from oldBlockN to blockN
+  auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
+  auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
+  if (oldElemTyWidth == elemTyWidth * 2) {
+    auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
+        allocOp->getLoc(), allocResult, offset, blockN / 2);
+    return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
+                                                     tmemDesc, subSlice);
+  } else if (elemTyWidth == oldElemTyWidth) {
+    auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
+        allocOp->getLoc(), allocResult, offset, blockN);
+    return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
+                                                     tmemDesc, subSlice);
+  } else {
+    assert(false);
+  }
+}
+
 ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
                                                         Operation *allocOp,
                                                         int offset,
@@ -192,6 +241,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   Attribute memSpace;
   Attribute encoding;
   auto context = builder.getContext();
+  unsigned highShape = 0;
   if (auto tensorType = dyn_cast<RankedTensorType>(inputType)) {
     elemBitWidth = tensorType.getElementTypeBitWidth();
     elemType = tensorType.getElementType();
@@ -202,6 +252,8 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
     elemType = allocType.getElementType();
     memSpace = allocType.getMemorySpace();
     encoding = allocType.getEncoding();
+    if (allocType.getShape().size() == 3)
+      highShape = allocType.getShape()[0];
   } else {
     assert(false && "Expected RankedTensorType or ttg::MemDescType");
   }
@@ -228,6 +280,12 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
       context, blockM, blockN,
       /*unpacked=*/unpacked, CTASplitM, CTASplitN);
+  if (highShape > 0) {
+    llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};
+    llvm::ArrayRef<int64_t> shape(shapeVec);
+    return ttg::MemDescType::get(shape, elemType, outputEncoding, memSpace,
+                                 /*mutableMemory=*/true);
+  }
   llvm::SmallVector<int64_t> shapeVec{blockM, blockN};
   llvm::ArrayRef<int64_t> shape(shapeVec);
   return ttg::MemDescType::get(shape, elemType, outputEncoding, memSpace,

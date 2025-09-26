@@ -1,6 +1,7 @@
 #ifndef NV_DIALECT_HOPPER_TRANSFORMS_TMEMUTILS_H_
 #define NV_DIALECT_HOPPER_TRANSFORMS_TMEMUTILS_H_
 
+#include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
@@ -13,6 +14,10 @@ namespace tt = mlir::triton;
 namespace mlir {
 // Generate code to reintepret a TMEM buffer operation by converting
 // the N dimension to the given value that must be less the current size.
+ttg::MemDescReinterpretOp
+sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+                          Operation *allocOp, Operation *newAlloc,
+                          Operation *user, int offset);
 ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
                                                         Operation *allocOp,
                                                         int offset,
