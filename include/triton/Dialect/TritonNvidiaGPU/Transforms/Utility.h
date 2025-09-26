@@ -10,7 +10,8 @@ namespace mlir::triton::nvidia_gpu {
 LogicalResult verifyBarrierType(Operation *op,
                                 mlir::triton::gpu::MemDescType barrierType);
 int allocateTMemWithInterval(
-    DenseMap<Operation *, Interval<int>> &allocToIntervals);
+    DenseMap<Operation *, Interval<int>> &allocToIntervals,
+    SmallVector<Operation *> &allocOrder);
 
 } // namespace mlir::triton::nvidia_gpu
 

@@ -426,14 +426,19 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       return iter1->second.numRows > iter2->second.numRows;
     assert(false);
   });
-  // If liveness overlaps, we can't reuse the buffer. Heuristics:
-  // - no reuse if isOperandD is true or isOperandDNoAcc is true
-  // Add buffers that can't have reuse first, extend live ranges.
-  // Sort alloc according to allocSize, handle allocs according to size. Add
-  // reuse as needed to fit into TMem.
+  // Heuristics: one copy for each alloc
+  // If liveness overlaps, we can't reuse the buffer.
+  // Heuristics:
+  // - no reuse if isOperandD is true
+  // - allocate space for channels where isOperandDNoAcc or isOperandD is true
+  // - extend live ranges for these channels in bufferSet
+  // Sort allocs according to allocSize, try to allocate space according to
+  // the sorted allocs, for each candidate alloc, decide if reuse is needed to
+  // fit into TMEM.
   DenseMap<Operation *, Interval<int>> bufferSet;
   Operation *candidateAlloc = nullptr;
   DenseMap<Operation *, unsigned> allocToOffsets;
+  SmallVector<Operation *> allocOrder;
   for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
     ttng::TMEMAllocOp alloc = *it;
     if (allocToChannel[alloc.getOperation()]->isOperandD ||
@@ -446,7 +451,8 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       alloc->setAttr(
           "buffer.copy",
           IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
-      allocToOffsets[alloc] = 0;
+      allocToOffsets[alloc.getOperation()] = 0;
+      allocOrder.push_back(alloc.getOperation());
       bufferId++;
     } else if (!candidateAlloc) {
       candidateAlloc = alloc.getOperation();
@@ -475,7 +481,7 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
     auto stageAttr = op->getAttrOfType<IntegerAttr>("buffer.id");
     return stageAttr.getInt();
   };
-  int totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
+  int totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
   LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
   if (totalMemorySize > 512)
     return;
@@ -487,7 +493,8 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       candidateAlloc->dump();
     });
     bufferSet[candidateAlloc] = Interval(0, (int)operationId.size());
-    totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
+    allocOrder.push_back(candidateAlloc);
+    totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
     LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
     if (totalMemorySize <= 512) {
       candidateAlloc->setAttr(
@@ -507,15 +514,22 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
         LDBG("try to reuse space with:");
         reuseAlloc->dump();
       });
-      // update intervals for representative channel and this channel
+      // update intervals for representative channel and this channel so they
+      // will not overlap
       auto origIntv = bufferSet[reuseAlloc];
       bufferSet[reuseAlloc] = Interval(origIntv.start(), origIntv.end() - 2);
-      origIntv = bufferSet[candidateAlloc];
       bufferSet[candidateAlloc] = Interval(origIntv.end() - 2, origIntv.end());
-      totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
+      totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
       LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
-      if (totalMemorySize > 512)
+
+      if (totalMemorySize > 512) {
+        for (auto *op_t : allocOrder) {
+          LLVM_DEBUG(op_t->dump());
+          LLVM_DEBUG(llvm::dbgs() << bufferSet[op_t].start() << " "
+                                  << bufferSet[op_t].end() << "\n");
+        }
         assert(false && "can't find space");
+      }
       candidateAlloc->setAttr(
           "buffer.id",
           IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
