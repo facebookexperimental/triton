@@ -79,15 +79,16 @@ private:
 
   void TMEMStore1D(OpResult producer, Operation *allocOpBuffer);
 
-  void TMEMLoad1D(OpResult producer, Operation *consumer);
+  // Returns the new loaded value as the new producer.
+  Value TMEMLoad1D(OpResult producer, Operation *consumer);
 
 public:
-  void replaceWith1DTMEM(OpResult producer, Operation *consumer,
-                         Operation *allocOpBuffer = nullptr) {
+  Value replaceWith1DTMEM(OpResult producer, Operation *consumer,
+                          Operation *allocOpBuffer = nullptr) {
     this->numWarps = ttg::lookupNumWarps(producer.getDefiningOp());
     assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
     TMEMStore1D(producer, allocOpBuffer);
-    TMEMLoad1D(producer, consumer);
+    return TMEMLoad1D(producer, consumer);
   }
 };
 
