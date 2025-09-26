@@ -180,20 +180,25 @@ Examples: how mbarriers are communicated in warp specialization
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
-[Pipelined GEMM on Hopper](third_party/tlx/tutorials/pipelined-gemm.py)
+[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-pipelined_test.py)
 
-[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/pipelined-gemm-blackwell-tma.py)
+[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-pipelined.py)
 
-[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/gemm-WS-hopper.py)
+[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-ws_test.py)
 
-[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/gemm-WS-blackwell.py)
+[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-ws.py)
 
 ### Attention kernels
-[Warp-specialized FA fwd on Hopper](third_party/tlx/tutorials/flash-attention-WS-hopper.py)
 
-[Warp-Specialized computation-pipelined FA fwd on Hopper](third_party/tlx/tutorials/flash-attention-WS-pipelined-hopper.py)
+[Warp-specialized FA fwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws_test.py)
 
-[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/flash-attention-WS-pipelined-pingpong-hopper.py)
+[Warp-specialized pipelined FA fwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws-pipelined_test.py)
+
+[Warp-specialized FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws_test.py)
+
+[Warp-Specialized computation-pipelined FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined_test.py)
+
+[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py)
 
 [Warp-Specialized computation-pipelined pingpong HSTU fwd on Hopper](https://github.com/meta-recsys/generative-recommenders/blob/bcb3aeea0f7b48faa9ea8d0d0337a055897618ec/generative_recommenders/ops/triton/triton_hstu_attention.py#L1262)
 
