@@ -23,12 +23,19 @@ from .utility import (
     async_task_replica_id,
     dtype_of,
 )
+from .dynamic_launch import (
+    alloc_clc_responses,
+    clc_issue,
+    clc_query,
+)
 
 from . import compiler
 
 __all__ = [
+    # async_tasks
     "async_tasks",
     "async_task",
+    # types
     "layout_encoding",
     "shared_layout_encoding",
     "swizzled_shared_layout_encoding",
@@ -40,6 +47,7 @@ __all__ = [
     "mbarrier",
     "mbarrier_type",
     "async_token",
+    # mem_ops
     "local_alloc",
     "local_view",
     "subslice",
@@ -54,16 +62,23 @@ __all__ = [
     "async_descriptor_store",
     "async_descriptor_store_wait",
     "fence_async_shared",
+    # barriers
     "alloc_barriers",
     "barrier_expect_bytes",
     "barrier_wait",
     "barrier_arrive",
     "named_barrier_wait",
     "named_barrier_arrive",
+    # mma_ops
     "async_dot",
     "async_dot_wait",
     "tcgen05_commit",
+    # utility
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    # dynamic launcher ops
+    "alloc_clc_responses",
+    "clc_issue",
+    "clc_query",
 ]

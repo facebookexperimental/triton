@@ -1589,3 +1589,66 @@ def test_async_dots_blackwell_tmem(device):
 
     ref_out = ((a @ b) * 0.5) @ c
     torch.testing.assert_close(d, ref_out)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("BLOCK_SIZE", [(256)])
+def test_cluster_launch_control(BLOCK_SIZE, device):
+
+    @triton.jit
+    def add2_clc(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # CTA ID of the first work load
+        ctaid = tl.program_id(axis=0)
+        block_start = ctaid * BLOCK_SIZE
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(z_ptr + offsets, output, mask=mask)
+
+        bars = tlx.alloc_barriers(num_barriers=1)
+        clc_mbar = bars[0]
+
+        responses = tlx.alloc_clc_responses(num_responses=1)
+        clc_response = tlx.local_view(responses, 0)
+
+        # CLC issue and wait
+        tlx.clc_issue(clc_response, clc_mbar)
+
+        # mbar completion and extract CTA ID
+        tlx.barrier_wait(clc_mbar, 1)
+
+        # CLC parse CTA ID from response
+        valid = 0
+        cta_id_x = -1
+        cta_id_y = -2
+        cta_id_z = -3
+        tlx.clc_query(clc_response, valid, cta_id_x, cta_id_y, cta_id_z)
+
+    torch.manual_seed(0)
+    # number of kernels to launch in a non-persistent mode
+    size = 100000
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = add2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
+
+    ptx = kernel.asm["ptx"]
+
+    assert re.search((r'clusterlaunchcontrol.try_cancel'), ptx, flags=re.DOTALL)
+    assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
+    assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
+
+    torch.testing.assert_close(output, x + y, check_dtype=False)
