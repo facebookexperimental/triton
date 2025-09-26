@@ -974,6 +974,8 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
   return newBuf;
 }
 
+// Create a local buffer for register channels. Return the allocated buffer and
+// the new producer (reloaded value).
 static std::pair<Value, Value>
 createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
                  bool useTMEM) {
