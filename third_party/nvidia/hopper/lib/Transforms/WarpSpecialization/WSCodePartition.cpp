@@ -564,9 +564,12 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   return barrierAlloc;
 }
 
-static int channelInReuseGroup(Channel *channel, ReuseConfig *config) {
+static int channelInReuseGroup(Channel *channel, ReuseConfig *config,
+                               bool reuseBarrier = true) {
   for (unsigned idx = 0; idx < config->getGroupSize(); idx++) {
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+    // Reuse the same barriers when numBuffers > 1.
+    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
+        reuseBarrier)
       continue;
     for (auto *ch : config->getGroup(idx)->channels) {
       if (channel == ch)
@@ -1491,6 +1494,68 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
 #endif
 }
 
+void replaceBufferReuse(triton::FuncOp funcOp,
+                        const DenseMap<Channel *, SmallVector<Channel *>>
+                            &channelsGroupedByConsumers,
+                        const SmallVector<Channel *> &orderedChannels,
+                        ReuseConfig *config) {
+  for (auto *key : orderedChannels) {
+    auto it = channelsGroupedByConsumers.find(key);
+    assert(it != channelsGroupedByConsumers.end());
+    Channel *channel = it->second.front();
+    // For each reuse group, choose a representative channel.
+    int reuseGrp = channelInReuseGroup(channel, config, false /*reuseBarrier*/);
+    if (reuseGrp < 0)
+      continue;
+    // The biggest type should be the representative.
+    auto *repCh = config->getGroup(reuseGrp)->channels[0];
+    if (channel != repCh && channel->getAllocOp() != repCh->getAllocOp()) {
+      LLVM_DEBUG({
+        LDBG("replace users for channel with alloc ");
+        channel->getAllocOp()->dump();
+      });
+      if (channel->channelKind == DataChannelKind::SMEMPost) {
+        assert(channel->getAllocOp()->getResult(0).getType() ==
+               repCh->getAllocOp()->getResult(0).getType());
+        SmallVector<Operation *> users;
+        for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
+          users.push_back(user);
+        }
+        for (auto *user : users) {
+          user->replaceUsesOfWith(channel->getAllocOp()->getResult(0),
+                                  repCh->getAllocOp()->getResult(0));
+        }
+        channel->getAllocOp()->erase();
+        continue;
+      }
+      // Remove alloc for the channel, create reinterpret from the
+      // representative buffer.
+      SmallVector<Operation *> users;
+      for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
+        users.push_back(user);
+      }
+      for (auto *user : users) {
+        OpBuilderWithAsyncTaskIds builder(user->getContext());
+        builder.setInsertionPoint(user);
+        builder.setAsyncTaskIdsFromOp(user);
+        auto reinter = sliceAndReinterpretMDTMEM(builder, repCh->getAllocOp(),
+                                                 channel->getAllocOp(), user,
+                                                 0 /*offset*/);
+        LLVM_DEBUG({
+          LDBG("replace users for channel user ");
+          user->dump();
+        });
+        user->replaceUsesOfWith(channel->getAllocOp()->getResult(0), reinter);
+        LLVM_DEBUG({
+          LDBG("replace users for channel user after replacing ");
+          user->dump();
+        });
+      }
+      channel->getAllocOp()->erase();
+    }
+  }
+}
+
 // Lower producers for channels. Here channels are grouped in
 // "channelsGroupedByConsumers". tokenMap tracks the set of tokens for each
 // channel.
@@ -2281,6 +2346,15 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nclean up tmem tokens");
     funcOp.dump();
   });
+
+  // Replace buffer reuses
+  replaceBufferReuse(funcOp, channelsGroupedByConsumers, orderedChannels,
+                     &config);
+  LLVM_DEBUG({
+    LDBG("\n\nreplace buffer reuse");
+    funcOp.dump();
+  });
+
   specializeRegion(funcOp, 0 /*requestedRegisters*/);
   LLVM_DEBUG({
     LDBG("\n\nwith specializeRegion");
