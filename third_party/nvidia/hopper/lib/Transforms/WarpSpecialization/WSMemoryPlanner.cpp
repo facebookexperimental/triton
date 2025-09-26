@@ -496,7 +496,10 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
     allocOrder.push_back(candidateAlloc);
     totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
     LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
-    if (totalMemorySize <= 512) {
+    // FIXME: there are some issues in allocateTMemWithInterval where
+    // it allocates overlapping address even though there is live range
+    // intersect.
+    if (false) { // totalMemorySize <= 512) {
       candidateAlloc->setAttr(
           "buffer.id",
           IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
@@ -522,14 +525,11 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
       LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
 
+#if 0
       if (totalMemorySize > 512) {
-        for (auto *op_t : allocOrder) {
-          LLVM_DEBUG(op_t->dump());
-          LLVM_DEBUG(llvm::dbgs() << bufferSet[op_t].start() << " "
-                                  << bufferSet[op_t].end() << "\n");
-        }
         assert(false && "can't find space");
       }
+#endif
       candidateAlloc->setAttr(
           "buffer.id",
           IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
@@ -540,6 +540,11 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
           IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
                            allocToOffsets[reuseAlloc] - iter2->second.numCols));
       LLVM_DEBUG(candidateAlloc->dump());
+    }
+    for (auto *op_t : allocOrder) {
+      LLVM_DEBUG(op_t->dump());
+      LLVM_DEBUG(llvm::dbgs() << bufferSet[op_t].start() << " "
+                              << bufferSet[op_t].end() << "\n");
     }
     // FIXME: heuristics
     candidateAlloc->setAttr(
