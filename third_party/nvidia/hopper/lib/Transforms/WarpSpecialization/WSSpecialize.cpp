@@ -248,7 +248,9 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            AsyncTaskId asyncTaskId) {
   // Create newForOp for each task Id.
   auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
-  if (asyncTaskId == 5) { // HACK
+  // This is for the epilogue partition.
+  const unsigned EpiloguePartition = 3;
+  if (asyncTaskId == EpiloguePartition) { // HACK tracked in T238592410
     auto parentForOp = forOp->getParentOfType<scf::ForOp>();
     if (!parentForOp) {
       usedArgs.pop_back();

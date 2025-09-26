@@ -418,10 +418,11 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
   unsigned argIdx = 0;
   assert(reuseGroupIdx >= 0 && reuseGroupIdx < config->getGroupSize());
   for (unsigned idx = 0; idx < reuseGroupIdx; ++idx) {
-    if (needAccumCntForReuse(regionOp, config->getGroup(reuseGroupIdx)))
+    if (needAccumCntForReuse(regionOp, config->getGroup(idx)))
       ++argIdx;
   }
-  return cnts + argIdx - 1;
+  assert(needAccumCntForReuse(regionOp, config->getGroup(reuseGroupIdx)));
+  return cnts + argIdx;
 }
 
 // Compute and return the buffer index and phase for a given accumulate count.
