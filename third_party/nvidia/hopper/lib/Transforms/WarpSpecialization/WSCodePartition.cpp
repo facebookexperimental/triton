@@ -2194,8 +2194,17 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
     return;
   }
 
-  // Step 2: Create buffers. A buffer for each channel.
-  createBuffer(channels, funcOp);
+  // Step 2: group channels
+  // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
+  // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
+  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
+  SmallVector<Channel *> orderedChannels;
+  groupChannels(channels, channelsGroupedByProducers,
+                channelsGroupedByConsumers, orderedChannels);
+
+  // Step 3: Create buffers. A buffer for each channel.
+  createBuffer(orderedChannels, funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
