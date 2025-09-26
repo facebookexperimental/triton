@@ -260,7 +260,6 @@ public:
     resolveLiveness();
     // Try to set buffer.copy, buffer.id, heuristics: for channels in innermost
     // loop, set to maxStage Make sure the configuration will fit in SMEM.
-    // FIXME: reuse for buffers in inner most loop, set copy to numBuffers.
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
     auto usedInnermostLoop = [&](Operation *alloc) -> bool {
@@ -278,7 +277,17 @@ public:
     };
     for (auto bufferIter : bufferRange) {
       Operation *owner = bufferIter.first->owner;
-      if (usedInnermostLoop(owner)) {
+      auto sAlloc = cast<ttg::LocalAllocOp>(owner);
+      auto aType = sAlloc.getType();
+      auto allocDescType = cast<triton::gpu::MemDescType>(aType);
+      // FIXME: reuse for buffers in inner most loop, set copy to numBuffers,
+      // when the shape is 2D.
+      unsigned numD = 0;
+      for (int shape : allocDescType.getShape()) {
+        if (shape > 1)
+          ++numD;
+      }
+      if (usedInnermostLoop(owner) && numD >= 2) {
         if (bufferIdInnermost < 0) {
           bufferIdInnermost = bufferId;
           ++bufferId;
