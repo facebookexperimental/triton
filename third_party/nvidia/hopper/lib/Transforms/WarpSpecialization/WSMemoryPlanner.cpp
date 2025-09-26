@@ -406,7 +406,12 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
 
     ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
         findChannelForAlloc(alloc, channels));
-    allocToIntervals[alloc.getOperation()] = liveInterval;
+    if (TheCh->isOperandD)
+      // Heuristics: do not reuse
+      allocToIntervals[alloc.getOperation()] =
+          Interval(0, (int)operationId.size());
+    else
+      allocToIntervals[alloc.getOperation()] = liveInterval;
     allocToSize.insert(
         {alloc.getOperation(),
          ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
@@ -428,6 +433,7 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
   // reuse as needed to fit into TMem.
   DenseMap<Operation *, Interval<int>> bufferSet;
   Operation *candidateAlloc = nullptr;
+  DenseMap<Operation *, unsigned> allocToOffsets;
   for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
     ttng::TMEMAllocOp alloc = *it;
     if (allocToChannel[alloc.getOperation()]->isOperandD ||
@@ -440,11 +446,35 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       alloc->setAttr(
           "buffer.copy",
           IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
+      allocToOffsets[alloc] = 0;
       bufferId++;
     } else if (!candidateAlloc) {
       candidateAlloc = alloc.getOperation();
     }
   }
+  auto findReuseChannel = [&](Operation *cand) -> Operation * {
+    // Go through allocs with buffer.id (i.e allocated), check intervals
+    // to find an allocated alloc without overlapping intervals and with enough
+    // space.
+    for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
+      Operation *alloc = (*it).getOperation();
+      if (allocToOffsets.count(alloc)) {
+        auto iter1 = allocToSize.find(cand);
+        auto iter2 = allocToSize.find(alloc);
+        if (!allocToIntervals[alloc].intersects(allocToIntervals[cand]) &&
+            iter2->second.numCols >=
+                iter1->second.numCols + allocToOffsets[alloc]) {
+          allocToOffsets[alloc] += iter1->second.numCols;
+          return alloc;
+        }
+      }
+    }
+    return nullptr;
+  };
+  auto getBufferId = [&](Operation *op) -> int {
+    auto stageAttr = op->getAttrOfType<IntegerAttr>("buffer.id");
+    return stageAttr.getInt();
+  };
   int totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
   LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
   if (totalMemorySize > 512)
@@ -452,26 +482,56 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
   while (bufferSet.size() != allocs.size()) {
     // Decide if we need to reuse buffer for candidateAlloc.
     // Choose an interval for candidateAlloc based on the decision.
-    LLVM_DEBUG(candidateAlloc->dump());
-    bool noReuse = true;
-    if (noReuse) {
-      bufferSet[candidateAlloc] = Interval(0, (int)operationId.size());
-      totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
-      LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
+    LLVM_DEBUG({
+      LDBG("try to allocate space for:");
+      candidateAlloc->dump();
+    });
+    bufferSet[candidateAlloc] = Interval(0, (int)operationId.size());
+    totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
+    LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
+    if (totalMemorySize <= 512) {
       candidateAlloc->setAttr(
           "buffer.id",
           IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
                            bufferId));
-      // FIXME: heuristics
-      candidateAlloc->setAttr(
-          "buffer.copy",
-          IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
-                           1));
+      allocToOffsets[candidateAlloc] = 0;
+      LLVM_DEBUG(candidateAlloc->dump());
+      ++bufferId;
     } else {
+      // need to reuse buffer, heuristics: do not reuse isOperandD channels
+      // if can't find a reuse buffer, bail out
+      auto *reuseAlloc = findReuseChannel(candidateAlloc);
+      if (!reuseAlloc)
+        assert(false && "can't find space");
+      LLVM_DEBUG({
+        LDBG("try to reuse space with:");
+        reuseAlloc->dump();
+      });
+      // update intervals for representative channel and this channel
+      auto origIntv = bufferSet[reuseAlloc];
+      bufferSet[reuseAlloc] = Interval(origIntv.start(), origIntv.end() - 2);
+      origIntv = bufferSet[candidateAlloc];
+      bufferSet[candidateAlloc] = Interval(origIntv.end() - 2, origIntv.end());
+      totalMemorySize = ttng::allocateTMemWithInterval(bufferSet);
+      LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
+      if (totalMemorySize > 512)
+        assert(false && "can't find space");
+      candidateAlloc->setAttr(
+          "buffer.id",
+          IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
+                           getBufferId(reuseAlloc)));
+      auto iter2 = allocToSize.find(candidateAlloc);
+      candidateAlloc->setAttr(
+          "buffer.offset",
+          IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
+                           allocToOffsets[reuseAlloc] - iter2->second.numCols));
+      LLVM_DEBUG(candidateAlloc->dump());
     }
-    if (totalMemorySize > 512)
-      return;
-    bufferId++;
+    // FIXME: heuristics
+    candidateAlloc->setAttr(
+        "buffer.copy",
+        IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
+                         1));
     // Find the next candidate.
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it)
       if (!bufferSet.count((*it).getOperation())) {
