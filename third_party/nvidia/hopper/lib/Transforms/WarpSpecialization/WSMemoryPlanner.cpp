@@ -458,10 +458,22 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       candidateAlloc = alloc.getOperation();
     }
   }
+  auto alongDependencyChain = [&](Operation *src, Operation *dst) -> bool {
+    // consumer of srcAlloc --> producer of dstAlloc
+    // consumer partition of srcAllc vs. producer partition of dstAlloc
+    auto *srcCh = allocToChannel[src];
+    auto *dstCh = allocToChannel[dst];
+    if (getAsyncTaskIds(dstCh->getSrcOp()) ==
+        getAsyncTaskIds(srcCh->getDstOp()))
+      return true;
+    return false;
+  };
   auto findReuseChannel = [&](Operation *cand) -> Operation * {
     // Go through allocs with buffer.id (i.e allocated), check intervals
     // to find an allocated alloc without overlapping intervals and with enough
     // space.
+    // FIXME: try to find a buffer with a dependency chain. For FA, we want
+    // p0/alpha0/l_i0/m_i0 to reuse.
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       Operation *alloc = (*it).getOperation();
       if (allocToOffsets.count(alloc)) {
@@ -469,7 +481,8 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
         auto iter2 = allocToSize.find(alloc);
         if (!allocToIntervals[alloc].intersects(allocToIntervals[cand]) &&
             iter2->second.numCols >=
-                iter1->second.numCols + allocToOffsets[alloc]) {
+                iter1->second.numCols + allocToOffsets[alloc] &&
+            alongDependencyChain(alloc, cand)) {
           allocToOffsets[alloc] += iter1->second.numCols;
           return alloc;
         }
