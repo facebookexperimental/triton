@@ -1029,6 +1029,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
         dyn_cast<mlir::OpResult>(srcResult), channel->relation.first, dstOp,
         allocOp);
+    buffer = allocOp->getResult(0);
   } else {
     auto originTaskIds = builder.getAsyncTaskIds();
     builder.setAsyncTaskIdsFromOp(srcOp);
@@ -1121,12 +1122,42 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
 // the buffer array will contain numBuffers.
-DenseMap<Channel *, Value>
-createBuffer(const SmallVector<Channel *> &orderedChannels,
-             triton::FuncOp funcOp) {
+DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
+                                        triton::FuncOp funcOp) {
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
+
+  // Sort channels by the positions of producer op.
+  llvm::DenseMap<Operation *, uint64_t> order;
+  uint64_t nextId = 0;
+  funcOp->walk<WalkOrder::PreOrder>(
+      [&](Operation *op) { order[op] = nextId++; });
+
+  SmallVector<Channel *> orderedChannels = channels;
+  // Reorder channels associated with one entry based on program order of the
+  // producers.
+  llvm::sort(orderedChannels, [&](Channel *a, Channel *b) {
+    auto resultA = dyn_cast<mlir::OpResult>(a->getSrcOperand());
+    auto resultB = dyn_cast<mlir::OpResult>(b->getSrcOperand());
+    auto srcOpA = resultA.getDefiningOp();
+    auto srcOpB = resultB.getDefiningOp();
+    if (srcOpA != srcOpB)
+      return order[srcOpA] < order[srcOpB]; // program order
+    return resultA.getResultNumber() <
+           resultB.getResultNumber(); // tie-break within same op
+  });
+
+  LLVM_DEBUG({
+    LDBG("\n\n");
+    LDBG(orderedChannels.size() << " ordered channels:");
+    for (unsigned i = 0; i < orderedChannels.size(); i++) {
+      const auto &channel = orderedChannels[i];
+      LDBG("ordered channel [" << i << "]  "
+                               << to_string(channel->channelKind));
+    }
+  });
+
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
   DenseMap<Value, SmallVector<Channel *>> channelsGroupedByProducers;
 
@@ -1137,7 +1168,6 @@ createBuffer(const SmallVector<Channel *> &orderedChannels,
   }
 
   mlir::DominanceInfo dom(funcOp);
-
   for (auto &[srcValue, channels] : channelsGroupedByProducers) {
     // Find a common place for all users of the producer, which would be the
     // common dominator.
@@ -2164,17 +2194,8 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
     return;
   }
 
-  // Step 2: group channels
-  // -  each entry of the channelsGroupedByProducers is keyed by the srcOp.
-  // -  each entry of the channelsGroupedByConsumers is keyed by the dstOp.
-  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
-  DenseMap<Channel *, SmallVector<Channel *>> channelsGroupedByConsumers;
-  SmallVector<Channel *> orderedChannels;
-  groupChannels(channels, channelsGroupedByProducers,
-                channelsGroupedByConsumers, orderedChannels);
-
-  // Step 3: Create buffers. A buffer for each channel.
-  createBuffer(orderedChannels, funcOp);
+  // Step 2: Create buffers. A buffer for each channel.
+  createBuffer(channels, funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
