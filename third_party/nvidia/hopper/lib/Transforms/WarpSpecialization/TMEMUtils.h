@@ -31,7 +31,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
 // 1D TMEM Allocation.
 class TMEM1DAllocator {
 private:
-  OpBuilder &builder;
+  OpBuilderWithAsyncTaskIds &builder;
   // Intermediate info to minimize code reuse across functions.
   int numWarps = -1;
   tt::ExpandDimsOp _expandedInput = nullptr;
@@ -43,7 +43,7 @@ private:
   Operation *_allocOp = nullptr;
 
 public:
-  TMEM1DAllocator(OpBuilder &builder) : builder(builder) {}
+  TMEM1DAllocator(OpBuilderWithAsyncTaskIds &builder) : builder(builder) {}
 
 private:
   void copyAttrs(Operation *oldOp, Operation *newOp) {
@@ -77,17 +77,19 @@ private:
 
   ttng::TMEMAllocOp alloc1DTMEMBuffer();
 
-  void TMEMStore1D(OpResult producer, Operation *allocOpBuffer);
+  void TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
+                   Operation *allocOpBuffer);
 
   // Returns the new loaded value as the new producer.
   Value TMEMLoad1D(OpResult producer, Operation *consumer);
 
 public:
-  Value replaceWith1DTMEM(OpResult producer, Operation *consumer,
+  Value replaceWith1DTMEM(OpResult producer, AsyncTaskId producerTaskId,
+                          Operation *consumer,
                           Operation *allocOpBuffer = nullptr) {
     this->numWarps = ttg::lookupNumWarps(producer.getDefiningOp());
     assert((numWarps == 4 || numWarps == 8) && "Only support 4 or 8 warps");
-    TMEMStore1D(producer, allocOpBuffer);
+    TMEMStore1D(producer, producerTaskId, allocOpBuffer);
     return TMEMLoad1D(producer, consumer);
   }
 };

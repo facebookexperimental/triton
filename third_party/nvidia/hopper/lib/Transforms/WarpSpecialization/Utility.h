@@ -51,16 +51,18 @@ public:
   }
 
   void setAsyncTaskIdsFromOp(Operation *op) {
-    setAsynTaskIdsFromArray(getAsyncTaskIds(op));
+    setAsynTaskIdsFromArray(mlir::getAsyncTaskIds(op));
   }
 
   void setAsyncTaskIdsFromValueUsers(Value value) {
     SetVector<AsyncTaskId> asyncTaskIdSet;
     for (Operation *user : value.getUsers())
-      for (AsyncTaskId asyncTaskId : getAsyncTaskIds(user))
+      for (AsyncTaskId asyncTaskId : mlir::getAsyncTaskIds(user))
         asyncTaskIdSet.insert(asyncTaskId);
     setAsynTaskIdsFromArray(asyncTaskIdSet.getArrayRef());
   }
+
+  SmallVector<AsyncTaskId> getAsyncTaskIds() { return asyncTaskIds; }
 
   template <typename OpTy, typename... Args>
   OpTy createWithAsyncTaskIds(Args &&...args) {
