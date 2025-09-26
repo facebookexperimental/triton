@@ -25,11 +25,14 @@ ttng::TMEMAllocOp TMEM1DAllocator::alloc1DTMEMBuffer() {
   return allocCall;
 }
 
-void TMEM1DAllocator::TMEMStore1D(OpResult producer, Operation *allocOpBuffer) {
+void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
+                                  Operation *allocOpBuffer) {
   // Expand from 1D -> 2D
   auto producerOp = producer.getDefiningOp();
   auto oldRetType = getResultTensorType(producer, 1);
   builder.setInsertionPointAfter(producerOp);
+  auto originTaskIds = builder.getAsyncTaskIds();
+  builder.setAsynTaskIdsFromArray(producerTaskId);
   auto encoding = oldRetType.getEncoding();
   Value expandDimsInput = producer;
   unsigned axis = 1;
@@ -59,12 +62,11 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, Operation *allocOpBuffer) {
     auto sliceEnc = ttg::SliceEncodingAttr::get(
         builder.getContext(), oldRetType.getRank(), blockedEnc);
     auto sliceType = oldRetType.cloneWithEncoding(sliceEnc);
-    expandDimsInput = builder.create<ttg::ConvertLayoutOp>(
+    expandDimsInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
         expandDimsInput.getLoc(), sliceType, expandDimsInput);
   }
-  auto expandDims = builder.create<tt::ExpandDimsOp>(producerOp->getLoc(),
-                                                     expandDimsInput, axis);
-  copyAttrs(producerOp, expandDims);
+  auto expandDims = builder.createWithAsyncTaskIds<tt::ExpandDimsOp>(
+      producerOp->getLoc(), expandDimsInput, axis);
   setExpandedInput(expandDims);
   Operation *allocOp;
   if (allocOpBuffer) {
@@ -90,15 +92,15 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, Operation *allocOpBuffer) {
   if (newLayout != oldLayout) {
     auto ty = cast<RankedTensorType>(expandType);
     auto newTy = ty.cloneWithEncoding(newLayout);
-    src = builder.create<ttg::ConvertLayoutOp>(expandDims.getLoc(), newTy,
-                                               expandDims);
-    copyAttrs(producerOp, src);
+    src = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
+        expandDims.getLoc(), newTy, expandDims);
   }
   // Generate the store
-  Value trueVal = builder.create<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-  auto storeOp = builder.create<ttng::TMEMStoreOp>(
+  Value trueVal =
+      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(src->getLoc(), 1, 1);
+  auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
-  copyAttrs(producerOp, storeOp);
+  builder.setAsynTaskIdsFromArray(originTaskIds);
 }
 
 Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
@@ -112,25 +114,26 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
       numWarps);
   auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
   // Generate the load
+  auto originTaskIds = builder.getAsyncTaskIds();
+  builder.setAsyncTaskIdsFromOp(consumer);
   builder.setInsertionPoint(consumer);
-  auto loadOp = builder.create<ttng::TMEMLoadOp>(
+  auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
       consumer->getLoc(), newExpandType, builder.getType<ttg::AsyncTokenType>(),
       allocOp->getResult(0), Value());
-  copyAttrs(consumer, loadOp);
   // Generate the reshape
-  auto reshape = builder.create<tt::ReshapeOp>(consumer->getLoc(),
-                                               oldInputType.getShape(), loadOp);
-  copyAttrs(consumer, reshape);
+  auto reshape = builder.createWithAsyncTaskIds<tt::ReshapeOp>(
+      consumer->getLoc(), oldInputType.getShape(), loadOp);
   // Generate a convert layout.
-  auto newInput = builder.create<ttg::ConvertLayoutOp>(consumer->getLoc(),
-                                                       oldInputType, reshape);
-  copyAttrs(consumer, newInput);
+  auto newInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
+      consumer->getLoc(), oldInputType, reshape);
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
+  builder.setAsynTaskIdsFromArray(originTaskIds);
   return newInput.getResult();
 }
 
-void generate1DAllocations(OpBuilder &builder, Operation *producer,
+void generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
+                           Operation *producer,
                            llvm::SmallVector<Operation *> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
   Operation *allocOpBuffer = nullptr;
@@ -151,15 +154,12 @@ void generate1DAllocations(OpBuilder &builder, Operation *producer,
       allocOpBuffer = allocOp;
     }
   }
-  auto producerPartition =
-      mlir::cast<mlir::IntegerAttr>(producer->getAttr("ttg.partition"))
-          .getInt();
+  auto producerPartition = getAsyncTaskIds(producer);
   for (auto consumer : producer->getUsers()) {
-    auto consumerParition =
-        mlir::cast<mlir::IntegerAttr>(consumer->getAttr("ttg.partition"))
-            .getInt();
+    auto consumerParition = getAsyncTaskIds(consumer);
     if (producerPartition != consumerParition) {
       TMEM1DAllocator(builder).replaceWith1DTMEM(producer->getOpResult(0),
+                                                 producerPartition.front(),
                                                  consumer, allocOpBuffer);
     }
   }
@@ -304,7 +304,7 @@ public:
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    OpBuilder builder(moduleOp.getContext());
+    OpBuilderWithAsyncTaskIds builder(moduleOp.getContext());
     llvm::SmallVector<Operation *> allocOps;
     moduleOp->walk([&](Operation *allocOp) {
       if (allocOp->hasAttr("tmem.start_buffer")) {

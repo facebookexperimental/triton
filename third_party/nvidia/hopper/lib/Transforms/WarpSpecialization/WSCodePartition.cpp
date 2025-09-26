@@ -913,7 +913,8 @@ void createTokenPost(
   });
 }
 
-static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
+static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
+                             Operation *oldAlloc) {
 
   Type oldAllocType;
 
@@ -953,26 +954,27 @@ static Value hoistLocalAlloc(OpBuilder &builder, Operation *oldAlloc) {
   }
 
   auto newBuf = newAlloc->getResult(0);
-
+  auto originTaskIds = builder.getAsyncTaskIds();
+  builder.setAsyncTaskIdsFromOp(oldAlloc);
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     if (localAlloc.getSrc() != nullptr) {
-      auto storeOp = builder.create<ttg::LocalStoreOp>(
+      auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
           oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
       storeOp->moveBefore(oldAlloc);
     }
     mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     if (tmemAlloc.getSrc() != nullptr) {
-      auto pred =
-          builder.create<arith::ConstantIntOp>(oldAlloc->getLoc(), 1, 1);
-      auto storeOp = builder.create<ttng::TMEMStoreOp>(
+      auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          oldAlloc->getLoc(), 1, 1);
+      auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
           oldAlloc->getLoc(), newBuf, tmemAlloc.getSrc(), pred);
       pred->moveBefore(oldAlloc);
       storeOp->moveBefore(oldAlloc);
     }
     oldAlloc->replaceAllUsesWith(newAlloc);
   }
-
+  builder.setAsynTaskIdsFromArray(originTaskIds);
   oldAlloc->erase();
   return newBuf;
 }
@@ -1006,7 +1008,6 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
   Value newProducer;
 
   if (useTMEM) {
-    builder.setAsyncTaskIdsFromOp(srcOp);
     // Get shape, layout and type of the complete buffer
     auto shape = tensorType.getShape();
     SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
@@ -1026,8 +1027,10 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         srcOp->getLoc(), memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
     newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
-        dyn_cast<mlir::OpResult>(srcResult), dstOp, allocOp);
+        dyn_cast<mlir::OpResult>(srcResult), channel->relation.first, dstOp,
+        allocOp);
   } else {
+    auto originTaskIds = builder.getAsyncTaskIds();
     builder.setAsyncTaskIdsFromOp(srcOp);
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [](Operation *op) {
@@ -1074,6 +1077,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     loadOp->moveBefore(dstOp);
     dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
     newProducer = loadOp->getResult(0);
+    builder.setAsynTaskIdsFromArray(originTaskIds);
   }
 
   return {buffer, newProducer};
@@ -1226,6 +1230,8 @@ createBuffer(const SmallVector<Channel *> &orderedChannels,
     if (newProducer) {
       for (auto c : channels) {
         auto dstOp = c->getDstOp();
+        assert(c->relation.second == channel->relation.second &&
+               "channels sharing the same producer must be in the same task");
         dstOp->replaceUsesOfWith(dstOp->getOperand(c->getDstOperandIdx()),
                                  newProducer);
       }
