@@ -60,7 +60,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
     return signalPassFailure();
 
   // Rename allocations to include partition information for better debugging
-  // Must be done AFTER serialize() but BEFORE PartitionLoops which removes
+  // Must be after serialize() but before PartitionLoops which removes
   // partition attributes
   renameAllocsToPartition(getOperation());
 
@@ -84,7 +84,4 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createTritonGPUScheduleLoops());
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();
-
-  // Rename allocations to include partition information for better debugging
-  renameAllocsToPartition(getOperation());
 }
