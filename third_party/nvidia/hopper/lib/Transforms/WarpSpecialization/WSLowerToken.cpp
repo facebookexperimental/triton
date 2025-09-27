@@ -50,11 +50,14 @@ Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
 
 void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
                               Value bufferEmpty) {
-  auto loc = op.getLoc();
+  auto namedLoc =
+      createBarrierNameLoc(builder, op, "producer_acquire", "empty");
+
   Value phase = getMBarrierPhaseBit(builder, op, true);
   auto i32Ty = builder.getIntegerType(32);
-  phase = builder.create<arith::ExtUIOp>(loc, i32Ty, phase);
-  auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferEmpty, phase);
+  phase = builder.create<arith::ExtUIOp>(namedLoc, i32Ty, phase);
+  auto waitOp =
+      builder.create<ttng::WaitBarrierOp>(namedLoc, bufferEmpty, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
 }
@@ -62,13 +65,15 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
 void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
                              Value bufferFull, ttnvws::TokenLoadType loadType,
                              unsigned fullCnt) {
-  auto loc = op.getLoc();
+  auto namedLoc = createBarrierNameLoc(builder, op, "producer_commit", "full");
+
   ttng::ArriveBarrierOp arriveOp;
 
   if (loadType == ttnvws::TokenLoadType::TMALoadOp) {
     // Get the count from the barriers: trace the local_alloc for the barrier
     // then find the count from init_barrier
-    arriveOp = builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, fullCnt);
+    arriveOp =
+        builder.create<ttng::ArriveBarrierOp>(namedLoc, bufferFull, fullCnt);
   } else {
     assert(false);
   }
@@ -79,11 +84,13 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
 
 void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
                            Value bufferFull) {
-  auto loc = op.getLoc();
+  auto namedLoc = createBarrierNameLoc(builder, op, "consumer_wait", "full");
+
   Value phase = getMBarrierPhaseBit(builder, op, false);
   auto i32Ty = builder.getIntegerType(32);
-  phase = builder.create<arith::ExtUIOp>(loc, i32Ty, phase);
-  auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferFull, phase);
+  phase = builder.create<arith::ExtUIOp>(namedLoc, i32Ty, phase);
+  auto waitOp =
+      builder.create<ttng::WaitBarrierOp>(namedLoc, bufferFull, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
 }
@@ -91,9 +98,11 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
                               Value bufferEmpty, int numCTAs,
                               unsigned emptyCnt) {
-  auto loc = op.getLoc();
+  auto namedLoc =
+      createBarrierNameLoc(builder, op, "consumer_release", "empty");
+
   auto arriveOp =
-      builder.create<ttng::ArriveBarrierOp>(loc, bufferEmpty, emptyCnt);
+      builder.create<ttng::ArriveBarrierOp>(namedLoc, bufferEmpty, emptyCnt);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
 }
@@ -142,12 +151,16 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
           loc, singleBarrierMemDescType, bufferFullArray, idx);
       // EmptyView is used for ConsumerRelease and ProducerAcquire.
       // FullView is for ConsumerWait and ProducerCommit.
-      builder.create<ttng::InitBarrierOp>(loc, barrierFullView,
+
+      auto fullLoc = createInitBarrierNameLoc(builder, loc, "full", i);
+      builder.create<ttng::InitBarrierOp>(fullLoc, barrierFullView,
                                           bufferFullCount);
 
       Value barrierEmptyView = builder.create<ttg::MemDescIndexOp>(
           loc, singleBarrierMemDescType, bufferEmptyArray, idx);
-      builder.create<ttng::InitBarrierOp>(loc, barrierEmptyView,
+
+      auto emptyLoc = createInitBarrierNameLoc(builder, loc, "empty", i);
+      builder.create<ttng::InitBarrierOp>(emptyLoc, barrierEmptyView,
                                           bufferEmptyCount);
     }
 

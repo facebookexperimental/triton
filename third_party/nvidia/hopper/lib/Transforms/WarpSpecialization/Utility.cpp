@@ -81,4 +81,68 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
 
 void removeAsyncTaskIds(Operation *op) { op->removeAttr("async_task_id"); }
 
+// Barrier naming utilities for creating descriptive NameLocs
+std::string getChannelNameFromProducerConsumers(int producerId,
+                                                ArrayRef<int> consumerIds) {
+  std::string name = "ch_prod" + std::to_string(producerId);
+  for (int consumerId : consumerIds) {
+    name += "_cons" + std::to_string(consumerId);
+  }
+  return name;
+}
+
+std::string getBarrierName(llvm::StringRef barrierType,
+                           llvm::StringRef bufferType,
+                           llvm::StringRef channelName) {
+  return (barrierType + "_" + bufferType + "_" + channelName).str();
+}
+
+std::string getInitBarrierName(llvm::StringRef bufferType, unsigned bufferIdx) {
+  return ("init_barrier_" + bufferType + "_buf" + std::to_string(bufferIdx))
+      .str();
+}
+
+// NameLoc creation utilities for barriers
+Location createBarrierNameLoc(OpBuilder &builder, Operation *op,
+                              llvm::StringRef barrierType,
+                              llvm::StringRef bufferType) {
+  auto loc = op->getLoc();
+
+  std::string channelName = "unknown";
+  if (auto attr = op->getAttrOfType<StringAttr>("channel_name")) {
+    channelName = attr.getValue().str();
+  }
+  std::string barrierName =
+      getBarrierName(barrierType, bufferType, channelName);
+  return mlir::NameLoc::get(builder.getStringAttr(barrierName), loc);
+}
+
+Location createInitBarrierNameLoc(OpBuilder &builder, Location baseLoc,
+                                  llvm::StringRef bufferType,
+                                  unsigned bufferIdx) {
+  std::string barrierName = getInitBarrierName(bufferType, bufferIdx);
+  return mlir::NameLoc::get(builder.getStringAttr(barrierName), baseLoc);
+}
+
+//===----------------------------------------------------------------------===//
+// Buffer naming utilities for creating descriptive NameLocs
+//===----------------------------------------------------------------------===//
+
+std::string getBufferName(llvm::StringRef bufferType,
+                          llvm::StringRef channelName, unsigned numBuffers) {
+  std::string name = bufferType.str() + "_" + channelName.str();
+
+  // Add number of buffers for pipelining
+  name += "_nbuf" + std::to_string(numBuffers);
+
+  return name;
+}
+
+Location createBufferNameLoc(OpBuilder &builder, Location baseLoc,
+                             llvm::StringRef bufferType,
+                             llvm::StringRef channelName, unsigned numBuffers) {
+  std::string bufferName = getBufferName(bufferType, channelName, numBuffers);
+  return mlir::NameLoc::get(builder.getStringAttr(bufferName), baseLoc);
+}
+
 } // namespace mlir
