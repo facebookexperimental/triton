@@ -36,6 +36,9 @@ struct AllocateSharedMemoryNv
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                  targetInfo));
     mlir::triton::gpu::attachAllocationSizeAndOffsetAttr(mod, allocation);
+
+    // Add shared memory annotations to operations that use shared memory
+    mlir::triton::gpu::addSharedMemoryAnnotations(mod);
   }
 };
 } // namespace
