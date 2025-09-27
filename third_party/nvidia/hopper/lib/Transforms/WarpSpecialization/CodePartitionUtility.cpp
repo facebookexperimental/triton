@@ -18,6 +18,10 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+std::string Channel::getChannelName() const {
+  return getChannelNameFromProducerConsumers(relation.first, relation.second);
+}
+
 // Check to see if op is enclosed under ifOp.
 bool enclosing(scf::IfOp ifOp, Operation *op) {
   return ifOp->isProperAncestor(op);
