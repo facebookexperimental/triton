@@ -9,6 +9,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -497,7 +498,20 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
   Type memdescType = ttg::MemDescType::get(bufferShape, ty.getElementType(),
                                            sharedEnc, sharedMemorySpace,
                                            /*mutableMemory=*/true);
-  Value alloc = builder.create<ttg::LocalAllocOp>(loc, memdescType);
+
+  // Calculate the size in bytes for the named location
+  size_t elemSizeBytes = ty.getElementTypeBitWidth() / 8;
+  size_t totalElements = 1;
+  for (auto dim : bufferShape) {
+    totalElements *= dim;
+  }
+  size_t totalSizeBytes = totalElements * elemSizeBytes;
+
+  // Create a meaningful location name for the allocation
+  auto namedLoc = createNamedAllocationLocation(
+      builder, loc, "pipelined", totalSizeBytes, "pipelining_utility");
+
+  Value alloc = builder.create<ttg::LocalAllocOp>(namedLoc, memdescType);
 
   builder.setInsertionPointAfter(insertBefore);
   builder.create<ttg::LocalDeallocOp>(insertBefore->getLoc(), alloc);
