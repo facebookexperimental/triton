@@ -1,4 +1,5 @@
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -159,7 +160,35 @@ void MembarOrFenceAnalysis::visitTerminator(
 
 void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
   OpBuilder::InsertionGuard g(*builder);
-  auto barrierOp = builder->create<gpu::BarrierOp>(op->getLoc());
+
+  // Create a meaningful name for this barrier based on the operation that
+  // triggered it
+  std::string purpose = "general";
+  if (isa<triton::gpu::AsyncWaitOp>(op)) {
+    purpose = "async_wait";
+  } else if (isa<triton::nvidia_gpu::TMAStoreWaitOp>(op)) {
+    purpose = "tma_store_wait";
+  } else if (isa<triton::gpu::ConvertLayoutOp>(op)) {
+    purpose = "convert_layout";
+  } else if (isa<triton::gpu::LocalLoadOp>(op)) {
+    purpose = "shared_load";
+  } else if (isa<triton::gpu::LocalStoreOp>(op)) {
+    purpose = "shared_store";
+  } else if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
+    purpose = "arrive_barrier";
+  } else if (auto callOp = dyn_cast<triton::CallOp>(op)) {
+    if (auto callee = callOp.getCalleeAttr()) {
+      purpose = "call_" + callee.getValue().str();
+    } else {
+      purpose = "call";
+    }
+  }
+
+  // Create named location for the barrier
+  auto namedLoc = createNamedBarrierLocation(*builder, op->getLoc(), purpose,
+                                             "membar_analysis");
+
+  auto barrierOp = builder->create<gpu::BarrierOp>(namedLoc);
 }
 
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,

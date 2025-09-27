@@ -1238,4 +1238,33 @@ bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
          dstLayout.getFreeVariableMasks()[kWarp] == 0;
 }
 
+mlir::Location createNamedAllocationLocation(OpBuilder &builder,
+                                             Location baseLoc,
+                                             StringRef allocType,
+                                             size_t sizeBytes,
+                                             StringRef passName) {
+  std::string name = "shared_" + allocType.str();
+  if (sizeBytes > 0) {
+    name += "_" + std::to_string(sizeBytes) + "B";
+  }
+  if (!passName.empty()) {
+    name += "_" + passName.str();
+  }
+
+  auto stringAttr = builder.getStringAttr(name);
+  return mlir::NameLoc::get(stringAttr, baseLoc);
+}
+
+mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
+                                          StringRef purpose,
+                                          StringRef passName) {
+  std::string name = "barrier_" + purpose.str();
+  if (!passName.empty()) {
+    name += "_" + passName.str();
+  }
+
+  auto stringAttr = builder.getStringAttr(name);
+  return mlir::NameLoc::get(stringAttr, baseLoc);
+}
+
 } // namespace mlir
