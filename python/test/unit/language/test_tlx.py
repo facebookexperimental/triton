@@ -1652,3 +1652,21 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
     torch.testing.assert_close(output, x + y, check_dtype=False)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_region_error(device):
+
+    @triton.jit
+    def ws_error_kernel():
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                _z = 1 + 2
+            with tlx.async_task(num_warps=1):
+                _x = 1 / 0
+
+    grid = lambda meta: (1, )
+    with pytest.raises(triton.CompilationError) as e:
+        ws_error_kernel[grid]()
+    exc_msg = str(e.value)
+    assert "ZeroDivisionError('division by zero')" in exc_msg, '\n\nExpected ZeroDivisionError but got: \n\n' + exc_msg + '\n\n'
