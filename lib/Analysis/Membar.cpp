@@ -159,31 +159,6 @@ void MembarOrFenceAnalysis::visitTerminator(
   llvm_unreachable("Unknown terminator encountered in membar analysis");
 }
 
-static std::string getPurposeFromOp(Operation *op) {
-  // Create name based on the operation
-  std::string purpose = "general";
-  if (isa<triton::gpu::AsyncWaitOp>(op)) {
-    purpose = "async_wait";
-  } else if (isa<triton::nvidia_gpu::TMAStoreWaitOp>(op)) {
-    purpose = "tma_store_wait";
-  } else if (isa<triton::gpu::ConvertLayoutOp>(op)) {
-    purpose = "convert_layout";
-  } else if (isa<triton::gpu::LocalLoadOp>(op)) {
-    purpose = "shared_load";
-  } else if (isa<triton::gpu::LocalStoreOp>(op)) {
-    purpose = "shared_store";
-  } else if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
-    purpose = "arrive_barrier";
-  } else if (auto callOp = dyn_cast<triton::CallOp>(op)) {
-    if (auto callee = callOp.getCalleeAttr()) {
-      purpose = "call_" + callee.getValue().str();
-    } else {
-      purpose = "call";
-    }
-  }
-  return purpose;
-}
-
 void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
   OpBuilder::InsertionGuard g(*builder);
 
@@ -193,7 +168,7 @@ void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
   }
 
   // Create named location for the barrier
-  std::string purpose = getPurposeFromOp(op);
+  std::string purpose = op->getName().getStringRef().str();
   auto namedLoc = createNamedBarrierLocation(*builder, op->getLoc(), purpose,
                                              "membar_analysis");
   auto barrierOp = builder->create<gpu::BarrierOp>(namedLoc);

@@ -1242,6 +1242,16 @@ bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
          dstLayout.getFreeVariableMasks()[kWarp] == 0;
 }
 
+size_t calculateBufferSizeInBytes(RankedTensorType ty,
+                                  ArrayRef<int64_t> bufferShape) {
+  size_t elemSizeBytes = ty.getElementTypeBitWidth() / 8;
+  size_t totalElements = 1;
+  for (auto dim : bufferShape) {
+    totalElements *= dim;
+  }
+  return totalElements * elemSizeBytes;
+}
+
 mlir::Location createNamedAllocationLocation(OpBuilder &builder,
                                              Location baseLoc,
                                              StringRef allocType,
@@ -1289,7 +1299,7 @@ static std::string getPartitionNameFromIndex(int idx) {
   case 4:
     return "softmax";
   default:
-    return "partition_" + std::to_string(idx);
+    return "id" + std::to_string(idx);
   }
 }
 

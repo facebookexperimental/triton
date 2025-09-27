@@ -428,7 +428,11 @@ std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
                    const triton::LinearLayout &dstLayout);
 
-/// Create a NameLoc for shared memory allocations with meaningful names
+/// the total buffer size in bytes given a tensor type and buffer shape.
+size_t calculateBufferSizeInBytes(RankedTensorType ty,
+                                  ArrayRef<int64_t> bufferShape);
+
+/// Create a NameLoc for shared memory allocations with names
 /// indicating allocation purpose, size, and pass information.
 mlir::Location createNamedAllocationLocation(OpBuilder &builder,
                                              Location baseLoc,

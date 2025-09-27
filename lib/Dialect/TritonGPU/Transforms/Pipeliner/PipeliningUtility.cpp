@@ -504,13 +504,7 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
   if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1)) {
     alloc = builder.create<ttg::LocalAllocOp>(loc, memdescType);
   } else {
-    // Create location name for the allocation
-    size_t elemSizeBytes = ty.getElementTypeBitWidth() / 8;
-    size_t totalElements = 1;
-    for (auto dim : bufferShape) {
-      totalElements *= dim;
-    }
-    size_t totalSizeBytes = totalElements * elemSizeBytes;
+    size_t totalSizeBytes = calculateBufferSizeInBytes(ty, bufferShape);
     auto namedLoc = createNamedAllocationLocation(
         builder, loc, "pipelined", totalSizeBytes, "pipelining_utility");
 
