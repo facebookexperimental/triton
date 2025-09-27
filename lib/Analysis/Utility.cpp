@@ -13,6 +13,10 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -1268,3 +1272,81 @@ mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
 }
 
 } // namespace mlir
+
+namespace mlir::triton::gpu {
+namespace ttng = triton::nvidia_gpu;
+
+/// Get human-readable partition name from index
+static std::string getPartitionNameFromIndex(int idx) {
+  switch (idx) {
+  case 0:
+    return "load_producer";
+  case 1:
+    return "mma_compute";
+  case 2:
+    return "consumer";
+  case 3:
+    return "epilogue";
+  case 4:
+    return "softmax";
+  default:
+    return "partition_" + std::to_string(idx);
+  }
+}
+
+/// Generate allocation name based on partition and operation type
+static std::string generateAllocationName(const std::string &partitionName,
+                                          const std::string &opType,
+                                          int index = -1) {
+  std::string name = partitionName + "_" + opType;
+  if (index >= 0) {
+    name += "_" + std::to_string(index);
+  }
+  return name;
+}
+
+void renameAllocsToPartition(scf::ForOp loop) {
+  int allocIndex = 0;
+  int barrierIndex = 0;
+
+  loop.walk([&](Operation *op) {
+    // Check if this is an allocation operation
+    if (!isa<LocalAllocOp, ttng::TMEMAllocOp>(op))
+      return;
+
+    // Get the partition attribute
+    auto partitionAttr = op->getAttrOfType<IntegerAttr>(kPartitionAttrName);
+    if (!partitionAttr)
+      return;
+
+    // Generate partition-based name
+    int partitionIdx = partitionAttr.getInt();
+    std::string partitionName = getPartitionNameFromIndex(partitionIdx);
+
+    std::string allocName;
+    if (isa<LocalAllocOp>(op)) {
+      allocName = generateAllocationName(partitionName, "buffer", allocIndex++);
+    } else if (isa<ttng::TMEMAllocOp>(op)) {
+      allocName = generateAllocationName(partitionName, "tmem", allocIndex++);
+    }
+
+    // Set enhanced location with meaningful partition name
+    if (!allocName.empty()) {
+      MLIRContext *ctx = op->getContext();
+      auto stringAttr = StringAttr::get(ctx, allocName);
+      auto namedLoc = NameLoc::get(stringAttr, op->getLoc());
+      op->setLoc(namedLoc);
+    }
+  });
+}
+
+void renameAllocsToPartition(ModuleOp module) {
+  module.walk([&](scf::ForOp loop) {
+    // Only process loops that have warp specialization
+    if (loop->hasAttr(kWarpSpecializeAttrName)) {
+      renameAllocsToPartition(loop);
+    }
+  });
+}
+
+} // namespace mlir::triton::gpu

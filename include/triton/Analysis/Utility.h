@@ -443,4 +443,15 @@ mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
 
 } // namespace mlir
 
+namespace mlir::triton::gpu {
+
+/// Rename allocation SSA values to include partition information
+/// This should be called after warp specialization scheduling is complete
+void renameAllocsToPartition(scf::ForOp loop);
+
+/// Rename all allocations in a module to include partition information
+void renameAllocsToPartition(ModuleOp module);
+
+} // namespace mlir::triton::gpu
+
 #endif // TRITON_ANALYSIS_UTILITY_H
