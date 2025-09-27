@@ -527,10 +527,11 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
 void rematerializeBroadcasts(WarpSchedule &schedule, OpOperand *use) {
   static_assert(
       std::is_base_of_v<OpTrait::OneResult<BroadcastOp>, BroadcastOp> &&
-      std::is_base_of_v<OpTrait::OneResult<ExpandDimsOp>, ExpandDimsOp>);
+      std::is_base_of_v<OpTrait::OneResult<ExpandDimsOp>, ExpandDimsOp> &&
+      std::is_base_of_v<OpTrait::OneResult<ConvertLayoutOp>, ConvertLayoutOp>);
 
   Operation *defOp = use->get().getDefiningOp();
-  while (isa_and_nonnull<BroadcastOp, ExpandDimsOp>(defOp)) {
+  while (isa_and_nonnull<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(defOp)) {
     Operation *clone = OpBuilder(defOp).clone(*defOp);
     Partition *userPartition = schedule.getPartition(use->getOwner());
     assert(userPartition && "user not scheduled");
@@ -542,14 +543,14 @@ void rematerializeBroadcasts(WarpSchedule &schedule, OpOperand *use) {
   }
 }
 
-/// Walk over \p loop and clone Broadcast/ExpandDims ops into each partition
-/// that they have users in. This reduces the amount of data that needs to be
-/// transferred through memory.
+/// Walk over \p loop and clone Broadcast/ExpandDims/ConvertLayout ops into each
+/// partition that they have users in. This reduces the amount of data that
+/// needs to be transferred through memory.
 void optimizeSchedule(scf::ForOp loop, WarpSchedule &schedule) {
   // Walk everything in reverse so that operations are visited before their
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (!isa<BroadcastOp, ExpandDimsOp>(op))
+    if (!isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
       return;
 
     Partition *partition = schedule.getPartition(op);
@@ -610,13 +611,13 @@ void PartitionScheduling::runOnOperation() {
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
-      // Clean Broadcast/ExpandDims that were left with no users after
-      // optimizeSchedule. We wait until after the schedule is serialized to
-      // avoid invalidating pointers stored in the schedule.
+      // Clean Broadcast/ExpandDims/ConvertLayout that were left with no users
+      // after optimizeSchedule. We wait until after the schedule is serialized
+      // to avoid invalidating pointers stored in the schedule.
       loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
         // By default, the walk is in postorder so it is safe to delete ops
         // while we walk.
-        if (isa<BroadcastOp, ExpandDimsOp>(op))
+        if (isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
           if (op->use_empty())
             op->erase();
       });
