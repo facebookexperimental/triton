@@ -124,10 +124,7 @@ Location createInitBarrierNameLoc(OpBuilder &builder, Location baseLoc,
   return mlir::NameLoc::get(builder.getStringAttr(barrierName), baseLoc);
 }
 
-//===----------------------------------------------------------------------===//
 // Buffer naming utilities for creating descriptive NameLocs
-//===----------------------------------------------------------------------===//
-
 std::string getBufferName(llvm::StringRef bufferType,
                           llvm::StringRef channelName, unsigned numBuffers) {
   std::string name = bufferType.str() + "_" + channelName.str();
