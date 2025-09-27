@@ -2013,10 +2013,15 @@ void insertAsyncComm(
         auto iter = commChannel.consumerBarriers.find(consumerTaskId);
         Value consumerBarrier = iter->second;
         // Use consumerBarrier as gen5 inline barrier.
-        auto tmemWaitBarrier =
-            desyncTCGen5MMAOp(builder, mmaOp, consumerBarrier, bufferIdx, phase,
-                              masterChannel->getNumBuffers(), headProducer,
-                              regionsWithChannels, dom, true, config);
+        // Correctly set the insertion point for producerAcquire when there is a
+        // tma/gen5 channel.
+        Operation *producerAcquirePoint = headProducer;
+        if (isProducerTMA(masterChannel, isPost))
+          producerAcquirePoint = tmaHeadProducer;
+        auto tmemWaitBarrier = desyncTCGen5MMAOp(
+            builder, mmaOp, consumerBarrier, bufferIdx, phase,
+            masterChannel->getNumBuffers(), producerAcquirePoint,
+            regionsWithChannels, dom, true, config);
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
