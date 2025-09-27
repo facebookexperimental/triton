@@ -6,6 +6,7 @@
 
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include <deque>
 
 namespace mlir {
@@ -158,11 +159,8 @@ void MembarOrFenceAnalysis::visitTerminator(
   llvm_unreachable("Unknown terminator encountered in membar analysis");
 }
 
-void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
-  OpBuilder::InsertionGuard g(*builder);
-
-  // Create a meaningful name for this barrier based on the operation that
-  // triggered it
+static std::string getPurposeFromOp(Operation *op) {
+  // Create name based on the operation
   std::string purpose = "general";
   if (isa<triton::gpu::AsyncWaitOp>(op)) {
     purpose = "async_wait";
@@ -183,11 +181,21 @@ void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
       purpose = "call";
     }
   }
+  return purpose;
+}
+
+void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
+  OpBuilder::InsertionGuard g(*builder);
+
+  if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1)) {
+    auto barrierOp = builder->create<gpu::BarrierOp>(op->getLoc());
+    return;
+  }
 
   // Create named location for the barrier
+  std::string purpose = getPurposeFromOp(op);
   auto namedLoc = createNamedBarrierLocation(*builder, op->getLoc(), purpose,
                                              "membar_analysis");
-
   auto barrierOp = builder->create<gpu::BarrierOp>(namedLoc);
 }
 

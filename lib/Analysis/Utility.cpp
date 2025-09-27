@@ -1322,7 +1322,7 @@ void renameAllocsToPartition(scf::ForOp loop) {
 }
 
 void renameAllocsToPartition(ModuleOp module) {
-  if (!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"))
+  if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1))
     return;
   module.walk([&](scf::ForOp loop) {
     // Only process loops that have warp specialization

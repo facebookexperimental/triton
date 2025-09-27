@@ -17,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -499,19 +500,22 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
                                            sharedEnc, sharedMemorySpace,
                                            /*mutableMemory=*/true);
 
-  // Calculate the size in bytes for the named location
-  size_t elemSizeBytes = ty.getElementTypeBitWidth() / 8;
-  size_t totalElements = 1;
-  for (auto dim : bufferShape) {
-    totalElements *= dim;
+  Value alloc;
+  if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1)) {
+    alloc = builder.create<ttg::LocalAllocOp>(loc, memdescType);
+  } else {
+    // Create location name for the allocation
+    size_t elemSizeBytes = ty.getElementTypeBitWidth() / 8;
+    size_t totalElements = 1;
+    for (auto dim : bufferShape) {
+      totalElements *= dim;
+    }
+    size_t totalSizeBytes = totalElements * elemSizeBytes;
+    auto namedLoc = createNamedAllocationLocation(
+        builder, loc, "pipelined", totalSizeBytes, "pipelining_utility");
+
+    alloc = builder.create<ttg::LocalAllocOp>(namedLoc, memdescType);
   }
-  size_t totalSizeBytes = totalElements * elemSizeBytes;
-
-  // Create a meaningful location name for the allocation
-  auto namedLoc = createNamedAllocationLocation(
-      builder, loc, "pipelined", totalSizeBytes, "pipelining_utility");
-
-  Value alloc = builder.create<ttg::LocalAllocOp>(namedLoc, memdescType);
 
   builder.setInsertionPointAfter(insertBefore);
   builder.create<ttg::LocalDeallocOp>(insertBefore->getLoc(), alloc);
