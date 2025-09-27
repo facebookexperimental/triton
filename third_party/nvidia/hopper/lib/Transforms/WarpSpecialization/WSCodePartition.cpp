@@ -1035,7 +1035,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     builder.setAsyncTaskIdsFromOp(srcOp);
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [](Operation *op) {
-          return isa<mlir::triton::DotOpInterface>(op);
+          return isa<mlir::triton::DotOpInterface, tt::DescriptorStoreOp>(op);
         });
 
     // Get shape, layout and type of a slice
