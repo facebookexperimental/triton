@@ -1626,9 +1626,11 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         OpBuilderWithAsyncTaskIds builder(user->getContext());
         builder.setInsertionPoint(user);
         builder.setAsyncTaskIdsFromOp(user);
+        auto bufferOff =
+            channel->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
         auto reinter = sliceAndReinterpretMDTMEM(builder, repCh->getAllocOp(),
                                                  channel->getAllocOp(), user,
-                                                 0 /*offset*/);
+                                                 bufferOff.getInt() /*offset*/);
         LLVM_DEBUG({
           LDBG("replace users for channel user ");
           user->dump();
