@@ -56,6 +56,15 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createCSEPass());
   pm.addPass(createNVWSAssignStagePhase());
   pm.addPass(createNVWSLowerAref());
+  if (failed(runPipeline(pm, getOperation())))
+    return signalPassFailure();
+
+  // Rename allocations to include partition information for better debugging
+  // Must be done AFTER serialize() but BEFORE PartitionLoops which removes
+  // partition attributes
+  renameAllocsToPartition(getOperation());
+
+  pm.clear();
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
   if (failed(runPipeline(pm, getOperation())))

@@ -1274,9 +1274,8 @@ mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
 } // namespace mlir
 
 namespace mlir::triton::gpu {
-namespace ttng = triton::nvidia_gpu;
 
-/// Get human-readable partition name from index
+// XXX: generate this list without hardcoding
 static std::string getPartitionNameFromIndex(int idx) {
   switch (idx) {
   case 0:
@@ -1294,24 +1293,11 @@ static std::string getPartitionNameFromIndex(int idx) {
   }
 }
 
-/// Generate allocation name based on partition and operation type
-static std::string generateAllocationName(const std::string &partitionName,
-                                          const std::string &opType,
-                                          int index = -1) {
-  std::string name = partitionName + "_" + opType;
-  if (index >= 0) {
-    name += "_" + std::to_string(index);
-  }
-  return name;
-}
-
 void renameAllocsToPartition(scf::ForOp loop) {
-  int allocIndex = 0;
-  int barrierIndex = 0;
-
   loop.walk([&](Operation *op) {
-    // Check if this is an allocation operation
-    if (!isa<LocalAllocOp, ttng::TMEMAllocOp>(op))
+    std::string opName = op->getName().getStringRef().str();
+    if (opName.find("alloc") == std::string::npos &&
+        opName.find("barrier") == std::string::npos)
       return;
 
     // Get the partition attribute
@@ -1322,15 +1308,10 @@ void renameAllocsToPartition(scf::ForOp loop) {
     // Generate partition-based name
     int partitionIdx = partitionAttr.getInt();
     std::string partitionName = getPartitionNameFromIndex(partitionIdx);
-
     std::string allocName;
-    if (isa<LocalAllocOp>(op)) {
-      allocName = generateAllocationName(partitionName, "buffer", allocIndex++);
-    } else if (isa<ttng::TMEMAllocOp>(op)) {
-      allocName = generateAllocationName(partitionName, "tmem", allocIndex++);
-    }
+    allocName = partitionName + "_" + opName;
 
-    // Set enhanced location with meaningful partition name
+    // Set location with partition name
     if (!allocName.empty()) {
       MLIRContext *ctx = op->getContext();
       auto stringAttr = StringAttr::get(ctx, allocName);
@@ -1341,11 +1322,12 @@ void renameAllocsToPartition(scf::ForOp loop) {
 }
 
 void renameAllocsToPartition(ModuleOp module) {
+  if (!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"))
+    return;
   module.walk([&](scf::ForOp loop) {
     // Only process loops that have warp specialization
-    if (loop->hasAttr(kWarpSpecializeAttrName)) {
+    if (loop->hasAttr(kWarpSpecializeAttrName))
       renameAllocsToPartition(loop);
-    }
   });
 }
 
