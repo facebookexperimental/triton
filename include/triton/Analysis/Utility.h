@@ -428,6 +428,19 @@ std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
                    const triton::LinearLayout &dstLayout);
 
+/// Create a NameLoc for shared memory allocations with meaningful names
+/// indicating allocation purpose, size, and pass information.
+mlir::Location createNamedAllocationLocation(OpBuilder &builder,
+                                             Location baseLoc,
+                                             StringRef allocType,
+                                             size_t sizeBytes,
+                                             StringRef passName = "");
+
+/// Create a NameLoc for barriers with context about their purpose and location.
+mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
+                                          StringRef purpose,
+                                          StringRef passName = "");
+
 } // namespace mlir
 
 #endif // TRITON_ANALYSIS_UTILITY_H
