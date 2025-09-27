@@ -1373,6 +1373,9 @@ DenseMap<Channel *, Value> createBufferPost(
                                     oldAllocOp->getAttr("buffer.copy"));
     buffer.getDefiningOp()->setAttr("buffer.id",
                                     oldAllocOp->getAttr("buffer.id"));
+    if (oldAllocOp->getAttr("buffer.offset"))
+      buffer.getDefiningOp()->setAttr("buffer.offset",
+                                      oldAllocOp->getAttr("buffer.offset"));
     SmallVector<Operation *> users;
     for (auto *user : oldAllocOp->getResult(0).getUsers())
       users.push_back(user);

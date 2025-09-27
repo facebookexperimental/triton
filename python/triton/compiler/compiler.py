@@ -467,6 +467,7 @@ class CompiledKernel:
             self.name, self.kernel, self.metadata.shared, device)
         warp_size = driver.active.get_current_target().warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
+            print("warp_size", warp_size, self.metadata.num_warps, self.n_max_threads)
             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
         if knobs.runtime.kernel_load_end_hook is not None:
             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
