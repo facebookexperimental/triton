@@ -506,11 +506,46 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
-                          int reuseGroupIdx) {
+                          int reuseGroupIdx, Channel *ch) {
   Value accumCnt =
       getAccumCount(builder, op, regionsWithChannels, config, reuseGroupIdx);
+  if (reuseGroupIdx < 0) {
+    std::tie(bufferIdx, phase) =
+        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+    return;
+  }
+  // op is a user of the channel. accumCnt is the corresponding argument of the
+  // parentForOp.
+  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
+  // FIXME: handle the case where ch is inside in IfOp.
+  SmallVector<Operation *> chList;
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
+                   chList);
+  assert(chList.size() >= 1);
+  int vecIdx = 0, theIdx = -1;
+  for (auto *tCh : chList) {
+    if (tCh == ch->getDstOp()) {
+      theIdx = vecIdx;
+      break;
+    }
+    ++vecIdx;
+  }
+  assert(theIdx >= 0);
+  if (theIdx == 0) {
+    std::tie(bufferIdx, phase) =
+        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+    return;
+  }
+  // Increment accumCnt if there are multiple channels in the reuseGroup in this
+  // region.
+  Value idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      op->getLoc(), theIdx, 64);
+  Value addRes = builder.createWithAsyncTaskIds<arith::AddIOp>(
+      op->getLoc(), accumCnt, idxVal);
+
   std::tie(bufferIdx, phase) =
-      getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+      getBufferIdxAndPhase(builder, op->getLoc(), addRes, numBuffers);
 }
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,

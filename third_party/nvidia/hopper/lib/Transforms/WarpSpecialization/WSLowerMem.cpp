@@ -473,7 +473,7 @@ void insertAsyncCopy(
       });
       getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
-                           reuseGrp);
+                           reuseGrp, kv.getFirst());
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will
       // be used by both producer and consumers.

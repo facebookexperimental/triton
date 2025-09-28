@@ -65,7 +65,8 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   ttng::ArriveBarrierOp arriveOp;
 
   assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
-  arriveOp = builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, fullCnt);
+  arriveOp =
+      builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, 1); // fullCnt);
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
@@ -87,7 +88,7 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
                               unsigned emptyCnt) {
   auto loc = op.getLoc();
   auto arriveOp =
-      builder.create<ttng::ArriveBarrierOp>(loc, bufferEmpty, emptyCnt);
+      builder.create<ttng::ArriveBarrierOp>(loc, bufferEmpty, 1); // emptyCnt);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
 }
@@ -177,12 +178,12 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       // EmptyView is used for ConsumerRelease and ProducerAcquire.
       // FullView is for ConsumerWait and ProducerCommit.
       builder.create<ttng::InitBarrierOp>(loc, barrierFullView,
-                                          bufferFullCount);
+                                          1); // bufferFullCount);
 
       Value barrierEmptyView = builder.create<ttg::MemDescIndexOp>(
           loc, singleBarrierMemDescType, bufferEmptyArray, idx);
       builder.create<ttng::InitBarrierOp>(loc, barrierEmptyView,
-                                          bufferEmptyCount);
+                                          1); // bufferEmptyCount);
     }
 
     assert(numCTAs == 1 && "remote CTA is not supported yet");

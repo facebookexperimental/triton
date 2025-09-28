@@ -234,7 +234,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
-                          int reuseGroupIdx);
+                          int reuseGroupIdx, Channel *ch);
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);

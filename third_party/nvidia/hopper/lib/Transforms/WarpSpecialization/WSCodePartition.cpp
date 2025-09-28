@@ -1380,7 +1380,7 @@ DenseMap<Channel *, Value> createBufferPost(
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
-                             bufferIdx, _phase, config, reuseGrp);
+                             bufferIdx, _phase, config, reuseGrp, channel);
       } else {
         bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             user->getLoc(), 0, 32);
@@ -1929,9 +1929,10 @@ void insertAsyncComm(
         LDBG("call getBufferIdxAndPhase2 ");
         headProducer->dump();
       });
-      getBufferIdxAndPhase(
-          builder, headProducer, kv.second.front()->getNumBuffers(),
-          regionsWithChannels, bufferIdx, phase, config, reuseGrp);
+      getBufferIdxAndPhase(builder, headProducer,
+                           kv.second.front()->getNumBuffers(),
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, masterChannel);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
