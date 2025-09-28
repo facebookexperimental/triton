@@ -487,6 +487,21 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   return accumCnt;
 }
 
+int channelInReuseGroup(Channel *channel, ReuseConfig *config,
+                        bool reuseBarrier) {
+  for (unsigned idx = 0; idx < config->getGroupSize(); idx++) {
+    // Reuse the same barriers when numBuffers > 1.
+    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
+        reuseBarrier)
+      continue;
+    for (auto *ch : config->getGroup(idx)->channels) {
+      if (channel == ch)
+        return idx;
+    }
+  }
+  return -1;
+}
+
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,

@@ -466,12 +466,14 @@ void insertAsyncCopy(
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
     if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
+      int reuseGrp = channelInReuseGroup(kv.getFirst(), config);
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase ");
         srcOp->dump();
       });
       getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->getNumBuffers(),
-                           regionsWithChannels, bufferIdx, phase, config);
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will
       // be used by both producer and consumers.

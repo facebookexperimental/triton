@@ -234,7 +234,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
-                          int reuseGroupIdx = -1);
+                          int reuseGroupIdx);
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
@@ -255,6 +255,8 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
 
 Operation *getSameLevelOp(Operation *p, Operation *c);
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
+int channelInReuseGroup(Channel *channel, ReuseConfig *config,
+                        bool reuseBarrier = true);
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
