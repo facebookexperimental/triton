@@ -1035,6 +1035,12 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     builder.setAsyncTaskIdsFromOp(srcOp);
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [](Operation *op) {
+          // convert_layout
+          if (isa<ttg::ConvertLayoutOp>(op)) {
+            for (auto *user : op->getUsers())
+              if (isa<tt::DescriptorStoreOp>(user))
+                return true;
+          }
           return isa<mlir::triton::DotOpInterface, tt::DescriptorStoreOp>(op);
         });
 
