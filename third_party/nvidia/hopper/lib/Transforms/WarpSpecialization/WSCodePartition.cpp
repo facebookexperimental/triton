@@ -564,21 +564,6 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   return barrierAlloc;
 }
 
-static int channelInReuseGroup(Channel *channel, ReuseConfig *config,
-                               bool reuseBarrier = true) {
-  for (unsigned idx = 0; idx < config->getGroupSize(); idx++) {
-    // Reuse the same barriers when numBuffers > 1.
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
-        reuseBarrier)
-      continue;
-    for (auto *ch : config->getGroup(idx)->channels) {
-      if (channel == ch)
-        return idx;
-    }
-  }
-  return -1;
-}
-
 static Operation *ProducerIsGen5(Operation *producerOp) {
   if (isa<ttng::TCGen5MMAOp>(producerOp))
     return producerOp;
@@ -1386,6 +1371,7 @@ DenseMap<Channel *, Value> createBufferPost(
     for (auto *user : oldAllocOp->getResult(0).getUsers())
       users.push_back(user);
     DenseMap<Operation *, Value> userToBufIdx;
+    int reuseGrp = channelInReuseGroup(channel, config);
     for (auto *user : users) {
       Value bufferIdx;
       Value _phase = Value();
@@ -1394,7 +1380,7 @@ DenseMap<Channel *, Value> createBufferPost(
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
-                             bufferIdx, _phase, config);
+                             bufferIdx, _phase, config, reuseGrp, channel);
       } else {
         bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             user->getLoc(), 0, 32);
@@ -1934,6 +1920,7 @@ void insertAsyncComm(
         continue; // FIXME: skip this channel for now.
       }
     }
+    int reuseGrp = channelInReuseGroup(masterChannel, config);
     if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
       // headProducer can be local_store but bufferIdx will be used
       // by tmaLoad as well.
@@ -1944,7 +1931,8 @@ void insertAsyncComm(
       });
       getBufferIdxAndPhase(builder, headProducer,
                            kv.second.front()->getNumBuffers(),
-                           regionsWithChannels, bufferIdx, phase, config);
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, masterChannel);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
