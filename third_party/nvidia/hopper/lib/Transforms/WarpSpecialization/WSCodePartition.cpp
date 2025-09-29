@@ -22,6 +22,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "llvm/ADT/MapVector.h"
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -1150,7 +1151,7 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
   });
 
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
-  DenseMap<Value, SmallVector<Channel *>> channelsGroupedByProducers;
+  llvm::MapVector<Value, SmallVector<Channel *>> channelsGroupedByProducers;
 
   // Group channels by source values
   for (auto *channelInOrder : orderedChannels) {
