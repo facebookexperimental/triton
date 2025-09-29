@@ -1487,14 +1487,16 @@ DenseMap<Channel *, Value> createBufferPost(
 // we will add WaitBarrier as consumerWait in the same partition as
 // producerOrConsumer. When asProducerAcquire is true, mmaOp is the consumer,
 // producerOrConsumer is the producer.
-ttng::WaitBarrierOp desyncTCGen5MMAOp(
-    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
-    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
-    Operation *producerOrConsumer, DenseSet<Operation *> &regionsWithChannels,
-    mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
+Operation *desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
+                             ttng::TCGen5MMAOp mmaOp, Value barrierAlloc,
+                             Value bufferIdx, Value inPhase,
+                             unsigned numBuffers, Operation *producerOrConsumer,
+                             DenseSet<Operation *> &regionsWithChannels,
+                             mlir::DominanceInfo &dom, bool asProducerAcquire,
+                             ReuseConfig *config, Operation *insertionPoint) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
-  builder.setInsertionPoint(mmaOp);
+  builder.setInsertionPoint(insertionPoint);
   builder.setAsyncTaskIdsFromOp(mmaOp);
   auto consumerBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
@@ -1523,8 +1525,13 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
   }
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
-  return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      loc, producerBarrier, phase);
+  if (insertionPoint != mmaOp) {
+    return builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+        loc, producerBarrier);
+  } else {
+    return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+        loc, producerBarrier, phase);
+  }
 
   LLVM_DEBUG({
     LDBG("desync: create wait_barrier for producer ");
@@ -1911,6 +1918,7 @@ void insertAsyncComm(
       tOps.insert(headProducer);
       tmaHeadProducer = getFirstOpInBlock(tOps);
     }
+    Operation *insertionPoint = headProducer;
     // Check to see if producer and consumer are in the same block.
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
@@ -1919,7 +1927,12 @@ void insertAsyncComm(
       if (regionCmp < 0) { // headProducer is in nested region
         LDBG("FIXME headProducer is in nested region "
              << masterChannel->uniqID);
-        continue;
+        // If we are in nested region set the assertion point
+        // to the end of the parent forOp.
+        insertionPoint = headProducer->getParentOp()->getNextNode();
+        if (!insertionPoint) {
+          llvm_unreachable("For Loop without yield statement");
+        }
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
@@ -1986,7 +1999,8 @@ void insertAsyncComm(
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
                           *commChannel.producerBarrier, bufferIdx, phase,
                           masterChannel->getNumBuffers(), headConsumer,
-                          regionsWithChannels, dom, false, config);
+                          regionsWithChannels, dom, false, config,
+                          insertionPoint);
       }
     }
     // Channel can have multiple consumers.
@@ -2024,10 +2038,10 @@ void insertAsyncComm(
         Operation *producerAcquirePoint = headProducer;
         if (isProducerTMA(masterChannel, isPost))
           producerAcquirePoint = tmaHeadProducer;
-        auto tmemWaitBarrier = desyncTCGen5MMAOp(
+        auto tmemWaitBarrier = cast<ttng::WaitBarrierOp>(desyncTCGen5MMAOp(
             builder, mmaOp, consumerBarrier, bufferIdx, phase,
             masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config);
+            regionsWithChannels, dom, true, config, mmaOp));
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
@@ -2419,6 +2433,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
                   barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels,
                   &config, true);
+  funcOp.dump();
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
