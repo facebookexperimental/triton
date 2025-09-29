@@ -23,7 +23,8 @@ def tlx_enter_sub_region():
         sub_region_has_exception = True
         raise e
     finally:
-        assert sub_region_has_exception or region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
+        if not sub_region_has_exception:
+            assert region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
 
 
 def _is_async_task(self, node) -> bool:
