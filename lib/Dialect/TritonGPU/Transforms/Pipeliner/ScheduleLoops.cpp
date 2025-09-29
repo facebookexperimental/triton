@@ -13,6 +13,8 @@
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+const bool FORCE_SOFTWARE_PIPELINE_FOR_FA = true;
+
 using namespace mlir;
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -314,16 +316,6 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::AsyncTMAGatherOp, ttng::MMAv5OpInterface,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
     };
-
-    // HACK: Indicate that all DescriptorLoadOp will be set to SWP stages=2.
-    // In the future, we should have better decision making, ideally based on
-    // the memory planner.
-    auto opNumStages = [&](Operation &op) {
-      if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
-        return 2;
-      return 1;
-    };
-
     // If there are no latency ops or all latency ops are in the same stage, we
     // don't need to pipeline the loop. Return a new schedule with everything
     // assigned to the same stage.
@@ -337,8 +329,21 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     if (latencyStages.size() <= 1) {
       CoarseSchedule normalized(/*numStages=*/1);
       auto cluster = normalized.clusters.newAtFront();
+      std::optional<CoarseSchedule::ClusterList::iterator> pipelineCluster =
+          std::nullopt;
       for (Operation &op : ops)
-        normalized.insert(&op, 0, cluster);
+        // HACK: Force AsyncTMACopyGlobalToLocalOp to be in stage 1.
+        // In the future this should be identified by an actual planning
+        // component for the producer.
+        if (FORCE_SOFTWARE_PIPELINE_FOR_FA &&
+            isa<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+          if (!pipelineCluster.has_value()) {
+            pipelineCluster = normalized.clusters.newAtFront();
+          }
+          normalized.insert(&op, 1, pipelineCluster.value());
+        } else {
+          normalized.insert(&op, 0, cluster);
+        }
       return normalized;
     }
 
@@ -439,7 +444,7 @@ void scheduleLoop(scf::ForOp forOp,
 /// Schedule the loops based on the latencies assigned to the operations.
 void scheduleLoops(ModuleOp moduleOp) {
   // Hack to enable testing with just the loop scheduling pass.
-  if (true) {
+  if (FORCE_SOFTWARE_PIPELINE_FOR_FA) {
     Builder builder(moduleOp.getContext());
     doLoopSchedulePreprocessing(moduleOp, builder);
   }
