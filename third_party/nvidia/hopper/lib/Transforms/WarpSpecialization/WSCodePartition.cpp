@@ -1487,16 +1487,14 @@ DenseMap<Channel *, Value> createBufferPost(
 // we will add WaitBarrier as consumerWait in the same partition as
 // producerOrConsumer. When asProducerAcquire is true, mmaOp is the consumer,
 // producerOrConsumer is the producer.
-Operation *desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
-                             ttng::TCGen5MMAOp mmaOp, Value barrierAlloc,
-                             Value bufferIdx, Value inPhase,
-                             unsigned numBuffers, Operation *producerOrConsumer,
-                             DenseSet<Operation *> &regionsWithChannels,
-                             mlir::DominanceInfo &dom, bool asProducerAcquire,
-                             ReuseConfig *config, Operation *insertionPoint) {
+ttng::WaitBarrierOp desyncTCGen5MMAOp(
+    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
+    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
+    Operation *producerOrConsumer, DenseSet<Operation *> &regionsWithChannels,
+    mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
-  builder.setInsertionPoint(insertionPoint);
+  builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
   auto consumerBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
@@ -1525,13 +1523,8 @@ Operation *desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
   }
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
-  if (insertionPoint != mmaOp) {
-    return builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-        loc, producerBarrier);
-  } else {
-    return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-        loc, producerBarrier, phase);
-  }
+  return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+      loc, producerBarrier, phase);
 
   LLVM_DEBUG({
     LDBG("desync: create wait_barrier for producer ");
@@ -1999,8 +1992,7 @@ void insertAsyncComm(
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
                           *commChannel.producerBarrier, bufferIdx, phase,
                           masterChannel->getNumBuffers(), headConsumer,
-                          regionsWithChannels, dom, false, config,
-                          insertionPoint);
+                          regionsWithChannels, dom, false, config);
       }
     }
     // Channel can have multiple consumers.
@@ -2038,10 +2030,10 @@ void insertAsyncComm(
         Operation *producerAcquirePoint = headProducer;
         if (isProducerTMA(masterChannel, isPost))
           producerAcquirePoint = tmaHeadProducer;
-        auto tmemWaitBarrier = cast<ttng::WaitBarrierOp>(desyncTCGen5MMAOp(
+        auto tmemWaitBarrier = desyncTCGen5MMAOp(
             builder, mmaOp, consumerBarrier, bufferIdx, phase,
             masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config, mmaOp));
+            regionsWithChannels, dom, true, config);
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
