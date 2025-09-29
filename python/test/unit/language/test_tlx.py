@@ -1607,6 +1607,8 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         ctaid = tl.program_id(axis=0)
         block_start = ctaid * BLOCK_SIZE
 
+        tid = tlx.thread_id(axis=0)
+
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
@@ -1633,6 +1635,8 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         cta_id_y = -2
         cta_id_z = -3
         tlx.clc_query(clc_response, valid, cta_id_x, cta_id_y, cta_id_z)
+        if tid==0:
+            tl.device_print("valid: ", valid)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
@@ -1652,3 +1656,4 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
     torch.testing.assert_close(output, x + y, check_dtype=False)
+    assert(False)
