@@ -438,6 +438,11 @@ void scheduleLoop(scf::ForOp forOp,
 
 /// Schedule the loops based on the latencies assigned to the operations.
 void scheduleLoops(ModuleOp moduleOp) {
+  // Hack to enable testing with just the loop scheduling pass.
+  if (true) {
+    Builder builder(moduleOp.getContext());
+    doLoopSchedulePreprocessing(moduleOp, builder);
+  }
   DenseMap<Operation *, int> opLatency = deserializeLatencies(moduleOp);
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
