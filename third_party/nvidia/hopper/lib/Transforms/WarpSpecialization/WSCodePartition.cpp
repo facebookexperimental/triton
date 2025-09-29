@@ -1911,22 +1911,15 @@ void insertAsyncComm(
       tOps.insert(headProducer);
       tmaHeadProducer = getFirstOpInBlock(tOps);
     }
-    Operation *insertionPoint = headProducer;
+    bool isProducerNested = false;
     // Check to see if producer and consumer are in the same block.
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
       // If producer is inside the loop, consumer is outside.
       int regionCmp = isAinNestedRegion(headProducer, headConsumer);
-      if (regionCmp < 0) { // headProducer is in nested region
-        LDBG("FIXME headProducer is in nested region "
-             << masterChannel->uniqID);
-        // If we are in nested region set the assertion point
-        // to the end of the parent forOp.
-        insertionPoint = headProducer->getParentOp()->getNextNode();
-        if (!insertionPoint) {
-          llvm_unreachable("For Loop without yield statement");
-        }
-      }
+      // headProducer is in nested region
+      // TODO: Is a nested consumer properly supported?
+      isProducerNested = regionCmp < 0;
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
       if (!appearsBefore(headProducer, headConsumer)) {
