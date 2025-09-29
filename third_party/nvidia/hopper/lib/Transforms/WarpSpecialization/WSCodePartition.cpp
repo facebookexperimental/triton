@@ -1487,21 +1487,31 @@ DenseMap<Channel *, Value> createBufferPost(
 // we will add WaitBarrier as consumerWait in the same partition as
 // producerOrConsumer. When asProducerAcquire is true, mmaOp is the consumer,
 // producerOrConsumer is the producer.
-ttng::WaitBarrierOp desyncTCGen5MMAOp(
-    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
-    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
-    Operation *producerOrConsumer, DenseSet<Operation *> &regionsWithChannels,
-    mlir::DominanceInfo &dom, bool asProducerAcquire, ReuseConfig *config) {
+// useConsumerBarrier is the logic for deciding if the barrier should be
+// directly set by the MMA operation. If False we should have generated
+// a tcgen05.commit Operation instead.
+ttng::WaitBarrierOp
+desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
+                  Value barrierAlloc, Value bufferIdx, Value inPhase,
+                  unsigned numBuffers, Operation *producerOrConsumer,
+                  DenseSet<Operation *> &regionsWithChannels,
+                  mlir::DominanceInfo &dom, bool asProducerAcquire,
+                  ReuseConfig *config, bool useConsumerBarrier) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
-  auto consumerBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
-  // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
-  auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      mmaOp->getLoc(), true, 1);
-  mmaOp.addCompletionBarrier(consumerBarrier, pred);
+  if (useConsumerBarrier) {
+    auto consumerBarrier =
+        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+    // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
+    auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        mmaOp->getLoc(), true, 1);
+    mmaOp.addCompletionBarrier(consumerBarrier, pred);
+  } else {
+    assert(!asProducerAcquire &&
+           "tcgen05.MMA consumer requires consumer Barrier");
+  }
   mmaOp.setIsAsync(true);
 
   // Create a wait_barrier before producerOrConsumer. When asProducerAcquire is
@@ -1705,16 +1715,6 @@ void insertAsyncComm(
       op = op->getParentOp();
     }
     llvm_unreachable("error in isAinNestedRegion");
-  };
-
-  // Get the first OP for A that is on the same level
-  // as B. This assumes B is not nested inside A.
-  auto getAUnnestedParent = [](Operation *A, Operation *B) -> Operation * {
-    while (A && A->getParentOp() != B->getParentOp()) {
-      A = A->getParentOp();
-    }
-    assert(A != nullptr && "A must be nested inside B or at the same level");
-    return A;
   };
 
   mlir::DominanceInfo dom(funcOp);
@@ -1932,9 +1932,7 @@ void insertAsyncComm(
       if (regionCmp < 0) {
         assert(isa<ttng::TCGen5MMAOp>(headProducer) &&
                "Only TCGen5MMAOp supported");
-        nestedInsertionTarget =
-            getAUnnestedParent(headProducer, headConsumer)->getNextNode();
-        assert(nestedInsertionTarget != nullptr && "Malformed IR");
+        nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
@@ -1995,9 +1993,6 @@ void insertAsyncComm(
 
     builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
 
-    // FIXME: channel for acc0 from gemm partition to correction_epilogue
-    // producer is inside the ForOp, consumer is outside the ForOp
-    // can't use inline barrier for producer.
     if (commChannel.producerBarrier) {
       // If we are using producer barrier, it is either TMA or gen5. Handle gen5
       // here, TMA will be handled later.
@@ -2010,10 +2005,22 @@ void insertAsyncComm(
           LDBG("channel has gen5 mma as producer " << masterChannel->uniqID
                                                    << " ");
         });
+        // If we have a nested target we cannot use the barrier in the
+        // TCGen5MMAOp directly and instead need a tcgen05.commit.
+        bool useConsumerBarrier = nestedInsertionTarget == nullptr;
+        if (!useConsumerBarrier) {
+          // We need to place the commit after the for loop.
+          builder.setInsertionPointAfter(nestedInsertionTarget);
+          builder.setAsyncTaskIdsFromOp(mmaOp);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), *commChannel.producerBarrier);
+        }
+        // Still call desyncTCGen5MMAOp to handle the consumer.
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
                           *commChannel.producerBarrier, bufferIdx, phase,
                           masterChannel->getNumBuffers(), headConsumer,
-                          regionsWithChannels, dom, false, config);
+                          regionsWithChannels, dom, false, config,
+                          useConsumerBarrier);
       }
     }
     // Channel can have multiple consumers.
@@ -2054,7 +2061,7 @@ void insertAsyncComm(
         auto tmemWaitBarrier = desyncTCGen5MMAOp(
             builder, mmaOp, consumerBarrier, bufferIdx, phase,
             masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config);
+            regionsWithChannels, dom, true, config, true);
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
@@ -2062,12 +2069,12 @@ void insertAsyncComm(
     for (const auto &token : commChannel.tokens) {
       // Use token for producer acquire and consumer release.
       if (commChannel.consumerBarriers.empty()) {
-        // FIXME: channel for acc0 from gemm partition to correction_epilogue
-        // producer is inside the ForOp, consumer is outside the ForOp. We can't
-        // lift the producer acquire to be before the ForOp.
         // Insert ProducerAcquireOp before the producer.
-        auto producerAcquirePoint =
-            getSameLevelOp(headConsumer, tmaHeadProducer);
+        // Even when A is nested inside B we still need to place
+        // the acquire right before the head producer to avoid
+        // reordering the barriers incorrectly. This acquire will
+        // be idemponent in the loop becasue we don't flip the phase.
+        auto producerAcquirePoint = tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
         builder.setInsertionPoint(producerAcquirePoint);
         builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
