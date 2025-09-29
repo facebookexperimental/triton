@@ -168,7 +168,7 @@ public:
     }
 
     doTokenLowering(funcOp, numWarpGroups - 1);
-    if (!ForBlackWell) {
+    if (true) { //! ForBlackWell) {
       // Clear num_stages to disable SWP.
       funcOp->walk([&](scf::ForOp forOp) {
         forOp->setAttr(mlir::triton::kNumStagesAttrName,

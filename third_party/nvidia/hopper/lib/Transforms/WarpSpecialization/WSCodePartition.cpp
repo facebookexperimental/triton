@@ -1379,6 +1379,9 @@ DenseMap<Channel *, Value> createBufferPost(
                                     oldAllocOp->getAttr("buffer.copy"));
     buffer.getDefiningOp()->setAttr("buffer.id",
                                     oldAllocOp->getAttr("buffer.id"));
+    if (oldAllocOp->getAttr("buffer.offset"))
+      buffer.getDefiningOp()->setAttr("buffer.offset",
+                                      oldAllocOp->getAttr("buffer.offset"));
     SmallVector<Operation *> users;
     for (auto *user : oldAllocOp->getResult(0).getUsers())
       users.push_back(user);
@@ -1626,9 +1629,11 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         OpBuilderWithAsyncTaskIds builder(user->getContext());
         builder.setInsertionPoint(user);
         builder.setAsyncTaskIdsFromOp(user);
+        auto bufferOff =
+            channel->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
         auto reinter = sliceAndReinterpretMDTMEM(builder, repCh->getAllocOp(),
                                                  channel->getAllocOp(), user,
-                                                 0 /*offset*/);
+                                                 bufferOff.getInt() /*offset*/);
         LLVM_DEBUG({
           LDBG("replace users for channel user ");
           user->dump();
@@ -2370,7 +2375,17 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
       ReuseGroup group;
-      group.channels = kv.second;
+      // make sure the channel without buffer.offset is the first one (i.e the
+      // representative channel)
+      std::vector<Channel *> ordered(kv.second);
+      std::stable_partition(ordered.begin(), ordered.end(), [](Channel *ch) {
+        auto bufferOffset =
+            ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
+        if (bufferOffset)
+          return false;
+        return true;
+      });
+      group.channels = ordered;
       LDBG("ReuseGroup with size " << kv.second.size() << " buffer.id "
                                    << kv.first << "\n");
       config.groups.push_back(group);
