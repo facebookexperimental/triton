@@ -1932,7 +1932,9 @@ void insertAsyncComm(
       if (regionCmp < 0) {
         assert(isa<ttng::TCGen5MMAOp>(headProducer) &&
                "Only TCGen5MMAOp supported");
-        nestedInsertionTarget = getAUnnestedParent(headProducer, headConsumer)
+        nestedInsertionTarget =
+            getAUnnestedParent(headProducer, headConsumer)->getNextNode();
+        assert(nestedInsertionTarget != nullptr && "Malformed IR");
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
