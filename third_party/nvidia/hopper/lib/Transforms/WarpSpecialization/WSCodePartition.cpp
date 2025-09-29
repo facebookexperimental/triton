@@ -22,6 +22,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "llvm/ADT/MapVector.h"
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -562,21 +563,6 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
     builder.create<ttng::InitBarrierOp>(funcOp->getLoc(), barrierView, 1);
   }
   return barrierAlloc;
-}
-
-static int channelInReuseGroup(Channel *channel, ReuseConfig *config,
-                               bool reuseBarrier = true) {
-  for (unsigned idx = 0; idx < config->getGroupSize(); idx++) {
-    // Reuse the same barriers when numBuffers > 1.
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
-        reuseBarrier)
-      continue;
-    for (auto *ch : config->getGroup(idx)->channels) {
-      if (channel == ch)
-        return idx;
-    }
-  }
-  return -1;
 }
 
 static Operation *ProducerIsGen5(Operation *producerOp) {
@@ -1165,7 +1151,7 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
   });
 
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
-  DenseMap<Value, SmallVector<Channel *>> channelsGroupedByProducers;
+  llvm::MapVector<Value, SmallVector<Channel *>> channelsGroupedByProducers;
 
   // Group channels by source values
   for (auto *channelInOrder : orderedChannels) {
@@ -1379,10 +1365,14 @@ DenseMap<Channel *, Value> createBufferPost(
                                     oldAllocOp->getAttr("buffer.copy"));
     buffer.getDefiningOp()->setAttr("buffer.id",
                                     oldAllocOp->getAttr("buffer.id"));
+    if (oldAllocOp->getAttr("buffer.offset"))
+      buffer.getDefiningOp()->setAttr("buffer.offset",
+                                      oldAllocOp->getAttr("buffer.offset"));
     SmallVector<Operation *> users;
     for (auto *user : oldAllocOp->getResult(0).getUsers())
       users.push_back(user);
     DenseMap<Operation *, Value> userToBufIdx;
+    int reuseGrp = channelInReuseGroup(channel, config);
     for (auto *user : users) {
       Value bufferIdx;
       Value _phase = Value();
@@ -1391,7 +1381,7 @@ DenseMap<Channel *, Value> createBufferPost(
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
-                             bufferIdx, _phase, config);
+                             bufferIdx, _phase, config, reuseGrp, channel);
       } else {
         bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             user->getLoc(), 0, 32);
@@ -1636,9 +1626,11 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         OpBuilderWithAsyncTaskIds builder(user->getContext());
         builder.setInsertionPoint(user);
         builder.setAsyncTaskIdsFromOp(user);
+        auto bufferOff =
+            channel->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
         auto reinter = sliceAndReinterpretMDTMEM(builder, repCh->getAllocOp(),
                                                  channel->getAllocOp(), user,
-                                                 0 /*offset*/);
+                                                 bufferOff.getInt() /*offset*/);
         LLVM_DEBUG({
           LDBG("replace users for channel user ");
           user->dump();
@@ -1942,6 +1934,7 @@ void insertAsyncComm(
         continue; // FIXME: skip this channel for now.
       }
     }
+    int reuseGrp = channelInReuseGroup(masterChannel, config);
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
       // calculation to after the loop
@@ -1952,7 +1945,8 @@ void insertAsyncComm(
       });
       getBufferIdxAndPhase(builder, nestedInsertionTarget,
                            kv.second.front()->getNumBuffers(),
-                           regionsWithChannels, bufferIdx, phase, config);
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, masterChannel);
 
     } else if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
       // headProducer can be local_store but bufferIdx will be used
@@ -1964,7 +1958,8 @@ void insertAsyncComm(
       });
       getBufferIdxAndPhase(builder, headProducer,
                            kv.second.front()->getNumBuffers(),
-                           regionsWithChannels, bufferIdx, phase, config);
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, masterChannel);
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
@@ -2405,7 +2400,17 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
       ReuseGroup group;
-      group.channels = kv.second;
+      // make sure the channel without buffer.offset is the first one (i.e the
+      // representative channel)
+      std::vector<Channel *> ordered(kv.second);
+      std::stable_partition(ordered.begin(), ordered.end(), [](Channel *ch) {
+        auto bufferOffset =
+            ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
+        if (bufferOffset)
+          return false;
+        return true;
+      });
+      group.channels = ordered;
       LDBG("ReuseGroup with size " << kv.second.size() << " buffer.id "
                                    << kv.first << "\n");
       config.groups.push_back(group);

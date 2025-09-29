@@ -43,6 +43,7 @@ unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
                       unsigned requestedRegisters) {
   assert(asyncTaskId != 0 && "producer group should not request registers");
   // TODO: scan ops to estimate register usage
+  // only tma loads, or tma stores, or gen5
   return requestedRegisters == 0 ? 232 : requestedRegisters;
 }
 
@@ -248,7 +249,9 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            AsyncTaskId asyncTaskId) {
   // Create newForOp for each task Id.
   auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
-  if (asyncTaskId == 5) { // HACK
+  // This is for the epilogue partition.
+  const unsigned EpiloguePartition = 3;
+  if (asyncTaskId == EpiloguePartition) { // HACK tracked in T238592410
     auto parentForOp = forOp->getParentOfType<scf::ForOp>();
     if (!parentForOp) {
       usedArgs.pop_back();
@@ -414,7 +417,12 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   for (AsyncTaskId asyncTaskId : nTaskIds) {
     if (asyncTaskId == 0)
       continue;
-    partitionNumWarps.push_back(4);
+    // HACK: hardcode 1,2,3 with 1 warp
+    // TODO: check TritonGPUAllocateWarpGroups
+    if (asyncTaskId == 1 || asyncTaskId == 2 || asyncTaskId == 3)
+      partitionNumWarps.push_back(4);
+    else
+      partitionNumWarps.push_back(4);
   }
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
@@ -459,7 +467,11 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     taskBuilder.create<ttg::WarpReturnOp>(loc);
     auto regAlloc =
         scanRegUsage(partitionBlock, asyncTaskId, requestedRegisters);
-    estRegUsage.push_back(regAlloc);
+    // HACK: first partition has idx of 2
+    if (idx == 2 || idx == 3 || idx == 4)
+      estRegUsage.push_back(24);
+    else
+      estRegUsage.push_back(192);
   }
 
   // The default region doesn't request registers.

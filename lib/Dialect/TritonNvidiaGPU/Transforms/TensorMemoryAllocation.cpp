@@ -390,11 +390,11 @@ allocateTMem(Operation *parentOp,
 } // anonymous namespace
 
 int allocateTMemWithInterval(
-    DenseMap<Operation *, Interval<int>> &allocToIntervals) {
+    DenseMap<Operation *, Interval<int>> &allocToIntervals,
+    SmallVector<Operation *> &allocOrder) {
   SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
   RowIdConstraints rowIdConstraints;
-  for (auto kv : allocToIntervals) {
-    Operation *op = kv.first;
+  for (auto *op : allocOrder) {
     if (auto alloc = dyn_cast<triton::nvidia_gpu::TMEMAllocOp>(op)) {
       allocs.push_back(alloc);
     }
@@ -429,9 +429,8 @@ int allocateTMemWithInterval(
   DenseMap<TMEMAllocOp, TMemChunk> allocChunks;
   // Implement a linear scan first fit algorithm. We expect that fragmentation
   // won't be a problem, if it is this should be revisited.
-  for (auto kv : allocToIntervals) {
-    Operation *op = kv.first;
-    auto liveInterval = kv.second;
+  for (auto *op : allocOrder) {
+    auto liveInterval = allocToIntervals[op];
     auto alloc = cast<triton::nvidia_gpu::TMEMAllocOp>(op);
     SmallVector<TMemChunk> coexistingChunks;
     auto memDescType = alloc.getType();
