@@ -1707,6 +1707,16 @@ void insertAsyncComm(
     llvm_unreachable("error in isAinNestedRegion");
   };
 
+  // Get the first OP for A that is on the same level
+  // as B. This assumes B is not nested inside A.
+  auto getAUnnestedParent = [](Operation *A, Operation *B) -> Operation * {
+    while (A && A->getParentOp() != B->getParentOp()) {
+      A = A->getParentOp();
+    }
+    assert(A != nullptr && "A must be nested inside B or at the same level");
+    return A;
+  };
+
   mlir::DominanceInfo dom(funcOp);
   mlir::PostDominanceInfo pdom(funcOp);
   auto consumerReleaseHeuristic = [&](Operation *p, Operation *c,
@@ -1911,7 +1921,7 @@ void insertAsyncComm(
       tOps.insert(headProducer);
       tmaHeadProducer = getFirstOpInBlock(tOps);
     }
-    bool isProducerNested = false;
+    Operation *nestedInsertionTarget = nullptr;
     // Check to see if producer and consumer are in the same block.
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
@@ -1919,7 +1929,11 @@ void insertAsyncComm(
       int regionCmp = isAinNestedRegion(headProducer, headConsumer);
       // headProducer is in nested region
       // TODO: Is a nested consumer properly supported?
-      isProducerNested = regionCmp < 0;
+      if (regionCmp < 0) {
+        assert(isa<ttng::TCGen5MMAOp>(headProducer) &&
+               "Only TCGen5MMAOp supported");
+        nestedInsertionTarget = getAUnnestedParent(headProducer, headConsumer)
+      }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
       if (!appearsBefore(headProducer, headConsumer)) {
@@ -1928,7 +1942,19 @@ void insertAsyncComm(
         continue; // FIXME: skip this channel for now.
       }
     }
-    if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
+    if (nestedInsertionTarget) {
+      // If the producer is nested we need to pull the buffer + index
+      // calculation to after the loop
+      builder.setInsertionPoint(nestedInsertionTarget);
+      LLVM_DEBUG({
+        LDBG("call getBufferIdxAndPhase3 ");
+        nestedInsertionTarget->dump();
+      });
+      getBufferIdxAndPhase(builder, nestedInsertionTarget,
+                           kv.second.front()->getNumBuffers(),
+                           regionsWithChannels, bufferIdx, phase, config);
+
+    } else if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
       // headProducer can be local_store but bufferIdx will be used
       // by tmaLoad as well.
       builder.setInsertionPoint(tmaHeadProducer);
