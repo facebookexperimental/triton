@@ -315,6 +315,15 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
     };
 
+    // HACK: Indicate that all DescriptorLoadOp will be set to SWP stages=2.
+    // In the future, we should have better decision making, ideally based on
+    // the memory planner.
+    auto opNumStages = [&](Operation &op) {
+      if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
+        return 2;
+      return 1;
+    };
+
     // If there are no latency ops or all latency ops are in the same stage, we
     // don't need to pipeline the loop. Return a new schedule with everything
     // assigned to the same stage.
