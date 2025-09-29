@@ -467,8 +467,8 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     taskBuilder.create<ttg::WarpReturnOp>(loc);
     auto regAlloc =
         scanRegUsage(partitionBlock, asyncTaskId, requestedRegisters);
-    // HACK:
-    if (idx == 1 || idx == 2 || idx == 3)
+    // HACK: first partition has idx of 2
+    if (idx == 2 || idx == 3 || idx == 4)
       estRegUsage.push_back(24);
     else
       estRegUsage.push_back(192);
