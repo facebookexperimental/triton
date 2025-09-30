@@ -812,8 +812,11 @@ void createTokenPost(
           assert(asyncTasks.size() == 1);
           if (asyncTasks[0] == consumerAsyncTaskId) {
             actualConsumers.insert(t);
-            if (!isa<ttng::TCGen5MMAOp>(t) ||
-                producerOp->getBlock() != t->getBlock())
+            // If consumer and producer are not in the same block, but
+            // as long as all consumers are gen5, we can use a gen5 related
+            // barrier such as gen5.commit. Remove producerOp->getBlock() !=
+            // t->getBlock()
+            if (!isa<ttng::TCGen5MMAOp>(t))
               useGen5Barrier = false;
           }
         }
@@ -1477,7 +1480,7 @@ DenseMap<Channel *, Value> createBufferPost(
 // we will add WaitBarrier as consumerWait in the same partition as
 // producerOrConsumer. When asProducerAcquire is true, mmaOp is the consumer,
 // producerOrConsumer is the producer.
-// useConsumerBarrier is the logic for deciding if the barrier should be
+// addCompletionBarrier is the logic for deciding if the barrier should be
 // directly set by the MMA operation. If False we should have generated
 // a tcgen05.commit Operation instead.
 ttng::WaitBarrierOp
@@ -1486,21 +1489,18 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
                   unsigned numBuffers, Operation *producerOrConsumer,
                   DenseSet<Operation *> &regionsWithChannels,
                   mlir::DominanceInfo &dom, bool asProducerAcquire,
-                  ReuseConfig *config, bool useConsumerBarrier) {
+                  ReuseConfig *config, bool addCompletionBarrier) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
-  if (useConsumerBarrier) {
+  if (addCompletionBarrier) {
     auto consumerBarrier =
         getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
     // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
     auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         mmaOp->getLoc(), true, 1);
     mmaOp.addCompletionBarrier(consumerBarrier, pred);
-  } else {
-    assert(!asProducerAcquire &&
-           "tcgen05.MMA consumer requires consumer Barrier");
   }
   mmaOp.setIsAsync(true);
 
@@ -1915,16 +1915,22 @@ void insertAsyncComm(
     }
     Operation *nestedInsertionTarget = nullptr;
     // Check to see if producer and consumer are in the same block.
+    bool producerInNestedRegion = false, consumerInNestedRegion = false;
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
-      // If producer is inside the loop, consumer is outside.
       int regionCmp = isAinNestedRegion(headProducer, headConsumer);
-      // headProducer is in nested region
-      // TODO: Is a nested consumer properly supported?
       if (regionCmp < 0) {
+        // A/producer in nested region. Lift up headProducer till it is
+        // in the same scope as headConsumer.
         assert(isa<ttng::TCGen5MMAOp>(headProducer) &&
                "Only TCGen5MMAOp supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
+        producerInNestedRegion = true;
+      } else if (regionCmp > 0) {
+        // B/consumer in nested region. Lift up headConsumer till it is
+        // in the same scope as headProducer.
+        nestedInsertionTarget = getSameLevelOp(tmaHeadProducer, headConsumer);
+        consumerInNestedRegion = true;
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
@@ -1937,8 +1943,13 @@ void insertAsyncComm(
     int reuseGrp = channelInReuseGroup(masterChannel, config);
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
-      // calculation to after the loop
-      builder.setInsertionPoint(nestedInsertionTarget);
+      // calculation to the lift-up headProducer.
+      if (producerInNestedRegion) {
+        builder.setInsertionPoint(nestedInsertionTarget);
+      } else {
+        assert(consumerInNestedRegion);
+        builder.setInsertionPoint(tmaHeadProducer);
+      }
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase3 ");
         nestedInsertionTarget->dump();
@@ -1947,7 +1958,6 @@ void insertAsyncComm(
                            kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
-
     } else if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
       // headProducer can be local_store but bufferIdx will be used
       // by tmaLoad as well.
@@ -2002,8 +2012,8 @@ void insertAsyncComm(
         });
         // If we have a nested target we cannot use the barrier in the
         // TCGen5MMAOp directly and instead need a tcgen05.commit.
-        bool useConsumerBarrier = nestedInsertionTarget == nullptr;
-        if (!useConsumerBarrier) {
+        bool addCompletionBarrier = nestedInsertionTarget == nullptr;
+        if (!addCompletionBarrier) {
           // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
@@ -2015,7 +2025,7 @@ void insertAsyncComm(
                           *commChannel.producerBarrier, bufferIdx, phase,
                           masterChannel->getNumBuffers(), headConsumer,
                           regionsWithChannels, dom, false, config,
-                          useConsumerBarrier);
+                          addCompletionBarrier);
       }
     }
     // Channel can have multiple consumers.
@@ -2053,10 +2063,18 @@ void insertAsyncComm(
         Operation *producerAcquirePoint = headProducer;
         if (isProducerTMA(masterChannel, isPost))
           producerAcquirePoint = tmaHeadProducer;
+        bool addCompletionBarrier = nestedInsertionTarget == nullptr;
+        if (!addCompletionBarrier) {
+          // We need to place the commit after the for loop.
+          builder.setInsertionPointAfter(nestedInsertionTarget);
+          builder.setAsyncTaskIdsFromOp(mmaOp);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               consumerBarrier);
+        }
         auto tmemWaitBarrier = desyncTCGen5MMAOp(
             builder, mmaOp, consumerBarrier, bufferIdx, phase,
             masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config, true);
+            regionsWithChannels, dom, true, config, addCompletionBarrier);
         tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
@@ -2069,7 +2087,8 @@ void insertAsyncComm(
         // the acquire right before the head producer to avoid
         // reordering the barriers incorrectly. This acquire will
         // be idemponent in the loop becasue we don't flip the phase.
-        auto producerAcquirePoint = tmaHeadProducer;
+        auto producerAcquirePoint =
+            getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
         builder.setInsertionPoint(producerAcquirePoint);
         builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
