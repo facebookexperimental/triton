@@ -154,6 +154,14 @@ public:
             << moduleOp << "\n\n\n";
       }
     }
+
+    doTokenLowering(funcOp, numWarpGroups - 1);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n"
+          << moduleOp << "\n\n\n";
+    }
+
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
@@ -166,19 +174,12 @@ public:
                       "doLoopSchedule\n"
                    << moduleOp << "\n\n\n";
     }
-
-    doTokenLowering(funcOp, numWarpGroups - 1);
     if (true) { //! ForBlackWell) {
       // Clear num_stages to disable SWP.
       funcOp->walk([&](scf::ForOp forOp) {
         forOp->setAttr(mlir::triton::kNumStagesAttrName,
                        builder.getI32IntegerAttr(0));
       });
-    }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n"
-          << moduleOp << "\n\n\n";
     }
   }
 
