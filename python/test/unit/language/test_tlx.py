@@ -1622,6 +1622,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
         responses = tlx.alloc_clc_responses(num_responses=1)
         clc_response = tlx.local_view(responses, 0)
+        tlx.barrier_expect_bytes(clc_mbar, 16)
 
         # CLC issue and wait
         tlx.clc_issue(clc_response, clc_mbar)
@@ -1637,6 +1638,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         tlx.clc_query(clc_response, valid, cta_id_x, cta_id_y, cta_id_z)
         if tid==0:
             tl.device_print("valid: ", valid)
+            tl.device_print("cta_id_x: ", cta_id_x)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode

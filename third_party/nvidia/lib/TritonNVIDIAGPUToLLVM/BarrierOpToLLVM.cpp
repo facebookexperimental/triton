@@ -328,9 +328,15 @@ struct AsyncCLCTryCancelOpConversion
   matchAndRewrite(triton::nvidia_gpu::AsyncCLCTryCancelOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    std::string ptx =
-        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_"
-        "tx::bytes.multicast::cluster::all.b128 [$0], [$1];";
+    std::string ptx = R"(
+    {
+      .reg .u32 lead;
+      .reg .pred p1;
+      mov.u32  lead, %cluster_ctaid.x;
+      setp.u32.eq p1, lead, 0x0;
+      @p1 clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
+    }
+    )";
 
     PTXBuilder ptxBuilder;
     SmallVector<PTXBuilder::Operand *, 2> operands = {
