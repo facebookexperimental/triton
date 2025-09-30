@@ -214,7 +214,6 @@ def _attn_fwd_ws(sm_scale, M,  #
             # -- compute q @ k ----
             # wait for the K buffer to be populated by the producer
             tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
-            tlx.barrier_wait(q_fulls[0], 0)
 
             k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
             _, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
