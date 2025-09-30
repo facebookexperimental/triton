@@ -209,6 +209,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // Compute the longest path to the yield for each operation reachable
   // from any latency operation.
   DenseMap<Operation *, int> distance;
+  // FB Change: Track how many dot ops we have for
+  // heurstic decisions.
+  size_t dotCount = 0;
   std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
     auto it = distance.find(op);
     if (it != distance.end())
@@ -230,6 +233,8 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
     int d = lat + (maxDist < 0 ? 0 : maxDist);
+    if (isa<ttng::MMAv5OpInterface>(op))
+      dotCount++;
     distance[op] = d;
     return d;
   };
@@ -242,12 +247,24 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       maxDistance = d;
   }
 
+  // FB Change: Set a budget based on the distance.
+  const size_t dotHeuristic = 3;
+  const bool useMMAHeurstic = dotCount > dotHeuristic;
+  size_t dotIndex = 0;
+
   // Assign stage to each op reachable from a latency op
   for (auto [op, dist] : distance) {
     // We only schedule ops that are downstream of a latency op
     // (had a non-negative distance due to a latency op).
-    if (dist >= 0)
-      opToStage[op] = maxDistance - dist;
+    if (dist >= 0) {
+      auto stage = maxDistance - dist;
+      if (useMMAHeurstic && dotIndex < dotHeuristic &&
+          isa<ttng::MMAv5OpInterface>(op)) {
+        stage--;
+        dotIndex++;
+      }
+      opToStage[op] = stage;
+    }
   }
 
   auto stages = llvm::make_second_range(opToStage);
