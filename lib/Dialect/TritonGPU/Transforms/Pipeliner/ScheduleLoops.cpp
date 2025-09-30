@@ -248,8 +248,8 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 
   // FB Change: Set a budget based on the distance.
-  const size_t dotHeuristic = 2;
-  const bool useMMAHeurstic = dotCount > (dotHeuristic + 1);
+  const size_t dotHeuristic = 3;
+  const bool useMMAHeurstic = dotCount > dotHeuristic;
   size_t dotIndex = 0;
 
   // Assign stage to each op reachable from a latency op
