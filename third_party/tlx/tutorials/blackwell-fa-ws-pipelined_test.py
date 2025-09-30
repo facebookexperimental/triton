@@ -225,7 +225,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 mBarriers=[qk_fulls[0]],
             )
 
-            tlx.barrier_wait(q_fulls[1], 0)
             tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
             tlx.async_dot(
                 q_tiles[1],
