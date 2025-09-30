@@ -86,9 +86,12 @@ def _attn_fwd_ws(sm_scale, M,  #
     # Alpha/l/m lives in the lower half of qk_buf, and P lives in the upper half.
     p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_v), NUM_MMA_GROUPS * NUM_BUFFERS_QK * 2,
                               tlx.storage_kind.tmem, reuse=qk_tiles)
-    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem, reuse=qk_tiles)
-    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * 2, tlx.storage_kind.tmem, reuse=qk_tiles)
-    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * 4, tlx.storage_kind.tmem, reuse=qk_tiles)
+    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                                  tlx.storage_kind.tmem, reuse=qk_tiles)
+    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                              tlx.storage_kind.tmem, reuse=qk_tiles)
+    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                              tlx.storage_kind.tmem, reuse=qk_tiles)
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
                                 tlx.storage_kind.tmem)
@@ -119,7 +122,8 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                     # -- update output accumulator --
                     tlx.barrier_wait(alpha_fulls[buf_idx_2], phase)
-                    alpha_1 = tlx.local_load(alpha_tiles[buf_idx_2])
+                    # Use alpha[0] for cid=0, and alpha[HEAD_DIM * NUM_BUFFERS_QK] for cid=1
+                    alpha_1 = tlx.local_load(alpha_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK])
                     tlx.barrier_arrive(alpha_empties[buf_idx_2])
 
                     acc = tlx.local_load(acc_tiles[buf_idx_2])
@@ -131,8 +135,10 @@ def _attn_fwd_ws(sm_scale, M,  #
             for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                 # epilogue
                 tlx.barrier_wait(l_fulls[cid], 0)
-                l = tlx.local_load(l_tiles[cid + NUM_MMA_GROUPS])
-                m = tlx.local_load(m_tiles[cid + NUM_MMA_GROUPS * 2])
+                # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
+                # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+                l = tlx.local_load(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1])
+                m = tlx.local_load(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2])
                 m += tl.math.log2(l)
                 offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                 m_ptrs = M + off_hz * N_CTX + offs_m
@@ -173,7 +179,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # -- compute correction factor
                 alpha = tl.math.exp2(m_i - m_ij)
                 tlx.barrier_wait(alpha_empties[qk_bufIdx], qk_phase ^ 1)
-                tlx.local_store(alpha_tiles[qk_bufIdx], alpha[:, None])
+                # Use alpha[0] for cid=0, and alpha[HEAD_DIM * NUM_BUFFERS_QK] for cid=1
+                tlx.local_store(alpha_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK], alpha[:, None])
                 tlx.barrier_arrive(alpha_fulls[qk_bufIdx])
 
                 qk = qk * qk_scale - m_ij[:, None]
@@ -182,7 +189,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 p = p.to(tlx.dtype_of(desc_v))
 
                 # prepare p for the v dot
-                p_bufIdx = qk_bufIdx + NUM_MMA_GROUPS * NUM_BUFFERS_QK
+                # Use p[1] for cid=0, and p[3] for cid=1
+                p_bufIdx = 1 + cid * NUM_MMA_GROUPS * NUM_BUFFERS_QK
                 tlx.local_store(p_tiles[p_bufIdx], p)
                 tlx.barrier_arrive(p_fulls[qk_bufIdx])
 
@@ -191,8 +199,10 @@ def _attn_fwd_ws(sm_scale, M,  #
                 accum_cnt_qk += 1
 
             # prepare l_i for the epilog
-            tlx.local_store(l_tiles[cid + NUM_MMA_GROUPS], l_i[:, None])
-            tlx.local_store(m_tiles[cid + NUM_MMA_GROUPS * 2], m_i[:, None])
+            # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
+            # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+            tlx.local_store(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1], l_i[:, None])
+            tlx.local_store(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2], m_i[:, None])
             tlx.barrier_arrive(l_fulls[cid])
 
         # mma group
@@ -242,7 +252,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                     qk_bufIdx_2 = qk_bufIdx + cid * NUM_BUFFERS_QK
                     tlx.barrier_wait(p_fulls[qk_bufIdx_2], qk_phase)
                     tlx.barrier_wait(acc_fulls[qk_bufIdx_2], qk_phase)
-                    p_bufIdx = qk_bufIdx_2 + NUM_MMA_GROUPS * NUM_BUFFERS_QK
+                    # Use p[1] for cid=0, and p[3] for cid=1
+                    p_bufIdx = 1 + cid * NUM_MMA_GROUPS * NUM_BUFFERS_QK
                     if cid == NUM_MMA_GROUPS - 1:
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
