@@ -548,8 +548,18 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       getBufferIdxAndPhase(builder, op->getLoc(), addRes, numBuffers);
 }
 
+void copyPipelineInfo(Operation *newOp, Operation *sourceOp) {
+  // Copy over pipeline info if it exists. It will for the
+  // innermost loop but won't for anything in the epilogue.
+  if (sourceOp->hasAttr("loop.stage"))
+    newOp->setAttr("loop.stage", sourceOp->getAttr("loop.stage"));
+  if (sourceOp->hasAttr("loop.cluster"))
+    newOp->setAttr("loop.cluster", sourceOp->getAttr("loop.cluster"));
+}
+
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
-                                 Value barrierAlloc, Value bufferIdx) {
+                                 Value barrierAlloc, Value bufferIdx,
+                                 Operation *stageOp) {
   auto context = barrierAlloc.getContext();
   Attribute sharedMemorySpace =
       triton::gpu::SharedMemorySpaceAttr::get(context);
@@ -560,8 +570,12 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
       /*mutableMemory=*/true);
 
   // Create barrierForTMA from barrierAlloc.
-  return builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
+  auto result = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       barrierAlloc.getLoc(), barrierTy, barrierAlloc, bufferIdx);
+  // SWP expects all barriers to be assigned to a stage. This ensures its
+  // consistent with the dependent op.
+  copyPipelineInfo(result, stageOp);
+  return result;
 }
 
 static void setTmemChannelAttr(Operation *op, int channelId,

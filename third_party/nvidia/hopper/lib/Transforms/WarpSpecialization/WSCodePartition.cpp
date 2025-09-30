@@ -1493,7 +1493,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   builder.setAsyncTaskIdsFromOp(mmaOp);
   if (useConsumerBarrier) {
     auto consumerBarrier =
-        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx, mmaOp);
     // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
     auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         mmaOp->getLoc(), true, 1);
@@ -1509,8 +1509,8 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   // is false this wait_barrier serves as consumer_wait.
   builder.setInsertionPoint(producerOrConsumer);
   builder.setAsyncTaskIdsFromOp(producerOrConsumer);
-  auto producerBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  auto producerBarrier = getBarrierForPipelineStage(
+      builder, barrierAlloc, bufferIdx, producerOrConsumer);
   // curPhase = curPhase xor True for emptyBarrier.
   Value phase = inPhase;
   auto loc = producerOrConsumer->getLoc();
@@ -1523,8 +1523,10 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   }
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
-  return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+  auto result = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, producerBarrier, phase);
+  copyPipelineInfo(result, producerOrConsumer);
+  return result;
 
   LLVM_DEBUG({
     LDBG("desync: create wait_barrier for producer ");
@@ -1558,7 +1560,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
       phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
           user->getLoc(), builder.getI32Type(), phase);
       consumerBarrier =
-          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx, user);
     } else {
       // mmaOp can be in a different task from headProducer. Even if user and
       // mma are in the same block and they share the same barrier, but the
@@ -1574,8 +1576,10 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
 
     // TODO: if there are multiple users of the mma op, we need to barrier
     // before the first user.
-    return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+    auto result = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         user->getLoc(), consumerBarrier, phase);
+    copyPipelineInfo(result, user);
+    return result;
   }
 
   llvm_unreachable("Failed to find the consumer of the mma op");

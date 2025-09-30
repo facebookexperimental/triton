@@ -236,8 +236,12 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
                           int reuseGroupIdx, Channel *ch);
 
+// Copy IR attrs that are expected to be in the IR for SWP
+void copyPipelineInfo(Operation *newOp, Operation *sourceOp);
+
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
-                                 Value barrierAlloc, Value bufferIdx);
+                                 Value barrierAlloc, Value bufferIdx,
+                                 Operation *stageOp);
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,

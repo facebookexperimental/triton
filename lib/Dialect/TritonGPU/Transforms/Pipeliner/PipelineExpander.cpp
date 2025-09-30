@@ -185,6 +185,7 @@ bool LoopPipelinerInternal::initializeLoopInfo(
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!stages.contains(&op)) {
       op.emitOpError("not assigned a pipeline stage");
+      // assert(false);
       LDBG("--op not assigned a pipeline stage: " << op << " -> BAIL");
       return false;
     }

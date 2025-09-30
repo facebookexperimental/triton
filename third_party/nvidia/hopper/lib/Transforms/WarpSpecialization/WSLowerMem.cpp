@@ -291,7 +291,7 @@ static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
 
 Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                 Type loadType, Value buffer, Value bufferIdx,
-                                bool mutableMem) {
+                                bool mutableMem, Operation *stageOp) {
   auto context = buffer.getContext();
   auto tensorType = dyn_cast<RankedTensorType>(loadType);
   assert(tensorType);
@@ -313,8 +313,10 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                             sliceType.getEncoding(), sharedMemorySpace,
                             /*mutableMemOry=*/mutableMem);
 
-  return builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
+  auto result = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       buffer.getLoc(), subviewTy, buffer, bufferIdx);
+  copyPipelineInfo(result, stageOp);
+  return result;
 }
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
@@ -339,8 +341,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // first load.
   builder.setInsertionPoint(headProducer);
   builder.setAsyncTaskIdsFromOp(headProducer);
-  auto prodBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  auto prodBarrier = getBarrierForPipelineStage(builder, barrierAlloc,
+                                                bufferIdx, headProducer);
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
   auto expect = builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
       loc, prodBarrier, sizeInBytes, pred);
@@ -349,8 +351,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   Operation *copy = nullptr;
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
     builder.setInsertionPoint(tmaLoad);
-    auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
-                                                    buffer, bufferIdx, true);
+    auto pipelineBuffer = getBufferForPipelineStage(
+        builder, tmaLoad.getType(), buffer, bufferIdx, true, tmaLoad);
     // FIXME: translateTMAIndices
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
@@ -360,12 +362,13 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // Create a wait_barrier before the first consumer.
   builder.setInsertionPoint(headConsumerSameLevel);
   builder.setAsyncTaskIdsFromOp(headConsumer);
-  auto consBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
+  auto consBarrier = getBarrierForPipelineStage(builder, barrierAlloc,
+                                                bufferIdxExtract, headConsumer);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase);
+  copyPipelineInfo(wait, headConsumer);
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
@@ -386,7 +389,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       continue;
     }
     auto pipelineBuffer = getBufferForPipelineStage(
-        builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
+        builder, tmaLoad.getType(), buffer, bufferIdxExtract, false, tmaLoad);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
         loc, tmaLoad.getType(), pipelineBuffer);
 
