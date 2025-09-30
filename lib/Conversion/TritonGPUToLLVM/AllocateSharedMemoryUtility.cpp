@@ -74,14 +74,7 @@ void addAllocationAnnotations(Operation *op) {
 // Function to add shared memory access annotations to all operations that use
 // shared memory
 void addSharedMemoryAnnotations(ModuleOp mod) {
-  // Check if MLIR_ENABLE_DUMP env is set to 1
-  static bool dumpEnabled = []() {
-    if (triton::tools::getBoolEnv("MLIR_ENABLE_DUMP")) {
-      return true;
-    }
-    return false;
-  }();
-  if (!dumpEnabled) {
+  if (!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP")) {
     return;
   }
 
