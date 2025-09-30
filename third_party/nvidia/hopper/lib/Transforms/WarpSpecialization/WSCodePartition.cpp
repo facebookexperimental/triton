@@ -2317,7 +2317,6 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
                   barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels,
                   &config, false);
-  funcOp.dump();
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
@@ -2459,7 +2458,6 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
                   barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels,
                   &config, true);
-  funcOp.dump();
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
