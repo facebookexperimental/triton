@@ -97,7 +97,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                                 tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
-    qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
@@ -171,7 +170,6 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                 tlx.barrier_wait(qk_fulls[qk_bufIdx], qk_phase)
                 qk = tlx.local_load(qk_tiles[qk_bufIdx])
-                tlx.barrier_arrive(qk_empties[qk_bufIdx])
 
                 # compute m_i, p in registers
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -227,7 +225,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 qk_bufIdx, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
                 for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     qk_bufIdx_2 = qk_bufIdx + cid * NUM_BUFFERS_QK
-                    tlx.barrier_wait(qk_empties[qk_bufIdx_2], qk_phase ^ 1)
                     if cid == NUM_MMA_GROUPS - 1:
                         tlx.async_dot(
                             q_tiles[cid],
