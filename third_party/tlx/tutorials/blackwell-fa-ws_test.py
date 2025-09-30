@@ -138,6 +138,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 m_ptrs = M + off_hz * N_CTX + offs_m
                 tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
+                # Reuse the phase from the last iteration, i.e., accum_cnt - 1, so no need
+                # to flip the phase.
                 tlx.barrier_wait(acc_empties[buf_idx + cid * NUM_BUFFERS_QK], phase)
                 acc = tlx.local_load(acc_tiles[cid])
                 acc = acc / l
