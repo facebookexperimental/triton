@@ -86,9 +86,12 @@ def _attn_fwd_ws(sm_scale, M,  #
     # Alpha/l/m lives in the lower half of qk_buf, and P lives in the upper half.
     p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_v), NUM_MMA_GROUPS * NUM_BUFFERS_QK * 2,
                               tlx.storage_kind.tmem, reuse=qk_tiles)
-    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem, reuse=qk_tiles)
-    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * 2, tlx.storage_kind.tmem, reuse=qk_tiles)
-    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * 4, tlx.storage_kind.tmem, reuse=qk_tiles)
+    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                                  tlx.storage_kind.tmem, reuse=qk_tiles)
+    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                              tlx.storage_kind.tmem, reuse=qk_tiles)
+    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+                              tlx.storage_kind.tmem, reuse=qk_tiles)
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
                                 tlx.storage_kind.tmem)
