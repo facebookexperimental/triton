@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include <list>
 #include <unordered_set>
 
@@ -876,6 +877,17 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
     return SmallVector<Operation *>(users.begin(), users.end());
   }
   return {consumerOp};
+}
+
+void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp) {
+  // This assignment is optional because we may call this code
+  // from sections outside the innermost loop.
+  if (oldOp->hasAttr(tt::kLoopStageAttrName))
+    newOp->setAttr(tt::kLoopStageAttrName,
+                   oldOp->getAttr(tt::kLoopStageAttrName));
+  if (oldOp->hasAttr(tt::kLoopClusterAttrName))
+    newOp->setAttr(tt::kLoopClusterAttrName,
+                   oldOp->getAttr(tt::kLoopClusterAttrName));
 }
 
 } // namespace mlir

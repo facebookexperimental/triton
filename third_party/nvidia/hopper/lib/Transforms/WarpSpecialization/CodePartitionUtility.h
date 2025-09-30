@@ -257,6 +257,11 @@ Operation *getSameLevelOp(Operation *p, Operation *c);
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier = true);
+
+// Copy any pipeline info (loop.stage, loop.cluster) from
+// the oldOp to the newOp. This is needed for any operation
+// where the dependency exists without a direct "user".
+void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp);
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
