@@ -56,6 +56,7 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferEmpty, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(waitOp, op);
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
@@ -70,6 +71,7 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
 
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(arriveOp, op);
 }
 
 void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
@@ -81,6 +83,7 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   auto waitOp = builder.create<ttng::WaitBarrierOp>(loc, bufferFull, phase);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(waitOp, op);
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
@@ -91,6 +94,7 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
       builder.create<ttng::ArriveBarrierOp>(loc, bufferEmpty, 1); // emptyCnt);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
+  copyLoopScheduleInfo(arriveOp, op);
 }
 
 void lowerTokenOperations(Operation *parentOp, int numCTAs,
