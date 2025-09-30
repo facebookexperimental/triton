@@ -187,7 +187,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.local_store(p_tiles[p_bufIdx], p)
                 tlx.barrier_arrive(p_fulls[qk_bufIdx])
 
-
                 l_i = l_i * alpha + l_ij
                 m_i = m_ij
                 accum_cnt_qk += 1
@@ -348,7 +347,6 @@ def _attn_fwd_ws(sm_scale, M,  #
             tlx.barrier_expect_bytes(q_fulls[1], 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
             qo_offset_y_split = qo_offset_y + BLOCK_M_SPLIT
             tlx.async_descriptor_load(desc_q, q_tiles[1], [qo_offset_y_split, 0], q_fulls[1])
-
 
             v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
             # wait for the V buffer to be released by the consumer
