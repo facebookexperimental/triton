@@ -2076,8 +2076,10 @@ void insertAsyncComm(
         auto producerAcquirePoint = tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
         builder.setInsertionPoint(producerAcquirePoint);
-        builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-            headProducer->getLoc(), token.second, bufferIdx, phase);
+        auto acquireOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                headProducer->getLoc(), token.second, bufferIdx, phase);
+        copyPipelineInfo(acquireOp, headProducer);
         LLVM_DEBUG({
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
@@ -2143,8 +2145,10 @@ void insertAsyncComm(
           producerCommitPoint->dump();
         });
         builder.setInsertionPointAfter(producerCommitPoint);
-        builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
-            tailProducer->getLoc(), token.second, bufferIdx);
+        auto commitOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                tailProducer->getLoc(), token.second, bufferIdx);
+        copyPipelineInfo(commitOp, tailProducer);
       }
     }
 
@@ -2154,8 +2158,9 @@ void insertAsyncComm(
       if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
-        builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+        auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
+        copyPipelineInfo(waitOp, headConsumer);
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
       }
 
@@ -2165,8 +2170,10 @@ void insertAsyncComm(
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
-        builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-            consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        auto releaseOp =
+            builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        copyPipelineInfo(releaseOp, tailConsumer);
         LLVM_DEBUG({
           LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
           token.second.dump();

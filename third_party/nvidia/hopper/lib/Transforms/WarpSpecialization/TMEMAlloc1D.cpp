@@ -1,3 +1,4 @@
+#include "CodePartitionUtility.h"
 #include "TMEMUtils.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/PassManager.h"
@@ -35,6 +36,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   builder.setAsynTaskIdsFromArray(producerTaskId);
   auto encoding = oldRetType.getEncoding();
   Value expandDimsInput = producer;
+  auto expandDimsOp = expandDimsInput.getDefiningOp();
   unsigned axis = 1;
   auto context = builder.getContext();
   // Handle blocked encoding which isn't a slice attribute.
@@ -64,9 +66,12 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
     auto sliceType = oldRetType.cloneWithEncoding(sliceEnc);
     expandDimsInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
         expandDimsInput.getLoc(), sliceType, expandDimsInput);
+    copyPipelineInfo(expandDimsInput.getDefiningOp(), expandDimsOp);
+    expandDimsOp = expandDimsInput.getDefiningOp();
   }
   auto expandDims = builder.createWithAsyncTaskIds<tt::ExpandDimsOp>(
       producerOp->getLoc(), expandDimsInput, axis);
+  copyPipelineInfo(expandDims, expandDimsOp);
   setExpandedInput(expandDims);
   Operation *allocOp;
   if (allocOpBuffer) {
@@ -94,12 +99,14 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
     auto newTy = ty.cloneWithEncoding(newLayout);
     src = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
         expandDims.getLoc(), newTy, expandDims);
+    copyPipelineInfo(src, expandDims);
   }
   // Generate the store
   Value trueVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(src->getLoc(), 1, 1);
   auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
+  copyPipelineInfo(src, expandDims);
   builder.setAsynTaskIdsFromArray(originTaskIds);
 }
 
@@ -120,12 +127,15 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
       consumer->getLoc(), newExpandType, builder.getType<ttg::AsyncTokenType>(),
       allocOp->getResult(0), Value());
+  copyPipelineInfo(loadOp, consumer);
   // Generate the reshape
   auto reshape = builder.createWithAsyncTaskIds<tt::ReshapeOp>(
       consumer->getLoc(), oldInputType.getShape(), loadOp);
+  copyPipelineInfo(reshape, loadOp);
   // Generate a convert layout.
   auto newInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
       consumer->getLoc(), oldInputType, reshape);
+  copyPipelineInfo(newInput, reshape);
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
   builder.setAsynTaskIdsFromArray(originTaskIds);
