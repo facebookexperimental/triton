@@ -1501,9 +1501,6 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
     auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         mmaOp->getLoc(), true, 1);
     mmaOp.addCompletionBarrier(consumerBarrier, pred);
-  } else {
-    assert(!asProducerAcquire &&
-           "tcgen05.MMA consumer requires consumer Barrier");
   }
   mmaOp.setIsAsync(true);
 
@@ -1918,18 +1915,22 @@ void insertAsyncComm(
     }
     Operation *nestedInsertionTarget = nullptr;
     // Check to see if producer and consumer are in the same block.
+    bool producerInNestedRegion = false, consumerInNestedRegion = false;
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
       int regionCmp = isAinNestedRegion(headProducer, headConsumer);
       if (regionCmp < 0) {
-        // A/producer in nested region
+        // A/producer in nested region. Lift up headProducer till it is
+        // in the same scope as headConsumer.
         assert(isa<ttng::TCGen5MMAOp>(headProducer) &&
                "Only TCGen5MMAOp supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
+        producerInNestedRegion = true;
       } else if (regionCmp > 0) {
         // B/consumer in nested region. Lift up headConsumer till it is
-        // in the same scope.
-        nestedInsertionTarget = getSameLevelOp(headProducer, headConsumer);
+        // in the same scope as headProducer.
+        nestedInsertionTarget = getSameLevelOp(tmaHeadProducer, headConsumer);
+        consumerInNestedRegion = true;
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
@@ -1942,8 +1943,13 @@ void insertAsyncComm(
     int reuseGrp = channelInReuseGroup(masterChannel, config);
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
-      // calculation to after the loop
-      builder.setInsertionPoint(nestedInsertionTarget);
+      // calculation to the lift-up headProducer.
+      if (producerInNestedRegion) {
+        builder.setInsertionPoint(nestedInsertionTarget);
+      } else {
+        assert(consumerInNestedRegion);
+        builder.setInsertionPoint(tmaHeadProducer);
+      }
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase3 ");
         nestedInsertionTarget->dump();
