@@ -2072,12 +2072,14 @@ void insertAsyncComm(
         auto producerAcquirePoint = tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
         builder.setInsertionPoint(producerAcquirePoint);
-        builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-            headProducer->getLoc(), token.second, bufferIdx, phase);
+        auto acquireOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                headProducer->getLoc(), token.second, bufferIdx, phase);
         LLVM_DEBUG({
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
         });
+        copyLoopScheduleInfo(acquireOp, headProducer);
       }
 
       if (!commChannel.producerBarrier) {
@@ -2150,9 +2152,10 @@ void insertAsyncComm(
       if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
-        builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+        auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
+        copyLoopScheduleInfo(waitOp, headConsumer);
       }
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
@@ -2161,12 +2164,14 @@ void insertAsyncComm(
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
-        builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-            consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        auto releaseOp =
+            builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                consumerReleasePoint->getLoc(), token.second, bufferIdx);
         LLVM_DEBUG({
           LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
           token.second.dump();
         });
+        copyLoopScheduleInfo(releaseOp, tailConsumer);
       }
     }
 
