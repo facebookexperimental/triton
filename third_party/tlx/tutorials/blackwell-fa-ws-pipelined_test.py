@@ -122,7 +122,8 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                     # -- update output accumulator --
                     tlx.barrier_wait(alpha_fulls[buf_idx_2], phase)
-                    alpha_1 = tlx.local_load(alpha_tiles[buf_idx_2])
+                    # Use alpha[0] for cid=0, and alpha[HEAD_DIM * NUM_BUFFERS_QK] for cid=1
+                    alpha_1 = tlx.local_load(alpha_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK])
                     tlx.barrier_arrive(alpha_empties[buf_idx_2])
 
                     acc = tlx.local_load(acc_tiles[buf_idx_2])
@@ -134,8 +135,10 @@ def _attn_fwd_ws(sm_scale, M,  #
             for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                 # epilogue
                 tlx.barrier_wait(l_fulls[cid], 0)
-                l = tlx.local_load(l_tiles[cid + NUM_MMA_GROUPS])
-                m = tlx.local_load(m_tiles[cid + NUM_MMA_GROUPS * 2])
+                # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
+                # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+                l = tlx.local_load(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1])
+                m = tlx.local_load(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2])
                 m += tl.math.log2(l)
                 offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                 m_ptrs = M + off_hz * N_CTX + offs_m
@@ -174,7 +177,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # -- compute correction factor
                 alpha = tl.math.exp2(m_i - m_ij)
                 tlx.barrier_wait(alpha_empties[qk_bufIdx], qk_phase ^ 1)
-                tlx.local_store(alpha_tiles[qk_bufIdx], alpha[:, None])
+                # Use alpha[0] for cid=0, and alpha[HEAD_DIM * NUM_BUFFERS_QK] for cid=1
+                tlx.local_store(alpha_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK], alpha[:, None])
                 tlx.barrier_arrive(alpha_fulls[qk_bufIdx])
 
                 qk = qk * qk_scale - m_ij[:, None]
@@ -183,7 +187,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 p = p.to(tlx.dtype_of(desc_v))
 
                 # prepare p for the v dot
-                p_bufIdx = qk_bufIdx + NUM_MMA_GROUPS * NUM_BUFFERS_QK
+                # Use p[1] for cid=0, and p[3] for cid=1
+                p_bufIdx = 1 + cid * NUM_MMA_GROUPS * NUM_BUFFERS_QK
                 tlx.local_store(p_tiles[p_bufIdx], p)
                 tlx.barrier_arrive(p_fulls[qk_bufIdx])
 
@@ -192,9 +197,10 @@ def _attn_fwd_ws(sm_scale, M,  #
                 accum_cnt_qk += 1
 
             # prepare l_i for the epilog
-            # Use l[2]/l[3] and m[4][5] to disambigulate from alpha[0]/alpha[1]
-            tlx.local_store(l_tiles[cid + NUM_MMA_GROUPS], l_i[:, None])
-            tlx.local_store(m_tiles[cid + NUM_MMA_GROUPS * 2], m_i[:, None])
+            # Use l[1]/l[1+HEAD_DIM * NUM_BUFFERS_QK] and m[2][2 + HEAD_DIM * NUM_BUFFERS_QK]
+            # to disambigulate from alpha[0]/alpha[HEAD_DIM * NUM_BUFFERS_QK]
+            tlx.local_store(l_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 1], l_i[:, None])
+            tlx.local_store(m_tiles[cid * HEAD_DIM * NUM_BUFFERS_QK + 2], m_i[:, None])
             tlx.barrier_arrive(l_fulls[cid])
 
         # mma group
@@ -207,12 +213,10 @@ def _attn_fwd_ws(sm_scale, M,  #
             k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
             v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
-            tlx.barrier_wait(q_fulls[0], 0)
-            tlx.barrier_wait(q_fulls[1], 0)
-
             # -- compute q @ k ----
             # wait for the K buffer to be populated by the producer
             tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
+            tlx.barrier_wait(q_fulls[0], 0)
 
             k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
             _, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
@@ -225,6 +229,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 mBarriers=[qk_fulls[0]],
             )
 
+            tlx.barrier_wait(q_fulls[1], 0)
             tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
             tlx.async_dot(
                 q_tiles[1],
@@ -241,7 +246,7 @@ def _attn_fwd_ws(sm_scale, M,  #
             tlx.barrier_wait(acc_fulls[0], qk_phase)
             # As p shares the second half of the qk buffer, use p[2]/p[3] instead of p[0]/p[1]
             tlx.async_dot(
-                p_tiles[2],
+                p_tiles[1],
                 kv_tiles[v_bufIdx],
                 acc_tiles[0],
                 use_acc=False,
@@ -300,7 +305,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.barrier_wait(p_fulls[0], qk_phase)
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
                 tlx.async_dot(
-                    p_tiles[2],
+                    p_tiles[1],
                     kv_tiles[v_bufIdx],
                     acc_tiles[0],
                     use_acc=True,
