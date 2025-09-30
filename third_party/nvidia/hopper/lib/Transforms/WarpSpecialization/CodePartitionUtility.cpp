@@ -877,4 +877,5 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
   }
   return {consumerOp};
 }
+
 } // namespace mlir

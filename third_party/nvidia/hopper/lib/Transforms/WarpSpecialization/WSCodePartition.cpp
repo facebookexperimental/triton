@@ -2079,7 +2079,7 @@ void insertAsyncComm(
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
         });
-        copyLoopScheduleInfo(acquireOp, headProducer);
+        copyLoopScheduleInfo(acquireOp, producerAcquirePoint);
       }
 
       if (!commChannel.producerBarrier) {
@@ -2155,7 +2155,7 @@ void insertAsyncComm(
         auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
-        copyLoopScheduleInfo(waitOp, headConsumer);
+        copyLoopScheduleInfo(waitOp, consumerWaitPoint);
       }
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
@@ -2171,7 +2171,7 @@ void insertAsyncComm(
           LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
           token.second.dump();
         });
-        copyLoopScheduleInfo(releaseOp, tailConsumer);
+        copyLoopScheduleInfo(releaseOp, consumerReleasePoint);
       }
     }
 
