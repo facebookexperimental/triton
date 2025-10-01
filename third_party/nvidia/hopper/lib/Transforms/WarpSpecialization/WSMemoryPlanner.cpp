@@ -415,6 +415,29 @@ OperationListT livenessForTmemChannel(Value value,
   return liveOps;
 }
 
+Operation *getInnermostCtrl(Value value, SmallVector<Channel *> &channels) {
+  ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
+      findChannelForAlloc(value, channels));
+  auto tmemAllocOp = cast<ttng::TMEMAllocOp>(TheCh->getAllocOp());
+  DenseSet<Operation *> users;
+  if (TheCh->isOperandD) {
+    for (auto user : tmemAllocOp.getResult().getUsers()) {
+      users.insert(user);
+    }
+  } else {
+    getAllAcutalUsersForChannel(TheCh, users);
+  }
+  Operation *scope = nullptr;
+  for (auto *user : users) {
+    if (scope == nullptr)
+      scope = user;
+    else {
+      scope = getLiftedScope(scope, user);
+    }
+  }
+  return scope;
+}
+
 // Copied from TensorMemoryAllocation.cpp
 static Interval<int> getLiveIntervals(Value value, Liveness &liveness,
                                       DenseMap<Operation *, int> &operationId,
@@ -447,6 +470,27 @@ static Interval<int> getLiveIntervals(Value value, Liveness &liveness,
   return Interval(minId, maxId);
 }
 
+static unsigned allocateTMemAllocs(
+    SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
+    SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allAllocs,
+    DenseMap<Operation *, Interval<int>> &allocToIntervals,
+    DenseMap<Operation *, ttng::TMemAllocation> &allocToSize,
+    DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
+    DenseMap<Operation *, int> &operationId,
+    DenseMap<Operation *, unsigned> &allocToOffsets, Operation *ctrlOp,
+    unsigned bufferId, bool firstRun);
+
+static Interval<int>
+getIntervalForCtrlOp(Operation *ctrlOp,
+                     DenseMap<Operation *, int> &operationId) {
+  // get the operationId of the first instruction
+  auto forOp = cast<scf::ForOp>(ctrlOp);
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    return Interval(operationId[&op], operationId[ctrlOp]);
+  }
+  llvm_unreachable("getIntervalForCtrlOp");
+}
+
 static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
                          unsigned bufferId) {
   SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
@@ -474,17 +518,21 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
 
     ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
         findChannelForAlloc(alloc, channels));
-    if (TheCh->isOperandD)
-      // Heuristics: do not reuse
-      allocToIntervals[alloc.getOperation()] =
-          Interval(0, (int)operationId.size());
-    else
+    if (TheCh->isOperandD) {
+      // Heuristics: do not reuse, extend to cover the ctrlOp
+      Operation *ctrlOp = getInnermostCtrl(alloc, channels);
+      auto updatedInterval = getIntervalForCtrlOp(ctrlOp, operationId);
+      LDBG("update tmem livenss: " << updatedInterval.start() << " "
+                                   << updatedInterval.end());
+      allocToIntervals[alloc.getOperation()] = updatedInterval;
+    } else
       allocToIntervals[alloc.getOperation()] = liveInterval;
     allocToSize.insert(
         {alloc.getOperation(),
          ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
     allocToChannel[alloc.getOperation()] = TheCh;
   }
+  // Divide up allocs if they are used in different ForOps.
   sort(allocs, [&](ttng::TMEMAllocOp a, ttng::TMEMAllocOp b) {
     auto iter1 = allocToSize.find(a.getOperation());
     auto iter2 = allocToSize.find(b.getOperation());
@@ -494,6 +542,35 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       return iter1->second.numRows > iter2->second.numRows;
     assert(false);
   });
+  // Allocation for each ForOp.
+  DenseMap<Operation *, SmallVector<triton::nvidia_gpu::TMEMAllocOp>>
+      forOpToAllocs;
+  for (auto alloc : allocs) {
+    // Innermost forOp containing all users of the channel.
+    Operation *ctrlOp = getInnermostCtrl(alloc, channels);
+    forOpToAllocs[ctrlOp].push_back(alloc);
+  }
+  bool firstRun = true;
+  DenseMap<Operation *, unsigned> allocToOffsets;
+  for (auto &kv : forOpToAllocs) {
+    bufferId = allocateTMemAllocs(kv.second, allocs, allocToIntervals,
+                                  allocToSize, allocToChannel, operationId,
+                                  allocToOffsets, kv.first, bufferId, firstRun);
+    for (auto kv : allocToOffsets)
+      kv.second = 0; // reset offset
+    firstRun = false;
+  }
+}
+
+static unsigned allocateTMemAllocs(
+    SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
+    SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allAllocs,
+    DenseMap<Operation *, Interval<int>> &allocToIntervals,
+    DenseMap<Operation *, ttng::TMemAllocation> &allocToSize,
+    DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
+    DenseMap<Operation *, int> &operationId,
+    DenseMap<Operation *, unsigned> &allocToOffsets, Operation *ctrlOp,
+    unsigned bufferId, bool firstRun) {
   // Heuristics: one copy for each alloc
   // If liveness overlaps, we can't reuse the buffer.
   // Heuristics:
@@ -505,25 +582,41 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
   // fit into TMEM.
   DenseMap<Operation *, Interval<int>> bufferSet;
   Operation *candidateAlloc = nullptr;
-  DenseMap<Operation *, unsigned> allocToOffsets;
   SmallVector<Operation *> allocOrder;
+  if (firstRun) {
+    for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
+      ttng::TMEMAllocOp alloc = *it;
+      if (allocToChannel[alloc.getOperation()]->isOperandD ||
+          allocToChannel[alloc.getOperation()]->isOperandDNoAcc) {
+        bufferSet[alloc.getOperation()] =
+            getIntervalForCtrlOp(ctrlOp, operationId);
+        alloc->setAttr(
+            "buffer.id",
+            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
+                             bufferId));
+        // FIXME: heuristics
+        alloc->setAttr(
+            "buffer.copy",
+            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
+        allocToOffsets[alloc.getOperation()] = 0;
+        allocOrder.push_back(alloc.getOperation());
+        LLVM_DEBUG({
+          LDBG("new buffer.id for channel:");
+          alloc.getOperation()->dump();
+          auto liveInterval = allocToIntervals[alloc.getOperation()];
+          LDBG("new buffer.id liveness: " << liveInterval.start() << " "
+                                          << liveInterval.end());
+        });
+        bufferId++;
+      }
+    }
+  }
   for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
-    ttng::TMEMAllocOp alloc = *it;
-    if (allocToChannel[alloc.getOperation()]->isOperandD ||
-        allocToChannel[alloc.getOperation()]->isOperandDNoAcc) {
-      bufferSet[alloc.getOperation()] = Interval(0, (int)operationId.size());
-      alloc->setAttr("buffer.id",
-                     IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                                      bufferId));
-      // FIXME: heuristics
-      alloc->setAttr(
-          "buffer.copy",
-          IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
-      allocToOffsets[alloc.getOperation()] = 0;
-      allocOrder.push_back(alloc.getOperation());
-      bufferId++;
-    } else if (!candidateAlloc) {
-      candidateAlloc = alloc.getOperation();
+    if (allocToOffsets.count((*it).getOperation()))
+      continue;
+    if (!candidateAlloc) {
+      candidateAlloc = (*it).getOperation();
+      break;
     }
   }
   auto alongDependencyChain = [&](Operation *src, Operation *dst) -> bool {
@@ -536,6 +629,10 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       return true;
     return false;
   };
+  // FIXME: need to keep track of the actual allocations:
+  // -- alloc: reuse baseAlloc with offset
+  // -- allocToOffsets: all baseAllocs
+  // For second forOp in causal mode, qk1 should reuse space of qk0, etc.
   auto findReuseChannel = [&](Operation *cand) -> Operation * {
     // Go through allocs with buffer.id (i.e allocated), check intervals
     // to find an allocated alloc without overlapping intervals and with enough
@@ -565,15 +662,18 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
   int totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
   LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
   if (totalMemorySize > 512)
-    return;
+    return bufferId;
   while (bufferSet.size() != allocs.size()) {
     // Decide if we need to reuse buffer for candidateAlloc.
     // Choose an interval for candidateAlloc based on the decision.
     LLVM_DEBUG({
       LDBG("try to allocate space for:");
       candidateAlloc->dump();
+      auto liveInterval = allocToIntervals[candidateAlloc];
+      LDBG("candidate liveness: " << liveInterval.start() << " "
+                                  << liveInterval.end());
     });
-    bufferSet[candidateAlloc] = Interval(0, (int)operationId.size());
+    bufferSet[candidateAlloc] = getIntervalForCtrlOp(ctrlOp, operationId);
     allocOrder.push_back(candidateAlloc);
     totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
     LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
@@ -639,6 +739,7 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
         break;
       }
   }
+  return bufferId;
 }
 
 void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
@@ -652,6 +753,19 @@ void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
   }
   if (channels.empty()) {
     return;
+  }
+  for (auto *ch : channels) {
+    LLVM_DEBUG({
+      LDBG("\nchannel with allocOp: " << static_cast<int>(ch->channelKind)
+                                      << " " << ch->uniqID << " ");
+      ch->getAllocOp()->dump();
+    });
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      ttng::TmemDataChannelPost *TheCh =
+          static_cast<ttng::TmemDataChannelPost *>(ch);
+      LDBG("channel type TMEM" << TheCh->isOperandD << " "
+                               << TheCh->isOperandDNoAcc);
+    }
   }
   // Step 2: figure out smem/tmem sizes and liveness.
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
