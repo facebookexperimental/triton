@@ -510,17 +510,22 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   builder.setInsertionPoint(yieldOp);
   unsigned tSize = body->getNumArguments();
   // Pass argument value as yield. This will be fixed in the caller.
-  for (unsigned i = 0; i < numAccumCnts; i++)
-    for (unsigned j = 0; j < numStages; j++)
+  auto startIndex = tSize - (numAccumCnts * numStages);
+  for (unsigned i = 0; i < numAccumCnts; i++) {
+    auto accumCntOffset = i * numStages;
+    for (unsigned j = 0; j < numStages; j++) {
+      auto stageOffset = j;
       yieldOp->insertOperands(
           yieldOp.getNumOperands(),
-          {body->getArgument(tSize - (numAccumCnts * numStages) +
-                             (i * numStages) + j)});
+          {body->getArgument(startIndex + accumCntOffset + stageOffset)});
+    }
+  }
 
   // Step 3: Create loop arguments for the new ForOp.
   SmallVector<Value> newLoopArgs;
   for (auto operand : forOp.getInitArgs())
     newLoopArgs.push_back(operand);
+  builder.setInsertionPoint(forOp);
   for (unsigned i = 0; i < numAccumCnts; i++)
     for (unsigned j = 0; j < numStages; j++)
       newLoopArgs.push_back(initialAccums[i]);
