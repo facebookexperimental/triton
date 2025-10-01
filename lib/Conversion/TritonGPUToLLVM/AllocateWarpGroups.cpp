@@ -67,17 +67,6 @@ struct AllocateWarpGroups
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    // HACK: tracked by T239590507
-    mod.walk([&](WarpSpecializeOp op) {
-      SmallVector<int32_t> partitionNumWarps(op.getPartitionNumWarps());
-      // if we have 5 partitions, try to set to [0, 1, 2] to 1.
-      if (partitionNumWarps.size() == 5) {
-        partitionNumWarps[0] = 1;
-        partitionNumWarps[1] = 1;
-        partitionNumWarps[2] = 1;
-      }
-      op.setPartitionNumWarps(partitionNumWarps);
-    });
     // First determine the maximum number of extra warps.
     int maxExtraWarps = 0;
     mod.walk([&](WarpSpecializeOp op) {
