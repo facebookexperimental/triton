@@ -56,7 +56,8 @@ Operation *ChannelPost::getSrcOp() {
 }
 
 static void getAllConsumers(ChannelPost *ch,
-                            SmallVector<Operation *> &consumers) {
+                            SmallVector<Operation *> &consumers,
+                            bool sameBlock = true) {
   for (auto usr : ch->allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -69,8 +70,9 @@ static void getAllConsumers(ChannelPost *ch,
   auto taskIds = getAsyncTaskIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
     auto taskIds2 = getAsyncTaskIds(consumers[i]);
-    assert(taskIds == taskIds2 &&
-           consumers[i]->getBlock() == consumers[0]->getBlock());
+    assert(taskIds == taskIds2);
+    if (sameBlock)
+      assert(consumers[i]->getBlock() == consumers[0]->getBlock());
   }
 }
 
@@ -121,7 +123,7 @@ Operation *ChannelPost::getDstOpLast() {
 }
 
 void ChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
-  getAllConsumers(this, dsts);
+  getAllConsumers(this, dsts, false);
 }
 
 static bool isTmemProducer(Operation *allocOp, Operation *user) {
@@ -830,7 +832,8 @@ Operation *getSameLevelOp(Operation *p, Operation *c) {
     }
     op = op->getParentOp();
   }
-  llvm_unreachable("Failed to find consumer's same level Op with producer");
+  return nullptr;
+  // llvm_unreachable("Failed to find consumer's same level Op with producer");
 };
 
 // When the consumer is a local_alloc loading from shared memory to registers,

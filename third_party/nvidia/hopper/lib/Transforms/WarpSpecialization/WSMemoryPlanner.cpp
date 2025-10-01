@@ -97,6 +97,23 @@ static void updateLiveOpsInOneBlock(Channel *TheCh, OperationListT &liveOps) {
   }
 }
 
+// Lift up scope of b till it contains a.
+static Operation *getLiftedScope(Operation *a, Operation *b) {
+  DenseSet<Operation *> parentScopes;
+  Operation *op = a;
+  while (!isa<triton::FuncOp>(op)) {
+    parentScopes.insert(op);
+    op = op->getParentOp();
+  }
+  op = b;
+  while (!isa<triton::FuncOp>(op)) {
+    if (parentScopes.count(op))
+      return op;
+    op = op->getParentOp();
+  }
+  return nullptr;
+}
+
 static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
                                       OperationListT &liveOps) {
   DenseSet<Operation *> userScopes; // users in the same scope
@@ -111,14 +128,41 @@ static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
       // lifted "scope". Otherwise, we can lift up "user" to be in the same
       // scope as "scope", return scope.
       auto *sameLevel = getSameLevelOp(user, scope);
-      if (sameLevel != scope) {
+      if (sameLevel && sameLevel != scope) {
         // user stays unchanged, scope gets lifted to sameLevel.
         userScopes.clear();
         userScopes.insert(sameLevel);
         userScopes.insert(user);
-      } else {
+      } else if (sameLevel) {
         // scope stays unchanged, user gets lifted.
         userScopes.insert(getSameLevelOp(scope, user));
+      } else { // user and scope in different blocks, lift both.
+        // find the parent scope that include both scope and user
+        auto *parentScope = getLiftedScope(scope, user);
+        userScopes.clear();
+        assert(parentScope);
+        Operation *op = user;
+        Operation *liftedUser = nullptr;
+        while (!isa<triton::FuncOp>(op)) {
+          if (op->getParentOp() == parentScope) {
+            liftedUser = op;
+            break;
+          }
+          op = op->getParentOp();
+        }
+        assert(liftedUser);
+        userScopes.insert(liftedUser);
+        op = scope;
+        Operation *liftedScope = nullptr;
+        while (!isa<triton::FuncOp>(op)) {
+          if (op->getParentOp() == parentScope) {
+            liftedScope = op;
+            break;
+          }
+          op = op->getParentOp();
+        }
+        assert(liftedScope);
+        userScopes.insert(liftedScope);
       }
     }
     first = false;
