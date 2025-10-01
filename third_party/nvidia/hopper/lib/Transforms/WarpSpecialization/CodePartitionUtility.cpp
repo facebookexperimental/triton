@@ -314,7 +314,6 @@ unsigned getAccumCnts(Operation *ctrlOp,
 unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
                         const DenseSet<Operation *> &regionsWithChannels,
                         ReuseConfig *config, int reuseGroupIdx) {
-  std::cout << "REACHED HERE" << std::endl;
   if (reuseGroupIdx >= 0) {
     auto cnts = getAccumCnts(parentForOp, regionsWithChannels, nullptr);
     for (unsigned idx = 0; idx < reuseGroupIdx; ++idx) {
@@ -330,7 +329,6 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   parentForOp->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
     // This will walk parentForOp.
     if (subOp == ctrlOp) {
-      ctrlOp->dump();
       ctrlId = preOrderId;
       found = true;
     }
@@ -481,8 +479,23 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
   unsigned accumArgId = getAccumArgIdx(parentForOp, pOp, regionsWithChannels,
                                        config, reuseGroupIdx);
-  Value accumCnt =
-      parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
+  unsigned numStages = 1;
+  if (parentForOp->hasAttr("tt.schedule_max_stage")) {
+    numStages = parentForOp->getAttrOfType<IntegerAttr>("tt.schedule_max_stage")
+                    .getInt() +
+                1;
+  }
+  unsigned stageOffset = numStages - 1;
+  if (op->hasAttr("tt.num_stages")) {
+    unsigned stageOffset =
+        op->getAttrOfType<IntegerAttr>("tt.num_stages").getInt();
+  }
+  accumArgId = (accumArgId * numStages) + stageOffset;
+  auto argIndex = tSize - parentTCnts + accumArgId;
+  if (argIndex >= tSize) {
+    LDBG("Error");
+  }
+  Value accumCnt = parentForOp.getBody()->getArgument(argIndex);
 
   LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
                                      << pOp << " " << tSize << " "

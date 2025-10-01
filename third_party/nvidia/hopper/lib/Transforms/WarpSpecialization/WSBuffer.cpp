@@ -724,8 +724,14 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     initialAccums.push_back(prevAccum);
   }
 
-  // TODO: Replace with actual stage info.
-  scf::ForOp newForOp = createNewLoop(origForOp, parentForOp, initialAccums, 3);
+  unsigned numStages = 1;
+  if (origForOp->hasAttr("tt.schedule_max_stage")) {
+    numStages = origForOp->getAttrOfType<IntegerAttr>("tt.schedule_max_stage")
+                    .getInt() +
+                1;
+  }
+  scf::ForOp newForOp =
+      createNewLoop(origForOp, parentForOp, initialAccums, numStages);
   LLVM_DEBUG({
     LDBG("after createNewLoop ");
     newForOp.dump();
