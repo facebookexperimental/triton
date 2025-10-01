@@ -4,7 +4,7 @@ import torch
 import re
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_blackwell, is_hopper, is_hip
+from triton._internal_testing import is_hopper_or_newer, is_blackwell, is_hopper, is_hip, is_cuda
 import triton.language.extra.tlx as tlx
 from typing import Optional
 import traceback
@@ -1670,3 +1670,46 @@ def test_async_tasks_region_error(device):
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
     assert "ZeroDivisionError('division by zero')" in exc_msg, '\n\nExpected ZeroDivisionError but got: \n\n' + exc_msg + '\n\n'
+
+
+@pytest.mark.skipif(
+    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Requires compute capability >= 9 for NV",
+)
+@pytest.mark.parametrize("BLOCK_SIZE", [(64)])
+def test_local_index(BLOCK_SIZE, device):
+
+    @triton.jit
+    def local_index(
+        x_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x_ptr_offsets = x_ptr + offsets
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+        tlx.async_load(x_ptr_offsets, buffers[0], mask=mask)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        s = tl.zeros((1, ), dtype=tl.float32)
+        for i in range(0, BLOCK_SIZE):
+            s += tlx.local_load(buffers[0][i])
+
+        # tl.store(output_ptr, s)
+        # Store using block addressing - broadcast the sum to all elements in the block
+        output_offsets = output_ptr + offsets
+        s_broadcasted = tl.broadcast_to(s, (BLOCK_SIZE, ))
+        tl.store(output_offsets, s_broadcasted, mask=mask)
+
+    torch.manual_seed(0)
+    x = torch.tensor([1, 2, 3, 4], dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    local_index[grid](x, output, n_elements, BLOCK_SIZE)
+    # torch.testing.assert_close(y, output)
