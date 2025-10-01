@@ -233,8 +233,12 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
     int d = lat + (maxDist < 0 ? 0 : maxDist);
-    if (isa<ttng::MMAv5OpInterface>(op))
+    if (isa<ttng::MMAv5OpInterface>(op)) {
+      if (dotCount != 2) {
+        d = 1;
+      }
       dotCount++;
+    }
     distance[op] = d;
     return d;
   };
@@ -248,37 +252,47 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 
   // FB Change: Set a budget based on the distance.
-  const size_t dotHeuristic = 3;
-  const bool useMMAHeurstic = dotCount > dotHeuristic;
+  const bool useMMAHeurstic = true;
   size_t dotIndex = 0;
 
   // Assign stage to each op reachable from a latency op
+  DenseMap<Operation *, int> mmaMap;
   for (auto [op, dist] : distance) {
     // We only schedule ops that are downstream of a latency op
     // (had a non-negative distance due to a latency op).
     if (dist >= 0) {
       auto stage = maxDistance - dist;
-      if (useMMAHeurstic && dotIndex < dotHeuristic &&
-          isa<ttng::MMAv5OpInterface>(op)) {
-        stage--;
+      if (useMMAHeurstic && isa<ttng::MMAv5OpInterface>(op)) {
+        if (dotIndex == 0) {
+          mmaMap[op] = 0;
+        }
         dotIndex++;
       }
-      opToStage[op] = stage;
+      opToStage[op] = maxDistance - dist;
     }
   }
 
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
   CoarseSchedule schedule(maxStage + 1);
-  SmallVector<CoarseSchedule::Cluster> clusters(maxStage + 1);
-  for (int i = 0; i <= maxStage; i++) {
+  auto numClusters = maxStage + 1 + 1;
+  SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
+  for (int i = 0; i < numClusters; i++) {
     clusters[i] = schedule.clusters.newAtBack();
   }
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (auto [op, stage] : opToStage)
-    schedule.insert(op, stage, clusters[maxStage - stage]);
+  // FB Change: Hack to place the first MMA in an earlier cluster.
+  for (auto [op, stage] : opToStage) {
+    int index;
+    if (mmaMap.count(op)) {
+      index = mmaMap[op];
+    } else {
+      index = (maxStage - stage) + 1;
+    }
+    schedule.insert(op, stage, clusters[index]);
+  }
 
   // Move `scf.if` ops in the current schedule (forward slice of the latency
   // ops) into a new epilogue cluster at the end of the schedule, pushing them
