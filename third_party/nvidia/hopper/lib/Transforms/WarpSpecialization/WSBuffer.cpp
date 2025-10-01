@@ -725,7 +725,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
 
   // TODO: Replace with actual stage info.
-  scf::ForOp newForOp = createNewLoop(origForOp, parentForOp, initialAccums, 1);
+  scf::ForOp newForOp = createNewLoop(origForOp, parentForOp, initialAccums, 3);
   LLVM_DEBUG({
     LDBG("after createNewLoop ");
     newForOp.dump();
