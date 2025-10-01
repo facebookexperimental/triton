@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include <iostream>
 #include <list>
 #include <unordered_set>
 
@@ -313,6 +314,7 @@ unsigned getAccumCnts(Operation *ctrlOp,
 unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
                         const DenseSet<Operation *> &regionsWithChannels,
                         ReuseConfig *config, int reuseGroupIdx) {
+  std::cout << "REACHED HERE" << std::endl;
   if (reuseGroupIdx >= 0) {
     auto cnts = getAccumCnts(parentForOp, regionsWithChannels, nullptr);
     for (unsigned idx = 0; idx < reuseGroupIdx; ++idx) {
@@ -328,10 +330,9 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   parentForOp->walk<WalkOrder::PreOrder>([&](Operation *subOp) {
     // This will walk parentForOp.
     if (subOp == ctrlOp) {
+      ctrlOp->dump();
       ctrlId = preOrderId;
       found = true;
-      // TODO: Why is this necesssary?
-      return;
     }
     for (auto *op : regionsWithChannels) {
       if (op == subOp) {
