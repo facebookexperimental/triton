@@ -321,8 +321,8 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
       if (needAccumCntForReuse(parentForOp.getOperation(),
                                config->getGroup(idx)))
         ++cnts;
-      return cnts;
     }
+    return cnts;
   }
   // Walk parentForOp in preorder.
   unsigned preOrderId = 0, ctrlId = 0;
