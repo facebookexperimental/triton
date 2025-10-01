@@ -1352,20 +1352,42 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
   });
 
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
-  llvm::MapVector<Value, SmallVector<Channel *>> channelsGroupedByProducers;
+  llvm::MapVector<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
 
   // Group channels by source values
+  // Do not group if they are in different blocks.
+  llvm::MapVector<Value, SmallVector<Channel *>> repChannelsForValue;
   for (auto *channelInOrder : orderedChannels) {
     auto srcValue = channelInOrder->getSrcOperand();
-    channelsGroupedByProducers[srcValue].push_back(channelInOrder);
+    // Find the repChannel for channelInOrder, by checking srcValue and block.
+    Channel *repCh = nullptr;
+    if (repChannelsForValue.count(srcValue)) {
+      for (auto *tCh : repChannelsForValue[srcValue]) {
+        if (tCh->getDstOp()->getBlock() ==
+            channelInOrder->getDstOp()->getBlock()) {
+          repCh = tCh;
+          break;
+        }
+      }
+      if (repCh)
+        channelsGroupedByProducers[repCh].push_back(channelInOrder);
+    }
+    // create a new entry
+    if (!repCh) {
+      repChannelsForValue[srcValue].push_back(channelInOrder);
+      channelsGroupedByProducers[channelInOrder].push_back(channelInOrder);
+    }
   }
 
   mlir::DominanceInfo dom(funcOp);
-  for (auto &[srcValue, channels] : channelsGroupedByProducers) {
+  LDBG("channels in group");
+  for (auto &[repChannel, channels] : channelsGroupedByProducers) {
+    auto srcValue = repChannel->getSrcOperand();
     // Find a common place for all users of the producer, which would be the
     // common dominator.
     std::unordered_set<Channel *> mutuallyNonDominatingUsers;
     for (auto user : channels) {
+      LLVM_DEBUG(user->getDstOp()->dump());
       auto it = mutuallyNonDominatingUsers.begin();
       while (it != mutuallyNonDominatingUsers.end()) {
         if (dom.properlyDominates(user->getDstOp(), (*it)->getDstOp())) {
