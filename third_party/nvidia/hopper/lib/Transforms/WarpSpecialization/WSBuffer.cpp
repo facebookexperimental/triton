@@ -489,7 +489,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
 
 // Handle the forOp given initial accumCnts.
 scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
-                         SmallVector<Value> &initialAccums) {
+                         SmallVector<Value> &initialAccums, int numStages) {
   auto loc = forOp.getLoc();
   Block *body = forOp.getBody();
 
@@ -501,7 +501,9 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
 
   // Step 1: Append accumCnts as forOp arguments.
   for (unsigned i = 0; i < numAccumCnts; i++)
-    body->insertArgument(body->getNumArguments(), builder.getI64Type(), loc);
+    for (unsigned j = 0; j < numStages; j++)
+      // Create 1 copy of the accumCnts for each stage.
+      body->insertArgument(body->getNumArguments(), builder.getI64Type(), loc);
 
   // Step 2: Add accumCnts to yieldOp.
   auto yieldOp = llvm::cast<scf::YieldOp>(body->getTerminator());
@@ -509,17 +511,19 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   unsigned tSize = body->getNumArguments();
   // Pass argument value as yield. This will be fixed in the caller.
   for (unsigned i = 0; i < numAccumCnts; i++)
-    yieldOp->insertOperands(yieldOp.getNumOperands(),
-                            {body->getArgument(tSize - numAccumCnts + i)});
+    for (unsigned j = 0; j < numStages; j++)
+      yieldOp->insertOperands(
+          yieldOp.getNumOperands(),
+          {body->getArgument(tSize - (numAccumCnts * numStages) +
+                             (i * numStages) + j)});
 
   // Step 3: Create loop arguments for the new ForOp.
   SmallVector<Value> newLoopArgs;
   for (auto operand : forOp.getInitArgs())
     newLoopArgs.push_back(operand);
-  builder.setInsertionPoint(forOp);
-  for (unsigned i = 0; i < numAccumCnts; i++) {
-    newLoopArgs.append({initialAccums[i]});
-  }
+  for (unsigned i = 0; i < numAccumCnts; i++)
+    for (unsigned j = 0; j < numStages; j++)
+      newLoopArgs.push_back(initialAccums[i]);
 
   // Step 4: Create newForOp and take the region of the original forOp.
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
