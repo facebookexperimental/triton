@@ -76,7 +76,43 @@ static void getAllConsumers(ChannelPost *ch,
   }
 }
 
+// Return an op that encloses both a and b
+static Operation *getCommonScope(Operation *a, Operation *b) {
+  DenseSet<Operation *> parentScopes;
+  Operation *op = a;
+  while (!isa<triton::FuncOp>(op)) {
+    parentScopes.insert(op);
+    op = op->getParentOp();
+  }
+  op = b;
+  while (!isa<triton::FuncOp>(op)) {
+    if (parentScopes.count(op))
+      return op;
+    op = op->getParentOp();
+  }
+  return nullptr;
+}
+
+// Return the lifted "op" that is directly under scope.
+static Operation *getLiftedOp(Operation *op, Operation *scope) {
+  if (op == scope)
+    return op;
+  Operation *liftedUser = nullptr;
+  while (!isa<triton::FuncOp>(op)) {
+    if (op->getParentOp() == scope) {
+      return op;
+    }
+    op = op->getParentOp();
+  }
+  return nullptr;
+}
+
 static bool appearsBefore(Operation *A, Operation *B) {
+  // A and B can be from different blocks.
+  if (A->getBlock() != B->getBlock()) {
+    auto *outScope = getCommonScope(A, B);
+    return appearsBefore(getLiftedOp(A, outScope), getLiftedOp(B, outScope));
+  }
   assert(A->getBlock() == B->getBlock());
   auto block = A->getBlock();
   for (auto &op : block->getOperations()) {
@@ -96,7 +132,7 @@ static bool appearsBefore(Operation *A, Operation *B) {
 // a representative consumer in the channel.
 Operation *ChannelPost::getDstOp() {
   SmallVector<Operation *> consumers;
-  getAllConsumers(this, consumers);
+  getAllConsumers(this, consumers, false);
   if (consumers.size() == 1)
     return consumers[0];
   assert(consumers.size() != 0);
