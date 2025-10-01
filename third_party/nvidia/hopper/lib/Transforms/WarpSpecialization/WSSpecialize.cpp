@@ -450,7 +450,6 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   unsigned idx = 1;
-  SmallVector<int32_t> estRegUsage;
   for (Region *region : wsOp.getPartitionRegions()) {
     AsyncTaskId asyncTaskId = nTaskIds[idx];
     OpBuilderWithAsyncTaskIds taskBuilder(context);
@@ -465,17 +464,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
     taskBuilder.create<ttg::WarpReturnOp>(loc);
-    auto regAlloc =
-        scanRegUsage(partitionBlock, asyncTaskId, requestedRegisters);
-    // HACK: first partition has idx of 2
-    if (idx == 2 || idx == 3 || idx == 4)
-      estRegUsage.push_back(24);
-    else
-      estRegUsage.push_back(192);
   }
-
-  // The default region doesn't request registers.
-  wsOp.setRequestedRegisters(estRegUsage);
 
   // The capture set is the same for every partition region, so now find the
   // captures and thread them in to the regions.

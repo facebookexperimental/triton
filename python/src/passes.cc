@@ -94,6 +94,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonInstrumentConcurrencySanitizer);
   ADD_PASS_WRAPPER_0("add_partition_scheduling",
                      createTritonGPUPartitionScheduling);
+  ADD_PASS_WRAPPER_0("add_optimize_partition_warps",
+                     createTritonGPUOptimizePartitionWarps);
 }
 
 void init_triton_passes_convert(py::module &&m) {
