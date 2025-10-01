@@ -1712,4 +1712,5 @@ def test_local_index(BLOCK_SIZE, device):
     n_elements = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     local_index[grid](x, output, n_elements, BLOCK_SIZE)
-    # torch.testing.assert_close(y, output)
+    y = torch.tensor([10., 10., 10., 10.], device='cuda:0')
+    torch.testing.assert_close(y, output)

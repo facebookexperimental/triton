@@ -158,12 +158,15 @@ def local_view(
     else:
         # Calculate the correct shape for the subview according to create_memdesc_subview logic
         original_shape = local_allocated_buffers.shape
-        if len(original_shape) == 1:
-            # For 1D tensors, subview creates a single element view with shape [1]
-            new_shape = [1]
+        if local_allocated_buffers.type.num == 0:
+            if len(original_shape) == 1:
+                # For 1D tensors, subview creates a single element view with shape [1]
+                new_shape = [1]
+            else:
+                # For multi-dimensional tensors, drop the first dimension
+                new_shape = original_shape[1:]
         else:
-            # For multi-dimensional tensors, drop the first dimension
-            new_shape = original_shape[1:]
+            new_shape = original_shape
 
         return tlx.buffered_tensor(
             view_handle,
