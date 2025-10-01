@@ -200,6 +200,7 @@ public:
             else
               opLatency[&op] += 1;
           }
+          opLatency[&op] = 0;
         }
       }
     }

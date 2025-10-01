@@ -197,21 +197,35 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   // Determine all operations that have a non-zero latency
   SmallVector<Operation *> latOps;
+  // Compute the longest path to the yield for each operation reachable
+  // from any latency operation.
+  DenseMap<Operation *, int> distance;
+  // Map for MMA cluster Hack
+  DenseMap<Operation *, int> mmaMap;
+  int dotCount = 0;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
+    if (opLatency.count(&op)) {
       latOps.push_back(&op);
+      if (isa<ttng::MMAv5OpInterface>(op)) {
+        if (dotCount == 0) {
+          mmaMap[&op] = 0;
+        }
+        if (dotCount < 3) {
+          distance[&op] = 1;
+        } else {
+          distance[&op] = 0;
+        }
+        dotCount++;
+      }
+    }
   }
   // If no latency ops, nothing to schedule
   if (latOps.empty())
     return CoarseSchedule(0);
 
   DominanceInfo domInfo(forOp);
-  // Compute the longest path to the yield for each operation reachable
-  // from any latency operation.
-  DenseMap<Operation *, int> distance;
   // FB Change: Track how many dot ops we have for
   // heurstic decisions.
-  size_t dotCount = 0;
   std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
     auto it = distance.find(op);
     if (it != distance.end())
@@ -228,17 +242,13 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
         maxDist = distUser;
     }
     int lat = 0;
+    if (distance.count(op))
+      return distance[op];
     if (opLatency.count(op))
       lat = opLatency.lookup(op);
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
     int d = lat + (maxDist < 0 ? 0 : maxDist);
-    if (isa<ttng::MMAv5OpInterface>(op)) {
-      if (dotCount != 2) {
-        d = 1;
-      }
-      dotCount++;
-    }
     distance[op] = d;
     return d;
   };
@@ -253,21 +263,12 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 
   // FB Change: Set a budget based on the distance.
   const bool useMMAHeurstic = true;
-  size_t dotIndex = 0;
 
   // Assign stage to each op reachable from a latency op
-  DenseMap<Operation *, int> mmaMap;
   for (auto [op, dist] : distance) {
     // We only schedule ops that are downstream of a latency op
     // (had a non-negative distance due to a latency op).
     if (dist >= 0) {
-      auto stage = maxDistance - dist;
-      if (useMMAHeurstic && isa<ttng::MMAv5OpInterface>(op)) {
-        if (dotIndex == 0) {
-          mmaMap[op] = 0;
-        }
-        dotIndex++;
-      }
       opToStage[op] = maxDistance - dist;
     }
   }
@@ -305,9 +306,10 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If the `scf.if` op itself is a latency op, skip it.
     if (opLatency.contains(ifOp))
       continue;
-    // Ensure this does not create scheduling conflicts by ensuring the forward
-    // slice of the `scf.if` does not contain ops that are already scheduled, as
-    // this will cause the `scf.if` to be scheduled after its dependents.
+    // Ensure this does not create scheduling conflicts by ensuring the
+    // forward slice of the `scf.if` does not contain ops that are already
+    // scheduled, as this will cause the `scf.if` to be scheduled after its
+    // dependents.
     SetVector<Operation *> slice;
     getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
@@ -346,9 +348,9 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
     };
 
-    // If there are no latency ops or all latency ops are in the same stage, we
-    // don't need to pipeline the loop. Return a new schedule with everything
-    // assigned to the same stage.
+    // If there are no latency ops or all latency ops are in the same stage,
+    // we don't need to pipeline the loop. Return a new schedule with
+    // everything assigned to the same stage.
     DenseSet<int> latencyStages;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
