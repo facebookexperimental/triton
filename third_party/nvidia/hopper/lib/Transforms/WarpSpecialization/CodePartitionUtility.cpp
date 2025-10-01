@@ -330,6 +330,8 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
     if (subOp == ctrlOp) {
       ctrlId = preOrderId;
       found = true;
+      // TODO: Why is this necesssary?
+      return;
     }
     for (auto *op : regionsWithChannels) {
       if (op == subOp) {
