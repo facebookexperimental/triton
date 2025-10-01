@@ -492,9 +492,6 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   }
   accumArgId = (accumArgId * numStages) + stageOffset;
   auto argIndex = tSize - parentTCnts + accumArgId;
-  if (argIndex >= tSize) {
-    LDBG("Error");
-  }
   Value accumCnt = parentForOp.getBody()->getArgument(argIndex);
 
   LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
