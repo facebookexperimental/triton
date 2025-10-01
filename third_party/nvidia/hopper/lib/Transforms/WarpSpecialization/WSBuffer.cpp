@@ -725,8 +725,8 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
 
   unsigned numStages = 1;
-  if (origForOp->hasAttr("tt.schedule_max_stage")) {
-    numStages = origForOp->getAttrOfType<IntegerAttr>("tt.schedule_max_stage")
+  if (origForOp->hasAttr("tt.scheduled_max_stage")) {
+    numStages = origForOp->getAttrOfType<IntegerAttr>("tt.scheduled_max_stage")
                     .getInt() +
                 1;
   }

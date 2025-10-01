@@ -474,24 +474,31 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     ReuseConfig *config, int reuseGroupIdx) {
   auto parentForOp = op->getParentOfType<scf::ForOp>();
   auto *pOp = op->getParentOp();
-  // Get parentForOp.arg[pOp]
-  unsigned tSize = parentForOp.getBody()->getArguments().size();
-  unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
-  unsigned accumArgId = getAccumArgIdx(parentForOp, pOp, regionsWithChannels,
-                                       config, reuseGroupIdx);
+
   unsigned numStages = 1;
-  if (parentForOp->hasAttr("tt.schedule_max_stage")) {
-    numStages = parentForOp->getAttrOfType<IntegerAttr>("tt.schedule_max_stage")
-                    .getInt() +
-                1;
+  if (parentForOp->hasAttr("tt.scheduled_max_stage")) {
+    numStages =
+        parentForOp->getAttrOfType<IntegerAttr>("tt.scheduled_max_stage")
+            .getInt() +
+        1;
   }
   unsigned stageOffset = numStages - 1;
-  if (op->hasAttr("tt.num_stages")) {
+  if (op->hasAttr("loop.stage")) {
     unsigned stageOffset =
-        op->getAttrOfType<IntegerAttr>("tt.num_stages").getInt();
+        op->getAttrOfType<IntegerAttr>("loop.stage").getInt();
   }
+
+  // Get parentForOp.arg[pOp]
+  unsigned tSize = parentForOp.getBody()->getArguments().size();
+  unsigned parentTCnts =
+      getAccumCnts(parentForOp, regionsWithChannels, config) * numStages;
+  unsigned accumArgId = getAccumArgIdx(parentForOp, pOp, regionsWithChannels,
+                                       config, reuseGroupIdx);
   accumArgId = (accumArgId * numStages) + stageOffset;
   auto argIndex = tSize - parentTCnts + accumArgId;
+  if (argIndex >= tSize) {
+    LDBG("accumArgId is out of bound");
+  }
   Value accumCnt = parentForOp.getBody()->getArgument(argIndex);
 
   LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
