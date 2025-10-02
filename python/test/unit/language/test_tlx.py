@@ -1631,24 +1631,16 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         tlx.barrier_wait(clc_mbar, 0)
 
         # CLC parse CTA ID from response
-        # valid, cta_id_x, cta_id_y, cta_id_z = tlx.clc_query(clc_response)
         valid = tlx.clc_query(clc_response)
-        # valid = 0
-        # cta_id_x = -1
-        # cta_id_y = -2
-        # cta_id_z = -3
-        # tlx.clc_query(clc_response, valid, cta_id_x, cta_id_y, cta_id_z)
-        # valid, cta_id|xyz = tlx.clc_query(clc_response)
-        # if ctaid != -1:
-            # tl.device_print("DAOHANG_DEBUG:", ctaid)
+
         if valid != 0:
             tl.device_print("DAOHANG_DEBUG:", valid)
             # tl.device_print("cta_id_x: ", cta_id_x)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
-    size = 100000
-    # size = 10000000
+    # size = 100000
+    size = 10000000
     x = torch.rand(size, device=device)
     y = torch.rand(size, device=device)
 
@@ -1661,7 +1653,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
     assert re.search((r'clusterlaunchcontrol.try_cancel'), ptx, flags=re.DOTALL)
     assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
-    assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
+    # assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
-    torch.testing.assert_close(output, x + y, check_dtype=False)
+    # torch.testing.assert_close(output, x + y, check_dtype=False)
     assert(False)

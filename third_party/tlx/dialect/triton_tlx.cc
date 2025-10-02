@@ -459,11 +459,8 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("clc_query",
            [](TritonOpBuilder &self, Value responseAddr
-              // Value valid,
-              //   Value ctaIdX, Value ctaIdY, Value ctaIdZ
-              // ) -> py::tuple {
               ) -> Value {
-             auto op = self.create<ttng::AsyncCLCQueryCancelOp>(responseAddr);
+             return self.create<ttng::AsyncCLCQueryCancelOp>(responseAddr);
 
              //  return op->getResult(0);
              //  return py::make_tuple(0, 1, 2, 3);
@@ -471,7 +468,7 @@ void init_triton_tlx_ir(py::module &&m) {
              //  op.getValid().dump();
              //  op.getValid().dump();
              //  return py::make_tuple(op.getValid(), 0, 0, 0);
-             return op.getValid();
+             //  return op.getValid();
              //  return py::make_tuple(op.getResult(0), op.getResult(1), 0, 0);
              // op->getResult(2), op->getResult(3));
            })
