@@ -205,9 +205,9 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
           loops.push_back(forOp);
       });
 
-      for (scf::ForOp forOp : loops) {
-        mlir::triton::pipelineTMAStores(forOp);
-      }
+      // for (scf::ForOp forOp : loops) {
+      //   mlir::triton::pipelineTMAStores(forOp);
+      // }
     }
   }
 };
