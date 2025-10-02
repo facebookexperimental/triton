@@ -79,8 +79,13 @@ public:
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
 
+    int index = 0;
+
     for (auto [loadOp, dist] : loadOpToIndLevel) {
-      opLatency[loadOp] = loadLatency;
+      opLatency[loadOp] = loadLatency - index;
+      if (index == 0) {
+        index += 1;
+      }
     }
   }
 
