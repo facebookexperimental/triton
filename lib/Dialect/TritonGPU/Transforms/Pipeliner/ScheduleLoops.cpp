@@ -192,9 +192,43 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
 
 // Determine the chain of dots in the given set of users for a dot.
 std::tuple<SmallVector<ttng::MMAv5OpInterface>, bool>
-computeDotChain(ttng::MMAv5OpInterface mmaOp,
+computeDotChain(ttng::MMAv5OpInterface dotOp,
                 DenseSet<ttng::MMAv5OpInterface> seenDots) {
   SmallVector<ttng::MMAv5OpInterface> chain;
+  SmallVector<Operation *> users;
+  std::optional<ttng::MMAv5OpInterface> nextDotOp = dotOp;
+  auto addUsers = [&users](Operation *op) {
+    for (mlir::Value result : op->getResults()) {
+      for (mlir::OpOperand &use : result.getUses()) {
+        auto owner = use.getOwner();
+        if (owner && !isa<scf::YieldOp>(owner)) {
+          users.push_back(use.getOwner());
+        }
+      }
+    }
+  };
+  while (nextDotOp.has_value()) {
+    ttng::MMAv5OpInterface activeDotOp = nextDotOp.value();
+    chain.push_back(activeDotOp);
+    nextDotOp = std::nullopt;
+    addUsers(activeDotOp);
+    while (!users.empty()) {
+      auto nextOp = users.pop_back_val();
+      if (auto newDotOp = dyn_cast<ttng::MMAv5OpInterface>(nextOp)) {
+        if (seenDots.count(newDotOp)) {
+          // Already seen dot, not support
+          return {chain, false};
+        }
+        if (nextDotOp.has_value()) {
+          // Not a linear chain
+          return {chain, false};
+        }
+        seenDots.insert(newDotOp);
+        nextDotOp = newDotOp;
+      }
+      addUsers(nextOp);
+    }
+  }
   return {chain, true};
 }
 
@@ -212,10 +246,10 @@ computeDotChain(ttng::MMAv5OpInterface mmaOp,
 // 4. A dot is gated under additional control flow. This is not currently
 // supported.
 // 5. Any type of dot is present that is not a MMAv5OpInterface.
-bool determineIndependentDotChains(
-    scf::ForOp forOp,
-    SmallVector<SmallVector<ttng::MMAv5OpInterface>> &dotChains) {
+std::tuple<SmallVector<SmallVector<ttng::MMAv5OpInterface>>, bool>
+determineIndependentDotChains(scf::ForOp forOp) {
   DenseSet<ttng::MMAv5OpInterface> seenDots;
+  SmallVector<SmallVector<ttng::MMAv5OpInterface>> dotChains;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
       if (seenDots.count(mmaOp)) {
@@ -227,26 +261,38 @@ bool determineIndependentDotChains(
       seenDots.insert(mmaOp);
       auto [dotChain, success] = computeDotChain(mmaOp, seenDots);
       if (!success) {
-        return false;
+        return {dotChains, false};
       }
       dotChains.push_back(dotChain);
     } else if (isa<tt::DotOpInterface>(op)) {
       // Cluster decisions require MMAv5OpInterface
-      return false;
+      return {dotChains, false};
     } else if (isa<scf::IfOp, scf::ForOp>(op)) {
       // Exit with unsupported control flow.
       bool found = false;
-      op.walk([&](ttng::MMAv5OpInterface op) {
+      op.walk([&](tt::DotOpInterface op) {
         found = true;
         // Interrupt the walk early if found
         return mlir::WalkResult::interrupt();
       });
       if (found) {
-        return false;
+        return {dotChains, false};
       }
     }
   }
-  return true;
+  if (dotChains.size() < 2) {
+    // Only 1 chain, ignore.
+    return {dotChains, false};
+  }
+  size_t maxChainLength = 0;
+  for (auto &chain : dotChains) {
+    maxChainLength = std::max(maxChainLength, chain.size());
+  }
+  if (maxChainLength < 2) {
+    // All chains are length 1. Ignore.
+    return {dotChains, false};
+  }
+  return {dotChains, true};
 }
 
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
