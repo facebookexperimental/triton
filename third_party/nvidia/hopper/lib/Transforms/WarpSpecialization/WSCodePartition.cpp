@@ -1523,8 +1523,10 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   }
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
-  return builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+  auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, producerBarrier, phase);
+  copyLoopScheduleInfo(waitOp, producerOrConsumer);
+  return waitOp;
 
   LLVM_DEBUG({
     LDBG("desync: create wait_barrier for producer ");

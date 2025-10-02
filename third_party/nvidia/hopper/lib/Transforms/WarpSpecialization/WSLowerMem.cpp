@@ -355,6 +355,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
         pipelineBuffer, pred);
+    copyLoopScheduleInfo(copy, tmaLoad);
   }
 
   // Create a wait_barrier before the first consumer.
