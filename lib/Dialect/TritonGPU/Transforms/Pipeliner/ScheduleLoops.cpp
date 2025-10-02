@@ -190,6 +190,43 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
   return false;
 }
 
+// Determine the chain of independent dot ops that are present in the body
+// of the loop. This will be used to influence the cluster decisions for placing
+// the dot ops at a maximum distance from each other. This returns a "success"
+// value with the following possible reasons for failure:
+// 1. The loop has <= 1 chain of dot ops. This is not helpful for scheduling
+// decisions.
+// 2. All dots are independent (longest chain is length 1). This is not helpful
+// for scheduling decisions.
+// 3. The chain of dots is not a line (e.g. A->B and A->C or A->C and B->C).
+// This case is too complicated
+//    to currently suppport.
+// 4. A dot is gated under additional control flow. This is not currently
+// supported.
+// 5. Any type of dot is present that is not a MMAv5OpInterface.
+bool determineIndependentDotChains(scf::ForOp forOp) {
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (isa<ttng::MMAv5OpInterface>(op)) {
+      // computeDotChain(op);
+    } else if (isa<tt::DotOpInterface>(op)) {
+      // Cluster decisions require MMAv5OpInterface
+      return false;
+    } else if (isa<scf::IfOp, scf::ForOp>(op)) {
+      // Exit with unsupported control flow.
+      bool found = false;
+      op.walk([&](ttng::MMAv5OpInterface op) {
+        found = true;
+        // Interrupt the walk early if found
+        return mlir::WalkResult::interrupt();
+      });
+      if (found) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency) {
   llvm::MapVector<Operation *, int> opToStage;
