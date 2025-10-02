@@ -252,7 +252,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       lat = opLatency.lookup(op);
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
-    int d = lat + (maxDist < 0 ? 0 : maxDist);
+    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), 2);
     distance[op] = d;
     return d;
   };
