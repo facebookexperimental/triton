@@ -355,7 +355,6 @@ struct AsyncCLCTryCancelOpConversion
 
 struct AsyncCLCQueryCancelOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncCLCQueryCancelOp> {
-  // TODO. check target infor for compute capability >= 100
   using ConvertOpToLLVMPattern<
       triton::nvidia_gpu::AsyncCLCQueryCancelOp>::ConvertOpToLLVMPattern;
   // clc.query_cancel.is_cancel.is_canceled.pred
@@ -364,39 +363,127 @@ struct AsyncCLCQueryCancelOpConversion
   // clc.query_cancel.get_first_ctaid
   // query ctaid from response if succeeds otherwise -1
 
+  // Constraints
+  // getOutputConstraints(ttng::AsyncCLCQueryCancelOp op) const {
+  //   auto resultType = op.getType();
+
+  //   auto outputStructType = dyn_cast<LLVM::LLVMStructType>(resultType);
+  //   uint32_t numOutputRegs = outputStructType.getBody().size();
+  //   std::string output =
+  //       outputStructType.getBody().front().isF32() ? "=f" : "=r";
+  //   return std::vector<std::string>(numOutputRegs, output);
+  // }
+
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::AsyncCLCQueryCancelOp op,
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
 
+    // create LLVM Values for valid, ctaIdX, ctaIdY, ctaIdZ
+    // TritonLLVMOpBuilder b(op.getLoc(), rewriter);
+    // Value valid;
+    // // Value ctaIdX = b.int_val(32, -1);
+    // // Value ctaIdY = b.int_val(32, -2);
+    // // Value ctaIdZ = b.int_val(32, -3);
+    // // Value valid = b.create<LLVM::ConstantOp>(loc, b.i32_val(0));
+
+    // // TritonLLVMOpBuilder b(op.getLoc(), rewriter);
+    // // Value id = getThreadId(rewriter, op.getLoc());
+    // // Value pred = b.icmp_eq(id, b.i32_val(0));
+    // // if (op.getPred())
+    // //   pred = b.and_(pred, adaptor.getPred());
     std::string ptx = R"(
     {
       .reg .pred p1;
       .reg .b128 clc_result;
-      ld.shared.b128 clc_result, [$0];
+      ld.shared.b128 clc_result, [%1];
       clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
-      selp.u32 $1, 1, 0, p1;
-      @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$2, $3, $4, _}, clc_result;
+      selp.u32 %0, 1, 0, p1;
     }
     )";
+    // @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$2, _,
+    // _, _}, clc_result;
 
-    PTXBuilder ptxBuilder;
-    SmallVector<PTXBuilder::Operand *, 5> operands = {
-        ptxBuilder.newOperand(adaptor.getClcResAlloc(), "r"),
-        ptxBuilder.newOperand(
-            adaptor.getValid(),
-            "r"), // 32-bit pred (1-bit will fail PTX compiling)
-        ptxBuilder.newOperand(adaptor.getCtaIdX(), "r"), // 32-bit pred
-        ptxBuilder.newOperand(adaptor.getCtaIdY(), "r"), // 32-bit pred
-        ptxBuilder.newOperand(adaptor.getCtaIdZ(), "r"), // 32-bit pred
-    };
+    PTXBuilder builder;
+    // auto cancelled = builder.newOperand("=r", true);
+    // auto clc_result = builder.newOperand(adaptor.getClcResAlloc(), "r");
+    SmallVector<PTXBuilder::Operand *, 2> operands;
+    operands.push_back(builder.newOperand("=r", true));
+    operands.push_back(builder.newOperand(adaptor.getClcResAlloc(), "r"));
 
-    auto queryOp = *ptxBuilder.create<>(ptx);
-    queryOp(operands, /*onlyAttachMLIRArgs=*/true);
+    auto queryOp = *builder.create<>(ptx);
+
+    // queryOp(cancelled, clc_result);
+    queryOp(operands, /*onlyAttachMLIRArgs=*/false);
+
     auto voidTy = void_ty(getContext());
-    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
-    rewriter.eraseOp(op);
+    builder.launch(rewriter, op.getLoc(), voidTy);
+
+    rewriter.replaceOp(op, builder.getAllMLIRArgs()[0]);
+
+    // auto ptxOutputs = getPtxOutputs(outputConstraints, ptxBuilder);
+    // auto ptxOperands =
+    //     getPtxOperands(operandsAndConstraints, ptxBuilder, loc, rewriter);
+
+    // SmallVector<PTXBuilder::Operand *> outputAndOperands = {
+    //     ptxBuilder.newOperand(adaptor.getClcResAlloc(), "r"),
+    //     ptxBuilder.newOperand("=r"),
+    //     // ptxBuilder.newOperand(ctaIdX,
+    //     // "r"), ptxBuilder.newOperand(ctaIdY, "r"),
+    //     // ptxBuilder.newOperand(ctaIdZ, "r"),
+    //     // ptxBuilder.newOperand(
+    //     //     adaptor.getValid(),
+    //     //     "r"), // 32-bit pred (1-bit will fail PTX compiling)
+    //     // ptxBuilder.newOperand(adaptor.getCtaIdX(), "r"), // 32-bit pred
+    //     // ptxBuilder.newOperand(adaptor.getCtaIdY(), "r"), // 32-bit pred
+    //     // ptxBuilder.newOperand(adaptor.getCtaIdZ(), "r"), // 32-bit pred
+    // };
+
+    // SmallVector<PTXBuilder::Operand *> operands;
+    // operands.push_back(builder.newOperand("=r"));
+    // operands.push_back(builder.newOperand(adaptor.getClcResAlloc(), "r"));
+
+    // auto queryOp = *ptxBuilder.create<>(ptx);
+    // queryOp(operands, /*onlyAttachMLIRArgs=*/true);
+
+    // auto res = ptxBuilder.launch(rewriter, op.getLoc(), i32_ty, false);
+
+    // Value c1 = b.int_val(32, 1);
+    // Value c0 = b.int_val(32, 0);
+
+    // if (res == Value()) {
+    //   rewriter.replaceOp(op, c0);
+    // } else {
+    //   rewriter.replaceOp(op, c1);
+    // }
+
+    // auto voidTy = void_ty(getContext());
+    // ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
+    // rewriter.eraseOp(op);
+
+    // auto dst = ptxBuilder.newOperand(valid, "=r");
+    // auto src = ptxBuilder.newOperand(adaptor.getClcResAlloc(), "r");
+    // queryOp(dst, src);
+
+    // ptxBuilder.launch(rewriter, op.getLoc(), f32_ty, false);
+
+    // rewriter.eraseOp(op);
+    // SmallVector<Value> retVals; // valid, ctaIdX, ctaIdY, ctaIdZ
+    // retVals.push_back(valid);
+    // retVals.push_back(ctaIdX);
+    // retVals.push_back(ctaIdY);
+    // retVals.push_back(ctaIdZ);
+
+    // auto resultTy = cast<RankedTensorType>(op.getType());
+
+    // pack and replace
+    // Value ret = packLLElements(loc, typeConverter, retVals, rewriter,
+    // resultTy);
+
+    // rewriter.replaceOp(op, {valid, ctaIdX, ctaIdY, ctaIdZ});
+    // rewriter.replaceOp(op, valid);
+    //  rewriter.eraseOp(op);
     return success();
   }
 };

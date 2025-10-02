@@ -1258,12 +1258,14 @@ class tensor(base_value):
 
 
 def _type_for_tuple_values(values, fields=None):
+    # import pdb; pdb.set_trace()
     return tuple_type([constexpr_type(x) if isinstance(x, (int, float, dtype)) else x.type for x in values], fields)
 
 
 class tuple(base_value):
 
     def __init__(self, args: Sequence, type: Optional[tuple_type] = None):
+        # import pdb; pdb.set_trace()
         self.values = [i for i in args]
         if isinstance(type, tuple_type):
             self.type = type

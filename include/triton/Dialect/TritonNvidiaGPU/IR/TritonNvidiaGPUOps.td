@@ -321,14 +321,12 @@ def TTNG_AsyncCLCQueryCancelOp : TTNG_Op<"async_clc_query_cancel", []> {
   }];
 
   let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc,
-    I32:$valid,
-    I32:$ctaIdX,
-    I32:$ctaIdY,
-    I32:$ctaIdZ
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc
   );
 
-  let assemblyFormat = "$clcResAlloc`,` $valid`,` $ctaIdX`,` $ctaIdY`,` $ctaIdZ attr-dict `:` type(operands)";
+  let results = (outs I32:$valid);
+
+  let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $valid)";
 }
 
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {

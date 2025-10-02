@@ -40,20 +40,21 @@ def clc_issue(
 @tl.builtin
 def clc_query(
     clc_response_addr: tlx.clc_response,
-    valid,
-    cta_id_x,
-    cta_id_y,
-    cta_id_z,
+    # valid,
+    # cta_id_x,
+    # cta_id_y,
+    # cta_id_z,
     _semantic=None,
 ):
     # Extract CTA ID from CLC response
     # Return success/fail of PTX instruction
     assert isinstance(clc_response_addr, tlx.clc_response)
 
-    return _semantic.builder.clc_query(
+    x = _semantic.builder.clc_query(
         clc_response_addr.handle,
-        valid.handle,
-        cta_id_x.handle,
-        cta_id_y.handle,
-        cta_id_z.handle,
+        # valid.handle,
+        # cta_id_x.handle,
+        # cta_id_y.handle,
+        # cta_id_z.handle,
     )
+    return _semantic.tensor(x, tl.int32)
