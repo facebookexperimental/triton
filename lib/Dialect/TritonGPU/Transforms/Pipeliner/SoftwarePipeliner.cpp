@@ -199,6 +199,9 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
         if (getNumStagesOrDefault(forOp, numStages) > 1)
           loops.push_back(forOp);
       });
+
+      // Note: We removed mlir::triton::pipelineTMAStores(forOp) for
+      // each loop because we handle this in AutoWS.
     }
   }
 };
