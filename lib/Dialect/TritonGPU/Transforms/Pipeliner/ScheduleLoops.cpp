@@ -190,6 +190,14 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
   return false;
 }
 
+// Determine the chain of dots in the given set of users for a dot.
+std::tuple<SmallVector<ttng::MMAv5OpInterface>, bool>
+computeDotChain(ttng::MMAv5OpInterface mmaOp,
+                DenseSet<ttng::MMAv5OpInterface> seenDots) {
+  SmallVector<ttng::MMAv5OpInterface> chain;
+  return {chain, true};
+}
+
 // Determine the chain of independent dot ops that are present in the body
 // of the loop. This will be used to influence the cluster decisions for placing
 // the dot ops at a maximum distance from each other. This returns a "success"
@@ -204,10 +212,24 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
 // 4. A dot is gated under additional control flow. This is not currently
 // supported.
 // 5. Any type of dot is present that is not a MMAv5OpInterface.
-bool determineIndependentDotChains(scf::ForOp forOp) {
+bool determineIndependentDotChains(
+    scf::ForOp forOp,
+    SmallVector<SmallVector<ttng::MMAv5OpInterface>> &dotChains) {
+  DenseSet<ttng::MMAv5OpInterface> seenDots;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (isa<ttng::MMAv5OpInterface>(op)) {
-      // computeDotChain(op);
+    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      if (seenDots.count(mmaOp)) {
+        // If we have already seen this Dot then we can just skip
+        // forward in program order. computeDotChain will detect
+        // any non-chain patterns.
+        continue;
+      }
+      seenDots.insert(mmaOp);
+      auto [dotChain, success] = computeDotChain(mmaOp, seenDots);
+      if (!success) {
+        return false;
+      }
+      dotChains.push_back(dotChain);
     } else if (isa<tt::DotOpInterface>(op)) {
       // Cluster decisions require MMAv5OpInterface
       return false;
