@@ -107,7 +107,9 @@ hip_configs = [
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'NUM_STAGES': 2}
                   | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 2}, num_warps=4),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'NUM_STAGES': 2}
-                  | {'kpack': 1, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=8)
+                  | {'kpack': 1, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=8),
+    triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 6, 'NUM_STAGES': 2}
+                  | {'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=8, num_stages=2)
 ]
 
 configs = get_hip_autotune_config_full() if full_tune else hip_configs
@@ -137,6 +139,15 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
 
     # offset computation
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -261,7 +272,7 @@ for fp8_inputs in [False, True]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-            x_vals=[256, 512, 1024, 2048],  # Different possible values for `x_name`
+            x_vals=[256, 512, 1024, 2048, 4096],  # Different possible values for `x_name`
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
