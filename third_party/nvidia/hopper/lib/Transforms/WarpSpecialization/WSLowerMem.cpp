@@ -366,6 +366,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), phase);
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase);
+  copyLoopScheduleInfo(wait, headConsumerSameLevel);
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
