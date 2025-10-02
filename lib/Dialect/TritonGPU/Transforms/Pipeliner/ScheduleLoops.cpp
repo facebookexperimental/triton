@@ -209,6 +209,10 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       if (isa<ttng::MMAv5OpInterface>(op)) {
         if (dotCount == 0) {
           mmaMap[&op] = 0;
+        } else if (dotCount == 1) {
+          mmaMap[&op] = 3;
+        } else if (dotCount == 2) {
+          mmaMap[&op] = 2;
         }
         if (dotCount < 3) {
           distance[&op] = 1;
@@ -276,7 +280,8 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
   CoarseSchedule schedule(maxStage + 1);
-  auto numClusters = maxStage + 1 + 1;
+  const size_t numExtraStageOneClusters = 2;
+  auto numClusters = maxStage + 1 + numExtraStageOneClusters;
   SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
   for (int i = 0; i < numClusters; i++) {
     clusters[i] = schedule.clusters.newAtBack();
@@ -290,7 +295,14 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     if (mmaMap.count(op)) {
       index = mmaMap[op];
     } else {
-      index = (maxStage - stage) + 1;
+      // Only 1 cluster goes before the typical stage 2 location.
+      // 2 clusters go before the typical stage 0 location.
+      // With stage 1 ... its complicated
+      if (stage == 2) {
+        index = maxStage - stage + 1;
+      } else {
+        index = (maxStage - stage) + 2;
+      }
     }
     schedule.insert(op, stage, clusters[index]);
   }
