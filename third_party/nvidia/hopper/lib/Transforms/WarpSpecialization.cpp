@@ -174,16 +174,6 @@ public:
                       "doLoopSchedule\n"
                    << moduleOp << "\n\n\n";
     }
-    // Note: Removing this reveals the
-    // Result has an invalid layout: #ttg.blocked<{sizePerThread = [1, 1],
-    // threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>.
-    if (false) { //! ForBlackWell) {
-      // Clear num_stages to disable SWP.
-      funcOp->walk([&](scf::ForOp forOp) {
-        forOp->setAttr(mlir::triton::kNumStagesAttrName,
-                       builder.getI32IntegerAttr(0));
-      });
-    }
   }
 
   void runOnOperation() override {
