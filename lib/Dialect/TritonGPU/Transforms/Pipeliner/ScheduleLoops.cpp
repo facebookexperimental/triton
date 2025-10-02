@@ -193,24 +193,26 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
 // Determine the chain of dots in the given set of users for a dot.
 std::tuple<SmallVector<ttng::MMAv5OpInterface>, bool>
 computeDotChain(ttng::MMAv5OpInterface dotOp,
-                DenseSet<ttng::MMAv5OpInterface> seenDots) {
+                DenseSet<ttng::MMAv5OpInterface> &seenDots) {
   SmallVector<ttng::MMAv5OpInterface> chain;
-  SmallVector<Operation *> users;
   std::optional<ttng::MMAv5OpInterface> nextDotOp = dotOp;
-  auto addUsers = [&users](Operation *op) {
-    for (mlir::Value result : op->getResults()) {
-      for (mlir::OpOperand &use : result.getUses()) {
-        auto owner = use.getOwner();
-        if (owner && !isa<scf::YieldOp>(owner)) {
-          users.push_back(use.getOwner());
-        }
-      }
-    }
-  };
   while (nextDotOp.has_value()) {
     ttng::MMAv5OpInterface activeDotOp = nextDotOp.value();
     chain.push_back(activeDotOp);
+    seenDots.insert(activeDotOp);
     nextDotOp = std::nullopt;
+    DenseSet<Operation *> seenOps;
+    SmallVector<Operation *> users;
+    auto addUsers = [&](Operation *op) {
+      for (mlir::Value result : op->getResults()) {
+        for (mlir::OpOperand &use : result.getUses()) {
+          auto owner = use.getOwner();
+          if (owner && !isa<scf::YieldOp>(owner) && !seenOps.count(owner)) {
+            users.push_back(use.getOwner());
+          }
+        }
+      }
+    };
     addUsers(activeDotOp);
     while (!users.empty()) {
       auto nextOp = users.pop_back_val();
@@ -219,14 +221,15 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
           // Already seen dot, not support
           return {chain, false};
         }
-        if (nextDotOp.has_value()) {
+        if (nextDotOp.has_value() && nextDotOp != newDotOp) {
           // Not a linear chain
           return {chain, false};
         }
-        seenDots.insert(newDotOp);
         nextDotOp = newDotOp;
+      } else {
+        seenOps.insert(nextOp);
+        addUsers(nextOp);
       }
-      addUsers(nextOp);
     }
   }
   return {chain, true};
@@ -258,7 +261,6 @@ determineIndependentDotChains(scf::ForOp forOp) {
         // any non-chain patterns.
         continue;
       }
-      seenDots.insert(mmaOp);
       auto [dotChain, success] = computeDotChain(mmaOp, seenDots);
       if (!success) {
         return {dotChains, false};
