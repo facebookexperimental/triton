@@ -231,19 +231,65 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # initialize offsets
                 _, _, lo, hi, _, _ = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
 
-                # wait for the Q buffer to be populated by the producer
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
-                tlx.barrier_wait(q_fulls[q_bufIdx], q_phase)
-                tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
-                tlx.barrier_wait(qk_empties[0], q_phase ^ 1)
-                tlx.barrier_wait(qk_empties[1], q_phase ^ 1)
+                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
-                # loop over k, v and update accumulator
-                for i in tl.range(lo, hi, BLOCK_N):
+                # wait for the K buffer to be populated by the producer
+                tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
+
+                # wait for the Q buffer to be populated by the producer
+                tlx.barrier_wait(q_fulls[q_bufIdx], q_phase)
+
+                # -- compute q0 @ k ----
+                k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
+                tlx.barrier_wait(qk_empties[0], q_phase ^ 1)
+                tlx.async_dot(
+                    q_tiles[0],
+                    k_tile,
+                    qk_tiles[0],
+                    use_acc=False,
+                    mBarriers=[qk_fulls[0]],
+                )
+
+                # -- compute q1 @ k ----
+                tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
+                tlx.barrier_wait(qk_empties[1], q_phase ^ 1)
+                tlx.async_dot(
+                    q_tiles[1],
+                    k_tile,
+                    qk_tiles[1],
+                    use_acc=False,
+                    mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
+                )
+
+                _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+
+                # -- compute p0 @ v ----
+                # wait for the V buffer to be populated by the producer
+                tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+                tlx.barrier_wait(p_fulls[0], qk_phase)
+                tlx.barrier_wait(acc_fulls[0], qk_phase)
+                # As p shares the second half of the qk buffer, use p[2]/p[3] instead of p[0]/p[1]
+                tlx.async_dot(
+                    p_tiles[1],
+                    kv_tiles[v_bufIdx],
+                    acc_tiles[0],
+                    use_acc=False,
+                )
+
+                acc1_init = False
+
+                for i in tl.range(lo + BLOCK_N, hi, BLOCK_N):
+                    v_bufIdx_prev = v_bufIdx
+                    qk_phase_prev = qk_phase
+
+                    accum_cnt_qk += 1
+                    accum_cnt_kv += 2
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
-                    # -- compute q @ k ----
+                    # -- compute q0 @ k ----
                     # wait for the K buffer to be populated by the producer
                     tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
                     k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
@@ -257,6 +303,20 @@ def _attn_fwd_ws(sm_scale, M,  #
                         mBarriers=[qk_fulls[0]],
                     )
 
+                    # -- compute p1 @ v from the previous iteration----
+                    tlx.barrier_wait(p_fulls[1], qk_phase_prev)
+                    tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
+                    tlx.async_dot(
+                        p_tiles[3],
+                        kv_tiles[v_bufIdx_prev],
+                        acc_tiles[1],
+                        use_acc=acc1_init,
+                        mBarriers=[kv_empties[v_bufIdx_prev]],
+                    )
+
+                    acc1_init = True
+
+                    # -- compute q1 @ k ----
                     tlx.async_dot(
                         q_tiles[1],
                         k_tile,
@@ -265,7 +325,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
                     )
 
-                    # -- compute p @ v ----
+                    # -- compute p0 @ v ----
                     # wait for the V buffer to be populated by the producer
                     tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
 
@@ -276,26 +336,26 @@ def _attn_fwd_ws(sm_scale, M,  #
                         p_tiles[1],
                         kv_tiles[v_bufIdx],
                         acc_tiles[0],
-                        use_acc=i > lo,
+                        use_acc=True,
                     )
-
-                    tlx.barrier_wait(p_fulls[1], qk_phase)
-                    tlx.barrier_wait(acc_fulls[1], qk_phase)
-                    tlx.async_dot(
-                        p_tiles[3],
-                        kv_tiles[v_bufIdx],
-                        acc_tiles[1],
-                        use_acc=i > lo,
-                        mBarriers=[kv_empties[v_bufIdx]],
-                    )
-
-                    accum_cnt_qk += 1
-                    accum_cnt_kv += 2
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
-                tlx.tcgen05_commit(acc_empties[1])
+
+                # -- compute p1 @ v ----
+                tlx.barrier_wait(p_fulls[1], qk_phase)
+                tlx.barrier_wait(acc_fulls[1], qk_phase)
+                tlx.async_dot(
+                    p_tiles[3],
+                    kv_tiles[v_bufIdx],
+                    acc_tiles[1],
+                    use_acc=acc1_init,
+                    mBarriers=[acc_empties[1], kv_empties[v_bufIdx]],
+                )
+
+                accum_cnt_qk += 1
+                accum_cnt_kv += 2
                 tile_idx += num_progs
 
         # load
@@ -305,21 +365,46 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # initialize offsets
                 _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
 
-                # load q: it will stay in SRAM throughout
+                # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
                 qo_offset_y_split = qo_offset_y
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
 
+                # loop over loading k, v
+                k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                # wait for the K buffer to be released by the consumer
+                k_empty = tlx.local_view(kv_empties, k_bufIdx)
+                tlx.barrier_wait(k_empty, k_phase ^ 1)
+
+                # load K
+                k_full = tlx.local_view(kv_fulls, k_bufIdx)
+                k_tile = tlx.local_view(kv_tiles, k_bufIdx)
+                tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * HEAD_DIM)  # float16
+                tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
+
+                # load q1
                 q_bufIdx += NUM_BUFFERS_Q
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], 2 * BLOCK_M_SPLIT * HEAD_DIM)  # float16
                 qo_offset_y_split = qo_offset_y + BLOCK_M_SPLIT
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
 
-                # loop over loading k, v
-                for _ in tl.range(lo, hi, BLOCK_N):
+                v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+                # wait for the V buffer to be released by the consumer
+                v_empty = tlx.local_view(kv_empties, v_bufIdx)
+                tlx.barrier_wait(v_empty, v_phase ^ 1)
+                # load V
+                v_full = tlx.local_view(kv_fulls, v_bufIdx)
+                v_tile = tlx.local_view(kv_tiles, v_bufIdx)
+                tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * HEAD_DIM)  # float16
+                tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
+
+                kv_offset_y += BLOCK_N
+                accum_cnt_kv += 2
+
+                for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     # wait for the K buffer to be released by the consumer
                     k_empty = tlx.local_view(kv_empties, k_bufIdx)
@@ -473,7 +558,7 @@ configs.append(
         line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
         styles=[("red", "-"), ("blue", "-"), ("green", "-")],
         ylabel="TFLOPS",
-        plot_name=f"fused-attention-ws-persistent-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+        plot_name=f"fused-attention-ws-pipelined-persistent-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
         args={
             "H": N_HEADS,
             "BATCH": BATCH,
