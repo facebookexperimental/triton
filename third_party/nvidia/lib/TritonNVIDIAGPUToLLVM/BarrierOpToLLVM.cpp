@@ -337,11 +337,11 @@ struct AsyncCLCTryCancelOpConversion
     {
       .reg .u32 first_cta_in_cluster;
       .reg .pred pred_first_cta_in_cluster;
+      .reg .pred pred_issue;
       mov.u32  first_cta_in_cluster, %cluster_ctaid.x;
       setp.u32.eq pred_first_cta_in_cluster, first_cta_in_cluster, 0x0;
-      @!$2 bra L1;
-      @pred_first_cta_in_cluster clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
-      L1:
+      and.pred pred_issue, $2, pred_first_cta_in_cluster;
+      @pred_issue clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
     }
     )";
 
