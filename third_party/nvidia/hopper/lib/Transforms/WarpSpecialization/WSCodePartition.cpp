@@ -1801,6 +1801,26 @@ void insertAsyncComm(
             consumerOps.insert(t);
             actualConsumerOps.insert(t);
           }
+
+          // If the consumer is subsequently used to perform a TMA store, we
+          // would like to skip actually loading the value and just directly
+          // copy it from SMEM to global memory. To make this possible, the TMA
+          // store should be treated as a consumer of the channel, so that the
+          // consumer release barrier is placed after the TMA store is
+          // completed. Note that this is best effort, if we miss the TMA store,
+          // the result will incur a performance hit, but still be correct.
+          if (llvm::isa<ttg::LocalLoadOp>(dst)) {
+            for (auto user : dst->getUsers()) {
+              // Advance past any layout conversions, because we will be storing
+              // directly from memory anyway.
+              while (llvm::isa<ttg::ConvertLayoutOp>(user) && user->hasOneUse())
+                user = *user->getUsers().begin();
+              if (llvm::isa<tt::DescriptorStoreOp>(user)) {
+                consumerOps.insert(user);
+                actualConsumerOps.insert(user);
+              }
+            }
+          }
         }
       } else {
         consumerOps.insert(c->getDstOp());
