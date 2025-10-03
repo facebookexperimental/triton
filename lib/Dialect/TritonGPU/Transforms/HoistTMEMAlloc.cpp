@@ -38,6 +38,41 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
+// Determine if an initial value set for a given operation is
+// unused. A value will be considered used for this analysis
+// if:
+//
+// 1. It is used by any store operation.
+// 2. It is used in any loop-carried variable.
+// 3. It influences any control-flow (e.g. if condition,
+//    or for loop argument). We will not attempt to track
+//    this across multiple blocks.
+//
+// A variable will be considered dead if it cannot reach that
+// result. If it reaches a predicated value (currrently only
+// implemented for MMA ops), then we will no longer check
+// the users.
+bool isInitialValueUnused(Operation *op) {
+  SmallVector<Operation *> queue{op};
+  // Use value that should halt checking
+  auto isFinalUser = [](Operation *op) {
+    return isa<scf::IfOp, scf::ForOp, scf::YieldOp, ttng::TMEMStoreOp,
+               tt::StoreOp, tt::DescriptorStoreOp, ttg::LocalStoreOp>(op);
+  };
+  while (!queue.empty()) {
+    auto nextOp = queue.pop_back_val();
+    if (isFinalUser(nextOp)) {
+      return false;
+    }
+    for (auto user : nextOp->getUsers()) {
+      if (user) {
+        queue.emplace_back(user);
+      }
+    }
+  }
+  return false;
+}
+
 class CombineTMEMStoreAndSelect : public OpRewritePattern<ttng::TMEMStoreOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -380,6 +415,8 @@ public:
     if (!initAlloc || initAlloc.getSrc())
       return failure();
     // TODO: 3. The live-in value of the TMEM variable is never read.
+    if (isInitialValueUnused(load))
+      return failure();
 
     // Create a store before the loop to write the initial value.
     int argNo = use.getOperandNumber();
