@@ -1502,7 +1502,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   builder.setAsyncTaskIdsFromOp(mmaOp);
   if (addCompletionBarrier) {
     auto consumerBarrier =
-        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx, mmaOp);
     // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
     auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         mmaOp->getLoc(), true, 1);
@@ -1516,8 +1516,8 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   // is false this wait_barrier serves as consumer_wait.
   builder.setInsertionPoint(producerOrConsumer);
   builder.setAsyncTaskIdsFromOp(producerOrConsumer);
-  auto producerBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  auto producerBarrier = getBarrierForPipelineStage(
+      builder, barrierAlloc, bufferIdx, producerOrConsumer);
   // curPhase = curPhase xor True for emptyBarrier.
   Value phase = inPhase;
   auto loc = producerOrConsumer->getLoc();
@@ -1571,7 +1571,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
           user->getLoc(), builder.getI32Type(), phase);
       copyLoopScheduleInfo(phase.getDefiningOp(), user);
       consumerBarrier =
-          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx, user);
     } else {
       // mmaOp can be in a different task from headProducer. Even if user and
       // mma are in the same block and they share the same barrier, but the

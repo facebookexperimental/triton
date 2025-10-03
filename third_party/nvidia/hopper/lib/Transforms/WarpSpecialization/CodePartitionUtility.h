@@ -238,7 +238,8 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           int reuseGroupIdx, Channel *ch);
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
-                                 Value barrierAlloc, Value bufferIdx);
+                                 Value barrierAlloc, Value bufferIdx,
+                                 Operation *op);
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,

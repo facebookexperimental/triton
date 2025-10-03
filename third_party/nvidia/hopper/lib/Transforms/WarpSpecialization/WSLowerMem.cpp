@@ -352,13 +352,13 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // first load.
   builder.setInsertionPoint(headProducer);
   builder.setAsyncTaskIdsFromOp(headProducer);
-  auto prodBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  auto prodBarrier = getBarrierForPipelineStage(builder, barrierAlloc,
+                                                bufferIdx, headProducer);
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
   auto expect = builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
       loc, prodBarrier, sizeInBytes, pred);
-  copyLoopScheduleInfo(pred, prodBarrier.getDefiningOp());
-  copyLoopScheduleInfo(expect, prodBarrier.getDefiningOp());
+  copyLoopScheduleInfo(pred, headProducer);
+  copyLoopScheduleInfo(expect, headProducer);
 
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;
@@ -376,8 +376,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // Create a wait_barrier before the first consumer.
   builder.setInsertionPoint(headConsumerSameLevel);
   builder.setAsyncTaskIdsFromOp(headConsumer);
-  auto consBarrier =
-      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
+  auto consBarrier = getBarrierForPipelineStage(
+      builder, barrierAlloc, bufferIdxExtract, headConsumerSameLevel);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
