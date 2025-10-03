@@ -18,10 +18,10 @@
 
 // CHECK: tt.descriptor_load %{{.*}} {loop.cluster = 6 : i32, loop.stage = 0 : i32}
 // CHECK: tt.descriptor_load %{{.*}} {loop.cluster = 6 : i32, loop.stage = 0 : i32}
-// CHECK: ttng.tc_gen5_mma %{{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.tc_gen5_mma %{{.*}} {loop.cluster = 4 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.tc_gen5_mma %{{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 2 : i32}
+// CHECK: ttng.tc_gen5_mma %{{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32}
+// CHECK: ttng.tc_gen5_mma %{{.*}} {loop.cluster = 4 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32}
+// CHECK: ttng.tc_gen5_mma %{{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32}
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 2 : i32, tt.self_latency = 1 : i32}
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABLE: @_dp_attn_peristent
