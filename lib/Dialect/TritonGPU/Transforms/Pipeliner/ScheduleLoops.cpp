@@ -387,7 +387,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (int i = 0; i < maxStages; i--) {
+  for (int i = 0; i < maxStages; i++) {
     if (maxClusterPerDistance[i] == -1) {
       maxClusterPerDistance[i] = numDots + offset++;
     }
