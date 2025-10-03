@@ -330,11 +330,12 @@ struct AsyncCLCTryCancelOpConversion
     Location loc = op->getLoc();
     std::string ptx = R"(
     {
-      .reg .u32 lead;
-      .reg .pred p1;
-      mov.u32  lead, %cluster_ctaid.x;
-      setp.u32.eq p1, lead, 0x0;
-      @p1 clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
+      .reg .b32 mask;
+      mov.b32 mask, -1;
+      .reg .b32 %rx;
+      .reg .pred %px;
+      elect.sync %rx|%px, mask;
+      @%px clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
     }
     )";
 

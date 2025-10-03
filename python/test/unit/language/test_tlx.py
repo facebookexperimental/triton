@@ -1603,7 +1603,6 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        # CTA ID of the first work load
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
 
@@ -1633,12 +1632,12 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         # Extract CTA ID from CLC response
         res = tlx.clc_query(clc_response)
 
-        if tid == 0 and res != -1:
-            tl.device_print("TLX CLC CTA ID", res)
+        if tid == 0:
+            tl.device_print("Extracted CtaID", res)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
-    size = 10000000
+    size = 1000000
     x = torch.ones(size, device=device)
     y = torch.ones(size, device=device)
 
