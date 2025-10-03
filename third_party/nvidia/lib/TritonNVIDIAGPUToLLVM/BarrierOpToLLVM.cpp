@@ -336,11 +336,11 @@ struct AsyncCLCTryCancelOpConversion
     std::string ptx = R"(
     {
       .reg .u32 first_cta_in_cluster;
-      .reg .pred p1;
+      .reg .pred pred_first_cta_in_cluster;
       mov.u32  first_cta_in_cluster, %cluster_ctaid.x;
-      setp.u32.eq p1, first_cta_in_cluster, 0x0;
+      setp.u32.eq pred_first_cta_in_cluster, first_cta_in_cluster, 0x0;
       @!$2 bra L1;
-      @p1 clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
+      @pred_first_cta_in_cluster clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
       L1:
     }
     )";
