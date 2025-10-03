@@ -38,15 +38,6 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
-bool allUsersInTargetBlock(Operation *op, Block *targetBlock) {
-  for (auto user : op->getUsers()) {
-    if (user->getBlock() != targetBlock) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool isUser(Operation &op, Value val) {
   for (auto operand : op.getOperands()) {
     if (operand == val) {
@@ -59,23 +50,20 @@ bool isUser(Operation &op, Value val) {
 // Determine if a store operation is overridden by an MMA op that
 // will ignore the accumulator. Whenever the accumulator is ignored
 // the load should be predicated.
-Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp) {
+Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp,
+                              Operation *loadOp) {
   Value vTrue = builder.create<arith::ConstantIntOp>(allocOp.getLoc(), 1, 1);
   Value bufferValue = allocOp->getResults()[0];
-  if (!allUsersInTargetBlock(allocOp, allocOp->getBlock())) {
-    return vTrue;
-  }
-  // Iterate in program order. We need to find if
-  // the first use of bufferValue may clobber it.
+  // Iterate in reverse program order. We need to find if
+  // an MMA clobbers the load.
   auto block = allocOp->getBlock();
-  auto it = mlir::Block::iterator(allocOp);
-  it++;
-  for (; it != block->end(); it++) {
+  auto it = mlir::Block::iterator(loadOp);
+  it--;
+  for (; it != block->begin(); it--) {
     auto &op = *it;
     if (!isUser(op, bufferValue)) {
       continue;
     }
-
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
       // Buffer value must be the accumulator.
       if (mmaOp.getAccumulator() != bufferValue) {
@@ -443,37 +431,12 @@ public:
       return failure();
     // TODO: 3. The live-in value of the TMEM variable is never read.
 
-    // Find the original store value to TMEM. We need to extract the
-    // predicate value.
-    auto block = forOp.getBody();
-    auto it = mlir::Block::iterator(load);
-    it--;
-    ttng::TMEMStoreOp store = nullptr;
-    auto bufferValue = initAlloc.getResults()[0];
-    for (; it != block->begin(); it--) {
-      auto &op = *it;
-      if (!isUser(op, bufferValue)) {
-        continue;
-      }
-      if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
-        // Find the earliest store to this buffer.
-        // Note: It may not match the initial value exactly
-        // because we verify the initial value holds after some
-        // amount of math.
-        if (storeOp.getDst() == bufferValue) {
-          store = storeOp;
-        }
-      }
-    }
-    if (!store)
-      return failure();
-
-    // Eliminate the store step if the store is predicated on the first
-    // iteration.
+    // Eliminate the store step if the original store is clobbered by an MMA
+    // operation.
     bool elimStore = false;
-    Value pred = store.getPred();
+    auto pred = getInitialTMEMPredicate(rewriter, initAlloc, load);
     if (auto blockPred = dyn_cast<BlockArgument>(pred)) {
-      if (blockPred.getOwner() == block) {
+      if (blockPred.getOwner() == forOp.getBody()) {
         pred = forOp.getInitArgs()[blockPred.getArgNumber() - 1];
       }
     }
@@ -581,9 +544,9 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   if (src != nullptr) {
     builder.setInsertionPoint(alloc);
     // Write the initial value of the allocation and replace the token.
-    auto pred = getInitialTMEMPredicate(builder, alloc);
+    Value vTrue = builder.create<arith::ConstantIntOp>(alloc.getLoc(), 1, 1);
     auto initStoreOp = builder.create<ttng::TMEMStoreOp>(
-        alloc.getLoc(), tokType, newAlloc.getResult(), newTok, src, pred);
+        alloc.getLoc(), tokType, newAlloc.getResult(), newTok, src, vTrue);
     newTok = initStoreOp.getToken();
   }
   alloc.replaceAllUsesWith(ValueRange{newAlloc.getResult(), newTok});
