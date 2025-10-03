@@ -383,7 +383,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
   // Initialize the cluster information for anything
   // not covered by the dots.
-  size_t offset = 0;
+  int offset = -1;
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
@@ -424,7 +424,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // latency otherwise it contributes 0 to the distance.
     //
     // The maximum distance allowed is the maxmium number of stages.
-    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxStages);
+    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxStages - 1);
     distance[op] = d;
     int c = -1;
     // We must always be scheduled as early as our earliest user for the same
@@ -461,7 +461,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
   int droppedStages = (maxStages - maxDistance);
-  int numClusters = maxClusterPerDistance.size() - droppedStages;
+  int numClusters = maxClusterPerDistance[(maxClusterPerDistance.size() - 1) -
+                                          droppedStages] +
+                    1;
   CoarseSchedule schedule(maxStage + 1);
   SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
   for (int i = 0; i < numClusters; i++) {
