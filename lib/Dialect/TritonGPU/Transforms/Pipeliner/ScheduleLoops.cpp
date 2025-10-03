@@ -315,6 +315,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 
   // Schedule parallel dot pattern.
   int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
+  int maxPossibleDistance = maxStages - 1;
   // Compute the longest path to the yield for each operation reachable
   // from any latency operation. We also use this to embed stage information
   // for mmas.
@@ -378,7 +379,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
   // Initialize the cluster information for anything
   // not covered by the dots.
-  int offset = -1;
+  int offset = 0;
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
@@ -419,7 +420,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // latency otherwise it contributes 0 to the distance.
     //
     // The maximum distance allowed is the maxmium number of stages.
-    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxStages - 1);
+    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxPossibleDistance);
     distance[op] = d;
     int c = -1;
     // We must always be scheduled as early as our earliest user for the same
@@ -455,7 +456,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
-  int droppedStages = (maxStages - maxDistance);
+  int droppedStages = maxPossibleDistance - maxDistance;
   int numClusters = maxClusterPerDistance[(maxClusterPerDistance.size() - 1) -
                                           droppedStages] +
                     1;
