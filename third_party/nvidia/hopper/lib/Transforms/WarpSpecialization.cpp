@@ -174,13 +174,6 @@ public:
                       "doLoopSchedule\n"
                    << moduleOp << "\n\n\n";
     }
-    if (true) { //! ForBlackWell) {
-      // Clear num_stages to disable SWP.
-      funcOp->walk([&](scf::ForOp forOp) {
-        forOp->setAttr(mlir::triton::kNumStagesAttrName,
-                       builder.getI32IntegerAttr(0));
-      });
-    }
   }
 
   void runOnOperation() override {
