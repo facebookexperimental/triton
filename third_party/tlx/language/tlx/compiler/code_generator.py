@@ -9,16 +9,22 @@ from contextlib import contextmanager
 # a non-default partition region. We use a stack to keep track of
 # replica_id of the region being compiled.
 region_replica_id_stack: List[int] = []
+sub_region_has_exception = False
 
 
 @contextmanager
 def tlx_enter_sub_region():
     global region_replica_id_stack
+    global sub_region_has_exception
     replica_id_stack_backup = region_replica_id_stack.copy()
     try:
         yield
+    except Exception as e:
+        sub_region_has_exception = True
+        raise e
     finally:
-        assert region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
+        if not sub_region_has_exception:
+            assert region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
 
 
 def _is_async_task(self, node) -> bool:
