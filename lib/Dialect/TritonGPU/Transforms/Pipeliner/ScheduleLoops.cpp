@@ -205,10 +205,9 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
     SmallVector<Operation *> users;
     auto addUsers = [&](Operation *op) {
       for (mlir::Value result : op->getResults()) {
-        for (mlir::OpOperand &use : result.getUses()) {
-          auto owner = use.getOwner();
-          if (owner && !isa<scf::YieldOp>(owner) && !seenOps.count(owner)) {
-            users.push_back(use.getOwner());
+        for (auto user : result.getUsers()) {
+          if (user && !isa<scf::YieldOp>(user) && !seenOps.count(user)) {
+            users.push_back(user);
           }
         }
       }
