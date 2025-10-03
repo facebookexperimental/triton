@@ -352,16 +352,18 @@ private:
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
       llvm::for_each(liveOperations, [&](Operation *liveOp) {
-        if (defOp && isa<mlir::triton::gpu::WarpSpecializeOp>(defOp)) {
+        if (liveOp && isa<mlir::triton::gpu::WarpSpecializeOp>(liveOp)) {
           minId = 0;
-          maxId = operationId.size();
-          return;
-        }
-        if (operationId[liveOp] < minId) {
-          minId = operationId[liveOp];
-        }
-        if ((operationId[liveOp] + 1) > maxId) {
-          maxId = operationId[liveOp] + 1;
+          if ((operationId[liveOp] + 1) > maxId) {
+            maxId = operationId[liveOp] + 1;
+          }
+        } else {
+          if (operationId[liveOp] < minId) {
+            minId = operationId[liveOp];
+          }
+          if ((operationId[liveOp] + 1) > maxId) {
+            maxId = operationId[liveOp] + 1;
+          }
         }
       });
       return Interval(minId, maxId);
