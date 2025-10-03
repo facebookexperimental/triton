@@ -197,18 +197,39 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   // Determine all operations that have a non-zero latency
   SmallVector<Operation *> latOps;
+  // Compute the longest path to the yield for each operation reachable
+  // from any latency operation.
+  DenseMap<Operation *, int> distance;
+  // Map for MMA cluster Hack
+  DenseMap<Operation *, int> mmaMap;
+  int dotCount = 0;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
+    if (opLatency.count(&op)) {
       latOps.push_back(&op);
+      if (isa<ttng::MMAv5OpInterface>(op)) {
+        if (dotCount == 0) {
+          mmaMap[&op] = 0;
+        } else if (dotCount == 1) {
+          mmaMap[&op] = 3;
+        } else if (dotCount == 2) {
+          mmaMap[&op] = 2;
+        }
+        if (dotCount < 3) {
+          distance[&op] = 1;
+        } else {
+          distance[&op] = 0;
+        }
+        dotCount++;
+      }
+    }
   }
   // If no latency ops, nothing to schedule
   if (latOps.empty())
     return CoarseSchedule(0);
 
   DominanceInfo domInfo(forOp);
-  // Compute the longest path to the yield for each operation reachable
-  // from any latency operation.
-  DenseMap<Operation *, int> distance;
+  // FB Change: Track how many dot ops we have for
+  // heurstic decisions.
   std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
     auto it = distance.find(op);
     if (it != distance.end())
@@ -225,11 +246,13 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
         maxDist = distUser;
     }
     int lat = 0;
+    if (distance.count(op))
+      return distance[op];
     if (opLatency.count(op))
       lat = opLatency.lookup(op);
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
-    int d = lat + (maxDist < 0 ? 0 : maxDist);
+    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), 2);
     distance[op] = d;
     return d;
   };
@@ -242,26 +265,47 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       maxDistance = d;
   }
 
+  // FB Change: Set a budget based on the distance.
+  const bool useMMAHeurstic = true;
+
   // Assign stage to each op reachable from a latency op
   for (auto [op, dist] : distance) {
     // We only schedule ops that are downstream of a latency op
     // (had a non-negative distance due to a latency op).
-    if (dist >= 0)
+    if (dist >= 0) {
       opToStage[op] = maxDistance - dist;
+    }
   }
 
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
   CoarseSchedule schedule(maxStage + 1);
-  SmallVector<CoarseSchedule::Cluster> clusters(maxStage + 1);
-  for (int i = 0; i <= maxStage; i++) {
+  const size_t numExtraStageOneClusters = 2;
+  auto numClusters = maxStage + 1 + numExtraStageOneClusters;
+  SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
+  for (int i = 0; i < numClusters; i++) {
     clusters[i] = schedule.clusters.newAtBack();
   }
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (auto [op, stage] : opToStage)
-    schedule.insert(op, stage, clusters[maxStage - stage]);
+  // FB Change: Hack to place the first MMA in an earlier cluster.
+  for (auto [op, stage] : opToStage) {
+    int index;
+    if (mmaMap.count(op)) {
+      index = mmaMap[op];
+    } else {
+      // Only 1 cluster goes before the typical stage 2 location.
+      // 2 clusters go before the typical stage 0 location.
+      // With stage 1 ... its complicated
+      if (stage == 2) {
+        index = maxStage - stage + 1;
+      } else {
+        index = (maxStage - stage) + 2;
+      }
+    }
+    schedule.insert(op, stage, clusters[index]);
+  }
 
   // Move `scf.if` ops in the current schedule (forward slice of the latency
   // ops) into a new epilogue cluster at the end of the schedule, pushing them
@@ -274,9 +318,10 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If the `scf.if` op itself is a latency op, skip it.
     if (opLatency.contains(ifOp))
       continue;
-    // Ensure this does not create scheduling conflicts by ensuring the forward
-    // slice of the `scf.if` does not contain ops that are already scheduled, as
-    // this will cause the `scf.if` to be scheduled after its dependents.
+    // Ensure this does not create scheduling conflicts by ensuring the
+    // forward slice of the `scf.if` does not contain ops that are already
+    // scheduled, as this will cause the `scf.if` to be scheduled after its
+    // dependents.
     SetVector<Operation *> slice;
     getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
@@ -315,9 +360,9 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
     };
 
-    // If there are no latency ops or all latency ops are in the same stage, we
-    // don't need to pipeline the loop. Return a new schedule with everything
-    // assigned to the same stage.
+    // If there are no latency ops or all latency ops are in the same stage,
+    // we don't need to pipeline the loop. Return a new schedule with
+    // everything assigned to the same stage.
     DenseSet<int> latencyStages;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {

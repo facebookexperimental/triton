@@ -60,7 +60,7 @@ class AssignLoadLatencies {
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
                       DenseMap<Operation *, int> &opLatency)
-      : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
+      : forOp(forOp), numStages(numStages), opLatency(opLatency){};
 
   void run() {
     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
@@ -79,8 +79,13 @@ public:
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
 
+    int index = 0;
+
     for (auto [loadOp, dist] : loadOpToIndLevel) {
-      opLatency[loadOp] = loadLatency;
+      opLatency[loadOp] = loadLatency - index;
+      if (index == 0) {
+        index += 1;
+      }
     }
   }
 
@@ -151,7 +156,7 @@ public:
 class AssignMMALatencies {
 public:
   AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency)
-      : forOp(forOp), opLatency(opLatency) {};
+      : forOp(forOp), opLatency(opLatency){};
 
   void run() {
     DenseMap<Operation *, int> mmaSelfLatency;
@@ -200,6 +205,7 @@ public:
             else
               opLatency[&op] += 1;
           }
+          opLatency[&op] = 0;
         }
       }
     }
