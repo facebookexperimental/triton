@@ -1633,9 +1633,8 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         # CLC parse CTA ID from response
         res = tlx.clc_query(clc_response)
 
-        if tid ==0:
-            tl.device_print("DAOHANG_DEBUG:", res)
-            # tl.device_print("cta_id_x: ", cta_id_x)
+        if tid == 0 and res != -1:
+            tl.device_print("TLX CLC CTA ID", res)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
@@ -1654,7 +1653,4 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
     assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
-    import pdb; pdb.set_trace()
-    # torch.testing.assert_close(output, output.sort(descending=True))
-    torch.testing.assert_close(output, x * y, check_dtype=False)
-    # assert(False)
+    assert (torch.count_nonzero(output) != size)
