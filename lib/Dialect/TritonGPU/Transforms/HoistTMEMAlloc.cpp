@@ -38,45 +38,60 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
-// Determine if a store operation that sets the initial value for
-// a memory buffer is unused. This value will be unused if there
-// is another operation that overwrites the buffer before its
-// first load.
-bool isInitialTMemStoreUnused(scf::ForOp forOp, TMEMTokenAllocOp allocOp,
-                              ttng::TMEMLoadOp targetLoad) {
+// Determine if a store operation is overridden by an MMA op that
+// will ignore the accumulator. Whenever the accumulator is ignored
+// the load should be predicated.
+Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp) {
+  Value vTrue = builder.create<arith::ConstantIntOp>(allocOp.getLoc(), 1, 1);
   Value bufferValue = allocOp->getResults()[0];
   for (auto user : allocOp->getUsers()) {
-    // TODO: Consider predicate value? This can be a no-op
-    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user)) {
-      // The buffer will be clobbered if:
-      // 1. The buffer is the accumulator to an MMA.
-      // 2. The buffer is not used in the first iteration.
-      //
-      // To be conservative we will only enforce this condition assuming
-      // the mmaOp comes before targetLoad in program order and is in the
-      // same basic block.
-      if (mmaOp.getAccumulator() == bufferValue &&
-          mmaOp->getBlock() == targetLoad->getBlock()) {
-        Value useAccumulator = mmaOp.useAccumulator();
-        if (auto blockArg = dyn_cast<BlockArgument>(useAccumulator)) {
-          auto block = blockArg.getOwner();
-          auto parentOp = block->getParentOp();
-          if (parentOp == forOp) {
-            // Off by 1 from copy used in prior step of pass.
-            auto argNum = blockArg.getArgNumber() - 1;
-            useAccumulator = forOp.getInitArgs()[argNum];
-          }
-        }
-        auto useAccOp = useAccumulator.getDefiningOp();
-        if (auto useAccumConst = dyn_cast<arith::ConstantOp>(useAccOp)) {
-          return !cast<BoolAttr>(useAccumConst.getValue()).getValue();
-        }
+    // Only check if every user is in the same block. We don't support
+    // nested control flow yet.
+    if (user->getBlock() != allocOp->getBlock()) {
+      return vTrue;
+    }
+  }
+  // Iterate in program order. We need to find if
+  // the first use of bufferValue may clobber it.
+  auto block = allocOp->getBlock();
+  auto it = mlir::Block::iterator(allocOp);
+  it++;
+  for (; it != block->end(); ++it) {
+    auto &op = *it;
+
+    bool isUser = false;
+    for (auto operand : op.getOperands()) {
+      if (operand == bufferValue) {
+        isUser = true;
+        break;
       }
     }
+    if (!isUser) {
+      continue;
+    }
+
+    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      // Buffer value must be the accumulator.
+      if (mmaOp.getAccumulator() != bufferValue) {
+        return vTrue;
+      }
+      // If the store is predicated we need to default to True.
+      auto mmaPred = mmaOp.getPredicate();
+      auto predOp = mmaPred.getDefiningOp();
+      if (predOp) {
+        auto isPredicated = dyn_cast<arith::ConstantOp>(predOp);
+        bool willExecute =
+            isPredicated && cast<BoolAttr>(isPredicated.getValue()).getValue();
+        if (!willExecute) {
+          return vTrue;
+        }
+      }
+      return mmaOp.useAccumulator();
+    }
     // Some other undefined or unsupported use.
-    return false;
+    return vTrue;
   }
-  llvm_unreachable("Alloc must have at least the load as a user");
+  return vTrue;
 }
 
 class CombineTMEMStoreAndSelect : public OpRewritePattern<ttng::TMEMStoreOp> {
@@ -422,10 +437,6 @@ public:
       return failure();
     // TODO: 3. The live-in value of the TMEM variable is never read.
 
-    // 4. Handle clobbering the Buffer before the load (no need to initialize).
-    if (isInitialTMemStoreUnused(forOp, initAlloc, load))
-      return failure();
-
     // Create a store before the loop to write the initial value.
     int argNo = use.getOperandNumber();
     Value initVal = forOp.getInitArgs()[argNo];
@@ -521,8 +532,9 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   if (src != nullptr) {
     builder.setInsertionPoint(alloc);
     // Write the initial value of the allocation and replace the token.
+    auto pred = getInitialTMEMPredicate(builder, alloc);
     auto initStoreOp = builder.create<ttng::TMEMStoreOp>(
-        alloc.getLoc(), tokType, newAlloc.getResult(), newTok, src, vTrue);
+        alloc.getLoc(), tokType, newAlloc.getResult(), newTok, src, pred);
     newTok = initStoreOp.getToken();
   }
   alloc.replaceAllUsesWith(ValueRange{newAlloc.getResult(), newTok});
