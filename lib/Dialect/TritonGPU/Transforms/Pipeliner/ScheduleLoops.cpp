@@ -329,6 +329,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t maxChainLength = 0;
   size_t numDots = 0;
+  SmallVector<int> maxClusterPerDistance(maxStages, -1);
   if (success) {
     for (auto &chain : chains) {
       maxChainLength = std::max(maxChainLength, chain.size());
@@ -373,9 +374,22 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
         // Anything that comes after an MMA (e.g. no known cluster) but has a
         // computed distance placed in the last cluster for a given stage.
         clusterMap[op] = nextOffset;
+        maxClusterPerDistance[currDistance] =
+            std::max(maxClusterPerDistance[currDistance], nextOffset);
         lastOffset = nextOffset;
       }
       startingOffset += maxChainLength;
+    }
+  }
+  // Initialize the cluster information for anything
+  // not covered by the dots.
+  size_t offset = 0;
+  // Assign ops to the clusters in reverse-stage order;
+  // ops with higher stage numbers are assigned first. This way we will
+  // end up with roughly reverse program order in the clusters.
+  for (int i = 0; i < maxStages; i--) {
+    if (maxClusterPerDistance[i] == -1) {
+      maxClusterPerDistance[i] = numDots + offset++;
     }
   }
 
@@ -444,19 +458,27 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     if (dist >= 0)
       opToStage[op] = maxDistance - dist;
   }
-
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
+  int droppedStages = (maxStages - maxDistance);
+  int numClusters = maxClusterPerDistance.size() - droppedStages;
   CoarseSchedule schedule(maxStage + 1);
-  SmallVector<CoarseSchedule::Cluster> clusters(maxStage + 1);
-  for (int i = 0; i <= maxStage; i++) {
+  SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
+  for (int i = 0; i < numClusters; i++) {
     clusters[i] = schedule.clusters.newAtBack();
   }
-  // Assign ops to the clusters in reverse-stage order;
-  // ops with higher stage numbers are assigned first. This way we will
-  // end up with roughly reverse program order in the clusters.
-  for (auto [op, stage] : opToStage)
-    schedule.insert(op, stage, clusters[maxStage - stage]);
+
+  for (auto [op, stage] : opToStage) {
+    auto mappedClusterIdx = clusterMap.find(op);
+    int clusterIdx;
+    if (mappedClusterIdx != clusterMap.end()) {
+      clusterIdx = mappedClusterIdx->second;
+    } else {
+      auto dist = maxDistance - stage;
+      clusterIdx = maxClusterPerDistance[dist];
+    }
+    schedule.insert(op, stage, clusters[clusterIdx]);
+  }
 
   // Move `scf.if` ops in the current schedule (forward slice of the latency
   // ops) into a new epilogue cluster at the end of the schedule, pushing them
