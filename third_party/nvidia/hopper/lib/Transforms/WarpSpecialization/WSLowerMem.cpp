@@ -77,6 +77,8 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
           loadOp.getLoc(), loadOp.getPtr(), view, loadOp.getMask(),
           loadOp.getOther(), loadOp.getCache(), loadOp.getEvict(),
           loadOp.getIsVolatile());
+  copyLoopScheduleInfo(view, loadOp);
+  copyLoopScheduleInfo(copy, loadOp);
 
   // Extract part.
   builder.setAsyncTaskIdsFromValueUsers(loadResult);
@@ -85,6 +87,8 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
       loadOp.getLoc(), subviewTy, buffer, bufferIdxExtract);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       loadOp.getLoc(), loadOp.getType(), viewLoad /*,wait->getResult(0)*/);
+  copyLoopScheduleInfo(viewLoad, loadOp);
+  copyLoopScheduleInfo(sharedLoad, loadOp);
   // Replace all uses of loadResult
   loadResult.replaceAllUsesWith(sharedLoad.getResult());
   loadOp.erase();
@@ -134,6 +138,8 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
       dstOp->getLoc(), subviewTy, buffer, dstBufferIdx);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       dstOp->getLoc(), srcValue.getType(), dstView);
+  copyLoopScheduleInfo(dstView, dstOp);
+  copyLoopScheduleInfo(sharedLoad, dstOp);
   srcValue.replaceAllUsesWith(sharedLoad.getResult());
 
   // Producer part. Create local_store for new producers.
@@ -145,6 +151,8 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   // Create local_alloc
   Operation *copy = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       srcOp->getLoc(), srcValue, srcView);
+  copyLoopScheduleInfo(srcView, srcOp);
+  copyLoopScheduleInfo(copy, srcOp);
   return {copy, sharedLoad};
 }
 
@@ -198,6 +206,7 @@ createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   builder.setAsyncTaskIdsFromOp(actualSrc);
   auto smemStoreOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       oldAllocOp.getLoc(), oldAllocOp.getSrc(), srcView);
+  copyLoopScheduleInfo(smemStoreOp, actualSrc);
 
   // Consumer will be updated.
   oldAllocOp->getResult(0).replaceAllUsesWith(srcView);
@@ -256,6 +265,7 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
     builder.setAsyncTaskIdsFromOp(opForStoreTask);
     Value vTrue = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         oldTMemAllocOp.getLoc(), 1, 1);
+    copyLoopScheduleInfo(vTrue.getDefiningOp(), oldTMemAllocOp);
     // Promote TMEMAlloc to start, create TMEMStore.
     // auto tokType = builder.getType<AsyncTokenType>();
     // tokType, srcView, oldTMemAllocOp.getToken()
@@ -265,6 +275,7 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
     auto tmemStoreOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
         oldTMemAllocOp.getLoc(), Type(), srcView, Value(),
         oldTMemAllocOp.getSrc(), vTrue);
+    copyLoopScheduleInfo(tmemStoreOp, oldTMemAllocOp);
     oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
     if (oldTMemAllocOp.getToken())
       oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
@@ -313,8 +324,10 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                             sliceType.getEncoding(), sharedMemorySpace,
                             /*mutableMemOry=*/mutableMem);
 
-  return builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
+  auto desc = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       buffer.getLoc(), subviewTy, buffer, bufferIdx);
+  copyLoopScheduleInfo(desc, bufferIdx.getDefiningOp());
+  return desc;
 }
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
@@ -344,6 +357,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
   auto expect = builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
       loc, prodBarrier, sizeInBytes, pred);
+  copyLoopScheduleInfo(pred, prodBarrier.getDefiningOp());
+  copyLoopScheduleInfo(expect, prodBarrier.getDefiningOp());
 
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;
@@ -391,6 +406,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
         loc, tmaLoad.getType(), pipelineBuffer);
+    copyLoopScheduleInfo(sharedLoad, tmaLoad);
 
     Value loadResult = tmaLoad.getResult();
     tmaLoad.getResult().replaceAllUsesWith(sharedLoad.getResult());
@@ -481,6 +497,7 @@ void insertAsyncCopy(
       // be used by both producer and consumers.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           srcOp->getLoc(), 0, 32);
+      copyLoopScheduleInfo(bufferIdx.getDefiningOp(), srcOp);
     }
 
     LLVM_DEBUG({

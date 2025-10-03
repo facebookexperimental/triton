@@ -229,7 +229,8 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     ReuseConfig *config, int reuseGroupIdx);
 std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                              Location loc, Value accumCnt,
-                                             unsigned numBuffers);
+                                             unsigned numBuffers,
+                                             Operation *op);
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
