@@ -325,7 +325,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // for mmas.
   DenseMap<Operation *, int> distance;
   // Track the MMA cluster information for the independent dot chain path.
-  DenseMap<ttng::MMAv5OpInterface, int> mmaClusters;
+  DenseMap<Operation *, int> clusterMap;
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t maxChainLength = 0;
   size_t numDots = 0;
@@ -339,17 +339,40 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // get the same dot distance with a later stage (but an earlier cluster),
     // then we will.
     int startingOffset = 0;
-    int minStage = maxStages - maxChainLength;
+    int incrementValue = (numDots - (maxChainLength - 1));
     for (auto &chain : chains) {
-      int lastOffset = startingOffset - maxChainLength;
-      int currStage = minStage;
+      int lastOffset = startingOffset - incrementValue;
+      // Distance is maxStage - stage.
+      // We initialize the distance to (chain_length - 1)
+      // and decrement to 0.
+      // Note the max stage is numStages - 1.
+      int currDistance = (chain.size() - 1);
       for (auto &op : chain) {
-        int nextOffset = (lastOffset + maxChainLength) % numDots;
+        int nextOffset = (lastOffset + incrementValue) % numDots;
         if (nextOffset < lastOffset) {
-          currStage++;
+          currDistance--;
         }
-        distance[op] = currStage;
-        mmaClusters[op] = nextOffset;
+        // Update the distance to impact the stage of the MMA
+        // and its dependent operations.
+        distance[op] = currDistance;
+        // Use mmaClusters to encode the ordering of the underlying clusters.
+        // This alters the simple heuristic later that cluster = max_stages -
+        // stage. To address this we leverage the follow details:
+        //
+        // 1. Every MMA operand will be at a distance >= MMA distance.
+        //    This is because the calculation for distance is distance + .
+        // 2. Every user will be at a distance <= MMA distance. This is because
+        //    the only ops that have defined distance are MMAs and loads. Since
+        //    MMAs are ordered (and guarenteed to be at a smaller distance), the
+        //    only way the distance could increase is if the MMA is an input to
+        //    to the load, requiring it to be either address, offset, or mask,
+        //    all of which are non-sense.
+        //
+        // As a result, when analyzing distance. We can safely assign each op to
+        // a cluster based on its distance as well as already assigned clusters.
+        // Anything that comes after an MMA (e.g. no known cluster) but has a
+        // computed distance placed in the last cluster for a given stage.
+        clusterMap[op] = nextOffset;
         lastOffset = nextOffset;
       }
       startingOffset += maxChainLength;
@@ -357,18 +380,26 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 
   DominanceInfo domInfo(forOp);
-  std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
+  std::function<std::tuple<int, int>(Operation *)> computeDistance =
+      [&](Operation *op) -> std::tuple<int, int> {
     auto it = distance.find(op);
-    if (it != distance.end())
-      return it->second;
+    if (it != distance.end()) {
+      int cluster = -1;
+      auto clusterInfo = clusterMap.find(op);
+      if (clusterInfo != clusterMap.end()) {
+        cluster = clusterInfo->second;
+      }
+      return {it->second, cluster};
+    }
     // Compute max distance among all users that are inside the loop body
     int maxDist = -1;
+    int currCluster = -1;
     for (Operation *user : op->getUsers()) {
       // Only consider users inside the same block and not the terminator
       Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
       if (!inBlockUser || inBlockUser == terminator)
         continue;
-      int distUser = computeDistance(inBlockUser);
+      auto [distUser, clusterUser] = computeDistance(inBlockUser);
       if (distUser > maxDist)
         maxDist = distUser;
     }
@@ -381,13 +412,27 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // The maximum distance allowed is the maxmium number of stages.
     int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxStages);
     distance[op] = d;
-    return d;
+    int c = -1;
+    // We must always be scheduled as early as our earliest user for the same
+    // distance. If we are at a larger distance (e.g. earlier stage), then we
+    // can/should be scheduled to a later cluster. Default to -1 here.
+    if (d == maxDist) {
+      if (currCluster == -1) {
+        c = currCluster;
+      } else {
+        currCluster = std::min(c, currCluster);
+      }
+    }
+    if (c != -1) {
+      clusterMap[op] = c;
+    }
+    return {d, c};
   };
 
   // Compute distances for all latency-starting ops
   int maxDistance = 0;
   for (Operation *latOp : latOps) {
-    int d = computeDistance(latOp);
+    auto [d, _] = computeDistance(latOp);
     if (d > maxDistance)
       maxDistance = d;
   }
