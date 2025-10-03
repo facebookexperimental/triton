@@ -109,17 +109,14 @@ static void lowerTMAStore(Operation *op, mlir::TypedValue<RankedTensorType> src,
   gpu::MemDescType memDescType = gpu::MemDescType::get(
       tensorType.getShape(), tensorType.getElementType(), encoding,
       sharedMemorySpace, /*mutableMemory=*/false);
-  // If there is a local_load for src, no need for LocalAlloc here.
+  // If there is a local_load for src and there are no intervening instructions,
+  // then we can safely reuse the allocation being loaded from as the source of
+  // the TMA store.
   Value alloc;
-  bool hasExisting = false;
-  if (auto localLoad = dyn_cast<gpu::LocalLoadOp>(src.getDefiningOp())) {
-    // FIXME: Make sure there is no other update to the smem space so we
-    // can directly use the original alloc.
-    // Tracked by T239580270.
-    alloc = localLoad.getSrc();
-    hasExisting = true;
-  }
-  if (!hasExisting) {
+  if (auto localLoad = dyn_cast_or_null<gpu::LocalLoadOp>(src.getDefiningOp()))
+    if (localLoad->getNextNode() == op)
+      alloc = localLoad.getSrc();
+  if (!alloc) {
     alloc = rewriter.create<gpu::LocalAllocOp>(loc, memDescType, src);
   }
   rewriter.create<triton::nvidia_gpu::FenceAsyncSharedOp>(loc, false);
