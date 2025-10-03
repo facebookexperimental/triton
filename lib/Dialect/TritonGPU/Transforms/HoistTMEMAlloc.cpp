@@ -100,40 +100,6 @@ Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp) {
   return vTrue;
 }
 
-bool isPopulatedByInitStore(TMEMTokenAllocOp allocOp, ttng::TMEMLoadOp load,
-                            scf::ForOp forOp, Value initVal) {
-  if (!allUsersInTargetBlock(allocOp, load->getBlock())) {
-    return false;
-  }
-  Value bufferValue = allocOp->getResults()[0];
-  auto block = allocOp->getBlock();
-  auto it = mlir::Block::iterator(allocOp);
-  it--;
-  for (; it != block->begin(); it--) {
-    auto &op = *it;
-    if (!isUser(op, bufferValue)) {
-      continue;
-    }
-
-    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
-      // Buffer value must be the accumulator.
-      if (mmaOp.getAccumulator() != bufferValue) {
-        continue;
-      }
-      // We ignore the predicate value for now.
-      return false;
-    }
-    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
-      // TODO: Disable when predicated on the first iteration
-      if (storeOp.getDep() == bufferValue && storeOp.getSrc() == initVal) {
-        return true;
-      }
-    }
-  }
-  // Unsupported pattern.
-  return false;
-}
-
 class CombineTMEMStoreAndSelect : public OpRewritePattern<ttng::TMEMStoreOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -477,21 +443,59 @@ public:
       return failure();
     // TODO: 3. The live-in value of the TMEM variable is never read.
 
-    int argNo = use.getOperandNumber();
-    Value initVal = forOp.getInitArgs()[argNo];
-    // 4. The load must be populated by a store that accepts the inital value.
-    // If this is not satistified then this optimization is not safe.
-    if (!isPopulatedByInitStore(initAlloc, load, forOp, initVal))
+    // Find the original store value to TMEM. We need to extract the
+    // predicate value.
+    auto block = forOp.getBody();
+    auto it = mlir::Block::iterator(load);
+    it--;
+    ttng::TMEMStoreOp store = nullptr;
+    auto bufferValue = initAlloc.getResults()[0];
+    for (; it != block->begin(); it--) {
+      auto &op = *it;
+      if (!isUser(op, bufferValue)) {
+        continue;
+      }
+      if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
+        // Find the earliest store to this buffer.
+        // Note: It may not match the initial value exactly
+        // because we verify the initial value holds after some
+        // amount of math.
+        if (storeOp.getDst() == bufferValue) {
+          store = storeOp;
+        }
+      }
+    }
+    if (!store)
       return failure();
 
+    // Eliminate the store step if the store is predicated on the first
+    // iteration.
+    bool elimStore = false;
+    Value pred = store.getPred();
+    if (auto blockPred = dyn_cast<BlockArgument>(pred)) {
+      if (blockPred.getOwner() == block) {
+        pred = forOp.getInitArgs()[blockPred.getArgNumber() - 1];
+      }
+    }
+    auto predSource = pred.getDefiningOp();
+    if (predSource) {
+      if (auto constant = dyn_cast<arith::ConstantOp>(predSource)) {
+        elimStore = !dyn_cast<BoolAttr>(constant.getValueAttr()).getValue();
+      }
+    }
+
     // Create a store before the loop to write the initial value.
-    rewriter.setInsertionPoint(forOp);
-    auto vTrue = rewriter.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
+    int argNo = use.getOperandNumber();
     auto tokType = rewriter.getType<AsyncTokenType>();
-    auto initStore = rewriter.create<ttng::TMEMStoreOp>(
-        load.getLoc(), tokType, load.getSrc(), initAlloc.getToken(), initVal,
-        vTrue);
-    forOp.getInitArgsMutable()[tokArgNo].assign(initStore.getToken());
+    if (!elimStore) {
+      Value initVal = forOp.getInitArgs()[argNo];
+      rewriter.setInsertionPoint(forOp);
+      auto vTrue = rewriter.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
+      auto initStore = rewriter.create<ttng::TMEMStoreOp>(
+          load.getLoc(), tokType, load.getSrc(), initAlloc.getToken(), initVal,
+          vTrue);
+      forOp.getInitArgsMutable()[tokArgNo].assign(initStore.getToken());
+    }
 
     // Move the load to the beginning of the loop to load the tensor value.
     yield.setOperand(tokArgNo, load.getDep());
@@ -528,8 +532,8 @@ static Value getTokenFromOp(Operation *op) {
   llvm_unreachable("unknown TMEM memory user");
 }
 
-// Find all the last uses of a memory variable in a loop body. This traces the
-// token lattice to its leaves.
+// Find all the last uses of a memory variable in a loop body. This traces
+// the token lattice to its leaves.
 static void findLastMemoryUses(OpResult token,
                                SmallVectorImpl<OpResult> &lastUses,
                                DenseSet<Value> &seen) {
@@ -543,8 +547,8 @@ static void findLastMemoryUses(OpResult token,
     findLastMemoryUses(cast<OpResult>(getTokenFromOp(user)), lastUses, seen);
 }
 
-// Find the last uses of a memory variable, joining them into a single token if
-// necessary. This token can be carried into the next loop iteration.
+// Find the last uses of a memory variable, joining them into a single token
+// if necessary. This token can be carried into the next loop iteration.
 static Value joinLastMemoryUses(OpBuilder &b, Value token) {
   SmallVector<OpResult> lastUses;
   DenseSet<Value> seenTokens;
@@ -567,8 +571,8 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   auto newAlloc = cast<ttng::TMEMAllocOp>(builder.clone(*alloc));
   newAlloc.getSrcMutable().clear();
 
-  // By hoisting the allocation out of the loop, we need to turn the underlying
-  // memory variable into a loop-carried depdendency.
+  // By hoisting the allocation out of the loop, we need to turn the
+  // underlying memory variable into a loop-carried depdendency.
   auto tokType = builder.getType<AsyncTokenType>();
   forOp = addIterArgsToLoop(builder, forOp, newAlloc.getToken());
   Value newTok = forOp.getRegionIterArgs().back();
@@ -588,8 +592,9 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   return newAlloc;
 }
 
-// Hoist invariant tmem_alloc. This could technically be done as general LICM
-// but controlling tmem liveranga more precisley is likely to be important.
+// Hoist invariant tmem_alloc. This could technically be done as general
+// LICM but controlling tmem liveranga more precisley is likely to be
+// important.
 static void hoistInvariantInputs(Operation *mmaOp, scf::ForOp forOp) {
   for (auto operand : mmaOp->getOperands()) {
     if (forOp.isDefinedOutsideOfLoop(operand))
@@ -600,7 +605,8 @@ static void hoistInvariantInputs(Operation *mmaOp, scf::ForOp forOp) {
     assert(tmemAllocOp.getSrc());
     Value src = tmemAllocOp.getSrc();
     SmallVector<Operation *> opToHoist = {tmemAllocOp.getOperation()};
-    // Also hoist simple unary elementwise that may have sinked into the loop.
+    // Also hoist simple unary elementwise that may have sinked into the
+    // loop.
     while (Operation *defOp = src.getDefiningOp()) {
       if (forOp.isDefinedOutsideOfLoop(src))
         break;
