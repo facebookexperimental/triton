@@ -250,7 +250,7 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
 // supported.
 // 5. Any type of dot is present that is not a MMAv5OpInterface.
 std::tuple<SmallVector<SmallVector<ttng::MMAv5OpInterface>>, bool>
-determineIndependentDotChains(scf::ForOp forOp) {
+determineIndependentDotChains(scf::ForOp forOp, int maxStages) {
   DenseSet<ttng::MMAv5OpInterface> seenDots;
   SmallVector<SmallVector<ttng::MMAv5OpInterface>> dotChains;
   for (auto &op : forOp.getBody()->without_terminator()) {
@@ -294,11 +294,17 @@ determineIndependentDotChains(scf::ForOp forOp) {
     // All chains are length 1. Ignore.
     return {dotChains, false};
   }
+  if (maxChainLength > maxStages) {
+    // Not enough stages to pipeline
+    // out the longest chain.
+    return {dotChains, false};
+  }
   return {dotChains, true};
 }
 
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
-                              const DenseMap<Operation *, int> &opLatency) {
+                              const DenseMap<Operation *, int> &opLatency,
+                              int defaultNumStages) {
   llvm::MapVector<Operation *, int> opToStage;
   // Find terminator for later reference
   auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -312,10 +318,45 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   if (latOps.empty())
     return CoarseSchedule(0);
 
-  DominanceInfo domInfo(forOp);
+  // Schedule parallel dot pattern.
+  int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
   // Compute the longest path to the yield for each operation reachable
-  // from any latency operation.
+  // from any latency operation. We also use this to embed stage information
+  // for mmas.
   DenseMap<Operation *, int> distance;
+  // Track the MMA cluster information for the independent dot chain path.
+  DenseMap<ttng::MMAv5OpInterface, int> mmaClusters;
+  auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
+  size_t maxChainLength = 0;
+  size_t numDots = 0;
+  if (success) {
+    for (auto &chain : chains) {
+      maxChainLength = std::max(maxChainLength, chain.size());
+      numDots += chain.size();
+    }
+    // Assign each chain in order. Any time we wrap around to the
+    // next stage we assign that op to a later stage. When we can
+    // get the same dot distance with a later stage (but an earlier cluster),
+    // then we will.
+    int startingOffset = 0;
+    int minStage = maxStages - maxChainLength;
+    for (auto &chain : chains) {
+      int lastOffset = startingOffset - maxChainLength;
+      int currStage = minStage;
+      for (auto &op : chain) {
+        int nextOffset = (lastOffset + maxChainLength) % numDots;
+        if (nextOffset < lastOffset) {
+          currStage++;
+        }
+        distance[op] = currStage;
+        mmaClusters[op] = nextOffset;
+        lastOffset = nextOffset;
+      }
+      startingOffset += maxChainLength;
+    }
+  }
+
+  DominanceInfo domInfo(forOp);
   std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
     auto it = distance.find(op);
     if (it != distance.end())
@@ -336,7 +377,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       lat = opLatency.lookup(op);
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
-    int d = lat + (maxDist < 0 ? 0 : maxDist);
+    //
+    // The maximum distance allowed is the maxmium number of stages.
+    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxStages);
     distance[op] = d;
     return d;
   };
@@ -397,14 +440,15 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 // Get an initial schedule for the loop. This is the base schedule from which
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
-                                  const DenseMap<Operation *, int> &opLatency) {
+                                  const DenseMap<Operation *, int> &opLatency,
+                                  int defaultNumStages) {
   if (!isSafeToPipeline(forOp))
     return CoarseSchedule(0);
 
   // If the loop has assigned latencies, use them to determine the initial
   // schedule.
   if (hasLatenciesAssigned(forOp, opLatency))
-    return scheduleKeyOps(forOp, opLatency);
+    return scheduleKeyOps(forOp, opLatency, defaultNumStages);
 
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
@@ -496,10 +540,11 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
   return afterPrologue;
 }
 
-void scheduleLoop(scf::ForOp forOp,
-                  const DenseMap<Operation *, int> &opLatency) {
+void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
+                  int defaultNumStages) {
   // Based on the latencies, schedule the key ops to the stages.
-  CoarseSchedule schedule = getInitialSchedule(forOp, opLatency);
+  CoarseSchedule schedule =
+      getInitialSchedule(forOp, opLatency, defaultNumStages);
   if (schedule.empty())
     return;
   LLVM_DEBUG({
@@ -535,14 +580,14 @@ void scheduleLoop(scf::ForOp forOp,
 } // namespace
 
 /// Schedule the loops based on the latencies assigned to the operations.
-void scheduleLoops(ModuleOp moduleOp) {
+void scheduleLoops(ModuleOp moduleOp, int defaultNumStages) {
   DenseMap<Operation *, int> opLatency = deserializeLatencies(moduleOp);
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   if (loops.empty())
     return;
   for (auto forOp : loops) {
-    scheduleLoop(forOp, opLatency);
+    scheduleLoop(forOp, opLatency, defaultNumStages);
   }
 }
 //===----------------------------------------------------------------------===//
@@ -555,7 +600,7 @@ void scheduleLoops(ModuleOp moduleOp) {
 struct ScheduleLoops : public impl::TritonGPUScheduleLoopsBase<ScheduleLoops> {
   using TritonGPUScheduleLoopsBase::TritonGPUScheduleLoopsBase;
 
-  void runOnOperation() override { scheduleLoops(getOperation()); }
+  void runOnOperation() override { scheduleLoops(getOperation(), numStages); }
 };
 
 } // namespace mlir::triton::gpu
