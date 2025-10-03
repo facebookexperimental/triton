@@ -1592,7 +1592,7 @@ def test_async_dots_blackwell_tmem(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-@pytest.mark.parametrize("BLOCK_SIZE", [(256)])
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_cluster_launch_control(BLOCK_SIZE, device):
 
     @triton.jit
@@ -1637,7 +1637,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
-    size = 1000000
+    size = 10000000
     x = torch.ones(size, device=device)
     y = torch.ones(size, device=device)
 

@@ -328,21 +328,28 @@ struct AsyncCLCTryCancelOpConversion
   matchAndRewrite(triton::nvidia_gpu::AsyncCLCTryCancelOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+
+    auto tid = getThreadId(rewriter, loc);
+    TritonLLVMOpBuilder b(op.getLoc(), rewriter);
+    Value pred = b.icmp_eq(tid, b.i32_val(0));
+
     std::string ptx = R"(
     {
-      .reg .b32 mask;
-      mov.b32 mask, -1;
-      .reg .b32 %rx;
-      .reg .pred %px;
-      elect.sync %rx|%px, mask;
-      @%px clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
+      .reg .u32 first_cta_in_cluster;
+      .reg .pred p1;
+      mov.u32  first_cta_in_cluster, %cluster_ctaid.x;
+      setp.u32.eq p1, first_cta_in_cluster, 0x0;
+      @!$2 bra L1;
+      @p1 clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];
+      L1:
     }
     )";
 
     PTXBuilder ptxBuilder;
-    SmallVector<PTXBuilder::Operand *, 2> operands = {
+    SmallVector<PTXBuilder::Operand *, 3> operands = {
         ptxBuilder.newOperand(adaptor.getClcResAlloc(), "r"),
-        ptxBuilder.newOperand(adaptor.getMbarAlloc(), "r")};
+        ptxBuilder.newOperand(adaptor.getMbarAlloc(), "r"),
+        ptxBuilder.newOperand(pred, "b")};
 
     auto clcOp = *ptxBuilder.create<>(ptx);
     clcOp(operands, /*onlyAttachMLIRArgs=*/true);
