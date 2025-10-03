@@ -1672,4 +1672,3 @@ def test_async_tasks_region_error(device):
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
     assert "ZeroDivisionError('division by zero')" in exc_msg, '\n\nExpected ZeroDivisionError but got: \n\n' + exc_msg + '\n\n'
-
