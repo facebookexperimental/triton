@@ -2205,6 +2205,52 @@ void insertAsyncComm(
                        headConsumer, consumerWaitPoint, isPost);
     }
   }
+
+  // Clean up tokens that are not used anymore.
+  // Remove an LocalAllocOp op if it is only used by
+  // MemDescIndexOp/InitBarrierOp
+  DenseSet<Value> removedBarriers;
+  auto removeTokenfNotUsed = [&](Value barrier) {
+    if (removedBarriers.count(barrier))
+      return;
+    if (barrier.use_empty()) {
+      barrier.getDefiningOp()->erase();
+      removedBarriers.insert(barrier);
+      return;
+    }
+
+    if (auto alloc = dyn_cast<ttg::LocalAllocOp>(barrier.getDefiningOp())) {
+      // Check: alloc result is only used once
+      if (!alloc->hasOneUse())
+        return;
+
+      Operation *memDescUser = *alloc->user_begin();
+      auto memDesc = dyn_cast<ttg::MemDescIndexOp>(memDescUser);
+      if (!memDesc || !memDesc->hasOneUse())
+        return;
+
+      Operation *idxUser = *memDesc->user_begin();
+      if (isa<ttng::InitBarrierOp>(idxUser)) {
+        // Safe to erase: drop uses first then erase ops
+        idxUser->erase();
+        memDesc->dropAllUses();
+        memDesc->erase();
+        alloc->erase();
+        removedBarriers.insert(barrier);
+      }
+    }
+  };
+
+  for (auto commChannel : tokenMap) {
+    if (commChannel.second.producerBarrier)
+      removeTokenfNotUsed(*commChannel.second.producerBarrier);
+
+    for (auto &barrier : commChannel.second.consumerBarriers)
+      removeTokenfNotUsed(barrier.second);
+
+    for (auto &token : commChannel.second.tokens)
+      removeTokenfNotUsed(token.second);
+  }
 }
 
 void foldLocalLoads(triton::FuncOp funcOp) {
