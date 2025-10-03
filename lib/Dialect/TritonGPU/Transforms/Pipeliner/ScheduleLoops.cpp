@@ -281,15 +281,16 @@ determineIndependentDotChains(scf::ForOp forOp) {
       }
     }
   }
-  if (dotChains.size() < 2) {
-    // Only 1 chain, ignore.
+  // Restrict to 2 chains for now so the math will always work.
+  if (dotChains.size() != 2) {
     return {dotChains, false};
   }
   size_t maxChainLength = 0;
   for (auto &chain : dotChains) {
     maxChainLength = std::max(maxChainLength, chain.size());
   }
-  // Require all chains to be length 2 for now.
+  // Require all chains to be length 2 for now so the math
+  // will always work.
   if (maxChainLength != 2) {
     return {dotChains, false};
   }
