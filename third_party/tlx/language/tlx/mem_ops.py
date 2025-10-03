@@ -156,13 +156,26 @@ def local_view(
     elif isinstance(local_allocated_buffers, tlx.clc_response):
         return tlx.clc_response(view_handle, 0, local_allocated_buffers.type.layout)
     else:
+        # Calculate the correct shape for the subview according to create_memdesc_subview logic
+        original_shape = local_allocated_buffers.shape
+        if local_allocated_buffers.type.num == 0:
+            if len(original_shape) == 1:
+                # For 1D tensors, subview creates a single element view with shape [1]
+                new_shape = [1]
+            else:
+                # For multi-dimensional tensors, drop the first dimension
+                new_shape = original_shape[1:]
+        else:
+            new_shape = original_shape
+
         return tlx.buffered_tensor(
             view_handle,
             local_allocated_buffers.type.scalar,
-            local_allocated_buffers.shape,
+            new_shape,
             0,
             local_allocated_buffers.type.storage,
             local_allocated_buffers.type.layout,
+            local_allocated_buffers.type.semantic,
         )
 
 
