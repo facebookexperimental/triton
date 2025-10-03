@@ -249,7 +249,7 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
 // supported.
 // 5. Any type of dot is present that is not a MMAv5OpInterface.
 std::tuple<SmallVector<SmallVector<ttng::MMAv5OpInterface>>, bool>
-determineIndependentDotChains(scf::ForOp forOp) {
+determineIndependentDotChains(scf::ForOp forOp, int maxStages) {
   DenseSet<ttng::MMAv5OpInterface> seenDots;
   SmallVector<SmallVector<ttng::MMAv5OpInterface>> dotChains;
   for (auto &op : forOp.getBody()->without_terminator()) {
@@ -290,8 +290,16 @@ determineIndependentDotChains(scf::ForOp forOp) {
     maxChainLength = std::max(maxChainLength, chain.size());
   }
   // Require all chains to be length 2 for now so the math
-  // will always work.
+  // will always work. In general the allocation strategy
+  // that we have chosen will always work so long as
+  // num_dots - (maxChainLength - 1)) and num_dots are
+  // coprime. However, finding the starting points is complicated
+  // unless maxChainLength = 2.
   if (maxChainLength != 2) {
+    return {dotChains, false};
+  }
+  if (maxChainLength > maxStages) {
+    // Not enough stages to schedule the dots.
     return {dotChains, false};
   }
   return {dotChains, true};
@@ -321,12 +329,14 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // for mmas.
   DenseMap<Operation *, int> distance;
   // Track the MMA cluster information for the independent dot chain path.
+  // If success=True every dot will be assigned to a chain (and therefore
+  // every dot will populate the clusterMap).
   DenseMap<Operation *, int> clusterMap;
-  auto [chains, success] = determineIndependentDotChains(forOp);
-  size_t maxChainLength = 0;
+  auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t numDots = 0;
   SmallVector<int> maxClusterPerDistance(maxStages, -1);
   if (success) {
+    size_t maxChainLength = 0;
     for (auto &chain : chains) {
       maxChainLength = std::max(maxChainLength, chain.size());
       numDots += chain.size();
@@ -390,6 +400,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 
   DominanceInfo domInfo(forOp);
+  // The return value is a tuple of <distance, cluster number>.
+  // If the cluster number is -1, then the op will eventually be
+  // assigned to the last cluster of its decided stage.
   std::function<std::tuple<int, int>(Operation *)> computeDistance =
       [&](Operation *op) -> std::tuple<int, int> {
     auto it = distance.find(op);
