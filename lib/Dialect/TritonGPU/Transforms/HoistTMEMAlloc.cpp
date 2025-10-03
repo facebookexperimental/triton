@@ -38,15 +38,6 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
-bool isUser(Operation &op, Value val) {
-  for (auto operand : op.getOperands()) {
-    if (operand == val) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Determine if a store operation is overridden by an MMA op that
 // will ignore the accumulator. Whenever the accumulator is ignored
 // the load should be predicated.
@@ -59,6 +50,14 @@ Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp,
   auto block = allocOp->getBlock();
   auto it = mlir::Block::iterator(loadOp);
   it--;
+  auto isUser = [](Operation &op, Value val) -> bool {
+    for (auto operand : op.getOperands()) {
+      if (operand == val) {
+        return true;
+      }
+    }
+    return false;
+  };
   for (; it != block->begin(); it--) {
     auto &op = *it;
     if (!isUser(op, bufferValue)) {
@@ -495,8 +494,8 @@ static Value getTokenFromOp(Operation *op) {
   llvm_unreachable("unknown TMEM memory user");
 }
 
-// Find all the last uses of a memory variable in a loop body. This traces
-// the token lattice to its leaves.
+// Find all the last uses of a memory variable in a loop body. This traces the
+// token lattice to its leaves.
 static void findLastMemoryUses(OpResult token,
                                SmallVectorImpl<OpResult> &lastUses,
                                DenseSet<Value> &seen) {
@@ -510,8 +509,8 @@ static void findLastMemoryUses(OpResult token,
     findLastMemoryUses(cast<OpResult>(getTokenFromOp(user)), lastUses, seen);
 }
 
-// Find the last uses of a memory variable, joining them into a single token
-// if necessary. This token can be carried into the next loop iteration.
+// Find the last uses of a memory variable, joining them into a single token if
+// necessary. This token can be carried into the next loop iteration.
 static Value joinLastMemoryUses(OpBuilder &b, Value token) {
   SmallVector<OpResult> lastUses;
   DenseSet<Value> seenTokens;
@@ -534,8 +533,8 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   auto newAlloc = cast<ttng::TMEMAllocOp>(builder.clone(*alloc));
   newAlloc.getSrcMutable().clear();
 
-  // By hoisting the allocation out of the loop, we need to turn the
-  // underlying memory variable into a loop-carried depdendency.
+  // By hoisting the allocation out of the loop, we need to turn the underlying
+  // memory variable into a loop-carried depdendency.
   auto tokType = builder.getType<AsyncTokenType>();
   forOp = addIterArgsToLoop(builder, forOp, newAlloc.getToken());
   Value newTok = forOp.getRegionIterArgs().back();
@@ -544,7 +543,6 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   if (src != nullptr) {
     builder.setInsertionPoint(alloc);
     // Write the initial value of the allocation and replace the token.
-    Value vTrue = builder.create<arith::ConstantIntOp>(alloc.getLoc(), 1, 1);
     auto initStoreOp = builder.create<ttng::TMEMStoreOp>(
         alloc.getLoc(), tokType, newAlloc.getResult(), newTok, src, vTrue);
     newTok = initStoreOp.getToken();
@@ -555,9 +553,8 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   return newAlloc;
 }
 
-// Hoist invariant tmem_alloc. This could technically be done as general
-// LICM but controlling tmem liveranga more precisley is likely to be
-// important.
+// Hoist invariant tmem_alloc. This could technically be done as general LICM
+// but controlling tmem liveranga more precisley is likely to be important
 static void hoistInvariantInputs(Operation *mmaOp, scf::ForOp forOp) {
   for (auto operand : mmaOp->getOperands()) {
     if (forOp.isDefinedOutsideOfLoop(operand))
@@ -568,8 +565,7 @@ static void hoistInvariantInputs(Operation *mmaOp, scf::ForOp forOp) {
     assert(tmemAllocOp.getSrc());
     Value src = tmemAllocOp.getSrc();
     SmallVector<Operation *> opToHoist = {tmemAllocOp.getOperation()};
-    // Also hoist simple unary elementwise that may have sinked into the
-    // loop.
+    // Also hoist simple unary elementwise that may have sinked into the loop.
     while (Operation *defOp = src.getDefiningOp()) {
       if (forOp.isDefinedOutsideOfLoop(src))
         break;
