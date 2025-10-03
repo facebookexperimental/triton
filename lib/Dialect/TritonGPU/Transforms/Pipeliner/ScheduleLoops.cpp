@@ -250,7 +250,7 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
 // supported.
 // 5. Any type of dot is present that is not a MMAv5OpInterface.
 std::tuple<SmallVector<SmallVector<ttng::MMAv5OpInterface>>, bool>
-determineIndependentDotChains(scf::ForOp forOp, int maxStages) {
+determineIndependentDotChains(scf::ForOp forOp) {
   DenseSet<ttng::MMAv5OpInterface> seenDots;
   SmallVector<SmallVector<ttng::MMAv5OpInterface>> dotChains;
   for (auto &op : forOp.getBody()->without_terminator()) {
@@ -290,13 +290,8 @@ determineIndependentDotChains(scf::ForOp forOp, int maxStages) {
   for (auto &chain : dotChains) {
     maxChainLength = std::max(maxChainLength, chain.size());
   }
-  if (maxChainLength < 2) {
-    // All chains are length 1. Ignore.
-    return {dotChains, false};
-  }
-  if (maxChainLength > maxStages) {
-    // Not enough stages to pipeline
-    // out the longest chain.
+  // Require all chains to be length 2 for now.
+  if (maxChainLength != 2) {
     return {dotChains, false};
   }
   return {dotChains, true};
@@ -326,7 +321,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   DenseMap<Operation *, int> distance;
   // Track the MMA cluster information for the independent dot chain path.
   DenseMap<Operation *, int> clusterMap;
-  auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
+  auto [chains, success] = determineIndependentDotChains(forOp);
   size_t maxChainLength = 0;
   size_t numDots = 0;
   SmallVector<int> maxClusterPerDistance(maxStages, -1);
