@@ -1622,15 +1622,15 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
         responses = tlx.alloc_clc_responses(num_responses=1)
         clc_response = tlx.local_view(responses, 0)
-        tlx.barrier_expect_bytes(clc_mbar, 16)
+        tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
 
-        # CLC issue and wait
+        # Issue async clc.try_cancel for the next available CTA
         tlx.clc_issue(clc_response, clc_mbar)
 
-        # mbar completion and extract CTA ID
+        # Wait for clc.try_cancel finishes
         tlx.barrier_wait(clc_mbar, 0)
 
-        # CLC parse CTA ID from response
+        # Extract CTA ID from CLC response
         res = tlx.clc_query(clc_response)
 
         if tid == 0 and res != -1:
@@ -1653,6 +1653,10 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
     assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
+    # Each worker uses the {blockIdx.x, blockIdx.y, blockIdx.z} coordinate as the first output tile to process
+    # and uses the CLC query for subsequent processing of output tiles.
+    # However in our test those CTAs left from the first round won't execute.
+    # Its nonzero count MUST be different from original size.
     assert (torch.count_nonzero(output) != size)
 
 
