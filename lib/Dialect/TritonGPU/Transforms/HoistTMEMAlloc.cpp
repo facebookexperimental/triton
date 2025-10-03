@@ -554,7 +554,7 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
 }
 
 // Hoist invariant tmem_alloc. This could technically be done as general LICM
-// but controlling tmem liveranga more precisley is likely to be important
+// but controlling tmem live range more precisely is likely to be important.
 static void hoistInvariantInputs(Operation *mmaOp, scf::ForOp forOp) {
   for (auto operand : mmaOp->getOperands()) {
     if (forOp.isDefinedOutsideOfLoop(operand))
