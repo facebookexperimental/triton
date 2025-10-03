@@ -365,20 +365,17 @@ struct AsyncCLCQueryCancelOpConversion
     Location loc = op->getLoc();
 
     TritonLLVMOpBuilder b(op.getLoc(), rewriter);
-    Value valid = b.i32_val(0);
 
     std::string ptx = R"(
     {
-      .reg .pred p1;
       .reg .b128 clc_result;
+      .reg .pred p1;
+      mov.s32 $0, -1;
       ld.shared.b128 clc_result, [$1];
       clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
-      selp.u32 $0, 1, 0, p1;
+      @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$0, _, _, _}, clc_result;
     }
     )";
-
-    // @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$2, _,
-    // _, _}, clc_result;
 
     PTXBuilder builder;
     auto queryOp = *builder.create<>(ptx);
@@ -388,9 +385,9 @@ struct AsyncCLCQueryCancelOpConversion
         builder.newOperand(adaptor.getClcResAlloc(), "r")};
     queryOp(operands, /*onlyAttachMLIRArgs=*/true);
 
-    valid = builder.launch(rewriter, op.getLoc(), i32_ty, false);
+    Value ctaId = builder.launch(rewriter, op.getLoc(), i32_ty, false);
 
-    rewriter.replaceOp(op, valid);
+    rewriter.replaceOp(op, ctaId);
 
     return success();
   }
