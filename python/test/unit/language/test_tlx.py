@@ -1592,27 +1592,28 @@ def test_async_dots_blackwell_tmem(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-@pytest.mark.parametrize("BLOCK_SIZE", [(256)])
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_cluster_launch_control(BLOCK_SIZE, device):
 
     @triton.jit
-    def add2_clc(
+    def mul2_clc(
         x_ptr,
         y_ptr,
         z_ptr,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        # CTA ID of the first work load
-        ctaid = tl.program_id(axis=0)
-        block_start = ctaid * BLOCK_SIZE
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+
+        tid = tlx.thread_id(axis=0)
 
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
         x = tl.load(x_ptr + offsets, mask=mask)
         y = tl.load(y_ptr + offsets, mask=mask)
-        output = x + y
+        output = x * y
         tl.store(z_ptr + offsets, output, mask=mask)
 
         bars = tlx.alloc_barriers(num_barriers=1)
@@ -1620,30 +1621,30 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
         responses = tlx.alloc_clc_responses(num_responses=1)
         clc_response = tlx.local_view(responses, 0)
+        tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
 
-        # CLC issue and wait
+        # Issue async clc.try_cancel for the next available CTA
         tlx.clc_issue(clc_response, clc_mbar)
 
-        # mbar completion and extract CTA ID
-        tlx.barrier_wait(clc_mbar, 1)
+        # Wait for clc.try_cancel finishes
+        tlx.barrier_wait(clc_mbar, 0)
 
-        # CLC parse CTA ID from response
-        valid = 0
-        cta_id_x = -1
-        cta_id_y = -2
-        cta_id_z = -3
-        tlx.clc_query(clc_response, valid, cta_id_x, cta_id_y, cta_id_z)
+        # Extract CTA ID from CLC response
+        res = tlx.clc_query(clc_response)
+
+        if tid == 0:
+            tl.device_print("Extracted CtaID", res)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
-    size = 100000
-    x = torch.rand(size, device=device)
-    y = torch.rand(size, device=device)
+    size = 10000000
+    x = torch.ones(size, device=device)
+    y = torch.ones(size, device=device)
 
-    output = torch.empty_like(x)
+    output = torch.zeros_like(x)
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = add2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
+    kernel = mul2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
 
     ptx = kernel.asm["ptx"]
 
@@ -1651,7 +1652,11 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
     assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
-    torch.testing.assert_close(output, x + y, check_dtype=False)
+    # Each worker uses the {blockIdx.x, blockIdx.y, blockIdx.z} coordinate as the first output tile to process
+    # and uses the CLC query for subsequent processing of output tiles.
+    # However in our test those CTAs left from the first round won't execute.
+    # Its nonzero count MUST be different from original size.
+    assert (torch.count_nonzero(output) != size)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

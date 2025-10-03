@@ -314,21 +314,19 @@ def TTNG_AsyncCLCQueryCancelOp : TTNG_Op<"async_clc_query_cancel", []> {
   let summary = "Extract CTA ID from CLC response";
 
   let description = [{
-    Extract CTA ID from CLC response stored at the SMEM address pointed
-    and store results to (valid, xctaid, yctaid, zctaid).
+    Extract CTA ID from CLC response if try_cancel was successful.
+    Otherwise, returns -1.
 
     https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-query-cancel
   }];
 
   let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc,
-    I32:$valid,
-    I32:$ctaIdX,
-    I32:$ctaIdY,
-    I32:$ctaIdZ
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc
   );
 
-  let assemblyFormat = "$clcResAlloc`,` $valid`,` $ctaIdX`,` $ctaIdY`,` $ctaIdZ attr-dict `:` type(operands)";
+  let results = (outs I32:$ctaId);
+
+  let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $ctaId)";
 }
 
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {
