@@ -1596,7 +1596,7 @@ def test_async_dots_blackwell_tmem(device):
 def test_cluster_launch_control(BLOCK_SIZE, device):
 
     @triton.jit
-    def add2_clc(
+    def mul2_clc(
         x_ptr,
         y_ptr,
         z_ptr,
@@ -1645,7 +1645,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     output = torch.zeros_like(x)
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = add2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
+    kernel = mul2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
 
     ptx = kernel.asm["ptx"]
 

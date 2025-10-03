@@ -206,7 +206,7 @@ private:
 protected:
   llvm::SmallVector<std::unique_ptr<Operand>, 6> argArchive;
   llvm::SmallVector<std::unique_ptr<PTXInstrCommon>, 2> instrs;
-  llvm::SmallVector<std::unique_ptr<PTXInstrExecution>, 8> executions;
+  llvm::SmallVector<std::unique_ptr<PTXInstrExecution>, 4> executions;
   int oprCounter{};
 };
 
