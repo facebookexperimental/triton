@@ -166,6 +166,8 @@ struct TmemDataChannelPost : Channel {
       : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, uniqID),
         isOperandD(isOperandD), isOperandDNoAcc(isOperandDNoAcc),
         allocOp(allocOp) {
+    assert(consumers.size() == 1 &&
+           "TmemDataChannelPost must have a single consumer partition");
     channelKind = DataChannelKind::TMEMPost;
   }
 
@@ -258,6 +260,7 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier = true);
 void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
+bool appearsBefore(Operation *A, Operation *B);
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_

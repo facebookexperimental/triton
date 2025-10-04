@@ -120,6 +120,7 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
 
     SetVector<std::pair<Operation *, unsigned>> users;
     getTransitiveUsers(result, users);
+    LDBG("getTransitiveUsers returns " << users.size());
     for (auto user : users) {
       auto userOp = user.first;
       if (producerOp == userOp && !opndAOfGen5)
@@ -154,6 +155,16 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
           channelKind = DataChannelKind::REG;
         }
 
+        if (isa<scf::ForOp>(userOp)) {
+          LDBG("createChannel with dstOp ForOp: producerId "
+               << producerTaskId << " number of consumerIds "
+               << consumerTaskIds.size());
+          auto *tSrc = userOp->getOperand(user.second).getDefiningOp();
+          if (isa<scf::ForOp>(tSrc)) {
+            LDBG("createChannel with srcOp ForOp");
+            continue;
+          }
+        }
         channels.push_back(std::make_unique<Channel>(
             producerTaskId, consumerTaskIds, userOp, user.second,
             producerNumBuffers, channels.size(), channelKind));

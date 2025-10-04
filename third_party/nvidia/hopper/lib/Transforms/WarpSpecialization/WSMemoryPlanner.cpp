@@ -577,15 +577,18 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
           findChannelForAlloc(a, channels));
       ttng::TmemDataChannelPost *bCh = static_cast<ttng::TmemDataChannelPost *>(
           findChannelForAlloc(b, channels));
-      if (aCh->isOperandD)
+      if (aCh->isOperandD && !bCh->isOperandD)
         return true;
-      if (bCh->isOperandD)
+      if (bCh->isOperandD && !aCh->isOperandD)
         return false;
-      if (aCh->isOperandDNoAcc)
+      if (aCh->isOperandDNoAcc && !bCh->isOperandDNoAcc)
         return true;
-      if (bCh->isOperandDNoAcc)
+      if (bCh->isOperandDNoAcc && !aCh->isOperandDNoAcc)
         return false;
-      return true;
+      // If consumer in the same block, sort according to program order.
+      if (appearsBefore(aCh->getDstOp(), bCh->getDstOp()))
+        return true;
+      return false;
     }
     if (iter1->second.numRows == iter2->second.numRows)
       return iter1->second.numCols > iter2->second.numCols;
@@ -772,6 +775,10 @@ static unsigned allocateTMemAllocs(
         auto *reuseAlloc = findReuseChannel(alloc.getOperation(), true);
         if (!reuseAlloc)
           assert(false && "can't find space");
+        LLVM_DEBUG({
+          LDBG("2nd loop allocate space for channel:");
+          alloc.getOperation()->dump();
+        });
         bufferSet[alloc.getOperation()] =
             getIntervalForCtrlOp(ctrlOp, operationId);
         alloc->setAttr(

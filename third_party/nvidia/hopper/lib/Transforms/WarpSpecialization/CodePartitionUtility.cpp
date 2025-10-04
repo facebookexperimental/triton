@@ -107,7 +107,7 @@ static Operation *getLiftedOp(Operation *op, Operation *scope) {
   return nullptr;
 }
 
-static bool appearsBefore(Operation *A, Operation *B) {
+bool appearsBefore(Operation *A, Operation *B) {
   // A and B can be from different blocks.
   if (A->getBlock() != B->getBlock()) {
     auto *outScope = getCommonScope(A, B);
