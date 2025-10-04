@@ -1022,15 +1022,25 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
   } else {
     auto originTaskIds = builder.getAsyncTaskIds();
     builder.setAsyncTaskIdsFromOp(srcOp);
+    tt::DescriptorStoreOp tmaStore;
     bool requireMMASharedEncoding =
-        llvm::any_of(actualConsumers, [](Operation *op) {
+        llvm::any_of(actualConsumers, [&](Operation *op) {
           // convert_layout
           if (isa<ttg::ConvertLayoutOp>(op)) {
-            for (auto *user : op->getUsers())
-              if (isa<tt::DescriptorStoreOp>(user))
-                return true;
+            for (auto *user : op->getUsers()) {
+              // Do not reuse the current order for TMA store desc. Subsequent
+              // codegen for TMA store does not handle mismatching order well.
+              if ((tmaStore = dyn_cast<tt::DescriptorStoreOp>(user))) {
+                return false;
+              }
+            }
           }
-          return isa<mlir::triton::DotOpInterface, tt::DescriptorStoreOp>(op);
+          // Do not reuse the current order for TMA store desc. Subsequent
+          // codegen for TMA store does not handle mismatching order well.
+          if ((tmaStore = dyn_cast<tt::DescriptorStoreOp>(op))) {
+            return false;
+          }
+          return isa<mlir::triton::DotOpInterface>(op);
         });
 
     // Get shape, layout and type of a slice
@@ -1040,6 +1050,9 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
       sharedLayout = ttg::NVMMASharedEncodingAttr::get(
           context, sliceShape, order, CTALayout, elemType,
           /*fp4Padded*/ false);
+    } else if (tmaStore) {
+      sharedLayout = ttng::getEncodingFromDescriptor(tmaStore, tensorType,
+                                                     tmaStore.getDesc());
     } else if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(srcOp)) {
       sharedLayout = ttng::getEncodingFromDescriptor(tmaLoad, tmaLoad.getType(),
                                                      tmaLoad.getDesc());
