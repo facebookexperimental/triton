@@ -100,7 +100,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                                 tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
-    qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
@@ -172,7 +171,6 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                 tlx.barrier_wait(qk_fulls[qk_bufIdx], qk_phase)
                 qk = tlx.local_load(qk_tiles[qk_bufIdx])
-                tlx.barrier_arrive(qk_empties[qk_bufIdx])
 
                 # compute m_i, p in registers
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -223,7 +221,6 @@ def _attn_fwd_ws(sm_scale, M,  #
 
             k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
             _, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
-            tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
             tlx.async_dot(
                 q_tiles[0],
                 k_tile,
@@ -233,7 +230,6 @@ def _attn_fwd_ws(sm_scale, M,  #
             )
 
             tlx.barrier_wait(q_fulls[1], 0)
-            tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
             tlx.async_dot(
                 q_tiles[1],
                 k_tile,
@@ -269,7 +265,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # -- compute q0 @ k ----
                 _, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
                 tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
-                tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
                 k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
                 tlx.async_dot(
                     q_tiles[0],
@@ -293,7 +288,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 acc1_init = True
 
                 # -- compute q1 @ k ----
-                tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                 tlx.async_dot(
                     q_tiles[1],
                     k_tile,
