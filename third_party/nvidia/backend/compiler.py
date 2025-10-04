@@ -288,10 +288,12 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages)
-            # use Meta's WS internally which supports both hopper and blackwell
-            passes.ttgpuir.add_partition_scheduling(pm)
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
-            # passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
+            if knobs.use_oai_ws:
+                passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
+            else:
+                # use Meta's WS internally which supports both hopper and blackwell
+                passes.ttgpuir.add_partition_scheduling(pm)
+                nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
@@ -315,7 +317,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 10:
+        if capability // 10 >= 10 and not knobs.use_oai_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
