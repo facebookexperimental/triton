@@ -288,7 +288,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages)
-            if knobs.use_oai_ws:
+            if knobs.nvidia.use_oai_ws:
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
@@ -317,7 +317,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 10 and not knobs.use_oai_ws:
+        if capability // 10 >= 10 and not knobs.nvidia.use_oai_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
