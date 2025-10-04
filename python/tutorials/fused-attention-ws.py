@@ -3,7 +3,6 @@ import torch
 
 import triton
 import triton.language as tl
-import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
 
