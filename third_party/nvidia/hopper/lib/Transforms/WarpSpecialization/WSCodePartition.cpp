@@ -1030,16 +1030,14 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
             for (auto *user : op->getUsers()) {
               // Do not reuse the current order for TMA store desc. Subsequent
               // codegen for TMA store does not handle mismatching order well.
-              if (isa<tt::DescriptorStoreOp>(user)) {
-                tmaStore = dyn_cast<tt::DescriptorStoreOp>(user);
+              if ((tmaStore = dyn_cast<tt::DescriptorStoreOp>(user))) {
                 return false;
               }
             }
           }
           // Do not reuse the current order for TMA store desc. Subsequent
           // codegen for TMA store does not handle mismatching order well.
-          if (isa<tt::DescriptorStoreOp>(op)) {
-            tmaStore = dyn_cast<tt::DescriptorStoreOp>(op);
+          if ((tmaStore = dyn_cast<tt::DescriptorStoreOp>(op))) {
             return false;
           }
           return isa<mlir::triton::DotOpInterface>(op);
