@@ -38,6 +38,55 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
+// Determine if a store operation is overridden by an MMA op that
+// will ignore the accumulator. Whenever the accumulator is ignored
+// the load should be predicated.
+Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp,
+                              Operation *loadOp) {
+  Value vTrue = builder.create<arith::ConstantIntOp>(allocOp.getLoc(), 1, 1);
+  Value bufferValue = allocOp->getResults()[0];
+  // Iterate in reverse program order. We need to find if
+  // an MMA clobbers the load.
+  auto block = allocOp->getBlock();
+  auto it = mlir::Block::iterator(loadOp);
+  it--;
+  auto isUser = [](Operation &op, Value val) -> bool {
+    for (auto operand : op.getOperands()) {
+      if (operand == val) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (; it != block->begin(); it--) {
+    auto &op = *it;
+    if (!isUser(op, bufferValue)) {
+      continue;
+    }
+    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      // Buffer value must be the accumulator.
+      if (mmaOp.getAccumulator() != bufferValue) {
+        return vTrue;
+      }
+      // If the store is predicated we need to default to True.
+      auto mmaPred = mmaOp.getPredicate();
+      auto predOp = mmaPred.getDefiningOp();
+      if (predOp) {
+        auto isPredicated = dyn_cast<arith::ConstantOp>(predOp);
+        bool willExecute =
+            isPredicated && cast<BoolAttr>(isPredicated.getValue()).getValue();
+        if (!willExecute) {
+          return vTrue;
+        }
+      }
+      return mmaOp.useAccumulator();
+    }
+    // Some other undefined or unsupported use.
+    return vTrue;
+  }
+  return vTrue;
+}
+
 class CombineTMEMStoreAndSelect : public OpRewritePattern<ttng::TMEMStoreOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -381,16 +430,34 @@ public:
       return failure();
     // TODO: 3. The live-in value of the TMEM variable is never read.
 
+    // Eliminate the store step if the original store is clobbered by an MMA
+    // operation.
+    bool elimStore = false;
+    auto pred = getInitialTMEMPredicate(rewriter, initAlloc, load);
+    if (auto blockPred = dyn_cast<BlockArgument>(pred)) {
+      if (blockPred.getOwner() == forOp.getBody()) {
+        pred = forOp.getInitArgs()[blockPred.getArgNumber() - 1];
+      }
+    }
+    auto predSource = pred.getDefiningOp();
+    if (predSource) {
+      if (auto constant = dyn_cast<arith::ConstantOp>(predSource)) {
+        elimStore = !dyn_cast<BoolAttr>(constant.getValueAttr()).getValue();
+      }
+    }
+
     // Create a store before the loop to write the initial value.
     int argNo = use.getOperandNumber();
-    Value initVal = forOp.getInitArgs()[argNo];
-    rewriter.setInsertionPoint(forOp);
-    auto vTrue = rewriter.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
     auto tokType = rewriter.getType<AsyncTokenType>();
-    auto initStore = rewriter.create<ttng::TMEMStoreOp>(
-        load.getLoc(), tokType, load.getSrc(), initAlloc.getToken(), initVal,
-        vTrue);
-    forOp.getInitArgsMutable()[tokArgNo].assign(initStore.getToken());
+    if (!elimStore) {
+      Value initVal = forOp.getInitArgs()[argNo];
+      rewriter.setInsertionPoint(forOp);
+      auto vTrue = rewriter.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
+      auto initStore = rewriter.create<ttng::TMEMStoreOp>(
+          load.getLoc(), tokType, load.getSrc(), initAlloc.getToken(), initVal,
+          vTrue);
+      forOp.getInitArgsMutable()[tokArgNo].assign(initStore.getToken());
+    }
 
     // Move the load to the beginning of the loop to load the tensor value.
     yield.setOperand(tokArgNo, load.getDep());
@@ -487,7 +554,7 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
 }
 
 // Hoist invariant tmem_alloc. This could technically be done as general LICM
-// but controlling tmem liveranga more precisley is likely to be important.
+// but controlling tmem live range more precisely is likely to be important.
 static void hoistInvariantInputs(Operation *mmaOp, scf::ForOp forOp) {
   for (auto operand : mmaOp->getOperands()) {
     if (forOp.isDefinedOutsideOfLoop(operand))
