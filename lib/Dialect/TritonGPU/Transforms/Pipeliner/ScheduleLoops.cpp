@@ -553,6 +553,8 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
       // FIXME: This should assert all latency ops have an assigned stage.
       if (schedule.count(&op))
         latencyStages.insert(schedule[&op].first);
+      else
+        assert(false);
     }
     if (latencyStages.size() <= 1) {
       CoarseSchedule normalized(/*numStages=*/1);
