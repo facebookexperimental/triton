@@ -165,8 +165,8 @@ public:
       return failure();
     }
     Value pred = select.getCondition();
-    // In case the false operand is overwriting, we need to negate the
-    // predicate (owerwrite when select would be false)
+    // In case the false operand is overwriting, we need to negate the predicate
+    // (owerwrite when select would be false)
     if (valueFromTMEM == kTrue) {
       Value one = rewriter.create<arith::ConstantIntOp>(select.getLoc(), 1, 1);
       pred = rewriter.create<arith::XOrIOp>(select.getLoc(), pred, one);
@@ -410,9 +410,9 @@ public:
       return failure();
     int tokArgNo = storeTok.getArgNumber() - 1;
 
-    // Create two copies of the store: one before the loop, storing the
-    // initial value, and one before the yield, storing the value carried by
-    // the loop arg.
+    // Create two copies of the store: one before the loop, storing the initial
+    // value, and one before the yield, storing the value carried by the loop
+    // arg.
     int argNo = src.getArgNumber() - 1;
     Value initVal = forOp.getInitArgs()[argNo];
     rewriter.setInsertionPoint(forOp);
@@ -429,8 +429,8 @@ public:
     yield.setOperand(tokArgNo, store.getToken());
     store.getSrcMutable().assign(yield.getOperand(argNo));
 
-    // Load from the tmem after the loop, and use it instead of the loop
-    // carried value.
+    // Load from the tmem after the loop, and use it instead of the loop carried
+    // value.
     rewriter.setInsertionPointAfter(forOp);
     auto load = rewriter.create<ttng::TMEMLoadOp>(
         store.getLoc(), store.getSrc().getType(), tokType, store.getDst(),
@@ -442,8 +442,8 @@ public:
   }
 };
 
-// Remove loop-carried tensor dependencies if they are the result of TMEM
-// loads at the end of the loop by pushing the load into the next iteration.
+// Remove loop-carried tensor dependencies if they are the result of TMEM loads
+// at the end of the loop by pushing the load into the next iteration.
 class RotateTMEMLoadInLoop : public OpRewritePattern<ttng::TMEMLoadOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -452,8 +452,8 @@ public:
                                 PatternRewriter &rewriter) const override {
     if (!load.getDep())
       return failure();
-    // Pattern match loads whose results are only passed into the next
-    // iteration of a loop.
+    // Pattern match loads whose results are only passed into the next iteration
+    // of a loop.
     scf::ForOp forOp = dyn_cast<scf::ForOp>(load->getParentOp());
     if (!forOp || !forOp.isDefinedOutsideOfLoop(load.getSrc()) ||
         !load.getResult().hasOneUse()) {
@@ -469,8 +469,7 @@ public:
     // Thus, they cannot be live at the same time. Check this by ensuring we
     // won't clobber the memory.
 
-    // 1. There are no aliasing stores between the load and the end of the
-    // loop.
+    // 1. There are no aliasing stores between the load and the end of the loop.
     if (!llvm::is_contained(load.getToken().getUsers(), yield))
       return failure();
     // 2. The TMEM variable is live into the loop with an undefined value.
@@ -505,8 +504,8 @@ public:
     tokArg.replaceAllUsesExcept(load.getToken(), load);
     forOp.getRegionIterArg(argNo).replaceAllUsesWith(load.getResult());
 
-    // Load from the tmem after the loop, and use it instead of the loop
-    // carried value.
+    // Load from the tmem after the loop, and use it instead of the loop carried
+    // value.
     rewriter.setInsertionPointAfter(forOp);
     auto loadAfterLoop = rewriter.create<ttng::TMEMLoadOp>(
         load.getLoc(), load.getResult().getType(), tokType, load.getSrc(),
@@ -547,8 +546,8 @@ static void findLastMemoryUses(OpResult token,
     findLastMemoryUses(cast<OpResult>(getTokenFromOp(user)), lastUses, seen);
 }
 
-// Find the last uses of a memory variable, joining them into a single token
-// if necessary. This token can be carried into the next loop iteration.
+// Find the last uses of a memory variable, joining them into a single token if
+// necessary. This token can be carried into the next loop iteration.
 static Value joinLastMemoryUses(OpBuilder &b, Value token) {
   SmallVector<OpResult> lastUses;
   DenseSet<Value> seenTokens;
@@ -571,8 +570,8 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   auto newAlloc = cast<ttng::TMEMAllocOp>(builder.clone(*alloc));
   newAlloc.getSrcMutable().clear();
 
-  // By hoisting the allocation out of the loop, we need to turn the
-  // underlying memory variable into a loop-carried depdendency.
+  // By hoisting the allocation out of the loop, we need to turn the underlying
+  // memory variable into a loop-carried depdendency.
   auto tokType = builder.getType<AsyncTokenType>();
   forOp = addIterArgsToLoop(builder, forOp, newAlloc.getToken());
   Value newTok = forOp.getRegionIterArgs().back();
