@@ -41,15 +41,31 @@ using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 // Determine if a store operation is overridden by an MMA op that
 // will ignore the accumulator. Whenever the accumulator is ignored
 // the load should be predicated.
-Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp,
-                              Operation *loadOp) {
-  Value vTrue = builder.create<arith::ConstantIntOp>(allocOp.getLoc(), 1, 1);
+bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
+                          scf::ForOp parentFor) {
   Value bufferValue = allocOp->getResults()[0];
-  // Iterate in reverse program order. We need to find if
-  // an MMA clobbers the load.
-  auto block = allocOp->getBlock();
-  auto it = mlir::Block::iterator(loadOp);
-  it--;
+  // Look for exactly one store. If there are multiple stores, we can't
+  // match accurately. An MMA could replace a store, but the initial
+  // value is based on the original store.
+  TMEMTokenStoreOp storeOp = nullptr;
+  for (auto user : bufferValue.getUsers()) {
+    if (auto store = dyn_cast<TMEMTokenStoreOp>(user)) {
+      // Only support a single store.
+      if (storeOp) {
+        return false;
+      }
+      storeOp = store;
+    }
+  }
+  if (!storeOp) {
+    return false;
+  }
+  // Verify the store and load are in the same block. Otherwise we may not
+  if (storeOp->getBlock() != loadOp->getBlock()) {
+    return false;
+  }
+  // Iterate in program order. Try and find a user
+  // that clobbers the result before.
   auto isUser = [](Operation &op, Value val) -> bool {
     for (auto operand : op.getOperands()) {
       if (operand == val) {
@@ -58,33 +74,67 @@ Value getInitialTMEMPredicate(OpBuilder &builder, TMEMTokenAllocOp allocOp,
     }
     return false;
   };
-  for (; it != block->begin(); it--) {
+  auto startit = mlir::Block::iterator(storeOp);
+  startit++;
+  auto endit = mlir::Block::iterator(loadOp);
+  // Iterate in program order. If we find a user before
+  // the result is clobbered then we can't match.
+  for (auto it = startit; it != endit; it++) {
     auto &op = *it;
+    // Skip non-users.
     if (!isUser(op, bufferValue)) {
       continue;
     }
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
-      // Buffer value must be the accumulator.
+      // Buffer value must be the accumulator. Otherwise the
+      // store has been used.
       if (mmaOp.getAccumulator() != bufferValue) {
-        return vTrue;
+        return false;
       }
-      // If the store is predicated we need to default to True.
+      // We don't support any predicate value than
+      // exactly True.
       auto mmaPred = mmaOp.getPredicate();
       auto predOp = mmaPred.getDefiningOp();
-      if (predOp) {
+      // No defining predicate op (e.g. BlockArgument)
+      if (!predOp) {
+        return false;
+      } else {
+        // Load the constant predicate value.
         auto isPredicated = dyn_cast<arith::ConstantOp>(predOp);
         bool willExecute =
             isPredicated && cast<BoolAttr>(isPredicated.getValue()).getValue();
         if (!willExecute) {
-          return vTrue;
+          return false;
         }
       }
-      return mmaOp.useAccumulator();
+      // Check the value of the accumulator. If its False on the initial
+      // iteration the initial store is unused.
+      auto useAccum = mmaOp.useAccumulator();
+      if (auto blockVal = dyn_cast<BlockArgument>(useAccum)) {
+        // Can only support block arguments initialized in the for
+        // loop.
+        if (blockVal.getOwner() != parentFor.getBody()) {
+          return false;
+        }
+        // Use -1 because of the extra inserted argument in the pass.
+        useAccum = parentFor.getInitArgs()[blockVal.getArgNumber() - 1];
+      }
+      auto useAccumOp = useAccum.getDefiningOp();
+      if (useAccumOp) {
+        // Match on exactly constant false. This means the value is
+        // replaced as the accumulator and otherwise unused.
+        if (auto constant = dyn_cast<arith::ConstantOp>(useAccumOp)) {
+          if (!cast<BoolAttr>(constant.getValueAttr()).getValue()) {
+            return true;
+          }
+        }
+      }
     }
     // Some other undefined or unsupported use.
-    return vTrue;
+    return false;
   }
-  return vTrue;
+  // Didn't find a user, exit.
+  return false;
 }
 
 class CombineTMEMStoreAndSelect : public OpRewritePattern<ttng::TMEMStoreOp> {
@@ -115,8 +165,8 @@ public:
       return failure();
     }
     Value pred = select.getCondition();
-    // In case the false operand is overwriting, we need to negate the predicate
-    // (owerwrite when select would be false)
+    // In case the false operand is overwriting, we need to negate the
+    // predicate (owerwrite when select would be false)
     if (valueFromTMEM == kTrue) {
       Value one = rewriter.create<arith::ConstantIntOp>(select.getLoc(), 1, 1);
       pred = rewriter.create<arith::XOrIOp>(select.getLoc(), pred, one);
@@ -360,9 +410,9 @@ public:
       return failure();
     int tokArgNo = storeTok.getArgNumber() - 1;
 
-    // Create two copies of the store: one before the loop, storing the initial
-    // value, and one before the yield, storing the value carried by the loop
-    // arg.
+    // Create two copies of the store: one before the loop, storing the
+    // initial value, and one before the yield, storing the value carried by
+    // the loop arg.
     int argNo = src.getArgNumber() - 1;
     Value initVal = forOp.getInitArgs()[argNo];
     rewriter.setInsertionPoint(forOp);
@@ -379,8 +429,8 @@ public:
     yield.setOperand(tokArgNo, store.getToken());
     store.getSrcMutable().assign(yield.getOperand(argNo));
 
-    // Load from the tmem after the loop, and use it instead of the loop carried
-    // value.
+    // Load from the tmem after the loop, and use it instead of the loop
+    // carried value.
     rewriter.setInsertionPointAfter(forOp);
     auto load = rewriter.create<ttng::TMEMLoadOp>(
         store.getLoc(), store.getSrc().getType(), tokType, store.getDst(),
@@ -392,8 +442,8 @@ public:
   }
 };
 
-// Remove loop-carried tensor dependencies if they are the result of TMEM loads
-// at the end of the loop by pushing the load into the next iteration.
+// Remove loop-carried tensor dependencies if they are the result of TMEM
+// loads at the end of the loop by pushing the load into the next iteration.
 class RotateTMEMLoadInLoop : public OpRewritePattern<ttng::TMEMLoadOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -402,8 +452,8 @@ public:
                                 PatternRewriter &rewriter) const override {
     if (!load.getDep())
       return failure();
-    // Pattern match loads whose results are only passed into the next iteration
-    // of a loop.
+    // Pattern match loads whose results are only passed into the next
+    // iteration of a loop.
     scf::ForOp forOp = dyn_cast<scf::ForOp>(load->getParentOp());
     if (!forOp || !forOp.isDefinedOutsideOfLoop(load.getSrc()) ||
         !load.getResult().hasOneUse()) {
@@ -419,7 +469,8 @@ public:
     // Thus, they cannot be live at the same time. Check this by ensuring we
     // won't clobber the memory.
 
-    // 1. There are no aliasing stores between the load and the end of the loop.
+    // 1. There are no aliasing stores between the load and the end of the
+    // loop.
     if (!llvm::is_contained(load.getToken().getUsers(), yield))
       return failure();
     // 2. The TMEM variable is live into the loop with an undefined value.
@@ -432,20 +483,7 @@ public:
 
     // Eliminate the store step if the original store is clobbered by an MMA
     // operation.
-    bool elimStore = false;
-    auto pred = getInitialTMEMPredicate(rewriter, initAlloc, load);
-    if (auto blockPred = dyn_cast<BlockArgument>(pred)) {
-      if (blockPred.getOwner() == forOp.getBody()) {
-        pred = forOp.getInitArgs()[blockPred.getArgNumber() - 1];
-      }
-    }
-    auto predSource = pred.getDefiningOp();
-    if (predSource) {
-      if (auto constant = dyn_cast<arith::ConstantOp>(predSource)) {
-        elimStore = !dyn_cast<BoolAttr>(constant.getValueAttr()).getValue();
-      }
-    }
-
+    bool elimStore = isInitialStoreUnused(initAlloc, load, forOp);
     // Create a store before the loop to write the initial value.
     int argNo = use.getOperandNumber();
     auto tokType = rewriter.getType<AsyncTokenType>();
@@ -467,8 +505,8 @@ public:
     tokArg.replaceAllUsesExcept(load.getToken(), load);
     forOp.getRegionIterArg(argNo).replaceAllUsesWith(load.getResult());
 
-    // Load from the tmem after the loop, and use it instead of the loop carried
-    // value.
+    // Load from the tmem after the loop, and use it instead of the loop
+    // carried value.
     rewriter.setInsertionPointAfter(forOp);
     auto loadAfterLoop = rewriter.create<ttng::TMEMLoadOp>(
         load.getLoc(), load.getResult().getType(), tokType, load.getSrc(),
@@ -509,8 +547,8 @@ static void findLastMemoryUses(OpResult token,
     findLastMemoryUses(cast<OpResult>(getTokenFromOp(user)), lastUses, seen);
 }
 
-// Find the last uses of a memory variable, joining them into a single token if
-// necessary. This token can be carried into the next loop iteration.
+// Find the last uses of a memory variable, joining them into a single token
+// if necessary. This token can be carried into the next loop iteration.
 static Value joinLastMemoryUses(OpBuilder &b, Value token) {
   SmallVector<OpResult> lastUses;
   DenseSet<Value> seenTokens;
@@ -533,8 +571,8 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   auto newAlloc = cast<ttng::TMEMAllocOp>(builder.clone(*alloc));
   newAlloc.getSrcMutable().clear();
 
-  // By hoisting the allocation out of the loop, we need to turn the underlying
-  // memory variable into a loop-carried depdendency.
+  // By hoisting the allocation out of the loop, we need to turn the
+  // underlying memory variable into a loop-carried depdendency.
   auto tokType = builder.getType<AsyncTokenType>();
   forOp = addIterArgsToLoop(builder, forOp, newAlloc.getToken());
   Value newTok = forOp.getRegionIterArgs().back();
