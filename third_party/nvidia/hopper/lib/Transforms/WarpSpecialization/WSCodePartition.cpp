@@ -1964,6 +1964,64 @@ void insertAsyncComm(
       tOps.insert(headProducer);
       tmaHeadProducer = getFirstOpInBlock(tOps);
     }
+
+    auto withSameTask = [&](Operation *A, Operation *B) -> bool {
+      auto aTasks = getAsyncTaskIds(A);
+      auto bTasks = getAsyncTaskIds(B);
+      return aTasks == bTasks;
+    };
+
+    // Return the backward channel if found.
+    // Assume chF is a forward channel where producer and consumer are in the
+    // same block.
+    auto isForwardOfChannelLoop = [&](Channel *chF) -> Channel * {
+      if (chF->channelKind != DataChannelKind::TMEMPost)
+        return nullptr;
+      ttng::TmemDataChannelPost *tmemChannel =
+          static_cast<ttng::TmemDataChannelPost *>(chF);
+      if (!tmemChannel->isOperandD)
+        return nullptr;
+      // Check for a cycle, a channel from chF->getDstOp to an op prior to
+      // chF->getSrcOp and all users are in the same block.
+      for (auto *ch : orderedChannels) {
+        if (ch == chF)
+          continue;
+        if (withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
+            ch->getAllocOp() == chF->getAllocOp() &&
+            ch->getSrcOp() == chF->getDstOp() &&
+            chF->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
+            chF->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
+          if (appearsBefore(ch->getDstOp(), chF->getSrcOp()))
+            return ch;
+        }
+      }
+      return nullptr;
+    };
+    // Assume chB is a backward channel where producer and consumer are in the
+    // same block.
+    auto isBackwardOfChannelLoop = [&](Channel *chB) -> bool {
+      if (chB->channelKind != DataChannelKind::TMEMPost)
+        return false;
+      ttng::TmemDataChannelPost *tmemChannel =
+          static_cast<ttng::TmemDataChannelPost *>(chB);
+      if (!tmemChannel->isOperandD)
+        return false;
+      // Check for a cycle, a channel from an op after chB->getDstOp to
+      // chB->getSrcOp and all users are in the same block.
+      for (auto *ch : orderedChannels) {
+        if (ch == chB)
+          continue;
+        if (withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
+            ch->getAllocOp() == chB->getAllocOp() &&
+            ch->getDstOp() == chB->getSrcOp() &&
+            chB->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
+            chB->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
+          if (appearsBefore(chB->getDstOp(), ch->getSrcOp()))
+            return true;
+        }
+      }
+      return false;
+    };
     Operation *nestedInsertionTarget = nullptr;
     // Check to see if producer and consumer are in the same block.
     bool producerInNestedRegion = false, consumerInNestedRegion = false;
@@ -1986,10 +2044,36 @@ void insertAsyncComm(
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
       if (!appearsBefore(headProducer, headConsumer)) {
-        LDBG("FIXME consumer before producer for channel "
+        // We will combine this channel with the other channel associated with
+        // the same value (gen5 operandD).
+        // -- Both channels are in the same block
+        // -- One channel is a forward edge, the other is a back edge.
+        // When handling the forward edge, we put a consumer release with gen5
+        // and a consumer wait prior to gen5, we also put a producer acquire
+        // before the srcOp of the channel and a producer commit after the
+        // srcOp. Instead, we need to move the producer acquire to be prior to
+        // the dstOp of the backward channel. We will have:
+        //   tmem_load(dstOp of channel B) ...
+        //   tmem_store(srcOp of channel F) ...
+        //   gen5(srcOp of channel B, dstOp of channel F)
+        // We should emit:
+        //   producer_acquire
+        //   tmem_load(dstOp of channel B) ...
+        //   tmem_store(srcOp of channel F)
+        //   producer_commit ...
+        //   consumer_wait (gen5 partition)
+        //   gen5 consumer_release (srcOp of channel B, dstOp of channel F)
+        assert(isBackwardOfChannelLoop(masterChannel));
+        LDBG("Skip consumer before producer for channel "
              << masterChannel->uniqID);
-        continue; // FIXME: skip this channel for now.
+        continue;
       }
+    }
+    Operation *producerAcquireForChannelLoop = nullptr;
+    if (headProducer->getBlock() == headConsumer->getBlock()) {
+      auto *bwdCh = isForwardOfChannelLoop(masterChannel);
+      if (bwdCh)
+        producerAcquireForChannelLoop = bwdCh->getDstOp();
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
     if (nestedInsertionTarget) {
@@ -2013,6 +2097,8 @@ void insertAsyncComm(
       // headProducer can be local_store but bufferIdx will be used
       // by tmaLoad as well.
       builder.setInsertionPoint(tmaHeadProducer);
+      if (producerAcquireForChannelLoop)
+        builder.setInsertionPoint(producerAcquireForChannelLoop);
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase2 ");
         headProducer->dump();
@@ -2116,6 +2202,14 @@ void insertAsyncComm(
         Operation *producerAcquirePoint = headProducer;
         if (isProducerTMA(masterChannel, isPost))
           producerAcquirePoint = tmaHeadProducer;
+        if (producerAcquireForChannelLoop) {
+          LLVM_DEBUG({
+            LDBG("move producer acquire for inline barrier "
+                 << masterChannel->uniqID << " ");
+            producerAcquireForChannelLoop->dump();
+          });
+          producerAcquirePoint = producerAcquireForChannelLoop;
+        }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
           // We need to place the commit after the for loop.
@@ -2143,7 +2237,11 @@ void insertAsyncComm(
         auto producerAcquirePoint =
             getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
-        builder.setInsertionPoint(producerAcquirePoint);
+        if (producerAcquireForChannelLoop) {
+          builder.setInsertionPoint(producerAcquireForChannelLoop);
+        } else {
+          builder.setInsertionPoint(producerAcquirePoint);
+        }
         auto acquireOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
                 headProducer->getLoc(), token.second, bufferIdx, phase);
