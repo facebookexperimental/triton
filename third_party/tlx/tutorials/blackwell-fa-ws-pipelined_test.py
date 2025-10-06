@@ -61,9 +61,15 @@ def _compute_offsets(H, N_CTX, BLOCK_M):
 # In Triton, just compute floor(x) explicitly and add y.
 @triton.jit
 def add_round_down(x, y):
-    # For the original usage (x rounded down; y is the big constant),
-    # this is equivalent to add.rm on (x + y) then subtracting y later.
-    return tl.math.floor(x) + y
+    # emulate add.rm.ftz.f32 (round down)
+    return tl.inline_asm_elementwise(
+        asm="add.rm.ftz.f32 $0, $1, $2;",
+        constraints="=f, f, f",
+        args=[x, y],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
 
 
 # ============================================================================
