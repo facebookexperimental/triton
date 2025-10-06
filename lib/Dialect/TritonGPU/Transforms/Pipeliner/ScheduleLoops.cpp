@@ -655,7 +655,7 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
   });
 
   // Write the schedule to the IR
-  schedule.serialize(forOp);
+  schedule.serialize(forOp, false);
 }
 } // namespace
 

@@ -97,6 +97,10 @@ static void expandLoops(ModuleOp moduleOp) {
     if (failed(schedule.deSerialize(forOp))) {
       continue;
     }
+    // Skip pipelining when we have a single stage.
+    if (schedule.getNumStages() == 1) {
+      continue;
+    }
 
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
