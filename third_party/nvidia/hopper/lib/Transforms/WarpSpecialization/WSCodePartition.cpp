@@ -273,10 +273,39 @@ static Operation *getUniqueActualConsumer(Operation *consumerOp,
 static Operation *getLastOpInBlock(DenseSet<Operation *> &ops) {
   Operation *tailConsumer = nullptr;
   Operation *first = *(ops.begin());
-  auto cBlock = first->getBlock();
-  for (auto *op : ops)
-    assert(op->getBlock() == cBlock);
-  for (auto &op : reverse(cBlock->getOperations())) {
+  auto cBlock = first->getParentOp();
+  bool inOneBlock = true;
+  DenseSet<Operation *> blocks;
+  for (auto *op : ops) {
+    blocks.insert(op->getParentOp());
+    if (op->getParentOp() != cBlock) {
+      inOneBlock = false;
+      break;
+    }
+  }
+  if (inOneBlock) {
+    assert(isa<scf::ForOp>(cBlock));
+    scf::ForOp cFor = cast<scf::ForOp>(cBlock);
+    for (auto &op : reverse(cFor.getBody()->getOperations())) {
+      if (ops.count(&op)) {
+        tailConsumer = &op;
+        break;
+      }
+    }
+    return tailConsumer;
+  }
+  // Handle ops in different blocks: find the last op in the last block.
+  // find the last block in blocks
+  auto *lastB = *(blocks.begin());
+  for (auto *block : blocks) {
+    if (block == lastB)
+      continue;
+    if (appearsBefore(lastB, block))
+      lastB = block;
+  }
+  assert(isa<scf::ForOp>(lastB));
+  scf::ForOp lastFor = cast<scf::ForOp>(lastB);
+  for (auto &op : reverse(lastFor.getBody()->getOperations())) {
     if (ops.count(&op)) {
       tailConsumer = &op;
       break;
@@ -929,7 +958,6 @@ void createTokenPost(
     DenseMap<Channel *, CommChannel> &tokenMap, ReuseConfig *config) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
-  DenseMap<ttng::TCGen5MMAOp, Channel *> gen5Barriers;
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
     LLVM_DEBUG({
@@ -1002,7 +1030,8 @@ void createTokenPost(
         }
       }
       assert(!actualConsumers.empty());
-      Operation *consumerOp = getLastOpInBlock(actualConsumers);
+      Operation *consumerOp =
+          *actualConsumers.begin(); // getLastOpInBlock(actualConsumers);
 
       LLVM_DEBUG({
         LDBG("-- createToken: useGen5Barrier = "
@@ -1011,14 +1040,6 @@ void createTokenPost(
         dstOp->dump();
         consumerOp->dump();
       });
-      if (useGen5Barrier) {
-        // FIXME: check to see if there is another conflict of using inline
-        // barrier.
-        auto mmaOp = cast<ttng::TCGen5MMAOp>(consumerOp);
-        if (gen5Barriers.count(mmaOp) && gen5Barriers[mmaOp] != channel) {
-          // Set useGen5Barrier to false if necessary.
-        }
-      }
       // Need token only when we are not using inline barriers
       if (!hasProdBar || !useGen5Barrier) {
         ttnvws::TokenLoadType tokenLoadType;
@@ -1046,7 +1067,6 @@ void createTokenPost(
       if (useGen5Barrier) {
         Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
-        gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
     }
 
