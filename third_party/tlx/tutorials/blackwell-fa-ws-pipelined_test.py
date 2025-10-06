@@ -69,17 +69,6 @@ def add_round_down(x, y):
 # ============================================================================
 # Custom exp2 Polynomial Approximation (the "emulation" path)
 # ============================================================================
-@triton.jit
-def fma_rn_asm(a, b, c):
-    # returns a*b + c using PTX fma.rn.f32
-    return tl.inline_asm_elementwise(
-        asm="fma.rn.f32 $0, $1, $2, $3;",
-        constraints="=f, f, f, f",   # $0 out, $1 a, $2 b, $3 c (all f32)
-        args=[a, b, c],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -111,7 +100,7 @@ def evaluate_polynomial(x, coeffs: tl.constexpr):
     deg = len(coeffs) - 1
     out = coeffs[deg]
     for i in range(deg - 1, -1, -1):
-        out = fma_rn_asm(out, x, coeffs[i])   # out = out*x + coeffs[i]
+        out = _fma_f32x2(out, x, coeffs[i])   # out = out*x + coeffs[i]
     return out
 
 @triton.jit
@@ -167,9 +156,9 @@ def ex2_emulation(x):
     C3 = 0.077119089663028717041015625
 
     x_frac_ex2 = C3
-    x_frac_ex2 = fma_rn_asm(x_frac_ex2, x_frac, C2)   # t = C3*r + C2
-    x_frac_ex2 = fma_rn_asm(x_frac_ex2, x_frac, C1)   # t = (..)*r + C1
-    x_frac_ex2 = fma_rn_asm(x_frac_ex2, x_frac, C0)   # t = (..)*r + C0   ~ 2**r
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C2)   # t = C3*r + C2
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C1)   # t = (..)*r + C1
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C0)   # t = (..)*r + C0   ~ 2**r
 
 
     return combine_int_frac_ex2(x_rounded, x_frac_ex2)       # 2**n * 2**r
@@ -307,7 +296,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                 BN: tl.constexpr = qk.shape[1]
                 qk_0, qk_1 = qk.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
 
-                # p_0 = ex2_poly_approx(qk_0)
                 p_0 = ex2_emulation(qk_0)
                 p_1 = tl.math.exp2(qk_1)
                 p = tl.join(p_0, p_1).permute(0, 2, 1).reshape([BM, BN])
