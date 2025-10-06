@@ -46,6 +46,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
   builder.setInsertionPoint(loadOp);
+  builder.setLoopScheduleInfo(loadOp);
   Value loadResult = loadOp.getResult();
   auto tensorType = dyn_cast<RankedTensorType>(loadResult.getType());
   if (!tensorType)
@@ -77,8 +78,6 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
           loadOp.getLoc(), loadOp.getPtr(), view, loadOp.getMask(),
           loadOp.getOther(), loadOp.getCache(), loadOp.getEvict(),
           loadOp.getIsVolatile());
-  copyLoopScheduleInfo(view, loadOp);
-  copyLoopScheduleInfo(copy, loadOp);
 
   // Extract part.
   builder.setAsyncTaskIdsFromValueUsers(loadResult);
@@ -87,8 +86,6 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
       loadOp.getLoc(), subviewTy, buffer, bufferIdxExtract);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       loadOp.getLoc(), loadOp.getType(), viewLoad /*,wait->getResult(0)*/);
-  copyLoopScheduleInfo(viewLoad, loadOp);
-  copyLoopScheduleInfo(sharedLoad, loadOp);
   // Replace all uses of loadResult
   loadResult.replaceAllUsesWith(sharedLoad.getResult());
   loadOp.erase();
@@ -134,25 +131,23 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   OpBuilderWithAsyncTaskIds builder(dstOp);
   builder.setAsyncTaskIdsFromOp(dstOp);
   builder.setInsertionPoint(dstOp);
+  builder.setLoopScheduleInfo(dstOp);
   auto dstView = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       dstOp->getLoc(), subviewTy, buffer, dstBufferIdx);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
       dstOp->getLoc(), srcValue.getType(), dstView);
-  copyLoopScheduleInfo(dstView, dstOp);
-  copyLoopScheduleInfo(sharedLoad, dstOp);
   srcValue.replaceAllUsesWith(sharedLoad.getResult());
 
   // Producer part. Create local_store for new producers.
   builder.setAsynTaskIdsFromArray(channel->relation.first);
   builder.setInsertionPoint(srcOp->getParentOp());
   builder.setInsertionPointAfter(srcOp);
+  builder.setLoopScheduleInfo(srcOp);
   auto srcView = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       srcOp->getLoc(), subviewTy, buffer, srcBufferIdx);
   // Create local_alloc
   Operation *copy = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       srcOp->getLoc(), srcValue, srcView);
-  copyLoopScheduleInfo(srcView, srcOp);
-  copyLoopScheduleInfo(copy, srcOp);
   return {copy, sharedLoad};
 }
 
@@ -192,6 +187,7 @@ createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
 
   assert(oldAllocOp.getSrc());
   auto *actualSrc = oldAllocOp.getSrc().getDefiningOp();
+  builder.setLoopScheduleInfo(actualSrc);
 
   SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(actualSrc);
   for (auto *user : oldAllocOp->getUsers()) {
@@ -206,7 +202,6 @@ createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   builder.setAsyncTaskIdsFromOp(actualSrc);
   auto smemStoreOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       oldAllocOp.getLoc(), oldAllocOp.getSrc(), srcView);
-  copyLoopScheduleInfo(smemStoreOp, actualSrc);
 
   // Consumer will be updated.
   oldAllocOp->getResult(0).replaceAllUsesWith(srcView);
@@ -227,6 +222,7 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
       cast<ttng::TMEMAllocOp>(bufferMap.find(channel)->second.getDefiningOp());
   OpBuilderWithAsyncTaskIds builder(oldTMemAllocOp);
   builder.setInsertionPointAfter(oldTMemAllocOp);
+  builder.setLoopScheduleInfo(oldTMemAllocOp);
 
   // A tmemChannel is usually centered around a gen5 dotOp. There are two
   // cases, one is that the channel is for the accumulator, the other is
@@ -265,7 +261,6 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
     builder.setAsyncTaskIdsFromOp(opForStoreTask);
     Value vTrue = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         oldTMemAllocOp.getLoc(), 1, 1);
-    copyLoopScheduleInfo(vTrue.getDefiningOp(), oldTMemAllocOp);
     // Promote TMEMAlloc to start, create TMEMStore.
     // auto tokType = builder.getType<AsyncTokenType>();
     // tokType, srcView, oldTMemAllocOp.getToken()
@@ -275,7 +270,6 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
     auto tmemStoreOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
         oldTMemAllocOp.getLoc(), Type(), srcView, Value(),
         oldTMemAllocOp.getSrc(), vTrue);
-    copyLoopScheduleInfo(tmemStoreOp, oldTMemAllocOp);
     oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
     if (oldTMemAllocOp.getToken())
       oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
@@ -326,7 +320,6 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
 
   auto desc = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       buffer.getLoc(), subviewTy, buffer, bufferIdx);
-  copyLoopScheduleInfo(desc, bufferIdx.getDefiningOp());
   return desc;
 }
 
@@ -401,6 +394,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       tmaLoad.erase();
       continue;
     }
+    builder.setLoopScheduleInfo(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
@@ -410,6 +404,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     tmaLoad.getResult().replaceAllUsesWith(sharedLoad.getResult());
     tmaLoad.erase();
   }
+  builder.clearLoopScheduleInfo();
   return copy;
 }
 
