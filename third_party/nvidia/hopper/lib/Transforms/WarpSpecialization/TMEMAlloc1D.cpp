@@ -31,6 +31,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto producerOp = producer.getDefiningOp();
   auto oldRetType = getResultTensorType(producer, 1);
   builder.setInsertionPointAfter(producerOp);
+  builder.setLoopScheduleInfo(producerOp);
   auto originTaskIds = builder.getAsyncTaskIds();
   builder.setAsynTaskIdsFromArray(producerTaskId);
   auto encoding = oldRetType.getEncoding();
@@ -64,11 +65,9 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
     auto sliceType = oldRetType.cloneWithEncoding(sliceEnc);
     expandDimsInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
         expandDimsInput.getLoc(), sliceType, expandDimsInput);
-    copyLoopScheduleInfo(expandDimsInput.getDefiningOp(), producerOp);
   }
   auto expandDims = builder.createWithAsyncTaskIds<tt::ExpandDimsOp>(
       producerOp->getLoc(), expandDimsInput, axis);
-  copyLoopScheduleInfo(expandDims, producerOp);
   setExpandedInput(expandDims);
   Operation *allocOp;
   if (allocOpBuffer) {
@@ -96,16 +95,14 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
     auto newTy = ty.cloneWithEncoding(newLayout);
     src = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
         expandDims.getLoc(), newTy, expandDims);
-    copyLoopScheduleInfo(src, producerOp);
   }
   // Generate the store
   Value trueVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-  copyLoopScheduleInfo(trueVal.getDefiningOp(), producerOp);
   auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
-  copyLoopScheduleInfo(storeOp, producerOp);
   builder.setAsynTaskIdsFromArray(originTaskIds);
+  builder.clearLoopScheduleInfo();
 }
 
 Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
@@ -122,21 +119,20 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto originTaskIds = builder.getAsyncTaskIds();
   builder.setAsyncTaskIdsFromOp(consumer);
   builder.setInsertionPoint(consumer);
+  builder.setLoopScheduleInfo(consumer);
   auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
       consumer->getLoc(), newExpandType, builder.getType<ttg::AsyncTokenType>(),
       allocOp->getResult(0), Value());
-  copyLoopScheduleInfo(loadOp, consumer);
   // Generate the reshape
   auto reshape = builder.createWithAsyncTaskIds<tt::ReshapeOp>(
       consumer->getLoc(), oldInputType.getShape(), loadOp);
-  copyLoopScheduleInfo(reshape, consumer);
   // Generate a convert layout.
   auto newInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
       consumer->getLoc(), oldInputType, reshape);
-  copyLoopScheduleInfo(newInput, consumer);
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
   builder.setAsynTaskIdsFromArray(originTaskIds);
+  builder.clearLoopScheduleInfo();
   return newInput.getResult();
 }
 

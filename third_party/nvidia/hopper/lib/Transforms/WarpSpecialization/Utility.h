@@ -5,9 +5,11 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Operation.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
+namespace tt = mlir::triton;
 namespace mlir {
 
 typedef int AsyncTaskId;
@@ -43,6 +45,7 @@ public:
 
   explicit OpBuilderWithAsyncTaskIds(Operation *op) : OpBuilder(op) {
     setAsyncTaskIdsFromOp(op);
+    setLoopScheduleInfo(op);
   }
 
   void setAsynTaskIdsFromArray(ArrayRef<AsyncTaskId> newAsyncTaskIds) {
@@ -77,8 +80,35 @@ public:
     return op;
   }
 
+  // Sets the loop schedule info (loop.stage, loop.cluster) of future
+  // createWithAsyncTaskIds operations based on the `loop.stage` and
+  // `loop.cluster` attributes of the given operation.
+  void setLoopScheduleInfo(Operation *op) {
+    if (op->hasAttr(tt::kLoopStageAttrName)) {
+      loopStage =
+          op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName).getInt();
+    } else {
+      loopStage = std::nullopt;
+    }
+    if (op->hasAttr(tt::kLoopClusterAttrName)) {
+      loopCluster =
+          op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName).getInt();
+    } else {
+      loopCluster = std::nullopt;
+    }
+  }
+
+  // Clears the loop schedule info (loop.stage, loop.cluster) for
+  // future createWithAsyncTaskIds operations.
+  void clearLoopScheduleInfo() {
+    loopStage = std::nullopt;
+    loopCluster = std::nullopt;
+  }
+
 private:
   SmallVector<AsyncTaskId> asyncTaskIds;
+  std::optional<int> loopStage = std::nullopt;
+  std::optional<int> loopCluster = std::nullopt;
 };
 
 // Copy any pipeline info (loop.stage, loop.cluster) from

@@ -352,37 +352,36 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // first load.
   builder.setInsertionPoint(headProducer);
   builder.setAsyncTaskIdsFromOp(headProducer);
-  auto prodBarrier = getBarrierForPipelineStage(builder, barrierAlloc,
-                                                bufferIdx, headProducer);
+  builder.setLoopScheduleInfo(headProducer);
+  auto prodBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
   auto expect = builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
       loc, prodBarrier, sizeInBytes, pred);
-  copyLoopScheduleInfo(pred, headProducer);
-  copyLoopScheduleInfo(expect, headProducer);
 
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
     builder.setInsertionPoint(tmaLoad);
+    builder.setLoopScheduleInfo(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
     // FIXME: translateTMAIndices
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
         pipelineBuffer, pred);
-    copyLoopScheduleInfo(copy, tmaLoad);
   }
 
   // Create a wait_barrier before the first consumer.
   builder.setInsertionPoint(headConsumerSameLevel);
   builder.setAsyncTaskIdsFromOp(headConsumer);
-  auto consBarrier = getBarrierForPipelineStage(
-      builder, barrierAlloc, bufferIdxExtract, headConsumerSameLevel);
+  builder.setLoopScheduleInfo(headConsumerSameLevel);
+  auto consBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase);
-  copyLoopScheduleInfo(wait, headConsumerSameLevel);
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
@@ -406,7 +405,6 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
         loc, tmaLoad.getType(), pipelineBuffer);
-    copyLoopScheduleInfo(sharedLoad, tmaLoad);
 
     Value loadResult = tmaLoad.getResult();
     tmaLoad.getResult().replaceAllUsesWith(sharedLoad.getResult());
@@ -497,7 +495,6 @@ void insertAsyncCopy(
       // be used by both producer and consumers.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           srcOp->getLoc(), 0, 32);
-      copyLoopScheduleInfo(bufferIdx.getDefiningOp(), srcOp);
     }
 
     LLVM_DEBUG({

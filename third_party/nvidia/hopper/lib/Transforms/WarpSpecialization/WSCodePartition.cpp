@@ -72,7 +72,7 @@ getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
   accumCnt = builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, one);
 
-  return getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers, op);
+  return getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
 }
 
 // Find transitive users of the root op. Track through control flow ops (such as
@@ -1406,7 +1406,6 @@ DenseMap<Channel *, Value> createBufferPost(
       } else {
         bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             user->getLoc(), 0, 32);
-        copyLoopScheduleInfo(bufferIdx.getDefiningOp(), user);
       }
       userToBufIdx[user] = bufferIdx;
     }
@@ -1513,13 +1512,13 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp);
   builder.setAsyncTaskIdsFromOp(mmaOp);
+  builder.setLoopScheduleInfo(mmaOp);
   if (addCompletionBarrier) {
     auto consumerBarrier =
-        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx, mmaOp);
+        getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
     // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
     auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         mmaOp->getLoc(), true, 1);
-    copyLoopScheduleInfo(pred, mmaOp);
     mmaOp.addCompletionBarrier(consumerBarrier, pred);
   }
   mmaOp.setIsAsync(true);
@@ -1529,26 +1528,24 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   // is false this wait_barrier serves as consumer_wait.
   builder.setInsertionPoint(producerOrConsumer);
   builder.setAsyncTaskIdsFromOp(producerOrConsumer);
-  auto producerBarrier = getBarrierForPipelineStage(
-      builder, barrierAlloc, bufferIdx, producerOrConsumer);
+  builder.setLoopScheduleInfo(producerOrConsumer);
+  auto producerBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   // curPhase = curPhase xor True for emptyBarrier.
   Value phase = inPhase;
   auto loc = producerOrConsumer->getLoc();
   if (asProducerAcquire) {
     Value _1_1b =
         builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-    copyLoopScheduleInfo(_1_1b.getDefiningOp(), producerOrConsumer);
     // Creating phase for producerOrConsumer.
     phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
                                                                 _1_1b);
-    copyLoopScheduleInfo(phase.getDefiningOp(), producerOrConsumer);
   }
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
-  copyLoopScheduleInfo(phase.getDefiningOp(), producerOrConsumer);
   auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, producerBarrier, phase);
-  copyLoopScheduleInfo(waitOp, producerOrConsumer);
+  builder.clearLoopScheduleInfo();
   return waitOp;
 
   LLVM_DEBUG({
@@ -1573,6 +1570,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
         continue;
     }
     builder.setInsertionPoint(user);
+    builder.setLoopScheduleInfo(user);
     builder.setAsyncTaskIdsFromOp(mmaOp);
     // If user and mmaOp are in the same block, we can use the same barrier.
     if (user->getBlock() != mmaOp->getBlock()) {
@@ -1582,9 +1580,8 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
           builder, mmaOp, numBuffers, regionsWithChannels, config, -1);
       phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
           user->getLoc(), builder.getI32Type(), phase);
-      copyLoopScheduleInfo(phase.getDefiningOp(), user);
       consumerBarrier =
-          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx, user);
+          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
     } else {
       // mmaOp can be in a different task from headProducer. Even if user and
       // mma are in the same block and they share the same barrier, but the
@@ -1592,20 +1589,17 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
       auto loc = user->getLoc();
       Value _1_1b =
           builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-      copyLoopScheduleInfo(_1_1b.getDefiningOp(), user);
       phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
                                                                   _1_1b);
-      copyLoopScheduleInfo(phase.getDefiningOp(), user);
       phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
           loc, builder.getI32Type(), phase);
-      copyLoopScheduleInfo(phase.getDefiningOp(), user);
     }
 
     // TODO: if there are multiple users of the mma op, we need to barrier
     // before the first user.
     auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         user->getLoc(), consumerBarrier, phase);
-    copyLoopScheduleInfo(waitOp, user);
+    builder.clearLoopScheduleInfo();
     return waitOp;
   }
 
@@ -1997,9 +1991,11 @@ void insertAsyncComm(
       // calculation to the lift-up headProducer.
       if (producerInNestedRegion) {
         builder.setInsertionPoint(nestedInsertionTarget);
+        builder.setLoopScheduleInfo(nestedInsertionTarget);
       } else {
         assert(consumerInNestedRegion);
         builder.setInsertionPoint(tmaHeadProducer);
+        builder.setLoopScheduleInfo(tmaHeadProducer);
       }
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase3 ");
@@ -2013,6 +2009,7 @@ void insertAsyncComm(
       // headProducer can be local_store but bufferIdx will be used
       // by tmaLoad as well.
       builder.setInsertionPoint(tmaHeadProducer);
+      builder.setLoopScheduleInfo(tmaHeadProducer);
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase2 ");
         headProducer->dump();
@@ -2022,14 +2019,14 @@ void insertAsyncComm(
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
     } else {
+      builder.setLoopScheduleInfo(headProducer);
       // Producer is not in a ForOp, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 32);
-      copyLoopScheduleInfo(bufferIdx.getDefiningOp(), headProducer);
       phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 1);
-      copyLoopScheduleInfo(phase.getDefiningOp(), headProducer);
     }
+    builder.clearLoopScheduleInfo();
 
     // Lower TMA loads and TCGen5MMAOp first before inserting synchronization
     // primitives to avoid displacement.
@@ -2069,9 +2066,11 @@ void insertAsyncComm(
         if (!addCompletionBarrier) {
           // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
+          builder.setLoopScheduleInfo(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
           builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
               mmaOp->getLoc(), *commChannel.producerBarrier);
+          builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
         desyncTCGen5MMAOp(builder, cast<ttng::TCGen5MMAOp>(mmaOp),
@@ -2120,9 +2119,11 @@ void insertAsyncComm(
         if (!addCompletionBarrier) {
           // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
+          builder.setLoopScheduleInfo(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
           builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
                                                                consumerBarrier);
+          builder.clearLoopScheduleInfo();
         }
         auto tmemWaitBarrier = desyncTCGen5MMAOp(
             builder, mmaOp, consumerBarrier, bufferIdx, phase,
