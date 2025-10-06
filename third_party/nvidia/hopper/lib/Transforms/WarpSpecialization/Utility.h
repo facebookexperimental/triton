@@ -85,17 +85,24 @@ public:
   // Sets the loop schedule info (loop.stage, loop.cluster) of future
   // createWithAsyncTaskIds operations based on the `loop.stage` and
   // `loop.cluster` attributes of the given operation.
+  void setLoopScheduleInfoFromTuple(
+      std::tuple<std::optional<IntegerAttr>, std::optional<IntegerAttr>>
+          loopScheduleInfo) {
+    loopStage = std::get<0>(loopScheduleInfo);
+    loopCluster = std::get<1>(loopScheduleInfo);
+  }
+
   void setLoopScheduleInfo(Operation *op) {
+    std::optional<IntegerAttr> nextLoopStage = std::nullopt;
+    std::optional<IntegerAttr> nextLoopCluster = std::nullopt;
     if (op->hasAttr(tt::kLoopStageAttrName)) {
-      loopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
-    } else {
-      loopStage = std::nullopt;
+      nextLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
     }
     if (op->hasAttr(tt::kLoopClusterAttrName)) {
-      loopCluster = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
-    } else {
-      loopCluster = std::nullopt;
+      nextLoopCluster =
+          op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
     }
+    setLoopScheduleInfoFromTuple({nextLoopStage, nextLoopCluster});
   }
 
   // Clears the loop schedule info (loop.stage, loop.cluster) for
@@ -103,6 +110,11 @@ public:
   void clearLoopScheduleInfo() {
     loopStage = std::nullopt;
     loopCluster = std::nullopt;
+  }
+
+  std::tuple<std::optional<IntegerAttr>, std::optional<IntegerAttr>>
+  getLoopScheduleInfo() {
+    return {loopStage, loopCluster};
   }
 
 private:

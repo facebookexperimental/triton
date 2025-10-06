@@ -944,29 +944,30 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
 
   auto newBuf = newAlloc->getResult(0);
   auto originTaskIds = builder.getAsyncTaskIds();
+  auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setAsyncTaskIdsFromOp(oldAlloc);
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
+    builder.setLoopScheduleInfo(oldAlloc);
     if (localAlloc.getSrc() != nullptr) {
       auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
           oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
-      copyLoopScheduleInfo(storeOp, oldAlloc);
       storeOp->moveBefore(oldAlloc);
     }
     mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
+    builder.setLoopScheduleInfo(tmemAlloc);
     if (tmemAlloc.getSrc() != nullptr) {
       auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           oldAlloc->getLoc(), 1, 1);
-      copyLoopScheduleInfo(pred, tmemAlloc);
       auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
           oldAlloc->getLoc(), newBuf, tmemAlloc.getSrc(), pred);
-      copyLoopScheduleInfo(storeOp, tmemAlloc);
       pred->moveBefore(oldAlloc);
       storeOp->moveBefore(oldAlloc);
     }
     oldAlloc->replaceAllUsesWith(newAlloc);
   }
   builder.setAsynTaskIdsFromArray(originTaskIds);
+  builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
   oldAlloc->erase();
   return newBuf;
 }
@@ -1024,7 +1025,9 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     buffer = allocOp->getResult(0);
   } else {
     auto originTaskIds = builder.getAsyncTaskIds();
+    auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
     builder.setAsyncTaskIdsFromOp(srcOp);
+    builder.setLoopScheduleInfo(srcOp);
     tt::DescriptorStoreOp tmaStore;
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [&](Operation *op) {
@@ -1081,17 +1084,16 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
         srcOp->getLoc(), srcResult, allocOp);
     storeOp->moveAfter(srcOp);
-    copyLoopScheduleInfo(storeOp, srcOp);
 
     // local load
     builder.setAsyncTaskIdsFromOp(dstOp);
     auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
         srcOp->getLoc(), srcResult.getType(), allocOp, Value());
-    copyLoopScheduleInfo(loadOp, srcOp);
     loadOp->moveBefore(dstOp);
     dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
     newProducer = loadOp->getResult(0);
     builder.setAsynTaskIdsFromArray(originTaskIds);
+    builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
   }
 
   return {buffer, newProducer};

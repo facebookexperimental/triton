@@ -33,6 +33,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   builder.setInsertionPointAfter(producerOp);
   builder.setLoopScheduleInfo(producerOp);
   auto originTaskIds = builder.getAsyncTaskIds();
+  auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setAsynTaskIdsFromArray(producerTaskId);
   auto encoding = oldRetType.getEncoding();
   Value expandDimsInput = producer;
@@ -102,7 +103,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
   builder.setAsynTaskIdsFromArray(originTaskIds);
-  builder.clearLoopScheduleInfo();
+  builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
 }
 
 Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
@@ -117,6 +118,7 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
   // Generate the load
   auto originTaskIds = builder.getAsyncTaskIds();
+  auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setAsyncTaskIdsFromOp(consumer);
   builder.setInsertionPoint(consumer);
   builder.setLoopScheduleInfo(consumer);
@@ -132,7 +134,7 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
   builder.setAsynTaskIdsFromArray(originTaskIds);
-  builder.clearLoopScheduleInfo();
+  builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
   return newInput.getResult();
 }
 
