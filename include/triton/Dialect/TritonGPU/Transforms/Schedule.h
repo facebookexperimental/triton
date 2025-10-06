@@ -159,7 +159,7 @@ public:
   auto begin() const { return opToStageAndCluster.begin(); }
 
   // Set <stage, cluster> based on CoarseSchedule.
-  void serialize(scf::ForOp &forOp) const;
+  void serialize(scf::ForOp &forOp, bool keepExistingMaxStage = true) const;
   // Create a CoarseSchedule based on forOp's <stage, cluster>.
   LogicalResult deSerialize(scf::ForOp &forOp);
 
