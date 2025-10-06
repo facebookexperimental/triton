@@ -72,11 +72,13 @@ public:
     OpTy op = OpBuilder::create<OpTy>(std::forward<Args>(args)...);
     if (!asyncTaskIds.empty())
       setAsyncTaskIds(op, asyncTaskIds);
+    setOpLoopScheduleInfo(op);
     return op;
   }
 
   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
     OpTy op = createWithAsyncTaskIds<OpTy>(std::forward<Args>(args)...);
+    setOpLoopScheduleInfo(op);
     return op;
   }
 
@@ -85,14 +87,12 @@ public:
   // `loop.cluster` attributes of the given operation.
   void setLoopScheduleInfo(Operation *op) {
     if (op->hasAttr(tt::kLoopStageAttrName)) {
-      loopStage =
-          op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName).getInt();
+      loopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
     } else {
       loopStage = std::nullopt;
     }
     if (op->hasAttr(tt::kLoopClusterAttrName)) {
-      loopCluster =
-          op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName).getInt();
+      loopCluster = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
     } else {
       loopCluster = std::nullopt;
     }
@@ -106,9 +106,18 @@ public:
   }
 
 private:
+  void setOpLoopScheduleInfo(Operation *op) {
+    if (loopStage.has_value()) {
+      op->setAttr(tt::kLoopStageAttrName, loopStage.value());
+    }
+    if (loopCluster.has_value()) {
+      op->setAttr(tt::kLoopClusterAttrName, loopCluster.value());
+    }
+  }
+
   SmallVector<AsyncTaskId> asyncTaskIds;
-  std::optional<int> loopStage = std::nullopt;
-  std::optional<int> loopCluster = std::nullopt;
+  std::optional<IntegerAttr> loopStage = std::nullopt;
+  std::optional<IntegerAttr> loopCluster = std::nullopt;
 };
 
 // Copy any pipeline info (loop.stage, loop.cluster) from

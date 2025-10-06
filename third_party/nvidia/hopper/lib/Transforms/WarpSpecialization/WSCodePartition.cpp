@@ -1570,14 +1570,16 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
         continue;
     }
     builder.setInsertionPoint(user);
-    builder.setLoopScheduleInfo(user);
     builder.setAsyncTaskIdsFromOp(mmaOp);
+    builder.setLoopScheduleInfo(user);
     // If user and mmaOp are in the same block, we can use the same barrier.
     if (user->getBlock() != mmaOp->getBlock()) {
       // Compute the barrier from the last consumer instance
       // Extract the accum count from the consumer block.
+      builder.setLoopScheduleInfo(mmaOp);
       std::tie(bufferIdx, phase) = getOutOfScopeBufferIdxAndPhase(
           builder, mmaOp, numBuffers, regionsWithChannels, config, -1);
+      builder.setLoopScheduleInfo(user);
       phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
           user->getLoc(), builder.getI32Type(), phase);
       consumerBarrier =
@@ -2145,6 +2147,7 @@ void insertAsyncComm(
             getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
         builder.setInsertionPoint(producerAcquirePoint);
+        builder.setLoopScheduleInfo(producerAcquirePoint);
         auto acquireOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
                 headProducer->getLoc(), token.second, bufferIdx, phase);
@@ -2152,7 +2155,6 @@ void insertAsyncComm(
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
         });
-        copyLoopScheduleInfo(acquireOp, producerAcquirePoint);
       }
 
       if (!commChannel.producerBarrier) {
@@ -2214,10 +2216,10 @@ void insertAsyncComm(
           producerCommitPoint->dump();
         });
         builder.setInsertionPointAfter(producerCommitPoint);
+        builder.setLoopScheduleInfo(producerCommitPoint);
         auto commitOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
                 tailProducer->getLoc(), token.second, bufferIdx);
-        copyLoopScheduleInfo(commitOp, producerCommitPoint);
       }
     }
 
@@ -2227,10 +2229,10 @@ void insertAsyncComm(
       if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
+        builder.setLoopScheduleInfo(consumerWaitPoint);
         auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
-        copyLoopScheduleInfo(waitOp, consumerWaitPoint);
       }
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
@@ -2239,6 +2241,7 @@ void insertAsyncComm(
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
+        builder.setLoopScheduleInfo(consumerReleasePoint);
         auto releaseOp =
             builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
                 consumerReleasePoint->getLoc(), token.second, bufferIdx);
@@ -2246,7 +2249,6 @@ void insertAsyncComm(
           LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
           token.second.dump();
         });
-        copyLoopScheduleInfo(releaseOp, consumerReleasePoint);
       }
     }
 
