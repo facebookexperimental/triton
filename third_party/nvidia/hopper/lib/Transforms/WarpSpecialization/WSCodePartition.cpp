@@ -1968,13 +1968,9 @@ void insertAsyncComm(
     auto withSameTask = [&](Operation *A, Operation *B) -> bool {
       auto aTasks = getAsyncTaskIds(A);
       auto bTasks = getAsyncTaskIds(B);
-      if (aTasks.size() != bTasks.size())
-        return false;
-      for (unsigned i = 0; i < aTasks.size(); ++i)
-        if (aTasks[i] != bTasks[i])
-          return false;
-      return true;
+      return aTasks == bTasks;
     };
+
     // Return the backward channel if found.
     // Assume chF is a forward channel where producer and consumer are in the
     // same block.
@@ -2074,9 +2070,11 @@ void insertAsyncComm(
       }
     }
     Operation *producerAcquireForChannelLoop = nullptr;
-    auto *bwdCh = isForwardOfChannelLoop(masterChannel);
-    if (bwdCh)
-      producerAcquireForChannelLoop = bwdCh->getDstOp();
+    if (headProducer->getBlock() == headConsumer->getBlock()) {
+      auto *bwdCh = isForwardOfChannelLoop(masterChannel);
+      if (bwdCh)
+        producerAcquireForChannelLoop = bwdCh->getDstOp();
+    }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
