@@ -1027,7 +1027,6 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
     builder.setAsyncTaskIdsFromOp(srcOp);
-    builder.setLoopScheduleInfo(srcOp);
     tt::DescriptorStoreOp tmaStore;
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [&](Operation *op) {
@@ -1081,12 +1080,14 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     buffer = allocOp->getResult(0);
 
     // Generate the local store
+    builder.setLoopScheduleInfo(srcOp);
     auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
         srcOp->getLoc(), srcResult, allocOp);
     storeOp->moveAfter(srcOp);
 
     // local load
     builder.setAsyncTaskIdsFromOp(dstOp);
+    builder.setLoopScheduleInfo(dstOp);
     auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
         srcOp->getLoc(), srcResult.getType(), allocOp, Value());
     loadOp->moveBefore(dstOp);
@@ -1400,6 +1401,7 @@ DenseMap<Channel *, Value> createBufferPost(
       Value bufferIdx;
       Value _phase = Value();
       OpBuilderWithAsyncTaskIds builder(user);
+      builder.setLoopScheduleInfo(user);
       if (auto forOp = user->getParentOfType<scf::ForOp>()) {
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
