@@ -295,8 +295,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                 BM: tl.constexpr = qk.shape[0]
                 BN: tl.constexpr = qk.shape[1]
                 qk_0, qk_1 = qk.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+                qk_0_0, qk_0_1 = qk_0.reshape([BM, 2, BN // 4]).permute(0, 2, 1).split()
 
-                p_0 = ex2_emulation(qk_0)
+                p_0_0 = ex2_emulation(qk_0_0)
+                p_0_1 = tl.math.exp2(qk_0_1)
+                p_0 = tl.join(p_0_0, p_0_1).permute(0, 2, 1).reshape([BM, BN // 2])
                 p_1 = tl.math.exp2(qk_1)
                 p = tl.join(p_0, p_1).permute(0, 2, 1).reshape([BM, BN])
 
