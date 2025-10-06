@@ -60,17 +60,23 @@ def _compute_offsets(H, N_CTX, BLOCK_M):
 # We only need it to produce floor(x) when paired with the big-constant trick.
 # In Triton, just compute floor(x) explicitly and add y.
 @triton.jit
-def add_round_down(x, y):
-    # emulate add.rm.ftz.f32 (round down)
+def add_round_down(a, b):
     return tl.inline_asm_elementwise(
-        asm="add.rm.ftz.f32 $0, $1, $2;",
-        constraints="=f, f, f",
-        args=[x, y],
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            add.rm.ftz.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
         dtype=tl.float32,
         is_pure=True,
-        pack=1,
+        pack=2,
     )
-
 
 # ============================================================================
 # Custom exp2 Polynomial Approximation (the "emulation" path)
