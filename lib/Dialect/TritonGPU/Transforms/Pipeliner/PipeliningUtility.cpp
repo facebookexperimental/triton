@@ -1092,5 +1092,5 @@ triton::MMAClusterInfo triton::getMMADistanceAndCluster(scf::ForOp forOp,
       startingOffset += maxChainLength;
     }
   }
-  return {distance, clusterMap, maxClusterPerDistance, numDots};
+  return {distance, clusterMap, maxClusterPerDistance, chains, numDots};
 }

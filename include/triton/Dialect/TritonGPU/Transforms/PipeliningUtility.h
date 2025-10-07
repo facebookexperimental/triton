@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <optional>
 #include <utility>
 #include <vector>
@@ -182,9 +183,9 @@ struct MMAClusterInfo {
   DenseMap<Operation *, int> distance;
   DenseMap<Operation *, int> clusterMap;
   SmallVector<int> maxClusterPerDistance;
+  SmallVector<SmallVector<triton::nvidia_gpu::MMAv5OpInterface>> mmaChains;
   size_t numDots;
 };
-typedef struct MMAClusterInfo MMAClusterInfo;
 
 MMAClusterInfo getMMADistanceAndCluster(scf::ForOp forOp, int maxStages);
 

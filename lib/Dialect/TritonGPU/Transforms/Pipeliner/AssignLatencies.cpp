@@ -60,12 +60,12 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
 // recursive, meaning if the MMA is a chain dot we only return the
 // first MMA in the chain, unless the original op is actually used
 // in both.
-void getMMAConsumer(Operation *op, SmallVector<ttng::MMAv5OpInterface> &users) {
+void getMMAConsumers(Operation *op, DenseSet<ttng::MMAv5OpInterface> &users) {
   for (auto user : op->getUsers()) {
     if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(user)) {
-      users.push_back(mma);
+      users.insert(mma);
     } else {
-      getMMAConsumer(user, users);
+      getMMAConsumers(user, users);
     }
   }
 }
@@ -87,30 +87,39 @@ public:
     if (loadOpToIndLevel.empty())
       return;
 
-    llvm::MapVector<Operation *, int> numMMAStages;
+    int maxIndirectionLevel = 0;
+    for (auto &[loadOp, info] : loadOpToIndLevel)
+      maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
+    unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
+
     // Grab MMA cluster info to determine the number of stages in which each
     // load will be active.
     MMAClusterInfo clusterInfo = getMMADistanceAndCluster(forOp, numStages);
-    // Calculate the stage distance between applicable loads.
-    int maxIndirectionLevel = 0;
-    for (auto &[loadOp, info] : loadOpToIndLevel) {
-      maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
-      SmallVector<ttng::MMAv5OpInterface> mmaConsumers;
-      getMMAConsumer(loadOp, mmaConsumers);
-      DenseSet<int> mmaStages;
-      for (auto &consumer : mmaConsumers) {
-        if (clusterInfo.distance.count(consumer)) {
-          mmaStages.insert(clusterInfo.distance[consumer]);
+    if (clusterInfo.numDots) {
+      // If we have explict dot ordering then consider the chain-level
+      for (auto [loadOp, dist] : loadOpToIndLevel) {
+        DenseSet<ttng::MMAv5OpInterface> mmaConsumers;
+        getMMAConsumers(loadOp, mmaConsumers);
+        int maxDistance = 0;
+        int minChainIndex = numStages;
+        for (auto chain : clusterInfo.mmaChains) {
+          for (int i = 0; i < chain.size(); i++) {
+            auto mmaOp = chain[i];
+            if (mmaConsumers.count(mmaOp)) {
+              maxDistance = std::max(maxDistance, clusterInfo.distance[mmaOp]);
+              minChainIndex = std::min(minChainIndex, i);
+            }
+          }
         }
+        unsigned mmaRelatedLatency =
+            ((numStages - 1) - maxDistance) / (minChainIndex + 1);
+        opLatency[loadOp] = std::min(mmaRelatedLatency, loadLatency);
       }
-      numMMAStages[loadOp] = mmaStages.size();
-    }
 
-    for (auto [loadOp, dist] : loadOpToIndLevel) {
-      auto mmaIndirection = (numMMAStages[loadOp] - 1);
-      auto indirection = std::max(maxIndirectionLevel, mmaIndirection);
-      opLatency[loadOp] = (numStages - 1) / (indirection + 1);
-      ;
+    } else {
+      for (auto [loadOp, dist] : loadOpToIndLevel) {
+        opLatency[loadOp] = loadLatency;
+      }
     }
   }
 

@@ -1147,11 +1147,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %offs_m0_27 = tt.splat %qo_offset_y : i32 -> tensor<128xi32, #blocked1>
       %offs_m0_28 = arith.addi %offs_m0_27, %offs_m0 : tensor<128xi32, #blocked1>
       %offs_m1_29 = arith.addi %offs_m0_27, %offs_m1 : tensor<128xi32, #blocked1>
-      // CHECK: descriptor_load {{.*}} {tt.latency = 2 : i32}
+      // CHECK: descriptor_load {{.*}} {tt.latency = 1 : i32}
       %q0 = tt.descriptor_load %desc_q[%qo_offset_y_26, %c0_i32] : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked2>
       %q0_30 = ttg.local_alloc %q0 : (tensor<128x128xbf16, #blocked2>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
       %q1 = arith.addi %qo_offset_y_26, %c128_i32 : i32
-      // CHECK: descriptor_load {{.*}} {tt.latency = 1 : i32}
+      // CHECK: descriptor_load {{.*}} {tt.latency = 0 : i32}
       %q1_31 = tt.descriptor_load %desc_q[%q1, %c0_i32] : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked2>
       %q1_32 = ttg.local_alloc %q1_31 : (tensor<128x128xbf16, #blocked2>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
       %qk_33, %qk_34 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
