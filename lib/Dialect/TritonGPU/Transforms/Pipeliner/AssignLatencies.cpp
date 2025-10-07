@@ -87,6 +87,7 @@ public:
     if (loadOpToIndLevel.empty())
       return;
 
+    // Calculate the stage distance between applicable loads.
     int maxIndirectionLevel = 0;
     for (auto &[loadOp, info] : loadOpToIndLevel)
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
