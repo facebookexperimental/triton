@@ -60,7 +60,8 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
   if (!storeOp) {
     return false;
   }
-  // Verify the store and load are in the same block. Otherwise we may not
+  // Verify the store and load are in the same block. Otherwise it
+  // would be more complicated to prove the store is unused.
   if (storeOp->getBlock() != loadOp->getBlock()) {
     return false;
   }
@@ -86,9 +87,10 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
       continue;
     }
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
-      // Buffer value must be the accumulator. Otherwise the
-      // store has been used.
-      if (mmaOp.getAccumulator() != bufferValue) {
+      // Buffer value must be the accumulator and not A.
+      // Otherwise the store has been used.
+      if (mmaOp.getAccumulator() != bufferValue ||
+          mmaOp.getA() == bufferValue) {
         return false;
       }
       // We don't support any predicate value than
