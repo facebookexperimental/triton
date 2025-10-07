@@ -178,6 +178,15 @@ Operation *
 getLastUseOfPipelinedOp(ArrayRef<Operation *> ops, scf::ForOp forOp,
                         CoarseSchedule &schedule,
                         std::function<bool(Operation *)> filterUse = nullptr);
+struct MMAClusterInfo {
+  DenseMap<Operation *, int> distance;
+  DenseMap<Operation *, int> clusterMap;
+  SmallVector<int> maxClusterPerDistance;
+  size_t numDots;
+};
+typedef struct MMAClusterInfo MMAClusterInfo;
+
+MMAClusterInfo getMMADistanceAndCluster(scf::ForOp forOp, int maxStages);
 
 } // namespace triton
 } // namespace mlir

@@ -56,6 +56,20 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
   }
 }
 
+// Get all of the MMA consumers of the given operation. This is not
+// recursive, meaning if the MMA is a chain dot we only return the
+// first MMA in the chain, unless the original op is actually used
+// in both.
+void getMMAConsumer(Operation *op, SmallVector<ttng::MMAv5OpInterface> &users) {
+  for (auto user : op->getUsers()) {
+    if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(user)) {
+      users.push_back(mma);
+    } else {
+      getMMAConsumer(user, users);
+    }
+  }
+}
+
 class AssignLoadLatencies {
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
@@ -73,14 +87,30 @@ public:
     if (loadOpToIndLevel.empty())
       return;
 
+    llvm::MapVector<Operation *, int> numMMAStages;
+    // Grab MMA cluster info to determine the number of stages in which each
+    // load will be active.
+    MMAClusterInfo clusterInfo = getMMADistanceAndCluster(forOp, numStages);
     // Calculate the stage distance between applicable loads.
     int maxIndirectionLevel = 0;
-    for (auto &[loadOp, info] : loadOpToIndLevel)
+    for (auto &[loadOp, info] : loadOpToIndLevel) {
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
-    unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
+      SmallVector<ttng::MMAv5OpInterface> mmaConsumers;
+      getMMAConsumer(loadOp, mmaConsumers);
+      DenseSet<int> mmaStages;
+      for (auto &consumer : mmaConsumers) {
+        if (clusterInfo.distance.count(consumer)) {
+          mmaStages.insert(clusterInfo.distance[consumer]);
+        }
+      }
+      numMMAStages[loadOp] = mmaStages.size();
+    }
 
     for (auto [loadOp, dist] : loadOpToIndLevel) {
-      opLatency[loadOp] = loadLatency;
+      auto mmaStageCount = numMMAStages[loadOp];
+      auto indirection = std::max(maxIndirectionLevel, mmaStageCount);
+      opLatency[loadOp] = (numStages - 1) / (indirection + 1);
+      ;
     }
   }
 
@@ -91,7 +121,8 @@ private:
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
-    // If used by an user with DotOp encoding, all the uses must be compatible.
+    // If used by an user with DotOp encoding, all the uses must be
+    // compatible.
     bool incompatible = false;
     getSharedEncIfAllUsersAreDotEnc(op.getResult(), incompatible);
     return !incompatible;
@@ -170,8 +201,9 @@ public:
         if (hasSyncDots(forOp)) {
           // Skip pipelining MMA in the loops where sync dots are used. This
           // is a dirty heuristic for performance drops in kernels where we
-          // would rather want to have last iteration peeled instead of having a
-          // full iteration of masked operations only to execute single wait.
+          // would rather want to have last iteration peeled instead of having
+          // a full iteration of masked operations only to execute single
+          // wait.
           continue;
         }
         auto pipeHelper = ttng::MMAv5PipelineableOperandsHelper(
@@ -187,13 +219,13 @@ public:
             // MMA's users can be pushed to the next stage
             opLatency[&op] = 1;
           }
-          // HACK: A pipelined MMA's latency should equal the number of buffers
-          // for the accumulator, but when the user is in an `scf.if` in SWP,
-          // the `scf.if` is pushed to the end of the loop rather than peeled
-          // before the MMA op, requiring an extra buffer due to liverange
-          // overlap. WS does not have this problem because the MMA is placed in
-          // a different partition than the MMA, so we can correctly set the
-          // latency.
+          // HACK: A pipelined MMA's latency should equal the number of
+          // buffers for the accumulator, but when the user is in an `scf.if`
+          // in SWP, the `scf.if` is pushed to the end of the loop rather than
+          // peeled before the MMA op, requiring an extra buffer due to
+          // liverange overlap. WS does not have this problem because the MMA
+          // is placed in a different partition than the MMA, so we can
+          // correctly set the latency.
           if (forOp->hasAttr(kWarpSpecializeAttrName)) {
             if (ttng::hasAccReadModifyWrite(mma, forOp))
               opLatency.erase(&op); // can't pipeline the MMA
@@ -222,10 +254,10 @@ private:
 // Discover operations that should become async and assign latencies to them
 // based on the numStages value provided by the user.
 //
-// Look for load ops that directly or indirectly feed into dot ops. Based on the
-// requested number of stages assign the latencies in a way that cover all the
-// stages with the sum of latencies in the chain from the first load to the
-// final dot op.
+// Look for load ops that directly or indirectly feed into dot ops. Based on
+// the requested number of stages assign the latencies in a way that cover all
+// the stages with the sum of latencies in the chain from the first load to
+// the final dot op.
 void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) {
