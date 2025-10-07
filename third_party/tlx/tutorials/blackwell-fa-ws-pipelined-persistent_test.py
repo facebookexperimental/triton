@@ -65,6 +65,27 @@ def _mul_f32x2(a, b):
 
 
 @triton.jit
+def _fma_f32x2(a, b, c):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mov.b64 rc, { $6, $7 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { $0, $1 }, rd;
+        }
+        """,
+        "=r,=r,r,r,r,r,r,r",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M):
     start_m = tile_idx % n_tile_num
     off_hz = tile_idx // n_tile_num
@@ -250,7 +271,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     tlx.local_store(alpha_tiles[cid * HEAD_DIM], alpha[:, None])
                     tlx.barrier_arrive(alpha_fulls[cid])
 
-                    qk = qk * qk_scale - m_ij[:, None]
+                    qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
                     p = tl.math.exp2(qk)
                     l_ij = tl.sum(p, 1)
                     p = p.to(tlx.dtype_of(desc_v))
