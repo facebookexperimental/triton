@@ -43,6 +43,7 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     phase = (accum_cnt // NUM_BUFFERS_KV) & 1
     return bufIdx, phase
 
+
 @triton.jit
 def _mul_f32x2(a, b):
     return tl.inline_asm_elementwise(
@@ -74,6 +75,7 @@ def _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M):
     lo, hi = 0, N_CTX
     kv_offset_y = offset_y + lo
     return start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y
+
 
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
@@ -199,7 +201,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                     tlx.barrier_arrive(o_fulls[cid])
 
                 tile_idx += num_progs
-
 
         # epilog group
         with tlx.async_task(num_warps=1, registers=24):
