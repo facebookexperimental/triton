@@ -44,6 +44,7 @@ def _attn_fwd_subtile(
     dtype: tl.constexpr,
     STAGE: tl.constexpr,
     SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
 ):
     qk = tl.dot(q, k)
     if STAGE == 2:
@@ -53,7 +54,10 @@ def _attn_fwd_subtile(
         qk -= m_ij[:, None]
     else:
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-        qk = qk * qk_scale - m_ij[:, None]
+        if VECT_MUL:
+            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        else:
+            qk = qk * qk_scale - m_ij[:, None]
     p = tl.math.exp2(qk)
     # -- compute correction factor
     alpha = tl.math.exp2(m_i - m_ij)
@@ -65,8 +69,12 @@ def _attn_fwd_subtile(
 
     if SUBTILING:
         acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-        acc0 = acc0 * alpha[:, None]
-        acc1 = acc1 * alpha[:, None]
+        if VECT_MUL:
+            acc0 = _mul_f32x2(acc0, alpha[:, None])
+            acc1 = _mul_f32x2(acc1, alpha[:, None])
+        else:
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
         acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
     else:
         acc = acc * alpha[:, None]
@@ -109,6 +117,7 @@ def _attn_fwd_inner_oss_dp(
     N_CTX: tl.constexpr,
     warp_specialize: tl.constexpr,
     SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:
@@ -144,6 +153,7 @@ def _attn_fwd_inner_oss_dp(
             dtype,
             STAGE,
             SUBTILING,
+            VECT_MUL,
         )
         l_i1, m_i1, acc1 = _attn_fwd_subtile(
             q1,
@@ -159,6 +169,7 @@ def _attn_fwd_inner_oss_dp(
             dtype,
             STAGE,
             SUBTILING,
+            VECT_MUL,
         )
 
         offsetkv_y += BLOCK_N
@@ -190,7 +201,12 @@ else:
 
 configs = [
     triton.Config(
-        {"BLOCK_M": BM, "BLOCK_N": BN, "SUBTILING": subtile},
+        {
+            "BLOCK_M": BM,
+            "BLOCK_N": BN,
+            "SUBTILING": subtile,
+            "VECT_MUL": vectmul,
+        },
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
@@ -200,7 +216,8 @@ configs = [
     for BN in [128]
     for s in NUM_STAGES_OPTIONS
     for w in [4]
-    for subtile in [False]
+    for subtile in [True]
+    for vectmul in [False]
 ]
 
 
@@ -231,6 +248,47 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 
 
 @triton.jit
+def _mul_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mul.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _fma_f32x2(a, b, c):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mov.b64 rc, { $6, $7 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { $0, $1 }, rd;
+        }
+        """,
+        "=r,=r,r,r,r,r,r,r",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _attn_fwd_tma_dp(
     sm_scale,
     M,  #
@@ -251,6 +309,7 @@ def _attn_fwd_tma_dp(
     warp_specialize: tl.constexpr,  #
     dtype: tl.constexpr,
     SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = pid  # tl.program_id(0)
@@ -305,6 +364,7 @@ def _attn_fwd_tma_dp(
             N_CTX,  #
             warp_specialize,
             SUBTILING,
+            VECT_MUL,
         )
     if STAGE & 2:
         acc0, acc1, l_i0, l_i1, m_i0, m_i1 = _attn_fwd_inner_oss_dp(
@@ -332,6 +392,7 @@ def _attn_fwd_tma_dp(
             N_CTX,  #
             warp_specialize,
             SUBTILING,
+            VECT_MUL,
         )
 
     m_i0 += tl.math.log2(l_i0)
@@ -371,6 +432,7 @@ def _attn_fwd(
     warp_specialize: tl.constexpr,  #
     dtype: tl.constexpr,
     SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -394,6 +456,7 @@ def _attn_fwd(
         warp_specialize,
         dtype,
         SUBTILING,
+        VECT_MUL,
     )
 
 
@@ -422,6 +485,7 @@ def _attn_fwd_persist(
     OUTER_LOOP: tl.constexpr,
     dtype: tl.constexpr,
     SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -457,6 +521,7 @@ def _attn_fwd_persist(
             warp_specialize and not OUTER_LOOP,
             dtype,
             SUBTILING,
+            VECT_MUL,
         )
         tile_idx += num_progs
 
