@@ -967,7 +967,7 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
     oldAlloc->replaceAllUsesWith(newAlloc);
   }
   builder.setAsynTaskIdsFromArray(originTaskIds);
-  builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
+  builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
   oldAlloc->erase();
   return newBuf;
 }
@@ -1094,7 +1094,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
     newProducer = loadOp->getResult(0);
     builder.setAsynTaskIdsFromArray(originTaskIds);
-    builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
+    builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
   }
 
   return {buffer, newProducer};

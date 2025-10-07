@@ -39,6 +39,12 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId);
 // Removes all async task ids from the given operation.
 void removeAsyncTaskIds(Operation *op);
 
+struct LoopScheduleInfo {
+  IntegerAttr stage;
+  IntegerAttr cluster;
+};
+typedef struct LoopScheduleInfo LoopScheduleInfo;
+
 class OpBuilderWithAsyncTaskIds : public OpBuilder {
 public:
   OpBuilderWithAsyncTaskIds(MLIRContext *context) : OpBuilder(context) {}
@@ -85,16 +91,13 @@ public:
   // Sets the loop schedule info (loop.stage, loop.cluster) of future
   // createWithAsyncTaskIds operations based on the `loop.stage` and
   // `loop.cluster` attributes of the given operation.
-  void setLoopScheduleInfoFromTuple(
-      std::tuple<std::optional<IntegerAttr>, std::optional<IntegerAttr>>
-          loopScheduleInfo) {
-    loopStage = std::get<0>(loopScheduleInfo);
-    loopCluster = std::get<1>(loopScheduleInfo);
+  void setLoopScheduleInfoFromInfo(LoopScheduleInfo newLoopScheduleInfo) {
+    loopScheduleInfo = newLoopScheduleInfo;
   }
 
   void setLoopScheduleInfoFromOp(Operation *op) {
-    std::optional<IntegerAttr> nextLoopStage = std::nullopt;
-    std::optional<IntegerAttr> nextLoopCluster = std::nullopt;
+    IntegerAttr nextLoopStage = nullptr;
+    IntegerAttr nextLoopCluster = nullptr;
     if (op->hasAttr(tt::kLoopStageAttrName)) {
       nextLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
     }
@@ -102,34 +105,27 @@ public:
       nextLoopCluster =
           op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
     }
-    setLoopScheduleInfoFromTuple({nextLoopStage, nextLoopCluster});
+    setLoopScheduleInfoFromInfo({nextLoopStage, nextLoopCluster});
   }
 
   // Clears the loop schedule info (loop.stage, loop.cluster) for
   // future createWithAsyncTaskIds operations.
-  void clearLoopScheduleInfo() {
-    loopStage = std::nullopt;
-    loopCluster = std::nullopt;
-  }
+  void clearLoopScheduleInfo() { loopScheduleInfo = {nullptr, nullptr}; }
 
-  std::tuple<std::optional<IntegerAttr>, std::optional<IntegerAttr>>
-  getLoopScheduleInfo() {
-    return {loopStage, loopCluster};
-  }
+  LoopScheduleInfo getLoopScheduleInfo() { return loopScheduleInfo; }
 
 private:
   void setOpLoopScheduleInfo(Operation *op) {
-    if (loopStage.has_value()) {
-      op->setAttr(tt::kLoopStageAttrName, loopStage.value());
+    if (loopScheduleInfo.stage) {
+      op->setAttr(tt::kLoopStageAttrName, loopScheduleInfo.stage);
     }
-    if (loopCluster.has_value()) {
-      op->setAttr(tt::kLoopClusterAttrName, loopCluster.value());
+    if (loopScheduleInfo.cluster) {
+      op->setAttr(tt::kLoopClusterAttrName, loopScheduleInfo.cluster);
     }
   }
 
   SmallVector<AsyncTaskId> asyncTaskIds;
-  std::optional<IntegerAttr> loopStage = std::nullopt;
-  std::optional<IntegerAttr> loopCluster = std::nullopt;
+  LoopScheduleInfo loopScheduleInfo = {nullptr, nullptr};
 };
 
 // Copy any pipeline info (loop.stage, loop.cluster) from

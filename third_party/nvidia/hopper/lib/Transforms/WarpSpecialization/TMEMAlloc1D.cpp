@@ -103,7 +103,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
   builder.setAsynTaskIdsFromArray(originTaskIds);
-  builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
+  builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
 }
 
 Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
@@ -134,7 +134,7 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
   builder.setAsynTaskIdsFromArray(originTaskIds);
-  builder.setLoopScheduleInfoFromTuple(originLoopScheduleInfo);
+  builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
   return newInput.getResult();
 }
 
