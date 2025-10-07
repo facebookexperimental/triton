@@ -220,7 +220,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # softmax groups
-        with tlx.async_task(num_warps=4, registers=152, replicate=NUM_MMA_GROUPS):
+        with tlx.async_task(num_warps=4, registers=168, replicate=NUM_MMA_GROUPS):
             accum_cnt_qk = 0
             for i in range(0, tiles_per_sm):
                 # initialize offsets
