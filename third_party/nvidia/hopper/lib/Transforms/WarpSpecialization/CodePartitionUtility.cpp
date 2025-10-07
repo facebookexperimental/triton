@@ -904,9 +904,41 @@ struct CommitOpSubgroupInfo {
 };
 typedef struct CommitOpSubgroupInfo CommitOpSubgroupInfo;
 
-bool hasMatchingPhase(ttng::WaitBarrierOp wait1, ttng::WaitBarrierOp wait2) {
-  // TODO: FIXME
+// Check if two values are certain to match given the assumption.
+// that the original value are located in the same block and therefore
+// occur with the same frequency.
+bool valuesMatch(Value v1, Value v2) {
+  if (v1 == v2) {
+    return true;
+  }
+  auto *op1 = v1.getDefiningOp();
+  auto *op2 = v2.getDefiningOp();
+  if (!op1 || !op2) {
+    return false;
+  }
+  // Verify the op types match
+  if ((op1->getName() != op2->getName()) ||
+      (op1->getNumOperands() != op2->getNumOperands())) {
+    return false;
+  }
+
+  // Special case on constants
+  if (auto const1 = dyn_cast<mlir::arith::ConstantOp>(op1)) {
+    auto const2 = cast<mlir::arith::ConstantOp>(op2);
+    return const1.getValue() == const2.getValue();
+  }
+  // Check all operands
+  for (unsigned i = 0, e = op1->getNumOperands(); i < e; ++i) {
+    if (!valuesMatch(op1->getOperand(i), op2->getOperand(i)))
+      return false;
+  }
+  // If all operands match and we have the same exact op type then
+  // this op matches.
   return true;
+}
+
+bool hasMatchingPhase(ttng::WaitBarrierOp wait1, ttng::WaitBarrierOp wait2) {
+  return valuesMatch(wait1.getPhase(), wait2.getPhase());
 }
 
 void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
@@ -917,24 +949,29 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
   if (barrierWaiters.empty()) {
     return;
   }
-  // Validate the inputs. All consumers must go to the same subgroup
+  // Validate the inputs. All co`sumers must go to the same subgroup
   // to remove a barrier
   auto initWaiter = barrierWaiters[0];
   for (size_t i = 1; i < consumers.size(); i++) {
     auto nextWaiter = barrierWaiters[i];
     if ((initWaiter->getParentOp() != nextWaiter->getParentOp()) &&
         hasMatchingPhase(initWaiter, nextWaiter)) {
-      // Unsupport commit.
+      // Unsupported commit.
       return;
     }
   }
   bool found = false;
   auto insertIntoSubgroup =
-      ([](CommitOpSubgroupInfo &subgroup, Operation *bufferAllocOp,
-          ttng::TCGen5CommitOp commit, SmallVector<Operation *> &consumers,
+      ([](CommitOpSubgroupInfo &subgroup, int initCount,
+          Operation *bufferAllocOp, ttng::TCGen5CommitOp commit,
+          SmallVector<Operation *> &consumers,
           SmallVector<ttng::WaitBarrierOp> &barrierWaiters) {
-        subgroup.bufferConsumers.emplace_back(consumers);
-        subgroup.barrierWaiters.emplace_back(barrierWaiters);
+        subgroup.initCount = initCount;
+        subgroup.bufferConsumers.insert(subgroup.bufferConsumers.end(),
+                                        consumers.begin(), consumers.end());
+        subgroup.barrierWaiters.insert(subgroup.barrierWaiters.end(),
+                                       barrierWaiters.begin(),
+                                       barrierWaiters.end());
         for (size_t j = 0; j < consumers.size(); j++) {
           subgroup.bufferAllocs.push_back(bufferAllocOp);
           subgroup.commits.push_back(commit);
@@ -947,8 +984,8 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
       // Require matching parent ops.
       if ((groupWaiter->getParentOp() == initWaiter->getParentOp()) &&
           hasMatchingPhase(groupWaiter, initWaiter)) {
-        insertIntoSubgroup(subgroup, bufferAllocOp, commit, consumers,
-                           barrierWaiters);
+        insertIntoSubgroup(subgroup, initCount, bufferAllocOp, commit,
+                           consumers, barrierWaiters);
         found = true;
         break;
       }
@@ -956,7 +993,7 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
   }
   if (!found) {
     CommitOpSubgroupInfo subgroup;
-    insertIntoSubgroup(subgroup, bufferAllocOp, commit, consumers,
+    insertIntoSubgroup(subgroup, initCount, bufferAllocOp, commit, consumers,
                        barrierWaiters);
     subgroups.push_back(subgroup);
   }
