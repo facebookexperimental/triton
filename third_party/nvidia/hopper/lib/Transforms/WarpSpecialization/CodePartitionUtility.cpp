@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include <list>
 #include <unordered_set>
 
@@ -893,6 +894,54 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
   return {consumerOp};
 }
 
+struct CommitOpSubgroupInfo {
+  // Arrive value from the init Barrier
+  int initCount;
+  SmallVector<Operation *> bufferAllocs;
+  SmallVector<Operation *> bufferConsumers;
+  SmallVector<ttng::WaitBarrierOp> barrierWaiters;
+};
+typedef struct CommitOpSubgroupInfo CommitOpSubgroupInfo;
+
+bool hasMatchingPhase(ttng::WaitBarrierOp wait1, ttng::WaitBarrierOp wait2) {
+  // TODO: FIXME
+  return true;
+}
+
+void mergeSubgroups(SmallVector<CommitOpSubgroupInfo> &subgroups, int initCount,
+                    Operation *bufferAllocOp,
+                    SmallVector<Operation *> &consumers,
+                    SmallVector<ttng::WaitBarrierOp> &barrierWaiters) {
+  assert(consumers.size() == barrierWaiters.size());
+  for (size_t i = 0; i < consumers.size(); i++) {
+    auto consumer = consumers[i];
+    auto barrierWaiter = barrierWaiters[i];
+    bool found = false;
+    for (auto subgroup : subgroups) {
+      if (subgroup.initCount == initCount) {
+        // Select a represetentive for comparison.
+        auto groupWaiter = subgroup.barrierWaiters.front();
+        // Require matching parent ops.
+        if ((groupWaiter->getParentOp() == barrierWaiter->getParentOp()) &&
+            hasMatchingPhase(groupWaiter, barrierWaiter)) {
+          subgroup.bufferAllocs.push_back(bufferAllocOp);
+          subgroup.bufferConsumers.push_back(consumer);
+          subgroup.barrierWaiters.push_back(barrierWaiter);
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      CommitOpSubgroupInfo subgroup;
+      subgroup.initCount = initCount;
+      subgroup.bufferAllocs.push_back(bufferAllocOp);
+      subgroup.bufferConsumers.push_back(consumer);
+      subgroup.barrierWaiters.push_back(barrierWaiter);
+      subgroups.push_back(subgroup);
+    }
+  }
+}
 // Find all ttng::TCGen5CommitOp that could be theoritically
 // fused together if the consumers are compatible.
 SmallVector<ttng::TCGen5CommitOp>
@@ -926,7 +975,8 @@ collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
 //
 // 2. For each candidate group, group together barriers based on the
 // underlying consumer(s). We will form a subgroup if the barrier:
-//    a. Has identical pipelining state.
+//    a. Has no pipelining state. In the future this can be extended
+//       to matching, but we don't want to worry about cluster reordering.
 //    b. Has the same nesting level.
 //    c. Has the same expected phase value.
 //
@@ -936,7 +986,8 @@ collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
 //
 // 4. Cleanup the code to remove the unused barriers.
 //
-// Note: This is run before warp specialization to simplify the transformation.
+// Note: This is run before warp specialization to simplify the
+// transformation.
 void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
   DenseSet<ttng::TCGen5CommitOp> seenCommits;
   SmallVector<SmallVector<ttng::TCGen5CommitOp>> commitGroups;
@@ -949,6 +1000,7 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
     }
   });
   for (auto &commitGroup : commitGroups) {
+    SmallVector<CommitOpSubgroupInfo> subgroups;
     for (auto &commitOp : commitGroup) {
       auto barrier = commitOp.getBarrier();
       auto barrierAllocOp = barrier.getDefiningOp();
@@ -957,10 +1009,10 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
       // 2. Producer: This should only be the tcgen05.commit op.
       // 3. Consumer: 1 or more ops.
       // We want to collect all of the consumers.
+      SmallVector<Operation *> bufferConsumers;
       SmallVector<ttng::WaitBarrierOp> consumers;
       bool safe = true;
-      // All barriers must be initialized to the same value.
-      int expectedInitCount = -1;
+      int initCount = -1;
       for (auto user : barrier.getUsers()) {
         // We have found the consumer.
         if (user == commitOp) {
@@ -988,15 +1040,21 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
           break;
         }
         if (auto initBarrier = dyn_cast<ttng::InitBarrierOp>(user)) {
-          if (expectedInitCount == -1) {
-            expectedInitCount = initBarrier.getCount();
+          if (initCount == -1) {
+            initCount = initBarrier.getCount();
           } else {
             // Multiple inits. This is not safe.
             safe = false;
             break;
           }
         } else if (auto barrierOp = dyn_cast<ttng::WaitBarrierOp>(user)) {
+          // We don't support pipelining state.
+          if (barrierOp->hasAttr(tt::kLoopStageAttrName)) {
+            safe = false;
+            break;
+          }
           consumers.push_back(barrierOp);
+          bufferConsumers.push_back(bufferConsumer);
         } else {
           // Unexpected barrier op.
           safe = false;
@@ -1004,9 +1062,13 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
         }
       }
       // Cannot group this commit. Unexpected operations.
-      if (!safe || expectedInitCount == -1) {
+      if (!safe || initCount == -1) {
         continue;
       }
+      mergeSubgroups(subgroups, initCount, barrierAllocOp, bufferConsumers,
+                     consumers);
+    }
+    for (auto &subgroup : subgroups) {
     }
   }
 }
