@@ -46,7 +46,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
   builder.setInsertionPoint(loadOp);
-  builder.setLoopScheduleInfo(loadOp);
+  builder.setLoopScheduleInfoFromOp(loadOp);
   Value loadResult = loadOp.getResult();
   auto tensorType = dyn_cast<RankedTensorType>(loadResult.getType());
   if (!tensorType)
@@ -131,7 +131,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   OpBuilderWithAsyncTaskIds builder(dstOp);
   builder.setAsyncTaskIdsFromOp(dstOp);
   builder.setInsertionPoint(dstOp);
-  builder.setLoopScheduleInfo(dstOp);
+  builder.setLoopScheduleInfoFromOp(dstOp);
   auto dstView = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       dstOp->getLoc(), subviewTy, buffer, dstBufferIdx);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
@@ -142,7 +142,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   builder.setAsynTaskIdsFromArray(channel->relation.first);
   builder.setInsertionPoint(srcOp->getParentOp());
   builder.setInsertionPointAfter(srcOp);
-  builder.setLoopScheduleInfo(srcOp);
+  builder.setLoopScheduleInfoFromOp(srcOp);
   auto srcView = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       srcOp->getLoc(), subviewTy, buffer, srcBufferIdx);
   // Create local_alloc
@@ -187,7 +187,7 @@ createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
 
   assert(oldAllocOp.getSrc());
   auto *actualSrc = oldAllocOp.getSrc().getDefiningOp();
-  builder.setLoopScheduleInfo(actualSrc);
+  builder.setLoopScheduleInfoFromOp(actualSrc);
 
   SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(actualSrc);
   for (auto *user : oldAllocOp->getUsers()) {
@@ -222,7 +222,7 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
       cast<ttng::TMEMAllocOp>(bufferMap.find(channel)->second.getDefiningOp());
   OpBuilderWithAsyncTaskIds builder(oldTMemAllocOp);
   builder.setInsertionPointAfter(oldTMemAllocOp);
-  builder.setLoopScheduleInfo(oldTMemAllocOp);
+  builder.setLoopScheduleInfoFromOp(oldTMemAllocOp);
 
   // A tmemChannel is usually centered around a gen5 dotOp. There are two
   // cases, one is that the channel is for the accumulator, the other is
@@ -345,7 +345,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // first load.
   builder.setInsertionPoint(headProducer);
   builder.setAsyncTaskIdsFromOp(headProducer);
-  builder.setLoopScheduleInfo(headProducer);
+  builder.setLoopScheduleInfoFromOp(headProducer);
   auto prodBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
@@ -356,7 +356,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   Operation *copy = nullptr;
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
     builder.setInsertionPoint(tmaLoad);
-    builder.setLoopScheduleInfo(tmaLoad);
+    builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
     // FIXME: translateTMAIndices
@@ -368,7 +368,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // Create a wait_barrier before the first consumer.
   builder.setInsertionPoint(headConsumerSameLevel);
   builder.setAsyncTaskIdsFromOp(headConsumer);
-  builder.setLoopScheduleInfo(headConsumerSameLevel);
+  builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
@@ -394,7 +394,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       tmaLoad.erase();
       continue;
     }
-    builder.setLoopScheduleInfo(tmaLoad);
+    builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
@@ -475,7 +475,7 @@ void insertAsyncCopy(
           asyncTasksPC.push_back(task);
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
-    builder.setLoopScheduleInfo(srcOp);
+    builder.setLoopScheduleInfoFromOp(srcOp);
 
     if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
       int reuseGrp = channelInReuseGroup(kv.getFirst(), config);

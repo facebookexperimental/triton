@@ -45,7 +45,7 @@ public:
 
   explicit OpBuilderWithAsyncTaskIds(Operation *op) : OpBuilder(op) {
     setAsyncTaskIdsFromOp(op);
-    setLoopScheduleInfo(op);
+    setLoopScheduleInfoFromOp(op);
   }
 
   void setAsynTaskIdsFromArray(ArrayRef<AsyncTaskId> newAsyncTaskIds) {
@@ -92,7 +92,7 @@ public:
     loopCluster = std::get<1>(loopScheduleInfo);
   }
 
-  void setLoopScheduleInfo(Operation *op) {
+  void setLoopScheduleInfoFromOp(Operation *op) {
     std::optional<IntegerAttr> nextLoopStage = std::nullopt;
     std::optional<IntegerAttr> nextLoopCluster = std::nullopt;
     if (op->hasAttr(tt::kLoopStageAttrName)) {

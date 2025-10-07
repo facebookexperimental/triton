@@ -194,7 +194,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   for (auto idx : keptResultVec) {
     newResultTypes.push_back(ifOp->getResultTypes()[idx]);
   }
-  builder.setLoopScheduleInfo(ifOp);
+  builder.setLoopScheduleInfoFromOp(ifOp);
   auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
       ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
       ifOp.elseBlock());
@@ -212,7 +212,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   // Update yields
   auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
     ifBuilder.setInsertionPoint(yield);
-    ifBuilder.setLoopScheduleInfo(yield);
+    ifBuilder.setLoopScheduleInfoFromOp(yield);
     ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(yield.getLoc(), operands);
     ifBuilder.clearLoopScheduleInfo();
     yield.erase();
@@ -278,7 +278,7 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   auto newStep = mapping.lookupOrDefault(forOp.getStep());
 
   // Create newForOp.
-  builder.setLoopScheduleInfo(forOp);
+  builder.setLoopScheduleInfoFromOp(forOp);
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
       forOp.getLoc(), newLowerBound, newUpperBound, newStep, newLoopArgs);
   builder.clearLoopScheduleInfo();

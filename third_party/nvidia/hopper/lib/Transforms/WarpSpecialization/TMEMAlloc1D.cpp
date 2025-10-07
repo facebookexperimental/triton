@@ -31,7 +31,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto producerOp = producer.getDefiningOp();
   auto oldRetType = getResultTensorType(producer, 1);
   builder.setInsertionPointAfter(producerOp);
-  builder.setLoopScheduleInfo(producerOp);
+  builder.setLoopScheduleInfoFromOp(producerOp);
   auto originTaskIds = builder.getAsyncTaskIds();
   auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setAsynTaskIdsFromArray(producerTaskId);
@@ -121,7 +121,7 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setAsyncTaskIdsFromOp(consumer);
   builder.setInsertionPoint(consumer);
-  builder.setLoopScheduleInfo(consumer);
+  builder.setLoopScheduleInfoFromOp(consumer);
   auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
       consumer->getLoc(), newExpandType, builder.getType<ttg::AsyncTokenType>(),
       allocOp->getResult(0), Value());
