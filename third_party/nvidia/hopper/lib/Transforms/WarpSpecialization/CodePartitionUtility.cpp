@@ -907,7 +907,7 @@ typedef struct CommitOpSubgroupInfo CommitOpSubgroupInfo;
 // Check if two values are certain to match given the assumption.
 // that the original value are located in the same block and therefore
 // occur with the same frequency.
-bool valuesMatch(Value v1, Value v2) {
+bool valuesMatchOrAlternate(Value v1, Value v2, bool canFlip) {
   if (v1 == v2) {
     return true;
   }
@@ -919,6 +919,48 @@ bool valuesMatch(Value v1, Value v2) {
   // Verify the op types match
   if ((op1->getName() != op2->getName()) ||
       (op1->getNumOperands() != op2->getNumOperands())) {
+    // Support barriers with alternating phases. This is a peephole
+    // to check for the XorIOp 1 pattern that we generate to get the
+    // exact opposite phase of the same calculation.
+    //
+    // We only support this if the subsequent op truncates to a single bit
+    // to verify that this is exactly a logical XOR.
+    if (canFlip) {
+      auto xorVal1 = dyn_cast<arith::XOrIOp>(op1);
+      auto xorVal2 = dyn_cast<arith::XOrIOp>(op2);
+      // Both are flipped, something else didn't match.
+      if (xorVal1 && xorVal2) {
+        return false;
+      }
+      auto nonTrueOperand = ([](arith::XOrIOp xorOp) -> int {
+        auto op1 = xorOp.getOperand(0).getDefiningOp();
+        auto op2 = xorOp.getOperand(1).getDefiningOp();
+        if (op1 && isa<arith::ConstantOp>(op1) &&
+            (cast<IntegerAttr>(cast<arith::ConstantOp>(op1).getValue())
+                 .getValue() == 1)) {
+          return 1;
+        }
+        if (op2 && isa<arith::ConstantOp>(op2) &&
+            (cast<IntegerAttr>(cast<arith::ConstantOp>(op2).getValue())
+                 .getValue() == 1)) {
+          return 0;
+        }
+        return -1;
+      });
+      if (xorVal1) {
+        auto keptOperand = nonTrueOperand(xorVal1);
+        if (keptOperand == -1) {
+          return valuesMatchOrAlternate(xorVal1.getOperand(keptOperand), v2,
+                                        false);
+        }
+      } else if (xorVal2) {
+        auto keptOperand = nonTrueOperand(xorVal2);
+        if (keptOperand == -1) {
+          return valuesMatchOrAlternate(v1, xorVal2.getOperand(keptOperand),
+                                        false);
+        }
+      }
+    }
     return false;
   }
 
@@ -927,9 +969,14 @@ bool valuesMatch(Value v1, Value v2) {
     auto const2 = cast<mlir::arith::ConstantOp>(op2);
     return const1.getValue() == const2.getValue();
   }
+  // We can match the flipping behavior exactly on a truncation
+  // to a single bit.
+  auto truncOp = dyn_cast<arith::TruncIOp>(op1);
+  bool canFlipInput = truncOp && v1.getType().getIntOrFloatBitWidth() == 1;
   // Check all operands
-  for (unsigned i = 0, e = op1->getNumOperands(); i < e; ++i) {
-    if (!valuesMatch(op1->getOperand(i), op2->getOperand(i)))
+  for (unsigned i = 0; i < op1->getNumOperands(); ++i) {
+    if (!valuesMatchOrAlternate(op1->getOperand(i), op2->getOperand(i),
+                                canFlipInput))
       return false;
   }
   // If all operands match and we have the same exact op type then
@@ -937,8 +984,12 @@ bool valuesMatch(Value v1, Value v2) {
   return true;
 }
 
-bool hasMatchingPhase(ttng::WaitBarrierOp wait1, ttng::WaitBarrierOp wait2) {
-  return valuesMatch(wait1.getPhase(), wait2.getPhase());
+// Return True if the two ttng::WaitBarrierOp will either have
+// exactly the same value or exactly the opposite value in
+// every iteration of the loop. If so, then these are safe to fuse.
+bool hasMatchingOrAlternatingPhase(ttng::WaitBarrierOp wait1,
+                                   ttng::WaitBarrierOp wait2) {
+  return valuesMatchOrAlternate(wait1.getPhase(), wait2.getPhase(), false);
 }
 
 void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
@@ -949,13 +1000,13 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
   if (barrierWaiters.empty()) {
     return;
   }
-  // Validate the inputs. All co`sumers must go to the same subgroup
-  // to remove a barrier
+  // Validate the inputs. All consumers must go to the same subgroup
+  // to remove a barrier.
   auto initWaiter = barrierWaiters[0];
   for (size_t i = 1; i < consumers.size(); i++) {
     auto nextWaiter = barrierWaiters[i];
     if ((initWaiter->getParentOp() != nextWaiter->getParentOp()) &&
-        hasMatchingPhase(initWaiter, nextWaiter)) {
+        hasMatchingOrAlternatingPhase(initWaiter, nextWaiter)) {
       // Unsupported commit.
       return;
     }
@@ -983,7 +1034,7 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
       auto groupWaiter = subgroup.barrierWaiters.front();
       // Require matching parent ops.
       if ((groupWaiter->getParentOp() == initWaiter->getParentOp()) &&
-          hasMatchingPhase(groupWaiter, initWaiter)) {
+          hasMatchingOrAlternatingPhase(groupWaiter, initWaiter)) {
         insertIntoSubgroup(subgroup, initCount, bufferAllocOp, commit,
                            consumers, barrierWaiters);
         found = true;
