@@ -31,10 +31,10 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto producerOp = producer.getDefiningOp();
   auto oldRetType = getResultTensorType(producer, 1);
   builder.setInsertionPointAfter(producerOp);
-  builder.setLoopScheduleInfoFromOp(producerOp);
   auto originTaskIds = builder.getAsyncTaskIds();
-  auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setAsynTaskIdsFromArray(producerTaskId);
+  auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
+  builder.setLoopScheduleInfoFromOp(producerOp);
   auto encoding = oldRetType.getEncoding();
   Value expandDimsInput = producer;
   unsigned axis = 1;
