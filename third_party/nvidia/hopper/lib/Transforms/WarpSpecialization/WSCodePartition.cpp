@@ -2686,6 +2686,13 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
+  // Prune any unnecessary barriers related to tgen05.commit
+  fuseTcgen05CommitBarriers(funcOp);
+  LLVM_DEBUG({
+    LDBG("\n\nPruned tcgen05 commit barriers");
+    funcOp.dump();
+  });
+
   // If loadResult has a single use which is LocalAlloc, we can get rid of
   // sharedLoad and replace all uses of LocalAlloc with viewLoad.
   foldLocalLoads(funcOp);

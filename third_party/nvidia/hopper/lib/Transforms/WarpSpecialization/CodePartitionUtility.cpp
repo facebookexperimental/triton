@@ -893,4 +893,122 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
   return {consumerOp};
 }
 
+// Find all ttng::TCGen5CommitOp that could be theoritically
+// fused together if the consumers are compatible.
+SmallVector<ttng::TCGen5CommitOp>
+collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
+                   DenseSet<ttng::TCGen5CommitOp> &seenCommits) {
+  SmallVector<ttng::TCGen5CommitOp> commitGroup;
+  auto block = commitOp->getBlock();
+  auto startit = mlir::Block::iterator(commitOp);
+  for (auto it = startit; it != block->end(); it++) {
+    if (auto op = dyn_cast<ttng::TCGen5CommitOp>(*it)) {
+      if (!seenCommits.count(op)) {
+        seenCommits.insert(op);
+        commitGroup.push_back(op);
+      }
+    } else {
+      // We currently only support all ttng::TCGen5CommitOp
+      // being grouped together.
+      break;
+    }
+  }
+  return commitGroup;
+}
+
+// Fuse together the barriers used by repeated
+// tcgen05.commit operations. This works with the following
+// setup:
+// 1, Collect all tcgen05.commit operations that logically occur
+// "concurrently" and especially without any intermediate mma ops.
+// Right now we only support commit operations that are placed next
+// to each other in the IR, but in theory this can be extended.
+//
+// 2. For each candidate group, group together barriers based on the
+// underlying consumer(s). We will form a subgroup if the barrier:
+//    a. Has identical pipelining state.
+//    b. Has the same nesting level.
+//    c. Has the same expected phase value.
+//
+// 3. For each subgroup, update the barriers based on the consumer's location.
+//    a. With the same async task id, eliminate all but the first barrier.
+//    b. With different async task ids, use the same allocation.
+//
+// 4. Cleanup the code to remove the unused barriers.
+//
+// Note: This is run before warp specialization to simplify the transformation.
+void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
+  DenseSet<ttng::TCGen5CommitOp> seenCommits;
+  SmallVector<SmallVector<ttng::TCGen5CommitOp>> commitGroups;
+  funcOp.walk<mlir::WalkOrder::PreOrder>([&](ttng::TCGen5CommitOp commitOp) {
+    if (!seenCommits.count(commitOp)) {
+      auto commitGroup = collectCommitGroup(commitOp, seenCommits);
+      if (commitGroup.size() > 1) {
+        commitGroups.push_back(commitGroup);
+      }
+    }
+  });
+  for (auto &commitGroup : commitGroups) {
+    for (auto &commitOp : commitGroup) {
+      auto barrier = commitOp.getBarrier();
+      auto barrierAllocOp = barrier.getDefiningOp();
+      // For each barrier that are 3 types of operations:
+      // 1. Initializer: This should immediately follow the alloc.
+      // 2. Producer: This should only be the tcgen05.commit op.
+      // 3. Consumer: 1 or more ops.
+      // We want to collect all of the consumers.
+      SmallVector<ttng::WaitBarrierOp> consumers;
+      bool safe = true;
+      // All barriers must be initialized to the same value.
+      int expectedInitCount = -1;
+      for (auto user : barrier.getUsers()) {
+        // We have found the consumer.
+        if (user == commitOp) {
+          continue;
+        }
+        // Track the operation for replacing buffers.
+        Operation *bufferConsumer = user;
+        // Find the actual barrier using op.
+        if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(user)) {
+          Operation *nextConsumer = nullptr;
+          for (auto indexUser : indexOp->getUsers()) {
+            if (nextConsumer) {
+              safe = false;
+              break;
+            }
+            nextConsumer = indexUser;
+          }
+          if (!nextConsumer) {
+            safe = false;
+          } else {
+            user = nextConsumer;
+          }
+        }
+        if (!safe) {
+          break;
+        }
+        if (auto initBarrier = dyn_cast<ttng::InitBarrierOp>(user)) {
+          if (expectedInitCount == -1) {
+            expectedInitCount = initBarrier.getCount();
+          } else {
+            // Multiple inits. This is not safe.
+            safe = false;
+            break;
+          }
+        } else if (auto barrierOp = dyn_cast<ttng::WaitBarrierOp>(user)) {
+          consumers.push_back(barrierOp);
+        } else {
+          // Unexpected barrier op.
+          safe = false;
+          break;
+        }
+      }
+      // Cannot group this commit. Unexpected operations.
+      if (!safe || expectedInitCount == -1) {
+        continue;
+      }
+    }
+  }
+}
+
 } // namespace mlir
