@@ -1849,6 +1849,8 @@ void replaceBufferReuse(triton::FuncOp funcOp,
                             &channelsGroupedByConsumers,
                         const SmallVector<Channel *> &orderedChannels,
                         ReuseConfig *config) {
+  // Multiple channels can associate with the same alloc.
+  DenseSet<Operation *> handledAllocs;
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
     assert(it != channelsGroupedByConsumers.end());
@@ -1860,10 +1862,14 @@ void replaceBufferReuse(triton::FuncOp funcOp,
     // The biggest type should be the representative.
     auto *repCh = config->getGroup(reuseGrp)->channels[0];
     if (channel != repCh && channel->getAllocOp() != repCh->getAllocOp()) {
+      if (handledAllocs.count(channel->getAllocOp()))
+        continue;
       LLVM_DEBUG({
-        LDBG("replace users for channel with alloc ");
+        LDBG("replace users for channel with alloc "
+             << channel->getAllocOp() << " in reuseGrp " << reuseGrp);
         channel->getAllocOp()->dump();
       });
+      handledAllocs.insert(channel->getAllocOp());
       if (channel->channelKind == DataChannelKind::SMEMPost) {
         assert(channel->getAllocOp()->getResult(0).getType() ==
                repCh->getAllocOp()->getResult(0).getType());
@@ -2663,6 +2669,7 @@ void foldLocalLoads(triton::FuncOp funcOp) {
                                               kv.getSecond());
 }
 
+// Compare against TritonNvidiaGPURemoveTMEMTokensPass.
 static void cleanupTmemTokens(triton::FuncOp funcOp) {
   auto b = OpBuilder::atBlockBegin(&funcOp.getBody().front());
   Value replTok =
@@ -2680,6 +2687,9 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
       mmaOp.getAccDepMutable().clear();
       if (mmaOp.getToken())
         mmaOp.getToken().replaceAllUsesWith(replTok);
+    } else if (auto alloc = dyn_cast<ttng::TMEMAllocOp>(op)) {
+      if (alloc.getToken())
+        alloc.getToken().replaceAllUsesWith(replTok);
     }
   });
 }
