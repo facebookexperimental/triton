@@ -41,6 +41,27 @@ void init_triton_tlx_ir(py::module &&m) {
             return self.create<ttg::MemDescIndexOp>(memDescType, localAlloc,
                                                     bufferIdx);
           })
+      .def("create_memdesc_subslice",
+           [](TritonOpBuilder &self, Value localAlloc,
+              std::vector<int32_t> offsets,
+              std::vector<int64_t> newShape) -> mlir::Value {
+             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+             auto localAllocShape = localAllocType.getShape();
+             assert(localAllocShape.size() == offsets.size() &&
+                    "shape mismatch");
+             assert(localAllocShape.size() == newShape.size() &&
+                    "shape mismatch");
+             auto context = self.getBuilder().getContext();
+             Type memDescType;
+             memDescType = ttg::MemDescType::get(
+                 newShape, localAllocType.getElementType(),
+                 localAllocType.getEncoding(), localAllocType.getMemorySpace(),
+                 /*mutableMemory=*/localAllocType.getMutableMemory(),
+                 localAllocShape);
+
+             return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
+                                                        offsets);
+           })
       .def("create_require_layout",
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
              Type newType;

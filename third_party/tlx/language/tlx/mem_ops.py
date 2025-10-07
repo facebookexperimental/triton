@@ -217,6 +217,30 @@ def subslice(
 
 
 @tl.builtin
+def local_slice(
+    buffer: tlx.buffered_tensor,
+    offset: list[int],
+    shape: list[int],
+    _semantic=None,
+) -> tlx.buffered_tensor:
+
+    if buffer.type.storage == tlx.storage_kind.tmem:
+        # TMEM can only slice along the innermost dimension
+        return subslice(buffer, offset[-1], shape[-1], _semantic=_semantic)
+    else:
+        slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
+        return tlx.buffered_tensor(
+            slice_handle,
+            buffer.type.scalar,
+            shape,
+            0,
+            buffer.type.storage,
+            buffer.type.layout,
+            buffer.type.semantic,
+        )
+
+
+@tl.builtin
 def async_load(
     src: tl.tensor,
     result: tlx.buffered_tensor,

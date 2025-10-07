@@ -46,6 +46,9 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Permutes the dimensions of a tensor.
 
+- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])`
+
+    Slice a `M x N` tensor at a `m x n` offset.
 
 ### Async memory access
 
