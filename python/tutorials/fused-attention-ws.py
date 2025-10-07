@@ -3,8 +3,8 @@ import torch
 
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -27,6 +27,7 @@ def is_blackwell():
 
 def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
+
 
 @triton.jit
 def _attn_fwd_subtile(
@@ -612,8 +613,6 @@ class _attention_opt(torch.autograd.Function):
         return o
 
 
-
-
 attention = _attention_opt.apply
 
 
@@ -632,9 +631,21 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, dtype=torch.float16):
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = (
+        torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    k = (
+        torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    v = (
+        torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE)
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
@@ -678,7 +689,10 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, dtype=torch.float16):
     rtol = 0.0
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
     # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+    if (
+        torch.version.hip is not None
+        and triton.runtime.driver.active.get_current_target().arch == "gfx90a"
+    ):
         rtol = 1e-2
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
@@ -686,8 +700,10 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, dtype=torch.float16):
 
 
 try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
+    from flash_attn.flash_attn_interface import (
+        flash_attn_qkvpacked_func as flash_attn_func,
+    )
+
     HAS_FLASH = True
 except BaseException:
     HAS_FLASH = False
@@ -712,7 +728,8 @@ configs.append(
             "HEAD_DIM": HEAD_DIM,
             "mode": "fwd",
         },
-    ))
+    )
+)
 
 
 @triton.testing.perf_report(configs)
@@ -720,9 +737,15 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
     if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        q = torch.randn(
+            (BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True
+        )
+        k = torch.randn(
+            (BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True
+        )
+        v = torch.randn(
+            (BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True
+        )
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
@@ -738,7 +761,12 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
         ms = triton.testing.do_bench(fn)
 
     if provider == "flash":
-        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        qkv = torch.randn(
+            (BATCH, N_CTX, 3, H, HEAD_DIM),
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
         fn = lambda: flash_attn_func(qkv)
         if mode == "bwd":
             o = fn()
