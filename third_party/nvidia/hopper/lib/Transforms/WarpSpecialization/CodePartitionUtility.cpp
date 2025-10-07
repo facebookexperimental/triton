@@ -995,7 +995,9 @@ void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
     if (commit != keptCommit) {
       deletedOps.insert(commit);
     }
-    // Check all existing operations
+    // Check all existing operations for a matching task id.
+    // Within the same task we will pick the earliest by
+    // program order.
     auto taskId = waiter->getAttr("async_task_id");
     bool matched = false;
     bool keptWait = true;
@@ -1143,32 +1145,30 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
             user = nextConsumer;
           }
         }
-        if (!safe) {
-          break;
-        }
         if (auto initBarrier = dyn_cast<ttng::InitBarrierOp>(user)) {
           if (initCount == -1) {
             initCount = initBarrier.getCount();
           } else {
             // Multiple inits. This is not safe.
             safe = false;
-            break;
           }
         } else if (auto barrierOp = dyn_cast<ttng::WaitBarrierOp>(user)) {
-          // We don't support pipelining state.
+          // We don't support pipelining state yet.
           if (barrierOp->hasAttr(tt::kLoopStageAttrName)) {
             safe = false;
-            break;
+          } else {
+            consumers.push_back(barrierOp);
+            bufferConsumers.push_back(bufferConsumer);
           }
-          consumers.push_back(barrierOp);
-          bufferConsumers.push_back(bufferConsumer);
         } else {
           // Unexpected barrier op.
           safe = false;
+        }
+        if (!safe) {
           break;
         }
       }
-      // Cannot group this commit. Unexpected operations.
+      // Cannot group this commit. Unsupport operations.
       if (!safe || initCount == -1) {
         continue;
       }
