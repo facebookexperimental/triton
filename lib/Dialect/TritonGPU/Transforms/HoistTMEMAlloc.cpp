@@ -109,7 +109,7 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
           return false;
         }
       }
-      // Check the value of the accumulator. If its False on the initial
+      // Check the value of useAccumulator. If its False on the initial
       // iteration the initial store is unused.
       auto useAccum = mmaOp.useAccumulator();
       if (auto blockVal = dyn_cast<BlockArgument>(useAccum)) {
