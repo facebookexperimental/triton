@@ -107,8 +107,8 @@ public:
     }
 
     for (auto [loadOp, dist] : loadOpToIndLevel) {
-      auto mmaStageCount = numMMAStages[loadOp];
-      auto indirection = std::max(maxIndirectionLevel, mmaStageCount);
+      auto mmaIndirection = (numMMAStages[loadOp] - 1);
+      auto indirection = std::max(maxIndirectionLevel, mmaIndirection);
       opLatency[loadOp] = (numStages - 1) / (indirection + 1);
       ;
     }
