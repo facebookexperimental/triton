@@ -254,7 +254,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
 
   // Read the attribute from the module
   ModuleOp mod = axisInfo.getModuleOp();
-  int minRegAutoWS = 42;  // default value
+  int minRegAutoWS = 24;  // default value
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
       minRegAutoWS = attr.getInt();
   }
