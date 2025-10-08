@@ -4,6 +4,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -1430,19 +1431,29 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   return true;
 }
 
-#define GEN_PASS_DEF_NVGPUTESTWSDATAPARTITION
+#define GEN_PASS_DEF_NVGPUWSDATAPARTITION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-class NVGPUTestWSDataPartitionPass
-    : public impl::NVGPUTestWSDataPartitionBase<NVGPUTestWSDataPartitionPass> {
+class NVGPUWSDataPartitionPass
+    : public impl::NVGPUWSDataPartitionBase<NVGPUWSDataPartitionPass> {
 public:
-  using impl::NVGPUTestWSDataPartitionBase<
-      NVGPUTestWSDataPartitionPass>::NVGPUTestWSDataPartitionBase;
+  using impl::NVGPUWSDataPartitionBase<
+      NVGPUWSDataPartitionPass>::NVGPUWSDataPartitionBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    if (numWarpGroups > 2)
-      if (!doDataPartition(funcOp, numWarpGroups - 1))
-        signalPassFailure();
+    if (numWarpGroups <= 2)
+      return;
+
+    SmallVector<scf::ForOp> loops;
+    funcOp->walk([&](scf::ForOp forOp) {
+      if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+        loops.push_back(forOp);
+    });
+    if (loops.empty())
+      return;
+
+    if (!doDataPartition(funcOp, numWarpGroups - 1))
+      signalPassFailure();
   }
 
   void runOnOperation() override {
