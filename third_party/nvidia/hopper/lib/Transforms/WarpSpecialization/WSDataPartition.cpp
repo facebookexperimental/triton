@@ -869,32 +869,25 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     shape[dim] = sliceSize;
     auto newAccType = RankedTensorType::get(shape, oldRetType.getElementType(),
                                             newDistributedEncoding);
-    Operation *ld;
+    triton::nvidia_gpu::TMEMLoadOp ld;
 
     // Create token
-    if (auto token = tmemLdOp.getToken()) {
-      auto newLdOp =
+    if (auto token = tmemLdOp.getDep()) {
+      ld =
           builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
               op->getLoc(), newAccType, token.getType(),
-              mappings.lookupOrNull(tmemLdOp.getSrc()), Value());
-      auto newToken = newLdOp.getToken();
-      mappings.map(token, newToken);
-      reverseMappings.map(newToken, token);
-      ld = newLdOp;
+              mappings.lookupOrNull(tmemLdOp.getSrc()),
+              mappings.lookupOrNull(token));
     } else {
       ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
           op->getLoc(), newAccType, mappings.lookupOrNull(tmemLdOp.getSrc()));
     }
 
-    auto newType = RankedTensorType::get(shape, oldRetType.getElementType(),
-                                         oldRetType.getEncoding());
-    auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
-        op->getLoc(), newType, ld->getResult(0));
-    auto v = tmemLdOp->getResult(0);
-    auto newV = cvtOp->getResult(0);
-    mappings.map(v, newV);
-    reverseMappings.map(newV, v);
-    newOp = cvtOp;
+    for (auto [v, newV] : llvm::zip(op->getResults(), ld.getResults())) {
+      mappings.map(v, newV);
+      reverseMappings.map(newV, v);
+    }
+    newOp = ld;
   } else if (auto tmemStOp = dyn_cast<nvidia_gpu::TMEMStoreOp>(op)) {
     sliceOp(tmemStOp.getDst(), offset, mappings, reverseMappings,
             partitionScheme);
