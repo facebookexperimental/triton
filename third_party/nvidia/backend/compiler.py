@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, nvidia, amd
+from triton._C.libtriton import ir, passes, llvm, nvidia
 from triton import knobs
 from triton.runtime.errors import PTXASError
 
@@ -294,7 +294,6 @@ class CUDABackend(BaseBackend):
                 # use Meta's WS internally which supports both hopper and blackwell
                 passes.ttgpuir.add_partition_scheduling(pm)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
-                amd.passes.ttgpuir.add_fold_true_cmpi(pm)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
