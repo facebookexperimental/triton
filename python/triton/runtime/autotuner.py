@@ -326,7 +326,6 @@ class Config:
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
         self.data_partition_factor = data_partition_factor
-        print("self.data_partition_factor", self.data_partition_factor)
 
 
     def __setstate__(self, state):
@@ -340,7 +339,6 @@ class Config:
         self.minRegAutoWS = state.get("minRegAutoWS", None)
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
         self.data_partition_factor = state.get("data_partition_factor", None)
-        print("self.data_partition_factor", self.data_partition_factor)
 
     def all_kwargs(self):
         return {
