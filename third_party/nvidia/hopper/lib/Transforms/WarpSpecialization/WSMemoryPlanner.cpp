@@ -317,10 +317,6 @@ public:
         if (idTypes.count(bufferId) == 0) {
           idTypes[bufferId] = elemType;
         }
-        if (idTypes[bufferId] != elemType) {
-          ++bufferId;
-          idTypes[bufferId] = elemType;
-        }
         owner->setAttr(
             "buffer.id",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
