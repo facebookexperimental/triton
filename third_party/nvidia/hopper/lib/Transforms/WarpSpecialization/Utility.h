@@ -43,7 +43,6 @@ struct LoopScheduleInfo {
   IntegerAttr stage;
   IntegerAttr cluster;
 };
-typedef struct LoopScheduleInfo LoopScheduleInfo;
 
 class OpBuilderWithAsyncTaskIds : public OpBuilder {
 public:
