@@ -204,8 +204,6 @@ configs = [
         {
             "BLOCK_M": BM,
             "BLOCK_N": BN,
-            "SUBTILING": subtile,
-            "VECT_MUL": vectmul,
         },
         num_stages=s,
         num_warps=w,
@@ -216,8 +214,6 @@ configs = [
     for BN in [128]
     for s in NUM_STAGES_OPTIONS
     for w in [4]
-    for subtile in [True]
-    for vectmul in [False]
 ]
 
 
@@ -534,7 +530,7 @@ def torch_dtype_to_triton(dtype):
 
 class _attention_opt(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, baseVariant):
+    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -649,6 +645,8 @@ class _attention_opt(torch.autograd.Function):
                 warp_specialize=warp_specialize,
                 OUTER_LOOP=True,
                 dtype=torch_dtype_to_triton(q.dtype),
+                SUBTILING=SUBTILING,
+                VECT_MUL=VECT_MUL,
                 **extra_kern_args,
             )
         else:
@@ -667,6 +665,8 @@ class _attention_opt(torch.autograd.Function):
                 STAGE=stage,  #
                 warp_specialize=warp_specialize,
                 dtype=torch_dtype_to_triton(q.dtype),
+                SUBTILING=SUBTILING,
+                VECT_MUL=VECT_MUL,
                 **extra_kern_args,
             )
 
@@ -692,7 +692,20 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, dtype=torch.float16):
+@pytest.mark.parametrize("SUBTILING", [False, True])
+@pytest.mark.parametrize("VECT_MUL", [False, True])
+def test_op(
+    Z,
+    H,
+    N_CTX,
+    HEAD_DIM,
+    causal,
+    mode,
+    provider,
+    SUBTILING,
+    VECT_MUL,
+    dtype=torch.float16,
+):
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)
@@ -740,7 +753,9 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, dtype=torch.float16):
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, "ws_persistent").half()
+    tri_out = attention(
+        q, k, v, causal, sm_scale, "ws_persistent", SUBTILING, VECT_MUL
+    ).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -818,7 +833,11 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, False, sm_scale, "ws_persistent")
+        SUBTILING = True
+        VECT_MUL = False
+        fn = lambda: attention(
+            q, k, v, False, sm_scale, "ws_persistent", SUBTILING, VECT_MUL
+        )
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
