@@ -173,6 +173,7 @@ configs = [
         {"BLOCK_M": BM, "BLOCK_N": BN, "SUBTILING": subtile},
         num_stages=s,
         num_warps=w,
+        data_partition_factor=2,
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
     )
