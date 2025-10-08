@@ -112,8 +112,10 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
   // Annoate the program with task ids
   SmallVector<AsyncTaskId, 1> producerTaskIds{0};
   SmallVector<AsyncTaskId, 2> consumerTaskIds;
+  SmallVector<AsyncTaskId> allTaskIds{0};
   for (unsigned i = 0; i < numWarpGroups - 1; ++i) {
     consumerTaskIds.push_back(i + producerTaskIds.size());
+    allTaskIds.push_back(i + producerTaskIds.size());
   }
 
   for (auto op : producerOps) {

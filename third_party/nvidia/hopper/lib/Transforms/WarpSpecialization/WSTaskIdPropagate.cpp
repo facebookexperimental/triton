@@ -4,6 +4,7 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -25,14 +26,25 @@ namespace mlir {
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // Convert ttg.partition to async_task_id
+  DenseSet<AsyncTaskId> totalTaskIds;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
       int64_t idx = attr.getInt();
+      totalTaskIds.insert(idx);
       assert(idx >= 0);
       setAsyncTaskIds(op, idx);
       op->removeAttr("ttg.partition");
     }
   });
+
+  std::vector<int> allTasksVec(totalTaskIds.begin(), totalTaskIds.end());
+  ArrayRef<AsyncTaskId> allTasks(allTasksVec);
+
+  // Hack: set async_task_id to all tasks for all assume ops.
+  // This is not necesssarily generally desirable because it could
+  // force data into multiple partitions. However, for now we will
+  // assume this is for the inputs and can state this as needed.
+  funcOp.walk([&](LLVM::AssumeOp op) { setAsyncTaskIds(op, allTasks); });
 
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
