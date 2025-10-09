@@ -750,8 +750,14 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value numStagesVal =
       builder.create<arith::ConstantIntOp>(forOp.getLoc(), numStages, 32);
 
+  Value usedBarIndex;
+  if (numStages > 1) {
+    usedBarIndex = barrierIdx;
+  } else {
+    usedBarIndex = zero;
+  }
   Value barrierSlice =
-      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+      triton::createSingleBufferView(builder, barrierAlloc, usedBarIndex);
   mma.addCompletionBarrier(barrierSlice, vTrue);
   mma.setIsAsync(true);
 
