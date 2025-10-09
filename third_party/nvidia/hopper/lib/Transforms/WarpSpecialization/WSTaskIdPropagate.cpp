@@ -24,10 +24,19 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
-  // Convert ttg.partition to async_task_id
+  // Compute the min partition to normalize to 0
+  int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
       int64_t idx = attr.getInt();
+      assert(idx >= 0);
+      minPartition = std::min(idx, minPartition);
+    }
+  });
+  // Convert ttg.partition to async_task_id
+  funcOp.walk([&](mlir::Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      int64_t idx = attr.getInt() - minPartition;
       assert(idx >= 0);
       setAsyncTaskIds(op, idx);
       op->removeAttr("ttg.partition");
