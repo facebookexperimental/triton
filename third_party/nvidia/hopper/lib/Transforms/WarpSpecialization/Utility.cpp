@@ -34,6 +34,8 @@ bool hasAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
 }
 
 void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
+  if (asyncTaskIds.empty())
+    return;
   SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
                                               asyncTaskIds.end());
   sort(sortedAsyncTaskIds);

@@ -4,6 +4,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -199,6 +200,8 @@ static SmallVector<int64_t> getShape(Value v) { return getShape(v.getType()); }
 static bool needToSlice(Value v, unsigned dim, int size) {
   if (dim == DataPartitionScheme::noOpPartitionDim)
     return true;
+  if (isa<AsyncTokenType>(v.getType()))
+    return true;
   auto shape = getShape(v);
   return shape.size() > dim && shape[dim] > size;
 }
@@ -274,7 +277,8 @@ static bool getBackwardSliceToPartition(Value v,
             BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp, ConvertLayoutOp,
             triton::gpu::LocalAllocOp, LoadOp, TransOp, MemDescTransOp,
             AtomicRMWOp, triton::AddPtrOp, DescriptorLoadOp,
-            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp, FpToFpOp>(op)) {
+            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
+            nvidia_gpu::TMEMStoreOp, FpToFpOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
@@ -529,11 +533,8 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
 
   // check all dot ops that have more than one async task id
   funcOp.walk([&](Operation *op) {
-    auto asyncTaskIds = getAsyncTaskIds(op);
-    if (asyncTaskIds.size() > 1) {
-      if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
-        dots.insert(op);
-      }
+    if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+      dots.insert(op);
     }
   });
 
@@ -567,14 +568,18 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
       LDBG("\n");
     });
 
+    auto asyncTaskIds = getAsyncTaskIds(op);
+    if (partitionScheme.numPartitions == 0) {
+      partitionScheme.numPartitions = asyncTaskIds.size();
+    }
+
     auto shapePerCTA = getShapePerCTA(dotType);
     if (shapePerCTA.size() != 2) {
       LDBG("partition not possible: shapePerCTA " << shapePerCTA.size());
       return false;
     }
-    auto asyncTaskIds = getAsyncTaskIds(op);
-    int sliceSizeM = shapePerCTA[0] / asyncTaskIds.size();
-    int sliceSizeN = shapePerCTA[1] / asyncTaskIds.size();
+    int sliceSizeM = shapePerCTA[0] / partitionScheme.numPartitions;
+    int sliceSizeN = shapePerCTA[1] / partitionScheme.numPartitions;
     SmallVector<unsigned, 2> partitionDim, partitionSize;
 
     if (sliceSizeM >= 64) {
@@ -590,15 +595,6 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
     if (partitionDim.empty()) {
       LDBG("Partition not available: " << sliceSizeM << " " << sliceSizeN);
       return false;
-    }
-
-    if (partitionScheme.numPartitions == 0) {
-      partitionScheme.numPartitions = asyncTaskIds.size();
-    } else {
-      if (partitionScheme.numPartitions != asyncTaskIds.size()) {
-        LDBG("partition not possible, in conflict with previous partition\n");
-        return false;
-      }
     }
 
     bool success = false;
@@ -759,7 +755,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     sliceTaskIds.push_back(asyncTaskIds.front());
     sliceTaskIds.push_back(asyncTaskIds[offset + 1]);
   } else {
-    llvm_unreachable("Unexpected asyncTaskIds.size()");
+    assert(asyncTaskIds.empty() && "Unexpected asyncTaskIds.size()");
   }
 
   OpBuilderWithAsyncTaskIds builder(op->getContext());
@@ -771,9 +767,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     mappings.map(op, newOp);
     reverseMappings.map(newOp, op);
     // set result shape
-    if (!op->getResults().empty()) {
-      auto v = op->getResult(0);
-      auto newV = newOp->getResult(0);
+    for (auto [v, newV] : llvm::zip(op->getResults(), newOp->getResults())) {
       bool needRetype = true;
       if (dim == DataPartitionScheme::noOpPartitionDim) {
         // Just duplicate the op for noOpPartitionDim
@@ -798,8 +792,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                   type.getEncoding())) {
             Attribute accEncoding =
                 triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-                    builder.getContext(),
-                    dim == 0 ? tmem.getBlockM() / 2 : tmem.getBlockM(),
+                    builder.getContext(), tmem.getBlockM(),
                     dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
                     tmem.getUnpacked(), tmem.getCTASplitM(),
                     tmem.getCTASplitN());
@@ -875,18 +868,62 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     shape[dim] = sliceSize;
     auto newAccType = RankedTensorType::get(shape, oldRetType.getElementType(),
                                             newDistributedEncoding);
-    auto ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
-        op->getLoc(), newAccType, mappings.lookupOrNull(tmemLdOp.getSrc()));
+    triton::nvidia_gpu::TMEMLoadOp ld;
 
-    auto newType = RankedTensorType::get(shape, oldRetType.getElementType(),
-                                         oldRetType.getEncoding());
-    auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(op->getLoc(),
-                                                                 newType, ld);
-    auto v = tmemLdOp->getResult(0);
-    auto newV = cvtOp->getResult(0);
-    mappings.map(v, newV);
-    reverseMappings.map(newV, v);
-    newOp = cvtOp;
+    // Create token
+    if (auto token = tmemLdOp.getDep()) {
+      ld =
+          builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
+              op->getLoc(), newAccType, token.getType(),
+              mappings.lookupOrNull(tmemLdOp.getSrc()),
+              mappings.lookupOrNull(token));
+    } else {
+      ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
+          op->getLoc(), newAccType, mappings.lookupOrNull(tmemLdOp.getSrc()));
+    }
+
+    for (auto [v, newV] : llvm::zip(op->getResults(), ld.getResults())) {
+      mappings.map(v, newV);
+      reverseMappings.map(newV, v);
+    }
+    newOp = ld;
+  } else if (auto tmemStOp = dyn_cast<nvidia_gpu::TMEMStoreOp>(op)) {
+    sliceOp(tmemStOp.getDst(), offset, mappings, reverseMappings,
+            partitionScheme);
+    sliceOp(tmemStOp.getDep(), offset, mappings, reverseMappings,
+            partitionScheme);
+
+    // Slice retype the source operand with a tmem compatible layout.
+    auto dstTy = mappings.lookupOrNull(tmemStOp.getDst()).getType();
+    auto type = cast<MemDescType>(dstTy);
+    auto tmem = cast<nvidia_gpu::TensorMemoryEncodingAttr>(type.getEncoding());
+
+    RankedTensorType oldSrcType = tmemStOp.getSrc().getType();
+    auto retShapePerCTA = getShapePerCTA(oldSrcType);
+    int numWarps = mlir::triton::gpu::lookupNumWarps(op);
+    auto CTALayout = getCTALayout(oldSrcType.getEncoding());
+    builder.setInsertionPoint(op);
+    // The source op is already sliced at this point, so srcTy, type, tmem is
+    // sliced. We use getTmemCompatibleLayout to get a block layout that is for
+    // the sliced tmem here.
+    Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
+        tmem.getBlockM(), tmem.getBlockN(), oldSrcType, numWarps);
+    // oldRetType is the desired output, we slice it and convert from the
+    // compatible layout to the sliced desired output.
+    SmallVector<int64_t> shape{oldSrcType.getShape().begin(),
+                               oldSrcType.getShape().end()};
+    int sliceSize = shape[dim] / numOfPartitions;
+    shape[dim] = sliceSize;
+    auto newSrcType = RankedTensorType::get(shape, oldSrcType.getElementType(),
+                                            newDistributedEncoding);
+    sliceOp(tmemStOp.getSrc(), offset, mappings, reverseMappings,
+            partitionScheme);
+
+    // TODO: Retype the source operand with a tmem compatible layout, and
+    // replace the dependency, recursively
+    auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
+    newSrc.setType(newSrcType);
+    newOp = cloneAndSetResultType(op);
   } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
@@ -911,8 +948,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       auto tmem =
           cast<nvidia_gpu::TensorMemoryEncodingAttr>(retType.getEncoding());
       auto accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-          builder.getContext(),
-          dim == 0 ? tmem.getBlockM() / 2 : tmem.getBlockM(),
+          builder.getContext(), tmem.getBlockM(),
           dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
           tmem.getUnpacked(), tmem.getCTASplitM(), tmem.getCTASplitN());
       auto newType = MemDescType::get(shape, retType.getElementType(),
@@ -927,11 +963,21 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
           op->getLoc(), newAccType,
           mappings.lookupOrNull(tmemAllocOp.getSrc()));
 
+      Operation *alloc;
       // replace tmemAllocOp with alloc, where the src is cvtOp.
-      auto alloc =
-          builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMAllocOp>(
-              op->getLoc(), newType, cvtOp);
-
+      // Create token
+      if (auto token = tmemAllocOp.getToken()) {
+        auto newAllocOp =
+            builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMAllocOp>(
+                op->getLoc(), newType, token.getType(), cvtOp);
+        auto newToken = newAllocOp.getToken();
+        mappings.map(token, newToken);
+        reverseMappings.map(newToken, token);
+        alloc = newAllocOp;
+      } else {
+        alloc = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMAllocOp>(
+            op->getLoc(), newType, cvtOp);
+      }
       auto v = tmemAllocOp->getResult(0);
       auto newV = alloc->getResult(0);
       mappings.map(v, newV);
@@ -1055,14 +1101,24 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       sliceOp(op->getOperand(otherOpndIndx), offset, mappings, reverseMappings,
               partitionScheme);
     }
-    // Hanlde accumulator
+    // Handle accumulator
     Value accumulator;
     if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
       accumulator = dotOp.getC();
     } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
       accumulator = dotOp.getD();
     }
+    LDBG("slicing accumulator\n");
     sliceOp(accumulator, offset, mappings, reverseMappings, partitionScheme);
+
+    // Handle token
+    if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
+      if (auto token = dotOp.getAccDep()) {
+        LDBG("slicing token \n");
+        sliceOp(token, offset, mappings, reverseMappings, partitionScheme);
+      }
+    }
+
     newOp = cloneAndSetResultType(op);
   } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     // Add new loop arguments
@@ -1284,7 +1340,8 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
 
     // delete block arguments
     RewritePatternSet cleanUpPatterns(funcOp.getContext());
-    populateForOpDeadArgumentElimination(cleanUpPatterns);
+    populateForOpDeadArgumentElimination(cleanUpPatterns,
+                                         opsCanBeTriviallyDead);
     scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns,
                                             funcOp.getContext());
     scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns,
@@ -1298,6 +1355,7 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
 
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   DataPartitionScheme partitionScheme;
+  partitionScheme.numPartitions = numConsumerGroups;
   if (!computePartitionScheme(funcOp, partitionScheme)) {
     if (numConsumerGroups > 1) {
       LDBG("computePartitionScheme failed when requested");
@@ -1365,19 +1423,29 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   return true;
 }
 
-#define GEN_PASS_DEF_NVGPUTESTWSDATAPARTITION
+#define GEN_PASS_DEF_NVGPUWSDATAPARTITION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-class NVGPUTestWSDataPartitionPass
-    : public impl::NVGPUTestWSDataPartitionBase<NVGPUTestWSDataPartitionPass> {
+class NVGPUWSDataPartitionPass
+    : public impl::NVGPUWSDataPartitionBase<NVGPUWSDataPartitionPass> {
 public:
-  using impl::NVGPUTestWSDataPartitionBase<
-      NVGPUTestWSDataPartitionPass>::NVGPUTestWSDataPartitionBase;
+  using impl::NVGPUWSDataPartitionBase<
+      NVGPUWSDataPartitionPass>::NVGPUWSDataPartitionBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    if (numWarpGroups > 2)
-      if (!doDataPartition(funcOp, numWarpGroups - 1))
-        signalPassFailure();
+    if (numWarpGroups <= 2)
+      return;
+
+    SmallVector<scf::ForOp> loops;
+    funcOp->walk([&](scf::ForOp forOp) {
+      if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+        loops.push_back(forOp);
+    });
+    if (loops.empty())
+      return;
+
+    if (!doDataPartition(funcOp, numWarpGroups - 1))
+      signalPassFailure();
   }
 
   void runOnOperation() override {
