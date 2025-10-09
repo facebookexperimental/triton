@@ -1112,10 +1112,33 @@ void AxisInfoAnalysis::visitForOpInductionVar(
   const auto &step =
       getLatticeElementFor(programPoint, op.getStep())->getValue();
 
+  // Handle case where lattice values are not properly propagated from control
+  // flow operations like scf.if. The symptoms on induction var:
+  // the AxisInfo has rank 0 (empty divisibility vector)
+  // TODO: this may happen between any two control flow Ops
+  AxisInfo effectiveLb = lb;
+  AxisInfo effectiveStep = step;
+  if (lb.getRank() == 0) {
+    effectiveLb = AxisInfo::getPessimisticValueState(op.getLowerBound());
+  }
+  if (step.getRank() == 0) {
+    effectiveStep = AxisInfo::getPessimisticValueState(op.getStep());
+  }
+
   AxisInfo::DimVectorT knownContiguity(1, 1);
   AxisInfo::DimVectorT knownDivisibility(1, 1);
   AxisInfo::DimVectorT knownConstancy(1, 1);
-  knownDivisibility[0] = gcd(lb.getDivisibility(0), step.getDivisibility(0));
+
+  // Safely compute divisibility, ensuring both AxisInfos have valid rank and
+  // dimension 0
+  if (effectiveLb.getRank() > 0 && effectiveStep.getRank() > 0) {
+    knownDivisibility[0] =
+        gcd(effectiveLb.getDivisibility(0), effectiveStep.getDivisibility(0));
+  } else {
+    // Fallback to conservative divisibility if we still have issues
+    knownDivisibility[0] = 1;
+  }
+
   auto inductionVar =
       AxisInfo(knownContiguity, knownDivisibility, knownConstancy);
   (void)argLattices[0]->join(inductionVar);
