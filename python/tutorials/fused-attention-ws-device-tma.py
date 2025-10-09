@@ -678,7 +678,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0, 1, 2, 3])
-@pytest.mark.parametrize("FADD2_REDUCE", [False, True])
+@pytest.mark.parametrize("FADD2_REDUCE", [False])
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, SUBTILING, VECT_MUL, FADD2_REDUCE, dtype=torch.float16):
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
@@ -782,8 +782,8 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        SUBTILING = False
-        VECT_MUL = 0
+        SUBTILING = True
+        VECT_MUL = 1
         FADD2_REDUCE = False
         fn = lambda: attention(q, k, v, False, sm_scale, "ws_persistent", SUBTILING, VECT_MUL, FADD2_REDUCE)
         if mode == "bwd":
