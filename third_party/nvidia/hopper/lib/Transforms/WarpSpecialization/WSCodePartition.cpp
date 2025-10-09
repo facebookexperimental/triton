@@ -1401,7 +1401,7 @@ DenseMap<Channel *, Value> createBufferPost(
       Value bufferIdx;
       Value _phase = Value();
       OpBuilderWithAsyncTaskIds builder(user);
-      builder.setLoopScheduleInfoFromOp(user);
+      builder.clearLoopScheduleInfo();
       if (auto forOp = user->getParentOfType<scf::ForOp>()) {
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
@@ -1580,7 +1580,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
     if (user->getBlock() != mmaOp->getBlock()) {
       // Compute the barrier from the last consumer instance
       // Extract the accum count from the consumer block.
-      builder.setLoopScheduleInfoFromOp(mmaOp);
+      builder.clearLoopScheduleInfo();
       std::tie(bufferIdx, phase) = getOutOfScopeBufferIdxAndPhase(
           builder, mmaOp, numBuffers, regionsWithChannels, config, -1);
       builder.setLoopScheduleInfoFromOp(user);
@@ -2076,16 +2076,15 @@ void insertAsyncComm(
         producerAcquireForChannelLoop = bwdCh->getDstOp();
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
+    builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
       // calculation to the lift-up headProducer.
       if (producerInNestedRegion) {
         builder.setInsertionPoint(nestedInsertionTarget);
-        builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
       } else {
         assert(consumerInNestedRegion);
         builder.setInsertionPoint(tmaHeadProducer);
-        builder.setLoopScheduleInfoFromOp(tmaHeadProducer);
       }
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase3 ");
@@ -2100,10 +2099,8 @@ void insertAsyncComm(
       // by tmaLoad as well.
       if (producerAcquireForChannelLoop) {
         builder.setInsertionPoint(producerAcquireForChannelLoop);
-        builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
       } else {
         builder.setInsertionPoint(tmaHeadProducer);
-        builder.setLoopScheduleInfoFromOp(tmaHeadProducer);
       }
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase2 ");
@@ -2114,14 +2111,12 @@ void insertAsyncComm(
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
     } else {
-      builder.setLoopScheduleInfoFromOp(headProducer);
       // Producer is not in a ForOp, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 32);
       phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 1);
     }
-    builder.clearLoopScheduleInfo();
 
     // Lower TMA loads and TCGen5MMAOp first before inserting synchronization
     // primitives to avoid displacement.

@@ -475,7 +475,7 @@ void insertAsyncCopy(
           asyncTasksPC.push_back(task);
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
-    builder.setLoopScheduleInfoFromOp(srcOp);
+    builder.clearLoopScheduleInfo();
 
     if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
       int reuseGrp = channelInReuseGroup(kv.getFirst(), config);
