@@ -744,20 +744,19 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value barrierAlloc = createBarrierAlloc(forOp, numStages);
   Value vTrue = builder.create<arith::ConstantIntOp>(1, 1);
   Value phase = forOp.getRegionIterArg(phaseArgIdx);
-  Value barrierIdx = forOp.getRegionIterArg(barrierIdxArgIdx);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
+  Value barrierIdx;
+  if (numStages > 1) {
+    barrierIdx = forOp.getRegionIterArg(barrierIdxArgIdx);
+  } else {
+    barrierIdx = zero;
+  }
   Value one = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 1, 32);
   Value numStagesVal =
       builder.create<arith::ConstantIntOp>(forOp.getLoc(), numStages, 32);
 
-  Value usedBarIndex;
-  if (numStages > 1) {
-    usedBarIndex = barrierIdx;
-  } else {
-    usedBarIndex = zero;
-  }
   Value barrierSlice =
-      triton::createSingleBufferView(builder, barrierAlloc, usedBarIndex);
+      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
   mma.addCompletionBarrier(barrierSlice, vTrue);
   mma.setIsAsync(true);
 
