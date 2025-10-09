@@ -125,10 +125,11 @@ struct DataPartitionScheme {
     return dim < numPartitions || dim == DataPartitionScheme::noOpPartitionDim;
   }
 
-  unsigned flipPartitionDim(unsigned dim) const {
+  unsigned flipPartitionDim(unsigned dim, const ArrayRef<int32_t> &order,
+                            bool forward) const {
     if (dim == DataPartitionScheme::noOpPartitionDim)
       return dim;
-    return numPartitions - 1 - dim;
+    return forward ? order[dim] : llvm::find(order, dim) - order.begin();
   }
 
   bool isPartitioned(Operation *op) const {
@@ -259,8 +260,13 @@ static bool getBackwardSliceToPartition(Value v,
     partitionScheme.opPartitionDims[op] = currentDim;
 
     // Flip dim when op is trans
-    if (isa<TransOp, MemDescTransOp>(op))
-      currentDim = partitionScheme.flipPartitionDim(currentDim);
+    if (auto transOp = dyn_cast<TransOp>(op)) {
+      currentDim = partitionScheme.flipPartitionDim(currentDim,
+                                                    transOp.getOrder(), false);
+    } else if (auto memDescTransOp = dyn_cast<MemDescTransOp>(op)) {
+      currentDim = partitionScheme.flipPartitionDim(
+          currentDim, memDescTransOp.getOrder(), false);
+    }
 
     if (auto expandDimsOp = dyn_cast<ExpandDimsOp>(op)) {
       // currentDim is the dim after expansion.
@@ -278,7 +284,8 @@ static bool getBackwardSliceToPartition(Value v,
             triton::gpu::LocalAllocOp, LoadOp, TransOp, MemDescTransOp,
             AtomicRMWOp, triton::AddPtrOp, DescriptorLoadOp,
             nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
-            nvidia_gpu::TMEMStoreOp, FpToFpOp>(op)) {
+            nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp, ReshapeOp>(
+            op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
@@ -362,8 +369,13 @@ static bool getForwardSliceToPartition(Value v,
   for (Operation *depOp : v.getUsers()) {
     currentDim = originalDim;
     // Flip dim when op is trans
-    if (isa<TransOp, MemDescTransOp>(depOp))
-      currentDim = partitionScheme.flipPartitionDim(currentDim);
+    if (auto transOp = dyn_cast<TransOp>(depOp)) {
+      currentDim = partitionScheme.flipPartitionDim(currentDim,
+                                                    transOp.getOrder(), true);
+    } else if (auto memDescTransOp = dyn_cast<MemDescTransOp>(depOp)) {
+      currentDim = partitionScheme.flipPartitionDim(
+          currentDim, memDescTransOp.getOrder(), true);
+    }
 
     // Check dim compatibility
     if (!partitionScheme.ops.insert(depOp)) {
@@ -694,9 +706,12 @@ static void rewriteRematerializedOps(triton::FuncOp &funcOp,
         assert(partitionScheme.opPartitionDims.contains(user) &&
                "user not partitioned");
         unsigned userDim = partitionScheme.opPartitionDims[user];
-        if (isa<TransOp, MemDescTransOp>(user)) {
-          // flip userDim for trans
-          userDim = partitionScheme.flipPartitionDim(userDim);
+        if (auto transOp = dyn_cast<TransOp>(user)) {
+          userDim = partitionScheme.flipPartitionDim(userDim,
+                                                     transOp.getOrder(), true);
+        } else if (auto memDescTransOp = dyn_cast<MemDescTransOp>(user)) {
+          userDim = partitionScheme.flipPartitionDim(
+              userDim, memDescTransOp.getOrder(), true);
         } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(user)) {
           // infer userDim for dot
           assert(partitionScheme.dotPartitionOperand.contains(user) &&
@@ -838,7 +853,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   if ((dim == DataPartitionScheme::noOpPartitionDim) ||
       op->hasTrait<OpTrait::Elementwise>() ||
       isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, FpToFpOp,
-          AtomicRMWOp, LocalAllocOp>(op)) {
+          AtomicRMWOp, LocalAllocOp, SplitOp, JoinOp, ReshapeOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
