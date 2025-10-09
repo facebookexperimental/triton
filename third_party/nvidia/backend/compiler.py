@@ -108,6 +108,9 @@ class CUDAOptions:
     num_ctas: int = 1
     num_stages: int = 3
     warp_size: int = 32
+    minRegAutoWS: int = 24
+    maxRegAutoWS: int = 152
+    data_partition_factor: int = 1
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -248,6 +251,14 @@ class CUDABackend(BaseBackend):
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
 
+        # Add minRegAutoWS attribute (you need to add this)
+        if opt.minRegAutoWS is not None:
+            mod.set_attr("ttg.min_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.minRegAutoWS))
+
+        # Add maxRegAutoWS attribute (you need to add this)
+        if opt.maxRegAutoWS is not None:
+            mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
+
         cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:
             cluster_info.clusterDimX = opt.cluster_dims[0]
@@ -286,6 +297,7 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
+            nvidia.passes.hopper.add_data_partitioning(pm, opt.data_partition_factor + 1)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages)
             if knobs.nvidia.use_oai_ws:

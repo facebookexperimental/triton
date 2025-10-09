@@ -45,6 +45,8 @@ constexpr static char AttrNumWarpsName[] = "ttg.num-warps";
 constexpr static char AttrNumCTAsName[] = "ttg.num-ctas";
 constexpr static char AttrTargetName[] = "ttg.target";
 constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
+constexpr static char AttrMinRegAutoWSName[] = "ttg.min_reg_auto_ws";
+constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);

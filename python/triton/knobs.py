@@ -434,6 +434,9 @@ class JITHookCompileInfo(TypedDict):
     num_warps: int
     num_ctas: int
     num_stages: int
+    minRegAutoWS: int
+    maxRegAutoWS: int
+    data_partition_factor: int
     enable_fp_fusion: bool
     launch_cooperative_grid: bool
     extern_libs: tuple[tuple[str, str], ...]
