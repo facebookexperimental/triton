@@ -102,19 +102,20 @@ def _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M):
 @triton.jit
 def _attn_fwd_ws(sm_scale, M,  #
                  Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-                 HEAD_DIM: tl.constexpr,  #
-                 BLOCK_M: tl.constexpr,  #
-                 BLOCK_N: tl.constexpr,  #
-                 FP8_OUTPUT: tl.constexpr,  #
-                 NUM_BUFFERS_Q: tl.constexpr,  #
-                 NUM_BUFFERS_KV: tl.constexpr,  #
-                 NUM_BUFFERS_QK: tl.constexpr,  #
-                 NUM_MMA_GROUPS: tl.constexpr,  #
-                 NUM_MMA_SLICES: tl.constexpr,  #
-                 ):
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    FP8_OUTPUT: tl.constexpr,  #
+    NUM_BUFFERS_Q: tl.constexpr,  #
+    NUM_BUFFERS_KV: tl.constexpr,  #
+    NUM_BUFFERS_QK: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    NUM_MMA_SLICES: tl.constexpr,  #
+):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
+    tl.static_assert(NUM_BUFFERS_Q == 1)
 
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
 
@@ -242,7 +243,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # softmax groups
-        with tlx.async_task(num_warps=4, registers=168, replicate=NUM_MMA_GROUPS):
+        with tlx.async_task(num_warps=4, registers=192, replicate=NUM_MMA_GROUPS):
             accum_cnt_qk = 0
             for i in range(0, tiles_per_sm):
                 # initialize offsets
@@ -271,17 +272,34 @@ def _attn_fwd_ws(sm_scale, M,  #
                     tlx.local_store(alpha_tiles[cid * HEAD_DIM], alpha[:, None])
                     tlx.barrier_arrive(alpha_fulls[cid])
 
-                    qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
-                    p = tl.math.exp2(qk)
-                    l_ij = tl.sum(p, 1)
-                    p = p.to(tlx.dtype_of(desc_v))
 
                     # prepare p for the v dot
                     # Use p[1] for cid=0, and p[3] for cid=1
                     p_bufIdx = 1 + cid * NUM_MMA_GROUPS
-                    tlx.local_store(p_tiles[p_bufIdx], p)
+
+                    BM: tl.constexpr = qk.shape[0]
+                    BN: tl.constexpr = qk.shape[1]
+                    qk_0, qk_1 = qk.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+                    qk_0 = _fma_f32x2(qk_0, qk_scale, -m_ij[:, None])
+                    p_0 = tl.math.exp2(qk_0)
+                    p_slice = tlx.subslice(
+                        p_tiles[p_bufIdx],
+                        0,
+                        HEAD_DIM // 2,
+                    )
+                    tlx.local_store(p_slice, p_0.to(tlx.dtype_of(desc_v)))
+                    qk_1 = _fma_f32x2(qk_1, qk_scale, -m_ij[:, None])
+                    p_1 = tl.math.exp2(qk_1)
+                    p_slice = tlx.subslice(
+                        p_tiles[p_bufIdx],
+                        HEAD_DIM // 2,
+                        HEAD_DIM // 2,
+                    )
+                    tlx.local_store(p_slice, p_1.to(tlx.dtype_of(desc_v)))
                     tlx.barrier_arrive(p_fulls[cid])
 
+                    p = tl.join(p_0, p_1).permute(0, 2, 1).reshape([BM, BN])
+                    l_ij = tl.sum(p, 1)
                     l_i = l_i * alpha + l_ij
                     m_i = m_ij
                     accum_cnt_qk += 1
