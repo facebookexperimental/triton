@@ -533,7 +533,6 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
 
   // check all dot ops that have more than one async task id
   funcOp.walk([&](Operation *op) {
-    auto asyncTaskIds = getAsyncTaskIds(op);
     if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
       dots.insert(op);
     }
