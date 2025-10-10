@@ -543,7 +543,6 @@ def grouped_matmul_tlx_kernel(
                         offs_am = tile_m_idx * BLOCK_SIZE_M
                         offs_bn = tile_n_idx * BLOCK_SIZE_N
 
-                        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                         for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
                             buf, phase = _get_bufidx_phase(accum_cnt, NUM_SMEM_BUFFERS)
                             tlx.barrier_wait(smem_empty_bars[buf], phase ^ 1)
