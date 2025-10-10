@@ -296,7 +296,7 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
-            nvidia.passes.hopper.add_data_partitioning(pm, 3)
+            nvidia.passes.hopper.add_data_partitioning(pm, 1)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages)
             if knobs.nvidia.use_oai_ws:

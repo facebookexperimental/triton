@@ -1449,9 +1449,6 @@ public:
       NVGPUWSDataPartitionPass>::NVGPUWSDataPartitionBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    if (numWarpGroups <= 2)
-      return;
-
     std::optional<uint32_t> dataPartitonFactor;
     SmallVector<scf::ForOp> loops;
     funcOp->walk([&](scf::ForOp forOp) {
@@ -1469,6 +1466,8 @@ public:
 
     if (!dataPartitonFactor)
       dataPartitonFactor = numWarpGroups - 1;
+    if (dataPartitonFactor < 2)
+      return;
     if (!doDataPartition(funcOp, *dataPartitonFactor))
       signalPassFailure();
   }
