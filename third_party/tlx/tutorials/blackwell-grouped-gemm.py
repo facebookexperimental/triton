@@ -344,14 +344,9 @@ tlx_configs = [
         },
         num_warps=4,
         num_stages=1,
-    )
-    for BM in [128]
-    for BN in [128, 256]
-    for BK in [64, 128]
-    for s in [2, 3, 4]
-    for t in [2]
-    for subtile in [False]
+    ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in [2, 3, 4] for t in [2] for subtile in [False]
 ]
+
 
 @triton.autotune(
     tlx_configs,
@@ -460,7 +455,6 @@ def grouped_matmul_tlx_kernel(
                 # get ready to go to the next gemm problem
                 last_problem_end = last_problem_end + num_tiles
 
-
         with tlx.async_task(num_warps=1, num_regs=48):  # MMA consumer
             tile_idx = tl.program_id(0)
             last_problem_end = 0
@@ -490,8 +484,8 @@ def grouped_matmul_tlx_kernel(
                             # wait for current phase(round) of load for this buf
                             tlx.barrier_wait(smem_full_bars[smem_buf], smem_phase)
                             # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                            tlx.async_dot(buffers_A[smem_buf], buffers_B[smem_buf], tmem_buffers[tmem_buf], use_acc=kk > 0,
-                                  mBarriers=[smem_empty_bars[smem_buf]], out_dtype=tl.float32)
+                            tlx.async_dot(buffers_A[smem_buf], buffers_B[smem_buf], tmem_buffers[tmem_buf], use_acc=kk
+                                          > 0, mBarriers=[smem_empty_bars[smem_buf]], out_dtype=tl.float32)
                             accum_cnt_smem += 1
 
                         # done filling this buffer, signal epilogue consumer
@@ -554,9 +548,11 @@ def grouped_matmul_tlx_kernel(
                             buf, phase = _get_bufidx_phase(accum_cnt, NUM_SMEM_BUFFERS)
                             tlx.barrier_wait(smem_empty_bars[buf], phase ^ 1)
                             tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                             2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
-                            tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, kk * BLOCK_SIZE_K], smem_full_bars[buf])
-                            tlx.async_descriptor_load(b_desc, buffers_B[buf], [kk * BLOCK_SIZE_K, offs_bn], smem_full_bars[buf])
+                                                     2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
+                            tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, kk * BLOCK_SIZE_K],
+                                                      smem_full_bars[buf])
+                            tlx.async_descriptor_load(b_desc, buffers_B[buf], [kk * BLOCK_SIZE_K, offs_bn],
+                                                      smem_full_bars[buf])
                             accum_cnt += 1
 
                         # go to the next tile by advancing NUM_SM
@@ -691,7 +687,6 @@ def test_op():
         assert torch.allclose(ref_out[i], tri_out[i], atol=1e-2, rtol=1e-2)
 
 
-
 # only launch the kernel, no tensor preparation here to remove all overhead
 def triton_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size):
     grid = lambda META: (META['NUM_SM'], )
@@ -715,6 +710,7 @@ def triton_tma_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, dtype):
     grouped_matmul_tma_kernel[grid](a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, FP8=torch.float8_e4m3fn == dtype,
                                     NUM_SM=num_sms())
 
+
 def triton_tlx_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, dtype):
     # TMA descriptors require a global memory allocation
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
@@ -724,6 +720,7 @@ def triton_tlx_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, dtype):
     grid = lambda META: (META['NUM_SM'], )
     grouped_matmul_tlx_kernel[grid](a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size, FP8=torch.float8_e4m3fn == dtype,
                                     NUM_SM=num_sms())
+
 
 def torch_perf_fn(group_A, group_B):
     for a, b in zip(group_A, group_B):
@@ -795,8 +792,8 @@ def benchmark_square_matrices(N, provider):
                                        float16), quantiles=quantiles)
     if provider == 'tlx':
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: triton_tlx_perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, dtype=torch.
-                                       float16), quantiles=quantiles)
+            lambda: triton_tlx_perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, dtype=torch.float16
+                                       ), quantiles=quantiles)
     return ms, max_ms, min_ms
 
 
@@ -870,8 +867,8 @@ def benchmark_batches(M, provider):
                                        float16), quantiles=quantiles)
     if provider == 'tlx':
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: triton_tlx_perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, dtype=torch.
-                                       float16), quantiles=quantiles)
+            lambda: triton_tlx_perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, dtype=torch.float16
+                                       ), quantiles=quantiles)
     return ms, max_ms, min_ms
 
 
