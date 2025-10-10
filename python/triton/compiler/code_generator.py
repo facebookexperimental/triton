@@ -1134,6 +1134,7 @@ class CodeGenerator(ast.NodeVisitor):
         num_stages = None
         loop_unroll_factor = None
         disallow_acc_multi_buffer = False
+        data_partition_factor = None
         flatten = False
         warp_specialize = False
         disable_licm = False
@@ -1148,6 +1149,7 @@ class CodeGenerator(ast.NodeVisitor):
             num_stages = iterator.num_stages
             loop_unroll_factor = iterator.loop_unroll_factor
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
+            data_partition_factor = iterator.data_partition_factor
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
@@ -1201,6 +1203,8 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.num_stages", self.builder.get_int32_attr(num_stages))
             if _unwrap_if_constexpr(loop_unroll_factor) is not None:
                 for_op.set_attr("tt.loop_unroll_factor", self.builder.get_int32_attr(loop_unroll_factor))
+            if _unwrap_if_constexpr(data_partition_factor) is not None:
+                for_op.set_attr("tt.data_partition_factor", self.builder.get_int32_attr(data_partition_factor))
             if disallow_acc_multi_buffer:
                 for_op.set_attr("tt.disallow_acc_multi_buffer", self.builder.get_unit_attr())
             if flatten:

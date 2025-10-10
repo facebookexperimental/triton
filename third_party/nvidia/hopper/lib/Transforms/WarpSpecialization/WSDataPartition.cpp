@@ -18,6 +18,8 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+static const char *kDataPartitionAttrName = "tt.data_partition_factor";
+
 static bool containsAll(const SmallVector<AsyncTaskId> &superset,
                         const SmallVector<AsyncTaskId> &subset) {
   for (AsyncTaskId id : subset) {
@@ -887,11 +889,10 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
     // Create token
     if (auto token = tmemLdOp.getDep()) {
-      ld =
-          builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
-              op->getLoc(), newAccType, token.getType(),
-              mappings.lookupOrNull(tmemLdOp.getSrc()),
-              mappings.lookupOrNull(token));
+      ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
+          op->getLoc(), newAccType, token.getType(),
+          mappings.lookupOrNull(tmemLdOp.getSrc()),
+          mappings.lookupOrNull(token));
     } else {
       ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
           op->getLoc(), newAccType, mappings.lookupOrNull(tmemLdOp.getSrc()));
@@ -1448,18 +1449,26 @@ public:
       NVGPUWSDataPartitionPass>::NVGPUWSDataPartitionBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    if (numWarpGroups <= 2)
-      return;
-
+    std::optional<uint32_t> dataPartitonFactor;
     SmallVector<scf::ForOp> loops;
     funcOp->walk([&](scf::ForOp forOp) {
       if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
         loops.push_back(forOp);
+      if (auto factor =
+              forOp->getAttrOfType<IntegerAttr>(kDataPartitionAttrName)) {
+        assert((!dataPartitonFactor || factor.getInt() == dataPartitonFactor) &&
+               "data partition factor mismatch");
+        dataPartitonFactor = factor.getInt();
+      }
     });
     if (loops.empty())
       return;
 
-    if (!doDataPartition(funcOp, numWarpGroups - 1))
+    if (!dataPartitonFactor)
+      dataPartitonFactor = numWarpGroups - 1;
+    if (dataPartitonFactor < 2)
+      return;
+    if (!doDataPartition(funcOp, *dataPartitonFactor))
       signalPassFailure();
   }
 

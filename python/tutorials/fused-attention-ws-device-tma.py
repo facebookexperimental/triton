@@ -126,6 +126,7 @@ def _attn_fwd_inner_oss_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:
@@ -139,7 +140,9 @@ def _attn_fwd_inner_oss_dp(
     offsetkv_y = offset_y + lo
 
     # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize, disallow_acc_multi_buffer=True):
+    for start_n in tl.range(
+        lo, hi, BLOCK_N, warp_specialize=warp_specialize, disallow_acc_multi_buffer=True, data_partition_factor=DP_FACTOR,
+    ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         k = desc_k.load([offsetkv_y, 0]).T
@@ -193,10 +196,9 @@ else:
 
 configs = [
     triton.Config(
-        {"BLOCK_M": BM, "BLOCK_N": BN},
+        {"BLOCK_M": BM, "BLOCK_N": BN, "DP_FACTOR": 2,},
         num_stages=s,
         num_warps=w,
-        data_partition_factor=2,
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
@@ -309,6 +311,7 @@ def _attn_fwd_tma_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -359,6 +362,7 @@ def _attn_fwd_tma_dp(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            DP_FACTOR,
         )
     if STAGE & 2:
         acc0, acc1, l_i0_0, l_i0_1, l_i1, m_i0, m_i1 = _attn_fwd_inner_oss_dp(
@@ -384,6 +388,7 @@ def _attn_fwd_tma_dp(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            DP_FACTOR,
         )
 
     if FADD2_REDUCE:
@@ -424,6 +429,7 @@ def _attn_fwd(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -449,6 +455,7 @@ def _attn_fwd(
         SUBTILING,
         VECT_MUL,
         FADD2_REDUCE,
+        DP_FACTOR,
     )
 
 
@@ -479,6 +486,7 @@ def _attn_fwd_persist(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -542,6 +550,7 @@ def _attn_fwd_persist(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            DP_FACTOR,
         )
         tile_idx += num_progs
 
