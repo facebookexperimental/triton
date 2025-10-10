@@ -346,9 +346,9 @@ tlx_configs = [
         num_stages=1,
     )
     for BM in [128]
-    for BN in [128]
-    for BK in [64]
-    for s in [2]
+    for BN in [128, 256]
+    for BK in [64, 128]
+    for s in [2, 3, 4]
     for t in [2]
     for subtile in [False]
 ]
@@ -875,5 +875,6 @@ def benchmark_batches(M, provider):
     return ms, max_ms, min_ms
 
 
-benchmark_square_matrices.run(show_plots=True, print_data=True)
-benchmark_batches.run(show_plots=True, print_data=True)
+if __name__ == "__main__":
+    benchmark_square_matrices.run(show_plots=True, print_data=True)
+    benchmark_batches.run(show_plots=True, print_data=True)
