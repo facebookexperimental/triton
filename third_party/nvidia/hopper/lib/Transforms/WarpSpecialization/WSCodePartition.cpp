@@ -490,6 +490,81 @@ void reorderProducerOps(SmallVector<Channel *> &channels) {
   });
 }
 
+// Reorder producer ops to unblock consumers interleavingly.
+void reorderEpilogOps(triton::FuncOp funcOp) {
+
+  llvm::SetVector<Block *> epliogBlocks;
+  funcOp->walk([&](Operation *op) {
+    if (isa<tt::DescriptorStoreOp, tt::StoreOp>(op)) {
+      epliogBlocks.insert(op->getBlock());
+    }
+  });
+
+  auto firstInBlockUser = [](Operation *op) {
+    Operation *firstUser = nullptr;
+    for (Operation *user : op->getUsers()) {
+      if (user->getBlock() != op->getBlock())
+        continue;
+      if (!firstUser || user->isBeforeInBlock(firstUser))
+        firstUser = user;
+    }
+    return firstUser;
+  };
+
+  // Streamline ops on a store chain
+  for (auto block : epliogBlocks) {
+    LLVM_DEBUG({
+      LDBG("\n");
+      LDBG("reordering epilog block");
+      block->dump();
+      LDBG("\n");
+    });
+    // Find the last scf::ForOp in the block
+    SetVector<Operation *> epilogOps;
+    SmallVector<Operation *> storeOps;
+    for (Operation &op : reverse(*block)) {
+      if (isa<scf::ForOp, scf::IfOp>(op)) {
+        break;
+      }
+      epilogOps.insert(&op);
+      if (isa<tt::DescriptorStoreOp, tt::StoreOp>(op))
+        storeOps.push_back(&op);
+    }
+
+    for (auto storeOp : reverse(storeOps)) {
+      // Move forward dependencies close to the op
+      // Start from the last store op backwards and move backward slice to
+      // before each op. This guarantees that the backward slice of each op is
+      // scheduled as late as possible.
+      BackwardSliceOptions opt;
+      opt.omitBlockArguments = true;
+      SetVector<Operation *> backwardSlice;
+      (void)getBackwardSlice(storeOp, &backwardSlice, opt);
+      for (auto &depOp : reverse(backwardSlice)) {
+        if (!epilogOps.contains(depOp))
+          continue;
+        // push depOp to be right before its first user
+        auto firstUser = firstInBlockUser(depOp);
+        depOp->moveBefore(firstUser);
+      }
+    }
+
+    LLVM_DEBUG({
+      LDBG("\n");
+      LDBG("reordered epilog block");
+      block->dump();
+      LDBG("\n");
+    });
+  }
+
+  LLVM_DEBUG({
+    LDBG("\n");
+    LDBG("after reordering epilog ops");
+    funcOp.dump();
+    LDBG("\n");
+  });
+}
+
 // Find top-level ops which contain at least one channel. If a channel's
 // getSrcOp() and getDstOp() belong to the inner loop, the outer loop will be
 // part of asyncTaskOps.
@@ -2452,6 +2527,7 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
 }
 
 void doBufferAllocation(triton::FuncOp &funcOp) {
+  reorderEpilogOps(funcOp);
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
