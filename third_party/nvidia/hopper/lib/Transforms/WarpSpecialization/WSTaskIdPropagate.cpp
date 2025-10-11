@@ -76,9 +76,12 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     if (!taskIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !op->hasAttr("async_task_id"))) {
       op->setAttr("async_task_id", taskIds.getTaskIds());
-      labelParentOps(op);
     }
   });
+  // The parent operations must have the union of their children's operations.
+  // We do this in a separate walk to avoid having a parent operation treated
+  // like an anchor op and skipped by the first walk.
+  funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
   return 0;
 }
 
