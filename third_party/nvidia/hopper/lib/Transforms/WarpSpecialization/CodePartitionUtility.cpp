@@ -926,8 +926,7 @@ bool valuesMatch(Value v1, Value v2) {
 // Return True if the two ttng::WaitBarrierOp will either have
 // exactly the same value or exactly the opposite value in
 // every iteration of the loop. If so, then these are safe to fuse.
-bool hasMatchingOrAlternatingPhase(ttng::WaitBarrierOp wait1,
-                                   ttng::WaitBarrierOp wait2) {
+bool hasMatchingPhase(ttng::WaitBarrierOp wait1, ttng::WaitBarrierOp wait2) {
   return valuesMatch(wait1.getPhase(), wait2.getPhase());
 }
 
@@ -945,7 +944,7 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
   for (size_t i = 1; i < consumers.size(); i++) {
     auto nextWaiter = barrierWaiters[i];
     if ((initWaiter->getParentOp() != nextWaiter->getParentOp()) &&
-        hasMatchingOrAlternatingPhase(initWaiter, nextWaiter)) {
+        hasMatchingPhase(initWaiter, nextWaiter)) {
       // Unsupported commit.
       return;
     }
@@ -973,7 +972,7 @@ void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
       auto groupWaiter = subgroup.barrierWaiters.front();
       // Require matching parent ops.
       if ((groupWaiter->getParentOp() == initWaiter->getParentOp()) &&
-          hasMatchingOrAlternatingPhase(groupWaiter, initWaiter)) {
+          hasMatchingPhase(groupWaiter, initWaiter)) {
         insertIntoSubgroup(subgroup, initCount, bufferAllocOp, commit,
                            consumers, barrierWaiters);
         found = true;
