@@ -903,8 +903,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto CTALayout = getCTALayout(oldRetType.getEncoding());
     builder.setInsertionPoint(op);
     // The source op is already sliced at this point, so srcTy, type, tmem is
-    // sliced. We use getTmemCompatibleLayout to get a block layout that is
-    // for the sliced tmem here.
+    // sliced. We use getTmemCompatibleLayout to get a block layout that is for
+    // the sliced tmem here.
     Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
         tmem.getBlockM(), tmem.getBlockN(), oldRetType, numWarps);
 
@@ -951,8 +951,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto CTALayout = getCTALayout(oldSrcType.getEncoding());
     builder.setInsertionPoint(op);
     // The source op is already sliced at this point, so srcTy, type, tmem is
-    // sliced. We use getTmemCompatibleLayout to get a block layout that is
-    // for the sliced tmem here.
+    // sliced. We use getTmemCompatibleLayout to get a block layout that is for
+    // the sliced tmem here.
     Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
         tmem.getBlockM(), tmem.getBlockN(), oldSrcType, numWarps);
     // oldRetType is the desired output, we slice it and convert from the
