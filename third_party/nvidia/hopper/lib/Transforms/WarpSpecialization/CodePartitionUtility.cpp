@@ -888,7 +888,6 @@ struct CommitOpSubgroupInfo {
   SmallVector<ttng::WaitBarrierOp> barrierWaiters;
   SmallVector<ttng::TCGen5CommitOp> commits;
 };
-typedef struct CommitOpSubgroupInfo CommitOpSubgroupInfo;
 
 // Check if two values are certain to match given the assumption.
 // that the original value are located in the same block and therefore
