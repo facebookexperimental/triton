@@ -280,14 +280,24 @@ static bool getBackwardSliceToPartition(Value v,
     }
 
     // Recusively process operands backwards.
-    if (op->hasTrait<OpTrait::Elementwise>() ||
-        isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
-            BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp, ConvertLayoutOp,
-            triton::gpu::LocalAllocOp, LoadOp, TransOp, MemDescTransOp,
-            AtomicRMWOp, triton::AddPtrOp, DescriptorLoadOp,
-            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
-            nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp, ReshapeOp>(
-            op)) {
+    if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
+      auto outputShape = getShape(loadOp.getResult());
+      auto inputShape = getShape(loadOp.getDesc());
+      // TODO: Handle 1s in the middle.
+      unsigned numSqueezedDims = inputShape.size() - outputShape.size();
+      for (Value operand : op->getOperands()) {
+        if (!getBackwardSliceToPartition(operand, partitionScheme,
+                                         currentDim + numSqueezedDims))
+          return false;
+      }
+    } else if (op->hasTrait<OpTrait::Elementwise>() ||
+               isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
+                   arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
+                   SplatOp, ConvertLayoutOp, triton::gpu::LocalAllocOp, LoadOp,
+                   TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
+                   nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
+                   nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
+                   ReshapeOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
@@ -361,6 +371,17 @@ static bool getForwardSliceToPartition(Value v,
                                        unsigned currentDim,
                                        DenseSet<Value> &seen) {
   assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
+  auto op = v.getDefiningOp();
+  if (op) {
+    if (auto expandDimsOp = dyn_cast<ExpandDimsOp>(op)) {
+      if (currentDim != DataPartitionScheme::noOpPartitionDim &&
+          currentDim >= expandDimsOp.getAxis()) {
+        currentDim += 1;
+        // Update the result for expand dims
+        partitionScheme.opPartitionDims[op] = currentDim;
+      }
+    }
+  }
   if (!seen.insert(v).second)
     return true;
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
@@ -498,8 +519,18 @@ static bool getSliceToPartition(Value root,
     currentDim = partitionScheme.opPartitionDims[op];
     if (currentDim == DataPartitionScheme::noOpPartitionDim)
       continue;
-    if (op->hasTrait<OpTrait::Elementwise>() ||
-        isa<StoreOp, DescriptorStoreOp, AtomicRMWOp>(op)) {
+    if (auto descStoreOp = dyn_cast<DescriptorStoreOp>(op)) {
+      auto inputShape = getShape(descStoreOp.getSrc());
+      auto outputShape = getShape(descStoreOp.getDesc());
+      // TODO: Handle 1s in the middle.
+      unsigned numSqueezedDims = inputShape.size() - outputShape.size();
+      for (OpOperand &operand : op->getOpOperands()) {
+        if (!getBackwardSliceToPartition(operand.get(), partitionScheme,
+                                         currentDim - numSqueezedDims))
+          return false;
+      }
+    } else if (op->hasTrait<OpTrait::Elementwise>() ||
+               isa<StoreOp, AtomicRMWOp>(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
         if (!getBackwardSliceToPartition(operand.get(), partitionScheme,
                                          currentDim))
@@ -872,8 +903,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto CTALayout = getCTALayout(oldRetType.getEncoding());
     builder.setInsertionPoint(op);
     // The source op is already sliced at this point, so srcTy, type, tmem is
-    // sliced. We use getTmemCompatibleLayout to get a block layout that is for
-    // the sliced tmem here.
+    // sliced. We use getTmemCompatibleLayout to get a block layout that is
+    // for the sliced tmem here.
     Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
         tmem.getBlockM(), tmem.getBlockN(), oldRetType, numWarps);
 
@@ -920,8 +951,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto CTALayout = getCTALayout(oldSrcType.getEncoding());
     builder.setInsertionPoint(op);
     // The source op is already sliced at this point, so srcTy, type, tmem is
-    // sliced. We use getTmemCompatibleLayout to get a block layout that is for
-    // the sliced tmem here.
+    // sliced. We use getTmemCompatibleLayout to get a block layout that is
+    // for the sliced tmem here.
     Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
         tmem.getBlockM(), tmem.getBlockN(), oldSrcType, numWarps);
     // oldRetType is the desired output, we slice it and convert from the
