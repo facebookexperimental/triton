@@ -1114,6 +1114,7 @@ collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
 //       to matching, but we don't want to worry about cluster reordering.
 //    b. Has the same nesting level.
 //    c. Has the same expected phase value.
+//    d. Has the same expected arrival count (init count).
 //
 // 3. For each subgroup, update the barriers based on the consumer's location.
 //    a. With the same async task id, eliminate all but the first barrier.
