@@ -181,7 +181,11 @@ LogicalResult getConvertBackwardSlice(
         nullptr);
 
 // Populate pattern to remove dead cycles in ForOp.
-void populateForOpDeadArgumentElimination(RewritePatternSet &patterns);
+// opsCanBeTriviallyDead specifies the operations of which the side effect can
+// be ignored.
+void populateForOpDeadArgumentElimination(
+    RewritePatternSet &patterns,
+    const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
 
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.

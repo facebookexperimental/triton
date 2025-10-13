@@ -70,8 +70,8 @@ def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::Modu
   ];
 }
 
-def NVGPUTestWSDataPartition : Pass<"nvgpu-test-ws-data-partition", "mlir::ModuleOp"> {
-  let summary = "test warp specialization data partition";
+def NVGPUWSDataPartition : Pass<"nvgpu-ws-data-partition", "mlir::ModuleOp"> {
+  let summary = "warp specialization data partition";
 
   let description = "This pass partitions operations into multiple suboperations which operate on smaller data shapes";
 

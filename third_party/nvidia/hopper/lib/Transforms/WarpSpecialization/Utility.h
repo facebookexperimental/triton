@@ -5,9 +5,11 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Operation.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
+namespace tt = mlir::triton;
 namespace mlir {
 
 typedef int AsyncTaskId;
@@ -37,12 +39,18 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId);
 // Removes all async task ids from the given operation.
 void removeAsyncTaskIds(Operation *op);
 
+struct LoopScheduleInfo {
+  IntegerAttr stage;
+  IntegerAttr cluster;
+};
+
 class OpBuilderWithAsyncTaskIds : public OpBuilder {
 public:
   OpBuilderWithAsyncTaskIds(MLIRContext *context) : OpBuilder(context) {}
 
   explicit OpBuilderWithAsyncTaskIds(Operation *op) : OpBuilder(op) {
     setAsyncTaskIdsFromOp(op);
+    setLoopScheduleInfoFromOp(op);
   }
 
   void setAsynTaskIdsFromArray(ArrayRef<AsyncTaskId> newAsyncTaskIds) {
@@ -69,16 +77,54 @@ public:
     OpTy op = OpBuilder::create<OpTy>(std::forward<Args>(args)...);
     if (!asyncTaskIds.empty())
       setAsyncTaskIds(op, asyncTaskIds);
+    setOpLoopScheduleInfo(op);
     return op;
   }
 
   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
     OpTy op = createWithAsyncTaskIds<OpTy>(std::forward<Args>(args)...);
+    setOpLoopScheduleInfo(op);
     return op;
   }
 
+  // Sets the loop schedule info (loop.stage, loop.cluster) of future
+  // createWithAsyncTaskIds operations based on the `loop.stage` and
+  // `loop.cluster` attributes of the given operation.
+  void setLoopScheduleInfoFromInfo(LoopScheduleInfo newLoopScheduleInfo) {
+    loopScheduleInfo = newLoopScheduleInfo;
+  }
+
+  void setLoopScheduleInfoFromOp(Operation *op) {
+    IntegerAttr nextLoopStage = nullptr;
+    IntegerAttr nextLoopCluster = nullptr;
+    if (op->hasAttr(tt::kLoopStageAttrName)) {
+      nextLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+    }
+    if (op->hasAttr(tt::kLoopClusterAttrName)) {
+      nextLoopCluster =
+          op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+    }
+    setLoopScheduleInfoFromInfo({nextLoopStage, nextLoopCluster});
+  }
+
+  // Clears the loop schedule info (loop.stage, loop.cluster) for
+  // future createWithAsyncTaskIds operations.
+  void clearLoopScheduleInfo() { loopScheduleInfo = {nullptr, nullptr}; }
+
+  LoopScheduleInfo getLoopScheduleInfo() { return loopScheduleInfo; }
+
 private:
+  void setOpLoopScheduleInfo(Operation *op) {
+    if (loopScheduleInfo.stage) {
+      op->setAttr(tt::kLoopStageAttrName, loopScheduleInfo.stage);
+    }
+    if (loopScheduleInfo.cluster) {
+      op->setAttr(tt::kLoopClusterAttrName, loopScheduleInfo.cluster);
+    }
+  }
+
   SmallVector<AsyncTaskId> asyncTaskIds;
+  LoopScheduleInfo loopScheduleInfo = {nullptr, nullptr};
 };
 
 // Copy any pipeline info (loop.stage, loop.cluster) from

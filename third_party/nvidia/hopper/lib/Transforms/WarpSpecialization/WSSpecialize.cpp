@@ -194,9 +194,11 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   for (auto idx : keptResultVec) {
     newResultTypes.push_back(ifOp->getResultTypes()[idx]);
   }
+  builder.setLoopScheduleInfoFromOp(ifOp);
   auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
       ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
       ifOp.elseBlock());
+  builder.clearLoopScheduleInfo();
 
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
   ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
@@ -210,7 +212,9 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   // Update yields
   auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
     ifBuilder.setInsertionPoint(yield);
+    ifBuilder.setLoopScheduleInfoFromOp(yield);
     ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(yield.getLoc(), operands);
+    ifBuilder.clearLoopScheduleInfo();
     yield.erase();
   };
   if (keptResultVec.size() < ifOp->getResultTypes().size()) {
@@ -274,8 +278,10 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   auto newStep = mapping.lookupOrDefault(forOp.getStep());
 
   // Create newForOp.
+  builder.setLoopScheduleInfoFromOp(forOp);
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
       forOp.getLoc(), newLowerBound, newUpperBound, newStep, newLoopArgs);
+  builder.clearLoopScheduleInfo();
   // Propagate the attributes of forOp to newForOp.
   // This is needed to preserve tt.warp_specialize,
   // and tt.loop_schedule among others.

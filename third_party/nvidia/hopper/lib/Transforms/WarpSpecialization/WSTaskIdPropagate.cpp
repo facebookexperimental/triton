@@ -24,10 +24,19 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
-  // Convert ttg.partition to async_task_id
+  // Compute the min partition to normalize to 0
+  int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
       int64_t idx = attr.getInt();
+      assert(idx >= 0);
+      minPartition = std::min(idx, minPartition);
+    }
+  });
+  // Convert ttg.partition to async_task_id
+  funcOp.walk([&](mlir::Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      int64_t idx = attr.getInt() - minPartition;
       assert(idx >= 0);
       setAsyncTaskIds(op, idx);
       op->removeAttr("ttg.partition");
@@ -67,9 +76,12 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     if (!taskIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !op->hasAttr("async_task_id"))) {
       op->setAttr("async_task_id", taskIds.getTaskIds());
-      labelParentOps(op);
     }
   });
+  // The parent operations must have the union of their children's operations.
+  // We do this in a separate walk to avoid having a parent operation treated
+  // like an anchor op and skipped by the first walk.
+  funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
   return 0;
 }
 
