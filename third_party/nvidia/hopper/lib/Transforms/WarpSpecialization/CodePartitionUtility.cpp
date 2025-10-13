@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include <list>
 #include <unordered_set>
 
@@ -877,6 +878,334 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
     return SmallVector<Operation *>(users.begin(), users.end());
   }
   return {consumerOp};
+}
+
+struct CommitOpSubgroupInfo {
+  // Arrive value from the init Barrier
+  int initCount;
+  SmallVector<Operation *> bufferAllocs;
+  SmallVector<Operation *> bufferConsumers;
+  SmallVector<ttng::WaitBarrierOp> barrierWaiters;
+  SmallVector<ttng::TCGen5CommitOp> commits;
+};
+
+// Check if two values are certain to match given the assumption.
+// that the original value are located in the same block and therefore
+// occur with the same frequency.
+bool valuesMatch(Value v1, Value v2) {
+  if (v1 == v2) {
+    return true;
+  }
+  auto *op1 = v1.getDefiningOp();
+  auto *op2 = v2.getDefiningOp();
+  if (!op1 || !op2) {
+    return false;
+  }
+  // Verify the op types match
+  if ((op1->getName() != op2->getName()) ||
+      (op1->getNumOperands() != op2->getNumOperands())) {
+    return false;
+  }
+
+  // Special case on constants
+  if (auto const1 = dyn_cast<mlir::arith::ConstantOp>(op1)) {
+    auto const2 = cast<mlir::arith::ConstantOp>(op2);
+    return const1.getValue() == const2.getValue();
+  }
+  // Check all operands
+  for (unsigned i = 0; i < op1->getNumOperands(); ++i) {
+    if (!valuesMatch(op1->getOperand(i), op2->getOperand(i))) {
+      return false;
+    }
+  }
+  // If all operands match and we have the same exact op type then
+  // this op matches.
+  return true;
+}
+
+// Return True if the two ttng::WaitBarrierOp will either have
+// exactly the same value or exactly the opposite value in
+// every iteration of the loop. If so, then these are safe to fuse.
+bool hasMatchingPhase(ttng::WaitBarrierOp wait1, ttng::WaitBarrierOp wait2) {
+  return valuesMatch(wait1.getPhase(), wait2.getPhase());
+}
+
+void mergeSubgroups(std::vector<CommitOpSubgroupInfo> &subgroups, int initCount,
+                    Operation *bufferAllocOp, ttng::TCGen5CommitOp commit,
+                    SmallVector<Operation *> &consumers,
+                    SmallVector<ttng::WaitBarrierOp> &barrierWaiters) {
+  assert(consumers.size() == barrierWaiters.size());
+  if (barrierWaiters.empty()) {
+    return;
+  }
+  // Validate the inputs. All consumers must go to the same subgroup
+  // to remove a barrier.
+  auto initWaiter = barrierWaiters[0];
+  for (size_t i = 1; i < consumers.size(); i++) {
+    auto nextWaiter = barrierWaiters[i];
+    if ((initWaiter->getParentOp() != nextWaiter->getParentOp()) &&
+        hasMatchingPhase(initWaiter, nextWaiter)) {
+      // Unsupported commit.
+      return;
+    }
+  }
+  bool found = false;
+  auto insertIntoSubgroup =
+      ([](CommitOpSubgroupInfo &subgroup, int initCount,
+          Operation *bufferAllocOp, ttng::TCGen5CommitOp commit,
+          SmallVector<Operation *> &consumers,
+          SmallVector<ttng::WaitBarrierOp> &barrierWaiters) {
+        subgroup.initCount = initCount;
+        subgroup.bufferConsumers.insert(subgroup.bufferConsumers.end(),
+                                        consumers.begin(), consumers.end());
+        subgroup.barrierWaiters.insert(subgroup.barrierWaiters.end(),
+                                       barrierWaiters.begin(),
+                                       barrierWaiters.end());
+        for (size_t j = 0; j < consumers.size(); j++) {
+          subgroup.bufferAllocs.push_back(bufferAllocOp);
+          subgroup.commits.push_back(commit);
+        }
+      });
+  for (auto &subgroup : subgroups) {
+    if (subgroup.initCount == initCount) {
+      // Select a represetentive for comparison.
+      auto groupWaiter = subgroup.barrierWaiters.front();
+      // Require matching parent ops.
+      if ((groupWaiter->getParentOp() == initWaiter->getParentOp()) &&
+          hasMatchingPhase(groupWaiter, initWaiter)) {
+        insertIntoSubgroup(subgroup, initCount, bufferAllocOp, commit,
+                           consumers, barrierWaiters);
+        found = true;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    CommitOpSubgroupInfo subgroup;
+    insertIntoSubgroup(subgroup, initCount, bufferAllocOp, commit, consumers,
+                       barrierWaiters);
+    subgroups.push_back(subgroup);
+  }
+}
+
+void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
+  Operation *keptAlloc = nullptr;
+  ttng::TCGen5CommitOp keptCommit = nullptr;
+  // Track consumers + waiters we are planning to keep.
+  // This is important because if we find two waiters
+  // in the same task id we need to select the first one
+  // in program order.
+  SmallVector<Operation *> processedConsumers;
+  SmallVector<ttng::WaitBarrierOp> processedWaiters;
+  // Track alloc + commit which could be duplicated.
+  DenseSet<Operation *> deletedOps;
+  for (size_t i = 0; i < subgroup.bufferAllocs.size(); i++) {
+    auto alloc = subgroup.bufferAllocs[i];
+    auto commit = subgroup.commits[i];
+    auto consumer = subgroup.bufferConsumers[i];
+    auto waiter = subgroup.barrierWaiters[i];
+    // Keep exactly one allocation and commit.
+    // We know we are going to fuse all barriers together.
+    if (keptAlloc == nullptr) {
+      keptAlloc = alloc;
+      keptCommit = commit;
+      processedConsumers.push_back(consumer);
+      processedWaiters.push_back(waiter);
+      continue;
+    }
+    // If a barrier has already been fused its possible
+    // multiple consumers share an alloc/commit.
+    if (alloc != keptAlloc) {
+      deletedOps.insert(alloc);
+    }
+    if (commit != keptCommit) {
+      deletedOps.insert(commit);
+    }
+    // Check all existing operations for a matching task id.
+    // Within the same task we will pick the earliest by
+    // program order.
+    auto taskId = waiter->getAttr("async_task_id");
+    bool matched = false;
+    bool keptWait = true;
+    for (size_t j = 0; j < processedConsumers.size(); j++) {
+      auto existingConsumer = processedConsumers[j];
+      auto existingWaiter = processedWaiters[j];
+      auto existingTaskID = existingWaiter->getAttr("async_task_id");
+      if (taskId == existingTaskID) {
+        // If task ids match we should delete whichever one comes later
+        // in program order.
+        if (existingWaiter->isBeforeInBlock(waiter)) {
+          deletedOps.insert(waiter);
+          deletedOps.insert(consumer);
+          keptWait = false;
+        } else {
+          deletedOps.insert(existingWaiter);
+          deletedOps.insert(existingConsumer);
+          // Replace the existing consumer in place.
+          processedConsumers[j] = consumer;
+          processedWaiters[j] = waiter;
+        }
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      // If we only have a new task ID we must keep the wait.
+      processedConsumers.push_back(consumer);
+      processedWaiters.push_back(waiter);
+    }
+    if (keptWait) {
+      // If we kept the wait then we should update
+      // the allocation being used.
+      consumer->replaceUsesOfWith(alloc->getResult(0), keptAlloc->getResult(0));
+    }
+  }
+  // Remove the deleted ops.
+  DenseSet<Operation *> erasedOps;
+  std::function<void(Operation *)> eraseOp = [&](Operation *op) {
+    if (erasedOps.count(op)) {
+      return;
+    }
+    for (auto user : op->getUsers()) {
+      eraseOp(user);
+    }
+    erasedOps.insert(op);
+    op->erase();
+  };
+  for (auto op : deletedOps) {
+    eraseOp(op);
+  }
+}
+
+// Find all ttng::TCGen5CommitOp that could be theoritically
+// fused together if the consumers are compatible.
+SmallVector<ttng::TCGen5CommitOp>
+collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
+                   DenseSet<ttng::TCGen5CommitOp> &seenCommits) {
+  SmallVector<ttng::TCGen5CommitOp> commitGroup;
+  auto block = commitOp->getBlock();
+  auto startit = mlir::Block::iterator(commitOp);
+  for (auto it = startit; it != block->end(); it++) {
+    if (auto op = dyn_cast<ttng::TCGen5CommitOp>(*it)) {
+      if (!seenCommits.count(op)) {
+        seenCommits.insert(op);
+        commitGroup.push_back(op);
+      }
+    } else {
+      // We currently only support all ttng::TCGen5CommitOp
+      // being grouped together.
+      break;
+    }
+  }
+  return commitGroup;
+}
+
+// Fuse together the barriers used by repeated
+// tcgen05.commit operations. This works with the following
+// setup:
+// 1, Collect all tcgen05.commit operations that logically occur
+// "concurrently" and especially without any intermediate mma ops.
+// Right now we only support commit operations that are placed next
+// to each other in the IR, but in theory this can be extended.
+//
+// 2. For each candidate group, group together barriers based on the
+// underlying consumer(s). We will form a subgroup if the barrier:
+//    a. Has no pipelining state. In the future this can be extended
+//       to matching, but we don't want to worry about cluster reordering.
+//    b. Has the same nesting level.
+//    c. Has the same expected phase value.
+//    d. Has the same expected arrival count (init count).
+//
+// 3. For each subgroup, update the barriers based on the consumer's location.
+//    a. With the same async task id, eliminate all but the first barrier.
+//    b. With different async task ids, use the same allocation.
+//
+// 4. Cleanup the code to remove the unused barriers.
+//
+// Note: This is run before warp specialization to simplify the
+// transformation.
+void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
+  DenseSet<ttng::TCGen5CommitOp> seenCommits;
+  SmallVector<SmallVector<ttng::TCGen5CommitOp>> commitGroups;
+  funcOp.walk<mlir::WalkOrder::PreOrder>([&](ttng::TCGen5CommitOp commitOp) {
+    if (!seenCommits.count(commitOp)) {
+      auto commitGroup = collectCommitGroup(commitOp, seenCommits);
+      if (commitGroup.size() > 1) {
+        commitGroups.push_back(commitGroup);
+      }
+    }
+  });
+  for (auto &commitGroup : commitGroups) {
+    std::vector<CommitOpSubgroupInfo> subgroups;
+    for (auto &commitOp : commitGroup) {
+      auto barrier = commitOp.getBarrier();
+      auto barrierAllocOp = barrier.getDefiningOp();
+      // For each barrier that are 3 types of operations:
+      // 1. Initializer: This should immediately follow the alloc.
+      // 2. Producer: This should only be the tcgen05.commit op.
+      // 3. Consumer: 1 or more ops.
+      // We want to collect all of the consumers.
+      SmallVector<Operation *> bufferConsumers;
+      SmallVector<ttng::WaitBarrierOp> consumers;
+      bool safe = true;
+      int initCount = -1;
+      for (auto user : barrier.getUsers()) {
+        // We have found the consumer.
+        if (user == commitOp) {
+          continue;
+        }
+        // Track the operation for replacing buffers.
+        Operation *bufferConsumer = user;
+        // Find the actual barrier using op.
+        if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(user)) {
+          Operation *nextConsumer = nullptr;
+          for (auto indexUser : indexOp->getUsers()) {
+            if (nextConsumer) {
+              safe = false;
+              break;
+            }
+            nextConsumer = indexUser;
+          }
+          if (!nextConsumer) {
+            safe = false;
+          } else {
+            user = nextConsumer;
+          }
+        }
+        if (auto initBarrier = dyn_cast<ttng::InitBarrierOp>(user)) {
+          if (initCount == -1) {
+            initCount = initBarrier.getCount();
+          } else {
+            // Multiple inits. This is not safe.
+            safe = false;
+          }
+        } else if (auto barrierOp = dyn_cast<ttng::WaitBarrierOp>(user)) {
+          // We don't support pipelining state yet.
+          if (barrierOp->hasAttr(tt::kLoopStageAttrName)) {
+            safe = false;
+          } else {
+            consumers.push_back(barrierOp);
+            bufferConsumers.push_back(bufferConsumer);
+          }
+        } else {
+          // Unexpected barrier op.
+          safe = false;
+        }
+        if (!safe) {
+          break;
+        }
+      }
+      // Cannot group this commit. Unsupport operations.
+      if (!safe || initCount == -1) {
+        continue;
+      }
+      mergeSubgroups(subgroups, initCount, barrierAllocOp, commitOp,
+                     bufferConsumers, consumers);
+    }
+    for (auto &subgroup : subgroups) {
+      updateSubgroup(subgroup);
+    }
+  }
 }
 
 } // namespace mlir
