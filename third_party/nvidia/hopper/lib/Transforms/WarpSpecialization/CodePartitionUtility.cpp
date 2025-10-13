@@ -429,38 +429,28 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
 // Compute and return the buffer index and phase for a given accumulate count.
 std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                              Location loc, Value accumCnt,
-                                             unsigned numBuffers,
-                                             Operation *op) {
+                                             unsigned numBuffers) {
   Value numBuffersVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
-  copyLoopScheduleInfo(numBuffersVal.getDefiningOp(), op);
   numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI64Type(), numBuffersVal);
-  copyLoopScheduleInfo(numBuffersVal.getDefiningOp(), op);
   // Calculate accumCnt / numBuffers
   // initBufferIdx = accumCnt - accumCnt / numBuffers * numBuffers
   // initPhase = (accumCnt / numBuffers) & 1
   Value bufferIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
       loc, accumCnt, numBuffersVal);
-  copyLoopScheduleInfo(bufferIdx.getDefiningOp(), op);
   auto mulOp = builder.createWithAsyncTaskIds<arith::MulIOp>(loc, bufferIdx,
                                                              numBuffersVal);
-  copyLoopScheduleInfo(mulOp, op);
   Value initBufferIdx =
       builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, mulOp);
-  copyLoopScheduleInfo(initBufferIdx.getDefiningOp(), op);
   initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI32Type(), initBufferIdx);
-  copyLoopScheduleInfo(initBufferIdx.getDefiningOp(), op);
 
   Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-  copyLoopScheduleInfo(one.getDefiningOp(), op);
   bufferIdx =
       builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
-  copyLoopScheduleInfo(bufferIdx.getDefiningOp(), op);
   Value initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI1Type(), bufferIdx);
-  copyLoopScheduleInfo(initPhase.getDefiningOp(), op);
   return {initBufferIdx, initPhase};
 }
 
@@ -522,7 +512,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       getAccumCount(builder, op, regionsWithChannels, config, reuseGroupIdx);
   if (reuseGroupIdx < 0) {
     std::tie(bufferIdx, phase) =
-        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers, op);
+        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
     return;
   }
   // op is a user of the channel. accumCnt is the corresponding argument of the
@@ -545,25 +535,22 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   assert(theIdx >= 0);
   if (theIdx == 0) {
     std::tie(bufferIdx, phase) =
-        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers, op);
+        getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
     return;
   }
   // Increment accumCnt if there are multiple channels in the reuseGroup in this
   // region.
   Value idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
       op->getLoc(), theIdx, 64);
-  copyLoopScheduleInfo(idxVal.getDefiningOp(), op);
   Value addRes = builder.createWithAsyncTaskIds<arith::AddIOp>(
       op->getLoc(), accumCnt, idxVal);
-  copyLoopScheduleInfo(addRes.getDefiningOp(), op);
 
   std::tie(bufferIdx, phase) =
-      getBufferIdxAndPhase(builder, op->getLoc(), addRes, numBuffers, op);
+      getBufferIdxAndPhase(builder, op->getLoc(), addRes, numBuffers);
 }
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
-                                 Value barrierAlloc, Value bufferIdx,
-                                 Operation *op) {
+                                 Value barrierAlloc, Value bufferIdx) {
   auto context = barrierAlloc.getContext();
   Attribute sharedMemorySpace =
       triton::gpu::SharedMemorySpaceAttr::get(context);
@@ -576,7 +563,6 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   // Create barrierForTMA from barrierAlloc.
   auto output = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       barrierAlloc.getLoc(), barrierTy, barrierAlloc, bufferIdx);
-  copyLoopScheduleInfo(output, op);
   return output;
 }
 

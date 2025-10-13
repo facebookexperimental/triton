@@ -252,12 +252,24 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     }
   } while (changed);
 
+  // Read the attribute from the module
+  ModuleOp mod = axisInfo.getModuleOp();
+  int minRegAutoWS = 24;  // default value
+  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
+      minRegAutoWS = attr.getInt();
+  }
+  int maxRegAutoWS = 168;  // default value
+  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName)) {
+      maxRegAutoWS = attr.getInt();
+  }
+
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
        llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                  wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
+
     // "Guess" the register usage for each partition.
-    estRegs = tensorRegs ? 152 : 24;
+    estRegs = tensorRegs ? maxRegAutoWS : minRegAutoWS;
 
     // Layouts need to be reassigned if the number of warps changed and there
     // are tensor computations.
