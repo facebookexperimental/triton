@@ -75,7 +75,10 @@ public:
       return WalkResult::advance();
     });
 
-    // Insert InvalBarrierOp before returnOp of entry funcOp
+    // todo: consider removing all the inval op that's located right before
+    // return in a later pass to save a few cycles.
+    // Insert InvalBarrierOp before returnOp of
+    // entry funcOp
     funcOp.walk([&](triton::ReturnOp op) {
       OpBuilder builder(op); // Insert *before* returnOp
       Location loc = op.getLoc();

@@ -1228,6 +1228,7 @@ def test_barrier_live_range(device):
         bars3 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=3)
         tlx.barrier_arrive(bars3[0])
 
+        # bars1 and bars2 should both be live here
         tlx.barrier_arrive(bars1[0])
 
     torch.manual_seed(0)
