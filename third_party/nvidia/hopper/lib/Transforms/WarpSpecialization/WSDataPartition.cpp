@@ -843,9 +843,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   OpBuilderWithAsyncTaskIds builder(op->getContext());
   builder.setAsynTaskIdsFromArray(sliceTaskIds);
   auto cloneAndSetResultType = [&](Operation *op) {
-    // Set the insertion point after the op so you don't move
-    // the result and can cache the output.
-    builder.setInsertionPointAfter(op);
+    builder.setInsertionPoint(op);
     auto newOp = builder.clone(*op, mappings);
     setAsyncTaskIds(newOp, sliceTaskIds);
     mappings.map(op, newOp);
@@ -1141,12 +1139,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       reverseMappings.map(newV, v);
     }
   } else if (auto tensorDescOp = dyn_cast<MakeTensorDescOp>(op)) {
-    if (mappings.contains(op)) {
-      newOp = mappings.lookup(op);
-    } else {
-      newOp = cloneAndSetResultType(op);
-      mappings.map(op, newOp);
-    }
+    newOp = cloneAndSetResultType(op);
   } else if (auto tensorDescOp = dyn_cast<ttng::ReinterpretTensorDescOp>(op)) {
     newOp = cloneAndSetResultType(op);
   } else if (isa<TransOp, MemDescTransOp>(op)) {
