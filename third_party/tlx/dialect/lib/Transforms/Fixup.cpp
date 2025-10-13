@@ -3,6 +3,8 @@
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
@@ -45,9 +47,53 @@ public:
     return success();
   }
 
+  LogicalResult insertInvalBarrier(ModuleOp &mod) {
+    auto hasInvalBarrierOp = mod.walk([&](Operation *op) {
+                                  if (isa<ttng::InvalBarrierOp>(op)) {
+                                    return WalkResult::interrupt();
+                                  }
+                                  return WalkResult::advance();
+                                })
+                                 .wasInterrupted();
+    if (hasInvalBarrierOp) {
+      return mod.emitError() << "InvalBarrierOp unexpectedly found. Unable to "
+                                "auto insert InvalBarrierOp.";
+    }
+
+    // Find all barrier init ops in the module
+    std::vector<Value> barriers;
+    mod.walk(
+        [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
+
+    // Find the entry funcOp
+    triton::FuncOp funcOp = nullptr;
+    mod.walk([&](triton::FuncOp op) {
+      if (triton::isKernel(op)) {
+        funcOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+
+    // Insert InvalBarrierOp before returnOp of entry funcOp
+    funcOp.walk([&](triton::ReturnOp op) {
+      OpBuilder builder(op); // Insert *before* returnOp
+      Location loc = op.getLoc();
+      for (auto barrier : barriers) {
+        builder.create<ttng::InvalBarrierOp>(loc, barrier);
+      }
+    });
+
+    return success();
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     if (failed(verifyModule(mod))) {
+      return signalPassFailure();
+    }
+
+    if (failed(insertInvalBarrier(mod))) {
       return signalPassFailure();
     }
 

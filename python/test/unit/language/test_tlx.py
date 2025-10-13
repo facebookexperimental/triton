@@ -1215,6 +1215,38 @@ def test_wait_arrive_ws(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_live_range(device):
+
+    @triton.jit
+    def bar_live_kernel():
+        # use bars1 after bars2/3 init
+        bars1 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+
+        bars2 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=2)
+        tlx.barrier_arrive(bars2[0])
+
+        bars3 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=3)
+        tlx.barrier_arrive(bars3[0])
+
+        tlx.barrier_arrive(bars1[0])
+
+    torch.manual_seed(0)
+    kernel = bar_live_kernel[(2, 1)]()
+    ptx = kernel.asm["ptx"]
+
+    # e.g. extract %1 and 1 from "mbarrier.init.shared::cta.b64 [%r1], 1;"
+    pattern = r"mbarrier\.init\..*\.b64 \[(%r\d+)\], (\d+);"
+    matches = re.findall(pattern, ptx)
+
+    arrive_count_to_reg = {int(arrive_count): reg for reg, arrive_count in matches}
+    assert len(arrive_count_to_reg) == 3, f"Expected 3 mbarrier init, got ptx: \n{ptx}"
+    # Make sure they all have different registers (different SMEM addresses)
+    assert arrive_count_to_reg[1] != arrive_count_to_reg[2], f"invalid reuse of SMEM, full ptx: \n{ptx}"
+    assert arrive_count_to_reg[2] != arrive_count_to_reg[3], f"invalid reuse of SMEM, full ptx: \n{ptx}"
+    assert arrive_count_to_reg[1] != arrive_count_to_reg[3], f"invalid reuse of SMEM, full ptx: \n{ptx}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 # def test_mbarriers(BLOCK_SIZE, device):
 def test_named_wait_arrive(BLOCK_SIZE, device):
