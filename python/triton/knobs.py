@@ -360,6 +360,7 @@ class compilation_knobs(base_knobs):
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")
     # TODO: Use enum to constrain / 'typecheck' the values
     use_ir_loc: env_opt_str = env_opt_str("USE_IR_LOC")
+    use_ptx_loc: env_bool = env_bool("USE_PTX_LOC")
     enable_asan: env_bool = env_bool("TRITON_ENABLE_ASAN")
     disable_line_info: env_bool = env_bool("TRITON_DISABLE_LINE_INFO")
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
