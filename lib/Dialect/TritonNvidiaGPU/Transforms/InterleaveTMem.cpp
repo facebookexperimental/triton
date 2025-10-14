@@ -253,46 +253,108 @@ bool trySinkOp(Operation *op, Value buffer) {
   return sinkOps(buffer, useChain);
 }
 
-void sinkArriveBarriers(Operation *op);
-void sinkArriveBarriersInBlock(Block &block);
+void sinkArriveBarriers(
+    Operation *op, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap);
+void sinkArriveBarriersInBlock(
+    Block &block, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap);
 
-void sinkArriveBarriersInBlock(Block &block) {
+bool mayCommitToBarrier(Operation *op) {
+  // Note: Technically we only need to wait at a MMAv5OpInterface
+  // if it updates a completion barrier, but this doesn't exist
+  // in MMAv5OpInterface yet.
+  return isa<WaitBarrierOp, scf::ForOp, scf::IfOp, scf::YieldOp,
+             MMAv5OpInterface, TCGen5CommitOp>(op);
+}
+
+void sinkArriveBarriersInBlock(
+    Block &block, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
   SmallVector<ArriveBarrierOp> arrives;
+  DenseSet<Operation *> seenMemoryOps;
   // Collect the arrives for the block in reverse program order.
   for (auto it = block.rbegin(), e = block.rend(); it != e; ++it) {
     Operation *op = &*it;
     if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
       arrives.push_back(arrive);
+      DenseSet<Operation *> memoryOpsCopy(seenMemoryOps);
+      arriveMap.insert({arrive, memoryOpsCopy});
+    } else if (!isMemoryEffectFree(op)) {
+      seenMemoryOps.insert(op);
     }
-    sinkArriveBarriers(op);
+    sinkArriveBarriers(op, arriveMap);
   }
-  auto mustNotSyncPast = [](Operation *op) {
-    // Note: Technically we only need to wait at a MMAv5OpInterface
-    // if it updates a completion barrier, but this doesn't exist
-    // in MMAv5OpInterface yet.
-    return isa<ArriveBarrierOp, WaitBarrierOp, scf::ForOp, scf::IfOp,
-               scf::YieldOp, scf::YieldOp, MMAv5OpInterface, TCGen5CommitOp>(
-        op);
-  };
   // Sink each barrier.
   for (auto &arrive : arrives) {
     auto startit = mlir::Block::iterator(arrive);
     startit++;
+    Operation *prevLastOp = &*startit;
     Operation *lastOp;
     for (auto it = startit; it != block.end(); it++) {
       lastOp = &*it;
-      if (mustNotSyncPast(lastOp)) {
+      if (mayCommitToBarrier(lastOp)) {
         break;
       }
     }
-    arrive->moveBefore(lastOp);
+    if (prevLastOp != lastOp) {
+      arrive->moveBefore(lastOp);
+    } else {
+      // Delete the arrive if not moved.
+      arriveMap.erase(arrive);
+    }
   }
 }
 
-void sinkArriveBarriers(Operation *op) {
+void sinkArriveBarriers(
+    Operation *op,
+    DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
   for (mlir::Region &region : op->getRegions()) {
     for (mlir::Block &block : region) {
-      sinkArriveBarriersInBlock(block);
+      sinkArriveBarriersInBlock(block, arriveMap);
+    }
+  }
+}
+
+void hoistArriveBarriers(
+    DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
+  auto mustMaterialize = [&](Operation *op, DenseSet<Operation *> &safeMemOps,
+                             DenseSet<Operation *> &parentOps) {
+    if (safeMemOps.count(op)) {
+      return false;
+      // We explicitly check for ArriveBarrierOp becuase it has
+      // a memory effect but we know its safe to reorder. We cannot
+      // track with safeMemOps as the order may have changed.
+    } else if (isa<ArriveBarrierOp>(op)) {
+      return false;
+    } else if (mayCommitToBarrier(op)) {
+      return true;
+    } else if (parentOps.count(op) != 0) {
+      return true;
+    } else {
+      return !isMemoryEffectFree(op);
+    }
+  };
+
+  for (auto &[arrive, safeMemOps] : arriveMap) {
+    // Don't pull the arrive before any of its arguments defining ops.
+    DenseSet<Operation *> parentOps;
+    for (auto operand : arrive.getOperands()) {
+      auto definingOp = operand.getDefiningOp();
+      if (definingOp) {
+        parentOps.insert(definingOp);
+      }
+    }
+    auto block = arrive->getBlock();
+    auto startit = mlir::Block::reverse_iterator(arrive);
+    startit++;
+    Operation *prevPrior = &*startit;
+    Operation *priorOp;
+    for (auto it = startit; it != block->rend(); it++) {
+      priorOp = &*it;
+      if (mustMaterialize(priorOp, safeMemOps, parentOps)) {
+        break;
+      }
+    }
+    if (priorOp != prevPrior) {
+      arrive->moveAfter(priorOp);
     }
   }
 }
@@ -313,12 +375,14 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // 1. We will not attempt to sink past any control flow
     // (for, if, yield).
     // 2. We will not sink any barrier past a wait like operation
-    // (e.g. MMA,  WaitBarrier, Commit).
-    // 3. We will not sink past another arrive. This is not a requirement,
-    // but will help to simplify understanding the underlying code.
+    // (e.g. MMA,  WaitBarrier, Commit). We can sync past an arrive,
+    // which we allow to simplify code under the assumption that the
+    // hoist step will restore the order if there is any memory difference.
     //
-    // To combat the last condition, we will process each basic block in reverse
-    // order. This should push every arrive as deeply as possible.
+    // To enable hoisting the arrives again, we will process each basic block in
+    // reverse order to track the memory mutating operations that previously
+    // followed the arrive. These will be used to determine the safe position of
+    // the arrive.
     //
     // Let's briefly justify why this is always safe. The arrive defines the
     // point at which another warp/op can "consume" the buffer. If the buffer
@@ -329,7 +393,8 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // can only arise from an invalid program. If our consumer was stuck at a
     // wait because the arrive is non-blocking we could have modified that
     // buffer anyways.
-    sinkArriveBarriers(m);
+    DenseMap<ArriveBarrierOp, DenseSet<Operation *>> arriveMap;
+    sinkArriveBarriers(m, arriveMap);
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
       if (auto load = dyn_cast<TMEMLoadOp>(op))
@@ -342,6 +407,9 @@ struct TritonNvidiaGPUInterleaveTMemPass
         // Keep trying to sink loads and their users.
       }
     }
+    // Restore the arriver barriers back to minimize
+    // the number of impacted loads. This can reorder arrives.
+    hoistArriveBarriers(arriveMap);
   }
 };
 
