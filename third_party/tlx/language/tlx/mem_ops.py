@@ -226,7 +226,10 @@ def local_slice(
 
     if buffer.type.storage == tlx.storage_kind.tmem:
         # TMEM can only slice along the innermost dimension
-        return subslice(buffer, offset[-1], shape[-1], _semantic=_semantic)
+        assert len(offset) == 2 and len(shape) == 2
+        assert offset[0] == 0
+        assert shape[0] == buffer.type.shape[0]
+        return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
     else:
         slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
         return tlx.buffered_tensor(
