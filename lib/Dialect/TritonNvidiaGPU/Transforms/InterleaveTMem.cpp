@@ -260,10 +260,11 @@ void sinkArriveBarriersInBlock(Block &block) {
   SmallVector<ArriveBarrierOp> arrives;
   // Collect the arrives for the block in reverse program order.
   for (auto it = block.rbegin(), e = block.rend(); it != e; ++it) {
-    if (auto arrive = dyn_cast<ArriveBarrierOp>(it)) {
+    Operation *op = &*it;
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
       arrives.push_back(arrive);
     }
-    sinkArriveBarriers(&*it);
+    sinkArriveBarriers(op);
   }
   auto mustNotSyncPast = [](Operation *op) {
     // Note: Technically we only need to wait at a MMAv5OpInterface
@@ -328,7 +329,7 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // can only arise from an invalid program. If our consumer was stuck at a
     // wait because the arrive is non-blocking we could have modified that
     // buffer anyways.
-
+    sinkArriveBarriers(m);
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
       if (auto load = dyn_cast<TMEMLoadOp>(op))
