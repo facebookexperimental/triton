@@ -253,6 +253,49 @@ bool trySinkOp(Operation *op, Value buffer) {
   return sinkOps(buffer, useChain);
 }
 
+void sinkArriveBarriers(Operation *op);
+void sinkArriveBarriersInBlock(Block &block);
+
+void sinkArriveBarriersInBlock(Block &block) {
+  SmallVector<ArriveBarrierOp> arrives;
+  // Collect the arrives for the block in reverse program order.
+  for (auto it = block.rbegin(), e = block.rend(); it != e; ++it) {
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(it)) {
+      arrives.push_back(arrive);
+    }
+    sinkArriveBarriers(&*it);
+  }
+  auto mustNotSyncPast = [](Operation *op) {
+    // Note: Technically we only need to wait at a MMAv5OpInterface
+    // if it updates a completion barrier, but this doesn't exist
+    // in MMAv5OpInterface yet.
+    return isa<ArriveBarrierOp, WaitBarrierOp, scf::ForOp, scf::IfOp,
+               scf::YieldOp, scf::YieldOp, MMAv5OpInterface, TCGen5CommitOp>(
+        op);
+  };
+  // Sink each barrier.
+  for (auto &arrive : arrives) {
+    auto startit = mlir::Block::iterator(arrive);
+    startit++;
+    Operation *lastOp;
+    for (auto it = startit; it != block.end(); it++) {
+      lastOp = &*it;
+      if (mustNotSyncPast(lastOp)) {
+        break;
+      }
+    }
+    arrive->moveBefore(lastOp);
+  }
+}
+
+void sinkArriveBarriers(Operation *op) {
+  for (mlir::Region &region : op->getRegions()) {
+    for (mlir::Block &block : region) {
+      sinkArriveBarriersInBlock(block);
+    }
+  }
+}
+
 } // anonymous namespace
 
 struct TritonNvidiaGPUInterleaveTMemPass
@@ -269,10 +312,8 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // 1. We will not attempt to sink past any control flow
     // (for, if, yield).
     // 2. We will not sink any barrier past a wait like operation
-    // (e.g. MMA, commit, WaitBarrier, ProducerAcquire, ConsumerWait).
-    // 3. We will not sink any barrier past a fence (if these can exist)
-    // or a generic GPU barrier.
-    // 4. We will not sink past another arrive. This is not a requirement,
+    // (e.g. MMA,  WaitBarrier, Commit).
+    // 3. We will not sink past another arrive. This is not a requirement,
     // but will help to simplify understanding the underlying code.
     //
     // To combat the last condition, we will process each basic block in reverse
@@ -287,6 +328,7 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // can only arise from an invalid program. If our consumer was stuck at a
     // wait because the arrive is non-blocking we could have modified that
     // buffer anyways.
+
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
       if (auto load = dyn_cast<TMEMLoadOp>(op))
