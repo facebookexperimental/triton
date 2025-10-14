@@ -264,6 +264,29 @@ struct TritonNvidiaGPUInterleaveTMemPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+    // Try and sink any ArriveBarrierOps to allow more interleave.
+    // In general we use the following criteria for sinking:
+    // 1. We will not attempt to sink past any control flow
+    // (for, if, yield).
+    // 2. We will not sink any barrier past a wait like operation
+    // (e.g. MMA, commit, WaitBarrier, ProducerAcquire, ConsumerWait).
+    // 3. We will not sink any barrier past a fence (if these can exist)
+    // or a generic GPU barrier.
+    // 4. We will not sink past another arrive. This is not a requirement,
+    // but will help to simplify understanding the underlying code.
+    //
+    // To combat the last condition, we will process each basic block in reverse
+    // order. This should push every arrive as deeply as possible.
+    //
+    // Let's briefly justify why this is always safe. The arrive defines the
+    // point at which another warp/op can "consume" the buffer. If the buffer
+    // were no longer safe to consume, then either
+    //  1) We removed a required operation
+    //  2) An operation we push past modified the buffer so its not longer safe.
+    // 1 can't happen because we only sink and don't move past control flow. 2
+    // can only arise from an invalid program. If our consumer was stuck at a
+    // wait because the arrive is non-blocking we could have modified that
+    // buffer anyways.
     SmallVector<std::pair<Operation *, Value>> opsToSink;
     m.walk([&](Operation *op) {
       if (auto load = dyn_cast<TMEMLoadOp>(op))
