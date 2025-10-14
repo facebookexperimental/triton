@@ -33,7 +33,9 @@ configs = [
         {
             'BLOCK_M': 256, 'BLOCK_N': 128, 'NUM_BUFFERS_Q': 1, 'NUM_BUFFERS_KV': 3, 'NUM_BUFFERS_QK': 1,
             'NUM_MMA_GROUPS': 2, 'NUM_MMA_SLICES': 2
-        }, num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+        }, num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook,
+        # ir_override=f"/tmp/tmpsi4c_yf8.ptx",
+    ),
 ]
 
 
@@ -235,30 +237,24 @@ def _attn_fwd_ws(sm_scale, M,  #
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
                     tlx.barrier_wait(acc_empties[cid], phase)
-                    acc = tlx.local_load(acc_tiles[cid])
-                    acc = acc / l
-                    acc = acc.to(tlx.dtype_of(desc_o))
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
-                    tlx.local_store(o_tiles[cid], acc)
+                    scale = 1 / l
+                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                        subslice = tlx.subslice(
+                        acc_tiles[cid],
+                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                            HEAD_DIM // NUM_MMA_SLICES,
+                    )
+                        acc = tlx.local_load(subslice)
+                        acc = _mul_f32x2(acc, scale)
+                        acc = acc.to(tlx.dtype_of(desc_o))
+                        subslice_o = tlx.local_slice(
+                        o_tiles[cid],
+                            [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
+                            [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
+                    )
+                        tlx.local_store(subslice_o, acc)
                     tlx.barrier_arrive(o_fulls[cid])
-
-                tile_idx += num_progs
-
-        # epilog group
-        with tlx.async_task(num_warps=1, registers=24):
-            # initialize offsets
-            for i in range(0, tiles_per_sm):
-                # initialize offsets
-                start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
-                _, phase = _get_bufidx_phase(i, 1)
-                for cid in tl.static_range(0, NUM_MMA_GROUPS):
-                    tlx.barrier_wait(o_fulls[cid], phase)
-                    tlx.fence_async_shared()
-                    qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
-                    tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
-                    tlx.async_descriptor_store_wait(0)
-                    tlx.barrier_arrive(o_empties[cid])
 
                 tile_idx += num_progs
 
@@ -325,7 +321,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # mma group
-        with tlx.async_task(num_warps=1, registers=24):
+        with tlx.async_task(num_warps=1, registers=80):
             accum_cnt_kv = 0
             accum_cnt_qk = 0
 
@@ -461,7 +457,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # load
-        with tlx.async_task(num_warps=1, registers=24):
+        with tlx.async_task(num_warps=1, registers=80):
             accum_cnt_kv = 0
             for i in range(0, tiles_per_sm):
                 # initialize offsets
@@ -531,6 +527,30 @@ def _attn_fwd_ws(sm_scale, M,  #
                     accum_cnt_kv += 2
 
                 tile_idx += num_progs
+
+
+        # epilog group
+        with tlx.async_task(num_warps=1, registers=80):
+            # initialize offsets
+            for i in range(0, tiles_per_sm):
+                # initialize offsets
+                _, _, _, _, qo_offset_y, _ = _compute_offsets(
+                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
+                _, phase = _get_bufidx_phase(i, 1)
+                for cid in tl.static_range(0, NUM_MMA_GROUPS):
+                    tlx.barrier_wait(o_fulls[cid], phase)
+                    tlx.fence_async_shared()
+                    qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
+                    tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.barrier_arrive(o_empties[cid])
+
+                tile_idx += num_progs
+
+        # emtpy group
+        with tlx.async_task(num_warps=1, registers=24):
+            accum_cnt_qk = 0
+
 
 
 class _attention(torch.autograd.Function):
@@ -654,7 +674,7 @@ configs = []
 configs.append(
     triton.testing.Benchmark(
         x_names=["N_CTX"],
-        x_vals=[2**i for i in range(10, 15)],
+        x_vals=[8192],
         line_arg="provider",
         line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
         line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
