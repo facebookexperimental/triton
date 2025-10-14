@@ -542,6 +542,20 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       epilogOps.insert(&op);
     }
 
+    // Bail out if there's any barrier ops in epilogOps
+    bool hasBarrierOps = false;
+    for (auto op : epilogOps) {
+      if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp,
+              ttng::NamedBarrierArriveOp, ttng::NamedBarrierWaitOp,
+              ttng::AsyncCopyMbarrierArriveOp, gpu::BarrierOp>(op)) {
+        hasBarrierOps = true;
+        break;
+      }
+    }
+
+    if (hasBarrierOps)
+      continue;
+
     for (auto channel : channels) {
       if (epilogOps.contains(channel->getDstOp()))
         channelOps[channel->relation.first].push_back(channel->getDstOp());
@@ -574,6 +588,9 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
         storeBuckets[1].push_back(op);
     }
 
+    if (storeBuckets[0].size() != storeBuckets[1].size())
+      continue;
+
     // Reorder store operations in the sequence:
     //   bucket[0][N], bucket[1][N],
     //   bucket[0][N-1], bucket[1][N-1],
@@ -601,7 +618,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     assert(storeBuckets[0].empty() && storeBuckets[1].empty() &&
            "All stores must have been processed");
 
-    // Reorder stores op physically based on the computed order.
+    // Reorder stores op physically based on the computed
     for (unsigned i = 1; i < storeOps.size(); i++) {
       storeOps[i]->moveBefore(storeOps[i - 1]);
     }
