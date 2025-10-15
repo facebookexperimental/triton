@@ -371,8 +371,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # wait for the V buffer to be populated by the producer
                 tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
-                # As p shares the second half of the qk buffer, use p[2]/p[3]/p[6]p[7]
-                # p[0] p[1] p[2] p[3] p[4] p[5] p[6] p[7]
+                # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
+                # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                     tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
                     kv_slice = tlx.local_slice(
@@ -705,7 +705,7 @@ configs = []
 configs.append(
     triton.testing.Benchmark(
         x_names=["N_CTX"],
-        x_vals=[8192],
+        x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
         line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
         line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
