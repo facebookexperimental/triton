@@ -105,6 +105,10 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Value initVal,
   auto endit = storeOp->getBlock()->end();
   for (auto it = startit; it != endit; it++) {
     auto &op = *it;
+    if (isa<scf::ForOp, scf::YieldOp, scf::IfOp>(op)) {
+      // We don't support nested control flow.
+      return false;
+    }
     // Skip non-users.
     if (!isUser(op, bufferValue)) {
       continue;
