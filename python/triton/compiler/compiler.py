@@ -228,6 +228,29 @@ def _sanitize_extern_libs(options):
 # Facebook end T207797237
 
 
+def _replace_ptx_line_info(ptx_text: str, ptx_file_path: str) -> str:
+    lines = [line for line in ptx_text.split('\n') if not line.strip().startswith('.loc')]
+    # replace ".file"
+    for i in range(len(lines)):
+        line = lines[i]
+        if line.strip().startswith('.file'):
+            lines[i] = line.split('"')[0] + f'"{ptx_file_path}"'
+
+    i = 0
+    while i < len(lines):
+        # for iteration i, we're actually looking at file line i+1
+        if any(x in lines[i] for x in ('bar', 'sync', 'wait')):
+            # if i==1, insert ".loc\t1 3, 1" at file line 2, and original line 2 moves to line 3
+            lines.insert(i, f".loc\t1 {i+2} 1")
+            i += 2
+            continue
+        i += 1
+
+    with open(ptx_file_path, 'w') as f:
+        f.write('\n'.join(lines))
+    return '\n'.join(lines)
+
+
 def compile(src, target=None, options=None, _env_vars=None):
     compilation_listener = knobs.compilation.listener
     if compilation_listener:
@@ -340,6 +363,11 @@ def compile(src, target=None, options=None, _env_vars=None):
         # If TRITON_STORE_BINARY_ONLY is 1, only store cubin/hsaco/json
         if (not store_only_binary) or (ext in ("cubin", "hsaco", "json")):
             metadata_group[ir_filename] = fn_cache_manager.put(next_module, ir_filename)
+
+        if knobs.compilation.use_ptx_loc and ext == 'ptx':
+            assert type(next_module) is str, f"expecting str ptx, but got {type(next_module)}"
+            full_ptx_path = fn_cache_manager.get_file(ir_filename).replace('.ptx', '.modifiled.ptx')
+            next_module = _replace_ptx_line_info(next_module, full_ptx_path)
         if fn_dump_manager is not None:
             fn_dump_manager.put(next_module, ir_filename)
             if ext == "cubin":
