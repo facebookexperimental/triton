@@ -38,13 +38,13 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
-void collectCorrectnessUsers(Value value, SmallVector<Operation *> &users) {
+void collectCorrectnessUsers(Value value, DenseSet<Operation *> &users) {
   // Collect all users that may impact correctness.
   for (auto user : value.getUsers()) {
     if (isa<scf::ForOp, scf::YieldOp>(user)) {
-      users.push_back(user);
+      users.insert(user);
     } else if (!isMemoryEffectFree(user)) {
-      users.push_back(user);
+      users.insert(user);
     } else {
       for (auto result : user->getResults()) {
         collectCorrectnessUsers(result, users);
@@ -65,7 +65,7 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Value initVal,
   // 2. Any Operation that can load from memory.
   // 3. Any value passed into a Loop.
   // 4. Any value loop carried value via yield.
-  SmallVector<Operation *> correctnessUsers;
+  DenseSet<Operation *> correctnessUsers;
   collectCorrectnessUsers(initVal, correctnessUsers);
   if (correctnessUsers.size() == 0) {
     return true;
@@ -74,7 +74,9 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Value initVal,
     // This is not a strict requirement.
     return false;
   }
-  TMEMTokenStoreOp storeOp = dyn_cast<TMEMTokenStoreOp>(correctnessUsers[0]);
+  SmallVector<Operation *> keptUsers(correctnessUsers.begin(),
+                                     correctnessUsers.end());
+  TMEMTokenStoreOp storeOp = dyn_cast<TMEMTokenStoreOp>(keptUsers[0]);
   if (!storeOp) {
     // We only support TMEM patterns at this time. This is not a strict
     // requirement.
@@ -139,7 +141,7 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Value initVal,
         if (blockVal.getOwner() != parentFor.getBody()) {
           return false;
         }
-        // Use -1 because of the extra inserted argument in the pass.
+        // Use -1 because of the Induction variable.
         useAccum = parentFor.getInitArgs()[blockVal.getArgNumber() - 1];
       }
       auto useAccumOp = useAccum.getDefiningOp();
@@ -506,14 +508,16 @@ public:
 
     // Create a store before the loop to write the initial value.
     int argNo = use.getOperandNumber();
-    Value initVal = forOp.getInitArgs()[argNo];
+    // Add 1 to account for the induction variable.
+    auto loopArg = forOp.getBody()->getArgument(argNo + 1);
     // Eliminate the store step if the original store is clobbered by an MMA
     // operation.
-    bool elimStore = isInitialStoreUnused(initAlloc, initVal, forOp);
+    bool elimStore = isInitialStoreUnused(initAlloc, loopArg, forOp);
     auto tokType = rewriter.getType<AsyncTokenType>();
     if (!elimStore) {
       rewriter.setInsertionPoint(forOp);
       auto vTrue = rewriter.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
+      Value initVal = forOp.getInitArgs()[argNo];
       auto initStore = rewriter.create<ttng::TMEMStoreOp>(
           load.getLoc(), tokType, load.getSrc(), initAlloc.getToken(), initVal,
           vTrue);
