@@ -258,12 +258,20 @@ void sinkArriveBarriers(
 void sinkArriveBarriersInBlock(
     Block &block, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap);
 
+void hoistArriveBarriersInBlock(
+    Block &block, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap);
+void hoistArriveBarriers(
+    Operation *op, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap);
+
 bool mayCommitToBarrier(Operation *op) {
   // Note: Technically we only need to wait at a MMAv5OpInterface
   // if it updates a completion barrier, but this doesn't exist
   // in MMAv5OpInterface yet.
   return isa<WaitBarrierOp, scf::ForOp, scf::IfOp, scf::YieldOp,
-             MMAv5OpInterface, TCGen5CommitOp>(op);
+             MMAv5OpInterface, TCGen5CommitOp, ArriveBarrierOp,
+             // Since Barriers are in SMEM we avoid possible aliasing ops
+             InitBarrierOp, gpu::LocalStoreOp, gpu::LocalAllocOp,
+             gpu::LocalLoadOp>(op);
 }
 
 void sinkArriveBarriersInBlock(
@@ -313,16 +321,24 @@ void sinkArriveBarriers(
   }
 }
 
-void hoistArriveBarriers(
-    DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
+void hoistArriveBarriersInBlock(
+    Block &block, DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
+
+  SmallVector<ArriveBarrierOp> arrives;
+  // Collect the Arrives for a block in program order.
+  for (auto it = block.rbegin(), e = block.rend(); it != e; ++it) {
+    Operation *op = &*it;
+    if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
+      if (arriveMap.count(arrive)) {
+        arrives.push_back(arrive);
+      }
+    }
+    hoistArriveBarriers(op, arriveMap);
+  }
+
   auto mustMaterialize = [&](Operation *op, DenseSet<Operation *> &safeMemOps,
                              DenseSet<Operation *> &parentOps) {
     if (safeMemOps.count(op)) {
-      return false;
-      // We explicitly check for ArriveBarrierOp becuase it has
-      // a memory effect but we know its safe to reorder. We cannot
-      // track with safeMemOps as the order may have changed.
-    } else if (isa<ArriveBarrierOp>(op)) {
       return false;
     } else if (mayCommitToBarrier(op)) {
       return true;
@@ -333,8 +349,9 @@ void hoistArriveBarriers(
     }
   };
 
-  for (auto &[arrive, safeMemOps] : arriveMap) {
-    // Don't pull the arrive before any of its arguments defining ops.
+  // Hoist each arrive.
+  for (auto &arrive : arrives) {
+    auto safeMemOps = arriveMap[arrive];
     DenseSet<Operation *> parentOps;
     for (auto operand : arrive.getOperands()) {
       auto definingOp = operand.getDefiningOp();
@@ -342,12 +359,11 @@ void hoistArriveBarriers(
         parentOps.insert(definingOp);
       }
     }
-    auto block = arrive->getBlock();
     auto startit = mlir::Block::reverse_iterator(arrive);
     startit++;
     Operation *prevPrior = &*startit;
     Operation *priorOp;
-    for (auto it = startit; it != block->rend(); it++) {
+    for (auto it = startit; it != block.rend(); it++) {
       priorOp = &*it;
       if (mustMaterialize(priorOp, safeMemOps, parentOps)) {
         break;
@@ -355,6 +371,16 @@ void hoistArriveBarriers(
     }
     if (priorOp != prevPrior) {
       arrive->moveAfter(priorOp);
+    }
+  }
+}
+
+void hoistArriveBarriersInBlock(
+    Operation *op,
+    DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
+  for (mlir::Region &region : op->getRegions()) {
+    for (mlir::Block &block : region) {
+      sinkArriveBarriersInBlock(block, arriveMap);
     }
   }
 }
@@ -375,14 +401,17 @@ struct TritonNvidiaGPUInterleaveTMemPass
     // 1. We will not attempt to sink past any control flow
     // (for, if, yield).
     // 2. We will not sink any barrier past a wait like operation
-    // (e.g. MMA,  WaitBarrier, Commit). We can sync past an arrive,
-    // which we allow to simplify code under the assumption that the
-    // hoist step will restore the order if there is any memory difference.
+    // (e.g. MMA,  WaitBarrier, Commit).
+    // 3. We cannot reorder the arrives, as one can safely wait on
+    // an arrive to depend on a consistent memory state. In particular,
+    // the earlier arrive is a load that must be completed by the time
+    // we reach the next arrive. To enable this we start at the bottom
+    // of each basic block.
     //
-    // To enable hoisting the arrives again, we will process each basic block in
-    // reverse order to track the memory mutating operations that previously
-    // followed the arrive. These will be used to determine the safe position of
-    // the arrive.
+    // To enable hoisting the arrives again and keeping, we will process each
+    // basic block in reverse order to track the memory mutating operations that
+    // previously followed the arrive. These will be used to determine the safe
+    // position of the arrive.
     //
     // Let's briefly justify why this is always safe. The arrive defines the
     // point at which another warp/op can "consume" the buffer. If the buffer
@@ -409,7 +438,7 @@ struct TritonNvidiaGPUInterleaveTMemPass
     }
     // Restore the arriver barriers back to minimize
     // the number of impacted loads. This can reorder arrives.
-    hoistArriveBarriers(arriveMap);
+    hoistArriveBarriers(m, arriveMap);
   }
 };
 
