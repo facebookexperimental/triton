@@ -236,6 +236,41 @@ static bool rematerializeOp(Operation *op, DataPartitionScheme &partitionScheme,
   return false;
 }
 
+// Given shape1 and shape2, where shape1 value is the unsqueezed
+// shape and shape2 is the squeezed shape, determine a mapping from
+// an origDim to the other dim. When unsqueeze=True we are mapping
+// from shape2 to shape1, but when unsqueeze=False we are mapping
+// from shape1 to shape2.
+static unsigned remappedSqueezedDim(SmallVector<int64_t> &shape1,
+                                    SmallVector<int64_t> &shape2,
+                                    unsigned origDim, bool unsqueeze) {
+  if (shape1.size() == shape2.size()) {
+    return origDim;
+  }
+  // Total is currDim + offset when unsqueeze = False
+  // and currDim when unsqueeze = True
+  unsigned total = 0;
+  unsigned currDim = 0;
+  unsigned offset = 0;
+  while (total <= origDim) {
+    if (shape1[currDim + offset] == shape2[currDim]) {
+      currDim++;
+      total++;
+    } else {
+      assert(shape1[currDim + offset] == 1);
+      offset++;
+      if (!unsqueeze) {
+        total++;
+      }
+    }
+  }
+  if (unsqueeze) {
+    return origDim + offset;
+  } else {
+    return origDim - offset;
+  }
+}
+
 static bool getBackwardSliceToPartition(Value v,
                                         DataPartitionScheme &partitionScheme,
                                         unsigned currentDim) {
@@ -280,14 +315,22 @@ static bool getBackwardSliceToPartition(Value v,
     }
 
     // Recusively process operands backwards.
-    if (op->hasTrait<OpTrait::Elementwise>() ||
-        isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
-            BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp, ConvertLayoutOp,
-            triton::gpu::LocalAllocOp, LoadOp, TransOp, MemDescTransOp,
-            AtomicRMWOp, triton::AddPtrOp, DescriptorLoadOp,
-            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
-            nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp, ReshapeOp>(
-            op)) {
+    if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
+      auto outputShape = getShape(loadOp.getResult());
+      auto inputShape = getShape(loadOp.getDesc());
+      unsigned remappedDim =
+          remappedSqueezedDim(inputShape, outputShape, currentDim, true);
+      if (!getBackwardSliceToPartition(loadOp.getDesc(), partitionScheme,
+                                       remappedDim))
+        return false;
+    } else if (op->hasTrait<OpTrait::Elementwise>() ||
+               isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
+                   arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
+                   SplatOp, ConvertLayoutOp, triton::gpu::LocalAllocOp, LoadOp,
+                   TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
+                   nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
+                   nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
+                   ReshapeOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
@@ -361,6 +404,17 @@ static bool getForwardSliceToPartition(Value v,
                                        unsigned currentDim,
                                        DenseSet<Value> &seen) {
   assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
+  auto op = v.getDefiningOp();
+  if (op) {
+    if (auto expandDimsOp = dyn_cast<ExpandDimsOp>(op)) {
+      if (currentDim != DataPartitionScheme::noOpPartitionDim &&
+          currentDim >= expandDimsOp.getAxis()) {
+        currentDim += 1;
+        // Update the result for expand dims
+        partitionScheme.opPartitionDims[op] = currentDim;
+      }
+    }
+  }
   if (!seen.insert(v).second)
     return true;
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
@@ -498,8 +552,19 @@ static bool getSliceToPartition(Value root,
     currentDim = partitionScheme.opPartitionDims[op];
     if (currentDim == DataPartitionScheme::noOpPartitionDim)
       continue;
-    if (op->hasTrait<OpTrait::Elementwise>() ||
-        isa<StoreOp, DescriptorStoreOp, AtomicRMWOp>(op)) {
+    if (auto descStoreOp = dyn_cast<DescriptorStoreOp>(op)) {
+      auto inputShape = getShape(descStoreOp.getSrc());
+      auto outputShape = getShape(descStoreOp.getDesc());
+      unsigned remappedDim =
+          remappedSqueezedDim(outputShape, inputShape, currentDim, false);
+      if (!getBackwardSliceToPartition(descStoreOp.getDesc(), partitionScheme,
+                                       currentDim))
+        return false;
+      if (!getBackwardSliceToPartition(descStoreOp.getSrc(), partitionScheme,
+                                       remappedDim))
+        return false;
+    } else if (op->hasTrait<OpTrait::Elementwise>() ||
+               isa<StoreOp, AtomicRMWOp>(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
         if (!getBackwardSliceToPartition(operand.get(), partitionScheme,
                                          currentDim))
