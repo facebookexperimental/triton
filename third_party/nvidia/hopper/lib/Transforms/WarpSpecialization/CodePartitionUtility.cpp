@@ -1250,8 +1250,8 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
 // explicitly waiting on that barrier.
 //
 // For now we just implement this for TCGEN05 Commit as it matches our
-// desired initial use case, but the logic here generalizes to arrive as
-// well for inline barriers.
+// desired initial use case, but the logic here generalizes to regular
+// arrive as well with some modifications.
 //
 
 void predicateInitialWaits(triton::FuncOp &funcOp) {}
