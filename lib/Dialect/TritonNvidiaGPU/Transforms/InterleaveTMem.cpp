@@ -375,7 +375,7 @@ void hoistArriveBarriersInBlock(
   }
 }
 
-void hoistArriveBarriersInBlock(
+void hoistArriveBarriers(
     Operation *op,
     DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
   for (mlir::Region &region : op->getRegions()) {
