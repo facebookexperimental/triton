@@ -490,6 +490,175 @@ void reorderProducerOps(SmallVector<Channel *> &channels) {
   });
 }
 
+// Reorder operations in epilogs to pack ops on a dependency chain as close as
+// possible.
+void reorderEpilogOps(const SmallVector<Channel *> &channels,
+                      triton::FuncOp funcOp) {
+
+  llvm::SetVector<Block *> epliogBlocks;
+  funcOp->walk([&](Operation *op) {
+    if (isa<tt::DescriptorStoreOp, tt::StoreOp>(op)) {
+      epliogBlocks.insert(op->getBlock());
+    }
+  });
+
+  auto lastInBlockOperand = [](Operation *op) {
+    Operation *lastOperandOp = nullptr;
+    for (auto opnd : op->getOperands()) {
+      if (auto defOp = opnd.getDefiningOp()) {
+        if (defOp->getBlock() != op->getBlock())
+          continue;
+        if (!lastOperandOp || !defOp->isBeforeInBlock(lastOperandOp))
+          lastOperandOp = defOp;
+      }
+    }
+    return lastOperandOp;
+  };
+
+  auto firstInBlockUser = [](Operation *op) {
+    Operation *firstUser = nullptr;
+    for (Operation *user : op->getUsers()) {
+      if (user->getBlock() != op->getBlock())
+        continue;
+      if (!firstUser || user->isBeforeInBlock(firstUser))
+        firstUser = user;
+    }
+    return firstUser;
+  };
+
+  for (auto block : epliogBlocks) {
+    LLVM_DEBUG({
+      LDBG("\n");
+      LDBG("reordering epilog block");
+      block->dump();
+      LDBG("\n");
+    });
+    // Find the last scf::ForOp in the block
+    SetVector<Operation *> epilogOps;
+    std::map<AsyncTaskId, SmallVector<Operation *>> channelOps;
+    for (Operation &op : reverse(*block)) {
+      if (isa<scf::ForOp, scf::IfOp>(op))
+        break;
+      epilogOps.insert(&op);
+    }
+
+    // Bail out if there's any barrier ops in epilogOps
+    bool hasBarrierOps = false;
+    for (auto op : epilogOps) {
+      if (isa<ttng::WaitBarrierOp, ttng::ArriveBarrierOp,
+              ttng::NamedBarrierArriveOp, ttng::NamedBarrierWaitOp,
+              ttng::AsyncCopyMbarrierArriveOp, gpu::BarrierOp>(op)) {
+        hasBarrierOps = true;
+        break;
+      }
+    }
+
+    if (hasBarrierOps)
+      continue;
+
+    for (auto channel : channels) {
+      if (epilogOps.contains(channel->getDstOp()))
+        channelOps[channel->relation.first].push_back(channel->getDstOp());
+    }
+
+    // Streamline ops on a channel chain.
+    // Starting with producers with smaller task ids, moving forward
+    // dependencies of the consumer ops close to the them.
+    for (auto item : channelOps) {
+      for (auto op : item.second) {
+        SetVector<Operation *> forwardSlice;
+        (void)getForwardSlice(op, &forwardSlice);
+        for (auto &depOp : reverse(forwardSlice)) {
+          if (!epilogOps.contains(depOp))
+            continue;
+          // push depOp to be right after its operands
+          auto lastOpndOp = lastInBlockOperand(depOp);
+          if (lastOpndOp)
+            depOp->moveAfter(lastOpndOp);
+        }
+      }
+    }
+
+    // Group store ops based on types.
+    SmallVector<SmallVector<Operation *, 2>, 2> storeBuckets(2);
+    for (auto op : reverse(epilogOps)) {
+      if (isa<tt::DescriptorStoreOp>(op))
+        storeBuckets[0].push_back(op);
+      if (isa<tt::StoreOp>(op))
+        storeBuckets[1].push_back(op);
+    }
+
+    if (storeBuckets[0].size() != storeBuckets[1].size())
+      continue;
+
+    // Reorder store operations in the sequence:
+    //   bucket[0][N], bucket[1][N],
+    //   bucket[0][N-1], bucket[1][N-1],
+    //   ...
+    //   bucket[0][0], bucket[1][0].
+    //
+    // This ordering aligns with the expected producer pattern, where
+    // producers of bucket[0][0], bucket[1][0], ... complete earlier than
+    // those of bucket[0][1], bucket[1][1], and so on. By reordering the
+    // stores in this manner, we ensure that operations finish as early as
+    // possible overall.
+    SmallVector<Operation *> storeOps;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto &store : storeBuckets) {
+        if (!store.empty()) {
+          storeOps.push_back(store.back());
+          store.pop_back();
+          changed = true;
+        }
+      }
+    }
+
+    assert(storeBuckets[0].empty() && storeBuckets[1].empty() &&
+           "All stores must have been processed");
+
+    // Reorder stores op physically based on the computed
+    for (unsigned i = 1; i < storeOps.size(); i++) {
+      storeOps[i]->moveBefore(storeOps[i - 1]);
+    }
+
+    // Streamline ops on a store chain
+    // For each store op, move backward dependencies close to the op.
+    // Start from the last store op backwards and move backward slice to
+    // before each op. This guarantees that the backward slice of each op is
+    // scheduled as late as possible.
+    for (auto storeOp : storeOps) {
+      BackwardSliceOptions opt;
+      opt.omitBlockArguments = true;
+      SetVector<Operation *> backwardSlice;
+      (void)getBackwardSlice(storeOp, &backwardSlice, opt);
+      for (auto &depOp : reverse(backwardSlice)) {
+        if (!epilogOps.contains(depOp))
+          continue;
+        // push depOp to be right before its first user
+        auto firstUser = firstInBlockUser(depOp);
+        if (firstUser)
+          depOp->moveBefore(firstUser);
+      }
+    }
+
+    LLVM_DEBUG({
+      LDBG("\n");
+      LDBG("reordered epilog block");
+      block->dump();
+      LDBG("\n");
+    });
+  }
+
+  LLVM_DEBUG({
+    LDBG("\n");
+    LDBG("after reordering epilog ops");
+    funcOp.dump();
+    LDBG("\n");
+  });
+}
+
 // Find top-level ops which contain at least one channel. If a channel's
 // getSrcOp() and getDstOp() belong to the inner loop, the outer loop will be
 // part of asyncTaskOps.
@@ -2463,7 +2632,10 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
     return;
   }
 
-  // Step 2: Create buffers. A buffer for each channel.
+  // Step 2: Reorder ops based on channel information.
+  reorderEpilogOps(channels, funcOp);
+
+  // Step 3: Create buffers. A buffer for each channel.
   createBuffer(channels, funcOp);
 }
 
