@@ -13,9 +13,25 @@ DenseMap<ttng::MMAv5OpInterface, int> determineMMAPriority(tt::FuncOp &funcOp) {
   return mmaPriority;
 }
 
+// Collect all MMA users of a given OP.
+// When you have OP -> MMA -> MMA only the first MMA is included.
+void collectOpInitialMMAUsers(Operation *op,
+                              SmallVector<ttng::MMAv5OpInterface> &users) {
+  for (auto user : op->getUsers()) {
+    if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(user)) {
+      users.push_back(mma);
+    } else {
+      collectOpInitialMMAUsers(user, users);
+    }
+  }
+}
+
+// Collect all the MMA users derived from the tt::DescriptorLoadOp.
+// When you have load -> MMA -> MMA only the first MMA is included.
 SmallVector<ttng::MMAv5OpInterface>
-collectMMAUsers(tt::DescriptorLoadOp &loadOp) {
+collectInitialMMAUsers(tt::DescriptorLoadOp &loadOp) {
   SmallVector<ttng::MMAv5OpInterface> users;
+  collectOpInitialMMAUsers(loadOp, users);
   return users;
 }
 
@@ -28,7 +44,7 @@ void annotateLoads(tt::FuncOp &funcOp) {
       return;
     }
     // Assign a load to its earliest user.
-    auto users = collectMMAUsers(loadOp);
+    auto users = collectInitialMMAUsers(loadOp);
     int priority = mmaPriority.size();
     for (auto &user : users) {
       if (!mmaPriority.count(user)) {
