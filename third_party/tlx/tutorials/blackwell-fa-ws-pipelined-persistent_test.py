@@ -583,10 +583,6 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                 tile_idx += num_progs
 
-        # emtpy group
-        with tlx.async_task(num_warps=1, registers=24):
-            accum_cnt_qk = 0
-
 
 class _attention(torch.autograd.Function):
 
