@@ -38,35 +38,56 @@ using TMEMTokenLoadOp = HasToken<ttng::TMEMLoadOp>;
 using TMEMTokenStoreOp = HasToken<ttng::TMEMStoreOp>;
 using TMEMTokenAllocOp = HasToken<ttng::TMEMAllocOp>;
 
+void collectCorrectnessUsers(Value value, SmallVector<Operation *> &users) {
+  // Collect all users that may impact correctness.
+  for (auto user : value.getUsers()) {
+    if (isa<scf::ForOp, scf::YieldOp>(user)) {
+      users.push_back(user);
+    } else if (!isMemoryEffectFree(user)) {
+      users.push_back(user);
+    } else {
+      for (auto result : user->getResults()) {
+        collectCorrectnessUsers(result, users);
+      }
+    }
+  }
+}
+
 // Determine if a store operation is overridden by an MMA op that
 // will ignore the accumulator. Whenever the accumulator is ignored
 // the load should be predicated.
-bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
+bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Value initVal,
                           scf::ForOp parentFor) {
-  Value bufferValue = allocOp->getResults()[0];
-  // Look for exactly one store. If there are multiple stores, we can't
-  // match accurately. An MMA could replace a store, but the initial
-  // value is based on the original store.
-  TMEMTokenStoreOp storeOp = nullptr;
-  for (auto user : bufferValue.getUsers()) {
-    if (auto store = dyn_cast<TMEMTokenStoreOp>(user)) {
-      // Only support a single store.
-      if (storeOp) {
-        return false;
-      }
-      storeOp = store;
-    }
+
+  // Determine all users of the initial value that may impact correctness.
+  // Right now we define these operations as:
+  // 1. Any Operation that can store to memory.
+  // 2. Any Operation that can load from memory.
+  // 3. Any value passed into a Loop.
+  // 4. Any value loop carried value via yield.
+  SmallVector<Operation *> correctnessUsers;
+  collectCorrectnessUsers(initVal, correctnessUsers);
+  if (correctnessUsers.size() == 0) {
+    return true;
+  } else if (correctnessUsers.size() != 1) {
+    // Currently this is only implemented for a single value.
+    // This is not a strict requirement.
+    return false;
   }
+  TMEMTokenStoreOp storeOp = dyn_cast<TMEMTokenStoreOp>(correctnessUsers[0]);
   if (!storeOp) {
+    // We only support TMEM patterns at this time. This is not a strict
+    // requirement.
     return false;
   }
-  // Verify the store and load are in the same block. Otherwise it
-  // would be more complicated to prove the store is unused.
-  if (storeOp->getBlock() != loadOp->getBlock()) {
+
+  Value bufferValue = allocOp->getResults()[0];
+  if (storeOp.getDst() != bufferValue) {
+    // Right now we require the intended store
+    // to modify the same buffer as the allocation
+    // for the load.
     return false;
   }
-  // Iterate in program order. Try and find a user
-  // that clobbers the result before.
   auto isUser = [](Operation &op, Value val) -> bool {
     for (auto operand : op.getOperands()) {
       if (operand == val) {
@@ -75,11 +96,11 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
     }
     return false;
   };
+  // Iterate in program order. Try and find a user
+  // that clobbers the result before use.
   auto startit = mlir::Block::iterator(storeOp);
   startit++;
-  auto endit = mlir::Block::iterator(loadOp);
-  // Iterate in program order. If we find a user before
-  // the result is clobbered then we can't match.
+  auto endit = storeOp->getBlock()->end();
   for (auto it = startit; it != endit; it++) {
     auto &op = *it;
     // Skip non-users.
@@ -135,7 +156,8 @@ bool isInitialStoreUnused(TMEMTokenAllocOp allocOp, Operation *loadOp,
     // Some other undefined or unsupported use.
     return false;
   }
-  // Didn't find a user, exit.
+  // Didn't find a user in this block. Be conservative and assume there
+  // might be a user in another block.
   return false;
 }
 
@@ -482,14 +504,14 @@ public:
       return failure();
     // TODO: 3. The live-in value of the TMEM variable is never read.
 
-    // Eliminate the store step if the original store is clobbered by an MMA
-    // operation.
-    bool elimStore = isInitialStoreUnused(initAlloc, load, forOp);
     // Create a store before the loop to write the initial value.
     int argNo = use.getOperandNumber();
+    Value initVal = forOp.getInitArgs()[argNo];
+    // Eliminate the store step if the original store is clobbered by an MMA
+    // operation.
+    bool elimStore = isInitialStoreUnused(initAlloc, initVal, forOp);
     auto tokType = rewriter.getType<AsyncTokenType>();
     if (!elimStore) {
-      Value initVal = forOp.getInitArgs()[argNo];
       rewriter.setInsertionPoint(forOp);
       auto vTrue = rewriter.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
       auto initStore = rewriter.create<ttng::TMEMStoreOp>(
