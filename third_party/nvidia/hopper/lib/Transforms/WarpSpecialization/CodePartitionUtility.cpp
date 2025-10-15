@@ -1208,4 +1208,52 @@ void fuseTcgen05CommitBarriers(tt::FuncOp &funcOp) {
   }
 }
 
+// Predicate the waits that are used in the first iteration
+// of a for loop. To do this we seek to prove the following
+// properties:
+// 1. The wait Buffer value is intialized to match the initial
+// phase outside the loop.
+// 2. For every iteration of the loop, there is a pair of wait, acquire
+// on the same buffer at the same buffer index. The exact count doesn't matter,
+// but for no buffer index should acquire count exceed wait count.
+// 3. There exists a wait acquire pair that puts all the loop barriers in a
+// "transaction". In effect this barrier's result dominates the others.
+// 4. For a given buffer all acquires are in the same async task and all waits
+// are in the same async task, which must be shared with the dominant barrier.
+// Technically this is not be strict requirement if you can prove the buffers
+// are disjoint (e.g. the index doesn't move), but we won't support that case
+// for now.
+//
+// With all of these constraints met, we can provably show that on the first
+// iteration of the loop is unnecessary. We will apply a predicate, which
+// eventually will be based on the loop scheduling information.
+//
+// Its worth briefly explaining step 3. We are looking for code with the
+// following structure:
+//
+// SomeWaitOp {task=i}
+// ...
+// for
+//    ...
+// ...
+// SomeArriveOp {task=j}
+//
+// When we do this, we know that loop iteration k - 1 has finished
+// when we reach the wait in iteration k. The one exception is async
+// ops which do not depend on control flow, so for those inside the
+// loop we depend on the type of arriveOp:
+//
+// Arrive Barrier: Only regular Arrive + Wait
+// TCGEN05 Commit: Regular Arrive + Wait + MMA
+//
+// Note: No op can guarentee there are no outstanding TMA ops without
+// explicitly waiting on that barrier.
+//
+// For now we just implement this for TCGEN05 Commit as it matches our
+// desired initial use case, but the logic here generalizes to arrive as
+// well for inline barriers.
+//
+
+void predicateInitialWaits(triton::FuncOp &funcOp) {}
+
 } // namespace mlir
