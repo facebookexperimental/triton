@@ -326,7 +326,7 @@ void hoistArriveBarriersInBlock(
 
   SmallVector<ArriveBarrierOp> arrives;
   // Collect the Arrives for a block in program order.
-  for (auto it = block.rbegin(), e = block.rend(); it != e; ++it) {
+  for (auto it = block.begin(), e = block.end(); it != e; ++it) {
     Operation *op = &*it;
     if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
       if (arriveMap.count(arrive)) {
@@ -380,7 +380,7 @@ void hoistArriveBarriers(
     DenseMap<ArriveBarrierOp, DenseSet<Operation *>> &arriveMap) {
   for (mlir::Region &region : op->getRegions()) {
     for (mlir::Block &block : region) {
-      sinkArriveBarriersInBlock(block, arriveMap);
+      hoistArriveBarriersInBlock(block, arriveMap);
     }
   }
 }
