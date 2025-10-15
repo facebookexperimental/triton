@@ -158,6 +158,52 @@ def test_local_load(BLOCK_SIZE, device):
     torch.testing.assert_close(x + y, output)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(4)])
+def test_local_slice(BLOCK_SIZE, device):
+
+    @triton.jit
+    def local_load(
+        x_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        x_ptr_offsets = x_ptr + offsets
+
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+        tlx.async_load(x_ptr_offsets, buffers[0])
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+        buffer_0 = tlx.local_slice(buffers[0], [0], [BLOCK_SIZE // 2])
+        buffer_1 = tlx.local_slice(buffers[0], [BLOCK_SIZE // 2], [BLOCK_SIZE // 2])
+        x_0 = tlx.local_load(buffer_0)
+        x_1 = tlx.local_load(buffer_1)
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE // 2)
+        output_ptr_offsets = output_ptr + offsets
+        tl.store(output_ptr_offsets, x_0)
+        tl.store(output_ptr_offsets + BLOCK_SIZE // 2, x_1)
+
+    torch.manual_seed(0)
+    size = 4
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = local_load[grid](x, output, n_elements, BLOCK_SIZE)
+    assert kernel.asm["ttgir"].count("ttg.local_alloc") == 1
+    assert kernel.asm["ttgir"].count("ttg.memdesc_index") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
+    assert kernel.asm["ttgir"].count("ttg.async_wait") == 1
+    assert kernel.asm["ttgir"].count("ttg.local_load") == 2
+    torch.testing.assert_close(x, output)
+
+
 def _generate_test_params():
     """Generate test parameters with filtering for memory constraints."""
     dims_mn = [16, 32, 64, 128, 512]
@@ -450,7 +496,7 @@ def test_tmem_subslice(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
         subslice1 = tlx.subslice(buffer1, 0, BLOCK_SIZE_N // 4)
         subslice2 = tlx.subslice(buffer1, BLOCK_SIZE_N // 4, BLOCK_SIZE_N // 4)
         subslice3 = tlx.subslice(buffer1, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 4)
-        subslice4 = tlx.subslice(buffer1, 3 * BLOCK_SIZE_N // 4, BLOCK_SIZE_N // 4)
+        subslice4 = tlx.local_slice(buffer1, [0, 3 * BLOCK_SIZE_N // 4], [BLOCK_SIZE_M, BLOCK_SIZE_N // 4])
 
         b1 = tlx.local_load(subslice1)
         b2 = tlx.local_load(subslice2)
