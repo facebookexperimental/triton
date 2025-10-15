@@ -229,8 +229,7 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     ReuseConfig *config, int reuseGroupIdx);
 std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                              Location loc, Value accumCnt,
-                                             unsigned numBuffers,
-                                             Operation *op);
+                                             unsigned numBuffers);
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
@@ -238,8 +237,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           int reuseGroupIdx, Channel *ch);
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
-                                 Value barrierAlloc, Value bufferIdx,
-                                 Operation *op);
+                                 Value barrierAlloc, Value bufferIdx);
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,
@@ -259,6 +257,7 @@ Operation *getSameLevelOp(Operation *p, Operation *c);
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier = true);
+void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_

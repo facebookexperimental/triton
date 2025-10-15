@@ -275,11 +275,15 @@ public:
       }
       return isInnermostLoop(first->getParentOfType<scf::ForOp>());
     };
+    // Keep track of unique element types. We don't support casting between
+    // different element types.
+    DenseMap<int, Type> idTypes;
     for (auto bufferIter : bufferRange) {
       Operation *owner = bufferIter.first->owner;
       auto sAlloc = cast<ttg::LocalAllocOp>(owner);
       auto aType = sAlloc.getType();
       auto allocDescType = cast<triton::gpu::MemDescType>(aType);
+      auto elemType = aType.getElementType();
       // FIXME: reuse for buffers in inner most loop, set copy to numBuffers,
       // when the shape is 2D.
       unsigned numD = 0;
@@ -292,6 +296,14 @@ public:
           bufferIdInnermost = bufferId;
           ++bufferId;
         }
+        if (idTypes.count(bufferIdInnermost) == 0) {
+          idTypes[bufferIdInnermost] = elemType;
+        }
+        if (idTypes[bufferIdInnermost] != elemType) {
+          bufferIdInnermost = bufferId;
+          idTypes[bufferIdInnermost] = elemType;
+          ++bufferId;
+        }
         owner->setAttr(
             "buffer.id",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
@@ -302,6 +314,9 @@ public:
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
                              numBuffers));
       } else {
+        if (idTypes.count(bufferId) == 0) {
+          idTypes[bufferId] = elemType;
+        }
         owner->setAttr(
             "buffer.id",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),

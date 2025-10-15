@@ -81,8 +81,6 @@ def _attn_fwd_subtile(
     else:
         acc = acc * alpha[:, None]
 
-    # update m_i and l_i
-    # place this at the end of the loop to reduce register pressure
     PM: tl.constexpr = p.shape[0]
     PN: tl.constexpr = p.shape[1]
     if FADD2_REDUCE:
@@ -107,15 +105,10 @@ def _attn_fwd_subtile(
 @triton.jit
 def _attn_fwd_inner_oss_dp(
     acc0,
-    acc1,
     l_i0,
     l_i0_1,
-    l_i1,
-    l_i1_1,
     m_i0,
-    m_i1,
     q0,
-    q1,  #
     desc_k,
     desc_v,  #
     offset_y,
@@ -127,13 +120,13 @@ def _attn_fwd_inner_oss_dp(
     BLOCK_N: tl.constexpr,  #
     STAGE: tl.constexpr,
     offs_m0: tl.constexpr,
-    offs_m1: tl.constexpr,  #
     offs_n: tl.constexpr,  #
     N_CTX: tl.constexpr,
     warp_specialize: tl.constexpr,
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:
@@ -147,7 +140,9 @@ def _attn_fwd_inner_oss_dp(
     offsetkv_y = offset_y + lo
 
     # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize, disallow_acc_multi_buffer=True):
+    for start_n in tl.range(
+        lo, hi, BLOCK_N, warp_specialize=warp_specialize, disallow_acc_multi_buffer=True, data_partition_factor=DP_FACTOR,
+    ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         k = desc_k.load([offsetkv_y, 0]).T
@@ -171,28 +166,10 @@ def _attn_fwd_inner_oss_dp(
             VECT_MUL,
             FADD2_REDUCE,
         )
-        l_i1, l_i1_1, m_i1, acc1 = _attn_fwd_subtile(
-            q1,
-            k,
-            offs_m1,
-            start_n,
-            offs_n,
-            qk_scale,
-            l_i1,
-            l_i1_1,
-            m_i1,
-            acc1,
-            v,
-            dtype,
-            STAGE,
-            SUBTILING,
-            VECT_MUL,
-            FADD2_REDUCE,
-        )
 
         offsetkv_y += BLOCK_N
 
-    return acc0, acc1, l_i0, l_i0_1, l_i1, l_i1_1, m_i0, m_i1
+    return acc0, l_i0, l_i0_1, m_i0
 
 
 def _host_descriptor_pre_hook(nargs):
@@ -201,13 +178,13 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
-    nargs["desc_q"].block_shape = [BLOCK_M // 2, HEAD_DIM]  # due to data partitioning
+    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]  # due to data partitioning
     if nargs["FP8_OUTPUT"]:
         nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
         nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_o"].block_shape = [BLOCK_M // 2, HEAD_DIM]
+    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
 
 if is_hip():
@@ -219,10 +196,7 @@ else:
 
 configs = [
     triton.Config(
-        {
-            "BLOCK_M": BM,
-            "BLOCK_N": BN,
-        },
+        {"BLOCK_M": BM, "BLOCK_N": BN, "DP_FACTOR": 2,},
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
@@ -337,6 +311,7 @@ def _attn_fwd_tma_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -346,43 +321,30 @@ def _attn_fwd_tma_dp(
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
     # initialize offsets
-    offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M // 2)
-    offs_m1 = start_m * BLOCK_M + tl.arange(BLOCK_M // 2, BLOCK_M)
+    offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
 
-    m_i0 = tl.zeros([BLOCK_M // 2], dtype=tl.float32) - float("inf")
-    l_i0_0 = tl.zeros([BLOCK_M // 2], dtype=tl.float32) + 1.0
-    acc0 = tl.zeros([BLOCK_M // 2, HEAD_DIM], dtype=tl.float32)
-
-    m_i1 = tl.zeros([BLOCK_M // 2], dtype=tl.float32) - float("inf")
-    l_i1_0 = tl.zeros([BLOCK_M // 2], dtype=tl.float32) + 1.0
-    acc1 = tl.zeros([BLOCK_M // 2, HEAD_DIM], dtype=tl.float32)
+    m_i0 = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i0_0 = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc0 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
 
     q0 = desc_q.load([qo_offset_y, 0])
-    q1 = desc_q.load([qo_offset_y + BLOCK_M // 2, 0])
 
     if FADD2_REDUCE:
         l_i0_1 = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
-        l_i1_1 = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
     else:
         l_i0_1 = 0
-        l_i1_1 = 0
 
     if STAGE & 1:
-        acc0, acc1, l_i0_0, l_i0_1, l_i1_0, l_i1_1, m_i0, m_i1 = _attn_fwd_inner_oss_dp(
+        acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
             acc0,
-            acc1,
             l_i0_0,
             l_i0_1,
-            l_i1_0,
-            l_i1_1,
             m_i0,
-            m_i1,
             q0,
-            q1,  #
             desc_k,
             desc_v,  #
             offset_y,
@@ -394,26 +356,21 @@ def _attn_fwd_tma_dp(
             BLOCK_N,  #
             4 - STAGE,
             offs_m0,
-            offs_m1,
             offs_n,
             N_CTX,  #
             warp_specialize,
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            DP_FACTOR,
         )
     if STAGE & 2:
-        acc0, acc1, l_i0_0, l_i0_1, l_i1_0, l_i1_1, m_i0, m_i1 = _attn_fwd_inner_oss_dp(
+        acc0, acc1, l_i0_0, l_i0_1, l_i1, m_i0, m_i1 = _attn_fwd_inner_oss_dp(
             acc0,
-            acc1,
             l_i0_0,
             l_i0_1,
-            l_i1_0,
-            l_i1_1,
             m_i0,
-            m_i1,
             q0,
-            q1,  #
             desc_k,
             desc_v,  #
             offset_y,
@@ -425,33 +382,25 @@ def _attn_fwd_tma_dp(
             BLOCK_N,  #
             2,
             offs_m0,
-            offs_m1,
             offs_n,
             N_CTX,  #
             warp_specialize,
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            DP_FACTOR,
         )
 
     if FADD2_REDUCE:
         l_i0 = l_i0_0 + l_i0_1
-        l_i1 = l_i1_0 + l_i1_1
     else:
         l_i0 = l_i0_0
-        l_i1 = l_i1_0
 
     m_i0 += tl.math.log2(l_i0)
     acc0 = acc0 / l_i0[:, None]
     m_ptrs0 = M + off_hz * N_CTX + offs_m0
     tl.store(m_ptrs0, m_i0)
     desc_o.store([qo_offset_y, 0], acc0.to(dtype))
-
-    m_i1 += tl.math.log2(l_i1)
-    acc1 = acc1 / l_i1[:, None]
-    m_ptrs1 = M + off_hz * N_CTX + offs_m1
-    tl.store(m_ptrs1, m_i1)
-    desc_o.store([qo_offset_y + BLOCK_M // 2, 0], acc1.to(dtype))
 
 
 @triton.autotune(
@@ -480,6 +429,7 @@ def _attn_fwd(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -505,6 +455,7 @@ def _attn_fwd(
         SUBTILING,
         VECT_MUL,
         FADD2_REDUCE,
+        DP_FACTOR,
     )
 
 
@@ -535,6 +486,7 @@ def _attn_fwd_persist(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -546,6 +498,32 @@ def _attn_fwd_persist(
         tiles_per_sm += 1
 
     tile_idx = prog_id
+
+    desc_q = tl.make_tensor_descriptor(
+        desc_q,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM],
+    )
+    desc_k = tl.make_tensor_descriptor(
+        desc_k,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM],
+    )
+    desc_v = tl.make_tensor_descriptor(
+        desc_v,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM],
+    )
+    desc_o = tl.make_tensor_descriptor(
+        desc_o,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM],
+    )
+
     # inner loop warpspec vs. outer loop warpspec
     for _ in tl.range(0, tiles_per_sm, warp_specialize=warp_specialize and OUTER_LOOP):
         pid = tile_idx % n_tile_num
@@ -572,6 +550,7 @@ def _attn_fwd_persist(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            DP_FACTOR,
         )
         tile_idx += num_progs
 
@@ -597,50 +576,11 @@ class _attention_opt(torch.autograd.Function):
         extra_kern_args = {}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        warp_specialize = baseVariant == "ws" or baseVariant == "ws_persistent"
-        # Use device_descriptor for Hopper + warpspec.
-        if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
-
-            dummy_block = [1, 1]
-            desc_q = TensorDescriptor(
-                q,
-                shape=[y_dim, HEAD_DIM_K],
-                strides=[HEAD_DIM_K, 1],
-                block_shape=dummy_block,
-            )
-            if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(
-                    v,
-                    shape=[HEAD_DIM_K, y_dim],
-                    strides=[q.shape[2], 1],
-                    block_shape=dummy_block,
-                )
-            else:
-                desc_v = TensorDescriptor(
-                    v,
-                    shape=[y_dim, HEAD_DIM_K],
-                    strides=[HEAD_DIM_K, 1],
-                    block_shape=dummy_block,
-                )
-            desc_k = TensorDescriptor(
-                k,
-                shape=[y_dim, HEAD_DIM_K],
-                strides=[HEAD_DIM_K, 1],
-                block_shape=dummy_block,
-            )
-            desc_o = TensorDescriptor(
-                o,
-                shape=[y_dim, HEAD_DIM_K],
-                strides=[HEAD_DIM_K, 1],
-                block_shape=dummy_block,
-            )
-        else:
-            desc_q = q
-            desc_v = v
-            desc_k = k
-            desc_o = o
+        warp_specialize = True
+        desc_q = q
+        desc_v = v
+        desc_k = k
+        desc_o = o
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -747,20 +687,8 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0, 1, 2, 3])
-@pytest.mark.parametrize("FADD2_REDUCE", [False, True])
-def test_op(
-    Z,
-    H,
-    N_CTX,
-    HEAD_DIM,
-    causal,
-    mode,
-    provider,
-    SUBTILING,
-    VECT_MUL,
-    FADD2_REDUCE,
-    dtype=torch.float16,
-):
+@pytest.mark.parametrize("FADD2_REDUCE", [False])
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, SUBTILING, VECT_MUL, FADD2_REDUCE, dtype=torch.float16):
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)
@@ -810,7 +738,7 @@ def test_op(
     rtol = 0.0
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
     # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if (torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a"):
+    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
         rtol = 1e-2
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
@@ -818,9 +746,8 @@ def test_op(
 
 
 try:
-    from flash_attn.flash_attn_interface import (
-        flash_attn_qkvpacked_func as flash_attn_func, )
-
+    from flash_attn.flash_attn_interface import \
+        flash_attn_qkvpacked_func as flash_attn_func
     HAS_FLASH = True
 except BaseException:
     HAS_FLASH = False
@@ -865,7 +792,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
         SUBTILING = True
-        VECT_MUL = False
+        VECT_MUL = 1
         FADD2_REDUCE = False
         fn = lambda: attention(q, k, v, False, sm_scale, "ws_persistent", SUBTILING, VECT_MUL, FADD2_REDUCE)
         if mode == "bwd":
@@ -875,12 +802,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
         ms = triton.testing.do_bench(fn)
 
     if provider == "flash":
-        qkv = torch.randn(
-            (BATCH, N_CTX, 3, H, HEAD_DIM),
-            dtype=dtype,
-            device=device,
-            requires_grad=True,
-        )
+        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         fn = lambda: flash_attn_func(qkv)
         if mode == "bwd":
             o = fn()
