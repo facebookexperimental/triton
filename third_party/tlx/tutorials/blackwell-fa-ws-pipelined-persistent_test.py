@@ -33,8 +33,10 @@ configs = [
         {
             'BLOCK_M': 256, 'BLOCK_N': 128, 'NUM_BUFFERS_Q': 1, 'NUM_BUFFERS_KV': 3, 'NUM_BUFFERS_QK': 1,
             'NUM_MMA_GROUPS': 2, 'NUM_MMA_SLICES': 2
-        }, num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook,
-        # ir_override=f"/tmp/tmpsi4c_yf8.ptx",
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
     ),
 ]
 
@@ -168,23 +170,30 @@ def _attn_fwd_ws(sm_scale, M,  #
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     # allocate TMEM buffers and barriers
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
+    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
     # Shared buffer for QK, P and Alpha, l, and m.
-    # Alpha/l/m lives in the lower half of qk_buf, and P lives in the upper half.
-    p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_v), NUM_MMA_GROUPS * 2,
-                              tlx.storage_kind.tmem, reuse=qk_tiles)
-    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    # A single QK buffer is split evenly:
+    #   - First half  : stores P
+    #   - Second half  : stores Alpha, l, and m
+    #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
+    #     P:                                                |  BLK_M/2 * BLOCK_N * fp16 |
+    #  Alpha : |BLK_M/2*1*fp32|
+    #     l :                 |BLK_M/2*1*fp32|
+    #     m :                                |BLK_M/2*1*fp32|
+    p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES), tlx.dtype_of(desc_v),
+                              NUM_MMA_GROUPS * NUM_MMA_SLICES * 2, tlx.storage_kind.tmem, reuse=qk_tiles)
+    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
                                   tlx.storage_kind.tmem, reuse=qk_tiles)
-    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
                               tlx.storage_kind.tmem, reuse=qk_tiles)
-    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
                               tlx.storage_kind.tmem, reuse=qk_tiles)
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
-    p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES)
     acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
@@ -241,18 +250,18 @@ def _attn_fwd_ws(sm_scale, M,  #
                     scale = 1 / l
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         subslice = tlx.subslice(
-                        acc_tiles[cid],
+                            acc_tiles[cid],
                             HEAD_DIM * slice_id // NUM_MMA_SLICES,
                             HEAD_DIM // NUM_MMA_SLICES,
-                    )
+                        )
                         acc = tlx.local_load(subslice)
                         acc = _mul_f32x2(acc, scale)
                         acc = acc.to(tlx.dtype_of(desc_o))
                         subslice_o = tlx.local_slice(
-                        o_tiles[cid],
+                            o_tiles[cid],
                             [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
                             [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
-                    )
+                        )
                         tlx.local_store(subslice_o, acc)
                     tlx.barrier_arrive(o_fulls[cid])
 
@@ -288,24 +297,19 @@ def _attn_fwd_ws(sm_scale, M,  #
                     tlx.local_store(alpha_tiles[cid * HEAD_DIM], alpha[:, None])
                     tlx.barrier_arrive(alpha_fulls[cid])
 
-                    # prepare p for the v dot
-                    # Use p[1] for cid=0, and p[3] for cid=1
-                    p_bufIdx = 1 + cid * NUM_MMA_GROUPS
-
                     qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
                     qks = _split_n(qk, NUM_MMA_SLICES)
                     ps = ()
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                        # prepare p for the v dot
+                        # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
+                        # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
+                        p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
                         p_i = tl.math.exp2(qks[slice_id])
-                        p_slice = tlx.subslice(
-                            p_tiles[p_bufIdx],
-                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                            HEAD_DIM // NUM_MMA_SLICES,
-                        )
-                        tlx.local_store(p_slice, p_i.to(tlx.dtype_of(desc_v)))
+                        tlx.local_store(p_tiles[p_bufIdx], p_i.to(tlx.dtype_of(desc_v)))
+                        tlx.barrier_arrive(p_fulls[slice_id + cid * NUM_MMA_SLICES])
                         ps = ps + (p_i, )
 
-                    tlx.barrier_arrive(p_fulls[cid])
                     p = _join_n(ps)
                     l_ij = tl.sum(p, 1)
                     l_i = l_i * alpha + l_ij
@@ -320,7 +324,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_idx += num_progs
 
-        # mma group
+            # mma group
         with tlx.async_task(num_warps=1, registers=80):
             accum_cnt_kv = 0
             accum_cnt_qk = 0
@@ -366,15 +370,23 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # -- compute p0 @ v ----
                 # wait for the V buffer to be populated by the producer
                 tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
-                tlx.barrier_wait(p_fulls[0], qk_phase)
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
-                # As p shares the second half of the qk buffer, use p[2]/p[3] instead of p[0]/p[1]
-                tlx.async_dot(
-                    p_tiles[1],
-                    kv_tiles[v_bufIdx],
-                    acc_tiles[0],
-                    use_acc=False,
-                )
+                # As p shares the second half of the qk buffer, use p[2]/p[3]/p[6]p[7]
+                # p[0] p[1] p[2] p[3] p[4] p[5] p[6] p[7]
+                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                    tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
+                    kv_slice = tlx.local_slice(
+                        kv_tiles[v_bufIdx],
+                        [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
+                        [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
+                    )
+                    p_bufIdx = NUM_MMA_SLICES + slice_id
+                    tlx.async_dot(
+                        p_tiles[p_bufIdx],
+                        kv_slice,
+                        acc_tiles[0],
+                        use_acc=slice_id > 0,
+                    )
 
                 acc1_init = False
 
@@ -402,15 +414,24 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
 
                     # -- compute p1 @ v from the previous iteration----
-                    tlx.barrier_wait(p_fulls[1], qk_phase_prev)
                     tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
-                    tlx.async_dot(
-                        p_tiles[3],
-                        kv_tiles[v_bufIdx_prev],
-                        acc_tiles[1],
-                        use_acc=acc1_init,
-                        mBarriers=[kv_empties[v_bufIdx_prev]],
-                    )
+                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                        tlx.barrier_wait(p_fulls[slice_id + 1 * NUM_MMA_SLICES], qk_phase_prev)
+                        kv_slice = tlx.local_slice(
+                            kv_tiles[v_bufIdx_prev],
+                            [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
+                            [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
+                        )
+                        p_bufIdx = 1 * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
+                        use_acc = acc1_init if slice_id == 0 else True
+                        mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
+                        tlx.async_dot(
+                            p_tiles[p_bufIdx],
+                            kv_slice,
+                            acc_tiles[1],
+                            use_acc=use_acc,
+                            mBarriers=mBarriers,
+                        )
 
                     acc1_init = True
 
@@ -427,30 +448,47 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # wait for the V buffer to be populated by the producer
                     tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
 
-                    tlx.barrier_wait(p_fulls[0], qk_phase)
                     tlx.barrier_wait(acc_fulls[0], qk_phase)
-                    # Use p[1] for cid=0, and p[3] for cid=1
-                    tlx.async_dot(
-                        p_tiles[1],
-                        kv_tiles[v_bufIdx],
-                        acc_tiles[0],
-                        use_acc=True,
-                    )
+                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                        tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
+                        # Use p[1] for cid=0, and p[3] for cid=1
+                        kv_slice = tlx.local_slice(
+                            kv_tiles[v_bufIdx],
+                            [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
+                            [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
+                        )
+                        p_bufIdx = NUM_MMA_SLICES + slice_id
+                        tlx.async_dot(
+                            p_tiles[p_bufIdx],
+                            kv_slice,
+                            acc_tiles[0],
+                            use_acc=True,
+                        )
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
 
                 # -- compute p1 @ v ----
-                tlx.barrier_wait(p_fulls[1], qk_phase)
                 tlx.barrier_wait(acc_fulls[1], qk_phase)
-                tlx.async_dot(
-                    p_tiles[3],
-                    kv_tiles[v_bufIdx],
-                    acc_tiles[1],
-                    use_acc=acc1_init,
-                    mBarriers=[acc_empties[1], kv_empties[v_bufIdx]],
-                )
+                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                    tlx.barrier_wait(p_fulls[slice_id + NUM_MMA_SLICES], qk_phase)
+                    # Use p[1] for cid=0, and p[3] for cid=1
+                    kv_slice = tlx.local_slice(
+                        kv_tiles[v_bufIdx],
+                        [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
+                        [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
+                    )
+                    p_bufIdx = 1 * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
+                    use_acc = acc1_init if slice_id == 0 else True
+                    mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
+                    tlx.async_dot(
+                        p_tiles[p_bufIdx],
+                        kv_slice,
+                        acc_tiles[1],
+                        use_acc=use_acc,
+                        mBarriers=mBarriers,
+                    )
 
                 accum_cnt_qk += 1
                 accum_cnt_kv += 2
@@ -528,14 +566,12 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                 tile_idx += num_progs
 
-
         # epilog group
         with tlx.async_task(num_warps=1, registers=80):
             # initialize offsets
             for i in range(0, tiles_per_sm):
                 # initialize offsets
-                _, _, _, _, qo_offset_y, _ = _compute_offsets(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
+                _, _, _, _, qo_offset_y, _ = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
@@ -550,7 +586,6 @@ def _attn_fwd_ws(sm_scale, M,  #
         # emtpy group
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_qk = 0
-
 
 
 class _attention(torch.autograd.Function):
