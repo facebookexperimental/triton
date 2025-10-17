@@ -1,10 +1,13 @@
 import argparse
+import pytest
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 import triton.profiler as proton
+
+from triton._internal_testing import is_blackwell
 from contextlib import contextmanager
 
 if torch.cuda.is_available():
@@ -335,7 +338,14 @@ def run_test(expect, fn, a, b, label, enabled=True):
     print(f"\r  {label}: {icon}  ")
 
 
-def validate(M, N, K, dtype):
+@pytest.mark.skipif(
+    not is_blackwell(),
+    reason="Requires Blackwell GPU",
+)
+@pytest.mark.parametrize("M", [2048, 4096, 8192])
+@pytest.mark.parametrize("N", [2048, 4096, 8192])
+@pytest.mark.parametrize("K", [64, 128])
+def test_correctness(M, N, K, dtype=torch.float16):
     print(f"{M=}, {N=}, {K=}, verification naive vs: ")
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
@@ -378,9 +388,9 @@ if __name__ == "__main__":
 
         torch.manual_seed(0)
 
-        # validate(32, 32, 32, dtype)
-        # validate(8192, 8192, args.K_range[0], dtype)
-        validate(2048, 2048, args.K_range[0], dtype)
+        # test_correctness(32, 32, 32, dtype)
+        # test_correctness(8192, 8192, args.K_range[0], dtype)
+        test_correctness(2048, 2048, args.K_range[0], dtype)
 
         # proton.start("matmul", hook="triton")
         # proton.deactivate()
