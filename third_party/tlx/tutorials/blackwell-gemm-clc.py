@@ -1,15 +1,11 @@
 import argparse
-import itertools
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 import triton.profiler as proton
-from triton.tools.tensor_descriptor import TensorDescriptor
 from contextlib import contextmanager
-
-from typing import Optional
 
 if torch.cuda.is_available():
     from triton._C.libtriton import nvidia
@@ -157,7 +153,6 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    num_tiles = num_pid_m * num_pid_n
 
     # NOTE: There is currently a bug in blackwell pipelining that means it can't handle a value being
     # used in both the prologue and epilogue, so we duplicate the counters as a work-around.
@@ -177,7 +172,6 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     while tile_id != -1:
         if tid == 0:
             tl.device_print("Processing CtaID", tile_id)
-    # for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
@@ -223,7 +217,6 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
 
         if tid == 0:
             tl.device_print("Extracted CtaID", tile_id)
-
 
 
 def matmul(a, b):
@@ -329,7 +322,6 @@ def bench(K, dtype, reps=10000, warmup_reps=10000):
     if dtype == torch.float16:
         bench_fn("torch", reps, warmup_reps, torch_matmul, a, b)
     bench_fn("persistent", reps, warmup_reps, matmul_persistent, a, b.T)
-    warp_specialize = [False, True] if HAS_WARP_SPECIALIZE else [False]
 
 
 def run_test(expect, fn, a, b, label, enabled=True):
