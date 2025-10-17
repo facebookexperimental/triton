@@ -132,6 +132,27 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+def matmul(a, b):
+    # Check constraints.
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+    M, K = a.shape
+    K, N = b.shape
+    dtype = a.dtype
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    # 1D launch kernel where each block gets its own program.
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+    matmul_kernel[grid](
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
+    )
+    return c
+
+
 @triton.autotune(
     configs=matmul_get_configs(),
     key=["M", "N", "K"],
@@ -217,27 +238,6 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
 
         if tid == 0:
             tl.device_print("Extracted CtaID", tile_id)
-
-
-def matmul(a, b):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
-    M, K = a.shape
-    K, N = b.shape
-    dtype = a.dtype
-
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
-    matmul_kernel[grid](
-        a, b, c,  #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
-    )
-    return c
 
 
 def matmul_persistent(a, b):
