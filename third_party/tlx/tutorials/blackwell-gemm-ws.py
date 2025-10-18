@@ -85,7 +85,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     with tlx.async_tasks():
-        with tlx.async_task("default"):  # producer, TMA load
+        with tlx.async_task("default"):  # epilogue consumer
             # common code duplicated for each region to avoid SMEM overhead
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -95,29 +95,42 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
 
-            load_phase = 0  # the current phase of TMA load
-            # we virtually "flatten" the two layer loop as if we're performing tma loads on
-            # one big list of data
-            processed_k_iters = 0
+            tmem_read_phase = 0
+            cur_tmem_buf = 0
+
             for tile_id in range(start_pid, num_tiles, NUM_SMS):
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
 
-                for k in range(0, k_tiles):
-                    # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
-                    buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
-                    # wait for previous phase(round) of dot for this buf
-                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
-                    # buffer is now ready to be used again
-                    offs_k = k * BLOCK_SIZE_K
-                    tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                             2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
-                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
-                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
-                    # flip phase at the end of a round
-                    load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
-                processed_k_iters += k_tiles
+                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
+                # flip phase at the end of a round of using TMEM barriers
+                tmem_read_phase = tmem_read_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
+
+                # load the result from TMEM to registers
+                acc_tmem = tmem_buffers[cur_tmem_buf]
+
+                if EPILOGUE_SUBTILE:
+                    # We load/store the result half by half to reduce SMEM pressure
+                    acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
+                    result = tlx.local_load(acc_tmem_subslice1)
+                    c = result.to(tl.float16)
+                    c_desc.store([offs_am, offs_bn], c)
+
+                    acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
+                    result = tlx.local_load(acc_tmem_subslice2)
+                    c = result.to(tl.float16)
+                    c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
+                else:
+                    result = tlx.local_load(acc_tmem)
+                    c = result.to(tl.float16)
+                    c_desc.store([offs_am, offs_bn], c)
+
+                # done storing this buffer, signal MMA consumer to resume writing to it
+                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
+
+                cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
+
         with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
             # common code duplicated for each region to avoid SMEM overhead
             start_pid = tl.program_id(axis=0)
@@ -168,7 +181,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
 
-        with tlx.async_task(num_warps=4, num_regs=232):  # epilogue consumer
+        with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
             # common code duplicated for each region to avoid SMEM overhead
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -178,41 +191,29 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
 
-            tmem_read_phase = 0
-            cur_tmem_buf = 0
-
+            load_phase = 0  # the current phase of TMA load
+            # we virtually "flatten" the two layer loop as if we're performing tma loads on
+            # one big list of data
+            processed_k_iters = 0
             for tile_id in range(start_pid, num_tiles, NUM_SMS):
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
 
-                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
-                # flip phase at the end of a round of using TMEM barriers
-                tmem_read_phase = tmem_read_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
-
-                # load the result from TMEM to registers
-                acc_tmem = tmem_buffers[cur_tmem_buf]
-
-                if EPILOGUE_SUBTILE:
-                    # We load/store the result half by half to reduce SMEM pressure
-                    acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice1)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn], c)
-
-                    acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice2)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
-                else:
-                    result = tlx.local_load(acc_tmem)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn], c)
-
-                # done storing this buffer, signal MMA consumer to resume writing to it
-                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
-
-                cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
+                for k in range(0, k_tiles):
+                    # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
+                    buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
+                    # wait for previous phase(round) of dot for this buf
+                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
+                    # buffer is now ready to be used again
+                    offs_k = k * BLOCK_SIZE_K
+                    tlx.barrier_expect_bytes(smem_full_bars[buf],
+                                             2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
+                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
+                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
+                    # flip phase at the end of a round
+                    load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
+                processed_k_iters += k_tiles
 
 
 def matmul(a, b):
@@ -287,9 +288,10 @@ def benchmark(M, N, K, provider):
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
     if provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
