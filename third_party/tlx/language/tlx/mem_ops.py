@@ -185,6 +185,7 @@ def _buffered_tensor_getitem(self, buffer_idx):
 
 tlx.buffered_tensor.__getitem__ = _buffered_tensor_getitem
 tlx.mbarrier.__getitem__ = _buffered_tensor_getitem
+tlx.clc_response.__getitem__ = _buffered_tensor_getitem
 
 
 @tl.builtin
