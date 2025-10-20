@@ -25,6 +25,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups);
+void annotateLoads(triton::FuncOp &funcOp);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -120,6 +121,14 @@ public:
       if (dumpIntermediateSteps) {
         llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                         "doTaskIdPropagate\n"
+                     << moduleOp << "\n\n\n";
+      }
+
+      // Annotate the first MMA op associated with each load.
+      annotateLoads(funcOp);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                        "annotateLoads \n"
                      << moduleOp << "\n\n\n";
       }
     }

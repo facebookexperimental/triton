@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "ReorderLoads.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -363,6 +364,9 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
         pipelineBuffer, pred);
+    if (tmaLoad->hasAttr(kMMAPriorityAttr)) {
+      copy->setAttr(kMMAPriorityAttr, tmaLoad->getAttr(kMMAPriorityAttr));
+    }
   }
 
   // Create a wait_barrier before the first consumer.
