@@ -9,7 +9,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-M, N, K = (8192, 8192, 8192)# (2176, 2176, 2176)
+M, N, K = (8192, 8192, 8192)  # (2176, 2176, 2176)
 
 
 def is_cuda():
@@ -31,7 +31,6 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_M = nargs["BM"]
     BLOCK_N = nargs["BN"]
     BLOCK_K = nargs["BK"]
-    NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
     nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
@@ -39,7 +38,6 @@ def matmul_tma_set_block_size_hook(nargs):
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
     else:
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
-
 
 
 def matmul_get_configs():
@@ -56,6 +54,7 @@ def matmul_get_configs():
         for named_barrier in [True, False]
     ]
 
+
 @triton.autotune(
     # Autotune configs can be reused or adapted
     configs=matmul_get_configs(),
@@ -64,8 +63,12 @@ def matmul_get_configs():
 )
 @triton.jit
 def matmul_kernel_tlx_ws_persistent(
-    a_desc, b_desc, c_desc,
-    M, N, K,
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
     NUM_SMS: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
@@ -116,7 +119,7 @@ def matmul_kernel_tlx_ws_persistent(
                     empty = tlx.local_view(mainloop_empty_bar, buf)
                     full = tlx.local_view(mainloop_full_bar, buf)
                     tlx.barrier_wait(bar=empty, phase=p)
-                    tlx.barrier_expect_bytes(full, BM * BK * 2 + BK * BN * 2) # a and b
+                    tlx.barrier_expect_bytes(full, BM * BK * 2 + BK * BN * 2)  # a and b
                     data_a = tlx.local_view(a, buf)
                     tlx.async_descriptor_load(a_desc, data_a, [offset_am, offset_k], full)
                     data_b = tlx.local_view(b, buf)
@@ -135,7 +138,7 @@ def matmul_kernel_tlx_ws_persistent(
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
             k_tiles = tl.cdiv(K, BK)
 
-            tile_rank = cid # cta0: 0, 2, 4 cta1; 1, 3, 5
+            tile_rank = cid  # cta0: 0, 2, 4 cta1; 1, 3, 5
             phase_mma = 1 - cid
             phase_epi = 1 - cid
 
@@ -195,7 +198,7 @@ def matmul_kernel_tlx_ws_persistent(
 
                     acc = tlx.async_dot(data_a, data_b, acc)
 
-                    acc = tlx.async_dot_wait(1, acc) # wait for last round
+                    acc = tlx.async_dot_wait(1, acc)  # wait for last round
 
                     empty = tlx.local_view(mainloop_empty_bar, last_buf)
                     tlx.barrier_arrive(empty)
@@ -212,9 +215,9 @@ def matmul_kernel_tlx_ws_persistent(
                         # After issuing async_dot, Consumer 1 signals barrier 9 to unblock Consumer 0.
                         tlx.named_barrier_arrive(9, 256)
                 else:
-                    tlx.barrier_arrive(mma_bar) # release mma bar
+                    tlx.barrier_arrive(mma_bar)  # release mma bar
 
-                acc = tlx.async_dot_wait(0, acc) # wait for last round
+                acc = tlx.async_dot_wait(0, acc)  # wait for last round
                 empty = tlx.local_view(mainloop_empty_bar, last_buf)
                 tlx.barrier_arrive(empty)
 
@@ -236,6 +239,7 @@ def matmul_kernel_tlx_ws_persistent(
                 if not USE_NAMED_BARRIER:
                     tlx.barrier_arrive(epi_bar)
 
+
 def matmul_tlx_ws_persistent(a, b, profile=False):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
@@ -255,14 +259,19 @@ def matmul_tlx_ws_persistent(a, b, profile=False):
         num_m_blocks = triton.cdiv(M, META['BM'])
         num_n_blocks = triton.cdiv(N, META['BN'])
         total_blocks = num_m_blocks * num_n_blocks
-        return (min(NUM_SMS, total_blocks),)
+        return (min(NUM_SMS, total_blocks), )
 
     matmul_kernel_tlx_ws_persistent[grid](
-        desc_in_1, desc_in_2, desc_out,
-        M, N, K,
+        desc_in_1,
+        desc_in_2,
+        desc_out,
+        M,
+        N,
+        K,
         NUM_SMS=NUM_SMS,
     )
     return c
+
 
 @pytest.mark.skipif(
     not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
@@ -277,14 +286,18 @@ def test_op():
     b = torch.randn((K, N), dtype=torch.float16, device=DEVICE)
 
     rtol = 1e-2 if is_hip_cdna2() else 0
-    output = matmul_tlx_ws_persistent(a, b,)
+    output = matmul_tlx_ws_persistent(
+        a,
+        b,
+    )
     output_ref = torch.matmul(a, b)
 
     torch.allclose(output, output_ref, atol=1e-2, rtol=rtol)
 
     output = matmul_tlx_ws_persistent(a, b, True)
 
-    print(f"Test passed!")
+    print("Test passed!")
+
 
 TORCH_HAS_FP8 = False
 
@@ -311,6 +324,7 @@ for fp8_inputs in [False, True]:
             args={"fp8_inputs": fp8_inputs},
         ))
 
+
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider, fp8_inputs):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
@@ -321,9 +335,11 @@ def benchmark(M, N, K, provider, fp8_inputs):
         b = b.to(torch.float8_e5m2)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=200, rep=200)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=200,
+                                                     rep=200)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_tlx_ws_persistent(a, b), quantiles=quantiles, warmup=200, rep=200)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_tlx_ws_persistent(a, b), quantiles=quantiles,
+                                                     warmup=200, rep=200)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
