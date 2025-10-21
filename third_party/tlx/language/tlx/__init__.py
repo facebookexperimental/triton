@@ -27,6 +27,7 @@ from .dynamic_launch import (
     alloc_clc_responses,
     clc_issue,
     clc_query,
+    # pipeline_clc_fetch_async,
 )
 
 from . import compiler
