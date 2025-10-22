@@ -565,8 +565,6 @@ void init_triton_ir(py::module &&m) {
       .def("get_before", &scf::WhileOp::getBefore, ret::reference)
       .def("get_after", &scf::WhileOp::getAfter, ret::reference);
 
-  py::class_<ttg::WarpYieldOp, OpState>(m, "WarpYieldOp", py::module_local());
-  py::class_<ttg::WarpReturnOp, OpState>(m, "WarpReturnOp", py::module_local());
   py::class_<scf::ConditionOp, OpState>(m, "ConditionOp", py::module_local());
 
   py::class_<Operation, std::unique_ptr<Operation, py::nodelete>>(
@@ -1827,50 +1825,6 @@ void init_triton_ir(py::module &&m) {
               bool isSignedInteger) -> Value {
              return self.create<MakeTensorDescOp>(base, shape, strides,
                                                   tensorShape, isSignedInteger);
-           })
-      // Warp specialize ops
-      .def("create_warp_specialize_op",
-           [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
-              std::optional<std::vector<int>> requestedRegisters,
-              int numPartitionRegions) -> ttg::WarpSpecializeOp {
-             ArrayRef<Type> dummyTypes;
-             auto wsOp = self.create<ttg::WarpSpecializeOp>(
-                 dummyTypes, partitionNumWarps, numPartitionRegions);
-
-             wsOp.setRequestedRegisters(requestedRegisters);
-
-             return wsOp;
-           })
-      .def("create_warp_yield_op",
-           [](TritonOpBuilder &self) -> ttg::WarpYieldOp {
-             ArrayRef<Type> dummyTypes;
-             return self.create<ttg::WarpYieldOp>(ValueRange{});
-           })
-      .def("create_warp_return_op",
-           [](TritonOpBuilder &self) -> ttg::WarpReturnOp {
-             ArrayRef<Type> dummyTypes;
-             return self.create<ttg::WarpReturnOp>();
-           })
-      .def("create_async_load",
-           [](TritonOpBuilder &self, Value ptrTensor, Value result,
-              std::optional<Value> mask, std::optional<Value> other,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> mlir::Value {
-             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
-                 ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile);
-           })
-      .def("create_thread_id",
-           [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
-             static constexpr mlir::gpu::Dimension dims[] = {
-                 mlir::gpu::Dimension::x, mlir::gpu::Dimension::y,
-                 mlir::gpu::Dimension::z};
-             Value threadId = self.create<::mlir::gpu::ThreadIdOp>(
-                 self.getBuilder().getIndexType(), dims[axis]);
-             threadId = self.create<arith::IndexCastOp>(
-                 self.getBuilder().getI32Type(), threadId);
-             return threadId;
            });
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
