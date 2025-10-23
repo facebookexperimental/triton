@@ -124,8 +124,8 @@ static void scheduleDependencies(scf::ForOp loop, WarpSchedule &schedule,
 // Recursively schedule the users of an operation, stopping when
 // encountering an operation that is already assigned.
 // If \p partition is null, a new partition will be created if needed.
-static void scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
-                          Partition *partition, Operation *op) {
+static Partition *scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
+                                Partition *partition, Operation *op) {
   SmallVector<OpOperand *> uses;
   for (OpOperand &use : op->getUses())
     uses.push_back(&use);
@@ -148,6 +148,7 @@ static void scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
   }
+  return partition;
 }
 
 // Given a partitioning scheme, determine an initial schedule by performing a
@@ -294,10 +295,27 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
     }
   }
 
+  // for causal, separate according to loops
   // The users of MMAs go to a new partition for each MMA.
+  DenseMap<Operation *, Partition *> mmaToPartition;
+  SmallVector<Operation *> inFirstLoop;
   for (auto mmaOp : llvm::reverse(mmas)) {
-    scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule, nullptr,
-                  mmaOp);
+    if (mmaOp->getParentOfType<scf::ForOp>() == loops[0]) {
+      auto part = scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule,
+                                nullptr, mmaOp);
+      mmaToPartition[mmaOp.getOperation()] = part;
+      inFirstLoop.push_back(mmaOp.getOperation());
+    }
+  }
+  unsigned Idx = 0;
+  for (auto mmaOp : llvm::reverse(mmas)) {
+    if (loops.size() == 3 && mmaOp->getParentOfType<scf::ForOp>() == loops[1]) {
+      // find the partition for the correspoding mmaOp in first loop
+      auto *part = mmaToPartition[inFirstLoop[Idx]];
+      scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule, part,
+                    mmaOp);
+      ++Idx;
+    }
   }
 
   return schedule;
