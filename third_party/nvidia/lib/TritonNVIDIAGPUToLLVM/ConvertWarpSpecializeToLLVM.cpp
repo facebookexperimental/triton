@@ -244,7 +244,6 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // Load the explicit captures from shared memory and replace the block args
     // if there are any.
     b.setInsertionPointToStart(&partition->front());
-
     if (auto actRegs = ws.getActualRegisters()) {
       createRegRealloc(b, lowRegs,
                        (*actRegs)[partition->getRegionNumber() + 1]);
@@ -277,10 +276,7 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
       createAllBarrier(b, kSwitchLoopBarrierIdx);
-      if (auto actRegs = ws.getActualRegisters()) {
-        createRegRealloc(b, (*actRegs)[partition->getRegionNumber() + 1],
-                         lowRegs);
-      }
+
       b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
     });
   }
@@ -314,13 +310,20 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
     return failure();
 
   mlir::PostDominanceInfo pdom(funcOp);
-  if (!pdom.properlyPostDominates(wsOp->getBlock(), entry))
+  if (!pdom.postDominates(wsOp->getBlock(), entry))
     return failure();
 
   auto module = cast<ModuleOp>(funcOp->getParentOp());
   unsigned threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(module);
   unsigned defaultNumWarps = lookupNumWarps(funcOp);
   unsigned defaultWarpGroupSize = threadsPerWarp * defaultNumWarps;
+  auto totalNumWarpsAttr =
+      module->getAttrOfType<IntegerAttr>("ttg.total-num-warps");
+  if (!totalNumWarpsAttr) {
+    return mlir::emitError(module.getLoc(),
+                           "module missing 'ttg.total-num-warps' attribute");
+  }
+  unsigned totalNumThreads = totalNumWarpsAttr.getInt() * threadsPerWarp;
 
   MLIRContext *ctx = funcOp.getContext();
   TritonLLVMIRRewriter b(funcOp.getLoc(), ctx);
@@ -331,15 +334,12 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
     funcOp->dump();
   });
 
-  // This splits `block` into two blocks:
-  // - `block` will contain all operations **before** `splitBefore`
-  // - `newBlock` will contain `splitBefore` and everything **after**
-  Block *wsPreBlock = wsOp->getBlock();
-  Block *wsBlock = wsPreBlock->splitBlock(wsOp);
-  Block *wsPostBlock = wsBlock->splitBlock(wsOp->getNextNode());
   Block *newBlock = entry->splitBlock(&entry->front());
   Block *headerBlock = entry;
   entry = newBlock;
+  Block *wsPreBlock = wsOp->getBlock();
+  Block *wsBlock = wsPreBlock->splitBlock(wsOp);
+  Block *wsPostBlock = wsBlock->splitBlock(wsOp->getNextNode());
 
   b.setInsertionPointToStart(headerBlock);
 
@@ -350,6 +350,18 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
   b.create<LLVM::CondBrOp>(isDefault, entry, wsBlock);
+
+  // Set register requirements for the default warp group.
+  auto maxnreg =
+      funcOp->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
+          AttrMaxRegistersName);
+  if (maxnreg) {
+    // Count the number of registers used by the other warp groups.
+    if (auto actRegs = wsOp.getActualRegisters()) {
+      b.setInsertionPointToStart(entry);
+      createRegRealloc(b, maxnreg.getInt(), (*actRegs)[0]);
+    }
+  }
 
   // Add captures before the WS op
   b.setInsertionPointToEnd(wsPreBlock);
@@ -372,6 +384,7 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   // The barrier ensures they have read the captures before the memory is
   // released upon entry.
   createAllBarrier(b, kSwitchLoopBarrierIdx);
+  createAllBarrier(b, kSwitchLoopBarrierIdx);
   b.create<LLVM::BrOp>(&wsOp.getDefaultRegion().front());
 
   // Replace WarpYieldOp of the default region with a jump to the epilog.
@@ -393,10 +406,8 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   b.setInsertionPointToStart(wsExitBlock);
   b.create<LLVM::ReturnOp>(ValueRange());
 
-  // Rewrite WS partition regions with captures and synchronization
-  // auto regsAttr = wsOp.getRequestedRegisters();
-  // uint32_t reguestedRegs = regsAttr ? (*regsAttr)[i] : 0;
-  rewritePartitionRegions(wsOp, wsExitBlock, targetInfo, 0);
+  rewritePartitionRegions(wsOp, wsExitBlock, targetInfo,
+                          maxnreg ? maxnreg.getInt() : 0);
 
   SmallVector<Block *> partitionBlocks;
   for (auto partition : wsOp.getPartitionRegions()) {
@@ -413,6 +424,11 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   auto curNumWarps = defaultNumWarps;
   for (size_t i = 0; i < wsOp.getPartitionRegions().size(); ++i) {
     Block *curPartitionBlock = partitionBlocks[i];
+    b.setInsertionPointToStart(curPartitionBlock);
+
+    // The shared memory is only live for the entry into the region, so put
+    // another barrier here.
+    createAllBarrier(b, kSwitchLoopBarrierIdx);
 
     // Branch for the partition region
     newBlock = wsBlock->splitBlock(wsOp);
@@ -429,7 +445,7 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   b.setInsertionPointToEnd(wsBlock);
   createAllBarrier(b, kSwitchLoopBarrierIdx);
   createAllBarrier(b, kSwitchLoopBarrierIdx);
-  b.create<LLVM::BrOp>(wsPostBlock);
+  b.create<LLVM::BrOp>(wsExitBlock);
   wsOp->erase();
 
   LLVM_DEBUG({
