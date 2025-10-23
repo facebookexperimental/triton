@@ -504,6 +504,49 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
+           }) // Warp specialize ops
+      .def("create_warp_specialize_op",
+           [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
+              std::optional<std::vector<int>> requestedRegisters,
+              int numPartitionRegions) -> ttg::WarpSpecializeOp {
+             ArrayRef<Type> dummyTypes;
+             auto wsOp = self.create<ttg::WarpSpecializeOp>(
+                 dummyTypes, partitionNumWarps, numPartitionRegions);
+
+             wsOp.setRequestedRegisters(requestedRegisters);
+
+             return wsOp;
+           })
+      .def("create_warp_yield_op",
+           [](TritonOpBuilder &self) -> void {
+             ArrayRef<Type> dummyTypes;
+             self.create<ttg::WarpYieldOp>(ValueRange{});
+           })
+      .def("create_warp_return_op",
+           [](TritonOpBuilder &self) -> void {
+             ArrayRef<Type> dummyTypes;
+             self.create<ttg::WarpReturnOp>();
+           })
+      .def("create_async_load",
+           [](TritonOpBuilder &self, Value ptrTensor, Value result,
+              std::optional<Value> mask, std::optional<Value> other,
+              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+              bool isVolatile) -> mlir::Value {
+             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                 ptrTensor, result, mask.value_or(Value()),
+                 other.value_or(Value()), cacheModifier, evictionPolicy,
+                 isVolatile);
+           })
+      .def("create_thread_id",
+           [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
+             static constexpr mlir::gpu::Dimension dims[] = {
+                 mlir::gpu::Dimension::x, mlir::gpu::Dimension::y,
+                 mlir::gpu::Dimension::z};
+             Value threadId = self.create<::mlir::gpu::ThreadIdOp>(
+                 self.getBuilder().getIndexType(), dims[axis]);
+             threadId = self.create<arith::IndexCastOp>(
+                 self.getBuilder().getI32Type(), threadId);
+             return threadId;
            });
 }
 
