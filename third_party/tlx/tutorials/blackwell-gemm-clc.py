@@ -6,7 +6,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 import triton.profiler as proton
-
+from triton.language.core import _aggregate as aggregate
+from triton.language.core import must_use_result
 from triton._internal_testing import is_blackwell
 from contextlib import contextmanager
 
@@ -156,6 +157,21 @@ def matmul(a, b):
     return c
 
 
+@aggregate
+class CLCPipelineState:
+    _stages: tl.tensor
+    _phase: tl.tensor
+
+    def __init__(self, stages, phase):
+        self._stages = stages
+        self._phase = phase
+
+    @must_use_result
+    @triton.jit
+    def flip_phase(self):
+        return CLCPipelineState(self._stages, self._phase ^ 1)
+
+
 @triton.autotune(
     configs=matmul_get_configs(),
     key=["M", "N", "K"],
@@ -186,7 +202,9 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
+    num_stages = 10
     phase = 0
+    state = CLCPipelineState(num_stages, phase)
     # TLX abstraction
     scheduler = tlx.clc_create_scheduler(num_stages=1)
 
@@ -224,8 +242,9 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
 
-        tile_id = tlx.clc_fetch_next_worker(scheduler, phase)
-        phase ^= 1
+        tile_id = tlx.clc_fetch_next_worker(scheduler, state)
+
+        state = state.flip_phase()
 
         if tid == 0:
             tl.device_print("Extracted CtaID", tile_id)
