@@ -37,10 +37,7 @@ from .utility import (
     dtype_of,
 )
 from .dynamic_launch import (
-    alloc_clc_responses,
-    clc_issue,
-    clc_query,
-    create_pipeliner,
+    clc_create_scheduler,
     clc_fetch_next_worker,
 )
 
@@ -97,9 +94,6 @@ __all__ = [
     "async_task_replica_id",
     "dtype_of",
     # dynamic launcher ops
-    "alloc_clc_responses",
-    "clc_issue",
-    "clc_query",
-    "create_pipeliner",
+    "clc_create_scheduler",
     "clc_fetch_next_worker",
 ]

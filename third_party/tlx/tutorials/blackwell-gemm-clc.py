@@ -241,13 +241,9 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # TLX: cluster launch control for dynamic tiling scheduling
     phase = 0
-
     # TLX abstraction
-    scheduler = tlx.create_pipeliner(num_stages=1)
-
-    # scheduler.alloc()
+    scheduler = tlx.clc_create_scheduler(num_stages=1)
 
     while tile_id != -1:
         if tid == 0:
@@ -283,21 +279,8 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
 
-        # # TLX
-        # # Issue async clc.try_cancel for the next available CTA
-        # tlx.barrier_expect_bytes(scheduler.clc_mbars[0], 16)  # CLC response is 16-byte
-        # tlx.clc_issue(scheduler.clc_responses[0], scheduler.clc_mbars[0])
-
-        # # Wait for clc.try_cancel finishes
-        # tlx.barrier_wait(scheduler.clc_mbars[0], scheduler.phase)
-        # scheduler.flip_phase()
-        # # phase ^= 1
-
-        # # Extract CTA ID from CLC response
-        # tile_id = tlx.clc_query(scheduler.clc_responses[0])
-
-        # tile_id = scheduler.fetch_next_work()
-        tile_id = tlx.clc_fetch_next_worker(scheduler)
+        tile_id = tlx.clc_fetch_next_worker(scheduler, phase)
+        phase ^= 1
 
         if tid == 0:
             tl.device_print("Extracted CtaID", tile_id)
