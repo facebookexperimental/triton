@@ -161,15 +161,17 @@ def matmul(a, b):
 class CLCPipelineState:
     _stages: tl.tensor
     _phase: tl.tensor
+    _next_tile_id: tl.tensor
 
-    def __init__(self, stages, phase):
+    def __init__(self, stages, phase, next_tile_id):
         self._stages = stages
         self._phase = phase
+        self._next_tile_id = next_tile_id
 
     @must_use_result
     @triton.jit
-    def flip_phase(self):
-        return CLCPipelineState(self._stages, self._phase ^ 1)
+    def advance(self, next_tile_id):
+        return CLCPipelineState(self._stages, self._phase ^ 1, next_tile_id)
 
 
 @triton.autotune(
@@ -204,14 +206,14 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
 
     num_stages = 10
     phase = 0
-    state = CLCPipelineState(num_stages, phase)
+    state = CLCPipelineState(num_stages, phase, tile_id)
     # TLX abstraction
     scheduler = tlx.clc_create_scheduler(num_stages=1)
 
-    while tile_id != -1:
+    while state._next_tile_id != -1:
         if tid == 0:
-            tl.device_print("Processing CtaID", tile_id)
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+            tl.device_print("Processing CtaID", state._next_tile_id)
+        pid_m, pid_n = _compute_pid(state._next_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -242,12 +244,10 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
 
-        tile_id = tlx.clc_fetch_next_worker(scheduler, state)
-
-        state = state.flip_phase()
+        state = state.advance(tlx.clc_fetch_next_worker(scheduler, state))
 
         if tid == 0:
-            tl.device_print("Extracted CtaID", tile_id)
+            tl.device_print("Extracted CtaID", state._next_tile_id)
 
 
 def matmul_persistent(a, b):
