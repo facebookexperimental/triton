@@ -428,6 +428,34 @@ std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
                    const triton::LinearLayout &dstLayout);
 
+/// the total buffer size in bytes given a tensor type and buffer shape.
+size_t calculateBufferSizeInBytes(RankedTensorType ty,
+                                  ArrayRef<int64_t> bufferShape);
+
+/// Create a NameLoc for shared memory allocations with names
+/// indicating allocation purpose, size, and pass information.
+mlir::Location createNamedAllocationLocation(OpBuilder &builder,
+                                             Location baseLoc,
+                                             StringRef allocType,
+                                             size_t sizeBytes,
+                                             StringRef passName = "");
+
+/// Create a NameLoc for barriers with context about their purpose and location.
+mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
+                                          StringRef purpose,
+                                          StringRef passName = "");
+
 } // namespace mlir
+
+namespace mlir::triton::gpu {
+
+/// Rename allocation SSA values to include partition information
+/// This should be called after warp specialization scheduling is complete
+void renameAllocsToPartition(scf::ForOp loop);
+
+/// Rename all allocations in a module to include partition information
+void renameAllocsToPartition(ModuleOp module);
+
+} // namespace mlir::triton::gpu
 
 #endif // TRITON_ANALYSIS_UTILITY_H
