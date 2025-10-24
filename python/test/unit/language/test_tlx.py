@@ -1149,7 +1149,7 @@ def tlx_square_non_ws(
 
     x = tl.load(x_ptr + offsets, mask=mask)  # Do something
 
-    p = 1
+    p = 0
     tlx.barrier_arrive(bar=bar)  # Release
     tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
 

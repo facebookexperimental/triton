@@ -12,7 +12,7 @@ from .types import (
     mbarrier_type,
     clc_response,
     clc_response_type,
-    CLCPipeliner,
+    CLCPipelineContext,
     async_token,
 )
 from .mem_ops import (local_alloc, local_view, local_slice, subslice, async_load, async_load_commit_group,
@@ -37,11 +37,12 @@ from .utility import (
     dtype_of,
 )
 from .dynamic_launch import (
-    alloc_clc_responses,
-    clc_issue,
-    clc_query,
-    create_pipeliner,
-    clc_fetch_next_worker,
+    _alloc_clc_responses,
+    _clc_issue,
+    _clc_query,
+    clc_producer,
+    clc_consumer,
+    clc_create_context,
 )
 
 from . import compiler
@@ -97,9 +98,11 @@ __all__ = [
     "async_task_replica_id",
     "dtype_of",
     # dynamic launcher ops
-    "alloc_clc_responses",
-    "clc_issue",
-    "clc_query",
-    "create_pipeliner",
-    "clc_fetch_next_worker",
+    "_alloc_clc_responses",
+    "_clc_issue",
+    "_clc_query",
+    "clc_create_context",
+    "clc_producer",
+    "clc_consumer",
+    "CLCPipelineContext",
 ]

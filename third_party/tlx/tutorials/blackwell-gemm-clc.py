@@ -6,12 +6,12 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 import triton.profiler as proton
-
 from triton._internal_testing import is_blackwell
 from contextlib import contextmanager
 
 if torch.cuda.is_available():
     from triton._C.libtriton import nvidia
+
     cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     cublas = nvidia.cublas.CublasLt(cublas_workspace)
 else:
@@ -33,61 +33,6 @@ def is_hopper():
 def supports_ws():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
-# @dataclass
-# class pipeline_state:
-#     _stages: int
-#     _index: int = 0
-#     _phase: int = 0
-#     _count: int = 0
-
-#     def incr(self)   -> None:
-#         self._index += 1
-#         self._count += 1
-#         if self._index == self._stages:
-#             self._index = 0
-#             self._phase ^= 1
-
-# @aggregate
-# class pipeline_clc_fetch_async:
-#     full_bars = None
-#     empty_bars = None
-#     responses = None
-#     _num_stages: int = 0
-#     _state: pipeline_state
-
-#     def __init__(self, num_stages, _semantic=None) -> None:
-#         # self._semantic = _semantic
-#         self._num_stages = tl._unwrap_if_constexpr(num_stages)
-#         self._state = pipeline_state(self._num_stages)
-#         self.full_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
-#         self.empty_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
-#         self.responses = alloc_clc_responses(num_responses=self._num_stages)
-
-    # @triton.jit
-    # def alloc(self) -> None:
-    #     # alloc mbar and clc responses        
-    #     full_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
-    #     empty_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
-    #     responses = tlx.alloc_clc_responses(num_responses=self._num_stages)
-
-# @triton.jit
-# def fetch_next_work(self) -> int:
-#     clc_mbar = self.full_bars[0]
-#     clc_response = self.responses[0]
-
-#     # TLX
-#     # Issue async clc.try_cancel for the next available CTA
-#     tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
-#     tlx.clc_issue(clc_response, clc_mbar)
-
-#     # Wait for clc.try_cancel finishes
-#     tlx.barrier_wait(clc_mbar, self._phase)
-#     self._phase = self._phase ^ 1
-
-#     # Extract CTA ID from CLC response
-#     tile_id = tlx.clc_query(clc_response)
-
-#     return tile_id
 
 def _matmul_launch_metadata(grid, kernel, args):
     ret = {}
@@ -98,7 +43,7 @@ def _matmul_launch_metadata(grid, kernel, args):
         bytes_per_elem = args["c_ptr"].element_size()
     else:
         bytes_per_elem = 1 if args["FP8_OUTPUT"] else 2
-    ret[f"flops{bytes_per_elem * 8}"] = 2. * M * N * K
+    ret[f"flops{bytes_per_elem * 8}"] = 2.0 * M * N * K
     ret["bytes"] = bytes_per_elem * (M * K + N * K + M * N)
     return ret
 
@@ -110,13 +55,12 @@ HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
 
 def matmul_get_configs(pre_hook=None):
     return [
-        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 1}, num_stages=s,
-                      num_warps=w, pre_hook=pre_hook)
-        for BM in [64]
-        for BN in [64]
-        for BK in [64]
-        for s in ([2])
-        for w in [4]
+        triton.Config(
+            {"BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 1},
+            num_stages=s,
+            num_warps=w,
+            pre_hook=pre_hook,
+        ) for BM in [64] for BN in [64] for BK in [64] for s in ([2]) for w in [4]
     ]
 
 
@@ -178,7 +122,7 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if (c_ptr.dtype.element_ty == tl.float8e4nv):
+    if c_ptr.dtype.element_ty == tl.float8e4nv:
         c = accumulator.to(tl.float8e4nv)
     else:
         c = accumulator.to(tl.float16)
@@ -226,30 +170,30 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
                              BLOCK_SIZE_K: tl.constexpr,  #
                              GROUP_SIZE_M: tl.constexpr,  #
                              NUM_SMS: tl.constexpr,  #
+                             NUM_CLC_STAGES: tl.constexpr,  #
                              ):
+    # NOTE: There is currently a bug in blackwell pipelining that means it can't handle a value being
+    # used in both the prologue and epilogue, so we duplicate the counters as a work-around.
+    # tile_id_c = start_pid - NUM_SMS
+
     tid = tlx.thread_id(axis=0)
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-
-    # NOTE: There is currently a bug in blackwell pipelining that means it can't handle a value being
-    # used in both the prologue and epilogue, so we duplicate the counters as a work-around.
-    # tile_id_c = start_pid - NUM_SMS
     tile_id = start_pid
-
-    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
 
-    # TLX: cluster launch control for dynamic tiling scheduling
-    phase = 0
-
-    # TLX abstraction
-    scheduler = tlx.create_pipeliner(num_stages=1)
-
-    # scheduler.alloc()
+    clc_context = tlx.clc_create_context(NUM_CLC_STAGES)
+    p_producer = 1
+    p_consumer = 0
 
     while tile_id != -1:
+        # producer
+        tlx.clc_producer(clc_context, p_producer)
+        p_producer ^= 1
+
         if tid == 0:
             tl.device_print("Processing CtaID", tile_id)
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
@@ -277,27 +221,15 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if (c_ptr.dtype.element_ty == tl.float8e4nv):
+        if c_ptr.dtype.element_ty == tl.float8e4nv:
             c = accumulator.to(tl.float8e4nv)
         else:
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
 
-        # # TLX
-        # # Issue async clc.try_cancel for the next available CTA
-        # tlx.barrier_expect_bytes(scheduler.clc_mbars[0], 16)  # CLC response is 16-byte
-        # tlx.clc_issue(scheduler.clc_responses[0], scheduler.clc_mbars[0])
-
-        # # Wait for clc.try_cancel finishes
-        # tlx.barrier_wait(scheduler.clc_mbars[0], scheduler.phase)
-        # scheduler.flip_phase()
-        # # phase ^= 1
-
-        # # Extract CTA ID from CLC response
-        # tile_id = tlx.clc_query(scheduler.clc_responses[0])
-
-        # tile_id = scheduler.fetch_next_work()
-        tile_id = tlx.clc_fetch_next_worker(scheduler)
+        # consumer
+        tile_id = tlx.clc_consumer(clc_context, p_consumer)
+        p_consumer ^= 1
 
         if tid == 0:
             tl.device_print("Extracted CtaID", tile_id)
@@ -322,6 +254,7 @@ def matmul_persistent(a, b):
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
+        NUM_CLC_STAGES=2,  #
         launch_cluster=True,  # Cluster launch control
     )
     return c

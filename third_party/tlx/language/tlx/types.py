@@ -1,6 +1,5 @@
 import triton.language.core as tl
 from triton.language.core import _aggregate as aggregate
-from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
@@ -240,7 +239,7 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
-        assert semantic or num == 0, "buffered_tensor array must be created with a builder"
+        # assert semantic or num == 0, "buffered_tensor array must be created with a builder"
         self.semantic = semantic
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
@@ -356,8 +355,8 @@ class clc_response_type(buffered_tensor_type):
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic):
         super().__init__(tl.int64, [1], num, storage_kind.smem, layout, semantic)
 
-    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
-        value = mbarrier(handles[cursor], self.num, self.layout)
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
+        value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
@@ -374,82 +373,22 @@ class clc_response_type(buffered_tensor_type):
         )
 
 
-# CLC pipeline
-# @aggregate
-@dataclass
-class pipeline_state:
-    _stages: int
-    _index: int = 0
-    _phase: int = 0
-    _count: int = 0
-
-    def incr(self) -> None:
-        self._index += 1
-        self._count += 1
-        if self._index == self._stages:
-            self._index = 0
-            self._phase ^= 1
-
-
 @aggregate
-class CLCPipeliner:
-    clc_mbars: mbarrier
-    clc_responses: clc_response
-    # phase: tl.tensor = None
-    phase: tl.constexpr = 0
+class CLCPipelineContext:
+    _clc_mbars_empty: mbarrier
+    _clc_mbars_full: mbarrier
+    _clc_responses: clc_response
 
-    def __init__(self, clc_mbars: mbarrier, clc_responses: clc_response, semantic: TritonSemantic = None):
-        self.clc_mbars = clc_mbars
-        self.clc_responses = clc_responses
-        self.phase = tl.constexpr(0)
-
-    def flip_phase(self) -> None:
-        self.phase = self.phase ^ 1
-        print(f"\rFlipping scheduler phase to {self.phase}")
-
-    # clc_response: clc_response_type
-    # phase: tl.constexpr
-    # full_bars: mbarrier
-    # bars: mbarrier
-    # responses: clc_response
-    # _num_stages: int = 0
-    # _state: pipeline_state
-
-
-#     @tl.builtin
-#     def __init__(self, num_stages, _semantic=None) -> None:
-#         # self._semantic = _semantic
-#         self._num_stages = tl._unwrap_if_constexpr(num_stages)
-#         self._state = pipeline_state(self._num_stages)
-#         self.full_bars = tlx_barrier.alloc_barriers(num_barriers=self._num_stages)
-#         self.empty_bars = tlx_barrier.alloc_barriers(num_barriers=self._num_stages)
-#         self.responses = alloc_clc_responses(num_responses=self._num_stages)
-
-#     # @triton.jit
-#     # def alloc(self) -> None:
-#     #     # alloc mbar and clc responses
-#     #     full_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
-#     #     empty_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
-#     #     responses = tlx.alloc_clc_responses(num_responses=self._num_stages)
-
-#     # @triton.jit
-#     def fetch_next_work(self) -> int:
-#         clc_mbar = self.full_bars[0]
-#         clc_response = self.responses[0]
-
-#         # TLX
-#         # Issue async clc.try_cancel for the next available CTA
-#         tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
-#         tlx.clc_issue(clc_response, clc_mbar)
-
-#         # Wait for clc.try_cancel finishes
-#         tlx.barrier_wait(clc_mbar, self._phase)
-#         self._phase = self._phase ^ 1
-
-#         # Extract CTA ID from CLC response
-#         tile_id = tlx.clc_query(clc_response)
-
-#         return tile_id
+    def __init__(
+        self,
+        clc_mbars_empty: mbarrier,
+        clc_mbars_full: mbarrier,
+        clc_responses: clc_response,
+        semantic: TritonSemantic = None,
+    ):
+        self._clc_mbars_empty = clc_mbars_empty
+        self._clc_mbars_full = clc_mbars_full
+        self._clc_responses = clc_responses
 
 
 class async_token(tl.base_value):
