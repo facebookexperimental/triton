@@ -1,6 +1,5 @@
 import triton.language.core as tl
 from triton.language.core import _aggregate as aggregate
-from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
