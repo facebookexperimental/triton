@@ -1,16 +1,15 @@
 # from dataclasses import dataclass
 import triton.language.core as tl
-# from triton.language.core import _aggregate as aggregate
 
 from . import types as tlx
-# from . import barrier as tlx_barrier
+from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait
 
 # Blackwell-only
 
 
 @tl.builtin
 def alloc_clc_responses(
-    num_responses: tl.constexpr,
+    num_responses: int,
     _semantic=None,
 ) -> tlx.clc_response:
     layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
@@ -23,8 +22,12 @@ def alloc_clc_responses(
         layout.numCTASplit,
         layout.numCTAOrder,
     )
-    return tlx.clc_response(_semantic.builder.create_alloc_clc_responses(num_responses.value, layout_handle),
-                            num_responses, layout, _semantic)
+    return tlx.clc_response(
+        _semantic.builder.create_alloc_clc_responses(num_responses, layout_handle),
+        num_responses,
+        layout,
+        _semantic,
+    )
 
 
 @tl.builtin
@@ -50,6 +53,34 @@ def clc_query(
 
     x = _semantic.builder.clc_query(clc_response_addr.handle, )
     return _semantic.tensor(x, tl.int32)
+
+
+@tl.builtin
+def create_pipeliner(num_stages: tl.constexpr, _semantic=None) -> tlx.CLCPipeliner:
+    # phase: tl.constexpr = tl.constexpr(0)
+    return tlx.CLCPipeliner(
+        clc_mbars=alloc_barriers(num_barriers=num_stages, _semantic=_semantic),
+        clc_responses=alloc_clc_responses(num_responses=num_stages, _semantic=_semantic),
+        # phase=_semantic._convert_elem_to_ir_value(0, require_i64=False),
+        _semantic=_semantic,
+    )
+    # responses = alloc_clc_responses(num_responses=1, _semantic=_semantic).handle
+    # return tlx.clc_pipeliner(bars, 0)
+
+
+@tl.builtin
+def clc_fetch_next_worker(scheduler: tlx.CLCPipeliner, _semantic=None):
+    # Issue async clc.try_cancel for the next available CTA
+    barrier_expect_bytes(scheduler.clc_mbars[0], tl.constexpr(16), _semantic=_semantic)  # CLC response is 16-byte
+    clc_issue(scheduler.clc_responses[0], scheduler.clc_mbars[0], _semantic=_semantic)
+
+    # Wait for clc.try_cancel finishes
+    barrier_wait(scheduler.clc_mbars[0], scheduler.phase, _semantic=_semantic)
+    scheduler.flip_phase()
+    # phase ^= 1
+
+    # Extract CTA ID from CLC response
+    return clc_query(scheduler.clc_responses[0], _semantic=_semantic)
 
 
 # @dataclass
