@@ -101,6 +101,12 @@ static void expandLoops(ModuleOp moduleOp) {
     if (schedule.getNumStages() == 1) {
       continue;
     }
+    // Skip pipelining on the default partition.
+    auto asyncIds = cast<DenseI32ArrayAttr>(forOp->getAttr("async_task_id"));
+    if (asyncIds[0] == 0) {
+      // Disable for default Partition
+      continue;
+    }
 
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
