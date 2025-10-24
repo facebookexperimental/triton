@@ -358,8 +358,14 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   if (maxnreg) {
     // Count the number of registers used by the other warp groups.
     if (auto actRegs = wsOp.getActualRegisters()) {
-      b.setInsertionPointToStart(entry);
-      createRegRealloc(b, maxnreg.getInt(), (*actRegs)[0]);
+      int numRegs = (*actRegs)[0];
+      if (maxnreg.getInt() > numRegs) {
+        // The default warp group needs more registers than the other warp
+        // groups. This is a special case where we need to lower the register
+        // count for the other warp groups.
+        b.setInsertionPointToStart(entry);
+        createRegRealloc(b, maxnreg.getInt(), numRegs);
+      }
     }
   }
 
