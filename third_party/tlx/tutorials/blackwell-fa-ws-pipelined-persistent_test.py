@@ -325,7 +325,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
             # mma group
-        with tlx.async_task(num_warps=1, registers=80):
+        with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
             accum_cnt_qk = 0
 
@@ -495,7 +495,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # load
-        with tlx.async_task(num_warps=1, registers=80):
+        with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
             for i in range(0, tiles_per_sm):
                 # initialize offsets
@@ -567,7 +567,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tile_idx += num_progs
 
         # epilog group
-        with tlx.async_task(num_warps=1, registers=80):
+        with tlx.async_task(num_warps=1, registers=24):
             # initialize offsets
             for i in range(0, tiles_per_sm):
                 # initialize offsets
