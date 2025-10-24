@@ -1,4 +1,6 @@
 import triton.language.core as tl
+from triton.language.core import _aggregate as aggregate
+from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
@@ -370,6 +372,84 @@ class clc_response_type(buffered_tensor_type):
             self.layout.to_ir(builder),
             self.storage.value,
         )
+
+
+# CLC pipeline
+# @aggregate
+@dataclass
+class pipeline_state:
+    _stages: int
+    _index: int = 0
+    _phase: int = 0
+    _count: int = 0
+
+    def incr(self) -> None:
+        self._index += 1
+        self._count += 1
+        if self._index == self._stages:
+            self._index = 0
+            self._phase ^= 1
+
+
+@aggregate
+class CLCPipeliner:
+    clc_mbars: mbarrier
+    clc_responses: clc_response
+    # phase: tl.tensor = None
+    phase: tl.constexpr = 0
+
+    def __init__(self, clc_mbars: mbarrier, clc_responses: clc_response, semantic: TritonSemantic = None):
+        self.clc_mbars = clc_mbars
+        self.clc_responses = clc_responses
+        self.phase = tl.constexpr(0)
+
+    def flip_phase(self) -> None:
+        self.phase = self.phase ^ 1
+        print(f"\rFlipping scheduler phase to {self.phase}")
+
+    # clc_response: clc_response_type
+    # phase: tl.constexpr
+    # full_bars: mbarrier
+    # bars: mbarrier
+    # responses: clc_response
+    # _num_stages: int = 0
+    # _state: pipeline_state
+
+
+#     @tl.builtin
+#     def __init__(self, num_stages, _semantic=None) -> None:
+#         # self._semantic = _semantic
+#         self._num_stages = tl._unwrap_if_constexpr(num_stages)
+#         self._state = pipeline_state(self._num_stages)
+#         self.full_bars = tlx_barrier.alloc_barriers(num_barriers=self._num_stages)
+#         self.empty_bars = tlx_barrier.alloc_barriers(num_barriers=self._num_stages)
+#         self.responses = alloc_clc_responses(num_responses=self._num_stages)
+
+#     # @triton.jit
+#     # def alloc(self) -> None:
+#     #     # alloc mbar and clc responses
+#     #     full_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
+#     #     empty_bars = tlx.alloc_barriers(num_barriers=self._num_stages)
+#     #     responses = tlx.alloc_clc_responses(num_responses=self._num_stages)
+
+#     # @triton.jit
+#     def fetch_next_work(self) -> int:
+#         clc_mbar = self.full_bars[0]
+#         clc_response = self.responses[0]
+
+#         # TLX
+#         # Issue async clc.try_cancel for the next available CTA
+#         tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
+#         tlx.clc_issue(clc_response, clc_mbar)
+
+#         # Wait for clc.try_cancel finishes
+#         tlx.barrier_wait(clc_mbar, self._phase)
+#         self._phase = self._phase ^ 1
+
+#         # Extract CTA ID from CLC response
+#         tile_id = tlx.clc_query(clc_response)
+
+#         return tile_id
 
 
 class async_token(tl.base_value):
