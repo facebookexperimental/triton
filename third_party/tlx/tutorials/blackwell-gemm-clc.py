@@ -159,7 +159,7 @@ def matmul(a, b):
 
 @aggregate
 class CLCPipelineState:
-    _stages: tl.tensor
+    _stages: tl.constexpr
     _phase: tl.tensor
     _next_tile_id: tl.tensor
 
@@ -172,6 +172,21 @@ class CLCPipelineState:
     @triton.jit
     def advance(self, next_tile_id):
         return CLCPipelineState(self._stages, self._phase ^ 1, next_tile_id)
+
+
+# @aggregate
+# class CLCPipelineScheduler:
+#     _state: CLCPipelineState
+#     _scheduler: tlx.CLCPipeliner
+
+#     def __init__(self, state, scheduler):
+#         self._state = state
+#         self._scheduler = scheduler
+
+#     @must_use_result
+#     @triton.jit
+#     def advance(self, next_tile_id):
+#         self._state = self._state.advance(tlx.clc_fetch_next_worker(self._scheduler, self._state))
 
 
 @triton.autotune(
@@ -189,6 +204,7 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
                              BLOCK_SIZE_K: tl.constexpr,  #
                              GROUP_SIZE_M: tl.constexpr,  #
                              NUM_SMS: tl.constexpr,  #
+                             NUM_CLC_STAGES: tl.constexpr,  #
                              ):
     tid = tlx.thread_id(axis=0)
     start_pid = tl.program_id(axis=0)
@@ -204,11 +220,9 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    num_stages = 10
     phase = 0
-    state = CLCPipelineState(num_stages, phase, tile_id)
-    # TLX abstraction
-    scheduler = tlx.clc_create_scheduler(num_stages=1)
+    state = CLCPipelineState(NUM_CLC_STAGES, phase, tile_id)
+    clc_context = tlx.clc_create_context(state._stages)
 
     while state._next_tile_id != -1:
         if tid == 0:
@@ -244,7 +258,7 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
 
-        state = state.advance(tlx.clc_fetch_next_worker(scheduler, state))
+        state = state.advance(tlx.clc_fetch_next_worker(clc_context, state))
 
         if tid == 0:
             tl.device_print("Extracted CtaID", state._next_tile_id)
@@ -269,6 +283,7 @@ def matmul_persistent(a, b):
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
+        NUM_CLC_STAGES=3,  #
         launch_cluster=True,  # Cluster launch control
     )
     return c

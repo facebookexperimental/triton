@@ -55,8 +55,8 @@ def _clc_query(
 
 
 @tl.builtin
-def clc_create_scheduler(num_stages: tl.constexpr, _semantic=None) -> tlx.CLCPipeliner:
-    return tlx.CLCPipeliner(
+def clc_create_context(num_stages: tl.tensor, _semantic=None) -> tlx.CLCPipelineContext:
+    return tlx.CLCPipelineContext(
         clc_mbars=alloc_barriers(num_barriers=num_stages, _semantic=_semantic),
         clc_responses=_alloc_clc_responses(num_responses=num_stages, _semantic=_semantic),
         _semantic=_semantic,
@@ -64,7 +64,7 @@ def clc_create_scheduler(num_stages: tl.constexpr, _semantic=None) -> tlx.CLCPip
 
 
 @tl.builtin
-def clc_fetch_next_worker(scheduler: tlx.CLCPipeliner, state, _semantic=None):
+def clc_fetch_next_worker(scheduler: tlx.CLCPipelineContext, state, _semantic=None):
     assert hasattr(state, "_phase")
     # Issue async clc.try_cancel for the next available CTA
     barrier_expect_bytes(scheduler.clc_mbars[0], tl.constexpr(16), _semantic=_semantic)  # CLC response is 16-byte

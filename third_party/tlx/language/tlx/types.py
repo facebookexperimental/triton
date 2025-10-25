@@ -374,7 +374,7 @@ class clc_response_type(buffered_tensor_type):
 
 
 @aggregate
-class CLCPipeliner:
+class CLCPipelineContext:
     clc_mbars: mbarrier
     clc_responses: clc_response
 
