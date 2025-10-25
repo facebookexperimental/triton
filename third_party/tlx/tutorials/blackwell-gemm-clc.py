@@ -6,7 +6,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 import triton.profiler as proton
-
+from triton.language.core import _aggregate as aggregate
+from triton.language.core import must_use_result
 from triton._internal_testing import is_blackwell
 from contextlib import contextmanager
 
@@ -156,6 +157,38 @@ def matmul(a, b):
     return c
 
 
+@aggregate
+class CLCPipelineState:
+    _stages: tl.constexpr
+    _phase: tl.tensor
+    _next_tile_id: tl.tensor
+
+    def __init__(self, stages, phase, next_tile_id):
+        self._stages = stages
+        self._phase = phase
+        self._next_tile_id = next_tile_id
+
+    @must_use_result
+    @triton.jit
+    def advance(self, next_tile_id):
+        return CLCPipelineState(self._stages, self._phase ^ 1, next_tile_id)
+
+
+# @aggregate
+# class CLCPipelineScheduler:
+#     _state: CLCPipelineState
+#     _scheduler: tlx.CLCPipeliner
+
+#     def __init__(self, state, scheduler):
+#         self._state = state
+#         self._scheduler = scheduler
+
+#     @must_use_result
+#     @triton.jit
+#     def advance(self, next_tile_id):
+#         self._state = self._state.advance(tlx.clc_fetch_next_worker(self._scheduler, self._state))
+
+
 @triton.autotune(
     configs=matmul_get_configs(),
     key=["M", "N", "K"],
@@ -171,6 +204,7 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
                              BLOCK_SIZE_K: tl.constexpr,  #
                              GROUP_SIZE_M: tl.constexpr,  #
                              NUM_SMS: tl.constexpr,  #
+                             NUM_CLC_STAGES: tl.constexpr,  #
                              ):
     tid = tlx.thread_id(axis=0)
     start_pid = tl.program_id(axis=0)
@@ -186,17 +220,14 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # TLX: cluster launch control for dynamic tiling scheduling
-    bars = tlx.alloc_barriers(num_barriers=1)
-    clc_mbar = bars[0]
-    responses = tlx.alloc_clc_responses(num_responses=1)
-    clc_response = responses[0]
     phase = 0
+    state = CLCPipelineState(NUM_CLC_STAGES, phase, tile_id)
+    clc_context = tlx.clc_create_context(state._stages)
 
-    while tile_id != -1:
+    while state._next_tile_id != -1:
         if tid == 0:
-            tl.device_print("Processing CtaID", tile_id)
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+            tl.device_print("Processing CtaID", state._next_tile_id)
+        pid_m, pid_n = _compute_pid(state._next_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -227,20 +258,10 @@ def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
 
-        # TLX
-        # Issue async clc.try_cancel for the next available CTA
-        tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
-        tlx.clc_issue(clc_response, clc_mbar)
-
-        # Wait for clc.try_cancel finishes
-        tlx.barrier_wait(clc_mbar, phase)
-        phase = phase ^ 1
-
-        # Extract CTA ID from CLC response
-        tile_id = tlx.clc_query(clc_response)
+        state = state.advance(tlx.clc_fetch_next_worker(clc_context, state))
 
         if tid == 0:
-            tl.device_print("Extracted CtaID", tile_id)
+            tl.device_print("Extracted CtaID", state._next_tile_id)
 
 
 def matmul_persistent(a, b):
@@ -262,6 +283,7 @@ def matmul_persistent(a, b):
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
+        NUM_CLC_STAGES=3,  #
         launch_cluster=True,  # Cluster launch control
     )
     return c

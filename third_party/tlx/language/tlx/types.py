@@ -1,4 +1,5 @@
 import triton.language.core as tl
+from triton.language.core import _aggregate as aggregate
 from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
@@ -370,6 +371,16 @@ class clc_response_type(buffered_tensor_type):
             self.layout.to_ir(builder),
             self.storage.value,
         )
+
+
+@aggregate
+class CLCPipelineContext:
+    clc_mbars: mbarrier
+    clc_responses: clc_response
+
+    def __init__(self, clc_mbars: mbarrier, clc_responses: clc_response, semantic: TritonSemantic = None):
+        self.clc_mbars = clc_mbars
+        self.clc_responses = clc_responses
 
 
 class async_token(tl.base_value):

@@ -1,5 +1,4 @@
 import triton.language.core as tl
-
 from . import types as tlx
 from .utility import is_hip
 
