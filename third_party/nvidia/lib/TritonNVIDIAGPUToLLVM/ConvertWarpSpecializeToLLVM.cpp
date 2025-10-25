@@ -402,8 +402,8 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
     b.replaceOpWithNewOp<LLVM::BrOp>(op, op.getOperands(), wsPostBlock);
   });
 
-  // Append the default region to the entry block.
-  funcOp.getBlocks().splice(std::next(entry->getIterator()),
+  // Append the default region to the WS header block.
+  funcOp.getBlocks().splice(std::next(wsPreBlock->getIterator()),
                             wsOp.getDefaultRegion().getBlocks());
 
   // Exit block for partition regions.
@@ -428,6 +428,7 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
 
   // Create the if-else-if-else chain for wsOp partition regions.
   auto curNumWarps = defaultNumWarps;
+  Block *startBlock = headerBlock;
   for (size_t i = 0; i < wsOp.getPartitionRegions().size(); ++i) {
     Block *curPartitionBlock = partitionBlocks[i];
     b.setInsertionPointToStart(curPartitionBlock);
@@ -444,6 +445,12 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
     curNumWarps += wsOp.getPartitionNumWarps()[i];
     Value isCurr = b.icmp_ult(wid, b.i32_val(curNumWarps));
     b.create<LLVM::CondBrOp>(isCurr, curPartitionBlock, wsBlock);
+
+    // Append the branch block to the header block for better locality.
+    funcOp.getBlocks().splice(std::next(startBlock->getIterator()),
+                              curBranchBlock->getParent()->getBlocks(),
+                              curBranchBlock->getIterator());
+    startBlock = curBranchBlock;
   }
 
   // The barrier ensures they have read the captures before the memory is
