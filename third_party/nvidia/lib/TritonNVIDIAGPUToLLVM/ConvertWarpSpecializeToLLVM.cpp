@@ -23,6 +23,9 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
 //===----------------------------------------------------------------------===//
 // convertOpTypes
 //===----------------------------------------------------------------------===//
@@ -241,7 +244,6 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // Load the explicit captures from shared memory and replace the block args
     // if there are any.
     b.setInsertionPointToStart(&partition->front());
-
     if (auto actRegs = ws.getActualRegisters()) {
       createRegRealloc(b, lowRegs,
                        (*actRegs)[partition->getRegionNumber() + 1]);
@@ -274,10 +276,7 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
       createAllBarrier(b, kSwitchLoopBarrierIdx);
-      if (auto actRegs = ws.getActualRegisters()) {
-        createRegRealloc(b, (*actRegs)[partition->getRegionNumber() + 1],
-                         lowRegs);
-      }
+
       b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
     });
   }
@@ -298,6 +297,176 @@ static void disableLICM(LLVM::BrOp latchBr) {
       LLVM::LoopAnnotationAttr::get(b.getContext(), {}, {}, {}, {}, {}, licmMD,
                                     {}, {}, {}, {}, {}, {}, {}, {}, {});
   latchBr.setLoopAnnotationAttr(loopMD);
+}
+
+static LogicalResult
+lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
+                         const NVIDIA::TargetInfo &targetInfo) {
+  LLVM::LLVMFuncOp funcOp = dyn_cast<LLVM::LLVMFuncOp>(wsOp->getParentOp());
+  assert(funcOp && "WS op must be on the trunk path of its parent function");
+  Block *entry = &funcOp.getBody().front();
+
+  if (wsOp->getNumResults() > 0)
+    return failure();
+
+  mlir::PostDominanceInfo pdom(funcOp);
+  if (!pdom.postDominates(wsOp->getBlock(), entry))
+    return failure();
+
+  auto module = cast<ModuleOp>(funcOp->getParentOp());
+  unsigned threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(module);
+  unsigned defaultNumWarps = lookupNumWarps(funcOp);
+  unsigned defaultWarpGroupSize = threadsPerWarp * defaultNumWarps;
+  auto totalNumWarpsAttr =
+      module->getAttrOfType<IntegerAttr>("ttg.total-num-warps");
+  if (!totalNumWarpsAttr) {
+    return mlir::emitError(module.getLoc(),
+                           "module missing 'ttg.total-num-warps' attribute");
+  }
+  unsigned totalNumThreads = totalNumWarpsAttr.getInt() * threadsPerWarp;
+
+  MLIRContext *ctx = funcOp.getContext();
+  TritonLLVMIRRewriter b(funcOp.getLoc(), ctx);
+  Builder rewriter(ctx);
+
+  LLVM_DEBUG({
+    LDBG("Lowering WarpSpecializeOp for function:");
+    funcOp->dump();
+  });
+
+  Block *newBlock = entry->splitBlock(&entry->front());
+  Block *headerBlock = entry;
+  entry = newBlock;
+  Block *wsPreBlock = wsOp->getBlock();
+  Block *wsBlock = wsPreBlock->splitBlock(wsOp);
+  Block *wsPostBlock = wsBlock->splitBlock(wsOp->getNextNode());
+
+  b.setInsertionPointToStart(headerBlock);
+
+  // This is the absolute thread ID.
+  Value tid = b.create<NVVM::ThreadIdXOp>(i32_ty);
+  Value wid = b.udiv(tid, b.i32_val(threadsPerWarp));
+  // Tell PTXAS this value is warp-uniform.
+  wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
+  Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
+  b.create<LLVM::CondBrOp>(isDefault, entry, wsBlock);
+
+  // Set register requirements for the default warp group.
+  auto maxnreg =
+      funcOp->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
+          AttrMaxRegistersName);
+  if (maxnreg) {
+    // Count the number of registers used by the other warp groups.
+    if (auto actRegs = wsOp.getActualRegisters()) {
+      int numRegs = (*actRegs)[0];
+      if (maxnreg.getInt() > numRegs) {
+        // The default warp group needs more registers than the other warp
+        // groups. This is a special case where we need to lower the register
+        // count for the other warp groups.
+        b.setInsertionPointToStart(entry);
+        createRegRealloc(b, maxnreg.getInt(), numRegs);
+      }
+    }
+  }
+
+  // Add captures before the WS op
+  b.setInsertionPointToEnd(wsPreBlock);
+  LLVM::LLVMPointerType ptrTy = ptr_ty(ctx, 3);
+
+  if (wsOp.getNumOperands()) {
+    auto captureType = LLVM::LLVMStructType::getLiteral(
+        b.getContext(), llvm::to_vector(wsOp.getOperandTypes()),
+        /*isPacked=*/true);
+    Value capturePtr =
+        LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, wsOp);
+    for (auto [i, arg] : llvm::zip(llvm::seq<int32_t>(wsOp.getNumOperands()),
+                                   wsOp.getOperands())) {
+      Value ptr =
+          b.gep(ptrTy, captureType, capturePtr, ArrayRef<LLVM::GEPArg>{0, i});
+      b.store(arg, ptr, /*align=*/1);
+    }
+  }
+
+  // The barrier ensures they have read the captures before the memory is
+  // released upon entry.
+  createAllBarrier(b, kSwitchLoopBarrierIdx);
+  createAllBarrier(b, kSwitchLoopBarrierIdx);
+  b.create<LLVM::BrOp>(&wsOp.getDefaultRegion().front());
+
+  // Replace WarpYieldOp of the default region with a jump to the epilog.
+  wsOp.getDefaultRegion().walk([&](WarpYieldOp op) mutable {
+    TritonLLVMIRRewriter b(op.getLoc(), op);
+    createAllBarrier(b, kSwitchLoopBarrierIdx);
+    // if (auto actRegs = wsOp.getActualRegisters())
+    //   createRegRealloc(b, actRegs->front(), defRegs);
+    b.replaceOpWithNewOp<LLVM::BrOp>(op, op.getOperands(), wsPostBlock);
+  });
+
+  // Append the default region to the WS header block.
+  funcOp.getBlocks().splice(std::next(wsPreBlock->getIterator()),
+                            wsOp.getDefaultRegion().getBlocks());
+
+  // Exit block for partition regions.
+  Block *wsExitBlock = new Block;
+  funcOp.getBlocks().insert(std::next(wsBlock->getIterator()), wsExitBlock);
+  b.setInsertionPointToStart(wsExitBlock);
+  b.create<LLVM::ReturnOp>(ValueRange());
+
+  rewritePartitionRegions(wsOp, wsExitBlock, targetInfo,
+                          maxnreg ? maxnreg.getInt() : 0);
+
+  SmallVector<Block *> partitionBlocks;
+  for (auto partition : wsOp.getPartitionRegions()) {
+    partitionBlocks.push_back(&partition->front());
+  }
+
+  // Append the parition regions to after the ws block.
+  for (Block *block : partitionBlocks) {
+    Region *region = block->getParent();
+    funcOp.getBlocks().splice(wsBlock->getIterator(), region->getBlocks());
+  }
+
+  // Create the if-else-if-else chain for wsOp partition regions.
+  auto curNumWarps = defaultNumWarps;
+  Block *startBlock = headerBlock;
+  for (size_t i = 0; i < wsOp.getPartitionRegions().size(); ++i) {
+    Block *curPartitionBlock = partitionBlocks[i];
+    b.setInsertionPointToStart(curPartitionBlock);
+
+    // The shared memory is only live for the entry into the region, so put
+    // another barrier here.
+    createAllBarrier(b, kSwitchLoopBarrierIdx);
+
+    // Branch for the partition region
+    newBlock = wsBlock->splitBlock(wsOp);
+    Block *curBranchBlock = wsBlock;
+    wsBlock = newBlock;
+    b.setInsertionPointToStart(curBranchBlock);
+    curNumWarps += wsOp.getPartitionNumWarps()[i];
+    Value isCurr = b.icmp_ult(wid, b.i32_val(curNumWarps));
+    b.create<LLVM::CondBrOp>(isCurr, curPartitionBlock, wsBlock);
+
+    // Append the branch block to the header block for better locality.
+    funcOp.getBlocks().splice(std::next(startBlock->getIterator()),
+                              curBranchBlock->getParent()->getBlocks(),
+                              curBranchBlock->getIterator());
+    startBlock = curBranchBlock;
+  }
+
+  // The barrier ensures they have read the captures before the memory is
+  // released upon entry.
+  b.setInsertionPointToEnd(wsBlock);
+  createAllBarrier(b, kSwitchLoopBarrierIdx);
+  createAllBarrier(b, kSwitchLoopBarrierIdx);
+  b.create<LLVM::BrOp>(wsExitBlock);
+  wsOp->erase();
+
+  LLVM_DEBUG({
+    LDBG("After lowering WarpSpecializeOp for function:");
+    funcOp->dump();
+  });
+
+  return llvm::success();
 }
 
 static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
@@ -353,6 +522,13 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Attempt to elide captures of trivial computations by hoisting them into the
   // header or rematerializing them into each partition.
   elideTrivialCaptures(func, wsOps);
+
+  // Optimize for the case where there's only one WS op which is on the trunk
+  // path.
+  if (wsOps.size() == 1) {
+    if (lowerWarpSpecializeTrunk(wsOps[0], targetInfo).succeeded())
+      return success();
+  }
 
   MLIRContext *ctx = func.getContext();
   TritonLLVMIRRewriter b(func.getLoc(), ctx);
