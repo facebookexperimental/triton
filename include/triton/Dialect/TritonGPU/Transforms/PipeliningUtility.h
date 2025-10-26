@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <optional>
 #include <utility>
 #include <vector>
@@ -178,6 +179,15 @@ Operation *
 getLastUseOfPipelinedOp(ArrayRef<Operation *> ops, scf::ForOp forOp,
                         CoarseSchedule &schedule,
                         std::function<bool(Operation *)> filterUse = nullptr);
+struct MMAClusterInfo {
+  DenseMap<Operation *, int> distance;
+  DenseMap<Operation *, int> clusterMap;
+  SmallVector<int> maxClusterPerDistance;
+  SmallVector<SmallVector<triton::nvidia_gpu::MMAv5OpInterface>> mmaChains;
+  size_t numDots;
+};
+
+MMAClusterInfo getMMADistanceAndCluster(scf::ForOp forOp, int maxStages);
 
 } // namespace triton
 } // namespace mlir

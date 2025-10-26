@@ -190,121 +190,6 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
   return false;
 }
 
-// Determine the chain of dots in the given set of users for a dot.
-std::tuple<SmallVector<ttng::MMAv5OpInterface>, bool>
-computeDotChain(ttng::MMAv5OpInterface dotOp,
-                DenseSet<ttng::MMAv5OpInterface> &seenDots) {
-  SmallVector<ttng::MMAv5OpInterface> chain;
-  std::optional<ttng::MMAv5OpInterface> nextDotOp = dotOp;
-  while (nextDotOp.has_value()) {
-    ttng::MMAv5OpInterface activeDotOp = nextDotOp.value();
-    chain.push_back(activeDotOp);
-    seenDots.insert(activeDotOp);
-    nextDotOp = std::nullopt;
-    DenseSet<Operation *> seenOps;
-    SmallVector<Operation *> users;
-    auto addUsers = [&](Operation *op) {
-      for (mlir::Value result : op->getResults()) {
-        for (auto user : result.getUsers()) {
-          if (user && !isa<scf::YieldOp>(user) && !seenOps.count(user)) {
-            users.push_back(user);
-          }
-        }
-      }
-    };
-    addUsers(activeDotOp);
-    while (!users.empty()) {
-      auto nextOp = users.pop_back_val();
-      if (auto newDotOp = dyn_cast<ttng::MMAv5OpInterface>(nextOp)) {
-        if (seenDots.count(newDotOp)) {
-          // Already seen dot, not support
-          return {chain, false};
-        }
-        if (nextDotOp.has_value() && nextDotOp != newDotOp) {
-          // Not a linear chain
-          return {chain, false};
-        }
-        nextDotOp = newDotOp;
-      } else {
-        seenOps.insert(nextOp);
-        addUsers(nextOp);
-      }
-    }
-  }
-  return {chain, true};
-}
-
-// Determine the chain of independent dot ops that are present in the body
-// of the loop. This will be used to influence the cluster decisions for placing
-// the dot ops at a maximum distance from each other. This returns a "success"
-// value with the following possible reasons for failure:
-// 1. The loop has <= 1 chain of dot ops. This is not helpful for scheduling
-// decisions.
-// 2. All dots are independent (longest chain is length 1). This is not helpful
-// for scheduling decisions.
-// 3. The chain of dots is not a line (e.g. A->B and A->C or A->C and B->C).
-// This case is too complicated
-//    to currently suppport.
-// 4. A dot is gated under additional control flow. This is not currently
-// supported.
-// 5. Any type of dot is present that is not a MMAv5OpInterface.
-std::tuple<SmallVector<SmallVector<ttng::MMAv5OpInterface>>, bool>
-determineIndependentDotChains(scf::ForOp forOp, int maxStages) {
-  DenseSet<ttng::MMAv5OpInterface> seenDots;
-  SmallVector<SmallVector<ttng::MMAv5OpInterface>> dotChains;
-  for (auto &op : forOp.getBody()->without_terminator()) {
-    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
-      if (seenDots.count(mmaOp)) {
-        // If we have already seen this Dot then we can just skip
-        // forward in program order. computeDotChain will detect
-        // any non-chain patterns.
-        continue;
-      }
-      auto [dotChain, success] = computeDotChain(mmaOp, seenDots);
-      if (!success) {
-        return {dotChains, false};
-      }
-      dotChains.push_back(dotChain);
-    } else if (isa<tt::DotOpInterface>(op)) {
-      // Cluster decisions require MMAv5OpInterface
-      return {dotChains, false};
-    } else if (isa<scf::IfOp, scf::ForOp>(op)) {
-      // Exit with unsupported control flow.
-      bool found = false;
-      op.walk([&](tt::DotOpInterface op) {
-        found = true;
-        // Interrupt the walk early if found
-        return mlir::WalkResult::interrupt();
-      });
-      if (found) {
-        return {dotChains, false};
-      }
-    }
-  }
-  if (dotChains.size() < 2) {
-    // Only 1 chain, ignore.
-    return {dotChains, false};
-  }
-  size_t maxChainLength = 0;
-  for (auto &chain : dotChains) {
-    maxChainLength = std::max(maxChainLength, chain.size());
-  }
-  // Require all chains to be length 2 for now so the math
-  // will always work. In general the allocation strategy
-  // that we have chosen will always work so long as
-  // num_dots - (maxChainLength - 1)) and num_dots are
-  // coprime. However, finding the starting points is complicated
-  // unless maxChainLength = 2.
-  if (maxChainLength != 2) {
-    return {dotChains, false};
-  }
-  if (maxChainLength > maxStages) {
-    // Not enough stages to schedule the dots.
-    return {dotChains, false};
-  }
-  return {dotChains, true};
-}
-
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency,
                               int defaultNumStages) {
@@ -324,72 +209,14 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // Schedule parallel dot pattern.
   int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
   int maxPossibleDistance = maxStages - 1;
-  // Compute the longest path to the yield for each operation reachable
-  // from any latency operation. We also use this to embed stage information
-  // for mmas.
-  DenseMap<Operation *, int> distance;
-  // Track the MMA cluster information for the independent dot chain path.
-  // If success=True every dot will be assigned to a chain (and therefore
-  // every dot will populate the clusterMap).
-  DenseMap<Operation *, int> clusterMap;
-  auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
-  size_t numDots = 0;
-  SmallVector<int> maxClusterPerDistance(maxStages, -1);
-  if (success) {
-    size_t maxChainLength = 0;
-    for (auto &chain : chains) {
-      maxChainLength = std::max(maxChainLength, chain.size());
-      numDots += chain.size();
-    }
-    // Assign each chain in order. Any time we wrap around to the
-    // next stage we assign that op to a later stage. When we can
-    // get the same dot distance with a later stage (but an earlier cluster),
-    // then we will.
-    int startingOffset = 0;
-    int incrementValue = (numDots - (maxChainLength - 1));
-    for (auto &chain : chains) {
-      int lastOffset = startingOffset - incrementValue;
-      // Distance is maxStage - stage.
-      // We initialize the distance to (chain_length - 1)
-      // and decrement to 0.
-      // Note the max stage is numStages - 1.
-      int currDistance = (chain.size() - 1);
-      for (auto &op : chain) {
-        int nextOffset = (lastOffset + incrementValue) % numDots;
-        if (nextOffset < lastOffset) {
-          currDistance--;
-        }
-        // Update the distance to impact the stage of the MMA
-        // and its dependent operations.
-        distance[op] = currDistance;
-        // Use mmaClusters to encode the ordering of the underlying clusters.
-        // This alters the simple heuristic later that cluster = max_stages -
-        // stage. To address this we leverage the follow details:
-        //
-        // 1. Every MMA operand will be at a distance >= MMA distance.
-        //    This is because the calculation for distance is distance + .
-        // 2. Every user will be at a distance <= MMA distance. This is because
-        //    the only ops that have defined distance are MMAs and loads. Since
-        //    MMAs are ordered (and guarenteed to be at a smaller distance), the
-        //    only way the distance could increase is if the MMA is an input to
-        //    to the load, requiring it to be either address, offset, or mask,
-        //    all of which are non-sense.
-        //
-        // As a result, when analyzing distance. We can safely assign each op to
-        // a cluster based on its distance as well as already assigned clusters.
-        // Anything that comes after an MMA (e.g. no known cluster) but has a
-        // computed distance placed in the last cluster for a given stage.
-        clusterMap[op] = nextOffset;
-        maxClusterPerDistance[currDistance] =
-            std::max(maxClusterPerDistance[currDistance], nextOffset);
-        lastOffset = nextOffset;
-      }
-      startingOffset += maxChainLength;
-    }
-  }
   // Initialize the cluster information for anything
   // not covered by the dots.
   int offset = 0;
+  auto clusterInfo = getMMADistanceAndCluster(forOp, maxStages);
+  DenseMap<Operation *, int> distance = clusterInfo.distance;
+  DenseMap<Operation *, int> clusterMap = clusterInfo.clusterMap;
+  SmallVector<int> maxClusterPerDistance = clusterInfo.maxClusterPerDistance;
+  auto numDots = clusterInfo.numDots;
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
