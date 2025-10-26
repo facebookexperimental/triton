@@ -420,10 +420,11 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
     partitionBlocks.push_back(&partition->front());
   }
 
-  // Append the parition regions to after the ws block.
+  // Append the parition regions to after the header block.
   for (Block *block : partitionBlocks) {
     Region *region = block->getParent();
-    funcOp.getBlocks().splice(wsBlock->getIterator(), region->getBlocks());
+    funcOp.getBlocks().splice(std::next(headerBlock->getIterator()),
+                              region->getBlocks());
   }
 
   // Create the if-else-if-else chain for wsOp partition regions.
