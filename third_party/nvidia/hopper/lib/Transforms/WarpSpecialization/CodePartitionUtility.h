@@ -258,6 +258,7 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier = true);
 void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
+void predicateInitialWaits(triton::FuncOp &funcOp);
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
