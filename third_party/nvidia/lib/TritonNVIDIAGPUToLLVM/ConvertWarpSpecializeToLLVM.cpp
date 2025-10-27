@@ -272,12 +272,22 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // another barrier here.
     createAllBarrier(b, kSwitchLoopBarrierIdx);
 
+    Operation *returnOp = nullptr;
+    if (switchLoop->getOperations().size() == 1 &&
+        isa<LLVM::ReturnOp>(switchLoop->front())) {
+      // If the switch loop only has one return op, then just inline the return.
+      returnOp = &switchLoop->front();
+    }
+
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
       createAllBarrier(b, kSwitchLoopBarrierIdx);
-
-      b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
+      // If switch block only has one return op, then just inline the return.
+      if (returnOp)
+        b.replaceOpWithNewOp<LLVM::ReturnOp>(op, returnOp->getOperands());
+      else
+        b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
     });
   }
 }
@@ -301,7 +311,8 @@ static void disableLICM(LLVM::BrOp latchBr) {
 
 static LogicalResult
 lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
-                         const NVIDIA::TargetInfo &targetInfo) {
+                         const NVIDIA::TargetInfo &targetInfo,
+                         bool useJumpTable = true) {
   LLVM::LLVMFuncOp funcOp = dyn_cast<LLVM::LLVMFuncOp>(wsOp->getParentOp());
   assert(funcOp && "WS op must be on the trunk path of its parent function");
   Block *entry = &funcOp.getBody().front();
@@ -412,6 +423,7 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
   b.setInsertionPointToStart(wsExitBlock);
   b.create<LLVM::ReturnOp>(ValueRange());
 
+  // TODO: replace WarpReturnOp with a return
   rewritePartitionRegions(wsOp, wsExitBlock, targetInfo,
                           maxnreg ? maxnreg.getInt() : 0);
 
@@ -427,31 +439,66 @@ lowerWarpSpecializeTrunk(WarpSpecializeOp wsOp,
                               region->getBlocks());
   }
 
-  // Create the if-else-if-else chain for wsOp partition regions.
-  auto curNumWarps = defaultNumWarps;
-  Block *startBlock = headerBlock;
-  for (size_t i = 0; i < wsOp.getPartitionRegions().size(); ++i) {
-    Block *curPartitionBlock = partitionBlocks[i];
-    b.setInsertionPointToStart(curPartitionBlock);
+  // Append the branch block to the header block for better locality.
+  funcOp.getBlocks().splice(std::next(headerBlock->getIterator()),
+                            wsBlock->getParent()->getBlocks(),
+                            wsBlock->getIterator());
 
-    // The shared memory is only live for the entry into the region, so put
-    // another barrier here.
-    createAllBarrier(b, kSwitchLoopBarrierIdx);
-
+  if (useJumpTable) {
     // Branch for the partition region
     newBlock = wsBlock->splitBlock(wsOp);
     Block *curBranchBlock = wsBlock;
     wsBlock = newBlock;
-    b.setInsertionPointToStart(curBranchBlock);
-    curNumWarps += wsOp.getPartitionNumWarps()[i];
-    Value isCurr = b.icmp_ult(wid, b.i32_val(curNumWarps));
-    b.create<LLVM::CondBrOp>(isCurr, curPartitionBlock, wsBlock);
 
-    // Append the branch block to the header block for better locality.
-    funcOp.getBlocks().splice(std::next(startBlock->getIterator()),
-                              curBranchBlock->getParent()->getBlocks(),
-                              curBranchBlock->getIterator());
-    startBlock = curBranchBlock;
+    // TODO: use switch table
+    // Create the switch.
+    SmallVector<APInt> caseValues;
+    SmallVector<Block *> caseBlocks;
+    auto curNumWarps = defaultNumWarps;
+    for (size_t i = 0; i < wsOp.getPartitionRegions().size(); ++i) {
+      Block *curPartitionBlock = partitionBlocks[i];
+      // The shared memory is only live for the entry into the region, so put
+      // another barrier here.
+      b.setInsertionPointToStart(curPartitionBlock);
+      createAllBarrier(b, kSwitchLoopBarrierIdx);
+      for (int warp = curNumWarps;
+           warp < curNumWarps + wsOp.getPartitionNumWarps()[i]; ++warp) {
+        caseValues.push_back(APInt(8, warp));
+        caseBlocks.push_back(curPartitionBlock);
+      }
+      curNumWarps += wsOp.getPartitionNumWarps()[i];
+    }
+    b.setInsertionPointToStart(curBranchBlock);
+    b.create<LLVM::SwitchOp>(wid, wsExitBlock, ValueRange(), caseValues,
+                             caseBlocks,
+                             SmallVector<ValueRange>(caseBlocks.size()));
+  } else {
+    // Create the if-else-if-else chain for wsOp partition regions.
+    auto curNumWarps = defaultNumWarps;
+    Block *startBlock = headerBlock;
+    for (size_t i = 0; i < wsOp.getPartitionRegions().size(); ++i) {
+      Block *curPartitionBlock = partitionBlocks[i];
+      b.setInsertionPointToStart(curPartitionBlock);
+
+      // The shared memory is only live for the entry into the region, so put
+      // another barrier here.
+      createAllBarrier(b, kSwitchLoopBarrierIdx);
+
+      // Branch for the partition region
+      newBlock = wsBlock->splitBlock(wsOp);
+      Block *curBranchBlock = wsBlock;
+      wsBlock = newBlock;
+      b.setInsertionPointToStart(curBranchBlock);
+      curNumWarps += wsOp.getPartitionNumWarps()[i];
+      Value isCurr = b.icmp_ult(wid, b.i32_val(curNumWarps));
+      b.create<LLVM::CondBrOp>(isCurr, curPartitionBlock, wsBlock);
+
+      // Append the branch block to the header block for better locality.
+      funcOp.getBlocks().splice(std::next(startBlock->getIterator()),
+                                curBranchBlock->getParent()->getBlocks(),
+                                curBranchBlock->getIterator());
+      startBlock = curBranchBlock;
+    }
   }
 
   // The barrier ensures they have read the captures before the memory is
