@@ -38,6 +38,29 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+LogicalResult MapToRemoteBufferOp::verify() {
+  // src and result should have the same type except MemorySpace
+  MemDescType localType = getSrc().getType();
+  MemDescType remoteType = getResult().getType();
+  if (!(localType.getShape() == remoteType.getShape() &&
+        localType.getElementType() == remoteType.getElementType() &&
+        localType.getEncoding() == remoteType.getEncoding() &&
+        localType.getMutableMemory() == remoteType.getMutableMemory() &&
+        localType.getAllocShape() == remoteType.getAllocShape())) {
+    return emitOpError() << "Local MemDesc not matching Remote MemDesc: "
+                         << localType << " vs " << remoteType;
+  }
+  if (!isa<SharedMemorySpaceAttr>(localType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for local MemDesc: "
+                         << localType;
+  }
+  if (!isa<SharedClusterMemorySpaceAttr>(remoteType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for remote MemDesc: "
+                         << remoteType;
+  }
+  return success();
+}
+
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,

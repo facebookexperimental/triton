@@ -549,6 +549,22 @@ void init_triton_tlx_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_map_to_remote_buffer",
+           [](TritonOpBuilder &self, Value &src,
+              Value &clusterCTARank) -> Value {
+             auto bufferType = cast<ttg::MemDescType>(src.getType());
+             assert(
+                 isa<ttg::SharedMemorySpaceAttr>(bufferType.getMemorySpace()) &&
+                 "Input of MapToRemoteBuffer has to be local SMEM");
+             auto newBufferType = ttg::MemDescType::get(
+                 bufferType.getShape(), bufferType.getElementType(),
+                 bufferType.getEncoding(),
+                 ttng::SharedClusterMemorySpaceAttr::get(self.getContext()),
+                 bufferType.getMutableMemory(), bufferType.getAllocShape());
+             Value remoteBuf = self.create<ttng::MapToRemoteBufferOp>(
+                 newBufferType, src, clusterCTARank);
+             return remoteBuf;
            });
 }
 
