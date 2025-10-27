@@ -506,6 +506,22 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
+           })
+      .def("create_map_to_remote_buffer",
+           [](TritonOpBuilder &self, Value &src,
+              Value &clusterCTARank) -> Value {
+             auto bufferType = cast<ttg::MemDescType>(src.getType());
+             assert(
+                 isa<ttg::SharedMemorySpaceAttr>(bufferType.getMemorySpace()) &&
+                 "Input of MapToRemoteBuffer has to be local SMEM");
+             auto newBufferType = ttg::MemDescType::get(
+                 bufferType.getShape(), bufferType.getElementType(),
+                 bufferType.getEncoding(),
+                 ttng::SharedClusterMemorySpaceAttr::get(self.getContext()),
+                 bufferType.getMutableMemory(), bufferType.getAllocShape());
+             Value remoteBuf = self.create<ttng::MapToRemoteBufferOp>(
+                 newBufferType, src, clusterCTARank);
+             return remoteBuf;
            });
 }
 
