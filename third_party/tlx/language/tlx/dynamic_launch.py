@@ -55,9 +55,9 @@ def _clc_query(
 
 
 @tl.builtin
-def clc_create_context(num_stages: tl.tensor, _semantic=None) -> tlx.CLCPipelineContext:
+def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> tlx.CLCPipelineContext:
     return tlx.CLCPipelineContext(
-        clc_mbars_empty=alloc_barriers(num_barriers=num_stages, _semantic=_semantic),
+        clc_mbars_empty=alloc_barriers(num_barriers=num_stages, arrive_count=num_consumers, _semantic=_semantic),
         clc_mbars_full=alloc_barriers(num_barriers=num_stages, _semantic=_semantic),
         clc_responses=_alloc_clc_responses(num_responses=num_stages, _semantic=_semantic),
         _semantic=_semantic,
@@ -65,7 +65,7 @@ def clc_create_context(num_stages: tl.tensor, _semantic=None) -> tlx.CLCPipeline
 
 
 @tl.builtin
-def clc_producer(context: tlx.CLCPipelineContext, p_producer, _semantic=None):
+def clc_producer(context, p_producer, _semantic=None):
     # acquire
     barrier_wait(context._clc_mbars_empty[0], p_producer, _semantic=_semantic)
 
@@ -75,7 +75,7 @@ def clc_producer(context: tlx.CLCPipelineContext, p_producer, _semantic=None):
 
 
 @tl.builtin
-def clc_consumer(context: tlx.CLCPipelineContext, p_consumer, _semantic=None):
+def clc_consumer(context, p_consumer, _semantic=None):
     # wait
     barrier_wait(context._clc_mbars_full[0], p_consumer, _semantic=_semantic)
 

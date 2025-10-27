@@ -378,17 +378,20 @@ class CLCPipelineContext:
     _clc_mbars_empty: mbarrier
     _clc_mbars_full: mbarrier
     _clc_responses: clc_response
+    # handle = None
 
     def __init__(
         self,
         clc_mbars_empty: mbarrier,
         clc_mbars_full: mbarrier,
         clc_responses: clc_response,
+        # handle,
         semantic: TritonSemantic = None,
     ):
         self._clc_mbars_empty = clc_mbars_empty
         self._clc_mbars_full = clc_mbars_full
         self._clc_responses = clc_responses
+        # self.handle = handle
 
 
 class async_token(tl.base_value):
