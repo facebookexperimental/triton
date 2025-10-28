@@ -134,8 +134,15 @@ public:
                                return WalkResult::advance();
                              })
                               .wasInterrupted();
-
-    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps) {
+    auto hasTLXTwoCTAs = mod.walk([&](ttng::TCGen5MMAOp tcgen05MMAOp) {
+                              if (tcgen05MMAOp.getTwoCtas()) {
+                                return WalkResult::interrupt();
+                              }
+                              return WalkResult::advance();
+                            })
+                             .wasInterrupted();
+    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
+        !hasTLXTwoCTAs) {
       return;
     }
 
@@ -152,6 +159,10 @@ public:
       mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
     if (hasWarpSpecOps)
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
+    if (hasTLXTwoCTAs) {
+      assert(numCTAs <= 1 && "num_ctas should not be set for TLX 2cta mode");
+      mod->setAttr(AttrIsTLXTwoCTAModeName, b.getBoolAttr(true));
+    }
   }
 };
 
