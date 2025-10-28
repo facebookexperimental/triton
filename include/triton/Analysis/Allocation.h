@@ -156,6 +156,15 @@ private:
     size_t alignment;
     size_t offset;
 
+    // For MemoryPlannerTmem
+    bool isOwnerOfSpace;
+    size_t rowOffset;
+    size_t colOffset;
+    size_t rowSize;
+    size_t colSize;
+    size_t reuseOffset;  // when isOwnerOfSpace is true
+    BufferT *reuseOwner; // when isOwnerOfSpace is false
+
     bool operator==(const BufferT &other) const { return id == other.id; }
     bool operator<(const BufferT &other) const { return id < other.id; }
 

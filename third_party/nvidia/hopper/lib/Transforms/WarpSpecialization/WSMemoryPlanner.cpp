@@ -385,13 +385,16 @@ public:
 };
 } // namespace triton
 
-static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
-                           std::vector<Operation *> &liveOps) {
-  DenseSet<Operation *> users;
-  for (auto user : tmemAllocOp.getResult().getUsers()) {
-    users.insert(user);
+static void getAllTmemUsers(ttng::TmemDataChannelPost *TheCh,
+                            DenseSet<Operation *> &users) {
+  ttng::TMEMAllocOp tmemAllocOp = cast<ttng::TMEMAllocOp>(TheCh->getAllocOp());
+  if (TheCh->isOperandD) {
+    for (auto user : tmemAllocOp.getResult().getUsers()) {
+      users.insert(user);
+    }
+  } else {
+    getAllAcutalUsersForChannel(TheCh, users);
   }
-  updateLiveOpsAcrossScopes(users, liveOps);
 }
 
 // Return the list of operations where value is live.
@@ -401,54 +404,12 @@ OperationListT livenessForTmemChannel(Value value,
   ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
       findChannelForAlloc(value, channels));
   std::vector<Operation *> liveOps;
-  // Operand D can be associated with multiple channels. From first producer to
-  // last consumer.
-  if (TheCh->isOperandD) {
-    handleOperandD(cast<ttng::TMEMAllocOp>(TheCh->getAllocOp()), liveOps);
-  } else {
-    DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users);
-    updateLiveOpsAcrossScopes(users, liveOps);
-  }
+  DenseSet<Operation *> users;
+  getAllTmemUsers(TheCh, users);
+  updateLiveOpsAcrossScopes(users, liveOps);
+
   return liveOps;
 }
-
-#if 0
-// For allocs with users inside a ForOp and outside the ForOp under one
-// scope, return the ForOp.
-Operation *getInnermostCtrl(Value value, SmallVector<Channel *> &channels) {
-  ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
-      findChannelForAlloc(value, channels));
-  auto tmemAllocOp = cast<ttng::TMEMAllocOp>(TheCh->getAllocOp());
-  DenseSet<Operation *> users;
-  if (TheCh->isOperandD) {
-    for (auto user : tmemAllocOp.getResult().getUsers()) {
-      users.insert(user);
-    }
-  } else {
-    getAllAcutalUsersForChannel(TheCh, users);
-  }
-  DenseSet<Operation *> userScopes;
-  getUserScopes(users, userScopes);
-  Operation *scope = nullptr;
-  unsigned numForOp = 0;
-  for (auto *user : userScopes) {
-    // if a single ForOp, return it
-    if (isa<scf::ForOp>(user)) {
-      ++numForOp;
-      scope = user;
-    }
-  }
-  // if multiple ForOp, return the parent scope.
-  if (numForOp > 1)
-    return scope->getParentOp();
-  if (numForOp == 0) {
-    auto *first = *(userScopes.begin());
-    return first->getParentOp();
-  }
-  return scope;
-}
-#endif
 
 namespace triton {
 // A simplified version of AllocationAnalysis.
@@ -460,7 +421,7 @@ public:
 
 private:
   using BufferT = Allocation::BufferT;
-  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<size_t>>;
+  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<int>>;
   using GraphT = DenseMap<BufferT *, DenseSet<BufferT *>>;
   Operation *operation;
   Allocation *allocation;
@@ -614,11 +575,13 @@ public:
         // check live interval length and offset.
         auto intv1 = allocToIntervals[a.getOperation()];
         auto intv2 = allocToIntervals[b.getOperation()];
+#if 0
         // larger interval has higher priority
         if (intv1.size() > intv2.size())
           return true;
         if (intv1.size() < intv2.size())
           return false;
+#endif
         // early interval has higher priority
         if (intv1.start() < intv2.start())
           return true;
@@ -638,7 +601,13 @@ public:
     for (auto alloc : allocs) {
       // size is 0, alignment is default, offset is default
       allocation.addBuffer<BufferT::BufferKind::Explicit>(alloc, 0);
-      buffers.emplace_back(allocation.valueBuffer[alloc]);
+      BufferT *tBuf = allocation.valueBuffer[alloc];
+      auto iter1 = allocToSize.find(alloc.getOperation());
+      tBuf->rowSize = iter1->second.numRows;
+      tBuf->colSize = iter1->second.numCols;
+      tBuf->rowOffset = std::numeric_limits<size_t>::max();
+      tBuf->colOffset = std::numeric_limits<size_t>::max();
+      buffers.emplace_back(tBuf);
     }
     for (auto valueBufferIter : allocation.valueBuffer) {
       auto *buffer = valueBufferIter.second;
@@ -649,86 +618,64 @@ public:
     }
     GraphT interference;
     buildInterferenceGraph(buffers, interference);
+    // For each innermost loop according to program order (via
+    // getIntervalForCtrlOp)
+    //   Go through all buffers that are live in the loop
+    //   Start with buffers with longest span within the loop
+    //   For each buffer
+    //     either allocate new space (owner of a set of rows)
+    //     or reuse an existing buffer's space
+    //     if this buffer interferes with all allocated buffers, allocate new
+    //     space if this buffer is along the dependency chain, reuse space if
+    //     there is enough space, allocate new space otherwise, reuse space
 
-    DenseMap<Operation *, unsigned> allocToOffsets;
-    // Start with the first candidate, allocate a space for it
-    // Goes through all buffers that interfere with it and allocate
-    // a new space or reuse an existing buffer depending on if we
-    // have available space.
-    bufferId = allocateTMemAllocs(allocs, allocs, allocToIntervals, allocToSize,
-                                  allocToChannel, operationId, allocToOffsets,
-                                  nullptr, bufferId, true /*firstRun*/);
-#if 0
-  DenseMap<unsigned, SmallVector<Operation *>> loopDepthMap;
-  parentOp->walk([&](Operation *subOp) {
-    if (dyn_cast<scf::ForOp>(subOp)) {
-      unsigned tDepth = getLoopDepth(subOp);
-      loopDepthMap[tDepth].push_back(subOp);
-    }
-  });
-  // Perform allocation for each ForOp.
-  llvm::MapVector<Operation *, SmallVector<triton::nvidia_gpu::TMEMAllocOp>>
-      forOpToAllocs;
-  auto getStartIdForLoop = [&](Operation *op) -> int {
-    scf::ForOp forOp = cast<scf::ForOp>(op);
-    // get the first instruction, return its operation id.
-    for (Operation &op : forOp.getBody()->without_terminator())
-      return operationId[&op];
-    llvm_unreachable("empty ForOp");
-  };
-  // HACK for causal, we need to have a general packing algorithm. Even
-  // if there is no liverange overlap, we can still use different space.
-  for (auto alloc : allocs) {
-    // Innermost forOp containing all users of the channel.
-    Operation *ctrlOp = getInnermostCtrl(alloc, channels);
-    LDBG("add alloc to forOp " << ctrlOp << " " << getLoopDepth(ctrlOp));
-    if (getLoopDepth(ctrlOp) == 0) {
-      // set ctrlOp to one of the inner ForOps
-      if (loopDepthMap[1].size() == 1)
-        ctrlOp = loopDepthMap[1][0];
-      else {
-        auto intv = allocToIntervals[alloc.getOperation()];
-        assert(loopDepthMap[1].size() == 2);
-        auto *secondLoop = loopDepthMap[1][1];
-        if (intv.end() < getStartIdForLoop(secondLoop)) {
-          // Before 2nd loop, comparing against first id of the loop.
-          ctrlOp = loopDepthMap[1][0];
-        } else {
-          ctrlOp = loopDepthMap[1][1];
+    // Use BufferT to track rowSize/colSize/rowOffset etc, use bufferRange to
+    // track intervals.
+    SmallVector<Operation *> innermostLoops;
+    parentOp->walk([&](Operation *subOp) {
+      if (auto theForOp = dyn_cast<scf::ForOp>(subOp))
+        if (isInnermostLoop(theForOp))
+          innermostLoops.push_back(subOp);
+    });
+    DenseSet<Operation *> handledAllocs;
+    for (auto *ctrlOp : innermostLoops) {
+      SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocsForThisLoop;
+      unsigned allocIdx = 0;
+      auto ctrlInt = getIntervalForCtrlOp(ctrlOp, operationId);
+      for (auto alloc : allocs) {
+        auto allocInt = bufferRange.lookup(buffers[allocIdx]);
+        ++allocIdx;
+        if (ctrlInt.intersects(allocInt)) {
+          allocsForThisLoop.push_back(alloc);
+          handledAllocs.insert(alloc.getOperation());
         }
-        LDBG("set ctrlOp to " << ctrlOp);
       }
+      LDBG("run allocation on innermost loop "
+           << allocsForThisLoop.size() << " allocs " << ctrlInt.start() << " "
+           << ctrlInt.end());
+      bufferId = allocateTMemAllocs(
+          allocsForThisLoop, buffers, // allocToIntervals,
+          /*allocToSize,*/ allocToChannel, operationId, ctrlOp, bufferId);
     }
-    forOpToAllocs[ctrlOp].push_back(alloc);
-  }
-  bool firstRun = true;
-  DenseMap<Operation *, unsigned> allocToOffsets;
-  for (auto &kv : forOpToAllocs) {
-    LDBG("run allocation on " << kv.second.size() << " allocs");
-    bufferId = allocateTMemAllocs(kv.second, allocs, allocToIntervals,
-                                  allocToSize, allocToChannel, operationId,
-                                  allocToOffsets, kv.first, bufferId, firstRun);
-    for (auto &kv_t : allocToOffsets)
-      kv_t.second = 0; // reset offset
-    firstRun = false;
-  }
-#endif
+    SmallVector<triton::nvidia_gpu::TMEMAllocOp> lastAllocs;
+    for (auto alloc : allocs) {
+      if (handledAllocs.count(alloc))
+        continue;
+      lastAllocs.push_back(alloc);
+    }
+    if (!lastAllocs.empty()) {
+      bufferId = allocateTMemAllocs(lastAllocs, buffers, // allocToIntervals,
+                                    /*allocToSize,*/ allocToChannel,
+                                    operationId, nullptr, bufferId);
+    }
   }
 
   unsigned allocateTMemAllocs(
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
-      SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allAllocs,
-      DenseMap<Operation *, Interval<int>> &allocToIntervals,
-      DenseMap<Operation *, ttng::TMemAllocation> &allocToSize,
+      SmallVector<BufferT *> &buffers,
       DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
-      DenseMap<Operation *, int> &operationId,
-      DenseMap<Operation *, unsigned> &allocToOffsets, Operation *ctrlOp,
-      unsigned bufferId, bool firstRun) {
-    // Map from owner of a tmem location to the list of allocs that reuse the
-    // space.
-    DenseMap<Operation *, SmallVector<Operation *>> allocToReuses;
-    // Map from an allocation to the owner of a tmem location + the offset.
-    DenseMap<Operation *, std::pair<Operation *, int>> allocToAllocation;
+      DenseMap<Operation *, int> &operationId, Operation *ctrlOp,
+      unsigned bufferId) {
     auto alongDependencyChain = [&](Operation *src, Operation *dst) -> bool {
       // consumer of srcAlloc --> producer of dstAlloc
       // consumer partition of srcAllc vs. producer partition of dstAlloc
@@ -739,56 +686,66 @@ public:
         return true;
       return false;
     };
-    // FIXME: need to keep track of the actual allocations:
-    // -- alloc: reuse baseAlloc with offset
-    // -- allocToOffsets: all baseAllocs
-    // For second forOp in causal mode, qk1 should reuse space of qk0, etc.
-    auto findReuseChannel = [&](Operation *cand,
-                                bool updateOffset) -> Operation * {
-      // Go through allocs with buffer.id (i.e allocated), check intervals
-      // to find an allocated alloc without overlapping intervals and with
-      // enough space.
-      // FIXME: try to find a buffer with a dependency chain. For FA, we want
-      // p0/alpha0/l_i0/m_i0 to reuse.
-      for (auto it = allAllocs.begin(), e = allAllocs.end(); it != e; ++it) {
-        Operation *alloc = (*it).getOperation();
-        if (allocToOffsets.count(alloc)) {
-          auto iter1 = allocToSize.find(cand);
-          auto iter2 = allocToSize.find(alloc);
-          if (!allocToIntervals[alloc].intersects(allocToIntervals[cand]) &&
-              iter2->second.numCols >=
-                  iter1->second.numCols + allocToOffsets[alloc] &&
-              alongDependencyChain(alloc, cand)) {
-            allocToReuses[alloc].push_back(cand);
-            allocToAllocation[cand] =
-                std::make_pair(alloc, allocToOffsets[alloc]);
-            if (updateOffset)
-              allocToOffsets[alloc] += iter1->second.numCols;
-            LLVM_DEBUG({
-              LDBG("move offset to " << allocToOffsets[alloc] << " for:");
-              alloc->dump();
-            });
-            return alloc;
+    auto sameLoop = [&](BufferT *alloc, BufferT *cand) -> bool {
+      if (ctrlOp) {
+        auto ctrlInt = getIntervalForCtrlOp(ctrlOp, operationId);
+        if (bufferRange[alloc].intersects(ctrlInt))
+          return false;
+        return true; // no overlapping for alloc and the current ctrlOp
+      }
+      return false;
+    };
+    auto getCombinedTasks = [&](BufferT *alloc) -> SmallVector<AsyncTaskId> {
+      ttng::TmemDataChannelPost *TheCh =
+          static_cast<ttng::TmemDataChannelPost *>(
+              findChannelForOp(alloc->owner, *channels));
+      DenseSet<Operation *> users;
+      getAllTmemUsers(TheCh, users);
+      SmallVector<AsyncTaskId> combinedTasks;
+      DenseSet<AsyncTaskId> combinedSet;
+      for (auto *user : users) {
+        auto asyncTasksVec = getAsyncTaskIds(user);
+        for (auto t : asyncTasksVec) {
+          if (!combinedSet.count(t)) {
+            combinedSet.insert(t);
+            combinedTasks.push_back(t);
           }
         }
       }
-      // Do not enforce dependency
-      for (auto it = allAllocs.begin(), e = allAllocs.end(); it != e; ++it) {
-        Operation *alloc = (*it).getOperation();
-        if (allocToOffsets.count(alloc)) {
-          auto iter1 = allocToSize.find(cand);
-          auto iter2 = allocToSize.find(alloc);
-          if (!allocToIntervals[alloc].intersects(allocToIntervals[cand]) &&
-              iter2->second.numCols >=
-                  iter1->second.numCols + allocToOffsets[alloc]) {
-            allocToAllocation[cand] =
-                std::make_pair(alloc, allocToOffsets[alloc]);
-            if (updateOffset)
-              allocToOffsets[alloc] += iter1->second.numCols;
-            allocToReuses[alloc].push_back(cand);
+      return combinedTasks;
+    };
+    auto samePartition = [&](BufferT *alloc, BufferT *cand) -> bool {
+      auto aTasks = getCombinedTasks(alloc);
+      auto bTasks = getCombinedTasks(cand);
+      return aTasks == bTasks;
+    };
+
+    auto findReuseChannel = [&](BufferT *cand, bool relax) -> BufferT * {
+      for (auto *alloc : buffers) {
+        if (alloc->isOwnerOfSpace) {
+          // The buffer owner owns a set of rows.
+          // Each reuseOffset has at most one other buffer sharing the space.
+          // If alloc and cand are in different loops, we can reuse as
+          // long as they have the same partitions.
+          // Otherwise, reuse when there is a dependency chain.
+          // if relax is true, ignore the constraints.
+          if (!bufferRange[alloc].intersects(bufferRange[cand]) &&
+              alloc->colSize >= cand->colSize + alloc->reuseOffset &&
+              (relax ||
+               (!sameLoop(alloc, cand) && samePartition(alloc, cand)) ||
+               (sameLoop(alloc, cand) &&
+                alongDependencyChain(alloc->owner, cand->owner)))) {
+            cand->isOwnerOfSpace = false; // redundant with reuseOwner?
+            cand->rowOffset = alloc->rowOffset;
+            cand->colOffset = alloc->reuseOffset;
+            cand->reuseOwner = alloc;
+            // Move reuseOffset for the buffer owner.
+            alloc->reuseOffset = cand->colOffset + cand->colSize;
             LLVM_DEBUG({
-              LDBG("move offset to " << allocToOffsets[alloc] << " for:");
-              alloc->dump();
+              LDBG("set offset to " << cand->rowOffset << " " << cand->colOffset
+                                    << " sameLoop " << sameLoop(alloc, cand)
+                                    << " releax " << relax << ":");
+              cand->owner->dump();
             });
             return alloc;
           }
@@ -796,170 +753,113 @@ public:
       }
       return nullptr;
     };
+    // interferes with all allocated buffers
+    auto allInterfere = [&](BufferT *cand) -> bool {
+      for (auto *alloc : buffers) {
+        if (alloc->rowOffset != std::numeric_limits<size_t>::max()) {
+          if (!bufferRange[alloc].intersects(bufferRange[cand]))
+            return false;
+        }
+      }
+      return true;
+    };
+    auto allocateNewSpace = [&](BufferT *cand, bool allocate) -> bool {
+      size_t maxRowOffset = 0;
+      for (auto *alloc : buffers) {
+        if (alloc->rowOffset != std::numeric_limits<size_t>::max()) {
+          maxRowOffset =
+              std::max(maxRowOffset, alloc->rowOffset + alloc->rowSize);
+          LLVM_DEBUG({
+            LDBG("\nbuffer is allocated "
+                 << alloc->rowOffset << " " << alloc->rowSize << " "
+                 << alloc->colOffset << " " << alloc->isOwnerOfSpace);
+            alloc->owner->dump();
+          });
+        }
+      }
+      if (allocate) {
+        cand->rowOffset = maxRowOffset;
+        cand->colOffset = 0;
+        cand->isOwnerOfSpace = true;
+        cand->reuseOffset = 0;
+        cand->reuseOwner = cand;
+        cand->owner->setAttr(
+            "buffer.id",
+            IntegerAttr::get(IntegerType::get(cand->owner->getContext(), 32),
+                             bufferId));
+        ++bufferId;
+      }
+      if (maxRowOffset + cand->rowSize > 512)
+        return false;
+      return true;
+    };
     auto getBufferId = [&](Operation *op) -> int {
       auto stageAttr = op->getAttrOfType<IntegerAttr>("buffer.id");
       return stageAttr.getInt();
     };
+    auto getBuffer = [&](Operation *candAlloc) -> BufferT * {
+      for (auto *alloc : buffers) {
+        if (alloc->owner == candAlloc)
+          return alloc;
+      }
+      return nullptr;
+    };
 
-    // Heuristics: one copy for each alloc
+    // Heuristics: num_buffers is one for each alloc
     // If liveness overlaps, we can't reuse the buffer.
     // Heuristics:
-    // - no reuse if isOperandD is true
-    // - allocate space for channels where isOperandDNoAcc or isOperandD is true
-    // - extend live ranges for these channels in bufferSet
-    // Sort allocs according to allocSize, try to allocate space according to
-    // the sorted allocs, for each candidate alloc, decide if reuse is needed to
-    // fit into TMEM.
+    //   if this buffer interferes with all allocated buffers, allocate new
+    //   space; reuse buffers
+    //   if belongs to the same loop and along the dependency chain
+    //   or belongs to different loops and have the same partitions
+    //   if there is enough space, allocate new space otherwise, reuse space
     DenseMap<Operation *, Interval<int>> bufferSet;
     Operation *candidateAlloc = nullptr;
     SmallVector<Operation *> allocOrder;
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       ttng::TMEMAllocOp alloc = *it;
-      if (allocToChannel[alloc.getOperation()]->isOperandD ||
-          allocToChannel[alloc.getOperation()]->isOperandDNoAcc) {
-        if (firstRun) {
-          bufferSet[alloc.getOperation()] =
-              getIntervalForCtrlOp(ctrlOp, operationId);
-          alloc->setAttr(
+      auto *candBuf = getBuffer(alloc.getOperation());
+      // if this is the first buffer to be allocated, allocate new space.
+      // get a list of allocated buffers, check if it interferes
+      if (allInterfere(candBuf)) {
+        bool hasSpace = allocateNewSpace(candBuf, true);
+        assert(hasSpace && "no new space for tmem alloc");
+      } else if (auto *reuseBuf = findReuseChannel(candBuf, false)) {
+        alloc.getOperation()->setAttr(
+            "buffer.id",
+            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
+                             getBufferId(reuseBuf->owner)));
+        alloc.getOperation()->setAttr(
+            "buffer.offset",
+            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
+                             reuseBuf->reuseOffset - candBuf->colSize));
+      } else {
+        if (allocateNewSpace(candBuf, false))
+          allocateNewSpace(candBuf, true);
+        else {
+          auto *reuseBuf = findReuseChannel(candBuf, true);
+          assert(reuseBuf && "can't find tmem space");
+          alloc.getOperation()->setAttr(
               "buffer.id",
               IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                               bufferId));
-          allocToOffsets[alloc.getOperation()] = 0;
-          allocOrder.push_back(alloc.getOperation());
-          LLVM_DEBUG({
-            LDBG("new buffer.id for channel:");
-            alloc.getOperation()->dump();
-            auto liveInterval = allocToIntervals[alloc.getOperation()];
-            LDBG("new buffer.id liveness: " << liveInterval.start() << " "
-                                            << liveInterval.end());
-          });
-          bufferId++;
-        } else {
-          // handle 2nd loop.
-          auto *reuseAlloc = findReuseChannel(alloc.getOperation(), true);
-          if (!reuseAlloc)
-            assert(false && "can't find space");
-          LLVM_DEBUG({
-            LDBG("2nd loop allocate space for channel:");
-            alloc.getOperation()->dump();
-          });
-          bufferSet[alloc.getOperation()] =
-              getIntervalForCtrlOp(ctrlOp, operationId);
-          alloc->setAttr(
-              "buffer.id",
-              IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                               getBufferId(reuseAlloc)));
-          auto iter2 = allocToSize.find(alloc.getOperation());
-          alloc->setAttr(
+                               getBufferId(reuseBuf->owner)));
+          alloc.getOperation()->setAttr(
               "buffer.offset",
               IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                               allocToOffsets[reuseAlloc] -
-                                   iter2->second.numCols));
-          allocOrder.push_back(alloc.getOperation());
+                               reuseBuf->reuseOffset - candBuf->colSize));
         }
-        // FIXME: heuristics
-        alloc->setAttr(
-            "buffer.copy",
-            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
       }
-    }
-    if (!firstRun) {
-      for (auto &kv_t : allocToOffsets)
-        kv_t.second = 0; // reset offset
-    }
-    for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
-      if (bufferSet.count((*it).getOperation()))
-        continue;
-      if (!candidateAlloc) {
-        candidateAlloc = (*it).getOperation();
-        break;
-      }
-    }
-    int totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
-    LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
-    if (totalMemorySize > 512)
-      return bufferId;
-    while (bufferSet.size() != allocs.size()) {
-      // Decide if we need to reuse buffer for candidateAlloc.
-      // Choose an interval for candidateAlloc based on the decision.
       LLVM_DEBUG({
-        LDBG("try to allocate space for:");
-        candidateAlloc->dump();
-        auto liveInterval = allocToIntervals[candidateAlloc];
-        LDBG("candidate liveness: " << liveInterval.start() << " "
-                                    << liveInterval.end());
+        LDBG("\ntmem allocation " << candBuf->rowOffset << " "
+                                  << candBuf->colOffset << " "
+                                  << candBuf->isOwnerOfSpace);
+        alloc.getOperation()->dump();
       });
-      bufferSet[candidateAlloc] = getIntervalForCtrlOp(ctrlOp, operationId);
-      allocOrder.push_back(candidateAlloc);
-      totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
-      LDBG(bufferSet.size() << " buffers with tmem size: " << totalMemorySize);
-      for (auto *op_t : allocOrder) {
-        LLVM_DEBUG(op_t->dump());
-        LLVM_DEBUG(llvm::dbgs() << op_t << " " << bufferSet[op_t].start() << " "
-                                << bufferSet[op_t].end() << "\n");
-      }
-      // FIXME: there are some issues in allocateTMemWithInterval where
-      // it allocates overlapping address even though there is live range
-      // intersect.
-      if (false) { // totalMemorySize <= 512) {
-        candidateAlloc->setAttr(
-            "buffer.id",
-            IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
-                             bufferId));
-        allocToOffsets[candidateAlloc] = 0;
-        LLVM_DEBUG(candidateAlloc->dump());
-        ++bufferId;
-      } else {
-        // need to reuse buffer, heuristics: do not reuse isOperandD channels
-        // if can't find a reuse buffer, bail out
-        auto *reuseAlloc = findReuseChannel(candidateAlloc, true);
-        if (!reuseAlloc)
-          assert(false && "can't find space");
-        LLVM_DEBUG({
-          LDBG("try to reuse space with:");
-          reuseAlloc->dump();
-        });
-        // update intervals for representative channel and this channel so they
-        // will not overlap
-        if (bufferSet.count(reuseAlloc)) {
-          auto origIntv = bufferSet[reuseAlloc];
-          bufferSet[reuseAlloc] =
-              Interval(origIntv.start(), origIntv.end() - 2);
-          bufferSet[candidateAlloc] =
-              Interval(origIntv.end() - 2, origIntv.end());
-        }
-        totalMemorySize = ttng::allocateTMemWithInterval(bufferSet, allocOrder);
-        LDBG(bufferSet.size()
-             << " buffers with tmem size: " << totalMemorySize);
 
-        candidateAlloc->setAttr(
-            "buffer.id",
-            IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
-                             getBufferId(reuseAlloc)));
-        auto iter2 = allocToSize.find(candidateAlloc);
-        candidateAlloc->setAttr(
-            "buffer.offset",
-            IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
-                             allocToOffsets[reuseAlloc] -
-                                 iter2->second.numCols));
-        LLVM_DEBUG(candidateAlloc->dump());
-      }
-      for (auto *op_t : allocOrder) {
-        LLVM_DEBUG(op_t->dump());
-        LLVM_DEBUG(llvm::dbgs() << op_t << " " << bufferSet[op_t].start() << " "
-                                << bufferSet[op_t].end() << "\n");
-      }
       // FIXME: heuristics
-      candidateAlloc->setAttr(
+      alloc.getOperation()->setAttr(
           "buffer.copy",
-          IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
-                           1));
-      // Find the next candidate.
-      for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it)
-        if (!bufferSet.count((*it).getOperation())) {
-          candidateAlloc = (*it).getOperation();
-          break;
-        }
+          IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
     }
     return bufferId;
   }
