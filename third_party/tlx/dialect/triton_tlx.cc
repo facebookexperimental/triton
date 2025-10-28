@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "ir.h" // TritonOpBuilder
 #include "mlir/Pass/PassManager.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -554,6 +555,14 @@ void init_triton_tlx_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_cluster_cta_rank",
+           [](TritonOpBuilder &self) -> Value {
+             // The naming of ClusterCTAIdOp is bad. It actually returns the
+             // cluster CTA rank (1D) instead of cluster CTA ID (3D)
+             Value rank = self.create<triton::nvgpu::ClusterCTAIdOp>(
+                 self.getBuilder().getI32Type());
+             return rank;
            })
       .def("create_map_to_remote_buffer",
            [](TritonOpBuilder &self, Value &src,
