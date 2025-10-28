@@ -1094,7 +1094,9 @@ static size_t getSharedMemorySize(Type type) {
   if (isa<PointerType, TensorDescType>(type))
     return 8;
   if (auto desc = dyn_cast<MemDescType>(type)) {
-    if (!isa<SharedMemorySpaceAttr>(desc.getMemorySpace()))
+    if (!isa<SharedMemorySpaceAttr,
+             triton::nvidia_gpu::SharedClusterMemorySpaceAttr>(
+            desc.getMemorySpace()))
       return 8;
     return 8 + desc.getRank() * 4;
   }

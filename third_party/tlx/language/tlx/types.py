@@ -177,6 +177,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 class storage_kind(enum.Enum):
     smem = "smem"
     tmem = "tmem"
+    smemCluster = "smemCluster"
 
 
 class buffered_tensor(tl.base_value):

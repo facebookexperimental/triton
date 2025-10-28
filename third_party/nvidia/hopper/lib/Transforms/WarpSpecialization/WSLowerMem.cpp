@@ -62,7 +62,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      dyn_cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -117,7 +117,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      dyn_cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -187,7 +187,7 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      dyn_cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
