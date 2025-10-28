@@ -1,9 +1,9 @@
 
-// RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=2 threads-per-warp=32})' %s| FileCheck %s
+// RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %s| FileCheck %s
 
 // CHECK: module attributes {
 // CHECK-SAME: tlx.has_tlx_ops = true
-// CHECK-SAME: "ttg.num-ctas" = 2
+// CHECK-SAME: "ttg.num-ctas" = 1
 // CHECK-SAME: "ttg.num-warps" = 8
 // CHECK-SAME: ttg.target = "cuda:90"
 // CHECK-SAME: "ttg.threads-per-warp" = 32
@@ -54,7 +54,7 @@ module {
 // CHECK: module attributes {
 // CHECK-SAME: tlx.has_explicit_local_mem_access = true
 // CHECK-NOT: tlx.has_tlx_ops
-// CHECK-SAME: "ttg.num-ctas" = 2
+// CHECK-SAME: "ttg.num-ctas" = 1
 // CHECK-SAME: "ttg.num-warps" = 8
 // CHECK-SAME: ttg.target = "cuda:90"
 // CHECK-SAME: "ttg.threads-per-warp" = 32
@@ -165,6 +165,32 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
       tt.store %17, %15, %6 : tensor<1024x!tt.ptr<f32>>
       ttg.warp_return
     } : (!tt.ptr<f32>, !tt.ptr<f32>, i32, !tt.ptr<f32>, i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK: module attributes {
+// CHECK-SAME: tlx.enable_paired_cta_mma = true
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 256, 32]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  tt.func @tc_gen5_mma(%a: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<128x128xf16, #shared1, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async, two_ctas}:
+       !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
     tt.return
   }
 }
