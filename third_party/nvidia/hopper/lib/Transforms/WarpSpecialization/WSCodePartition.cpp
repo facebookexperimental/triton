@@ -1288,7 +1288,8 @@ static ttg::LocalAllocOp hoistLocalAllocPost(OpBuilder &builder,
 
 static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
                                              ttng::TMEMAllocOp oldTMemAllocOp,
-                                             int numBuffers) {
+                                             int numBuffers,
+                                             const std::string &channelName) {
   Location loc = oldTMemAllocOp.getLoc();
   auto oldRetType = oldTMemAllocOp.getType();
   SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
@@ -1300,9 +1301,14 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
+
+  // Create NameLoc with partition information
+  auto bufferLoc =
+      createBufferNameLoc(builder, loc, "tmem_buffer", channelName, numBuffers);
+
   return builder.create<ttng::TMEMAllocOp>(
-      oldTMemAllocOp.getLoc(), accMemDescType,
-      builder.getType<ttg::AsyncTokenType>(), /*src=*/Value());
+      bufferLoc, accMemDescType, builder.getType<ttg::AsyncTokenType>(),
+      /*src=*/Value());
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
@@ -1545,8 +1551,10 @@ DenseMap<Channel *, Value> createBufferPost(
           static_cast<ttng::TmemDataChannelPost *>(channel);
       oldAllocOp = tmemChannel->allocOp;
       OpBuilderWithAsyncTaskIds builder(oldAllocOp);
+      std::string channelName = channel->getChannelName();
       buffer = createTMemAllocPost(
-          builder, cast<ttng::TMEMAllocOp>(tmemChannel->allocOp), numBuffers);
+          builder, cast<ttng::TMEMAllocOp>(tmemChannel->allocOp), numBuffers,
+          channelName);
     } else { // must be SMEMPost
       ChannelPost *smemChannel = static_cast<ChannelPost *>(channel);
       oldAllocOp = smemChannel->allocOp;
@@ -2339,6 +2347,9 @@ void insertAsyncComm(
                           addCompletionBarrier);
       }
     }
+    // Get channel name for descriptive barriers
+    std::string channelName = masterChannel->getChannelName();
+
     // Channel can have multiple consumers.
     for (auto &consumerTaskId : masterChannel->relation.second) {
       // Set up consumer release and producer acquire for channel where consumer
@@ -2421,6 +2432,7 @@ void insertAsyncComm(
         auto acquireOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
                 headProducer->getLoc(), token.second, bufferIdx, phase);
+        acquireOp->setAttr("channel_name", builder.getStringAttr(channelName));
         LLVM_DEBUG({
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
@@ -2490,6 +2502,7 @@ void insertAsyncComm(
         auto commitOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
                 tailProducer->getLoc(), token.second, bufferIdx);
+        commitOp->setAttr("channel_name", builder.getStringAttr(channelName));
       }
     }
 
@@ -2502,6 +2515,7 @@ void insertAsyncComm(
         builder.setLoopScheduleInfoFromOp(consumerWaitPoint);
         auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
+        waitOp->setAttr("channel_name", builder.getStringAttr(channelName));
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
       }
 
@@ -2515,6 +2529,7 @@ void insertAsyncComm(
         auto releaseOp =
             builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
                 consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        releaseOp->setAttr("channel_name", builder.getStringAttr(channelName));
         LLVM_DEBUG({
           LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
           token.second.dump();
