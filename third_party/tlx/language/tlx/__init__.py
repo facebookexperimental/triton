@@ -19,6 +19,7 @@ from .mma_ops import (
     tcgen05_commit,
 )
 from .utility import (
+    cluster_cta_rank,
     thread_id,
     async_task_replica_id,
     dtype_of,
@@ -76,6 +77,7 @@ __all__ = [
     "async_dot_wait",
     "tcgen05_commit",
     # utility
+    "cluster_cta_rank",
     "thread_id",
     "async_task_replica_id",
     "dtype_of",

@@ -507,6 +507,12 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
            })
+      .def("create_cluster_cta_rank",
+           [](TritonOpBuilder &self) -> Value {
+             Value rank = self.create<ttng::GetClusterCTARankOp>(
+                 self.getBuilder().getI32Type());
+             return rank;
+           })
       .def("create_map_to_remote_buffer",
            [](TritonOpBuilder &self, Value &src,
               Value &clusterCTARank) -> Value {

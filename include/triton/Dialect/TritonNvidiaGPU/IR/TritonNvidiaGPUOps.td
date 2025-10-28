@@ -70,6 +70,17 @@ def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
   let assemblyFormat = "attr-dict";
 }
 
+def TTNG_GetClusterCTARankOp : TTNG_Op<"get_cluster_cta_rank", [Pure]> {
+  let summary = "Get the cluster CTA rank of executing CTA";
+  let description = [{
+    Get current CTA's unique ID across all dims in a CTA cluster. A valid ID is in the range 0~<num of CTA in the cluster - 1>.
+  }];
+
+  let results = (outs I32:$rank);
+
+  let assemblyFormat = "attr-dict `:` type($rank)";
+}
+
 def TTNG_MapToRemoteBufferOp : TTNG_Op<"map_to_remote_buffer", [Pure, MemDescViewTrait]> {
   let summary = "Map shared memory buffer to the corresponding buffer in the target CTA";
   let description = [{

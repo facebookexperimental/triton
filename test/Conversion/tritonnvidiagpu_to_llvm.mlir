@@ -274,6 +274,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// CHECK-LABEL: get_cluster_cta_rank
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @get_cluster_cta_rank() {
+    // CHECK: nvgpu.cluster_id
+    %0 = ttng.get_cluster_cta_rank : i32
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: map_smem_to_remote
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory

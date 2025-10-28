@@ -65,6 +65,21 @@ struct ClusterWaitOpConversion
   }
 };
 
+struct GetClusterCTARankOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::GetClusterCTARankOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::GetClusterCTARankOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::GetClusterCTARankOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto ctx = rewriter.getContext();
+    rewriter.replaceOpWithNewOp<triton::nvgpu::ClusterCTAIdOp>(
+        op, rewriter.getI32Type());
+    return success();
+  }
+};
+
 // lower MapToRemoteBufferOp
 struct MapToRemoteBufferOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::MapToRemoteBufferOp> {
@@ -113,6 +128,7 @@ void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
     PatternBenefit benefit) {
   patterns.add<ClusterArriveOpConversion>(typeConverter, benefit);
   patterns.add<ClusterWaitOpConversion>(typeConverter, benefit);
+  patterns.add<GetClusterCTARankOpConversion>(typeConverter, benefit);
   patterns.add<MapToRemoteBufferOpConversion>(typeConverter, benefit);
   return;
 }
