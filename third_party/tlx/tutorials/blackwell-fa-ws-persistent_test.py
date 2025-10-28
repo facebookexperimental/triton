@@ -6,7 +6,6 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
-from triton.language.core import _aggregate as aggregate
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -125,24 +124,12 @@ def _attn_fwd_ws(sm_scale, M,  #
     alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    clc_context = tlx.clc_create_context(1, 6)
-    # clc_context = tlx.CLCPipelineContext.alloc(6)
-
     with tlx.async_tasks():
+        # correction group
         with tlx.async_task("default"):
-            clc_phase_producer = 1
-            clc_phase_consumer = 0
-
             accum_cnt = 0
             phase = 0
-
-            i = 0
-            # for i in range(0, tiles_per_sm):
-            while tile_idx != -1:
-                # producer
-                tlx.clc_producer(clc_context, clc_phase_producer)
-                clc_phase_producer ^= 1
-
+            for i in range(0, tiles_per_sm):
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
@@ -180,18 +167,12 @@ def _attn_fwd_ws(sm_scale, M,  #
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     desc_o.store([qo_offset_y_split, 0], acc.to(tlx.dtype_of(desc_o)))
 
-                # tile_idx += num_progs
-                tile_idx = tlx.clc_consumer(clc_context, clc_phase_consumer)
-                clc_phase_consumer ^= 1
-                i += 1
+                tile_idx += num_progs
 
         # softmax groups
         with tlx.async_task(num_warps=4, registers=152, replicate=NUM_MMA_GROUPS):
             accum_cnt_qk = 0
-
-            clc_phase = 0
-            # for i in range(0, tiles_per_sm):
-            while tile_idx != -1:
+            for i in range(0, tiles_per_sm):
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
@@ -239,19 +220,14 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.local_store(l_tiles[cid * HEAD_DIM + 1], l_i[:, None])
                 tlx.local_store(m_tiles[cid * HEAD_DIM + 2], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
-                # tile_idx += num_progs
-                tile_idx = tlx.clc_consumer(clc_context, clc_phase)
-                clc_phase ^= 1
+                tile_idx += num_progs
 
         # mma group
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
             accum_cnt_qk = 0
 
-            clc_phase = 0
-            j = 0
-            # for j in range(0, tiles_per_sm):
-            while tile_idx != -1:
+            for j in range(0, tiles_per_sm):
                 # initialize offsets
                 _, _, lo, hi, _, _ = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
 
@@ -320,18 +296,12 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
                 tlx.tcgen05_commit(acc_empties[1])
-                # tile_idx += num_progs
-                tile_idx = tlx.clc_consumer(clc_context, clc_phase)
-                clc_phase ^= 1
-                j += 1
+                tile_idx += num_progs
 
         # load
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
-            clc_phase = 0
-            # for i in range(0, tiles_per_sm):
-            i = 0
-            while tile_idx != -1:
+            for i in range(0, tiles_per_sm):
                 # initialize offsets
                 _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M)
 
@@ -373,10 +343,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     kv_offset_y += BLOCK_N
                     accum_cnt_kv += 2
 
-                # tile_idx += num_progs
-                tile_idx = tlx.clc_consumer(clc_context, clc_phase)
-                clc_phase ^= 1
-                i += 1
+                tile_idx += num_progs
 
 
 class _attention(torch.autograd.Function):
@@ -424,13 +391,19 @@ class _attention(torch.autograd.Function):
 
         ctx.grid = grid
         _attn_fwd_ws[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
+            sm_scale,
+            M,  #
+            q.shape[0],
+            q.shape[1],  #
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            **extra_kern_args)
+            **extra_kern_args,
+        )
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale

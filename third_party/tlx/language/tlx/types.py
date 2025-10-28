@@ -239,7 +239,7 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
-        # assert semantic or num == 0, "buffered_tensor array must be created with a builder"
+        assert semantic or num == 0, "buffered_tensor array must be created with a builder"
         self.semantic = semantic
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
@@ -378,20 +378,17 @@ class CLCPipelineContext:
     _clc_mbars_empty: mbarrier
     _clc_mbars_full: mbarrier
     _clc_responses: clc_response
-    # handle = None
 
     def __init__(
         self,
         clc_mbars_empty: mbarrier,
         clc_mbars_full: mbarrier,
         clc_responses: clc_response,
-        # handle,
         semantic: TritonSemantic = None,
     ):
         self._clc_mbars_empty = clc_mbars_empty
         self._clc_mbars_full = clc_mbars_full
         self._clc_responses = clc_responses
-        # self.handle = handle
 
 
 class async_token(tl.base_value):
