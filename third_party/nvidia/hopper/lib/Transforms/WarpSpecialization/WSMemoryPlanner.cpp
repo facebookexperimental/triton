@@ -525,6 +525,19 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
     // space.
     // FIXME: try to find a buffer with a dependency chain. For FA, we want
     // p0/alpha0/l_i0/m_i0 to reuse.
+
+    // TODO: Add allocation type compatibility check. Currently, this function
+    // can return a SMEM allocation for reuse with a TMEM allocation (or vice
+    // versa), causing crashes in sliceAndReinterpretMDTMEM. Buffer reuse should
+    // ONLY be allowed between allocations of the same type:
+    // - SMEM (ttg.local_alloc) can reuse SMEM
+    // - TMEM (ttng.tmem_alloc) can reuse TMEM
+    // Mixing types is not supported because TMEM operations (especially TMA)
+    // require TMEM memory space and cannot fall back to SMEM.
+    // Suggested fix:
+    //   bool candIsTMEM = isa<ttng::TMEMAllocOp>(cand);
+    //   bool allocIsTMEM = isa<ttng::TMEMAllocOp>(alloc);
+    //   if (candIsTMEM != allocIsTMEM) continue;
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       Operation *alloc = (*it).getOperation();
       if (allocToOffsets.count(alloc)) {
