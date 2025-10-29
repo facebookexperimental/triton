@@ -371,10 +371,16 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
-  phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+  phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), phase);
+
+  // Create a constant true predicate for the wait_barrier
+  // This ensures barriers are never skipped, preventing deadlocks
+  Value waitPred =
+      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+
   auto wait = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      loc, consBarrier, phase);
+      loc, consBarrier, phase, waitPred);
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
