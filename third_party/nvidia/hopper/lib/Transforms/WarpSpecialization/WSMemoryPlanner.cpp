@@ -607,6 +607,8 @@ public:
       tBuf->colSize = iter1->second.numCols;
       tBuf->rowOffset = std::numeric_limits<size_t>::max();
       tBuf->colOffset = std::numeric_limits<size_t>::max();
+      tBuf->isOwnerOfSpace = false;
+      tBuf->reuseOwner = nullptr;
       buffers.emplace_back(tBuf);
     }
     for (auto valueBufferIter : allocation.valueBuffer) {
@@ -638,6 +640,7 @@ public:
           innermostLoops.push_back(subOp);
     });
     DenseSet<Operation *> handledAllocs;
+    unsigned ctrlIdx = 0;
     for (auto *ctrlOp : innermostLoops) {
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocsForThisLoop;
       unsigned allocIdx = 0;
@@ -645,7 +648,9 @@ public:
       for (auto alloc : allocs) {
         auto allocInt = bufferRange.lookup(buffers[allocIdx]);
         ++allocIdx;
-        if (ctrlInt.intersects(allocInt)) {
+        if (!handledAllocs.count(alloc.getOperation()) &&
+            (ctrlInt.intersects(allocInt) ||
+             ctrlIdx == innermostLoops.size() - 1)) {
           allocsForThisLoop.push_back(alloc);
           handledAllocs.insert(alloc.getOperation());
         }
@@ -653,15 +658,16 @@ public:
       LDBG("run allocation on innermost loop "
            << allocsForThisLoop.size() << " allocs " << ctrlInt.start() << " "
            << ctrlInt.end());
+      for (auto t : allocsForThisLoop)
+        LLVM_DEBUG(t.getOperation()->dump());
       bufferId = allocateTMemAllocs(
           allocsForThisLoop, buffers, // allocToIntervals,
           /*allocToSize,*/ allocToChannel, operationId, ctrlOp, bufferId);
+      ++ctrlIdx;
     }
     SmallVector<triton::nvidia_gpu::TMEMAllocOp> lastAllocs;
     for (auto alloc : allocs) {
-      if (handledAllocs.count(alloc))
-        continue;
-      lastAllocs.push_back(alloc);
+      assert(handledAllocs.count(alloc));
     }
     if (!lastAllocs.empty()) {
       bufferId = allocateTMemAllocs(lastAllocs, buffers, // allocToIntervals,
@@ -676,7 +682,8 @@ public:
       DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
       DenseMap<Operation *, int> &operationId, Operation *ctrlOp,
       unsigned bufferId) {
-    auto alongDependencyChain = [&](Operation *src, Operation *dst) -> bool {
+    auto alongDependencyChain = [&](Operation *src, Operation *dst,
+                                    unsigned depChainCondition) -> bool {
       // consumer of srcAlloc --> producer of dstAlloc
       // consumer partition of srcAllc vs. producer partition of dstAlloc
       auto *srcCh = allocToChannel[src];
@@ -686,13 +693,14 @@ public:
         return true;
       return false;
     };
-    auto sameLoop = [&](BufferT *alloc, BufferT *cand) -> bool {
+    auto sameLoop = [&](BufferT *alloc) -> bool {
+      // cand belongs to ctrlOp.
       if (ctrlOp) {
         auto ctrlInt = getIntervalForCtrlOp(ctrlOp, operationId);
-        if (bufferRange[alloc].intersects(ctrlInt))
-          return false;
-        return true; // no overlapping for alloc and the current ctrlOp
+        // If alloc also belongs to ctrlOp, return true.
+        return bufferRange[alloc].intersects(ctrlInt);
       }
+      // For allocs not in an innermost loop
       return false;
     };
     auto getCombinedTasks = [&](BufferT *alloc) -> SmallVector<AsyncTaskId> {
@@ -712,43 +720,193 @@ public:
           }
         }
       }
+      std::sort(combinedTasks.begin(), combinedTasks.end());
       return combinedTasks;
     };
-    auto samePartition = [&](BufferT *alloc, BufferT *cand) -> bool {
+    // Should we check source partitions and dst partitions separately?
+    auto samePartition = [&](BufferT *alloc, BufferT *cand,
+                             unsigned partitionCondition) -> bool {
+      if (partitionCondition == 0)
+        return true;
+      if (partitionCondition == 1) {
+        // Check dstPartition of alloc with srcPartiton of cand
+        auto *srcCh = allocToChannel[alloc->owner];
+        auto *dstCh = allocToChannel[cand->owner];
+        auto dstChPart = getAsyncTaskIds(dstCh->getSrcOp());
+        auto srcChPart = getAsyncTaskIds(srcCh->getDstOp());
+        LLVM_DEBUG(llvm::dbgs() << "Check partitions\n");
+        for (auto t : dstChPart) {
+          LLVM_DEBUG(llvm::dbgs() << t << " ");
+        }
+        LLVM_DEBUG(llvm::dbgs() << "\n");
+        for (auto t : srcChPart) {
+          LLVM_DEBUG(llvm::dbgs() << t << " ");
+        }
+        LLVM_DEBUG(llvm::dbgs() << "\n");
+        return getAsyncTaskIds(dstCh->getSrcOp()) ==
+               getAsyncTaskIds(srcCh->getDstOp());
+      }
       auto aTasks = getCombinedTasks(alloc);
       auto bTasks = getCombinedTasks(cand);
+      LLVM_DEBUG(llvm::dbgs() << "Check combined partitions\n");
+      for (auto t : aTasks) {
+        LLVM_DEBUG(llvm::dbgs() << t << " ");
+      }
+      LLVM_DEBUG(llvm::dbgs() << "\n");
+      for (auto t : bTasks) {
+        LLVM_DEBUG(llvm::dbgs() << t << " ");
+      }
+      LLVM_DEBUG(llvm::dbgs() << "\n");
       return aTasks == bTasks;
     };
 
-    auto findReuseChannel = [&](BufferT *cand, bool relax) -> BufferT * {
+    // buf and cand belong to the same ctrlOp
+    auto findUsesInCtrlOp = [&](BufferT *buf, BufferT *cand) -> size_t {
+      assert(buf->colOffset == 0);
+      size_t maxColOffset = 0;
+      for (auto *alloc : buffers) {
+        if (!alloc->isOwnerOfSpace && alloc->reuseOwner == buf->reuseOwner &&
+            alloc != buf &&
+            (sameLoop(alloc) ||
+             bufferRange[alloc].intersects(bufferRange[cand]))) {
+          maxColOffset =
+              std::max(maxColOffset, alloc->colOffset + alloc->colSize);
+        }
+      }
+      return maxColOffset;
+    };
+    // Make sure we can place cand at colOffset in the buffer owned by
+    // reuseOwner.
+    auto checkOtherReuses = [&](BufferT *cand, BufferT *reuseOwner,
+                                size_t colOffset) -> bool {
+      for (auto *alloc : buffers) {
+        if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
+          Interval candSizeRange = {colOffset, colOffset + cand->colSize};
+          Interval allocSizeRange = {alloc->colOffset,
+                                     alloc->colOffset + alloc->colSize};
+          if (bufferRange[alloc].intersects(bufferRange[cand]) &&
+              allocSizeRange.intersects(candSizeRange)) {
+            LLVM_DEBUG({
+              LDBG("checkOtherReuses conflict "
+                   << colOffset << " " << alloc->colOffset << " "
+                   << cand->colSize << " " << alloc->colSize);
+              alloc->owner->dump();
+            });
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+    auto findReuseSpace = [&](BufferT *cand, BufferT *reuseOwner,
+                              unsigned depChainCondition) -> size_t {
+      size_t maxColOffset = 0;
+      // Try to find the colOffset in this reuseOwner. If there is already a
+      // reuse in the same loop, move up colOffset.
+      for (auto *alloc : buffers) {
+        if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
+          if (sameLoop(alloc) ||
+              bufferRange[alloc].intersects(bufferRange[cand]))
+            maxColOffset =
+                std::max(alloc->colOffset + alloc->colSize, maxColOffset);
+        }
+      }
+      LDBG("findReuseSpace first pass maxColOffset " << maxColOffset);
+      if (maxColOffset + cand->colSize <= reuseOwner->colSize)
+        return maxColOffset;
+      if (!sameLoop(reuseOwner)) {
+        // owner is not live in this ctrlOp
+        // If owner is in a different loop, try to find a buffer in this loop
+        // where
+        // -- colOffset == 0, in this loop, and along the dependency chain
+        for (auto *alloc : buffers) {
+          if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner &&
+              alloc->colOffset == 0 && sameLoop(alloc) &&
+              alongDependencyChain(alloc->owner, cand->owner,
+                                   depChainCondition)) {
+            auto tOffset = findUsesInCtrlOp(alloc, cand);
+            LLVM_DEBUG({
+              LDBG("findUsesInCtrlOp returns " << tOffset);
+              alloc->owner->dump();
+            });
+            if (tOffset + cand->colSize <= alloc->colSize)
+              return tOffset;
+          }
+        }
+      }
+      return std::numeric_limits<size_t>::max();
+    };
+    auto getBuffer = [&](Operation *candAlloc) -> BufferT * {
+      for (auto *alloc : buffers) {
+        if (alloc->owner == candAlloc)
+          return alloc;
+      }
+      return nullptr;
+    };
+    // Return true if this is the first reuse of a buffer in "ctrlOp" while the
+    // owner of the buffer is in a different ctrlOp.
+    auto firstReuseOfBuffer = [&](BufferT *cand) -> bool {
+      for (auto alloc : allocs) {
+        if (cand->owner == alloc.getOperation()) {
+          // later allocs are not handled yet.
+          break;
+        }
+        auto *allocBuf = getBuffer(alloc.getOperation());
+        if (allocBuf->reuseOwner == cand->reuseOwner)
+          return false;
+      }
+      return true;
+    };
+    // partitionCondition: used when buffer owner is in different loop
+    // depChainCondition: used when buffer owner is in the same loop
+    auto findReuseChannel = [&](BufferT *cand, unsigned partitionCondition,
+                                unsigned depChainCondition) -> BufferT * {
       for (auto *alloc : buffers) {
         if (alloc->isOwnerOfSpace) {
+          LLVM_DEBUG({
+            LDBG("check to reuse buffer owned by " << bufferRange[alloc].start()
+                                                   << " "
+                                                   << bufferRange[alloc].end());
+            alloc->owner->dump();
+          });
           // The buffer owner owns a set of rows.
-          // Each reuseOffset has at most one other buffer sharing the space.
           // If alloc and cand are in different loops, we can reuse as
           // long as they have the same partitions.
           // Otherwise, reuse when there is a dependency chain.
-          // if relax is true, ignore the constraints.
           if (!bufferRange[alloc].intersects(bufferRange[cand]) &&
-              alloc->colSize >= cand->colSize + alloc->reuseOffset &&
-              (relax ||
-               (!sameLoop(alloc, cand) && samePartition(alloc, cand)) ||
-               (sameLoop(alloc, cand) &&
-                alongDependencyChain(alloc->owner, cand->owner)))) {
+              alloc->colSize >= cand->colSize &&
+              ((!sameLoop(alloc) &&
+                samePartition(alloc, cand, partitionCondition)) ||
+               (sameLoop(alloc) &&
+                alongDependencyChain(alloc->owner, cand->owner,
+                                     depChainCondition)))) {
+            // Make sure there is no liveness overlap with other buffers using
+            // the space.
+            auto colOffset = findReuseSpace(cand, alloc, depChainCondition);
+            if (colOffset == std::numeric_limits<size_t>::max()) {
+              LDBG("-- findReuseSpace fails");
+              continue;
+            }
+            if (!checkOtherReuses(cand, alloc, colOffset)) {
+              LDBG("-- checkOtherReuses fails");
+              continue;
+            }
             cand->isOwnerOfSpace = false; // redundant with reuseOwner?
             cand->rowOffset = alloc->rowOffset;
-            cand->colOffset = alloc->reuseOffset;
+            cand->colOffset = colOffset;
             cand->reuseOwner = alloc;
-            // Move reuseOffset for the buffer owner.
-            alloc->reuseOffset = cand->colOffset + cand->colSize;
             LLVM_DEBUG({
               LDBG("set offset to " << cand->rowOffset << " " << cand->colOffset
-                                    << " sameLoop " << sameLoop(alloc, cand)
-                                    << " releax " << relax << ":");
+                                    << " sameLoop " << sameLoop(alloc) << ":");
               cand->owner->dump();
             });
             return alloc;
           }
+          LLVM_DEBUG({
+            LDBG("can't reuse owner "
+                 << bufferRange[alloc].intersects(bufferRange[cand]));
+            alloc->owner->dump();
+          });
         }
       }
       return nullptr;
@@ -797,13 +955,6 @@ public:
       auto stageAttr = op->getAttrOfType<IntegerAttr>("buffer.id");
       return stageAttr.getInt();
     };
-    auto getBuffer = [&](Operation *candAlloc) -> BufferT * {
-      for (auto *alloc : buffers) {
-        if (alloc->owner == candAlloc)
-          return alloc;
-      }
-      return nullptr;
-    };
 
     // Heuristics: num_buffers is one for each alloc
     // If liveness overlaps, we can't reuse the buffer.
@@ -819,26 +970,25 @@ public:
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       ttng::TMEMAllocOp alloc = *it;
       auto *candBuf = getBuffer(alloc.getOperation());
+      LLVM_DEBUG({
+        LDBG("\ntry tmem allocation size "
+             << candBuf->rowSize << " " << bufferRange[candBuf].start() << " "
+             << bufferRange[candBuf].end());
+        alloc.getOperation()->dump();
+      });
       // if this is the first buffer to be allocated, allocate new space.
       // get a list of allocated buffers, check if it interferes
       if (allInterfere(candBuf)) {
+        LDBG("\nallInterfere");
         bool hasSpace = allocateNewSpace(candBuf, true);
         assert(hasSpace && "no new space for tmem alloc");
-      } else if (auto *reuseBuf = findReuseChannel(candBuf, false)) {
-        alloc.getOperation()->setAttr(
-            "buffer.id",
-            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                             getBufferId(reuseBuf->owner)));
-        alloc.getOperation()->setAttr(
-            "buffer.offset",
-            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                             reuseBuf->reuseOffset - candBuf->colSize));
       } else {
-        if (allocateNewSpace(candBuf, false))
-          allocateNewSpace(candBuf, true);
-        else {
-          auto *reuseBuf = findReuseChannel(candBuf, true);
-          assert(reuseBuf && "can't find tmem space");
+        auto *reuseBuf = findReuseChannel(candBuf, 2 /*partitionCondition*/,
+                                          1 /*depChainCondition*/);
+        if (!reuseBuf)
+          reuseBuf = findReuseChannel(candBuf, 1 /*partitionCondition*/,
+                                      1 /*depChainCondition*/);
+        if (reuseBuf) {
           alloc.getOperation()->setAttr(
               "buffer.id",
               IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
@@ -846,7 +996,13 @@ public:
           alloc.getOperation()->setAttr(
               "buffer.offset",
               IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
-                               reuseBuf->reuseOffset - candBuf->colSize));
+                               candBuf->colOffset));
+        } else {
+          if (allocateNewSpace(candBuf, false))
+            allocateNewSpace(candBuf, true);
+          else {
+            assert(false && "can't find tmem space");
+          }
         }
       }
       LLVM_DEBUG({
