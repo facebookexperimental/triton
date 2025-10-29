@@ -424,53 +424,30 @@ def _attn_bwd(
     if CAUSAL:
         start_m = start_n
         num_steps = BLOCK_N1 // MASK_BLOCK_M1
-        dk, dv = _attn_bwd_dkdv(
-            dk,
-            dv,  #
-            Q,
-            k,
-            v,
-            sm_scale,  #
-            DO,  #
-            M,
-            D,  #
-            stride_tok,
-            stride_d,  #
-            H,
-            N_CTX,  #
-            MASK_BLOCK_M1,
-            BLOCK_N1,
-            HEAD_DIM,  #
-            start_n,
-            start_m,
-            num_steps,  #
-            MASK=True,  #
-        )
+        dk, dv = _attn_bwd_dkdv(dk, dv,  #
+                                Q, k, v, sm_scale,  #
+                                DO,  #
+                                M, D,  #
+                                stride_tok, stride_d,  #
+                                H, N_CTX,  #
+                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+                                start_n, start_m, num_steps,  #
+                                MASK=True,  #
+                                )
 
         start_m += num_steps * MASK_BLOCK_M1
 
     # Compute dK and dV for non-masked blocks.
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(  #
-        dk,
-        dv,  #
-        Q,
-        k,
-        v,
-        sm_scale,  #
+        dk, dv,  #
+        Q, k, v, sm_scale,  #
         DO,  #
-        M,
-        D,  #
-        stride_tok,
-        stride_d,  #
-        H,
-        N_CTX,  #
-        BLOCK_M1,
-        BLOCK_N1,
-        HEAD_DIM,  #
-        start_n,
-        start_m,
-        num_steps,  #
+        M, D,  #
+        stride_tok, stride_d,  #
+        H, N_CTX,  #
+        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+        start_n, start_m, num_steps,  #
         MASK=False,  #
     )
 
@@ -505,51 +482,27 @@ def _attn_bwd(
         # structure for dK & dV above as much as possible.
         end_n = start_m + BLOCK_M2
         num_steps = BLOCK_M2 // MASK_BLOCK_N2
-        dq = _attn_bwd_dq(
-            dq,
-            q,
-            K,
-            V,  #
-            do,
-            m,
-            D,  #
-            stride_tok,
-            stride_d,  #
-            H,
-            N_CTX,  #
-            BLOCK_M2,
-            MASK_BLOCK_N2,
-            HEAD_DIM,  #
-            start_m,
-            end_n - num_steps * MASK_BLOCK_N2,
-            num_steps,  #
-            MASK=True,  #
-        )
+        dq = _attn_bwd_dq(dq, q, K, V,  #
+                          do, m, D,  #
+                          stride_tok, stride_d,  #
+                          H, N_CTX,  #
+                          BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
+                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
+                          MASK=True,  #
+                          )
         end_n -= num_steps * MASK_BLOCK_N2
         # stage 2
         num_steps = end_n // BLOCK_N2
         start_n = end_n - num_steps * BLOCK_N2
 
-    dq = _attn_bwd_dq(
-        dq,
-        q,
-        K,
-        V,  #
-        do,
-        m,
-        D,  #
-        stride_tok,
-        stride_d,  #
-        H,
-        N_CTX,  #
-        BLOCK_M2,
-        BLOCK_N2,
-        HEAD_DIM,  #
-        start_m,
-        start_n,
-        num_steps,  #
-        MASK=False,  #
-    )
+    dq = _attn_bwd_dq(dq, q, K, V,  #
+                      do, m, D,  #
+                      stride_tok, stride_d,  #
+                      H, N_CTX,  #
+                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
+                      start_m, start_n, num_steps,  #
+                      MASK=False,  #
+                      )
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
@@ -656,26 +609,12 @@ class _attention(torch.autograd.Function):
         )
         grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
         _attn_bwd[grid](
-            q,
-            arg_k,
-            v,
-            ctx.sm_scale,
-            do,
-            dq,
-            dk,
-            dv,  #
-            M,
-            delta,  #
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),  #
-            N_HEAD,
-            N_CTX,  #
-            BLOCK_M1=BLOCK_M1,
-            BLOCK_N1=BLOCK_N1,  #
-            BLOCK_M2=BLOCK_M2,
-            BLOCK_N2=BLOCK_N2,  #
+            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
+            M, delta,  #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            N_HEAD, N_CTX,  #
+            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
+            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             num_warps=NUM_WARPS,  #
