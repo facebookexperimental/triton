@@ -4,6 +4,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "nvgpu-1D-tmem-alloc"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -154,8 +155,48 @@ void generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
     if (allocShape[allocShape.size() - 1] != 1) {
       builder.setInsertionPointAfter(allocOp);
       // Hardcode allocShape[0] / 2 for testing.
-      allocOpBuffer = sliceAndReinterpretTMEMBuffer(
+      auto reinterpretOp = sliceAndReinterpretTMEMBuffer(
           builder, allocOp, allocShape[allocShape.size() - 2] / 2, 1);
+
+      // If the primary allocation failed, try other TMEM allocations
+      if (!reinterpretOp) {
+        LDBG("Primary TMEM allocation failed, trying alternative allocations");
+
+        for (size_t i = 0; i < allocOps.size() && !reinterpretOp; ++i) {
+          if (i == producerTMEMStart)
+            continue; // Skip the one we already tried
+
+          auto altAllocOp = allocOps[i];
+          auto altAllocShape =
+              dyn_cast<ttg::MemDescType>(altAllocOp->getResult(0).getType())
+                  .getShape();
+
+          if (altAllocShape[altAllocShape.size() - 1] != 1) {
+            builder.setInsertionPointAfter(altAllocOp);
+            reinterpretOp = sliceAndReinterpretTMEMBuffer(
+                builder, altAllocOp,
+                altAllocShape[altAllocShape.size() - 2] / 2, 1);
+
+            if (reinterpretOp) {
+              LDBG("Successfully found alternative TMEM allocation at index "
+                   << i);
+              break;
+            }
+          }
+        }
+
+        // If all TMEM allocations failed, fall back to SMEM (LocalAllocOp)
+        if (!reinterpretOp) {
+          LDBG("All TMEM allocations failed, falling back to SMEM");
+          // Set allocOpBuffer to nullptr to signal SMEM fallback
+          // The TMEM1DAllocator will create a new allocation
+          allocOpBuffer = nullptr;
+        } else {
+          allocOpBuffer = reinterpretOp.getOperation();
+        }
+      } else {
+        allocOpBuffer = reinterpretOp.getOperation();
+      }
     } else {
       allocOpBuffer = allocOp;
     }
@@ -177,6 +218,18 @@ ttg::MemDescReinterpretOp
 sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
                           Operation *allocOp, Operation *newAlloc,
                           Operation *user, int offset) {
+  // This function is TMEM-specific - verify both allocations are TMEM
+  if (!isa<ttng::TMEMAllocOp>(allocOp)) {
+    LDBG("sliceAndReinterpretMDTMEM called with non-TMEM allocOp - returning "
+         "nullptr");
+    return nullptr;
+  }
+  if (!isa<ttng::TMEMAllocOp>(newAlloc)) {
+    LDBG("sliceAndReinterpretMDTMEM called with non-TMEM newAlloc - returning "
+         "nullptr");
+    return nullptr;
+  }
+
   // user is the index into newAlloc.
   // create a new index based on allocOp to reduce from 1xMxN to MxN.
   // then subslice + interpret
@@ -195,9 +248,16 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto newShape = newType.getShape();
   auto blockN = newShape[shape.size() - 1];
 
-  assert(oldBlockN >= blockN && "Invalid blockN size");
-  assert(oldBlockN % blockN == 0 && "Invalid blockN divisibility");
-  assert((offset + blockN) <= oldBlockN && "Invalid offset");
+  // Validate the allocation is valid before attempting to create subslice
+  if (oldBlockN < blockN || oldBlockN % blockN != 0 ||
+      (offset + blockN) > oldBlockN) {
+    // Cannot use this TMEM allocation - return nullptr to signal failure
+    // Caller should try another TMEM allocation or fall back to SMEM
+    LDBG("TMEM allocation validation failed: oldBlockN="
+         << oldBlockN << ", blockN=" << blockN << ", offset=" << offset);
+    return nullptr;
+  }
+
   // We convert from allocOp's type to another allocOp's type.
   // When the data type is different, we need to construct another TMEMDesc. For
   // example from 128x128xf32 to 128x128xbf16, we subslice to 128x64xf32, then
@@ -218,7 +278,8 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
     return builder.create<ttg::MemDescReinterpretOp>(allocOp->getLoc(),
                                                      tmemDesc, subSlice);
   } else {
-    assert(false);
+    // Unsupported element type conversion
+    return nullptr;
   }
 }
 
@@ -230,9 +291,17 @@ ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
   auto allocType = cast<ttg::MemDescType>(allocResult.getType());
   auto shape = allocType.getShape();
   auto oldBlockN = shape[1];
-  assert(oldBlockN >= blockN && "Invalid blockN size");
-  assert(oldBlockN % blockN == 0 && "Invalid blockN divisibility");
-  assert((offset + blockN) <= oldBlockN && "Invalid offset");
+
+  // Validate the allocation is valid before attempting to create subslice
+  if (oldBlockN < blockN || oldBlockN % blockN != 0 ||
+      (offset + blockN) > oldBlockN) {
+    // Cannot use this TMEM allocation - return nullptr to signal failure
+    // Caller should try another TMEM allocation or fall back to SMEM
+    LDBG("TMEM buffer allocation validation failed: oldBlockN="
+         << oldBlockN << ", blockN=" << blockN << ", offset=" << offset);
+    return nullptr;
+  }
+
   auto tmemDesc =
       createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
   auto subSlice = builder.create<ttng::TMEMSubSliceOp>(
