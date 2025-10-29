@@ -234,6 +234,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                                        NUM_SMEM_BUFFERS: tl.constexpr,  #
                                        NUM_TMEM_BUFFERS: tl.constexpr,  #
                                        NUM_SMS: tl.constexpr,  #
+                                       NUM_CLC_STAGES: tl.constexpr,  #
                                        EPILOGUE_SUBTILE: tl.constexpr,  #
                                        ):
     # allocate NUM_SMEM_BUFFERS buffers
@@ -248,7 +249,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
-    clc_context = tlx.clc_create_context(1, 3)
+    clc_context = tlx.clc_create_context(NUM_CLC_STAGES, 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -267,13 +268,16 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
             clc_phase_producer = 1
             clc_phase_consumer = 0
+            clc_buf = 0
             while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
                 # Debug prints
                 # if tlx.thread_id(axis=0) == 0:
                 # tl.device_print("Default WG Processing CtaID", tile_id)
                 # producer
-                tlx.clc_producer(clc_context, clc_phase_producer)
-                clc_phase_producer ^= 1
+                tlx.clc_producer(clc_context, clc_buf, clc_phase_producer)
+                # clc_phase_producer ^= 1
+                clc_phase_producer = clc_phase_producer ^ (clc_buf == (NUM_CLC_STAGES - 1))
 
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
@@ -307,8 +311,10 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
-                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
-                clc_phase_consumer ^= 1
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase_consumer)
+                # clc_phase_consumer ^= 1
+                clc_phase_consumer = clc_phase_consumer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
 
                 # Debug-only: verifying that CLC steals workloads successfully
                 # if tlx.thread_id(axis=0) == 0:
@@ -330,7 +336,9 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
             processed_k_iters = 0
             tile_id = start_pid
             clc_phase = 0
+            clc_buf = 0
             while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -364,8 +372,10 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, clc_phase)
-                clc_phase ^= 1
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                # clc_phase ^= 1
+                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
             # common code duplicated for each region to avoid SMEM overhead
@@ -383,7 +393,9 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
             tile_id = start_pid
             clc_phase = 0
+            clc_buf = 0
             while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -402,8 +414,10 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, clc_phase)
-                clc_phase ^= 1
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                # clc_phase ^= 1
+                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
 
 
 def matmul(a, b, enable_clc=False):
@@ -430,6 +444,7 @@ def matmul(a, b, enable_clc=False):
             a_desc, b_desc, c_desc,  #
             M, N, K,  #
             NUM_SMS=NUM_SMS,  #
+            NUM_CLC_STAGES=1,  #
             # launch_cluster=True,
         )
     else:

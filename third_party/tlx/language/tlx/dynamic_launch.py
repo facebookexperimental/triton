@@ -65,25 +65,25 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 
 @tl.builtin
-def clc_producer(context, p_producer, _semantic=None):
+def clc_producer(context, k, p_producer, _semantic=None):
     # acquire
-    barrier_wait(context._clc_mbars_empty[0], p_producer, _semantic=_semantic)
+    barrier_wait(context._clc_mbars_empty[k], p_producer, _semantic=_semantic)
 
     # commit
-    barrier_expect_bytes(context._clc_mbars_full[0], tl.constexpr(16), _semantic=_semantic)
-    _clc_issue(context._clc_responses[0], context._clc_mbars_full[0], _semantic=_semantic)
+    barrier_expect_bytes(context._clc_mbars_full[k], tl.constexpr(16), _semantic=_semantic)
+    _clc_issue(context._clc_responses[k], context._clc_mbars_full[k], _semantic=_semantic)
 
 
 @tl.builtin
-def clc_consumer(context, p_consumer, _semantic=None):
+def clc_consumer(context, k, p_consumer, _semantic=None):
     # wait
-    barrier_wait(context._clc_mbars_full[0], p_consumer, _semantic=_semantic)
+    barrier_wait(context._clc_mbars_full[k], p_consumer, _semantic=_semantic)
 
     # extract
-    stolen_tile_id = _clc_query(context._clc_responses[0], _semantic=_semantic)
+    stolen_tile_id = _clc_query(context._clc_responses[k], _semantic=_semantic)
 
     # release
-    barrier_arrive(context._clc_mbars_empty[0], _semantic=_semantic)
+    barrier_arrive(context._clc_mbars_empty[k], _semantic=_semantic)
 
     # return
     return stolen_tile_id
