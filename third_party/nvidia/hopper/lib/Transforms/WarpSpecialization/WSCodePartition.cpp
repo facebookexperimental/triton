@@ -2184,8 +2184,48 @@ DenseMap<Channel *, Value> createBufferPost(
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
                              bufferIdx, _phase, config, reuseGrp, channel);
       } else {
-        bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-            user->getLoc(), 0, 32);
+        // For operations outside loops (epilogue), compute the
+        // correct bufferIdx and phase based on the parent loop's final
+        // iteration. Using constant 0 for phase causes deadlock when the loop
+        // completes multiple iterations, as the barrier will wait for phase 0
+        // instead of the final phase value. Find the parent loop that this
+        // operation came from by walking up the IR.
+        Operation *opInsideLoop = nullptr;
+
+        // PRIORITY 1: Look at the channel's source operation, which is where
+        // the data was produced. This is the most reliable way to find the
+        // loop that produced the data being consumed in the epilogue.
+        if (channel) {
+          if (auto srcOp = channel->getSrcOp()) {
+            if (srcOp->getParentOfType<scf::ForOp>()) {
+              opInsideLoop = srcOp;
+            }
+          }
+        }
+
+        // PRIORITY 2: If channel doesn't have a source in a loop, try the
+        // allocation's operand (though this is less reliable since allocations
+        // are often hoisted)
+        if (!opInsideLoop && oldAllocOp->getNumOperands() > 0) {
+          if (auto defOp = oldAllocOp->getOperand(0).getDefiningOp()) {
+            if (defOp->getParentOfType<scf::ForOp>()) {
+              opInsideLoop = defOp;
+            }
+          }
+        }
+
+        if (opInsideLoop) {
+          std::tie(bufferIdx, _phase) = getOutOfScopeBufferIdxAndPhase(
+              builder, opInsideLoop, numBuffers, regionsWithChannels, config,
+              reuseGrp);
+        } else {
+          // Fallback: if we can't find a parent loop, use constant 0
+          // (this should only happen for operations truly outside any loop)
+          bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+              user->getLoc(), 0, 32);
+          _phase = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+              user->getLoc(), 0);
+        }
       }
       userToBufIdx[user] = bufferIdx;
     }
@@ -2321,7 +2361,10 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
     phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
                                                                 _1_1b);
   }
-  phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+  // Use zero extension (ExtUIOp) instead of sign extension (ExtSIOp)
+  // When phase is i1 with value 1, ExtSIOp produces -1 (all bits set)
+  // because the sign bit is 1. ExtUIOp correctly produces 1.
+  phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), phase);
   auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, producerBarrier, phase);
@@ -2360,7 +2403,8 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
       std::tie(bufferIdx, phase) = getOutOfScopeBufferIdxAndPhase(
           builder, mmaOp, numBuffers, regionsWithChannels, config, -1);
       builder.setLoopScheduleInfoFromOp(user);
-      phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+      // Use zero extension (ExtUIOp) instead of sign extension (ExtSIOp)
+      phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
           user->getLoc(), builder.getI32Type(), phase);
       consumerBarrier =
           getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
@@ -2373,7 +2417,8 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
           builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
       phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
                                                                   _1_1b);
-      phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+      // Use zero extension (ExtUIOp) instead of sign extension (ExtSIOp)
+      phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
           loc, builder.getI32Type(), phase);
     }
 
@@ -2734,7 +2779,7 @@ void insertAsyncComm(
 
   DenseMap<ttng::TCGen5MMAOp, ttng::WaitBarrierOp> tmemWaitBarriers;
 
-  // Postpont TMEM channels until all SMEM channels are processed.
+  // Postpone TMEM channels until all SMEM channels are processed.
   // TODO: Reorder the channels in channelsGroupedByConsumers in dependency
   // order. This is to ensure that we insert the synchronization primitives for
   // dependent before using it.
