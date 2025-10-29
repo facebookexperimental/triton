@@ -96,6 +96,11 @@ static LogicalResult relayoutWarps(ModuleAxisInfoAnalysis &axisInfo,
   replacer.addReplacement([](TensorDescType ty) -> std::pair<Type, WalkResult> {
     return {ty, WalkResult::skip()};
   });
+  // Don't replace memdesc types - they are created by warp specialization
+  // and cannot be recreated by ConvertTritonToTritonGPU
+  replacer.addReplacement([](MemDescType ty) -> std::pair<Type, WalkResult> {
+    return {ty, WalkResult::skip()};
+  });
   replacer.recursivelyReplaceElementsIn(*container, /*replaceAttrs=*/false,
                                         /*replaceLocs=*/false,
                                         /*replaceTypes=*/true);
@@ -159,9 +164,15 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // Because the partition region is isolated from above, we could in theory
   // compile it to PTX and read the number of registers that got allocated.
   SmallVector<unsigned> maxTensorRegs;
+  SmallVector<bool> hasMemDescAlloc;
   for (Region *partition : wsOp.getPartitionRegions()) {
     unsigned &tensorRegs = maxTensorRegs.emplace_back(0);
+    bool &hasAlloc = hasMemDescAlloc.emplace_back(false);
     partition->walk([&](Operation *op) {
+      // Check for memdesc allocations that cannot be recreated
+      if (isa<LocalAllocOp, ttng::TMEMAllocOp>(op)) {
+        hasAlloc = true;
+      }
       for (Type type :
            llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes())) {
         if (auto tensor = dyn_cast<RankedTensorType>(type))
@@ -258,12 +269,41 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
     minRegAutoWS = attr.getInt();
   }
-  int maxRegAutoWS = 88; // default value
+  int maxRegAutoWS = 88; // default value (used to be 168)
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName)) {
     maxRegAutoWS = attr.getInt();
   }
 
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
+
+  // Check if ANY partition has memdesc allocations that can't be recreated
+  bool anyHasMemDesc = llvm::any_of(hasMemDescAlloc, [](bool b) { return b; });
+
+  if (anyHasMemDesc) {
+    // CRITICAL: Kernels with memdesc allocations cannot use relayout.
+    // relayoutWarps() strips encodings and re-runs ConvertTritonToTritonGPU,
+    // but memdesc allocations (local_alloc, tmem_alloc) created by earlier
+    // warp specialization passes cannot be recreated, causing unresolved
+    // materialization errors.
+    //
+    // We must keep original warp counts since changing them without relayout
+    // creates mismatches between tensor encodings and partition context.
+    llvm::errs()
+        << "[OptimizePartitionWarps] Kernel has memdesc allocations, "
+        << "skipping warp optimization to avoid materialization errors\n";
+
+    // Set conservative register estimates
+    for (auto [estRegs, tensorRegs] : llvm::zip(estRegUsage, maxTensorRegs)) {
+      estRegs = minRegAutoWS; // tensorRegs ? maxRegAutoWS : minRegAutoWS;
+    }
+
+    // IMPORTANT: Do NOT change partitionNumWarps - this causes hangs/errors
+    // Only set register estimates
+    wsOp.setRequestedRegisters(estRegUsage);
+    return success();
+  }
+
+  // No memdesc allocations - safe to proceed with normal optimization
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
        llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                  wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
