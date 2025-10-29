@@ -611,17 +611,18 @@ def _attn_bwd_preprocess(
 def _attn_bwd_dkdv(
     dk,
     dv,  #
-    Q,
+    desc_q,
     k,
     v,
     sm_scale,  #
-    DO,  #
-    DQ,
+    desc_do,  #
+    desc_dq,
     M,
     D,  #
     # shared by Q/K/V/DO.
     stride_tok,
     stride_d,  #
+    off_bh,
     H,
     N_CTX,
     BLOCK_M1: tl.constexpr,  #
@@ -635,10 +636,6 @@ def _attn_bwd_dkdv(
 ):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
-    offs_k = tl.arange(0, HEAD_DIM)
-    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
-    do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -647,7 +644,8 @@ def _attn_bwd_dkdv(
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs)
+        q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
+        qT = tl.trans(q)
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
@@ -657,7 +655,7 @@ def _attn_bwd_dkdv(
         if MASK:
             mask = offs_m[None, :] >= offs_n[:, None]
             pT = tl.where(mask, pT, 0.0)
-        do = tl.load(do_ptrs)
+        do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
         # Compute dV.
         ppT = pT
         ppT = ppT.to(tl.float16)
@@ -671,28 +669,57 @@ def _attn_bwd_dkdv(
         dk += tl.dot(dsT, tl.trans(qT))
         # Compute dq = tl.dot(tl.trans(dsT), k)
         dq = tl.dot(tl.trans(dsT), k) * LN2
-        tl.atomic_add(dq_ptrs, dq)
-
+        desc_dq.store(
+            [(off_bh + curr_m).to(tl.int32), 0],
+            dq,
+            store_reduce="add",
+        )
         # Increment pointers.
         curr_m += step_m
-        qT_ptrs += step_m * stride_tok
-        do_ptrs += step_m * stride_tok
-        dq_ptrs += step_m * stride_tok
 
     return dk, dv
 
 
 
+def _bwd_host_descriptor_pre_hook(nargs):
+    BLOCK_M1 = nargs["BLOCK_M1"]
+    BLOCK_N1 = nargs["BLOCK_N1"]
+    HEAD_DIM = nargs["HEAD_DIM"]
+    nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
+    nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
+    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM]
+    nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
+    nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
+    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM]
+    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM]
+
+
+configs_bwd = [
+    triton.Config(
+        {
+            "BLOCK_M1": 32,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 32,
+        },
+        num_warps=4,
+        num_stages=1,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    )
+]
+
+
+@triton.autotune(configs=configs_bwd, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd(
-    Q,
-    K,
-    V,
+    desc_q,
+    desc_k,
+    desc_v,
     sm_scale,  #
-    DO,  #
-    DQ,
-    DK,
-    DV,  #
+    desc_do,  #
+    desc_dq,
+    desc_dk,
+    desc_dv,  #
     M,
     D,
     # shared by Q/K/V/DO.
@@ -709,54 +736,41 @@ def _attn_bwd(
     BLK_SLICE_FACTOR: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
 ):
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
-    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
+    off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     pid = tl.program_id(0)
 
     # offset pointers for batch/head
-    Q += adj
-    K += adj
-    V += adj
-    DO += adj
-    DQ += adj
-    DK += adj
-    DV += adj
     M += off_chz
     D += off_chz
-
-    # load scales
-    offs_k = tl.arange(0, HEAD_DIM)
-
-    start_n = pid * BLOCK_N1
-    start_m = 0
-
-    offs_n = start_n + tl.arange(0, BLOCK_N1)
 
     dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
-    # load K and V: they stay in SRAM throughout the inner loop.
-    k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
-    v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    start_n = pid * BLOCK_N1
+    start_m = 0
 
+    # load K and V: they stay in SRAM throughout the inner loop.
+    k = desc_k.load([(off_bh + start_n).to(tl.int32), 0])
+    v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
     # Compute dK and dV for non-masked blocks.
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(  #
         dk,
         dv,  #
-        Q,
+        desc_q,
         k,
         v,
         sm_scale,  #
-        DO,  #
-        DQ,
+        desc_do,  #
+        desc_dq,
         M,
         D,  #
         stride_tok,
         stride_d,  #
+        off_bh,
         H,
         N_CTX,  #
         BLOCK_M1,
@@ -768,13 +782,17 @@ def _attn_bwd(
         MASK=False,  #
     )
 
-    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dv_ptrs, dv)
+    desc_dv.store(
+        [(off_bh + start_n).to(tl.int32), 0],
+        dv.to(tlx.dtype_of(desc_dv)),
+    )
 
     # Write back dK.
     dk *= sm_scale
-    dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dk_ptrs, dk)
+    desc_dk.store(
+        [(off_bh + start_n).to(tl.int32), 0],
+        dk.to(tlx.dtype_of(desc_dk)),
+    )
 
 
 class _attention(torch.autograd.Function):
@@ -845,7 +863,6 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         PRE_BLOCK = 128
-        NUM_WARPS, NUM_STAGES = 4, 1
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
@@ -865,16 +882,49 @@ class _attention(torch.autograd.Function):
             BLOCK_M=PRE_BLOCK,
             HEAD_DIM=ctx.HEAD_DIM,  #
         )
-        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
+
+        dummy_block = [1, 1]
+        HEAD_DIM = ctx.HEAD_DIM
+        desc_k = TensorDescriptor(
+            arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+        desc_v = TensorDescriptor(
+            v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+        desc_q = TensorDescriptor(
+            q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+        desc_do = TensorDescriptor(
+            do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+        desc_dq = TensorDescriptor(
+            dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+        desc_dk = TensorDescriptor(
+            dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+        desc_dv = TensorDescriptor(
+            dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block
+        )
+
+        def alloc_fn(size: int, align: int, _):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+        def grid(meta):
+            return (triton.cdiv(N_CTX, meta['BLOCK_N1']),    # tiles along N (K/V)
+                    1,                                       # (or cdiv over M if you need)
+                    BATCH * N_HEAD)                          # batch*heads
+
         _attn_bwd[grid](
-            q,
-            arg_k,
-            v,
+            desc_q,
+            desc_k,
+            desc_v,
             ctx.sm_scale,
-            do,
-            dq,
-            dk,
-            dv,  #
+            desc_do,
+            desc_dq,
+            desc_dk,
+            desc_dv,  #
             M,
             delta,  #
             q.stride(0),
@@ -883,14 +933,8 @@ class _attention(torch.autograd.Function):
             q.stride(3),  #
             N_HEAD,
             N_CTX,  #
-            BLOCK_M1=BLOCK_M1,
-            BLOCK_N1=BLOCK_N1,  #
-            BLOCK_M2=BLOCK_M2,
-            BLOCK_N2=BLOCK_N2,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
-            num_warps=NUM_WARPS,  #
-            num_stages=NUM_STAGES,  #
         )
 
         return dq, dk, dv, None, None, None, None
