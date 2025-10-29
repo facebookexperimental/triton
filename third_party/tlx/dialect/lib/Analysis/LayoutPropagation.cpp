@@ -41,7 +41,8 @@ void LayoutEncoding::print(raw_ostream &os) const {
 
 LayoutEncoding LayoutEncoding::join(const LayoutEncoding &lhs,
                                     const LayoutEncoding &rhs) {
-  return LayoutEncoding::getUnknownLayout();
+  assert(lhs == rhs && "Conflicting layouts");
+  return lhs;
 }
 
 LayoutEncoding LayoutEncoding::meet(const LayoutEncoding &lhs,
