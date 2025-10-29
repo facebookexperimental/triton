@@ -77,5 +77,29 @@ public:
 private:
   SmallVector<AsyncTaskId> asyncTaskIds;
 };
+
+// Barrier naming utilities for creating descriptive NameLocs
+std::string getChannelNameFromProducerConsumers(int producerId,
+                                                ArrayRef<int> consumerIds);
+std::string getBarrierName(llvm::StringRef barrierType,
+                           llvm::StringRef bufferType,
+                           llvm::StringRef channelName);
+std::string getInitBarrierName(llvm::StringRef bufferType, unsigned bufferIdx);
+
+// NameLoc creation utilities for barriers
+Location createBarrierNameLoc(OpBuilder &builder, Operation *op,
+                              llvm::StringRef barrierType,
+                              llvm::StringRef bufferType);
+Location createInitBarrierNameLoc(OpBuilder &builder, Location baseLoc,
+                                  llvm::StringRef bufferType,
+                                  unsigned bufferIdx);
+
+// Buffer naming utilities for creating descriptive NameLocs
+std::string getBufferName(llvm::StringRef bufferType,
+                          llvm::StringRef channelName, unsigned numBuffers);
+Location createBufferNameLoc(OpBuilder &builder, Location baseLoc,
+                             llvm::StringRef bufferType,
+                             llvm::StringRef channelName, unsigned numBuffers);
+
 } // namespace mlir
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_UTILITY_H_

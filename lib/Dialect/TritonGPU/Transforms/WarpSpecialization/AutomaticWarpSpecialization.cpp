@@ -5,6 +5,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
@@ -55,6 +56,15 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createCSEPass());
   pm.addPass(createNVWSAssignStagePhase());
   pm.addPass(createNVWSLowerAref());
+  if (failed(runPipeline(pm, getOperation())))
+    return signalPassFailure();
+
+  // Rename allocations to include partition information for better debugging
+  // Must be after serialize() but before PartitionLoops which removes
+  // partition attributes
+  renameAllocsToPartition(getOperation());
+
+  pm.clear();
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
   if (failed(runPipeline(pm, getOperation())))

@@ -688,7 +688,8 @@ void createToken(
 
 static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
                                          ttng::TMEMAllocOp oldTMemAllocOp,
-                                         int numBuffers) {
+                                         int numBuffers,
+                                         const std::string &channelName) {
   Location loc = oldTMemAllocOp.getLoc();
   auto oldRetType = oldTMemAllocOp.getType();
   SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
@@ -700,8 +701,12 @@ static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return builder.create<ttng::TMEMAllocOp>(oldTMemAllocOp.getLoc(),
-                                           accMemDescType, nullptr);
+
+  // Create NameLoc with partition information
+  auto bufferLoc =
+      createBufferNameLoc(builder, loc, "tmem_buffer", channelName, numBuffers);
+
+  return builder.create<ttng::TMEMAllocOp>(bufferLoc, accMemDescType, nullptr);
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
@@ -748,7 +753,9 @@ DenseMap<Channel *, Value> createBuffer(
       ttng::TmemDataChannel *tmemChannel =
           static_cast<ttng::TmemDataChannel *>(channel);
       auto oldTMemAllocOp = tmemChannel->getAllocOp();
-      buffer = createTMemAlloc(builder, oldTMemAllocOp, numBuffers);
+      std::string channelName = channel->getChannelName();
+      buffer =
+          createTMemAlloc(builder, oldTMemAllocOp, numBuffers, channelName);
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       // Get basic information from tensorType
@@ -798,7 +805,13 @@ DenseMap<Channel *, Value> createBuffer(
       Type memdescType =
           ttg::MemDescType::get(bufferShape, elemType, sharedLayout,
                                 sharedMemorySpace, /*mutableMemory*/ true);
-      buffer = builder.create<ttg::LocalAllocOp>(funcOp.getLoc(), memdescType);
+
+      // Create NameLoc with partition information
+      std::string channelName = channel->getChannelName();
+      auto bufferLoc = createBufferNameLoc(
+          builder, funcOp.getLoc(), "smem_buffer", channelName, numBuffers);
+
+      buffer = builder.create<ttg::LocalAllocOp>(bufferLoc, memdescType);
     } else {
       llvm_unreachable("Unexpected result type");
     }
@@ -1111,6 +1124,9 @@ void insertAsyncComm(
 
     builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
 
+    // Get channel name for descriptive barriers
+    std::string channelName = masterChannel->getChannelName();
+
     // Channel can have multiple consumers.
     for (auto &consumerTaskId : masterChannel->relation.second) {
       // Desynchronize TCGen5MMAOp. Set up consumer release and producer
@@ -1142,8 +1158,10 @@ void insertAsyncComm(
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint = getSameLevelOp(headConsumer, headProducer);
         builder.setInsertionPoint(producerAcquirePoint);
-        builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-            headProducer->getLoc(), token.second, bufferIdx, phase);
+        auto acquireOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                headProducer->getLoc(), token.second, bufferIdx, phase);
+        acquireOp->setAttr("channel_name", builder.getStringAttr(channelName));
       }
 
       // Insert ProducerCommitOp if producer is not TMA. For TMA, TMA lowering
@@ -1160,8 +1178,10 @@ void insertAsyncComm(
           producerCommitPoint = getSameLevelOp(headConsumer, tailProducer);
         }
         builder.setInsertionPointAfter(producerCommitPoint);
-        builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
-            tailProducer->getLoc(), token.second, bufferIdx);
+        auto commitOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                tailProducer->getLoc(), token.second, bufferIdx);
+        commitOp->setAttr("channel_name", builder.getStringAttr(channelName));
       }
     }
 
@@ -1171,8 +1191,9 @@ void insertAsyncComm(
       if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
-        builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+        auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
+        waitOp->setAttr("channel_name", builder.getStringAttr(channelName));
       }
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
@@ -1181,8 +1202,10 @@ void insertAsyncComm(
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
         builder.setInsertionPointAfter(consumerReleasePoint);
-        builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-            consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        auto releaseOp =
+            builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                consumerReleasePoint->getLoc(), token.second, bufferIdx);
+        releaseOp->setAttr("channel_name", builder.getStringAttr(channelName));
         LLVM_DEBUG({
           LDBG("create ConsumerRelease ");
           token.second.dump();
