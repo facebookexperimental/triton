@@ -541,8 +541,72 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
-    if (!hasUse)
+    if (!hasUse) {
       op->erase();
+    } /* else {
+       llvm::errs() << "Op still has users: " << op->getName();
+
+       // Check for partition attribute
+       if (auto partitionAttr =
+               op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+         llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
+       }
+
+       // Check for async task ID
+       auto taskIds = getAsyncTaskIds(op);
+       if (!taskIds.empty()) {
+         llvm::errs() << " (taskIds: ";
+         for (size_t i = 0; i < taskIds.size(); ++i) {
+           if (i > 0)
+             llvm::errs() << ", ";
+           llvm::errs() << taskIds[i];
+         }
+         llvm::errs() << ")";
+       }
+
+       // Print all attributes
+       auto attrs = op->getAttrs();
+       if (!attrs.empty()) {
+         llvm::errs() << " [attrs: ";
+         bool first = true;
+         for (auto namedAttr : attrs) {
+           if (!first)
+             llvm::errs() << ", ";
+           llvm::errs() << namedAttr.getName().str();
+           first = false;
+         }
+         llvm::errs() << "]";
+       }
+
+       llvm::errs() << "\n";
+
+       for (unsigned i = 0; i < op->getNumResults(); ++i) {
+         for (Operation *user : op->getResult(i).getUsers()) {
+           llvm::errs() << "  User: " << user->getName();
+
+           // Check for partition attribute on user
+           if (auto userPartitionAttr =
+                   user->getAttrOfType<IntegerAttr>("ttg.partition")) {
+             llvm::errs() << " (partition: " << userPartitionAttr.getInt()
+                          << ")";
+           }
+
+           // Check for async task ID on user
+           auto userTaskIds = getAsyncTaskIds(user);
+           if (!userTaskIds.empty()) {
+             llvm::errs() << " (taskIds: ";
+             for (size_t j = 0; j < userTaskIds.size(); ++j) {
+               if (j > 0)
+                 llvm::errs() << ", ";
+               llvm::errs() << userTaskIds[j];
+             }
+             llvm::errs() << ")";
+           }
+
+           llvm::errs() << "\n";
+         }
+       }
+     }*/
   }
 }
 

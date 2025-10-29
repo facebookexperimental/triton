@@ -2,6 +2,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/Pass/Pass.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -149,6 +150,43 @@ static Partition *scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
       uses.push_back(&use);
   }
   return partition;
+}
+
+// Schedule post-loop operations (operations outside and after the loop) into
+// the epilogue partition. This recursively schedules operations that consume
+// loop results and their transitive users.
+static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
+                                Partition *epiloguePartition) {
+  SmallVector<OpOperand *> uses;
+
+  // Collect all uses of the loop's results.
+  for (OpResult result : loop.getResults()) {
+    for (OpOperand &use : result.getUses())
+      uses.push_back(&use);
+  }
+
+  // Recursively schedule all post-loop users.
+  DenseSet<Operation *> visited;
+  while (!uses.empty()) {
+    OpOperand *use = uses.pop_back_val();
+    Operation *user = use->getOwner();
+
+    // Skip if already visited or scheduled.
+    if (!visited.insert(user).second || schedule.isScheduled(user))
+      continue;
+
+    // Only schedule operations that are outside the loop.
+    if (loop->isAncestor(user))
+      continue;
+
+    // Schedule this post-loop operation to the epilogue partition.
+    schedule.trySchedule(epiloguePartition, user);
+
+    // Add all users of this operation to process transitively.
+    for (OpResult result : user->getResults())
+      for (OpOperand &nextUse : result.getUses())
+        uses.push_back(&nextUse);
+  }
 }
 
 // Given a partitioning scheme, determine an initial schedule by performing a
@@ -316,34 +354,6 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
                     mmaOp);
       ++Idx;
     }
-  }
-
-  // Handle operations outside the loop (both prologue and epilogue).
-  // This ensures all operations, including those outside the loop,
-  // get partition assignments.
-  Partition *outsideLoopPartition = schedule.getRootPartition();
-
-  // Walk all operations in the parent block (both before and after the loop)
-  Block *parentBlock = mainLoop->getBlock();
-  for (Operation &op : *parentBlock) {
-    // Skip the loop itself
-    if (&op == &(*mainLoop))
-      continue;
-
-    // Skip operations that are already scheduled
-    if (schedule.isScheduled(&op))
-      continue;
-
-    // Skip terminators
-    if (isa<triton::ReturnOp>(op))
-      continue;
-
-    // Assign this operation and all nested operations to the root partition
-    op.walk([&](Operation *nestedOp) {
-      if (!schedule.isScheduled(nestedOp) && !isa<triton::ReturnOp>(nestedOp)) {
-        schedule.insert(outsideLoopPartition, nestedOp);
-      }
-    });
   }
 
   return schedule;
@@ -652,6 +662,16 @@ void PartitionScheduling::runOnOperation() {
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     if (std::optional<WarpSchedule> schedule = getInitialSchedule(loop)) {
       propagatePartitions(loop, *schedule);
+
+      // Schedule post-loop operations into the epilogue partition after
+      // propagatePartitions completes. The epilogue partition is the last
+      // partition created (see getInitialSchedule).
+      if (schedule->getNumPartitions() > 0) {
+        Partition *epiloguePartition =
+            schedule->getPartition(schedule->getNumPartitions() - 1);
+        schedulePostLoopOps(loop, *schedule, epiloguePartition);
+      }
+
       optimizeSchedule(loop, *schedule);
       schedule->serialize(loop);
       loop->setAttr(
