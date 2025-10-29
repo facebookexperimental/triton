@@ -465,24 +465,21 @@ def test_op(enable_clc):
 
 ref_lib = "cuBLAS"
 
-configs = []
-configs.append(
+
+@triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
         x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=[ref_lib.lower(), "triton"],  # Label name for the lines
-        line_names=[ref_lib, "Triton"],  # Line styles
-        styles=[("green", "-"), ("blue", "-")],
+        line_vals=[ref_lib.lower(), "triton_persistent", "triton_clc"],  # Label name for the lines
+        line_names=[ref_lib, "Triton (persisent)", "Triton (CLC)"],  # Line styles
+        styles=[("green", "-"), ("blue", "-"), ("red", "-")],
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
         args={},
     ))
-
-
-@triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
@@ -490,8 +487,14 @@ def benchmark(M, N, K, provider):
     if provider == ref_lib.lower():
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
                                                      rep=2000)
-    if provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
+    if provider == "triton_persistent":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, False), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
+
+    if provider == "triton_clc":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, True), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
+
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 

@@ -8,7 +8,7 @@ from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier
 
 @tl.builtin
 def _alloc_clc_responses(
-    num_responses: int,
+    num_responses: tl.constexpr,
     _semantic=None,
 ) -> tlx.clc_response:
     layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
