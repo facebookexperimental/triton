@@ -541,7 +541,8 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
-    op->erase();
+    if (!hasUse)
+      op->erase();
   }
 }
 

@@ -53,7 +53,14 @@ static Channel *findChannelForAlloc(Value value,
 
 static void getAllAcutalUsersForChannel(Channel *TheCh,
                                         DenseSet<Operation *> &users) {
+  // Skip null channels
+  if (!TheCh)
+    return;
   Operation *src = TheCh->getSrcOp();
+  // Skip channels without valid source operations (e.g., allocations outside
+  // loops)
+  if (!src)
+    return;
   SmallVector<Operation *> dsts;
   TheCh->getDstOps(dsts);
   users.insert(src);
@@ -109,6 +116,10 @@ static Operation *getLiftedScope(Operation *a, Operation *b) {
 // will be lifted up.
 static void getUserScopes(DenseSet<Operation *> &users,
                           DenseSet<Operation *> &userScopes) {
+  // Skip if users is empty (e.g., channels without valid operations)
+  if (users.empty())
+    return;
+
   bool first = true;
   for (auto user : users) {
     if (first) {
@@ -273,6 +284,14 @@ private:
         value.dump();
       });
       auto liveOperations = livenessForSmemChannel(value);
+
+      // If no live operations found (e.g., for allocations outside loops
+      // without valid channels), return an empty interval at the beginning.
+      // This allocation won't interfere with any operations.
+      if (liveOperations.empty()) {
+        return Interval<size_t>(0, 0);
+      }
+
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
       llvm::for_each(liveOperations, [&](Operation *liveOp) {
@@ -309,13 +328,21 @@ public:
           static_cast<ChannelPost *>(findChannelForOp(alloc, *channels));
       DenseSet<Operation *> users;
       getAllAcutalUsersForChannel(TheCh, users);
+      // If no users found (e.g., for allocations outside loops), not in
+      // innermost loop
+      if (users.empty())
+        return false;
       // All users are in the same block and in the innermost loop.
       auto *first = *(users.begin());
       for (auto *user : users) {
         if (user->getBlock() != first->getBlock())
           return false;
       }
-      return isInnermostLoop(first->getParentOfType<scf::ForOp>());
+      auto parentLoop = first->getParentOfType<scf::ForOp>();
+      // If users are outside loops, they're not in the innermost loop
+      if (!parentLoop)
+        return false;
+      return isInnermostLoop(parentLoop);
     };
     // Keep track of unique element types. We don't support casting between
     // different element types.
