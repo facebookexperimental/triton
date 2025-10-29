@@ -180,7 +180,7 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
   tt.func @tc_gen5_mma(%a: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>,
-                       %b: !ttg.memdesc<128x128xf16, #shared1, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<128x64xf16, #shared1, #ttg.shared_memory>,
                        %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
                        %useAcc: i1,
                        %pred: i1,
@@ -188,7 +188,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
                        %barrierPred: i1) {
     ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async, two_ctas}:
        !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>,
-       !ttg.memdesc<128x128xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x64xf16, #shared1, #ttg.shared_memory>,
        !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
        !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
     tt.return
