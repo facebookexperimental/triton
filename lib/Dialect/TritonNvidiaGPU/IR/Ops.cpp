@@ -24,6 +24,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -320,6 +321,29 @@ bool TCGen5MMAOp::verifyDims() {
   auto bShape = this->getB().getType().getShape();
 
   return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
+}
+
+bool TCGen5MMAOp::verifyOutputDims() {
+
+  if (getTwoCtas()) {
+    // Here we have to relax the verification to support two possibilities
+    // - For TLX 2CTA:
+    //  - Full MMA shape: [2M, K] x [K, N] -> [2M, N]
+    //  - Each CTA: [M, K] x [K, N/2] -> [M, N]. We're verifying each CTA here.
+    // - For non TLX 2CTA: each CTA has [M, K] x [K, N] -> [M, N]
+    // We cannot rely on module attr to differentiate them here because this
+    // verification can run before Fixup pass. If we want to be as accurate as
+    // possible, we should have a tlxTwoCTAs flag on MMA Op in the future
+    auto aShape = getA().getType().getShape();
+    auto bShape = getB().getType().getShape();
+    auto dShape = getD().getType().getShape();
+    return dShape[dShape.size() - 2] == aShape[aShape.size() - 2] &&
+           (dShape[dShape.size() - 1] == bShape[aShape.size() - 1] /* non TLX*/
+            || dShape[dShape.size() - 1] ==
+                   2 * bShape[aShape.size() - 1] /* TLX 2CTA*/);
+  }
+  // 1cta case still delegates to default verifiers
+  return DotOpInterfaceTrait::verifyOutputDims();
 }
 
 Value TCGen5MMAOp::useAccumulator() { return getUseD(); }
