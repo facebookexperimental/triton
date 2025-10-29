@@ -28,7 +28,7 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
-- `buffer = tlx.local_view(buffers, buffer_idx)`
+- `buffer = buffers[ buffer_idx]`
 
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`.
 
