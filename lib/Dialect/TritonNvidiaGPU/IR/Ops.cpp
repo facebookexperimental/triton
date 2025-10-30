@@ -261,8 +261,6 @@ static void printToken(OpAsmPrinter &p, Operation *op, Value dep, Type token) {
   p << ']';
 }
 
-<<<<<<< HEAD
-=======
 namespace {
 enum class MMADTypeKind { tf32, f16, f8f6f4, i8 };
 } // namespace
@@ -326,7 +324,6 @@ static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
   return success();
 }
 
->>>>>>> db379e8b3 (Fix missing return at end of strMMADTypeKind function (#8019))
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
