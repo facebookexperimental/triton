@@ -664,11 +664,7 @@ def _attn_bwd_dkdv(
         dk += tl.dot(dsT, tl.trans(qT))
         # Compute dq = tl.dot(tl.trans(dsT), k)
         dq = tl.dot(tl.trans(dsT), k) * LN2
-        desc_dq.store(
-            [(off_bh + curr_m).to(tl.int32), 0],
-            dq,
-            store_reduce="add",
-        )
+        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), 0], dq)
         # Increment pointers.
         curr_m += step_m
 
