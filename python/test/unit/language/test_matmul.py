@@ -9,6 +9,7 @@ from triton._internal_testing import is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4
 
 
 def f8_to_f16(x, dtype):
+
     @triton.jit
     def kernel(Y, X, N, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -18,7 +19,7 @@ def f8_to_f16(x, dtype):
         tl.store(Y + offs, x, mask=mask)
 
     ret = torch.empty(x.shape, dtype=torch.float16, device=x.device)
-    grid = lambda META: (triton.cdiv(x.numel(), META["BLOCK_SIZE"]),)
+    grid = lambda META: (triton.cdiv(x.numel(), META["BLOCK_SIZE"]), )
     dtype = getattr(tl, dtype)
     kernel[grid](ret, triton.reinterpret(x, dtype), ret.numel(), BLOCK_SIZE=1024)
     return ret
@@ -217,15 +218,9 @@ def test_simple_matmul(
     # operations. (Pipeliner will add additional mma operation by peeling the prologue.)
     # This applies only if TCv5 MMA is used (M % 64 == 0 and N % 8 == 0) and
     # when MMA arguments loads are pipelined (N > 16)
-    if (
-        device == "cuda"
-        and torch.cuda.get_device_capability()[0] == 10
-        and NUM_STAGES > 1
-        and BLOCK_M % 64 == 0
-        and BLOCK_N % 8 == 0
-        and BLOCK_N > 16
-        and not (precision == "ieee" and (dtype_src_str == "float32" or dtype_src_str == "float64"))
-    ):
+    if (device == "cuda" and torch.cuda.get_device_capability()[0] == 10 and NUM_STAGES > 1 and BLOCK_M % 64 == 0
+            and BLOCK_N % 8 == 0 and BLOCK_N > 16
+            and not (precision == "ieee" and (dtype_src_str == "float32" or dtype_src_str == "float64"))):
         ttgir = k.asm["ttgir"]
         count = ttgir.count("ttng.tc_gen5_mma")
         assert count == 2, "The TTGIR does not match the expected pattern."
@@ -345,7 +340,7 @@ def test_simple_persistent_matmul(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, DISALLOW
     # Fake small number of SMS to test that persistent kernel works reliably
     NUM_SMS = 8
 
-    grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)),)
+    grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
     k = simple_persistent_kernel[grid](
         a,
         b,
@@ -375,13 +370,8 @@ def test_simple_persistent_matmul(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, DISALLOW
     # Make sure the mma is pipelined by checking if in the TTGIR we have peeled mmav5 ops.
     # This applies only if TCv5 MMA is used (M % 64 == 0 and N % 8 == 0) and
     # when MMA arguments loads are pipelined (N > 16)
-    if (
-        device == "cuda"
-        and torch.cuda.get_device_capability()[0] == 10
-        and BLOCK_M % 64 == 0
-        and BLOCK_N % 8 == 0
-        and BLOCK_N > 16
-    ):
+    if (device == "cuda" and torch.cuda.get_device_capability()[0] == 10 and BLOCK_M % 64 == 0 and BLOCK_N % 8 == 0
+            and BLOCK_N > 16):
         ttgir = k.asm["ttgir"]
         pattern = "ttng.tc_gen5_mma"
         assert ttgir.count(pattern) > 0, "Expect peeled mmav5 operations."
@@ -578,20 +568,12 @@ def block_scale_mxfp_matmul(  #
         offs_sk = tl.arange(0, (BLOCK_K // 128))
         offs_sc = tl.arange(0, 32)
         offs_sd = tl.arange(0, 4)
-        a_scale_ptr = a_scale + (
-            offs_sm[:, None, None, None, None] * stride_sk
-            + offs_sk[None, :, None, None, None] * stride_sb
-            + offs_sc[None, None, :, None, None] * stride_sc
-            + offs_sd[None, None, None, :, None] * stride_sd
-            + offs_sd[None, None, None, None, :]
-        )
-        b_scale_ptr = b_scale + (
-            offs_sn[:, None, None, None, None] * stride_sk
-            + offs_sk[None, :, None, None, None] * stride_sb
-            + offs_sc[None, None, :, None, None] * stride_sc
-            + offs_sd[None, None, None, :, None] * stride_sd
-            + offs_sd[None, None, None, None, :]
-        )
+        a_scale_ptr = a_scale + (offs_sm[:, None, None, None, None] * stride_sk + offs_sk[None, :, None, None, None] *
+                                 stride_sb + offs_sc[None, None, :, None, None] * stride_sc +
+                                 offs_sd[None, None, None, :, None] * stride_sd + offs_sd[None, None, None, None, :])
+        b_scale_ptr = b_scale + (offs_sn[:, None, None, None, None] * stride_sk + offs_sk[None, :, None, None, None] *
+                                 stride_sb + offs_sc[None, None, :, None, None] * stride_sc +
+                                 offs_sd[None, None, None, :, None] * stride_sd + offs_sd[None, None, None, None, :])
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -683,16 +665,14 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales_cdna4(
     b_ptrs = b_ptr + (offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # Create pointers for the first block of A and B scales
-    offs_asn = (
-        pid_n * (BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE) + tl.arange(0, (BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE))
-    ) % N
+    offs_asn = (pid_n *
+                (BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE) + tl.arange(0, (BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE))) % N
     offs_ks = tl.arange(0, BLOCK_K // SCALE_GROUP_SIZE * NON_K_PRESHUFFLE_BLOCK_SIZE)
 
     # B scales are N x K even though B operand is K x N.
     b_scale_ptrs = b_scales_ptr + offs_asn[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
-    offs_asm = (
-        pid_m * (BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE) + tl.arange(0, (BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE))
-    ) % M
+    offs_asm = (pid_m *
+                (BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE) + tl.arange(0, (BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE))) % M
     a_scale_ptrs = a_scales_ptr + offs_asm[:, None] * stride_asm + offs_ks[None, :] * stride_ask
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -700,31 +680,23 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales_cdna4(
         if preshuffle:
             # Here we "undo" the shuffle done in global memory (shuffle_scales_cdna4 function).
             if mfma_nonkdim == 32:
-                a_scales = (
-                    tl.load(a_scale_ptrs)
-                    .reshape(BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE, BLOCK_K // SCALE_GROUP_SIZE // 8, 2, 32, 4, 1)
-                    .permute(0, 3, 1, 4, 2, 5)
-                    .reshape(BLOCK_M, BLOCK_K // SCALE_GROUP_SIZE)
-                )
-                b_scales = (
-                    tl.load(b_scale_ptrs)
-                    .reshape(BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE, BLOCK_K // SCALE_GROUP_SIZE // 8, 2, 32, 4, 1)
-                    .permute(0, 3, 1, 4, 2, 5)
-                    .reshape(BLOCK_N, BLOCK_K // SCALE_GROUP_SIZE)
-                )
+                a_scales = (tl.load(a_scale_ptrs).reshape(BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE,
+                                                          BLOCK_K // SCALE_GROUP_SIZE // 8, 2, 32, 4,
+                                                          1).permute(0, 3, 1, 4, 2,
+                                                                     5).reshape(BLOCK_M, BLOCK_K // SCALE_GROUP_SIZE))
+                b_scales = (tl.load(b_scale_ptrs).reshape(BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE,
+                                                          BLOCK_K // SCALE_GROUP_SIZE // 8, 2, 32, 4,
+                                                          1).permute(0, 3, 1, 4, 2,
+                                                                     5).reshape(BLOCK_N, BLOCK_K // SCALE_GROUP_SIZE))
             elif mfma_nonkdim == 16:
-                a_scales = (
-                    tl.load(a_scale_ptrs)
-                    .reshape(BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE, BLOCK_K // SCALE_GROUP_SIZE // 8, 4, 16, 2, 2, 1)
-                    .permute(0, 5, 3, 1, 4, 2, 6)
-                    .reshape(BLOCK_M, BLOCK_K // SCALE_GROUP_SIZE)
-                )
-                b_scales = (
-                    tl.load(b_scale_ptrs)
-                    .reshape(BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE, BLOCK_K // SCALE_GROUP_SIZE // 8, 4, 16, 2, 2, 1)
-                    .permute(0, 5, 3, 1, 4, 2, 6)
-                    .reshape(BLOCK_N, BLOCK_K // SCALE_GROUP_SIZE)
-                )
+                a_scales = (tl.load(a_scale_ptrs).reshape(BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE,
+                                                          BLOCK_K // SCALE_GROUP_SIZE // 8, 4, 16, 2, 2,
+                                                          1).permute(0, 5, 3, 1, 4, 2,
+                                                                     6).reshape(BLOCK_M, BLOCK_K // SCALE_GROUP_SIZE))
+                b_scales = (tl.load(b_scale_ptrs).reshape(BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE,
+                                                          BLOCK_K // SCALE_GROUP_SIZE // 8, 4, 16, 2, 2,
+                                                          1).permute(0, 5, 3, 1, 4, 2,
+                                                                     6).reshape(BLOCK_N, BLOCK_K // SCALE_GROUP_SIZE))
         else:
             a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
@@ -829,7 +801,7 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, mfma_no
         return scales_shuffled
 
     def e8m0_to_f32(x):
-        x_f32 = 2 ** ((x - 127).to(torch.float32))
+        x_f32 = 2**((x - 127).to(torch.float32))
         x_f32[x_f32 == 128] = float("nan")
         return x_f32
 
@@ -920,9 +892,8 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, mfma_no
 
 
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 512), (998, 111, 512), (63, 128, 512)])
-@pytest.mark.parametrize(
-    "BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 128, 256), (128, 256, 256)]
-)
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (256, 128, 128), (128, 256, 128),
+                                                       (128, 128, 256), (128, 256, 256)])
 @pytest.mark.parametrize("NUM_STAGES", [1, 2, 4])
 @pytest.mark.parametrize("USE_2D_SCALE_LOAD", [False, True])
 @pytest.mark.skipif(is_hip() or torch.cuda.get_device_capability()[0] != 10, reason="Requires compute capability == 10")
@@ -1005,8 +976,8 @@ def test_blocked_scale_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, USE_
             load_pipelined = ttgir.count(f"ttg.local_alloc : () -> !ttg.memdesc<{NUM_STAGES}x{BLOCK_M}x{BLOCK_K}") == 2
         else:
             load_pipelined = ttgir.count(
-                f"ttg.local_alloc : () -> !ttg.memdesc<{NUM_STAGES}x{BLOCK_M}x{BLOCK_K}"
-            ) and ttgir.count(f"ttg.local_alloc : () -> !ttg.memdesc<{NUM_STAGES}x{BLOCK_K}x{BLOCK_N}")
+                f"ttg.local_alloc : () -> !ttg.memdesc<{NUM_STAGES}x{BLOCK_M}x{BLOCK_K}") and ttgir.count(
+                    f"ttg.local_alloc : () -> !ttg.memdesc<{NUM_STAGES}x{BLOCK_K}x{BLOCK_N}")
 
         if load_pipelined and USE_2D_SCALE_LOAD:
             # If load is pipelined and tmem_copy is used,  MMA pipelining should also kick in
@@ -1018,9 +989,8 @@ def test_blocked_scale_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, USE_
             print(f"SWP failed for M = {M}, N = {N}")
 
 
-@pytest.mark.parametrize(
-    "BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 64), (128, 64, 128), (64, 128, 32), (128, 256, 32), (256, 64, 32)]
-)
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 64), (128, 64, 128), (64, 128, 32), (128, 256, 32),
+                                                       (256, 64, 32)])
 @pytest.mark.parametrize("a_trans", [False, True])
 @pytest.mark.parametrize("dtype_src_str", ["float32", "float16", "float8e5"])
 @pytest.mark.skipif(is_hip() or torch.cuda.get_device_capability()[0] != 10, reason="Requires compute capability == 10")
@@ -1216,9 +1186,8 @@ def block_scale_fp4_matmul(  #
             scale_b = tl.load(b_scale_ptr)
         else:
             scale_b = None
-        accumulator = tl.dot_scaled(
-            a, scale_a, "e2m1", b, scale_b, "e2m1", accumulator, lhs_k_pack=PACK_ALONG_K, rhs_k_pack=PACK_ALONG_K
-        )
+        accumulator = tl.dot_scaled(a, scale_a, "e2m1", b, scale_b, "e2m1", accumulator, lhs_k_pack=PACK_ALONG_K,
+                                    rhs_k_pack=PACK_ALONG_K)
         a_ptrs += (BLOCK_K_PACKED) * stride_ak
         b_ptrs += (BLOCK_K_PACKED) * stride_bk
         if a_scale is not None:
@@ -1240,13 +1209,11 @@ def block_scale_fp4_matmul(  #
 @pytest.mark.parametrize("with_a_scale", [True, False])
 @pytest.mark.parametrize("with_b_scale", [True, False])
 @pytest.mark.parametrize("pack_along_k", [True, False])
-@pytest.mark.parametrize(
-    ("scale_type", "VEC_SIZE"), [("float8_e8m0fnu", 32), ("float8_e4m3fn", 16)], ids=["mxfp4", "nvfp4"]
-)
+@pytest.mark.parametrize(("scale_type", "VEC_SIZE"), [("float8_e8m0fnu", 32), ("float8_e4m3fn", 16)],
+                         ids=["mxfp4", "nvfp4"])
 @pytest.mark.parametrize("nonKDim", ([0, 16, 32] if is_hip_cdna() else [0]))
-def test_block_scale_fp4(
-    M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, with_a_scale, with_b_scale, pack_along_k, scale_type, nonKDim, device
-):
+def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, with_a_scale, with_b_scale, pack_along_k,
+                         scale_type, nonKDim, device):
     assert M % BLOCK_M == 0
     assert N % BLOCK_N == 0
     assert K % BLOCK_K == 0
@@ -1472,9 +1439,8 @@ def test_mxfp8_mxfp4_matmul(
 
     torch.manual_seed(42)
 
-    def create_operand(
-        dtype: str, size0: int, size1: int, k_dim: int, transpose: bool = True, pack_along_k: bool = True
-    ):
+    def create_operand(dtype: str, size0: int, size1: int, k_dim: int, transpose: bool = True,
+                       pack_along_k: bool = True):
         if dtype == "float8e5":
             if transpose:
                 v = torch.randint(20, 40, (size0, size1), dtype=torch.uint8).view(torch.float8_e5m2).to(device)
