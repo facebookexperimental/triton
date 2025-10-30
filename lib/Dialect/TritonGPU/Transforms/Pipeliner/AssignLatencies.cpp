@@ -46,26 +46,24 @@ bool hasLatenciesAssigned(scf::ForOp forOp) {
   return false;
 }
 
-void assignUserProvidedLatencies(scf::ForOp forOp,
+// Return if we can take the user provided latencies into account and
+// derive the latencies for the rest of the operations. Currently we only
+// support this if the user provides latency=0 to all operations in the
+// loop.
+bool assignUserProvidedLatencies(scf::ForOp forOp,
                                  DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(forOp)->getLatencyAttrHelper();
+  bool canFuseWithCompiler = true;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (auto latencyAttr = helper.getAttr(&op)) {
-      opLatency[&op] = latencyAttr.getInt();
+      auto latencyValue = latencyAttr.getInt();
+      if (latencyValue != 0) {
+        canFuseWithCompiler = false;
+      }
+      opLatency[&op] = latencyValue;
     }
   }
-}
-
-// Check if we can support mixing user and compiler provided latencies.
-// Currently we only support these if the user provides latency=0 to an
-// operation.
-bool supportMixingUserAndCompilerLatencies(
-    DenseMap<Operation *, int> &opLatency) {
-  for (auto &pair : opLatency) {
-    if (pair.second != 0)
-      return false;
-  }
-  return true;
+  return canFuseWithCompiler;
 }
 
 class AssignLoadLatencies {
@@ -343,10 +341,10 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
   DenseMap<Operation *, int> opLatency;
   for (auto forOp : loops) {
     if (hasLatenciesAssigned(forOp)) {
-      assignUserProvidedLatencies(forOp, opLatency);
+      bool deriveLatencies = assignUserProvidedLatencies(forOp, opLatency);
       // FB Change: Support Latency analysis when users set
       // latency=0 for some operations.
-      if (!supportMixingUserAndCompilerLatencies(opLatency))
+      if (!deriveLatencies)
         continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
