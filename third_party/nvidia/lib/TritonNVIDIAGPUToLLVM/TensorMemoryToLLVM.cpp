@@ -6,6 +6,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Support/LogicalResult.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -880,23 +881,46 @@ createBlockedScalesSMEMDescriptor(ConversionPatternRewriter &rewriter,
 }
 
 static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
-                         Value barrier, Value pred) {
+                         Value barrier, Value pred, bool tlxTwoCTAs) {
   PTXBuilder ptxBuilder;
-  auto *barrierOperand = ptxBuilder.newAddrOperand(barrier, "r");
-  std::string opcode = "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64";
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  SmallVector<PTXBuilder::Operand *> ptxOperands;
+  auto *predOperand = ptxBuilder.newOperand(pred, "b");
+  ptxOperands.push_back(predOperand);
+  auto *barrierOperand = ptxBuilder.newOperand(barrier, "l");
+  ptxOperands.push_back(barrierOperand);
+  std::string opcode;
+  if (tlxTwoCTAs) {
+    // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
+    // be broadcasted into CTAid 0 and 1
+    auto *ctaMask = ptxBuilder.newOperand(b.int_val(16, 0x3), "h");
+    ptxOperands.push_back(ctaMask);
+    opcode = "@$0 "
+             "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
+             "cluster.multicast::cluster.b64 [$1], $2;";
+  } else {
+    opcode = "@$0 tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$1];";
+  }
   auto &barrierOp = *ptxBuilder.create<PTXInstr>(opcode);
-  barrierOp(barrierOperand).predicate(pred);
+  barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
   ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
 }
 
 static void createTcgen05Cp(ConversionPatternRewriter &rewriter, Location loc,
                             Value tmem_address, Value src_desc, Value pred,
-                            bool scales) {
+                            bool scales, bool useTwoCTAs) {
   PTXBuilder ptxBuilder;
   auto dst = ptxBuilder.newAddrOperand(tmem_address, "r");
   auto src = ptxBuilder.newOperand(src_desc, "l");
-  std::string opcode = scales ? "tcgen05.cp.cta_group::1.warpx4.32x128b"
-                              : "tcgen05.cp.cta_group::1.128x256b";
+  std::string opcode = "tcgen05.cp";
+  if (useTwoCTAs)
+    opcode += ".cta_group::2";
+  else
+    opcode += ".cta_group::1";
+  if (scales)
+    opcode += ".warpx4.32x128b";
+  else
+    opcode += ".128x256b";
   auto &op = *ptxBuilder.create<PTXInstr>(opcode);
   op({dst, src}).predicate(pred);
   ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
@@ -905,7 +929,7 @@ static void createTcgen05Cp(ConversionPatternRewriter &rewriter, Location loc,
 static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
                        const TypeConverter *typeConverter,
                        triton::nvidia_gpu::TMEMCopyOp op, Value src, Value dst,
-                       Value pred) {
+                       Value pred, bool useTwoCTAs) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MemDescType srcTy = op.getSrc().getType();
   MemDescType dstTy = op.getDst().getType();
@@ -943,7 +967,7 @@ static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
         auto smemAddr = b.gep(elemPtrTy, llvmElementTy, baseSrc, smemOffset);
         smemDesc = createBlockedScalesSMEMDescriptor(rewriter, loc, smemAddr);
         createTcgen05Cp(rewriter, loc, tmemAddr, smemDesc, pred,
-                        /*scales=*/true);
+                        /*scales=*/true, useTwoCTAs);
       }
     }
   };
@@ -995,7 +1019,7 @@ static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
 static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
                              const TypeConverter *typeConverter,
                              triton::nvidia_gpu::TMEMCopyOp op, Value src,
-                             Value dst, Value pred) {
+                             Value dst, Value pred, bool useTwoCTAs) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MemDescType srcTy = op.getSrc().getType();
   MemDescType dstTy = op.getDst().getType();
@@ -1031,7 +1055,7 @@ static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
         auto tmemAddr = b.add(b.ptrtoint(i32_ty, baseDst), colOffset);
         Value smemDesc = smemLoader.smemLoad(m, n, rewriter, loc);
         createTcgen05Cp(rewriter, loc, tmemAddr, smemDesc, pred,
-                        /*scales=*/false);
+                        /*scales=*/false, useTwoCTAs);
       }
     }
   };
@@ -1051,22 +1075,31 @@ struct TensorMemoryCopyOpConversion
 
     Location loc = op->getLoc();
     Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
+
+    bool tlxTwoCTAs = tlx::tlxEnablePairedMMA(op);
+    if (tlxTwoCTAs) {
+      // In 2cta mode, only one thread from the two CTAs should issue the
+      // inst:https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-issue-granularity
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      pred =
+          b.and_(pred, LLVM::NVIDIA::createLeaderCTAPredicate(loc, rewriter));
+    }
     if (isa<TensorMemoryScalesEncodingAttr>(
             op.getDst().getType().getEncoding())) {
       // Special case for copy of scales as they behave differently from other
       // copies. This can be unified once we fix the smem layout representation
       // of the source.
       copyScales(rewriter, loc, typeConverter, op, adaptor.getSrc(),
-                 adaptor.getDst(), pred);
+                 adaptor.getDst(), pred, tlxTwoCTAs);
     } else {
       copySharedToTmem(rewriter, loc, typeConverter, op, adaptor.getSrc(),
-                       adaptor.getDst(), pred);
+                       adaptor.getDst(), pred, tlxTwoCTAs);
     }
 
     if (op.getBarrier()) {
       auto barrier = LLVM::getSharedMemoryObjectFromStruct(
           op.getLoc(), adaptor.getBarrier(), i64_ty, rewriter);
-      createCommit(rewriter, loc, barrier.getBase(), pred);
+      createCommit(rewriter, loc, barrier.getBase(), pred, tlxTwoCTAs);
     }
 
     rewriter.eraseOp(op);

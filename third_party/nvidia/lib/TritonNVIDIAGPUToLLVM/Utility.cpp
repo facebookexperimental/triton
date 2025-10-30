@@ -137,6 +137,16 @@ Value createElectPredicateWarp0(Location loc, RewriterBase &rewriter) {
   return b.and_(warp0, createElectPredicate(loc, rewriter));
 }
 
+Value createLeaderCTAPredicate(Location loc, RewriterBase &rewriter) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
+      loc, rewriter.getI32Type());
+  // Always pick the even numbered CTA in the CTA pair to be the leader
+  Value rem =
+      rewriter.create<mlir::arith::RemUIOp>(loc, clusterCTARank, b.i32_val(2));
+  return b.icmp_eq(rem, b.i32_val(0));
+}
+
 LogicalResult lowerLdStMatrix(
     Location loc, LinearLayout cvt, bool transpose,
     SmallVector<Value> &vals, // Input for stmatrix, output for ldmatrix
