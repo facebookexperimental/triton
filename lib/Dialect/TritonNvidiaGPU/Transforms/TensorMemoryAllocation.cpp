@@ -389,6 +389,80 @@ allocateTMem(Operation *parentOp,
 
 } // anonymous namespace
 
+int allocateTMemWithInterval(
+    DenseMap<Operation *, Interval<int>> &allocToIntervals,
+    SmallVector<Operation *> &allocOrder) {
+  SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
+  RowIdConstraints rowIdConstraints;
+  for (auto *op : allocOrder) {
+    if (auto alloc = dyn_cast<triton::nvidia_gpu::TMEMAllocOp>(op)) {
+      allocs.push_back(alloc);
+    }
+    if (auto mmaOp = dyn_cast<MMAv5OpInterface>(op)) {
+      if (isa<TensorMemoryEncodingAttr>(mmaOp.getA().getType().getEncoding())) {
+        TMemAllocation allocSize = getTmemAllocSizes(mmaOp.getA().getType());
+        if (allocSize.numRows == 64) {
+          // HW restriction, the A alloc and accumulator needs to be in the same
+          // rows.
+          SmallVector<Operation *> lhsAllocs = getAlloc(mmaOp.getA());
+          SmallVector<Operation *> accAllocs = getAlloc(mmaOp.getAccumulator());
+          for (Operation *lhsAlloc : lhsAllocs)
+            for (Operation *accAlloc : accAllocs)
+              rowIdConstraints.joinOps(lhsAlloc, accAlloc);
+        } else {
+          // TODO: we need to handle cases where the format is blockM and we
+          // have multiple blocks.
+          assert((cast<TensorMemoryEncodingAttr>(
+                      mmaOp.getA().getType().getEncoding())
+                          .getBlockM() != 64 &&
+                  cast<TensorMemoryEncodingAttr>(
+                      mmaOp.getAccumulator().getType().getEncoding())
+                          .getBlockM() != 64) &&
+                 "interleaved layout with TMEM operand is not supported yet.");
+        }
+      }
+    }
+  }
+  int totalMemorySize = 0;
+  MemoryBitMap memoryMap;
+  std::multimap<int, TMemChunk> intervalLiverangeEnd;
+  DenseMap<TMEMAllocOp, TMemChunk> allocChunks;
+  // Implement a linear scan first fit algorithm. We expect that fragmentation
+  // won't be a problem, if it is this should be revisited.
+  for (auto *op : allocOrder) {
+    auto liveInterval = allocToIntervals[op];
+    auto alloc = cast<triton::nvidia_gpu::TMEMAllocOp>(op);
+    SmallVector<TMemChunk> coexistingChunks;
+    auto memDescType = alloc.getType();
+    TMemAllocation allocSize = getTmemAllocSizes(memDescType);
+    updateMap(memoryMap, liveInterval, intervalLiverangeEnd);
+
+    std::optional<int> rowIdConstraint =
+        rowIdConstraints.getRowIdConstraint(alloc);
+    // TODO: clarify the alignment requirements for different allocations. For
+    // now enforce an alignment of 4 columns.
+    const int columnAlignment = 4;
+    TMemChunk chunkAllocated =
+        allocFirstFit(memoryMap, allocSize, rowIdConstraint, coexistingChunks,
+                      columnAlignment);
+    allocChunks.insert({alloc, chunkAllocated});
+    // currently naively constraint allocs based on the first one we find.
+    rowIdConstraints.addConstraints(alloc, chunkAllocated.startRow);
+    intervalLiverangeEnd.insert({liveInterval.end(), chunkAllocated});
+    int colOffset = chunkAllocated.startCol;
+    int rowOffset = chunkAllocated.startRow * 16;
+
+    alloc->setAttr(
+        "tensor_memory_col_offset",
+        IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), colOffset));
+    alloc->setAttr(
+        "tensor_memory_row_offset",
+        IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), rowOffset));
+    totalMemorySize = std::max(totalMemorySize, colOffset + allocSize.numCols);
+  }
+  return totalMemorySize;
+}
+
 class TritonTensorMemoryAllocationPass
     : public impl::TritonTensorMemoryAllocationPassBase<
           TritonTensorMemoryAllocationPass> {

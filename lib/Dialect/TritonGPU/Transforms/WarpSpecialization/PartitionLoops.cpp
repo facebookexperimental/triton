@@ -240,8 +240,8 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
   cloneOpsInBlock(ifOp.thenBlock(), builders, schedule);
 
   if (auto elseBlock = ifOp.elseBlock()) {
-    for (auto [builder, newIfOp] : llvm::zip(builders, newIfOps)) {
-      builder.setInsertionPointToStart(newIfOp.elseBlock());
+    for (auto [idx, newIfOp] : llvm::zip(partitionIndices, newIfOps)) {
+      builders[idx].setInsertionPointToStart(newIfOp.elseBlock());
     }
     cloneOpsInBlock(elseBlock, builders, schedule);
   }

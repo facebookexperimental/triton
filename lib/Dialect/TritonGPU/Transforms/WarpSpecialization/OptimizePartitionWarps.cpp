@@ -199,8 +199,9 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     region->walk([minWarps = &minWarps](Operation *op) {
       // Some instructions have critical throughput if have low register usage.
       // Make sure there are enough warps for these ops to execute quickly.
-      if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp,
-              ttng::AsyncTMACopyGlobalToLocalOp>(op))
+      // TODO: Should we keep a minimum of 2 warps for
+      // AsyncTMACopyGlobalToLocalOp under certain conditions?
+      if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp>(op))
         *minWarps = 2;
       // TMEM ops require at least 4 warps to be able to read all lanes.
       else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
@@ -251,12 +252,24 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     }
   } while (changed);
 
+  // Read the attribute from the module
+  ModuleOp mod = axisInfo.getModuleOp();
+  int minRegAutoWS = 24; // default value
+  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
+    minRegAutoWS = attr.getInt();
+  }
+  int maxRegAutoWS = 168; // default value
+  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName)) {
+    maxRegAutoWS = attr.getInt();
+  }
+
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
        llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                  wsOp.getPartitionNumWarps(), maxTensorRegs, estRegUsage)) {
+
     // "Guess" the register usage for each partition.
-    estRegs = tensorRegs ? 88 : 24;
+    estRegs = tensorRegs ? maxRegAutoWS : minRegAutoWS;
 
     // Layouts need to be reassigned if the number of warps changed and there
     // are tensor computations.

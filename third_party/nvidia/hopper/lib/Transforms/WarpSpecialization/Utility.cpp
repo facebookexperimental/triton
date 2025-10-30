@@ -1,7 +1,10 @@
 #include "Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/ADT/SetVector.h"
 
+namespace tt = mlir::triton;
 namespace mlir {
 
 //===----------------------------------------------------------------------===//
@@ -18,6 +21,10 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
           asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
         asyncTaskIds.push_back(asyncTaskId);
     }
+  } else if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+    int64_t idx = attr.getInt();
+    if (idx >= 0)
+      asyncTaskIds.push_back(idx);
   }
   return asyncTaskIds;
 }
@@ -27,6 +34,8 @@ bool hasAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
 }
 
 void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
+  if (asyncTaskIds.empty())
+    return;
   SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
                                               asyncTaskIds.end());
   sort(sortedAsyncTaskIds);
@@ -81,4 +90,14 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
 
 void removeAsyncTaskIds(Operation *op) { op->removeAttr("async_task_id"); }
 
+void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp) {
+  // This assignment is optional because we may call this code
+  // from sections outside the innermost loop.
+  if (oldOp->hasAttr(tt::kLoopStageAttrName))
+    newOp->setAttr(tt::kLoopStageAttrName,
+                   oldOp->getAttr(tt::kLoopStageAttrName));
+  if (oldOp->hasAttr(tt::kLoopClusterAttrName))
+    newOp->setAttr(tt::kLoopClusterAttrName,
+                   oldOp->getAttr(tt::kLoopClusterAttrName));
+}
 } // namespace mlir
