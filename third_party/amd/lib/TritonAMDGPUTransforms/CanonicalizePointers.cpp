@@ -992,27 +992,6 @@ private:
       newOffset = createTruncIOffset(rewriter, curLoc, newOffset,
                                      rewriter.getI32Type());
     }
-<<<<<<< HEAD
-
-    // If the newOffset is not created in this function, chances are it could
-    // already be mapped to another value, say y. In that case, we need to
-    // use y instead of newOffset. Otherwise, consider the following sequence,
-    // this operation (op1) feeds its result to op2 as the operand0. When op2
-    // is visited, the framework will associate the op2.operand0, via
-    // OneToNOpAdaptor, with <fatPtrBase, y> instead of <fatPtrBase, newOffset>.
-    //
-    //   op1: r = this-addPtr ...
-    //   op2:   = op r, ...
-    //
-    // If we were using <fatPtrBase, newOffset> to set an entry in fatPtrs, we
-    // would not be able to lookup the entry when op2 is visited, as it will
-    // use index <fatPtrBase, y>.
-    if (auto remapped = rewriter.getRemappedValue(newOffset);
-        (remapped != nullptr) && (remapped != newOffset))
-      newOffset = remapped;
-
-=======
->>>>>>> 8a34c216a ([AMD] Accumulate into offset instead of pointer for jit specialized tensor (#7939))
     LDBG("   -- new offset: " << newOffset);
 
     rewriter.replaceOpWithMultiple(addPtrOp, {{fatPtrBase, newOffset}});
@@ -1725,15 +1704,7 @@ struct InitFuncPtrArgs : OpRewritePattern<tt::FuncOp> {
               newOp.getArgAttrOfType<IntegerAttr>(idx, "tt.pointer_range"))
         bitness = pointerRangeAttr.getInt();
 
-<<<<<<< HEAD
-      LDBG(idx << "-th argument: " << arg << ", bitness: " << bitness);
-      if (!enableLargeTensorPtrCanon && (bitness == 64)) {
-        LDBG("Do not init argument of large-tensor pointer: " << arg);
-        continue;
-      }
-=======
       LDBG(idx << "-th argument: " << arg << ", bitness: " << bitness << "\n");
->>>>>>> 8a34c216a ([AMD] Accumulate into offset instead of pointer for jit specialized tensor (#7939))
 
       Value zeroOffset =
           rewriter.create<arith::ConstantIntOp>(newOp.getLoc(), 0, bitness);
