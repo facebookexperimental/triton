@@ -38,47 +38,53 @@ namespace triton {
 
 //-- LoadOp --
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
-                   CacheModifier cache, EvictionPolicy evict, bool isVolatile) {
+                   CacheModifier cache, EvictionPolicy evict, bool isVolatile,
+                   std::optional<IntegerAttr> tt_latency) {
   LoadOp::build(builder, state, ptr, /*mask=*/{}, /*other=*/{},
                 /*boundaryCheck=*/ArrayRef<int32_t>{}, /*padding=*/std::nullopt,
-                cache, evict, isVolatile);
+                cache, evict, isVolatile, tt_latency);
 }
 
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                    ArrayRef<int32_t> boundaryCheck,
                    std::optional<PaddingOption> padding, CacheModifier cache,
-                   EvictionPolicy evict, bool isVolatile) {
+                   EvictionPolicy evict, bool isVolatile,
+                   std::optional<IntegerAttr> tt_latency) {
   LoadOp::build(builder, state, ptr, /*mask=*/{}, /*other=*/{}, boundaryCheck,
-                padding, cache, evict, isVolatile);
+                padding, cache, evict, isVolatile, tt_latency);
 }
 
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                    Value mask, CacheModifier cache, EvictionPolicy evict,
-                   bool isVolatile) {
+                   bool isVolatile, std::optional<IntegerAttr> tt_latency) {
   LoadOp::build(builder, state, ptr, mask, /*other=*/{},
                 /*boundaryCheck=*/ArrayRef<int32_t>{},
-                /*padding=*/std::nullopt, cache, evict, isVolatile);
+                /*padding=*/std::nullopt, cache, evict, isVolatile, tt_latency);
 }
 
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                    Value mask, Value other, CacheModifier cache,
-                   EvictionPolicy evict, bool isVolatile) {
+                   EvictionPolicy evict, bool isVolatile,
+                   std::optional<IntegerAttr> tt_latency) {
   LoadOp::build(builder, state, ptr, mask, other,
                 /*boundaryCheck=*/ArrayRef<int32_t>{},
-                /*padding=*/std::nullopt, cache, evict, isVolatile);
+                /*padding=*/std::nullopt, cache, evict, isVolatile, tt_latency);
 }
 
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                    Value mask, Value other, ArrayRef<int32_t> boundaryCheck,
                    std::optional<PaddingOption> padding, CacheModifier cache,
-                   EvictionPolicy evict, bool isVolatile) {
+                   EvictionPolicy evict, bool isVolatile,
+                   std::optional<IntegerAttr> tt_latency) {
   auto paddingAttr =
       padding.has_value()
           ? PaddingOptionAttr::get(builder.getContext(), padding.value())
           : PaddingOptionAttr();
+  auto latencyAttr =
+      tt_latency.has_value() ? tt_latency.value() : IntegerAttr();
   LoadOp::build(builder, state, ptr, mask, other,
                 builder.getDenseI32ArrayAttr(boundaryCheck), paddingAttr, cache,
-                evict, isVolatile);
+                evict, isVolatile, latencyAttr);
 }
 
 // load(ptr, splat(1), ...)        -> load(ptr, ...)
@@ -106,7 +112,8 @@ struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
       rewriter.replaceOpWithNewOp<LoadOp>(
           loadOp, loadOp.getType(), loadOp.getPtr(), Value(), Value(),
           loadOp.getBoundaryCheckAttr(), loadOp.getPaddingAttr(),
-          loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile());
+          loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile(),
+          loadOp.getTtLatencyAttr());
     } else {
       // mask = splat(0)
 
