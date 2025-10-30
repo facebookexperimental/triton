@@ -400,35 +400,6 @@ struct AsyncCLCQueryCancelOpConversion
     return success();
   }
 };
-
-struct NamedBarrierArriveOpConversion
-    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::NamedBarrierArriveOp> {
-  using ConvertOpToLLVMPattern<
-      triton::nvidia_gpu::NamedBarrierArriveOp>::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::NamedBarrierArriveOp op,
-                  OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<NVVM::BarrierArriveOp>(op, adaptor.getBar(),
-                                                       adaptor.getNumThreads());
-    return success();
-  }
-};
-
-struct NamedBarrierWaitOpConversion
-    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::NamedBarrierWaitOp> {
-  using ConvertOpToLLVMPattern<
-      triton::nvidia_gpu::NamedBarrierWaitOp>::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::NamedBarrierWaitOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<NVVM::BarrierOp>(op, adaptor.getBar(),
-                                                 adaptor.getNumThreads());
-    return success();
-  }
-};
 } // namespace
 
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(

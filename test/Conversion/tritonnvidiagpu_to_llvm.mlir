@@ -103,28 +103,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     ttng.async_clc_try_cancel %alloc, %clc_response : !ttg.memdesc<1xi64, #shared0, #smem, mutable>, !ttg.memdesc<1xui128, #shared0, #smem, mutable>
     tt.return
   }
-
-  // CHECK-LABEL: arrive_barrier_named
-  tt.func @arrive_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
-    %c9_i32 = arith.constant 9 : i32
-    %c256_i32 = arith.constant 256 : i32
-    // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
-    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
-    // CHECK-NEXT: nvvm.barrier.arrive id = [[BAR_ID]] number_of_threads = [[NUM_THRADS]]
-    ttng.arrive_barrier_named %c9_i32, %c256_i32 : i32, i32
-    tt.return
-  }
-
-  // CHECK-LABEL: wait_barrier_named
-  tt.func @wait_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
-    %c9_i32 = arith.constant 9 : i32
-    %c256_i32 = arith.constant 256 : i32
-    // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
-    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
-    // CHECK-NEXT: nvvm.barrier id = [[BAR_ID]] number_of_threads = [[NUM_THRADS]]
-    ttng.wait_barrier_named %c9_i32, %c256_i32 : i32, i32
-    tt.return
-  }
 }
 
 // -----
