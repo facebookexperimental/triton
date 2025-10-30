@@ -46,6 +46,11 @@ from ._core import (
     device_assert,
     expand_dims,
     full,
+<<<<<<< HEAD
+=======
+    gather,
+    histogram,
+>>>>>>> c7fd12001 ([GLUON] Integrate `gather` and its layout tests (#8018))
     inline_asm_elementwise,
     join,
     load,
