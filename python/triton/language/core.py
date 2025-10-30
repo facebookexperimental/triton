@@ -2064,7 +2064,7 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
 
 @builtin
 def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", cache_modifier="", eviction_policy="",
-         volatile=False, _semantic=None):
+         volatile=False, latency=None, _semantic=None):
     """
     Return a tensor of data whose values are loaded from memory at location defined by `pointer`:
 
