@@ -481,46 +481,6 @@ private:
     return depth;
   }
 
-  void buildInterferenceGraph(const SmallVector<BufferT *> &buffers,
-                              GraphT &interference) {
-    // Reset interference graph
-    interference.clear();
-    for (auto x : buffers) {
-      for (auto y : buffers) {
-        if (x == y)
-          continue;
-        auto xStart = x->offset;
-        auto yStart = y->offset;
-        auto xSize = x->size;
-        auto ySize = y->size;
-        Interval xSizeRange = {xStart, xStart + xSize};
-        Interval ySizeRange = {yStart, yStart + ySize};
-        auto xOpRange = bufferRange.lookup(x);
-        auto yOpRange = bufferRange.lookup(y);
-
-        // Buffers interfere if their allocation offsets overlap and they are
-        // live at the same time.
-        if (xOpRange.intersects(yOpRange) &&
-            xSizeRange.intersects(ySizeRange)) {
-          interference[x].insert(y);
-        }
-
-        // Buffers also interfere if their allocation offsets overlap and they
-        // exist within regions that may execute simultaneously with respect to
-        // each other.
-        auto wsx = x->owner->getParentWithTrait<OpTrait::AsyncRegions>();
-        auto wsy = y->owner->getParentWithTrait<OpTrait::AsyncRegions>();
-        if (wsx && wsy && wsx == wsy &&
-            x->owner->getParentRegion() != y->owner->getParentRegion() &&
-            xSizeRange.intersects(ySizeRange)) {
-          interference[x].insert(y);
-        }
-      }
-    }
-
-    // LLVM_DEBUG(dumpInterferenceGraph(interference));
-  }
-
 public:
   void run(unsigned bufferId) {
     Operation *parentOp = operation;
@@ -595,7 +555,6 @@ public:
         return iter1->second.numRows > iter2->second.numRows;
       assert(false);
     });
-    // Set up Vector<BufferT>, build interference graph.
     Allocation allocation;
     SmallVector<BufferT *> buffers;
     for (auto alloc : allocs) {
@@ -618,8 +577,6 @@ public:
       // bufferRange maps BufferT to interval
       bufferRange[buffer] = allocToIntervals[alloc];
     }
-    GraphT interference;
-    buildInterferenceGraph(buffers, interference);
     // For each innermost loop according to program order (via
     // getIntervalForCtrlOp)
     //   Go through all buffers that are live in the loop
