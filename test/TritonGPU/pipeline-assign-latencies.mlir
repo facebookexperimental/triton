@@ -386,7 +386,7 @@ tt.func @annotated_zero(%lb : index, %ub : index, %step : index,
 
   %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
     // CHECK: tt.load {{.*}} {tt.latency = 0 : i32}
-    %a_ = tt.load %a_ptr : tensor<128x32x!tt.ptr<f16>, #AL> {tt.latency = 0 : i32}
+    %a_ = tt.load %a_ptr {tt.latency = 0 : i32} : tensor<128x32x!tt.ptr<f16>, #AL>
     %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
     // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
     %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<f16>, #BL>
@@ -413,7 +413,7 @@ tt.func @annotated_one(%lb : index, %ub : index, %step : index,
 
   %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
     // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
-    %a_ = tt.load %a_ptr : tensor<128x32x!tt.ptr<f16>, #AL>
+    %a_ = tt.load %a_ptr {tt.latency = 1 : i32} : tensor<128x32x!tt.ptr<f16>, #AL>
     %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
     // CHECK: tt.load
     // CHECK-NOT: {tt.latency = .*}
