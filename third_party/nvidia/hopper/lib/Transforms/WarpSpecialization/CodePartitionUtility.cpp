@@ -56,7 +56,8 @@ Operation *ChannelPost::getSrcOp() {
 }
 
 static void getAllConsumers(ChannelPost *ch,
-                            SmallVector<Operation *> &consumers) {
+                            SmallVector<Operation *> &consumers,
+                            bool sameBlock = true) {
   for (auto usr : ch->allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -69,12 +70,49 @@ static void getAllConsumers(ChannelPost *ch,
   auto taskIds = getAsyncTaskIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
     auto taskIds2 = getAsyncTaskIds(consumers[i]);
-    assert(taskIds == taskIds2 &&
-           consumers[i]->getBlock() == consumers[0]->getBlock());
+    assert(taskIds == taskIds2);
+    if (sameBlock)
+      assert(consumers[i]->getBlock() == consumers[0]->getBlock());
   }
 }
 
-static bool appearsBefore(Operation *A, Operation *B) {
+// Return an op that encloses both a and b
+static Operation *getCommonScope(Operation *a, Operation *b) {
+  DenseSet<Operation *> parentScopes;
+  Operation *op = a;
+  while (!isa<triton::FuncOp>(op)) {
+    parentScopes.insert(op);
+    op = op->getParentOp();
+  }
+  op = b;
+  while (!isa<triton::FuncOp>(op)) {
+    if (parentScopes.count(op))
+      return op;
+    op = op->getParentOp();
+  }
+  return nullptr;
+}
+
+// Return the lifted "op" that is directly under scope.
+static Operation *getLiftedOp(Operation *op, Operation *scope) {
+  if (op == scope)
+    return op;
+  Operation *liftedUser = nullptr;
+  while (!isa<triton::FuncOp>(op)) {
+    if (op->getParentOp() == scope) {
+      return op;
+    }
+    op = op->getParentOp();
+  }
+  return nullptr;
+}
+
+bool appearsBefore(Operation *A, Operation *B) {
+  // A and B can be from different blocks.
+  if (A->getBlock() != B->getBlock()) {
+    auto *outScope = getCommonScope(A, B);
+    return appearsBefore(getLiftedOp(A, outScope), getLiftedOp(B, outScope));
+  }
   assert(A->getBlock() == B->getBlock());
   auto block = A->getBlock();
   for (auto &op : block->getOperations()) {
@@ -94,7 +132,7 @@ static bool appearsBefore(Operation *A, Operation *B) {
 // a representative consumer in the channel.
 Operation *ChannelPost::getDstOp() {
   SmallVector<Operation *> consumers;
-  getAllConsumers(this, consumers);
+  getAllConsumers(this, consumers, false);
   if (consumers.size() == 1)
     return consumers[0];
   assert(consumers.size() != 0);
@@ -121,7 +159,7 @@ Operation *ChannelPost::getDstOpLast() {
 }
 
 void ChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
-  getAllConsumers(this, dsts);
+  getAllConsumers(this, dsts, false);
 }
 
 static bool isTmemProducer(Operation *allocOp, Operation *user) {
@@ -830,7 +868,8 @@ Operation *getSameLevelOp(Operation *p, Operation *c) {
     }
     op = op->getParentOp();
   }
-  llvm_unreachable("Failed to find consumer's same level Op with producer");
+  return nullptr;
+  // llvm_unreachable("Failed to find consumer's same level Op with producer");
 };
 
 // When the consumer is a local_alloc loading from shared memory to registers,
