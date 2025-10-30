@@ -376,6 +376,7 @@ tt.func @intermediate_use_cust_stages(%lb : index, %ub : index, %step : index,
 
 // Check that when you annotate 0 as the latency on a load that all other
 // latency is unchanged.
+
 // CHECK-LABEL: @annotated_zero
 tt.func @annotated_zero(%lb : index, %ub : index, %step : index,
                   %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = 16 : i32, tt.contiguity = 32 : i32},
@@ -403,6 +404,7 @@ tt.func @annotated_zero(%lb : index, %ub : index, %step : index,
 
 // Check that when you annotate 1 as the latency on a load that no compiler
 // derived latency is computed.
+
 // CHECK-LABEL: @annotated_one
 tt.func @annotated_one(%lb : index, %ub : index, %step : index,
                   %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = 16 : i32, tt.contiguity = 32 : i32},
