@@ -1364,8 +1364,12 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &ptrs, CacheModifier cacheModifier,
               EvictionPolicy evictionPolicy, bool isVolatile,
               std::optional<int> latency) -> Value {
+             IntegerAttr latencyAttr = nullptr;
+             if (latency.has_value())
+               latencyAttr =
+                   self.getBuilder().getI32IntegerAttr(latency.value());
              return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
-                                        isVolatile);
+                                        isVolatile, latencyAttr);
            })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,
@@ -1379,9 +1383,13 @@ void init_triton_ir(py::module &&m) {
               std::optional<PaddingOption> paddingOption,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
               bool isVolatile, std::optional<int> latency) -> Value {
+             IntegerAttr latencyAttr = nullptr;
+             if (latency.has_value())
+               latencyAttr =
+                   self.getBuilder().getI32IntegerAttr(latency.value());
              return self.create<LoadOp>(ptr, boundaryCheck, paddingOption,
                                         cacheModifier, evictionPolicy,
-                                        isVolatile);
+                                        isVolatile, latencyAttr);
            })
       .def("create_tensor_pointer_store",
            [](TritonOpBuilder &self, Value &ptr, Value &val,
@@ -1395,9 +1403,13 @@ void init_triton_ir(py::module &&m) {
               std::optional<Value> &other, CacheModifier cacheModifier,
               EvictionPolicy evictionPolicy, bool isVolatile,
               std::optional<int> latency) -> Value {
+             IntegerAttr latencyAttr = nullptr;
+             if (latency.has_value())
+               latencyAttr =
+                   self.getBuilder().getI32IntegerAttr(latency.value());
              return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
                                         cacheModifier, evictionPolicy,
-                                        isVolatile);
+                                        isVolatile, latencyAttr);
            })
       .def("create_masked_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &val, Value &mask,

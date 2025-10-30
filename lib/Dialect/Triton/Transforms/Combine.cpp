@@ -103,7 +103,8 @@ public:
     rewriter.replaceOpWithNewOp<LoadOp>(
         op, loadOp.getPtr(), loadOp.getMask(), /*other=*/falseValue,
         loadOp.getBoundaryCheckAttr(), loadOp.getPaddingAttr(),
-        loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile());
+        loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile(),
+        loadOp.getTtLatencyAttr());
     return success();
   }
 };

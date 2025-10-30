@@ -262,7 +262,7 @@ struct RewriteLoadPattern : OpConversionPattern<triton::DescriptorLoadOp> {
         op, generatePtr(rewriter, loc, blockShape, desc, offsets),
         generateMask(rewriter, loc, blockShape, desc, offsets),
         generateOther(rewriter, loc, descTy), triton::CacheModifier::NONE,
-        triton::EvictionPolicy::NORMAL, false);
+        triton::EvictionPolicy::NORMAL, false, op.getTtLatencyAttr());
     newLoad->setAttrs(filterSegmentSizes(op->getAttrs()));
 
     return llvm::success();
@@ -329,7 +329,7 @@ struct RewriteGatherPattern : OpConversionPattern<triton::DescriptorGatherOp> {
                                blockShape);
     auto newLoad = rewriter.replaceOpWithNewOp<triton::LoadOp>(
         op, ptr, mask, other, triton::CacheModifier::NONE,
-        triton::EvictionPolicy::NORMAL, false);
+        triton::EvictionPolicy::NORMAL, false, std::nullopt);
     newLoad->setAttrs(filterSegmentSizes(op->getAttrs()));
 
     return llvm::success();
