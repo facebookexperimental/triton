@@ -64,14 +64,15 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     key=["M", "N", "K"],
 )
 @triton.jit
-def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
-                                              BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-                                              GROUP_SIZE_M: tl.constexpr,  #
-                                              NUM_SMEM_BUFFERS: tl.constexpr,  #
-                                              NUM_TMEM_BUFFERS: tl.constexpr,  #
-                                              NUM_SMS: tl.constexpr,  #
-                                              EPILOGUE_SUBTILE: tl.constexpr,  #
-                                              ):
+def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
+                                       BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
+                                       GROUP_SIZE_M: tl.constexpr,  #
+                                       NUM_SMEM_BUFFERS: tl.constexpr,  #
+                                       NUM_TMEM_BUFFERS: tl.constexpr,  #
+                                       NUM_SMS: tl.constexpr,  #
+                                       NUM_CLC_STAGES: tl.constexpr,  #
+                                       EPILOGUE_SUBTILE: tl.constexpr,  #
+                                       ):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
     buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
@@ -84,6 +85,8 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
+    clc_context = tlx.clc_create_context(NUM_CLC_STAGES, 3)
+
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
             # common code duplicated for each region to avoid SMEM overhead
@@ -91,14 +94,27 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            num_tiles = num_pid_m * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
 
             tmem_read_phase = 0
             cur_tmem_buf = 0
 
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+            tile_id = start_pid
+
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            clc_buf = 0
+            while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
+                # Debug prints
+                # if tlx.thread_id(axis=0) == 0:
+                # tl.device_print("Default WG Processing CtaID", tile_id)
+                # producer
+                tlx.clc_producer(clc_context, clc_buf, clc_phase_producer)
+                # clc_phase_producer ^= 1
+                clc_phase_producer = clc_phase_producer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -131,13 +147,21 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase_consumer)
+                # clc_phase_consumer ^= 1
+                clc_phase_consumer = clc_phase_consumer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
+
+                # Debug-only: verifying that CLC steals workloads successfully
+                # if tlx.thread_id(axis=0) == 0:
+                # tl.device_print("Extracted CtaID", tile_id)
+
         with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
             # common code duplicated for each region to avoid SMEM overhead
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            num_tiles = num_pid_m * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
 
@@ -146,7 +170,11 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
             cur_tmem_buf = 0
 
             processed_k_iters = 0
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+            tile_id = start_pid
+            clc_phase = 0
+            clc_buf = 0
+            while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -163,14 +191,8 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bars[buf], dot_phase)
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(
-                        buffers_A[buf],
-                        buffers_B[buf],
-                        tmem_buffers[cur_tmem_buf],
-                        use_acc=k > 0,
-                        mBarriers=[smem_empty_bars[buf]],
-                        out_dtype=tl.float32,
-                    )
+                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,
+                                  mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
@@ -186,6 +208,10 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                # clc_phase ^= 1
+                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
             # common code duplicated for each region to avoid SMEM overhead
@@ -193,7 +219,6 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
             num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            num_tiles = num_pid_m * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
 
@@ -202,7 +227,11 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
             # one big list of data
             processed_k_iters = 0
 
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+            tile_id = start_pid
+            clc_phase = 0
+            clc_buf = 0
+            while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -221,6 +250,10 @@ def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, B
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                # clc_phase ^= 1
+                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
 
 
 def matmul(a, b):
@@ -241,15 +274,15 @@ def matmul(a, b):
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     # Persistent kernel to have thread block resident in SM as long as possible
-    grid = lambda META: (min(
-        NUM_SMS,
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    ), )
-    matmul_kernel_tma_ws_blackwell_persistent[grid](
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+    matmul_kernel_tma_ws_blackwell_clc[grid](
         a_desc, b_desc, c_desc,  #
         M, N, K,  #
         NUM_SMS=NUM_SMS,  #
+        NUM_CLC_STAGES=1,  #
+        # launch_cluster=True,
     )
+
     return c
 
 
@@ -280,8 +313,8 @@ ref_lib = "cuBLAS"
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=[ref_lib.lower(), "triton_persistent"],  # Label name for the lines
-        line_names=[ref_lib, "Triton (persisent)"],  # Line styles
+        line_vals=[ref_lib.lower(), "triton_clc"],  # Label name for the lines
+        line_names=[ref_lib, "Triton (CLC)"],  # Line styles
         styles=[("green", "-"), ("blue", "-")],
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
@@ -294,8 +327,9 @@ def benchmark(M, N, K, provider):
     if provider == ref_lib.lower():
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
                                                      rep=2000)
-    if provider == "triton_persistent":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, False), quantiles=quantiles, warmup=2000,
+
+    if provider == "triton_clc":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, True), quantiles=quantiles, warmup=2000,
                                                      rep=2000)
 
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
