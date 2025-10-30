@@ -46,14 +46,24 @@ bool hasLatenciesAssigned(scf::ForOp forOp) {
   return false;
 }
 
-void assignUserProvidedLatencies(scf::ForOp forOp,
+// Return if we can take the user provided latencies into account and
+// derive the latencies for the rest of the operations. Currently we only
+// support this if the user provides latency=0 to all operations in the
+// loop.
+bool assignUserProvidedLatencies(scf::ForOp forOp,
                                  DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(forOp)->getLatencyAttrHelper();
+  bool canFuseWithCompiler = true;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (auto latencyAttr = helper.getAttr(&op)) {
-      opLatency[&op] = latencyAttr.getInt();
+      auto latencyValue = latencyAttr.getInt();
+      if (latencyValue != 0) {
+        canFuseWithCompiler = false;
+      }
+      opLatency[&op] = latencyValue;
     }
   }
+  return canFuseWithCompiler;
 }
 
 class AssignLoadLatencies {
@@ -173,6 +183,10 @@ private:
                   op)) {
             if (!isPipeliningBeneficial(op, finalUser, axisInfoAnalysis))
               return;
+            // FB Change: Skip the load if the user provided latency is 0.
+            // TODO: Support user provided non-zero latency for loads.
+            if (opLatency.count(op))
+              return;
             if (loadOpToIndLevel.count(op)) {
               int level = loadOpToIndLevel[op];
               if (level != distance) {
@@ -264,24 +278,28 @@ public:
              !ttng::hasLoadsAfterMMA(mma, forOp))) {
           // MMA can be overlapped with itself
           mmaSelfLatency[mma] = 1;
-          if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
-              (ttng::isAccMultibufferingPossible(mma, forOp) &&
-               !getDisallowAccMultiBuffer(forOp))) {
-            // MMA's users can be pushed to the next stage
-            opLatency[&op] = 1;
-          }
-          // HACK: A pipelined MMA's latency should equal the number of buffers
-          // for the accumulator, but when the user is in an `scf.if` in SWP,
-          // the `scf.if` is pushed to the end of the loop rather than peeled
-          // before the MMA op, requiring an extra buffer due to liverange
-          // overlap. WS does not have this problem because the MMA is placed in
-          // a different partition than the MMA, so we can correctly set the
-          // latency.
-          if (forOp->hasAttr(kWarpSpecializeAttrName)) {
-            if (ttng::hasAccReadModifyWrite(mma, forOp))
-              opLatency.erase(&op); // can't pipeline the MMA
-            else
-              opLatency[&op] += 1;
+          // Only update the MMA latency if it wasn't set to 0 by the user.
+          // TODO: Support values other than 0.
+          if (!opLatency.count(&op)) {
+            if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
+                (ttng::isAccMultibufferingPossible(mma, forOp) &&
+                 !getDisallowAccMultiBuffer(forOp))) {
+              // MMA's users can be pushed to the next stage
+              opLatency[&op] = 1;
+            }
+            // HACK: A pipelined MMA's latency should equal the number of
+            // buffers for the accumulator, but when the user is in an `scf.if`
+            // in SWP, the `scf.if` is pushed to the end of the loop rather than
+            // peeled before the MMA op, requiring an extra buffer due to
+            // liverange overlap. WS does not have this problem because the MMA
+            // is placed in a different partition than the MMA, so we can
+            // correctly set the latency.
+            if (forOp->hasAttr(kWarpSpecializeAttrName)) {
+              if (ttng::hasAccReadModifyWrite(mma, forOp))
+                opLatency.erase(&op); // can't pipeline the MMA
+              else
+                opLatency[&op] += 1;
+            }
           }
         }
       }
@@ -323,8 +341,11 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
   DenseMap<Operation *, int> opLatency;
   for (auto forOp : loops) {
     if (hasLatenciesAssigned(forOp)) {
-      assignUserProvidedLatencies(forOp, opLatency);
-      continue;
+      bool deriveLatencies = assignUserProvidedLatencies(forOp, opLatency);
+      // FB Change: Support Latency analysis when users set
+      // latency=0 for some operations.
+      if (!deriveLatencies)
+        continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
     AssignLoadLatencies(forOp, numStages, opLatency).run();
