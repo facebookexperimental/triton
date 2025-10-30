@@ -29,6 +29,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir::triton::gpu;
 
@@ -261,6 +262,72 @@ static void printToken(OpAsmPrinter &p, Operation *op, Value dep, Type token) {
   p << ']';
 }
 
+<<<<<<< HEAD
+=======
+namespace {
+enum class MMADTypeKind { tf32, f16, f8f6f4, i8 };
+} // namespace
+
+static std::string strMMADTypeKind(MMADTypeKind kind) {
+  switch (kind) {
+  case MMADTypeKind::tf32:
+    return "tf32";
+  case MMADTypeKind::f16:
+    return "f16";
+  case MMADTypeKind::f8f6f4:
+    return "f8f6f4";
+  case MMADTypeKind::i8:
+    return "i8";
+  }
+  llvm_unreachable("unknown mma dtype kind");
+}
+
+static std::optional<std::pair<MMADTypeKind, SmallVector<Type>>>
+getMMAv5DTypeKindAndAcc(Type t) {
+  MLIRContext *ctx = t.getContext();
+  if (t.isF32()) {
+    return {{MMADTypeKind::tf32, {Float32Type::get(ctx)}}};
+  }
+  if (t.isF16() || t.isBF16()) {
+    return {
+        {MMADTypeKind::f16, {Float16Type::get(ctx), Float32Type::get(ctx)}}};
+  }
+  // TODO: float6 and explicit float4 types are not supported yet.
+  // TODO: tcgen05.mma supports ui8/si8 -> s32 MMA, but Triton does not.
+  // FIXME: i8 is used to represent float4 types.
+  if (isa<Float8E4M3FNType, Float8E5M2Type>(t) || t.isInteger(8)) {
+    return {
+        {MMADTypeKind::f8f6f4, {Float16Type::get(ctx), Float32Type::get(ctx)}}};
+  }
+  return std::nullopt;
+}
+
+static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
+  auto akind = getMMAv5DTypeKindAndAcc(a);
+  auto bkind = getMMAv5DTypeKindAndAcc(b);
+  if (!akind)
+    return op->emitOpError("unsupported LHS operand dtype: ") << a;
+  if (!bkind)
+    return op->emitOpError("unsupported RHS operand dtype: ") << b;
+  if (akind->first != bkind->first) {
+    return op->emitOpError(
+               "LHS and RHS operand dtypes kinds don't match: LHS kind is ")
+           << strMMADTypeKind(akind->first) << " but RHS kind is "
+           << strMMADTypeKind(bkind->first);
+  }
+  if (!llvm::is_contained(akind->second, d)) {
+    InFlightDiagnostic diag =
+        op->emitOpError("unsupported accumulator dtype for operand kind ")
+        << strMMADTypeKind(akind->first) << ", accumulator dtype is " << d
+        << " but must be one of [";
+    llvm::interleaveComma(akind->second, diag, [&](Type t) { diag << t; });
+    diag << "]";
+    return diag;
+  }
+  return success();
+}
+
+>>>>>>> 084d620d8 ([Triton][Gluon] Run the inliner after scf-to-cf (#8017))
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
