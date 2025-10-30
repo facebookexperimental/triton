@@ -56,6 +56,18 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
   }
 }
 
+// Check if we can support mixing user and compiler provided latencies.
+// Currently we only support these if the user provides latency=0 to an
+// operation.
+bool supportMixingUserAndCompilerLatencies(
+    DenseMap<Operation *, int> &opLatency) {
+  for (auto &pair : opLatency) {
+    if (pair.second != 0)
+      return false;
+  }
+  return true;
+}
+
 class AssignLoadLatencies {
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
@@ -173,6 +185,10 @@ private:
                   op)) {
             if (!isPipeliningBeneficial(op, finalUser, axisInfoAnalysis))
               return;
+            // FB Change: Skip the load if the user provided latency is 0.
+            // TODO: Support user provided non-zero latency for loads.
+            if (opLatency.count(op))
+              return;
             if (loadOpToIndLevel.count(op)) {
               int level = loadOpToIndLevel[op];
               if (level != distance) {
@@ -264,24 +280,28 @@ public:
              !ttng::hasLoadsAfterMMA(mma, forOp))) {
           // MMA can be overlapped with itself
           mmaSelfLatency[mma] = 1;
-          if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
-              (ttng::isAccMultibufferingPossible(mma, forOp) &&
-               !getDisallowAccMultiBuffer(forOp))) {
-            // MMA's users can be pushed to the next stage
-            opLatency[&op] = 1;
-          }
-          // HACK: A pipelined MMA's latency should equal the number of buffers
-          // for the accumulator, but when the user is in an `scf.if` in SWP,
-          // the `scf.if` is pushed to the end of the loop rather than peeled
-          // before the MMA op, requiring an extra buffer due to liverange
-          // overlap. WS does not have this problem because the MMA is placed in
-          // a different partition than the MMA, so we can correctly set the
-          // latency.
-          if (forOp->hasAttr(kWarpSpecializeAttrName)) {
-            if (ttng::hasAccReadModifyWrite(mma, forOp))
-              opLatency.erase(&op); // can't pipeline the MMA
-            else
-              opLatency[&op] += 1;
+          // Only update the MMA latency if it wasn't set to 0 by the user.
+          // TODO: Support values other than 0.
+          if (!opLatency.count(&op)) {
+            if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
+                (ttng::isAccMultibufferingPossible(mma, forOp) &&
+                 !getDisallowAccMultiBuffer(forOp))) {
+              // MMA's users can be pushed to the next stage
+              opLatency[&op] = 1;
+            }
+            // HACK: A pipelined MMA's latency should equal the number of
+            // buffers for the accumulator, but when the user is in an `scf.if`
+            // in SWP, the `scf.if` is pushed to the end of the loop rather than
+            // peeled before the MMA op, requiring an extra buffer due to
+            // liverange overlap. WS does not have this problem because the MMA
+            // is placed in a different partition than the MMA, so we can
+            // correctly set the latency.
+            if (forOp->hasAttr(kWarpSpecializeAttrName)) {
+              if (ttng::hasAccReadModifyWrite(mma, forOp))
+                opLatency.erase(&op); // can't pipeline the MMA
+              else
+                opLatency[&op] += 1;
+            }
           }
         }
       }
@@ -324,7 +344,10 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
   for (auto forOp : loops) {
     if (hasLatenciesAssigned(forOp)) {
       assignUserProvidedLatencies(forOp, opLatency);
-      continue;
+      // FB Change: Support Latency analysis when users set
+      // latency=0 for some operations.
+      if (!supportMixingUserAndCompilerLatencies(opLatency))
+        continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
     AssignLoadLatencies(forOp, numStages, opLatency).run();
