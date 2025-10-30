@@ -20,6 +20,10 @@ void lowerLoops(ModuleOp moduleOp);
 
 bool hasGpuBarriers(scf::ForOp forOp);
 bool isSafeToPipeline(scf::ForOp forOp);
+// Do any preprocessing on the loop information for a given module.
+void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder);
+// TODO: Remove me and move to pass structure.
+void scheduleLoops(ModuleOp moduleOp, int defaultNumStages);
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
@@ -155,7 +159,7 @@ public:
   auto begin() const { return opToStageAndCluster.begin(); }
 
   // Set <stage, cluster> based on CoarseSchedule.
-  void serialize(scf::ForOp &forOp) const;
+  void serialize(scf::ForOp &forOp, bool keepExistingMaxStage = true) const;
   // Create a CoarseSchedule based on forOp's <stage, cluster>.
   LogicalResult deSerialize(scf::ForOp &forOp);
 
