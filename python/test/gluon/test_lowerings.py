@@ -240,8 +240,6 @@ _1d_layouts = _filter_layouts([
 ])
 
 
-<<<<<<< HEAD
-=======
 @pytest.mark.parametrize("M, bins", [[2048, 2], [8, 512], [32, 32]])
 @pytest.mark.parametrize("src_layout", [ttgl.BlockedLayout([1], [THREADS_PER_WARP], [4], [0]), "linear_layout"])
 @pytest.mark.parametrize("dst_layout", [ttgl.BlockedLayout([1], [THREADS_PER_WARP], [4], [0])])
@@ -276,7 +274,6 @@ def test_histogram(M, bins, src_layout, dst_layout, device):
     torch.testing.assert_close(z, z_torch, atol=0, rtol=0)
 
 
->>>>>>> 078954b83 (Fix histograms for complex replicated layouts (#7938))
 @pytest.mark.parametrize("M", [64, 128, 256])
 @pytest.mark.parametrize("src_layout", _1d_layouts)
 @pytest.mark.parametrize("dst_layout", _1d_layouts)
