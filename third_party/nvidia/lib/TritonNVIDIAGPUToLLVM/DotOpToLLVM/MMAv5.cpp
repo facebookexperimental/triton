@@ -3,6 +3,7 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "Utility.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 
 using namespace mlir;
@@ -707,8 +708,12 @@ struct TCGen5CommitOpConversion
     if (adaptor.getPred())
       pred = b.and_(adaptor.getPred(), pred);
 
-    createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred,
-                    op.getTwoCtas());
+    bool twoCTAs = op.getTwoCtas();
+    if (tlx::isTLXTwoCTAMode(op)) {
+      twoCTAs = true;
+    }
+
+    createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred, twoCTAs);
     rewriter.eraseOp(op);
     return success();
   }

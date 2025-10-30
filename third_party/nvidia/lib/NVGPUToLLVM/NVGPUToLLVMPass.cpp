@@ -9,6 +9,8 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
+#include "tlx/dialect/include/IR/Dialect.h"
+
 #include "llvm/Support/ErrorHandling.h"
 
 namespace ttn = mlir::triton::nvgpu;
@@ -694,7 +696,13 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
     return rewriter.create<LLVM::UndefOp>(loc, ptr_ty(ctx, 6));
   }
 
-  int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  int numCTAs;
+  if (tlx::isTLXTwoCTAMode(mod)) {
+    // TLX attr takes precedence
+    numCTAs = 2;
+  } else {
+    numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  }
   // Assume that 2CTAs is used if we have two CTAs this is pessimistic but
   // should be fine for now.
   bool useTwoCTAs = numCTAs == 2;

@@ -24,6 +24,8 @@ constexpr static char AttrHasExplicitLocalMemAccessName[] =
 constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
 constexpr static char AttrHasWarpSpecOpsName[] = "tlx.has_warp_spec_ops";
 constexpr static char AttrIsTLXTwoCTAModeName[] = "tlx.is_tlx_two_cta_mode";
+
+bool isTLXTwoCTAMode(Operation *op);
 } // namespace tlx
 } // namespace triton
 } // namespace mlir

@@ -137,6 +137,17 @@ Value createElectPredicateWarp0(Location loc, RewriterBase &rewriter) {
   return b.and_(warp0, createElectPredicate(loc, rewriter));
 }
 
+Value createLeaderCTAPredicated(Location loc, RewriterBase &rewriter) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  // todo: is it best practice to create ttng/arith Ops here?
+  Value clusterCTARank =
+      rewriter.create<triton::nvidia_gpu::GetClusterCTARankOp>(
+          loc, rewriter.getI32Type());
+  Value rem =
+      rewriter.create<mlir::arith::RemUIOp>(loc, clusterCTARank, b.i32_val(2));
+  return b.icmp_eq(rem, b.i32_val(0));
+}
+
 LogicalResult lowerLdStMatrix(
     Location loc, LinearLayout cvt, bool transpose,
     SmallVector<Value> &vals, // Input for stmatrix, output for ldmatrix
