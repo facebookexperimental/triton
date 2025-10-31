@@ -1533,7 +1533,7 @@ class TritonSemantic(Generic[TensorTy]):
     #   assert lhs.type.is_block() and rhs.type.is_block()
 
     def dot_precheck(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
-                     max_num_imprecise_acc: int, out_dtype: tl.dtype) -> Tuple[Any]:
+                     max_num_imprecise_acc: int, out_dtype: tl.dtype, two_ctas: bool = False) -> Tuple[Any]:
         input_precision = tl._unwrap_if_constexpr(input_precision)
         allow_tf32 = tl._unwrap_if_constexpr(allow_tf32)
         assert input_precision is None or tl._unwrap_if_constexpr(
@@ -1620,7 +1620,10 @@ class TritonSemantic(Generic[TensorTy]):
             ret_scalar_ty = out_dtype
 
         M = lhs.type.shape[-2]
-        N = rhs.type.shape[-1]
+        if two_ctas:
+            N = 2 * rhs.type.shape[-1]  # rhs is actually [K, N/2] in two_ctas mode so we scale it back
+        else:
+            N = rhs.type.shape[-1]
         K = lhs.type.shape[-1]
         B = lhs.type.shape[0] if lhs_rank == 3 else None
         ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])

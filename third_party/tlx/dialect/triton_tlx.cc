@@ -372,16 +372,17 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_tcgen5_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &d, std::optional<Value> useD,
-              std::optional<Value> pred, std::vector<Value> mBarriers) -> void {
+              std::optional<Value> pred, bool twoCTAs,
+              std::vector<Value> mBarriers) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
              self.create<ttng::TCGen5MMAOp>(
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred */,
-                 false /* two_ctas*/, ValueRange(mBarriers),
-                 ValueRange(barrierPreds), !mBarriers.empty() /* is_async */);
+                 pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
+                 ValueRange(mBarriers), ValueRange(barrierPreds),
+                 !mBarriers.empty() /* is_async */);
            })
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier) -> void {
