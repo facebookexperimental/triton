@@ -1,10 +1,10 @@
+from typing import Optional
+
 import pytest
 import torch
-
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from typing import Optional
 from triton._internal_testing import is_cuda, is_hip_cdna2
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -46,7 +46,11 @@ def matmul_tma_set_block_size_hook(nargs):
                 "NUM_MMA_WARPS": 8,
                 "NUM_MMA_GROUPS": 2,
                 "EPILOGUE_SUBTILE": True,
-            }, num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+            },
+            num_stages=1,
+            num_warps=4,
+            pre_hook=matmul_tma_set_block_size_hook,
+        ),
         triton.Config(
             {
                 "BM": 128,
@@ -57,38 +61,55 @@ def matmul_tma_set_block_size_hook(nargs):
                 "NUM_MMA_WARPS": 8,
                 "NUM_MMA_GROUPS": 2,
                 "EPILOGUE_SUBTILE": False,
-            }, num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
+            },
+            num_stages=1,
+            num_warps=4,
+            pre_hook=matmul_tma_set_block_size_hook,
+        ),
     ],
     key=["M", "N", "K"],
     use_cuda_graph=True,
 )
 @triton.jit
-def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
-                         M, N, K,  #
-                         BM: tl.constexpr,  #
-                         BN: tl.constexpr,  #
-                         BK: tl.constexpr,  #
-                         GROUP_SIZE_M: tl.constexpr,  #
-                         NUM_STAGES: tl.constexpr,  #
-                         NUM_MMA_WARPS: tl.constexpr,  #
-                         NUM_MMA_GROUPS: tl.constexpr,  #
-                         EPILOGUE_SUBTILE: tl.constexpr,  #
-                         ):
+def matmul_kernel_tlx_ws(
+    a_desc,
+    b_desc,
+    c_desc,  #
+    M,
+    N,
+    K,  #
+    BM: tl.constexpr,  #
+    BN: tl.constexpr,  #
+    BK: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
+    NUM_STAGES: tl.constexpr,  #
+    NUM_MMA_WARPS: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,  #
+):
     # Descriptor
     BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
 
     # Need NUM_STAGES sets of SMEM buffers for A and B
     # where each set contains two for A and one for B.
     # Split A into two in M-dimension to have two consumer tasks for wgmma
-    a = tlx.local_alloc((BLOCK_M_SPLIT, BK), tlx.dtype_of(a_desc), NUM_STAGES * NUM_MMA_GROUPS)
+    a = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BK), tlx.dtype_of(a_desc), NUM_STAGES * NUM_MMA_GROUPS
+    )
     b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
 
     # Need NUM_STAGES sets of mbarriers for A and B
     # where each set contains two for A and one for B.
     # Do the above for both empty states and full states respectively.
-    bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
-    bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
-    bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS)
+    bars_empty_a = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1
+    )
+    bars_full_a = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1
+    )
+    bars_empty_b = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS
+    )
     bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
 
     # Warp specilization
@@ -116,28 +137,35 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 offset_k = k * BK
 
                 # Async load to a[buf]
-                empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
-                full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
+                empty_a_1st = bars_empty_a[buf]  # mbar
+                full_a_1st = bars_full_a[buf]  # mbar
                 tlx.barrier_wait(bar=empty_a_1st, phase=p)  # EmptyBar A1 wait
                 tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * 2)
-                data_a_1st = tlx.local_view(a, buf)  # smem data
-                tlx.async_descriptor_load(a_desc, data_a_1st, [offset_am, offset_k], full_a_1st)
+                data_a_1st = a[buf]  # smem data
+                tlx.async_descriptor_load(
+                    a_desc, data_a_1st, [offset_am, offset_k], full_a_1st
+                )
 
                 # Async load to b[buf]
-                empty_b = tlx.local_view(bars_empty_b, buf)
-                full_b = tlx.local_view(bars_full_b, buf)
+                empty_b = bars_empty_b[buf]
+                full_b = bars_full_b[buf]
                 tlx.barrier_wait(bar=empty_b, phase=p)
                 tlx.barrier_expect_bytes(full_b, BN * BK * 2)
-                data_b = tlx.local_view(b, buf)
+                data_b = b[buf]
                 tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full_b)
 
                 # Async load to a[buf+NUM_STAGES]
-                empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
-                full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
+                empty_a_2nd = bars_empty_a[buf + NUM_STAGES]
+                full_a_2nd = bars_full_a[buf + NUM_STAGES]
                 tlx.barrier_wait(bar=empty_a_2nd, phase=p)
                 tlx.barrier_expect_bytes(bar=full_a_2nd, size=BLOCK_M_SPLIT * BK * 2)
-                data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)  # smem data
-                tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
+                data_a_2nd = a[buf + NUM_STAGES]  # smem data
+                tlx.async_descriptor_load(
+                    a_desc,
+                    data_a_2nd,
+                    [offset_am + BLOCK_M_SPLIT, offset_k],
+                    full_a_2nd,
+                )
 
                 # Flip phase after every NUM_STAGES iterations finish
                 p = p ^ (buf == (NUM_STAGES - 1))
@@ -164,14 +192,14 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 buf = k % NUM_STAGES
 
                 # Wait for TMA load
-                full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
-                full_b = tlx.local_view(bars_full_b, buf)
+                full_a = bars_full_a[buf + NUM_STAGES * tlx.async_task_replica_id()]  # noqa
+                full_b = bars_full_b[buf]
                 tlx.barrier_wait(bar=full_a, phase=p)
                 tlx.barrier_wait(bar=full_b, phase=p)
 
                 # async_dot
-                data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
-                data_b = tlx.local_view(b, buf)
+                data_a = a[buf + NUM_STAGES * tlx.async_task_replica_id()]  # noqa
+                data_b = b[buf]
                 acc = tlx.async_dot(
                     data_a,
                     data_b,
@@ -181,8 +209,8 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 acc = tlx.async_dot_wait(tl.constexpr(0), acc)
 
                 # Release buffers
-                empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
-                empty_b = tlx.local_view(bars_empty_b, buf)
+                empty_a = bars_empty_a[buf + NUM_STAGES * tlx.async_task_replica_id()]  # noqa
+                empty_b = bars_empty_b[buf]
                 tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
                 tlx.barrier_arrive(empty_b)
 
@@ -239,10 +267,15 @@ def matmul(
     )
 
     grid = lambda META: (  # noqa E731
-        triton.cdiv(M, META['BM']) * triton.cdiv(N, META['BN']), )
+        triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"]),
+    )
     matmul_kernel_tlx_ws[grid](
-        desc_in_1, desc_in_2, desc_out,  #
-        M, N, K,  #
+        desc_in_1,
+        desc_in_2,
+        desc_out,  #
+        M,
+        N,
+        K,  #
     )
     return c
 
@@ -271,7 +304,7 @@ def test_op():
 
 TORCH_HAS_FP8 = False
 
-ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
+ref_lib = "cuBLAS" if is_cuda() else "rocBLAS"
 
 # Benchmarking
 configs = []
@@ -281,18 +314,25 @@ for fp8_inputs in [False, True]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-            x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
+            x_vals=[
+                128 * i for i in range(2, 33)
+            ],  # Different possible values for `x_name`
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-            line_vals=["triton"] if fp8_inputs else [ref_lib.lower(), "triton"],  # Label name for the lines
+            line_vals=["triton"]
+            if fp8_inputs
+            else [ref_lib.lower(), "triton"],  # Label name for the lines
             line_names=["Triton"] if fp8_inputs else [ref_lib, "Triton"],  # Line styles
             styles=[("green", "-"), ("blue", "-")],
             ylabel="TFLOPS",  # Label name for the y-axis
-            plot_name="matmul-performance-" +
-            ("fp16" if not fp8_inputs else "fp8"),  # Name for the plot, used also as a file name for saving the plot.
+            plot_name="matmul-performance-"
+            + (
+                "fp16" if not fp8_inputs else "fp8"
+            ),  # Name for the plot, used also as a file name for saving the plot.
             args={"fp8_inputs": fp8_inputs},
-        ))
+        )
+    )
 
 
 @triton.testing.perf_report(configs)
@@ -305,9 +345,13 @@ def benchmark(M, N, K, provider, fp8_inputs):
         b = b.to(torch.float8_e5m2)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: torch.matmul(a, b), quantiles=quantiles
+        )
+    if provider == "triton":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: matmul(a, b), quantiles=quantiles
+        )
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
