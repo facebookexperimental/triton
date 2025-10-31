@@ -276,7 +276,7 @@ void init_triton_tlx_ir(py::module &&m) {
 
              auto singleBarrierMemDescType = ttg::MemDescType::get(
                  {1}, self.getBuilder().getI64Type(), barrierEncoding,
-                 memorySpace, /*mutableMemory=*/true);
+                 barriersMemDescType.getMemorySpace(), /*mutableMemory=*/true);
 
              // Allocate buffer in shared memory
              mlir::Value bufferViews =
@@ -439,6 +439,8 @@ void init_triton_tlx_ir(py::module &&m) {
                memorySpace = ttng::TensorMemorySpaceAttr::get(context);
              else if (storage == "smem") {
                memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             } else if (storage == "smemCluster") {
+               memorySpace = ttng::SharedClusterMemorySpaceAttr::get(context);
              } else {
                llvm_unreachable("Unknown storage type");
              }

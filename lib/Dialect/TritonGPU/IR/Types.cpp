@@ -147,10 +147,11 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
                          << ll.getOutDimSize(dims[1]);
     }
   } else if (auto enc = dyn_cast<SharedEncodingTrait>(encoding)) {
-    if (memorySpace != SharedMemorySpaceAttr::get(ctx)) {
-      return emitError()
-             << "memorySpace must be SharedMemorySpace for shared encoding. "
-             << "Got " << memorySpace;
+    if (memorySpace != SharedMemorySpaceAttr::get(ctx) &&
+        memorySpace != nvidia_gpu::SharedClusterMemorySpaceAttr::get(ctx)) {
+      return emitError() << "memorySpace must be SharedMemorySpace or "
+                            "SharedClusterMemorySpace for shared encoding. "
+                         << "Got " << memorySpace;
     }
   } else if (auto enc = dyn_cast<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
                  encoding)) {

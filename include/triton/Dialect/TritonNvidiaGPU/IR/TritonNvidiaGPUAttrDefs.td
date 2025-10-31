@@ -5,6 +5,14 @@ include "mlir/IR/AttrTypeBase.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 
+def TTG_SharedClusterMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "SharedClusterMemorySpace"> {
+  let mnemonic = "shared_cluster_memory";
+  let description = [{
+    Attribute to indicate that the memory descriptor points to shared memory. The shared memory could reside in
+    any CTA within a CTA cluster.
+  }];
+}
+
 def TTG_TensorMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"> {
   let mnemonic = "tensor_memory";
   let description = [{

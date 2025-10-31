@@ -595,6 +595,11 @@ int TargetInfo::getAddressSpace(Attribute addressSpace) const {
   if (isa<triton::gpu::SharedMemorySpaceAttr,
           triton::nvidia_gpu::TensorMemorySpaceAttr>(addressSpace)) {
     spaceId = 3;
+  } else if (isa<triton::nvidia_gpu::SharedClusterMemorySpaceAttr>(
+                 addressSpace)) {
+    // NVPTX backend defines 7 for Shared Cluster memory space:
+    // https://llvm.org/docs/NVPTXUsage.html#address-spaces
+    spaceId = 7;
   } else {
     llvm::report_fatal_error(
         "Only support SharedMemorySpace, TensorMemorySpace for now");

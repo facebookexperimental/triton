@@ -3,6 +3,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace mlir {
 
@@ -27,7 +28,10 @@ LogicalResult SharedMemoryAliasAnalysis::visitOperation(
   auto result = op->getResult(0);
   // skip ops that return memdesc in a different memory space.
   if (auto memdescTy = dyn_cast<triton::gpu::MemDescType>(result.getType())) {
-    if (!isa_and_nonnull<triton::gpu::SharedMemorySpaceAttr>(
+    // CTA Cluster level SMEM should go through the analysis too, so not
+    // skipping here
+    if (!isa_and_nonnull<triton::gpu::SharedMemorySpaceAttr,
+                         triton::nvidia_gpu::SharedClusterMemorySpaceAttr>(
             memdescTy.getMemorySpace()))
       return success();
   }
