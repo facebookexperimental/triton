@@ -1684,12 +1684,15 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     ):
         tile_id = tl.program_id(axis=0)
 
+        # CLC Init
         clc_phase_producer = 1
         clc_phase_consumer = 0
+        # NUM_CLC_STAGES=1
+        # NUM_CONSUMERS=1
         clc_context = tlx.clc_create_context(1, 1)
 
         while tile_id != -1:
-            # producer
+            # CLC producer
             tlx.clc_producer(clc_context, 0, clc_phase_producer)
             clc_phase_producer ^= 1
 
@@ -1703,6 +1706,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
             output = x * y
             tl.store(z_ptr + offsets, output, mask=mask)
 
+            # CLC consumer
             tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
             clc_phase_consumer ^= 1
 
