@@ -1010,6 +1010,225 @@ def test_async_dot_blackwell_not_use_d(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_blackwell_2cta_tma(device):
+    """
+    Test 2cta collective D = A*B for 1 tile.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
+                                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                                  OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+        # difference from 1cta
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        pred_cta0 = cluster_cta_rank == 0
+        cta_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)  # CTA0 waits for signals from both CTAs
+
+        desc_a = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+
+        desc_b = tl.make_tensor_descriptor(b_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
+                                           block_shape=[BLOCK_K, BLOCK_N // 2],  # difference from 1cta
+                                           )
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float16, tl.constexpr(1))  # difference from 1cta
+        a_smem = tlx.local_view(buf_alloc_a, 0)
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+
+        bars = tlx.alloc_barriers(tl.constexpr(2))
+        bar_a = tlx.local_view(bars, 0)
+        bar_b = tlx.local_view(bars, 1)
+        tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K * 2)  # fp16
+        tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 2)  # difference from 1cta
+
+        # difference from 1cta: size and offsets
+        tlx.async_descriptor_load(desc_a, a_smem, [cluster_cta_rank * BLOCK_M, 0], bar_a)
+        tlx.async_descriptor_load(desc_b, b_smem, [0, cluster_cta_rank * BLOCK_N // 2], bar_b)
+
+        tlx.barrier_wait(bar_a, tl.constexpr(0))
+        tlx.barrier_wait(bar_b, tl.constexpr(0))
+
+        # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
+        cta_bar = tlx.remote_view(cta_bars[0], 0)
+        tlx.barrier_arrive(cta_bar, 1)
+        tlx.barrier_wait(cta_bar, phase=0, pred=pred_cta0)
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(buffers, 0)
+
+        # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
+        tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
+
+        result = tlx.local_load(acc_tmem)
+
+        c = result.to(tl.float16)
+        offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    triton.set_allocator(alloc_fn)
+    torch.manual_seed(0)
+    M, N, K = (256, 128, 128)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    BLOCK_M = M // 2
+    BLOCK_N = N
+    BLOCK_K = K
+    kern_kwargs = {
+        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K
+    }
+    kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
+                                                                     y.stride(1), z, z.stride(0), z.stride(1),
+                                                                     **kern_kwargs)
+
+    # verify kernel launch cluster
+    assert kernel.metadata.cluster_dims == (
+        2, 1, 1), f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}"
+    assert kernel.metadata.num_ctas == 1, f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}"
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("ttng.map_to_remote_buffer") == 1
+
+    ptx = kernel.asm["ptx"]
+    assert ptx.count("barrier.cluster.arrive.aligned") == 2  # one for remote bar init, one for tmem dealloc
+    assert ptx.count("barrier.cluster.wait.aligned") == 2  # one for remote bar init, one for tmem dealloc
+    assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
+    assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
+
+    ref_out = torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_blackwell_2cta_tma_ws(device):
+    """
+    Test 2cta collective D = A*B for 1 tile.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def tcgen5_dot_kernel2cta_tma_ws(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm,
+                                     stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                                     OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+        # difference from 1cta
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        pred_cta0 = cluster_cta_rank == 0
+        cta_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)  # CTA0 waits for signals from both CTAs
+
+        desc_a = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+
+        desc_b = tl.make_tensor_descriptor(b_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
+                                           block_shape=[BLOCK_K, BLOCK_N // 2],  # difference from 1cta
+                                           )
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float16, tl.constexpr(1))  # difference from 1cta
+        a_smem = tlx.local_view(buf_alloc_a, 0)
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+
+        smem_full_bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        tmem_full_bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(buffers, 0)
+
+        with tlx.async_tasks():
+            with tlx.async_task("default"):  # epilogue consumer
+                tlx.barrier_wait(tmem_full_bars[0], phase=0)
+
+                result = tlx.local_load(acc_tmem)
+                c = result.to(tl.float16)
+                offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
+                offs_n = tl.arange(0, BLOCK_N)
+                c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+                tl.store(c_ptrs, c)
+            with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
+                tlx.barrier_wait(smem_full_bars[0], phase=0)
+
+                # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
+                cta_bar = tlx.remote_view(cta_bars[0], 0)
+                tlx.barrier_arrive(cta_bar, 1)
+                tlx.barrier_wait(cta_bar, phase=0, pred=pred_cta0)
+
+                # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
+                tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
+
+                tlx.barrier_arrive(tmem_full_bars[0], 1)
+            with tlx.async_task(num_warps=1, num_regs=232):  # producer
+                # difference from 1cta: size
+                tlx.barrier_expect_bytes(smem_full_bars[0],
+                                         BLOCK_M * BLOCK_K * 2 + BLOCK_K * (BLOCK_N // 2) * 2)  # fp16
+                # difference from 1cta: size and offsets
+                tlx.async_descriptor_load(desc_a, a_smem, [cluster_cta_rank * BLOCK_M, 0], smem_full_bars[0])
+                tlx.async_descriptor_load(desc_b, b_smem, [0, cluster_cta_rank * BLOCK_N // 2], smem_full_bars[0])
+
+    triton.set_allocator(alloc_fn)
+    torch.manual_seed(0)
+    M, N, K = (256, 128, 128)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    BLOCK_M = M // 2
+    BLOCK_N = N
+    BLOCK_K = K
+    kern_kwargs = {
+        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K
+    }
+    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
+                                                                        y.stride(1), z, z.stride(0), z.stride(1),
+                                                                        **kern_kwargs)
+
+    # verify kernel launch cluster
+    assert kernel.metadata.cluster_dims == (
+        2, 1, 1), f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}"
+    assert kernel.metadata.num_ctas == 1, f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}"
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("ttng.map_to_remote_buffer") == 1
+
+    ptx = kernel.asm["ptx"]
+    # two for trunk remote bar init: one for default wg, one for non default
+    # two for tmem dealloc (two returns)
+    assert ptx.count("barrier.cluster.arrive.aligned") == 4
+    # one for trunk remote bar init: non default WGs just arrive anyway, then it's equivalent to a sync between
+    #   default WGs in all CTAs
+    # two for tmem dealloc (two returns)
+    assert ptx.count("barrier.cluster.wait.aligned") == 3
+    assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
+    assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
+
+    ref_out = torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_tcgen05_commit(device):
     """
     Test tcgen05.commit tracking multiple tcgen05 ops

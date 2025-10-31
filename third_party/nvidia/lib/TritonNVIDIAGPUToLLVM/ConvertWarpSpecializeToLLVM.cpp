@@ -9,6 +9,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -232,6 +233,25 @@ static LogicalResult rewriteWarpGroupBarriers(LLVM::LLVMFuncOp func,
   return success();
 }
 
+// If necessary, create a block for cluster sync before jumping to target block
+// returns the intermediate block created, or the targetBlock if no new block
+Block *maybeCreateClusterSyncBlock(LLVM::LLVMFuncOp func, Block *targetBlock) {
+  if (tlx::tlxEnablePairedMMA(func)) {
+    auto ctx = func.getContext();
+    TritonLLVMIRRewriter b(func.getLoc(), ctx);
+    auto unitAttr = UnitAttr::get(ctx);
+
+    Block *clusterSyncBlock = b.createBlock(targetBlock);
+    b.setInsertionPointToStart(clusterSyncBlock);
+    b.create<NVVM::ClusterArriveOp>(unitAttr);
+    // no need for all warps to do cluster wait, non default warps will wait for
+    // default warps to be done with trunk code to start execution
+    b.create<LLVM::BrOp>(targetBlock);
+    return clusterSyncBlock;
+  }
+  return targetBlock;
+}
+
 static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
                                     const NVIDIA::TargetInfo &targetInfo,
                                     int lowRegs) {
@@ -364,6 +384,11 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
       func.getArguments(), [](BlockArgument arg) { return arg.getLoc(); }));
   Block *header = b.createBlock(entry, func.getArgumentTypes(), argLocs);
   Block *switchLoop = b.createBlock(entry);
+
+  // insert cluster sync for non-default warp before jumping to switchloop, and
+  // before any CTA level sync
+  Block *maybeClusterSyncBlock = maybeCreateClusterSyncBlock(func, switchLoop);
+
   b.setInsertionPointToStart(header);
 
   // This is the absolute thread ID.
@@ -372,7 +397,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
-  b.create<LLVM::CondBrOp>(isDefault, entry, switchLoop);
+  b.create<LLVM::CondBrOp>(isDefault, entry, maybeClusterSyncBlock);
 
   // Forward arguments from the header into the old entry block.
   for (auto [arg, oldArg] :
@@ -567,6 +592,27 @@ struct ConvertWarpSpecializeToLLVM
     for (LLVM::LLVMFuncOp kernel : kernels)
       if (failed(lowerWarpSpecialize(kernel, targetInfo)))
         return signalPassFailure();
+
+    // insert cluster sync right before every return op after ws lowering to
+    // make sure all warps execute it
+    if (tlx::tlxEnablePairedMMA(mod)) {
+      for (LLVM::LLVMFuncOp kernel : kernels) {
+        kernel.walk([&](LLVM::ReturnOp ret) {
+          auto ctx = ret->getContext();
+          auto loc = ret.getLoc();
+          IRRewriter rewriter(kernel.getContext());
+
+          // for 2cta, this is needed
+          // "When the current CTA issues the operation, the peer CTA should be
+          // active and should not have exited." todo: find a better way to
+          // implement this
+          auto unitAttr = UnitAttr::get(ctx);
+          rewriter.setInsertionPoint(ret);
+          rewriter.create<NVVM::ClusterArriveOp>(loc, unitAttr);
+          rewriter.create<NVVM::ClusterWaitOp>(loc, unitAttr);
+        });
+      }
+    }
   }
 };
 } // namespace
