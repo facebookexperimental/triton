@@ -321,7 +321,15 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod)
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+
+        is_tlx_two_cta_mode = mod.get_bool_attr("tlx.is_tlx_two_cta_mode") or False
+        metadata["is_tlx_two_cta_mode"] = is_tlx_two_cta_mode
+        if is_tlx_two_cta_mode:
+            assert cluster_info.clusterDimX == 1 and cluster_info.clusterDimY == 1 and cluster_info.clusterDimZ == 1, \
+                f"Unexpected cluster dims before TLX override:({cluster_info.clusterDimX}, {cluster_info.clusterDimY}, {cluster_info.clusterDimZ})"
+            metadata["cluster_dims"] = (2, 1, 1)
+        else:
+            metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod

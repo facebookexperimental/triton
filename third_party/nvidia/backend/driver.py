@@ -698,14 +698,18 @@ class CudaLauncher(object):
         )
         has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
 
-        self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
+        self.is_tlx_two_cta_mode = metadata.is_tlx_two_cta_mode
+        if self.is_tlx_two_cta_mode:
+            self.num_ctas = 1
+        else:
+            self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
         self.launch = wrap_handle_tensordesc(mod.launch, tensordesc_meta) if has_tensor_desc_arg else mod.launch
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
         self.profile_scratch_align = metadata.profile_scratch_align
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
-        self.launch_cluster = metadata.launch_cluster
+        self.launch_cluster = metadata.launch_cluster or self.is_tlx_two_cta_mode
         self.launch_pdl = metadata.launch_pdl
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):
