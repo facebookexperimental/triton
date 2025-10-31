@@ -1033,6 +1033,7 @@ class CodeGenerator(ast.NodeVisitor):
     def _verify_loop_carried_variable(self, name, loop_val, live_val):
         assert _is_triton_value(loop_val), f'cannot reassign constexpr {name} in the loop'
         assert _is_triton_value(live_val), f'cannot reassign constexpr {name} in the loop'
+<<<<<<< HEAD
         assert type(loop_val) is type(live_val), f'Loop carried variable {name} changed type'
         # Facebook begin:
         # if tl.constexpr: skip to avoid false alarm such as \
@@ -1040,6 +1041,11 @@ class CodeGenerator(ast.NodeVisitor):
         # if tl.tensor or buffered_tensor(tl.base_value): assert type persists
         if not _is_constexpr(loop_val) and hasattr(loop_val, 'type'):
             assert loop_val.type == live_val.type, \
+=======
+        assert type(loop_val) is type(live_val), (
+            f'Loop carried variable {name} changed type, was {type(loop_val)} but is now {type(live_val)}')
+        assert not _is_triton_tensor(loop_val) or loop_val.type == live_val.type, \
+>>>>>>> 6bc2a2d57 ([Frontend][Gluon] Misc error message improvements (#8001))
             f'Loop-carried variable {name} has initial type {live_val.type} '\
             f'but is re-assigned to {loop_val.type} in loop! '\
             f'Please make sure that the type stays consistent.'
