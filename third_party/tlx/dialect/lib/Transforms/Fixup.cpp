@@ -10,6 +10,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include <mlir/Analysis/SliceAnalysis.h>
+
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
@@ -90,6 +92,63 @@ public:
     return success();
   }
 
+  LogicalResult insertClusterSync(ModuleOp &mod) {
+    SetVector<Operation *> barAllocOps;
+    // Find all bar alloc op in the back slice of mapa ops
+    mod.walk([&](ttng::MapToRemoteBufferOp mapaOp) {
+      SetVector<Operation *> ops;
+      if (failed(getBackwardSlice(mapaOp.getOperation(), &ops))) {
+        llvm_unreachable("Failed to find bar alloc for MapToRemoteBufferOp");
+      }
+      for (auto op : ops) {
+        if (isa<ttg::LocalAllocOp>(op)) {
+          barAllocOps.insert(op);
+        }
+      }
+    });
+
+    // Find all the bar init op from the alloc ops who had a mapa usage later
+    SetVector<Operation *> barInitOps;
+    for (auto barAllocOp : barAllocOps) {
+      SetVector<Operation *> ops;
+      getForwardSlice(barAllocOp, &ops);
+      for (auto op : ops) {
+        if (isa<ttng::InitBarrierOp>(op)) {
+          barInitOps.insert(op);
+        }
+      }
+    }
+
+    if (barInitOps.empty()) {
+      return success();
+    }
+
+    // follow the program order and identify the last bar init op, assuming
+    // all bar init happens at the first block of the proram for simplicity
+    // TODO: add a module level check to make sure the assumption is true
+    mod.walk<WalkOrder::PreOrder>([&](ttng::InitBarrierOp initBarOp) {
+      if (barInitOps.size() <= 1) {
+        return WalkResult::interrupt();
+      }
+      barInitOps.remove(initBarOp);
+      return WalkResult::advance();
+    });
+
+    assert(barInitOps.size() == 1 &&
+           "expecting only 1 bar init op left for cluster sync op insertion");
+    auto lastBarInitOp = cast<ttng::InitBarrierOp>(barInitOps.back());
+    OpBuilder builder(lastBarInitOp);
+    builder.setInsertionPointAfter(lastBarInitOp);
+    // need to insert cluster arrive and wait to prevent CTA_X from arriving
+    // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
+    builder.create<ttng::ClusterArriveOp>(lastBarInitOp.getLoc(),
+                                          /*relaxed*/ false);
+    builder.create<ttng::ClusterWaitOp>(lastBarInitOp.getLoc());
+
+    return success();
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     if (failed(verifyModule(mod))) {
@@ -97,6 +156,10 @@ public:
     }
 
     if (failed(insertInvalBarrier(mod))) {
+      return signalPassFailure();
+    }
+
+    if (failed(insertClusterSync(mod))) {
       return signalPassFailure();
     }
 
