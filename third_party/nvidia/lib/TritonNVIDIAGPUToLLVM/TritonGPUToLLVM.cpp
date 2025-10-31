@@ -21,6 +21,7 @@
 
 #include "Allocation.h"
 #include "PatternTritonGPUOpToLLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 
@@ -190,7 +191,7 @@ struct ConvertTritonGPUToLLVM
 
     // Fold CTAId when there is only 1 CTA.
     int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
-    if (numCTAs == 1) {
+    if (numCTAs == 1 && !tlx::isTLXTwoCTAMode(mod)) {
       mod.walk([](triton::nvgpu::ClusterCTAIdOp id) {
         OpBuilder b(id);
         Value zero = LLVM::createConstantI32(id->getLoc(), b, 0);

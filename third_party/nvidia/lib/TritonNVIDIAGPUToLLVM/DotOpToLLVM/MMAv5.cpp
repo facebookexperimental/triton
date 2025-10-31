@@ -383,8 +383,12 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   if (twoCTAs) {
     // TODO: we have to sync the two CTAs because we currently don't use remove
     // barriers for the copies.
-    rewriter.create<ttng::ClusterArriveOp>(loc, false);
-    rewriter.create<ttng::ClusterWaitOp>(loc);
+    // rewriter.create<ttng::ClusterArriveOp>(loc, false);
+    // rewriter.create<ttng::ClusterWaitOp>(loc);
+    // Facebook: we comment out the above two Cluster Ops because as of now it
+    // almost guarantees a hang in TLX Warp Spec cases - only MMA warps would
+    // execute ClusterArriveOp but ClusterWaitOp expects all threads in the
+    // cluster
 
     Value clusterId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
     Value cluster0 = tb.icmp_eq(clusterId, tb.i32_val(0));
