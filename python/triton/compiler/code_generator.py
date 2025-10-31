@@ -1604,5 +1604,14 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
     generator.visit(fn.parse())
     ret = generator.module
     # module takes ownership of the context
+<<<<<<< HEAD
     ret.context = context
     return ret
+=======
+    module.context = context
+    if not module.verify():
+        if not fn.is_gluon():
+            print(module)
+        raise RuntimeError("error encountered during parsing")
+    return module
+>>>>>>> c52137f0b ([Frontend] Always verify with diagnostics (#8074))
