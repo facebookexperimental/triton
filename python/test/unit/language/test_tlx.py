@@ -1661,7 +1661,7 @@ def test_async_dots_blackwell_tmem(device):
 
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = tcgen5_fa_kernel[(1, 1)](a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c, c.stride(0),
-                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=1)
+                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=4)
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.tmem_alloc") == 2
