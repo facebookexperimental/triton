@@ -20,6 +20,7 @@ def parse_profile(profile_path, useful_op_regex):
     construct a PerfRecord from a (proton) profile path and a regex for useful operations
     """
     from triton.profiler import viewer
+
     gf, _, _, _ = viewer.read(profile_path)
     # aggregate "useful" flops + bytes
     useful = gf.filter(f"MATCH ('*', c) WHERE c.'name' =~ '{useful_op_regex}' AND c IS LEAF").dataframe
@@ -43,9 +44,8 @@ def write_csv(xs, perfs, fpath):
             writer.writerow([x, p.flops, p.bytes, p.time_ns])
     return csv_path
 
-def compute_roofline(*args, \
-                  bench_fn, intensity_proxy_name, intensity_proxy_values, out_path, verbose, \
-                  **kwargs):
+
+def compute_roofline(*args, bench_fn, intensity_proxy_name, intensity_proxy_values, out_path, verbose, **kwargs):
     # validate input args
     if not isinstance(intensity_proxy_name, str):
         raise TypeError("intensity_proxy must be a string naming a parameter in target_fn")
@@ -66,7 +66,7 @@ def compute_roofline(*args, \
     perfs = []
     if verbose:
         print("=========================================")
-        print(f"{out_path   }...")
+        print(f"{out_path}...")
         print("=========================================")
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
@@ -148,6 +148,7 @@ def validate_perfs(perfs):
 def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="", xlabel="", labels=None):
     from bisect import bisect_left
     from pathlib import Path
+
     perfs = [load_perf_csv(p) for p in series]
     validate_perfs(perfs)
     xs, flops_ref, bytes_ref, _ = perfs[0]
@@ -157,8 +158,6 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
     if not isinstance(max_tflops, int):
         assert max_tflops == "cublas"
         max_tflops = get_cublas_tflops(flops_dtype)
-<<<<<<< HEAD:python/triton_kernels/bench/roofline.py
-=======
 
     grey = "#7f7f7f"
     opints = [f / b for f, b in zip(flops_ref, bytes_ref)]  # arithmetic intensity per sample
@@ -211,7 +210,6 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
         series_labels.append(labels[idx] if labels and idx < len(labels) else Path(pth).stem)
 
     # --- draw ---
->>>>>>> d4399a15c ([triton_kernels] minor rename (#8044)):python/triton_kernels/triton_kernels/roofline.py
     fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("performance  [TFLOP/s]")
@@ -219,30 +217,6 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
     xmin, xmax = min(xs), max(xs)
     dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
     ax.set_xlim(xmin - dx, xmax + dx)
-<<<<<<< HEAD:python/triton_kernels/bench/roofline.py
-    ax.set_ylim(100, max_tflops + 500)
-
-    # roofline from operational intensity (identical across series)
-    opints = [f / b for f, b in zip(flops_ref, bytes_ref)]
-    knee = bisect_left(opints, max_tflops / max_tbps)
-    if knee > 0:
-        x_bw = [xs[0], xs[knee - 1]]
-        y_bw = [opints[0] * max_tbps, max_tflops]
-    else:
-        x_bw = y_bw = []
-    x_comp = xs[max(knee - 1, 0):]
-    y_comp = [max_tflops] * len(x_comp)
-    grey = "#7f7f7f"
-    ax.plot(x_bw, y_bw, linestyle="--", color=grey, label=f"BW-bound - {max_tbps:.1f} TB/s [memset]", zorder=1)
-    ax.plot(x_comp, y_comp, linestyle=":", color=grey, label=f"Compute-bound  - {max_tflops:.0f} TFLOP/s [cuBLAS]",
-            zorder=1)
-
-    # Plot each series as a lineplot of TFLOP/s
-    for idx, (pth, (_, f, b, t)) in enumerate(zip(series, perfs)):
-        perf_tflops = [ff / tt * 1e-3 if tt > 0 else 0.0 for ff, tt in zip(f, t)]
-        label = (labels[idx] if labels and idx < len(labels) else Path(pth).stem)
-        ax.plot(xs, perf_tflops, label=label, linewidth=1.8, zorder=2)
-=======
     ax.set_ylim(min(y_roof) * 0.8 if y_roof else 0.0, max_tflops * 1.05)
 
     # Points of interest
@@ -251,9 +225,15 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
             y_pt = interp(xs, series_perf[0], x_pt)
             y_rf = interp(xs, y_roof, x_pt)
             ax.plot([x_pt], [y_pt], marker="o", ms=4, mfc="white", mec="black", zorder=3)
-            ax.annotate(f"{label}\n{int(y_pt)} TFLOP/s ({int(y_pt/y_rf*100)}%)", xy=(x_pt, y_pt), xytext=(5, -25),
-                        textcoords="offset points", fontsize=7, ha="left", va="bottom")
->>>>>>> d4399a15c ([triton_kernels] minor rename (#8044)):python/triton_kernels/triton_kernels/roofline.py
+            ax.annotate(
+                f"{label}\n{int(y_pt)} TFLOP/s ({int(y_pt / y_rf * 100)}%)",
+                xy=(x_pt, y_pt),
+                xytext=(5, -25),
+                textcoords="offset points",
+                fontsize=7,
+                ha="left",
+                va="bottom",
+            )
 
     ax.legend(frameon=False, loc="lower right")
     ax.grid(True, which="both", ls=":", lw=0.5)
@@ -263,16 +243,32 @@ def plot_roofline(series, flops_dtype, out_path, max_tbps, max_tflops, title="",
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Plot roofline(s) from perf CSV series")
-    parser.add_argument("--series", type=str, nargs="+", required=True,
-                        help="list of .csv files; columns must be `x`, `flops`, `bytes`, `time_ns`")
-    parser.add_argument("--dtype", type=str, required=True, choices=["fp16", "bf16", "fp8"],
-                        help="data type used for compute-bound roof")
+    parser.add_argument(
+        "--series",
+        type=str,
+        nargs="+",
+        required=True,
+        help="list of .csv files; columns must be `x`, `flops`, `bytes`, `time_ns`",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        required=True,
+        choices=["fp16", "bf16", "fp8"],
+        help="data type used for compute-bound roof",
+    )
     parser.add_argument("--out_path", type=str, required=True, help="path to write the output image")
     parser.add_argument("--title", type=str, default="", help="plot title")
     parser.add_argument("--xlabel", type=str, default="", help="x-axis label")
-    parser.add_argument("--labels", type=str, nargs="+", default=None,
-                        help="optional list of names for each series, in order; must match number of --series")
+    parser.add_argument(
+        "--labels",
+        type=str,
+        nargs="+",
+        default=None,
+        help="optional list of names for each series, in order; must match number of --series",
+    )
     args = parser.parse_args()
     if args.labels is not None and len(args.labels) != len(args.series):
         parser.error("--labels must have the same number of entries as --series")
