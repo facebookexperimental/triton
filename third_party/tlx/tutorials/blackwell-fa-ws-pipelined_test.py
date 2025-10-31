@@ -56,6 +56,126 @@ def _compute_offsets(H, N_CTX, BLOCK_M):
     return start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y
 
 
+# Original add_round_down(x, y) did: add.rm.ftz.f32  (round-down)
+# We only need it to produce floor(x) when paired with the big-constant trick.
+# In Triton, just compute floor(x) explicitly and add y.
+@triton.jit
+def add_round_down(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            add.rm.ftz.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+# ============================================================================
+# Custom exp2 Polynomial Approximation (the "emulation" path)
+# ============================================================================
+
+
+@triton.jit
+def _fma_f32x2(a, b, c):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mov.b64 rc, { $6, $7 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { $0, $1 }, rd;
+        }
+        """,
+        "=r,=r,r,r,r,r,r,r",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+@triton.jit
+def evaluate_polynomial(x, coeffs: tl.constexpr):
+    """
+    Returns P(x) with scalar coeffs using Horner's rule and inline PTX FMA.
+    P(t) = sum_{i=0..deg} coeffs[i] * t^i
+    """
+    deg = len(coeffs) - 1
+    out = coeffs[deg]
+    for i in range(deg - 1, -1, -1):
+        out = _fma_f32x2(out, x, coeffs[i])   # out = out*x + coeffs[i]
+    return out
+
+@triton.jit
+def combine_int_frac_ex2(x_rounded, frac_ex2):
+    """
+    Compose: out_bits = (x_rounded_bits << 23) + frac_ex2_bits
+    where:
+      - x_rounded carries the integer part (floor) in its low bits
+      - frac_ex2 carries the mantissa approximation of 2**fraction(x)
+    Returns fp32 with those bits.
+    """
+    out = tl.inline_asm_elementwise(
+        asm="""
+        {
+          .reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;
+          mov.b32 x_rounded_i, $1;
+          mov.b32 frac_ex_i, $2;
+          shl.b32 x_rounded_e, x_rounded_i, 23;
+          add.s32 out_i, x_rounded_e, frac_ex_i;
+          mov.b32 $0, out_i;
+        }
+        """,
+        constraints="=f, f, f",        # $0: out(float), $1: x_rounded(float), $2: frac_ex2(float)
+        args=[x_rounded, frac_ex2],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return out
+
+
+
+
+@triton.jit
+def ex2_emulation(x):
+    # We assume x <= 127.0
+    x = tl.maximum(x, -127.0)
+
+    FP32_ROUND_INT = (2.0 ** 23) + (2.0 ** 22)  # same constant you used
+
+    # Emulate your “round down fractional” split explicitly
+    x_rounded = add_round_down(x, FP32_ROUND_INT)
+    x_rounded_back = x_rounded - FP32_ROUND_INT
+    x_frac = x - x_rounded_back                       # r in [0,1)
+
+    # Your degree-3 approximation coefficients for 2**r, r in [0,1)
+
+                    # ---- inline polynomial for 2**r (degree-3, Horner) ----
+    # Coeffs: (C0, C1, C2, C3)
+    C0 = 1.0
+    C1 = 0.695146143436431884765625
+    C2 = 0.227564394474029541015625
+    C3 = 0.077119089663028717041015625
+
+    x_frac_ex2 = C3
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C2)   # t = C3*r + C2
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C1)   # t = (..)*r + C1
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C0)   # t = (..)*r + C0   ~ 2**r
+
+
+    return combine_int_frac_ex2(x_rounded, x_frac_ex2)       # 2**n * 2**r
+
+
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
 def _attn_fwd_ws(sm_scale, M,  #
@@ -183,7 +303,19 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.barrier_arrive(alpha_fulls[qk_bufIdx])
 
                 qk = qk * qk_scale - m_ij[:, None]
-                p = tl.math.exp2(qk)
+
+                BM: tl.constexpr = qk.shape[0]
+                BN: tl.constexpr = qk.shape[1]
+                qk_0, qk_1 = qk.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+                qk_0_0, qk_0_1 = qk_0.reshape([BM, 2, BN // 4]).permute(0, 2, 1).split()
+
+                p_0_0 = ex2_emulation(qk_0_0)
+                p_0_1 = tl.math.exp2(qk_0_1)
+                p_0 = tl.join(p_0_0, p_0_1).permute(0, 2, 1).reshape([BM, BN // 2])
+                p_1 = tl.math.exp2(qk_1)
+                p = tl.join(p_0, p_1).permute(0, 2, 1).reshape([BM, BN])
+
+
                 l_ij = tl.sum(p, 1)
                 p = p.to(tlx.dtype_of(desc_v))
 
