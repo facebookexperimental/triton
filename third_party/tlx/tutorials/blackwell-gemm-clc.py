@@ -1,72 +1,56 @@
-import argparse
+# TLX GEMM kernel optimized for Blackwell Warp Specialization
 import pytest
-
 import torch
+
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-import triton.profiler as proton
-
+from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
-from contextlib import contextmanager
 
-if torch.cuda.is_available():
-    from triton._C.libtriton import nvidia
-    cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    cublas = nvidia.cublas.CublasLt(cublas_workspace)
-else:
-    cublas = None
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
-
-
-def supports_tma():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-
-def is_hopper():
-    return torch.cuda.get_device_capability()[0] == 9
-
-
-def supports_ws():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-
-def _matmul_launch_metadata(grid, kernel, args):
-    ret = {}
-    M, N, K, WS = args["M"], args["N"], args["K"], args.get("WARP_SPECIALIZE", False)
-    ws_str = "_ws" if WS else ""
-    ret["name"] = f"{kernel.name}{ws_str} [M={M}, N={N}, K={K}]"
-    if "c_ptr" in args:
-        bytes_per_elem = args["c_ptr"].element_size()
-    else:
-        bytes_per_elem = 1 if args["FP8_OUTPUT"] else 2
-    ret[f"flops{bytes_per_elem * 8}"] = 2. * M * N * K
-    ret["bytes"] = bytes_per_elem * (M * K + N * K + M * N)
-    return ret
-
-
-HAS_TENSOR_DESC = supports_tma() and hasattr(tl, "make_tensor_descriptor")
-HAS_HOST_TENSOR_DESC = supports_tma() and hasattr(triton.tools.tensor_descriptor, "TensorDescriptor")
-HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
-
-
-def matmul_get_configs(pre_hook=None):
+def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 1}, num_stages=s,
-                      num_warps=w, pre_hook=pre_hook)
-        for BM in [64]
-        for BN in [64]
-        for BK in [64]
-        for s in ([2])
-        for w in [4]
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": BM,
+                "BLOCK_SIZE_N": BN,
+                "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": 8,
+                "NUM_SMEM_BUFFERS": s,
+                "NUM_TMEM_BUFFERS": t,
+                "EPILOGUE_SUBTILE": subtile,
+            },
+            num_warps=4,
+            num_stages=1,
+            pre_hook=matmul_tma_set_block_size_hook,
+        )
+        for BM in [128]
+        for BN in [128, 256]
+        for BK in [64, 128]
+        for s in [2, 3, 4]
+        for t in [2, 3]
+        for subtile in [True]
     ]
 
 
+def matmul_tma_set_block_size_hook(nargs):
+    BLOCK_M = nargs["BLOCK_SIZE_M"]
+    BLOCK_N = nargs["BLOCK_SIZE_N"]
+    BLOCK_K = nargs["BLOCK_SIZE_K"]
+    nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
+    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
+    if EPILOGUE_SUBTILE:
+        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
+    else:
+        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
+
+
 @triton.jit
-def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     group_id = tile_id // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -76,325 +60,285 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
 
 
 @triton.autotune(
-    configs=matmul_get_configs(),
+    configs=get_cuda_autotune_config(),
     key=["M", "N", "K"],
 )
-@triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel(a_ptr, b_ptr, c_ptr,  #
-                  M, N, K,  #
-                  stride_am, stride_ak,  #
-                  stride_bk, stride_bn,  #
-                  stride_cm, stride_cn,  #
-                  BLOCK_SIZE_M: tl.constexpr,  #
-                  BLOCK_SIZE_N: tl.constexpr,  #
-                  BLOCK_SIZE_K: tl.constexpr,  #
-                  GROUP_SIZE_M: tl.constexpr,  #
-                  ):
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+@triton.jit
+def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
+                                       BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
+                                       GROUP_SIZE_M: tl.constexpr,  #
+                                       NUM_SMEM_BUFFERS: tl.constexpr,  #
+                                       NUM_TMEM_BUFFERS: tl.constexpr,  #
+                                       NUM_SMS: tl.constexpr,  #
+                                       NUM_CLC_STAGES: tl.constexpr,  #
+                                       EPILOGUE_SUBTILE: tl.constexpr,  #
+                                       ):
+    # allocate NUM_SMEM_BUFFERS buffers
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
+    # use multiple TMEM buffers to overlap MMA and epilogue
+    tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
 
-    start_m = pid_m * BLOCK_SIZE_M
-    start_n = pid_n * BLOCK_SIZE_N
+    # allocate barriers
+    smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
-    offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
-    offs_am = tl.where(offs_am < M, offs_am, 0)
-    offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+    clc_context = tlx.clc_create_context(NUM_CLC_STAGES, 3)
 
-    offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
-    offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    with tlx.async_tasks():
+        with tlx.async_task("default"):  # epilogue consumer
+            # common code duplicated for each region to avoid SMEM overhead
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # end of common code
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            tmem_read_phase = 0
+            cur_tmem_buf = 0
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        accumulator = tl.dot(a, b, accumulator)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+            tile_id = start_pid
 
-    if (c_ptr.dtype.element_ty == tl.float8e4nv):
-        c = accumulator.to(tl.float8e4nv)
-    else:
-        c = accumulator.to(tl.float16)
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            clc_buf = 0
+            while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
+                # Debug prints
+                # if tlx.thread_id(axis=0) == 0:
+                # tl.device_print("Default WG Processing CtaID", tile_id)
+                # producer
+                tlx.clc_producer(clc_context, clc_buf, clc_phase_producer)
+                # clc_phase_producer ^= 1
+                clc_phase_producer = clc_phase_producer ^ (clc_buf == (NUM_CLC_STAGES - 1))
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_am = pid_m * BLOCK_SIZE_M
+                offs_bn = pid_n * BLOCK_SIZE_N
+
+                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
+                # flip phase at the end of a round of using TMEM barriers
+                tmem_read_phase = tmem_read_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
+
+                # load the result from TMEM to registers
+                acc_tmem = tmem_buffers[cur_tmem_buf]
+
+                if EPILOGUE_SUBTILE:
+                    # We load/store the result half by half to reduce SMEM pressure
+                    acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
+                    result = tlx.local_load(acc_tmem_subslice1)
+                    c = result.to(tl.float16)
+                    c_desc.store([offs_am, offs_bn], c)
+
+                    acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
+                    result = tlx.local_load(acc_tmem_subslice2)
+                    c = result.to(tl.float16)
+                    c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
+                else:
+                    result = tlx.local_load(acc_tmem)
+                    c = result.to(tl.float16)
+                    c_desc.store([offs_am, offs_bn], c)
+
+                # done storing this buffer, signal MMA consumer to resume writing to it
+                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
+
+                cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
+
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase_consumer)
+                # clc_phase_consumer ^= 1
+                clc_phase_consumer = clc_phase_consumer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
+
+                # Debug-only: verifying that CLC steals workloads successfully
+                # if tlx.thread_id(axis=0) == 0:
+                # tl.device_print("Extracted CtaID", tile_id)
+
+        with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
+            # common code duplicated for each region to avoid SMEM overhead
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # end of common code
+
+            dot_phase = 0  # the current phase of dot op
+            tmem_write_phase = 1  # sync between epilogue consumer and MMA consumer
+            cur_tmem_buf = 0
+
+            processed_k_iters = 0
+            tile_id = start_pid
+            clc_phase = 0
+            clc_buf = 0
+            while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
+                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_am = pid_m * BLOCK_SIZE_M
+                offs_bn = pid_n * BLOCK_SIZE_N
+
+                # wait epilogue consumer to be done with the buffer before reusing it
+                tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
+                # flip phase at the end of a round of using TMEM barriers
+                tmem_write_phase = tmem_write_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
+
+                # now iterate along K to compute result for the block
+                for k in range(0, k_tiles):
+                    # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
+                    buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
+                    # wait for current phase(round) of load for this buf
+                    tlx.barrier_wait(smem_full_bars[buf], dot_phase)
+                    # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
+                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,
+                                  mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
+                    # flip phase at the end of a round
+                    dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
+
+                # wait for last mma to complete
+                last_buf = (processed_k_iters + k_tiles - 1) % NUM_SMEM_BUFFERS
+                # in case phase was flipped, we should use the phase value when dot op was issued
+                last_dot_phase = dot_phase ^ (last_buf == NUM_SMEM_BUFFERS - 1)
+                tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
+
+                # done filling this buffer, signal epilogue consumer
+                tlx.barrier_arrive(tmem_full_bars[cur_tmem_buf], 1)
+
+                # possibly enter next iteration (next tile) without waiting for epilogue
+                cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
+                processed_k_iters += k_tiles
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                # clc_phase ^= 1
+                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
+
+        with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
+            # common code duplicated for each region to avoid SMEM overhead
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # end of common code
+
+            load_phase = 0  # the current phase of TMA load
+            # we virtually "flatten" the two layer loop as if we're performing tma loads on
+            # one big list of data
+            processed_k_iters = 0
+
+            tile_id = start_pid
+            clc_phase = 0
+            clc_buf = 0
+            while tile_id != -1:
+                clc_buf = clc_buf % NUM_CLC_STAGES
+                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_am = pid_m * BLOCK_SIZE_M
+                offs_bn = pid_n * BLOCK_SIZE_N
+
+                for k in range(0, k_tiles):
+                    # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
+                    buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
+                    # wait for previous phase(round) of dot for this buf
+                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
+                    # buffer is now ready to be used again
+                    offs_k = k * BLOCK_SIZE_K
+                    tlx.barrier_expect_bytes(smem_full_bars[buf],
+                                             2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
+                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
+                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
+                    # flip phase at the end of a round
+                    load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
+                processed_k_iters += k_tiles
+                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                # clc_phase ^= 1
+                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_buf += 1
 
 
 def matmul(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     K, N = b.shape
-    dtype = a.dtype
-
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
-    matmul_kernel[grid](
-        a, b, c,  #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
-    )
-    return c
-
-
-@triton.autotune(
-    configs=matmul_get_configs(),
-    key=["M", "N", "K"],
-)
-@triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_persistent(a_ptr, b_ptr, c_ptr,  #
-                             M, N, K,  #
-                             stride_am, stride_ak,  #
-                             stride_bk, stride_bn,  #
-                             stride_cm, stride_cn,  #
-                             BLOCK_SIZE_M: tl.constexpr,  #
-                             BLOCK_SIZE_N: tl.constexpr,  #
-                             BLOCK_SIZE_K: tl.constexpr,  #
-                             GROUP_SIZE_M: tl.constexpr,  #
-                             NUM_SMS: tl.constexpr,  #
-                             ):
-    tid = tlx.thread_id(axis=0)
-    start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-
-    # NOTE: There is currently a bug in blackwell pipelining that means it can't handle a value being
-    # used in both the prologue and epilogue, so we duplicate the counters as a work-around.
-    # tile_id_c = start_pid - NUM_SMS
-    tile_id = start_pid
-
-    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-
-    # TLX: cluster launch control for dynamic tiling scheduling
-    bars = tlx.alloc_barriers(num_barriers=1)
-    clc_mbar = bars[0]
-    responses = tlx.alloc_clc_responses(num_responses=1)
-    clc_response = responses[0]
-    phase = 0
-
-    while tile_id != -1:
-        if tid == 0:
-            tl.device_print("Processing CtaID", tile_id)
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        start_m = pid_m * BLOCK_SIZE_M
-        start_n = pid_n * BLOCK_SIZE_N
-        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
-        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
-        offs_am = tl.where(offs_am < M, offs_am, 0)
-        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
-        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
-        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in range(k_tiles):
-            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
-            accumulator = tl.dot(a, b, accumulator)
-
-        # pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if (c_ptr.dtype.element_ty == tl.float8e4nv):
-            c = accumulator.to(tl.float8e4nv)
-        else:
-            c = accumulator.to(tl.float16)
-        tl.store(c_ptrs, c, mask=c_mask)
-
-        # TLX
-        # Issue async clc.try_cancel for the next available CTA
-        tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
-        tlx.clc_issue(clc_response, clc_mbar)
-
-        # Wait for clc.try_cancel finishes
-        tlx.barrier_wait(clc_mbar, phase)
-        phase = phase ^ 1
-
-        # Extract CTA ID from CLC response
-        tile_id = tlx.clc_query(clc_response)
-
-        if tid == 0:
-            tl.device_print("Extracted CtaID", tile_id)
-
-
-def matmul_persistent(a, b):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    M, K = a.shape
-    K, N = b.shape
-    dtype = a.dtype
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-    # 1D launch kernel where each block gets its own program.
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+
+    # A dummy block value that will be overwritten when we have the real block size
+    dummy_block = [1, 1]
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    # Persistent kernel to have thread block resident in SM as long as possible
     grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
-    matmul_kernel_persistent[grid](
-        a, b, c,  #
+    matmul_kernel_tma_ws_blackwell_clc[grid](
+        a_desc, b_desc, c_desc,  #
         M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
-        launch_cluster=True,  # Cluster launch control
+        NUM_CLC_STAGES=1,  #
+        # launch_cluster=True,
     )
+
     return c
-
-
-def cublas_matmul(a, b):
-    # Check constraints.
-    assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
-    M, K = a.shape
-    N, K = b.shape
-    dtype = a.dtype
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-    bytes_per_elem = a.element_size()
-    flops_str = f"flops{bytes_per_elem * 8}"
-    with proton.scope(f"cublas [M={M}, N={N}, K={K}]",
-                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
-        cublas.matmul(a, b, c)
-    return c
-
-
-def torch_matmul(a, b):
-    M, K = a.shape
-    N, K = b.shape
-    bytes_per_elem = a.element_size()
-    flops_str = f"flops{bytes_per_elem * 8}"
-    with proton.scope(f"torch [M={M}, N={N}, K={K}]",
-                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
-        c = torch.matmul(a, b.T)
-    return c
-
-
-@contextmanager
-def proton_context():
-    proton.activate(0)
-    try:
-        yield
-    finally:
-        proton.deactivate(0)
-
-
-def bench_fn(label, reps, warmup_reps, fn, *args):
-    print(f"Benchmarking {label}: ...", end="")
-    for _ in range(warmup_reps):
-        fn(*args)
-    with proton_context():
-        for _ in range(reps):
-            fn(*args)
-    print(f"\rBenchmarking {label}: done")
-
-
-def bench(K, dtype, reps=10000, warmup_reps=10000):
-    M = 8192
-    N = 8192
-    a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
-
-    b = b.T.contiguous()
-
-    if cublas is not None:
-        bench_fn("cublas", reps, warmup_reps, cublas_matmul, a, b)
-    if dtype == torch.float16:
-        bench_fn("torch", reps, warmup_reps, torch_matmul, a, b)
-    bench_fn("persistent", reps, warmup_reps, matmul_persistent, a, b.T)
-
-
-def run_test(expect, fn, a, b, label, enabled=True):
-    print(f"  {label}: ...", end="")
-    if enabled:
-        actual = fn(a, b)
-        passed = torch.allclose(expect, actual.to(expect.dtype), atol=1e-4)
-        icon = "✅" if passed else "❌"
-    else:
-        icon = "⭕"
-    print(f"\r  {label}: {icon}  ")
 
 
 @pytest.mark.skipif(
     not is_blackwell(),
     reason="Requires Blackwell GPU",
 )
-@pytest.mark.parametrize("M", [2048, 4096, 8192])
-@pytest.mark.parametrize("N", [2048, 4096, 8192])
-@pytest.mark.parametrize("K", [64, 128])
-def test_correctness(M, N, K, dtype=torch.float16):
-    print(f"{M=}, {N=}, {K=}, verification naive vs: ")
-    a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
-    b = b.T.contiguous()
-
-    naive_result = matmul(a, b.T).to(torch.float16)
-    run_test(naive_result, matmul_persistent, a, b.T, "Persistent")
-    # run_test(naive_result, torch_matmul, a, b, "Torch", enabled=dtype == torch.float16)
-    # run_test(naive_result, cublas_matmul, a, b, "cuBLAS", enabled=cublas is not None)
+def test_op():
+    torch.manual_seed(0)
+    M, N, K = 8192, 8192, 8192
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    torch_output = torch.matmul(a, b)
+    triton_output = matmul(a, b)
+    print(f"torch_output_with_fp16_inputs={torch_output}")
+    print(f"triton_output_with_fp16_inputs={triton_output}")
+    rtol = 0
+    torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=rtol)
 
 
-def show_profile(precision, profile_name):
-    import triton.profiler.viewer as proton_viewer
-    metric_names = ["time/ms"]
-    if precision == 'fp8':
-        metric_names = ["tflop8/s"] + metric_names
-    elif precision == 'fp16':
-        metric_names = ["tflop16/s"] + metric_names
-    file_name = f"{profile_name}.hatchet"
-    tree, metrics = proton_viewer.parse(metric_names, file_name)
-    proton_viewer.print_tree(tree, metrics)
+ref_lib = "cuBLAS"
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
+        x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
+        line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
+        # Possible values for `line_arg`
+        # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
+        line_vals=[ref_lib.lower(), "triton_clc"],  # Label name for the lines
+        line_names=[ref_lib, "Triton (CLC)"],  # Line styles
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="TFLOPS",  # Label name for the y-axis
+        plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
+        args={},
+    ))
+def benchmark(M, N, K, provider):
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == ref_lib.lower():
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
+
+    if provider == "triton_clc":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, True), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
+
+    perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-K", type=int, required=False, default=512)
-    parser.add_argument("--K_range", type=int, nargs=2)
-    parser.add_argument("--K_step", type=int, default=512)
-    parser.add_argument("--prec", type=str, choices=["fp8", "fp16"], default="fp16")
-    args = parser.parse_args()
-
-    if args.prec == 'fp8' and (not hasattr(torch, "float8_e4m3fn") or not is_cuda()):
-        print("This example requires CUDA with fp8 support.")
+    if is_blackwell():
+        print("Running benchmarks...")
+        benchmark.run(print_data=True)
     else:
-        dtype = torch.float8_e4m3fn if args.prec == 'fp8' else torch.float16
-
-        if args.K and args.K_range is None:
-            args.K_range = [args.K, args.K]
-            args.K_step = 1  # doesn't matter as long as it's not 0
-
-        torch.manual_seed(0)
-
-        # test_correctness(32, 32, 32, dtype)
-        # test_correctness(8192, 8192, args.K_range[0], dtype)
-        test_correctness(2048, 2048, args.K_range[0], dtype)
-
-        # proton.start("matmul", hook="triton")
-        # proton.deactivate()
-        # for K in range(args.K_range[0], args.K_range[1] + 1, args.K_step):
-        #     bench(K, dtype)
-        # proton.finalize()
-        # show_profile(args.prec, "matmul")
+        print("Skipping benchmarks, no Blackwell GPU found.")

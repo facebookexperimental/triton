@@ -129,7 +129,12 @@ def visit_withAsyncTasks(self, node):
         captures = sorted(v for v in (liveins.keys() & self.used_vars) if not _is_constexpr(liveins[v]))
         for name in captures:
             val = liveins[name]
-            ws_op.append_operand(val.handle)
+            if getattr(val, "__triton_aggregate__", False):
+                for field in val.type.fields:
+                    v = getattr(val, field[0])
+                    ws_op.append_operand(v.handle)
+            else:
+                ws_op.append_operand(val.handle)
 
         # real codegen
         index = 0
@@ -163,8 +168,14 @@ def visit_withAsyncTasks(self, node):
 
                 for name in captures:
                     val = liveins[name]
-                    arg = task_body.add_argument(val.handle.get_type())
-                    block.replace_use_in_block_with(val.handle, arg)
+                    if getattr(val, "__triton_aggregate__", False):
+                        for field in val.type.fields:
+                            v = getattr(val, field[0])
+                            arg = task_body.add_argument(v.handle.get_type())
+                            block.replace_use_in_block_with(v.handle, arg)
+                    else:
+                        arg = task_body.add_argument(val.handle.get_type())
+                        block.replace_use_in_block_with(val.handle, arg)
 
                 self.builder.create_warp_return_op()
                 region_replica_id_stack.pop()

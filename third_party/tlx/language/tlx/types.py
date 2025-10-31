@@ -1,4 +1,5 @@
 import triton.language.core as tl
+from triton.language.core import _aggregate as aggregate
 from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
@@ -354,8 +355,8 @@ class clc_response_type(buffered_tensor_type):
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic):
         super().__init__(tl.int64, [1], num, storage_kind.smem, layout, semantic)
 
-    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
-        value = mbarrier(handles[cursor], self.num, self.layout)
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
+        value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
@@ -370,6 +371,24 @@ class clc_response_type(buffered_tensor_type):
             self.layout.to_ir(builder),
             self.storage.value,
         )
+
+
+@aggregate
+class CLCPipelineContext:
+    _clc_mbars_empty: mbarrier
+    _clc_mbars_full: mbarrier
+    _clc_responses: clc_response
+
+    def __init__(
+        self,
+        clc_mbars_empty: mbarrier,
+        clc_mbars_full: mbarrier,
+        clc_responses: clc_response,
+        semantic: TritonSemantic = None,
+    ):
+        self._clc_mbars_empty = clc_mbars_empty
+        self._clc_mbars_full = clc_mbars_full
+        self._clc_responses = clc_responses
 
 
 class async_token(tl.base_value):
