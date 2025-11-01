@@ -1145,7 +1145,7 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
 // the new producer (reloaded value).
 static std::pair<Value, Value>
 createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
-                 bool useTMEM) {
+                 bool useTMEM, bool isPost) {
   auto srcResult = channel->getSrcOperand();
   auto srcOp = channel->getSrcOp();
   auto dstOp = channel->getDstOp();
@@ -1195,7 +1195,8 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
   } else {
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
-    builder.setAsyncTaskIdsFromOp(srcOp);
+    if (isPost)
+      builder.setAsyncTaskIdsFromOp(srcOp);
     tt::DescriptorStoreOp tmaStore;
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [&](Operation *op) {
@@ -1239,31 +1240,38 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
 
     // Get shape, layout and type of the complete buffer
     SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
+    if (srcOp->getParentOfType<scf::ForOp>())
+      bufferShape.insert(bufferShape.begin(), channel->getNumBuffers());
+    else
+      bufferShape.insert(bufferShape.begin(), 1);
+
     Attribute sharedMemorySpace =
         triton::gpu::SharedMemorySpaceAttr::get(context);
-    Type memdescType =
-        ttg::MemDescType::get(sliceShape, elemType, sharedLayout,
-                              sharedMemorySpace, /*mutableMemory*/ true);
+    Type memdescType = ttg::MemDescType::get(
+        isPost ? sliceShape : bufferShape, elemType, sharedLayout,
+        sharedMemorySpace, /*mutableMemory*/ true);
     auto allocOp =
         builder.create<ttg::LocalAllocOp>(srcOp->getLoc(), memdescType);
     buffer = allocOp->getResult(0);
 
-    // Generate the local store
-    builder.setLoopScheduleInfoFromOp(srcOp);
-    auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
-        srcOp->getLoc(), srcResult, allocOp);
-    storeOp->moveAfter(srcOp);
+    if (isPost) {
+      // Generate the local store
+      builder.setLoopScheduleInfoFromOp(srcOp);
+      auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+          srcOp->getLoc(), srcResult, allocOp);
+      storeOp->moveAfter(srcOp);
 
-    // local load
-    builder.setAsyncTaskIdsFromOp(dstOp);
-    builder.setLoopScheduleInfoFromOp(dstOp);
-    auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
-        srcOp->getLoc(), srcResult.getType(), allocOp, Value());
-    loadOp->moveBefore(dstOp);
-    dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
-    newProducer = loadOp->getResult(0);
-    builder.setAsynTaskIdsFromArray(originTaskIds);
-    builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
+      // local load
+      builder.setAsyncTaskIdsFromOp(dstOp);
+      builder.setLoopScheduleInfoFromOp(dstOp);
+      auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
+          srcOp->getLoc(), srcResult.getType(), allocOp, Value());
+      loadOp->moveBefore(dstOp);
+      dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
+      newProducer = loadOp->getResult(0);
+      builder.setAsynTaskIdsFromArray(originTaskIds);
+      builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
+    }
   }
 
   return {buffer, newProducer};
@@ -1308,7 +1316,7 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
 // Create a buffer array for each producer op, if the producer is in a ForOp,
 // the buffer array will contain numBuffers.
 DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
-                                        triton::FuncOp funcOp) {
+                                        triton::FuncOp funcOp, bool isPost) {
 
   DenseMap<Channel *, Value> bufferMap;
   MLIRContext *context = funcOp.getContext();
@@ -1423,8 +1431,9 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
         llvm_unreachable("Unexpected srcOp type");
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
-      auto res =
-          createLocalAlloc(builder, channel, tensorType.getShape().size() == 1);
+      auto res = createLocalAlloc(
+          builder, channel, isPost ? tensorType.getShape().size() == 1 : false,
+          isPost);
       buffer = res.first;
       newProducer = res.second;
     } else {
@@ -1962,7 +1971,9 @@ void insertAsyncComm(
   SmallVector<std::pair<Channel *, SmallVector<Channel *>>>
       orderedChannelsGroupedByConsumers;
   for (auto *key : orderedChannels) {
-    if (key->channelKind == DataChannelKind::SMEMPost) {
+    if (key->channelKind == DataChannelKind::SMEMPost ||
+        key->channelKind == DataChannelKind::SMEM ||
+        key->channelKind == DataChannelKind::REG) {
       auto kv = channelsGroupedByConsumers.find(key);
       orderedChannelsGroupedByConsumers.push_back({key, kv->second});
     }
@@ -2636,7 +2647,7 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
   reorderEpilogOps(channels, funcOp);
 
   // Step 3: Create buffers. A buffer for each channel.
-  createBuffer(channels, funcOp);
+  createBuffer(channels, funcOp, true);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
@@ -2661,7 +2672,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
                 channelsGroupedByConsumers, orderedChannels);
 
   // Step 3: Create buffers. An array of buffers for each channel.
-  DenseMap<Channel *, Value> bufferMap = createBuffer(channels, funcOp);
+  DenseMap<Channel *, Value> bufferMap = createBuffer(channels, funcOp, false);
   LLVM_DEBUG({
     LDBG("\n\nafter createBuffer");
     funcOp.dump();

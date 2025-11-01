@@ -254,13 +254,13 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
 
   // Read the attribute from the module
   ModuleOp mod = axisInfo.getModuleOp();
-  int minRegAutoWS = 24;  // default value
+  int minRegAutoWS = 24; // default value
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
-      minRegAutoWS = attr.getInt();
+    minRegAutoWS = attr.getInt();
   }
-  int maxRegAutoWS = 168;  // default value
+  int maxRegAutoWS = 88; // default value
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName)) {
-      maxRegAutoWS = attr.getInt();
+    maxRegAutoWS = attr.getInt();
   }
 
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());

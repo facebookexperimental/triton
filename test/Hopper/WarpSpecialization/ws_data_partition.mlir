@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-data-partition=num-warp-groups=3 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s
 
 // CHECK-LABEL: @matmul_persistent_ws_cooperative_kernel
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
@@ -40,7 +40,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
      // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
      // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
      tt.store %7, %6 {async_task_id = array<i32: 1, 2>} : tensor<128x256x!tt.ptr<f16>, #blocked1>
-    }
+    } {tt.data_partition_factor = 2 : i32}
     tt.return
   }
 }
