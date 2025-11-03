@@ -397,8 +397,6 @@ def full(shape, value, dtype, layout=None, _semantic=None):
 
 
 @builtin
-<<<<<<< HEAD
-=======
 def histogram(input, num_bins, mask=None, layout=None, _semantic=None, _generator=None):
     """
     Compute a histogram of a 1D integer tensor.
@@ -439,7 +437,6 @@ def gather(src, index, axis, _semantic=None):
 
 
 @builtin
->>>>>>> c7fd12001 ([GLUON] Integrate `gather` and its layout tests (#8018))
 def allocate_shared_memory(element_ty, shape, layout, value=None, _semantic=None) -> shared_memory_descriptor:
     """
     Allocate shared memory for a tensor with the given element type, shape, and layout.
@@ -477,8 +474,16 @@ def set_auto_layout(value, layout, _semantic=None):
 
 
 @builtin
-def warp_specialize(default_args, default_partition, worker_args, worker_partitions, worker_num_warps, worker_num_regs,
-                    _semantic=None, _generator=None):
+def warp_specialize(
+    default_args,
+    default_partition,
+    worker_args,
+    worker_partitions,
+    worker_num_warps,
+    worker_num_regs,
+    _semantic=None,
+    _generator=None,
+):
     """
     Create a warp-specialized execution region, partitioning work across warps.
 
