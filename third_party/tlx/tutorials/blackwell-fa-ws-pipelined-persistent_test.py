@@ -824,11 +824,11 @@ configs_bwd_tlx = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "NUM_BUFFERS_KV": 1,
-            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_Q": 2,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "EPILOGUE_SUBTILE": 2,
+            "EPILOGUE_SUBTILE": 4,
         },
         num_warps=4,
         num_stages=1,
@@ -874,7 +874,7 @@ def _attn_bwd(
     k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
     v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
     q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
-    do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do), NUM_BUFFERS_Q)
+    do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
 
     # Use SMEM for dsT
     ds_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_TMEM)
@@ -884,8 +884,8 @@ def _attn_bwd(
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
-    do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
-    do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
+    do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
+    do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
     ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
     # allocate tmem buffers
@@ -1049,6 +1049,7 @@ def _attn_bwd(
             # -----------------------------------------------------------
 
             q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+            do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
             tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
             # Compute qkT = tl.dot(k, qT)
@@ -1064,10 +1065,10 @@ def _attn_bwd(
             )
 
             # Compute dpT = tl.dot(v, tl.trans(do))
-            tlx.barrier_wait(do_fulls[q_buf_id], q_phase)
+            tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
             # As dP uses the same tmem as dQ, wait for dQ release.
             tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
-            doT = tlx.local_trans(do_tiles[q_buf_id])
+            doT = tlx.local_trans(do_tiles[do_buf_id])
             tlx.async_dot(
                 v_tiles[0],
                 doT,
@@ -1080,10 +1081,10 @@ def _attn_bwd(
             tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
             tlx.async_dot(
                 p_tiles[tmem_buf_id],
-                do_tiles[q_buf_id],
+                do_tiles[do_buf_id],
                 dv_tiles[tmem_buf_id],
                 use_acc=False,
-                mBarriers=[do_empties[tmem_buf_id]],
+                mBarriers=[do_empties[do_buf_id]],
             )
 
             # -----------------------------------------------------------
@@ -1092,6 +1093,17 @@ def _attn_bwd(
             for blk_idx in range(1, num_steps):
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+                # Compute qkT = tl.dot(k, qT)
+                tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
+                tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
+                qT = tlx.local_trans(q_tiles[q_buf_id])
+                tlx.async_dot(
+                    k_tiles[0],
+                    qT,
+                    qk_tiles[tmem_buf_id],
+                    use_acc=False,
+                    mBarriers=[qk_fulls[tmem_buf_id]],
+                )
 
                 prev_blk_idx = blk_idx - 1
                 q_buf_id_prev, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
@@ -1115,26 +1127,15 @@ def _attn_bwd(
                     q_tiles[q_buf_id_prev],
                     dk_tiles[tmem_buf_id_prev],
                     use_acc=prev_blk_idx > 0,
-                    mBarriers=[q_empties[tmem_buf_id_prev]],
+                    mBarriers=[q_empties[q_buf_id_prev]],
                 )
 
-                # Compute qkT = tl.dot(k, qT)
-                tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
-                tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
-                qT = tlx.local_trans(q_tiles[q_buf_id])
-                tlx.async_dot(
-                    k_tiles[0],
-                    qT,
-                    qk_tiles[tmem_buf_id],
-                    use_acc=False,
-                    mBarriers=[qk_fulls[tmem_buf_id]],
-                )
-
+                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                 # Compute dpT = tl.dot(v, tl.trans(do))
-                tlx.barrier_wait(do_fulls[q_buf_id], q_phase)
+                tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
                 # As dP uses the same tmem as dQ, wait for dQ release.
                 tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
-                doT = tlx.local_trans(do_tiles[q_buf_id])
+                doT = tlx.local_trans(do_tiles[do_buf_id])
                 tlx.async_dot(
                     v_tiles[0],
                     doT,
@@ -1147,10 +1148,10 @@ def _attn_bwd(
                 tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
                 tlx.async_dot(
                     p_tiles[tmem_buf_id],
-                    do_tiles[q_buf_id],
+                    do_tiles[do_buf_id],
                     dv_tiles[tmem_buf_id],
                     use_acc=True,
-                    mBarriers=[do_empties[q_buf_id]],
+                    mBarriers=[do_empties[do_buf_id]],
                 )
 
             tlx.tcgen05_commit(dv_fulls[kv_buf_id])
@@ -1167,7 +1168,7 @@ def _attn_bwd(
                 q_tiles[q_buf_id],
                 dk_tiles[tmem_buf_id],
                 use_acc=num_steps > 1,
-                mBarriers=[q_empties[tmem_buf_id], dk_fulls[kv_buf_id]],
+                mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
             )
 
             # Compute dq = tl.dot(tl.trans(dsT), k)
@@ -1208,15 +1209,17 @@ def _attn_bwd(
             )
 
             # Load dO
-            tlx.barrier_wait(do_empties[q_buf_id], q_phase ^ 1)
-            tlx.barrier_expect_bytes(do_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
+            do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+            tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
+            tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
             tlx.async_descriptor_load(
-                desc_do, do_tiles[q_buf_id], [(off_bh + curr_m).to(tl.int32), 0], do_fulls[q_buf_id]
+                desc_do, do_tiles[do_buf_id], [(off_bh + curr_m).to(tl.int32), 0], do_fulls[do_buf_id]
             )
             curr_m += step_m
 
             for blk_idx in range(1, num_steps):
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                 # Load Q
                 tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
@@ -1224,10 +1227,10 @@ def _attn_bwd(
                                           q_fulls[q_buf_id])
 
                 # Load dO
-                tlx.barrier_wait(do_empties[q_buf_id], q_phase ^ 1)
-                tlx.barrier_expect_bytes(do_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
-                tlx.async_descriptor_load(desc_do, do_tiles[q_buf_id], [(off_bh + curr_m).to(tl.int32), 0],
-                                          do_fulls[q_buf_id])
+                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
+                tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
+                tlx.async_descriptor_load(desc_do, do_tiles[do_buf_id], [(off_bh + curr_m).to(tl.int32), 0],
+                                          do_fulls[do_buf_id])
                 curr_m += step_m
 
 
