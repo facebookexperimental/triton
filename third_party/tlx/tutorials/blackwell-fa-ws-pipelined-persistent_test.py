@@ -1074,7 +1074,7 @@ def _attn_bwd(
                     do_tiles[q_buf_id],
                     dv_tiles[tmem_buf_id],
                     use_acc=blk_idx > 0,
-                    mBarriers=[do_empties[tmem_buf_id]],
+                    mBarriers=[do_empties[q_buf_id]],
                 )
 
                 # Compute dk += tl.dot(dsT, tl.trans(qT))
