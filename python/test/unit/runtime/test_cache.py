@@ -633,14 +633,12 @@ def test_hooks(device, fresh_triton_cache) -> None:
 
 @pytest.mark.skipif(reason="within_2g is a HIP specific optimization", condition=not is_hip())
 def test_within_2gb(device, fresh_triton_cache) -> None:
-    default_buffer_ops = os.environ.get("AMDGCN_USE_BUFFER_OPS", "0")
-    try:
-        use_buffer_ops_opts = ["1", "0"]
+    with triton.knobs.amd.scope():
+        use_buffer_ops_opts = [True, False]
         # The ranges should only be available when buffer ops are enabled
         pointer_ranges = [[(0, )], []]
         for use_buffer_ops, pointer_range in zip(use_buffer_ops_opts, pointer_ranges):
-            # Set AMDGCN_USE_BUFFER_OPS
-            os.environ["AMDGCN_USE_BUFFER_OPS"] = use_buffer_ops
+            triton.knobs.amd.use_buffer_ops = use_buffer_ops
 
             @triton.jit
             def kernel_add(a):
@@ -665,8 +663,6 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
             # Torch tensor <= 2GB
             kernel_add[(1, 0)](torch.empty(2**31 - 1, dtype=torch.int8, device=device))
             assert pointer_range_32 == pointer_range
-    finally:
-        os.environ["AMDGCN_USE_BUFFER_OPS"] = default_buffer_ops
 
 
 def test_function_arguments(device):
