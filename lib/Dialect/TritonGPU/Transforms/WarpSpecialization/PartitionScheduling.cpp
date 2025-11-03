@@ -300,6 +300,34 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
                   mmaOp);
   }
 
+  // Handle operations outside the loop (both prologue and epilogue).
+  // This ensures all operations, including those outside the loop,
+  // get partition assignments.
+  Partition *outsideLoopPartition = schedule.getRootPartition();
+
+  // Walk all operations in the parent block (both before and after the loop)
+  Block *parentBlock = mainLoop->getBlock();
+  for (Operation &op : *parentBlock) {
+    // Skip the loop itself
+    if (&op == &(*mainLoop))
+      continue;
+
+    // Skip operations that are already scheduled
+    if (schedule.isScheduled(&op))
+      continue;
+
+    // Skip terminators
+    if (isa<triton::ReturnOp>(op))
+      continue;
+
+    // Assign this operation and all nested operations to the root partition
+    op.walk([&](Operation *nestedOp) {
+      if (!schedule.isScheduled(nestedOp) && !isa<triton::ReturnOp>(nestedOp)) {
+        schedule.insert(outsideLoopPartition, nestedOp);
+      }
+    });
+  }
+
   return schedule;
 }
 

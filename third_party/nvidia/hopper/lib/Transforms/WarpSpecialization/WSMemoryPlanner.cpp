@@ -62,7 +62,14 @@ static Channel *findChannelForAlloc(Value value,
 
 static void getAllAcutalUsersForChannel(Channel *TheCh,
                                         DenseSet<Operation *> &users) {
+  // Skip null channels
+  if (!TheCh)
+    return;
   Operation *src = TheCh->getSrcOp();
+  // Skip channels without valid source operations (e.g., allocations outside
+  // loops)
+  if (!src)
+    return;
   SmallVector<Operation *> dsts;
   TheCh->getDstOps(dsts);
   users.insert(src);
@@ -99,6 +106,10 @@ static void updateLiveOpsInOneBlock(Channel *TheCh, OperationListT &liveOps) {
 
 static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
                                       OperationListT &liveOps) {
+  // Skip if users is empty (e.g., channels without valid operations)
+  if (users.empty())
+    return;
+
   DenseSet<Operation *> userScopes; // users in the same scope
   bool first = true;
   for (auto user : users) {
@@ -231,6 +242,14 @@ private:
         value.dump();
       });
       auto liveOperations = livenessForSmemChannel(value);
+
+      // If no live operations found (e.g., for allocations outside loops
+      // without valid channels), return an empty interval at the beginning.
+      // This allocation won't interfere with any operations.
+      if (liveOperations.empty()) {
+        return Interval<size_t>(0, 0);
+      }
+
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
       llvm::for_each(liveOperations, [&](Operation *liveOp) {
@@ -267,13 +286,21 @@ public:
           static_cast<ChannelPost *>(findChannelForOp(alloc, *channels));
       DenseSet<Operation *> users;
       getAllAcutalUsersForChannel(TheCh, users);
+      // If no users found (e.g., for allocations outside loops), not in
+      // innermost loop
+      if (users.empty())
+        return false;
       // All users are in the same block and in the innermost loop.
       auto *first = *(users.begin());
       for (auto *user : users) {
         if (user->getBlock() != first->getBlock())
           return false;
       }
-      return isInnermostLoop(first->getParentOfType<scf::ForOp>());
+      auto parentLoop = first->getParentOfType<scf::ForOp>();
+      // If users are outside loops, they're not in the innermost loop
+      if (!parentLoop)
+        return false;
+      return isInnermostLoop(parentLoop);
     };
     // Keep track of unique element types. We don't support casting between
     // different element types.
@@ -498,6 +525,19 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
     // space.
     // FIXME: try to find a buffer with a dependency chain. For FA, we want
     // p0/alpha0/l_i0/m_i0 to reuse.
+
+    // TODO: Add allocation type compatibility check. Currently, this function
+    // can return a SMEM allocation for reuse with a TMEM allocation (or vice
+    // versa), causing crashes in sliceAndReinterpretMDTMEM. Buffer reuse should
+    // ONLY be allowed between allocations of the same type:
+    // - SMEM (ttg.local_alloc) can reuse SMEM
+    // - TMEM (ttng.tmem_alloc) can reuse TMEM
+    // Mixing types is not supported because TMEM operations (especially TMA)
+    // require TMEM memory space and cannot fall back to SMEM.
+    // Suggested fix:
+    //   bool candIsTMEM = isa<ttng::TMEMAllocOp>(cand);
+    //   bool allocIsTMEM = isa<ttng::TMEMAllocOp>(alloc);
+    //   if (candIsTMEM != allocIsTMEM) continue;
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       Operation *alloc = (*it).getOperation();
       if (allocToOffsets.count(alloc)) {
@@ -546,10 +586,34 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
       ++bufferId;
     } else {
       // need to reuse buffer, heuristics: do not reuse isOperandD channels
-      // if can't find a reuse buffer, bail out
+      // if can't find a reuse buffer, allocate a new one
       auto *reuseAlloc = findReuseChannel(candidateAlloc);
-      if (!reuseAlloc)
-        assert(false && "can't find space");
+      if (!reuseAlloc) {
+        // Can't find space to reuse - allocate a new buffer instead
+        // This can happen for allocations outside loops or when TMEM is full
+        LLVM_DEBUG({
+          LDBG("can't find space to reuse, allocating new buffer for:");
+          candidateAlloc->dump();
+        });
+        candidateAlloc->setAttr(
+            "buffer.id",
+            IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
+                             bufferId));
+        candidateAlloc->setAttr(
+            "buffer.copy",
+            IntegerAttr::get(IntegerType::get(candidateAlloc->getContext(), 32),
+                             1));
+        allocToOffsets[candidateAlloc] = 0;
+        ++bufferId;
+        // Find the next candidate
+        candidateAlloc = nullptr;
+        for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it)
+          if (!bufferSet.count((*it).getOperation())) {
+            candidateAlloc = (*it).getOperation();
+            break;
+          }
+        continue; // Skip to next iteration
+      }
       LLVM_DEBUG({
         LDBG("try to reuse space with:");
         reuseAlloc->dump();
