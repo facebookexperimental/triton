@@ -1526,7 +1526,7 @@ public:
         dataPartitonFactor = factor.getInt();
       }
     });
-    if (loops.empty())
+    if (!dataPartitonFactor && numWarpGroups <= 2)
       return;
 
     if (!dataPartitonFactor)

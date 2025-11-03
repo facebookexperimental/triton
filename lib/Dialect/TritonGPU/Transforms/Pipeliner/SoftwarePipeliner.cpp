@@ -91,7 +91,12 @@ static void expandLoops(ModuleOp moduleOp) {
   };
 
   SmallVector<scf::ForOp> loops;
-  moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+  bool hasWarpSpec = false;
+  moduleOp->walk([&](scf::ForOp forOp) {
+    if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+      hasWarpSpec = true;
+    loops.push_back(forOp);
+  });
   for (scf::ForOp forOp : loops) {
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
@@ -120,7 +125,13 @@ static void expandLoops(ModuleOp moduleOp) {
 
     // FB Change: Enable epilogue peeling for warp specialized loops
     // This may not be fully working but seems to work based on FA testing.
-    bool customEpiloguePeeling = true;
+    bool customEpiloguePeeling =
+        hasMMAv5WaitsInLastStage(forOp, schedule) &&
+        !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
+        !keepPredicateStage; // do not peel if we are testing the stage
+                             // predication
+    if (hasWarpSpec)
+      customEpiloguePeeling = true;
 
     if (keepPredicateStage || customEpiloguePeeling) {
       options.emitPredicateStageFn =
@@ -198,14 +209,20 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
 
     {
       SmallVector<scf::ForOp> loops;
+      bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {
         // Bail out for loops with num_stage <= 1.
         if (getNumStagesOrDefault(forOp, numStages) > 1)
           loops.push_back(forOp);
+        if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+          hasWarpSpec = true;
       });
 
-      // Note: We removed mlir::triton::pipelineTMAStores(forOp) for
-      // each loop because we handle this in AutoWS.
+      // With Meta's warpspec, we are handling this in AutoWS.
+      if (!hasWarpSpec)
+        for (scf::ForOp forOp : loops) {
+          mlir::triton::pipelineTMAStores(forOp);
+        }
     }
   }
 };
