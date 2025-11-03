@@ -1038,9 +1038,85 @@ def _attn_bwd(
             tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
             curr_m = start_m
             step_m = BLOCK_M1
-            for blk_idx in range(num_steps):
+            blk_idx = 0
+
+            # -----------------------------------------------------------
+            ###### Prologue
+            #
+            # 1. qkT = tl.dot(k, qT)
+            # 2. dpT = tl.dot(v, tl.trans(do))
+            # 3. dv += tl.dot(ppT, do)
+            # -----------------------------------------------------------
+
+            q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+            tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+
+            # Compute qkT = tl.dot(k, qT)
+            tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
+            tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
+            qT = tlx.local_trans(q_tiles[q_buf_id])
+            tlx.async_dot(
+                k_tiles[0],
+                qT,
+                qk_tiles[tmem_buf_id],
+                use_acc=False,
+                mBarriers=[qk_fulls[tmem_buf_id]],
+            )
+
+            # Compute dpT = tl.dot(v, tl.trans(do))
+            tlx.barrier_wait(do_fulls[q_buf_id], q_phase)
+            # As dP uses the same tmem as dQ, wait for dQ release.
+            tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+            doT = tlx.local_trans(do_tiles[q_buf_id])
+            tlx.async_dot(
+                v_tiles[0],
+                doT,
+                dp_tiles[tmem_buf_id],
+                use_acc=False,
+                mBarriers=[dp_fulls[tmem_buf_id]],
+            )
+
+            # Compute dv += tl.dot(ppT, do)
+            tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
+            tlx.async_dot(
+                p_tiles[tmem_buf_id],
+                do_tiles[q_buf_id],
+                dv_tiles[tmem_buf_id],
+                use_acc=False,
+                mBarriers=[do_empties[tmem_buf_id]],
+            )
+
+            # -----------------------------------------------------------
+            ###### MAIN LOOP
+            # -----------------------------------------------------------
+            for blk_idx in range(1, num_steps):
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+
+                prev_blk_idx = blk_idx - 1
+                q_buf_id_prev, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
+                tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+
+                # Compute dq = tl.dot(tl.trans(dsT), k) from previous iteration
+                tlx.barrier_wait(ds_fulls[tmem_buf_id_prev], tmem_phase_prev)
+                tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
+                dsT_view = tlx.local_trans(ds_tiles[tmem_buf_id_prev])
+                tlx.async_dot(
+                    dsT_view,
+                    k_tiles[0],
+                    dq_tiles[tmem_buf_id_prev],
+                    use_acc=False,
+                    mBarriers=[dq_fulls[tmem_buf_id_prev]],
+                )
+
+                # Compute dk += tl.dot(dsT, tl.trans(qT)) from previous iteration
+                tlx.async_dot(
+                    ds_tiles[tmem_buf_id_prev],
+                    q_tiles[q_buf_id_prev],
+                    dk_tiles[tmem_buf_id_prev],
+                    use_acc=prev_blk_idx > 0,
+                    mBarriers=[q_empties[tmem_buf_id_prev]],
+                )
 
                 # Compute qkT = tl.dot(k, qT)
                 tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
@@ -1073,57 +1149,81 @@ def _attn_bwd(
                     p_tiles[tmem_buf_id],
                     do_tiles[q_buf_id],
                     dv_tiles[tmem_buf_id],
-                    use_acc=blk_idx > 0,
+                    use_acc=True,
                     mBarriers=[do_empties[q_buf_id]],
                 )
 
-                # Compute dk += tl.dot(dsT, tl.trans(qT))
-                tlx.barrier_wait(ds_fulls[tmem_buf_id], tmem_phase)
-                tlx.async_dot(
-                    ds_tiles[tmem_buf_id],
-                    q_tiles[q_buf_id],
-                    dk_tiles[tmem_buf_id],
-                    use_acc=blk_idx > 0,
-                    mBarriers=[q_empties[tmem_buf_id]],
-                )
-
-                # Compute dq = tl.dot(tl.trans(dsT), k)
-                tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
-                dsT_view = tlx.local_trans(ds_tiles[tmem_buf_id])
-                tlx.async_dot(
-                    dsT_view,
-                    k_tiles[0],
-                    dq_tiles[tmem_buf_id],
-                    use_acc=False,
-                    mBarriers=[dq_fulls[tmem_buf_id]],
-                )
-
             tlx.tcgen05_commit(dv_fulls[kv_buf_id])
-            tlx.tcgen05_commit(dk_fulls[kv_buf_id])
+
+            # -----------------------------------------------------------
+            ###### Epilog
+            # -----------------------------------------------------------
+            q_buf_id, _ = _get_bufidx_phase(num_steps - 1, NUM_BUFFERS_Q)
+            tmem_buf_id, tmem_phase = _get_bufidx_phase(num_steps - 1, NUM_BUFFERS_TMEM)
+            # Compute dk += tl.dot(dsT, tl.trans(qT))
+            tlx.barrier_wait(ds_fulls[tmem_buf_id], tmem_phase)
+            tlx.async_dot(
+                ds_tiles[tmem_buf_id],
+                q_tiles[q_buf_id],
+                dk_tiles[tmem_buf_id],
+                use_acc=num_steps > 1,
+                mBarriers=[q_empties[tmem_buf_id], dk_fulls[kv_buf_id]],
+            )
+
+            # Compute dq = tl.dot(tl.trans(dsT), k)
+            tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+            dsT_view = tlx.local_trans(ds_tiles[tmem_buf_id])
+            tlx.async_dot(
+                dsT_view,
+                k_tiles[0],
+                dq_tiles[tmem_buf_id],
+                use_acc=False,
+                mBarriers=[dq_fulls[tmem_buf_id]],
+            )
+
 
         # load
         with tlx.async_task(num_warps=1, registers=88):
             _, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX,
                                                                           BLOCK_M1, BLOCK_N1)
-
+            # Load K
             kv_buf_id, _ = _get_bufidx_phase(0, NUM_BUFFERS_KV)
             tlx.barrier_expect_bytes(k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
             tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [(off_bh + start_n).to(tl.int32), 0],
                                       k_fulls[kv_buf_id])
 
-            tlx.barrier_expect_bytes(v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
-            tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [(off_bh + start_n).to(tl.int32), 0],
-                                      v_fulls[kv_buf_id])
-
+            # Load Q
             curr_m = start_m
             step_m = BLOCK_M1
-            for blk_idx in range(num_steps):
+            blk_idx = 0
+            q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+            tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
+            tlx.barrier_expect_bytes(q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
+            tlx.async_descriptor_load(desc_q, q_tiles[q_buf_id], [(off_bh + curr_m).to(tl.int32), 0], q_fulls[q_buf_id])
+
+            # Load V
+            tlx.barrier_expect_bytes(v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
+            tlx.async_descriptor_load(
+                desc_v, v_tiles[kv_buf_id], [(off_bh + start_n).to(tl.int32), 0], v_fulls[kv_buf_id]
+            )
+
+            # Load dO
+            tlx.barrier_wait(do_empties[q_buf_id], q_phase ^ 1)
+            tlx.barrier_expect_bytes(do_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
+            tlx.async_descriptor_load(
+                desc_do, do_tiles[q_buf_id], [(off_bh + curr_m).to(tl.int32), 0], do_fulls[q_buf_id]
+            )
+            curr_m += step_m
+
+            for blk_idx in range(1, num_steps):
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                # Load Q
                 tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(desc_q, q_tiles[q_buf_id], [(off_bh + curr_m).to(tl.int32), 0],
                                           q_fulls[q_buf_id])
 
+                # Load dO
                 tlx.barrier_wait(do_empties[q_buf_id], q_phase ^ 1)
                 tlx.barrier_expect_bytes(do_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(desc_do, do_tiles[q_buf_id], [(off_bh + curr_m).to(tl.int32), 0],
