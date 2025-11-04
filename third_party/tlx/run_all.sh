@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Hello, $USER! (Facebook-only)"
+echo "Hello! (Facebook-only)"
 
 # Build
 ask() {
