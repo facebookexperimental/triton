@@ -2881,6 +2881,12 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nPruned tcgen05 commit barriers");
     funcOp.dump();
   });
+  // Predicate any barriers on the initial iteration based on barrier dominance.
+  predicateInitialWaits(funcOp);
+  LLVM_DEBUG({
+    LDBG("\n\nwith Predicated barriers");
+    funcOp.dump();
+  });
 
   // If loadResult has a single use which is LocalAlloc, we can get rid of
   // sharedLoad and replace all uses of LocalAlloc with viewLoad.
