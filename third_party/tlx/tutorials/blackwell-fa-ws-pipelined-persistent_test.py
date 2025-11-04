@@ -1192,7 +1192,6 @@ def _attn_bwd_ws(
                 mBarriers=[dq_fulls[tmem_buf_id]],
             )
 
-
         # load
         with tlx.async_task(num_warps=1, registers=88):
             _, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX,
@@ -1214,17 +1213,15 @@ def _attn_bwd_ws(
 
             # Load V
             tlx.barrier_expect_bytes(v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
-            tlx.async_descriptor_load(
-                desc_v, v_tiles[kv_buf_id], [(off_bh + start_n).to(tl.int32), 0], v_fulls[kv_buf_id]
-            )
+            tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [(off_bh + start_n).to(tl.int32), 0],
+                                      v_fulls[kv_buf_id])
 
             # Load dO
             do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
             tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
             tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
-            tlx.async_descriptor_load(
-                desc_do, do_tiles[do_buf_id], [(off_bh + curr_m).to(tl.int32), 0], do_fulls[do_buf_id]
-            )
+            tlx.async_descriptor_load(desc_do, do_tiles[do_buf_id], [(off_bh + curr_m).to(tl.int32), 0],
+                                      do_fulls[do_buf_id])
             curr_m += step_m
 
             for blk_idx in range(1, num_steps):
@@ -1355,22 +1352,10 @@ class _attention(torch.autograd.Function):
                     BATCH * N_HEAD)  # batch*heads
 
         _attn_bwd_ws[grid](
-            desc_q,
-            desc_k,
-            desc_v,
-            ctx.sm_scale,
-            desc_do,
-            desc_dq,
-            desc_dk,
-            desc_dv,  #
-            M,
-            delta,  #
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),  #
-            N_HEAD,
-            N_CTX,  #
+            desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
+            M, delta,  #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            N_HEAD, N_CTX,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
         )
