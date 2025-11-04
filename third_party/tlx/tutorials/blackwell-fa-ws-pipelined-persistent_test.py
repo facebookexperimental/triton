@@ -951,7 +951,7 @@ def _attn_bwd_ws(
                 curr_m += step_m
 
         # compute
-        with tlx.async_task(num_warps=8, registers=136, replicate=1):
+        with tlx.async_task(num_warps=8, registers=192, replicate=1):
             off_chz, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H,
                                                                                 N_CTX, BLOCK_M1, BLOCK_N1)
 
@@ -1027,7 +1027,7 @@ def _attn_bwd_ws(
                 )
 
         # mma
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=48):
             _, _, start_m, _, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX, BLOCK_M1,
                                                                BLOCK_N1)
 
