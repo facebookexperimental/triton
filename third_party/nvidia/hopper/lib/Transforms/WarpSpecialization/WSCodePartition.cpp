@@ -120,6 +120,7 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
 
     SetVector<std::pair<Operation *, unsigned>> users;
     getTransitiveUsers(result, users);
+    LDBG("getTransitiveUsers returns " << users.size());
     for (auto user : users) {
       auto userOp = user.first;
       if (producerOp == userOp && !opndAOfGen5)
@@ -154,6 +155,16 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
           channelKind = DataChannelKind::REG;
         }
 
+        if (isa<scf::ForOp>(userOp)) {
+          LDBG("createChannel with dstOp ForOp: producerId "
+               << producerTaskId << " number of consumerIds "
+               << consumerTaskIds.size());
+          auto *tSrc = userOp->getOperand(user.second).getDefiningOp();
+          if (isa<scf::ForOp>(tSrc)) {
+            LDBG("createChannel with srcOp ForOp");
+            continue;
+          }
+        }
         channels.push_back(std::make_unique<Channel>(
             producerTaskId, consumerTaskIds, userOp, user.second,
             producerNumBuffers, channels.size(), channelKind));
@@ -262,10 +273,39 @@ static Operation *getUniqueActualConsumer(Operation *consumerOp,
 static Operation *getLastOpInBlock(DenseSet<Operation *> &ops) {
   Operation *tailConsumer = nullptr;
   Operation *first = *(ops.begin());
-  auto cBlock = first->getBlock();
-  for (auto *op : ops)
-    assert(op->getBlock() == cBlock);
-  for (auto &op : reverse(cBlock->getOperations())) {
+  auto cBlock = first->getParentOp();
+  bool inOneBlock = true;
+  DenseSet<Operation *> blocks;
+  for (auto *op : ops) {
+    blocks.insert(op->getParentOp());
+    if (op->getParentOp() != cBlock) {
+      inOneBlock = false;
+      break;
+    }
+  }
+  if (inOneBlock) {
+    assert(isa<scf::ForOp>(cBlock));
+    scf::ForOp cFor = cast<scf::ForOp>(cBlock);
+    for (auto &op : reverse(cFor.getBody()->getOperations())) {
+      if (ops.count(&op)) {
+        tailConsumer = &op;
+        break;
+      }
+    }
+    return tailConsumer;
+  }
+  // Handle ops in different blocks: find the last op in the last block.
+  // find the last block in blocks
+  auto *lastB = *(blocks.begin());
+  for (auto *block : blocks) {
+    if (block == lastB)
+      continue;
+    if (appearsBefore(lastB, block))
+      lastB = block;
+  }
+  assert(isa<scf::ForOp>(lastB));
+  scf::ForOp lastFor = cast<scf::ForOp>(lastB);
+  for (auto &op : reverse(lastFor.getBody()->getOperations())) {
     if (ops.count(&op)) {
       tailConsumer = &op;
       break;
@@ -918,7 +958,6 @@ void createTokenPost(
     DenseMap<Channel *, CommChannel> &tokenMap, ReuseConfig *config) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
-  DenseMap<ttng::TCGen5MMAOp, Channel *> gen5Barriers;
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
     LLVM_DEBUG({
@@ -991,7 +1030,8 @@ void createTokenPost(
         }
       }
       assert(!actualConsumers.empty());
-      Operation *consumerOp = getLastOpInBlock(actualConsumers);
+      Operation *consumerOp =
+          *actualConsumers.begin(); // getLastOpInBlock(actualConsumers);
 
       LLVM_DEBUG({
         LDBG("-- createToken: useGen5Barrier = "
@@ -1000,14 +1040,6 @@ void createTokenPost(
         dstOp->dump();
         consumerOp->dump();
       });
-      if (useGen5Barrier) {
-        // FIXME: check to see if there is another conflict of using inline
-        // barrier.
-        auto mmaOp = cast<ttng::TCGen5MMAOp>(consumerOp);
-        if (gen5Barriers.count(mmaOp) && gen5Barriers[mmaOp] != channel) {
-          // Set useGen5Barrier to false if necessary.
-        }
-      }
       // Need token only when we are not using inline barriers
       if (!hasProdBar || !useGen5Barrier) {
         ttnvws::TokenLoadType tokenLoadType;
@@ -1035,7 +1067,6 @@ void createTokenPost(
       if (useGen5Barrier) {
         Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
-        gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
     }
 
@@ -1352,20 +1383,42 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
   });
 
   OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
-  llvm::MapVector<Value, SmallVector<Channel *>> channelsGroupedByProducers;
+  llvm::MapVector<Channel *, SmallVector<Channel *>> channelsGroupedByProducers;
 
   // Group channels by source values
+  // Do not group if they are in different blocks.
+  llvm::MapVector<Value, SmallVector<Channel *>> repChannelsForValue;
   for (auto *channelInOrder : orderedChannels) {
     auto srcValue = channelInOrder->getSrcOperand();
-    channelsGroupedByProducers[srcValue].push_back(channelInOrder);
+    // Find the repChannel for channelInOrder, by checking srcValue and block.
+    Channel *repCh = nullptr;
+    if (repChannelsForValue.count(srcValue)) {
+      for (auto *tCh : repChannelsForValue[srcValue]) {
+        if (tCh->getDstOp()->getBlock() ==
+            channelInOrder->getDstOp()->getBlock()) {
+          repCh = tCh;
+          break;
+        }
+      }
+      if (repCh)
+        channelsGroupedByProducers[repCh].push_back(channelInOrder);
+    }
+    // create a new entry
+    if (!repCh) {
+      repChannelsForValue[srcValue].push_back(channelInOrder);
+      channelsGroupedByProducers[channelInOrder].push_back(channelInOrder);
+    }
   }
 
   mlir::DominanceInfo dom(funcOp);
-  for (auto &[srcValue, channels] : channelsGroupedByProducers) {
+  LDBG("channels in group");
+  for (auto &[repChannel, channels] : channelsGroupedByProducers) {
+    auto srcValue = repChannel->getSrcOperand();
     // Find a common place for all users of the producer, which would be the
     // common dominator.
     std::unordered_set<Channel *> mutuallyNonDominatingUsers;
     for (auto user : channels) {
+      LLVM_DEBUG(user->getDstOp()->dump());
       auto it = mutuallyNonDominatingUsers.begin();
       while (it != mutuallyNonDominatingUsers.end()) {
         if (dom.properlyDominates(user->getDstOp(), (*it)->getDstOp())) {
@@ -1796,6 +1849,8 @@ void replaceBufferReuse(triton::FuncOp funcOp,
                             &channelsGroupedByConsumers,
                         const SmallVector<Channel *> &orderedChannels,
                         ReuseConfig *config) {
+  // Multiple channels can associate with the same alloc.
+  DenseSet<Operation *> handledAllocs;
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
     assert(it != channelsGroupedByConsumers.end());
@@ -1807,10 +1862,14 @@ void replaceBufferReuse(triton::FuncOp funcOp,
     // The biggest type should be the representative.
     auto *repCh = config->getGroup(reuseGrp)->channels[0];
     if (channel != repCh && channel->getAllocOp() != repCh->getAllocOp()) {
+      if (handledAllocs.count(channel->getAllocOp()))
+        continue;
       LLVM_DEBUG({
-        LDBG("replace users for channel with alloc ");
+        LDBG("replace users for channel with alloc "
+             << channel->getAllocOp() << " in reuseGrp " << reuseGrp);
         channel->getAllocOp()->dump();
       });
+      handledAllocs.insert(channel->getAllocOp());
       if (channel->channelKind == DataChannelKind::SMEMPost) {
         assert(channel->getAllocOp()->getResult(0).getType() ==
                repCh->getAllocOp()->getResult(0).getType());
@@ -2610,6 +2669,7 @@ void foldLocalLoads(triton::FuncOp funcOp) {
                                               kv.getSecond());
 }
 
+// Compare against TritonNvidiaGPURemoveTMEMTokensPass.
 static void cleanupTmemTokens(triton::FuncOp funcOp) {
   auto b = OpBuilder::atBlockBegin(&funcOp.getBody().front());
   Value replTok =
@@ -2627,6 +2687,9 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
       mmaOp.getAccDepMutable().clear();
       if (mmaOp.getToken())
         mmaOp.getToken().replaceAllUsesWith(replTok);
+    } else if (auto alloc = dyn_cast<ttng::TMEMAllocOp>(op)) {
+      if (alloc.getToken())
+        alloc.getToken().replaceAllUsesWith(replTok);
     }
   });
 }
