@@ -90,7 +90,7 @@ read user_choice
 case $user_choice in
     c)
         echo "Verifying correctness of TLX tutorial kernels"
-        pytest third_party/tlx/tutorials/
+        pytest third_party/tlx/tutorials/*.py
         ;;
     p)
         echo "Measuring performance of TLX tutorial kernels"
