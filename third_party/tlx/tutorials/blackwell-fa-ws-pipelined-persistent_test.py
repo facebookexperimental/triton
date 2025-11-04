@@ -1042,7 +1042,7 @@ def _attn_bwd_ws(
             blk_idx = 0
 
             # -----------------------------------------------------------
-            ###### Prologue
+            # Prolog
             #
             # 1. qkT = tl.dot(k, qT)
             # 2. dpT = tl.dot(v, tl.trans(do))
@@ -1089,7 +1089,12 @@ def _attn_bwd_ws(
             )
 
             # -----------------------------------------------------------
-            ###### MAIN LOOP
+            # Main loop
+            # 1. qkT = tl.dot(k, qT)
+            # 2. dq = tl.dot(tl.trans(dsT), k) from previous iteration
+            # 3. dk += tl.dot(dsT, tl.trans(qT)) from previous iteration
+            # 4. dpT = tl.dot(v, tl.trans(do))
+            # 5. dv += tl.dot(ppT, do)
             # -----------------------------------------------------------
             for blk_idx in range(1, num_steps):
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
@@ -1159,7 +1164,9 @@ def _attn_bwd_ws(
             tlx.tcgen05_commit(dv_fulls[kv_buf_id])
 
             # -----------------------------------------------------------
-            ###### Epilog
+            # Epilog
+            # 4. dk += tl.dot(dsT, tl.trans(qT))
+            # 5. dq = tl.dot(tl.trans(dsT), k)
             # -----------------------------------------------------------
             q_buf_id, _ = _get_bufidx_phase(num_steps - 1, NUM_BUFFERS_Q)
             tmem_buf_id, tmem_phase = _get_bufidx_phase(num_steps - 1, NUM_BUFFERS_TMEM)
