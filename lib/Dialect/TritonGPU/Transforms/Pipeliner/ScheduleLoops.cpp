@@ -470,9 +470,24 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
   int droppedStages = maxPossibleDistance - maxDistance;
-  int numClusters = maxClusterPerDistance[(maxClusterPerDistance.size() - 1) -
-                                          droppedStages] +
-                    1;
+  int maxIndex = 0;
+  int minIndex =
+      maxClusterPerDistance[(maxClusterPerDistance.size() - 1) - droppedStages];
+  // Calculate the min/max cluster index to avoid wasted empty clusters.
+  // This is mostly to avoid divergence with upstream.
+  for (auto [op, stage] : opToStage) {
+    auto mappedClusterIdx = clusterMap.find(op);
+    int clusterIdx;
+    if (mappedClusterIdx != clusterMap.end()) {
+      clusterIdx = mappedClusterIdx->second;
+    } else {
+      auto dist = maxDistance - stage;
+      clusterIdx = maxClusterPerDistance[dist];
+    }
+    minIndex = std::min(minIndex, clusterIdx);
+    maxIndex = std::max(maxIndex, clusterIdx);
+  }
+  int numClusters = maxIndex - minIndex + 1;
   CoarseSchedule schedule(maxStage + 1);
   SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
   for (int i = 0; i < numClusters; i++) {
@@ -488,7 +503,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       auto dist = maxDistance - stage;
       clusterIdx = maxClusterPerDistance[dist];
     }
-    schedule.insert(op, stage, clusters[clusterIdx]);
+    schedule.insert(op, stage, clusters[clusterIdx - minIndex]);
   }
 
   // Move `scf.if` ops in the current schedule (forward slice of the latency
