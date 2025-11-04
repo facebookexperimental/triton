@@ -1661,7 +1661,7 @@ def test_async_dots_blackwell_tmem(device):
 
     kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
     kernel = tcgen5_fa_kernel[(1, 1)](a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c, c.stride(0),
-                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=1)
+                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=4)
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.tmem_alloc") == 2
@@ -1682,37 +1682,36 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        pid = tl.program_id(axis=0)
-        block_start = pid * BLOCK_SIZE
+        tile_id = tl.program_id(axis=0)
 
-        tid = tlx.thread_id(axis=0)
+        # CLC Init
+        clc_phase_producer = 1
+        clc_phase_consumer = 0
+        # NUM_CLC_STAGES=1
+        # NUM_CONSUMERS=1
+        clc_context = tlx.clc_create_context(1, 1)
 
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
+        while tile_id != -1:
+            # CLC producer
+            tlx.clc_producer(clc_context, 0, clc_phase_producer)
+            clc_phase_producer ^= 1
 
-        x = tl.load(x_ptr + offsets, mask=mask)
-        y = tl.load(y_ptr + offsets, mask=mask)
-        output = x * y
-        tl.store(z_ptr + offsets, output, mask=mask)
+            block_start = tile_id * BLOCK_SIZE
 
-        bars = tlx.alloc_barriers(num_barriers=1)
-        clc_mbar = bars[0]
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
 
-        responses = tlx.alloc_clc_responses(num_responses=1)
-        clc_response = tlx.local_view(responses, 0)
-        tlx.barrier_expect_bytes(clc_mbar, 16)  # CLC response is 16-byte
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            output = x * y
+            tl.store(z_ptr + offsets, output, mask=mask)
 
-        # Issue async clc.try_cancel for the next available CTA
-        tlx.clc_issue(clc_response, clc_mbar)
+            # CLC consumer
+            tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
+            clc_phase_consumer ^= 1
 
-        # Wait for clc.try_cancel finishes
-        tlx.barrier_wait(clc_mbar, 0)
-
-        # Extract CTA ID from CLC response
-        res = tlx.clc_query(clc_response)
-
-        if tid == 0:
-            tl.device_print("Extracted CtaID", res)
+            if tlx.thread_id(axis=0) == 0:
+                tl.device_print("Extracted CtaID", tile_id)
 
     torch.manual_seed(0)
     # number of kernels to launch in a non-persistent mode
@@ -1731,11 +1730,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
     assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
 
-    # Each worker uses the {blockIdx.x, blockIdx.y, blockIdx.z} coordinate as the first output tile to process
-    # and uses the CLC query for subsequent processing of output tiles.
-    # However in our test those CTAs left from the first round won't execute.
-    # Its nonzero count MUST be different from original size.
-    assert (torch.count_nonzero(output) != size)
+    assert (torch.count_nonzero(output) == size)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
