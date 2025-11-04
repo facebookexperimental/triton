@@ -839,7 +839,7 @@ configs_bwd_tlx = [
 
 @triton.autotune(configs=configs_bwd_tlx, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
-def _attn_bwd(
+def _attn_bwd_ws(
     desc_q,
     desc_k,
     desc_v,
@@ -951,7 +951,7 @@ def _attn_bwd(
                 curr_m += step_m
 
         # compute
-        with tlx.async_task(num_warps=4, registers=136, replicate=1):
+        with tlx.async_task(num_warps=8, registers=136, replicate=1):
             off_chz, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H,
                                                                                 N_CTX, BLOCK_M1, BLOCK_N1)
 
@@ -1344,11 +1344,23 @@ class _attention(torch.autograd.Function):
                     1,  # (or cdiv over M if you need)
                     BATCH * N_HEAD)  # batch*heads
 
-        _attn_bwd[grid](
-            desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
-            M, delta,  #
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-            N_HEAD, N_CTX,  #
+        _attn_bwd_ws[grid](
+            desc_q,
+            desc_k,
+            desc_v,
+            ctx.sm_scale,
+            desc_do,
+            desc_dq,
+            desc_dk,
+            desc_dv,  #
+            M,
+            delta,  #
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),  #
+            N_HEAD,
+            N_CTX,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
         )
