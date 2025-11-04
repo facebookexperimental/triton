@@ -176,7 +176,7 @@ Examples: how mbarriers are communicated in warp specialization
 
     Returns the id of the current thread instance along the given `axis`.
 
-- `tlx.thread_id(axis)`
+- `tlx.clock64()`
 
     Returns the current 64-bit hardware clock value. E.g,
     ```

@@ -567,7 +567,9 @@ def TTG_WarpReturnOp : TTG_Op<"warp_return", [
   let assemblyFormat = "attr-dict";
 }
 
-def TTG_Clock64Op : TTG_Op<"clock64", []> {
+def TTG_Clock64Op : TTG_Op<"clock64", [
+    MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
+]> {
   let summary = "read 64-bit GPU clock counter";
   let results = (outs I64:$res);
   let assemblyFormat = "attr-dict";
