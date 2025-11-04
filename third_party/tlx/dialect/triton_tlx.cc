@@ -537,6 +537,11 @@ void init_triton_tlx_ir(py::module &&m) {
                  other.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile);
            })
+      .def("create_clock64",
+           [](TritonOpBuilder &self) -> mlir::Value {
+             return self.create<triton::gpu::Clock64Op>(
+                 self.getBuilder().getIntegerType(64));
+           })
       .def("create_thread_id",
            [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
              static constexpr mlir::gpu::Dimension dims[] = {

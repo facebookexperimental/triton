@@ -52,10 +52,25 @@ struct GetNumProgramsOpConversion
   }
 };
 
+struct Clock64OpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::Clock64Op> {
+  using ConvertOpToLLVMPattern<triton::gpu::Clock64Op>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::Clock64Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto readClock =
+        rewriter.create<NVVM::Clock64Op>(op.getLoc(), rewriter.getI64Type());
+    rewriter.replaceOp(op, readClock.getResult());
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateSPMDOpToLLVMPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
   patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);
+  patterns.add<Clock64OpConversion>(typeConverter, benefit);
 }
