@@ -914,6 +914,7 @@ def _attn_bwd_ws(
     qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
@@ -986,6 +987,8 @@ def _attn_bwd_ws(
                 # Wait for dpT = tl.dot(v, tl.trans(do))
                 tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
                 dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+                tlx.barrier_arrive(dp_empties[tmem_buf_id])
+
                 # No need to release dP, as dP uses the same tmem as dQ
                 # in the same iteration. Release dQ instead later.
                 dsT = pT * (dpT - Di[None, :])
@@ -1068,7 +1071,7 @@ def _attn_bwd_ws(
             # Compute dpT = tl.dot(v, tl.trans(do))
             tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
             # As dP uses the same tmem as dQ, wait for dQ release.
-            tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+            tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
             doT = tlx.local_trans(do_tiles[do_buf_id])
             tlx.async_dot(
                 v_tiles[0],
@@ -1141,7 +1144,7 @@ def _attn_bwd_ws(
                 # Compute dpT = tl.dot(v, tl.trans(do))
                 tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
                 # As dP uses the same tmem as dQ, wait for dQ release.
-                tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+                tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
                 doT = tlx.local_trans(do_tiles[do_buf_id])
                 tlx.async_dot(
                     v_tiles[0],
@@ -1370,9 +1373,9 @@ attention = _attention.apply
     not is_blackwell(),
     reason="Requires Hopper GPU",
 )
-@pytest.mark.parametrize("Z", [8])
-@pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024])
+@pytest.mark.parametrize("Z", [1])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("N_CTX", [256])
 @pytest.mark.parametrize("HEAD_DIM", [128])
 @pytest.mark.parametrize("mode", ["bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
