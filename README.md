@@ -176,8 +176,15 @@ Examples: how mbarriers are communicated in warp specialization
 
     Returns the id of the current thread instance along the given `axis`.
 
+- `tlx.clock64()`
 
-
+    Returns the current 64-bit hardware clock value. E.g,
+    ```
+        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start  # Number of clock cycles elapsed
+    ```
 
 
 ## Kernels Implemented with TLX
