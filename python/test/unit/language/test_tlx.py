@@ -552,6 +552,34 @@ def test_thread_id(device):
     torch.testing.assert_close(output, expected_output)
 
 
+def test_clock64(device):
+
+    @triton.jit
+    def clock64_from_thread_0_kernel(
+        output_ptr,
+        value,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tid = tlx.thread_id(0)
+        if pid == 0 and tid == 0:
+            start = tlx.clock64()
+            tl.store(output_ptr + offsets, value, mask=mask)
+            end = tlx.clock64()
+            tl.device_print("Cycles elapsed: ", end - start)
+
+    output = torch.zeros(32, dtype=torch.int32, device="cuda")
+    n_elements = output.numel()
+    value = 42
+    kernel = clock64_from_thread_0_kernel[(1, )](output, value, n_elements, 32, num_warps=1)
+    assert kernel.asm["ttgir"].count("ttg.clock64") == 2
+    assert kernel.asm["ptx"].count("%clock64") == 2
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_async_wait(BLOCK_SIZE, device):

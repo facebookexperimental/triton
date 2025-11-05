@@ -15,7 +15,7 @@ from .types import (
     CLCPipelineContext,
     async_token,
 )
-from .mem_ops import (local_alloc, local_view, local_slice, subslice, async_load, async_load_commit_group,
+from .mem_ops import (local_alloc, local_view, remote_view, local_slice, subslice, async_load, async_load_commit_group,
                       async_load_wait_group, local_load, local_store, local_trans, local_reinterpret,
                       async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, fence_async_shared)
 from .barrier import (
@@ -35,6 +35,7 @@ from .utility import (
     thread_id,
     async_task_replica_id,
     dtype_of,
+    clock64,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -69,6 +70,7 @@ __all__ = [
     # mem_ops
     "local_alloc",
     "local_view",
+    "remote_view",
     "local_slice",
     "subslice",
     "async_load",
@@ -97,6 +99,7 @@ __all__ = [
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    "clock64",
     # dynamic launcher ops
     "_alloc_clc_responses",
     "_clc_issue",

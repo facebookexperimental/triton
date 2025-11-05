@@ -4,6 +4,7 @@ from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
 from triton._C.libtriton import ir
+
 from triton.language.semantic import TritonSemantic
 
 
@@ -178,6 +179,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 class storage_kind(enum.Enum):
     smem = "smem"
     tmem = "tmem"
+    smemCluster = "smemCluster"
 
 
 class buffered_tensor(tl.base_value):
@@ -286,9 +288,10 @@ class mbarrier(tl.base_value):
     """
 
     def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding],
-                 semantics: TritonSemantic = None):
+                 semantics: TritonSemantic = None, storage: storage_kind = storage_kind.smem):
+        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, "mbarrier requires storage to be smem or smemCluster"
         self.handle = handle
-        self.type = mbarrier_type(num, layout, semantics)
+        self.type = mbarrier_type(num, layout, semantics, storage)
         self.num = num
 
     def _flatten_ir(self, handles) -> None:
@@ -304,8 +307,8 @@ class mbarrier(tl.base_value):
 
 class mbarrier_type(buffered_tensor_type):
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic):
-        super().__init__(tl.int64, [1], num, storage_kind.smem, layout, semantic)
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic, storage):
+        super().__init__(tl.int64, [1], num, storage, layout, semantic)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
         value = mbarrier(handles[cursor], self.num, self.layout, self.semantic)

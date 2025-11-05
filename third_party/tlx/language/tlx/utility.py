@@ -53,3 +53,20 @@ def dtype_of(v, _semantic=None) -> tl.dtype:
         return v.dtype
     else:
         raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
+
+
+@tl.builtin
+def clock64(_semantic=None):
+    """
+    Returns the current 64-bit hardware clock value.
+    The returned value is the number of clock cycles since the device was powered on or reset.
+    This is useful for measuring elapsed time or performance of specific code regions.
+    Returns:
+        tl.tensor: A tensor containing the current 64-bit clock value as an int64.
+    Example:
+        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start  # Number of clock cycles elapsed
+    """
+    return tl.tensor(_semantic.builder.create_clock64(), tl.int64)

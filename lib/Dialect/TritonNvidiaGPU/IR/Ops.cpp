@@ -38,6 +38,29 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+LogicalResult MapToRemoteBufferOp::verify() {
+  // src and result should have the same type except MemorySpace
+  MemDescType localType = getSrc().getType();
+  MemDescType remoteType = getResult().getType();
+  if (!(localType.getShape() == remoteType.getShape() &&
+        localType.getElementType() == remoteType.getElementType() &&
+        localType.getEncoding() == remoteType.getEncoding() &&
+        localType.getMutableMemory() == remoteType.getMutableMemory() &&
+        localType.getAllocShape() == remoteType.getAllocShape())) {
+    return emitOpError() << "Local MemDesc not matching Remote MemDesc: "
+                         << localType << " vs " << remoteType;
+  }
+  if (!isa<SharedMemorySpaceAttr>(localType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for local MemDesc: "
+                         << localType;
+  }
+  if (!isa<SharedClusterMemorySpaceAttr>(remoteType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for remote MemDesc: "
+                         << remoteType;
+  }
+  return success();
+}
+
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
@@ -400,6 +423,8 @@ void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
         useTwoCTAs ? builder.getUnitAttr() : UnitAttr());
 }
 
+bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
+
 // -- TCGen5MMAScaledOp --
 LogicalResult TCGen5MMAScaledOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
@@ -572,6 +597,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr());
 }
+
+bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
 
 // -- TMEMStoreOp --
 static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
