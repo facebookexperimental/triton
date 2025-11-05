@@ -127,6 +127,28 @@ struct FinalizeOpConversion
     Value index = b.load(i32_ty, segmentObj.indexPtr);
     b.store(index, gmemWarpIndexPtr);
 
+    // Write back 'buffer size in byte'.
+    Value gmemBufSizeOffset = b.i32_val(3);
+    Value gmemBufSizePtr =
+        b.gep(scratchPtrTy, i32_ty, scratchPtr, gmemBufSizeOffset);
+    b.store(b.i32_val(bufferSizeInWords * 4), gmemBufSizePtr);
+
+    // Write back 'pre-final time'.
+    Value gmemPreFinalTimeOffset = b.i32_val(6);
+    Value gmemPreFinalTimePtr =
+        b.gep(scratchPtrTy, i32_ty, scratchPtr, gmemPreFinalTimeOffset);
+    Value preFinalTime = targetInfo.globalTime(rewriter, loc);
+    b.store(preFinalTime, gmemPreFinalTimePtr);
+
+    // Early return if we are using the global memory as the profiler buffer.
+    auto objBaseTy =
+        mlir::cast<LLVM::LLVMPointerType>(segmentObj.base.getType());
+    if (objBaseTy.getAddressSpace() == 1) {
+      writeBackPostFinalTime(b, rewriter, op, isFirstThread, scratchPtr);
+      rewriter.eraseOp(op);
+      return success();
+    }
+
     Block *prevBlock = op->getBlock();
     // Add the 'if' block.
     Block *ifBlock = rewriter.splitBlock(prevBlock, op->getIterator());
@@ -167,12 +189,15 @@ struct FinalizeOpConversion
     Value gmemHwidPtr = b.gep(scratchPtrTy, i32_ty, scratchPtr, gmemHwidOffset);
     b.store(hwid, gmemHwidPtr);
 
+<<<<<<< HEAD
     // Write back 'buffer size in byte'.
     Value gmemBufSizeOffset = b.i32_val(3);
     Value gmemBufSizePtr =
         b.gep(scratchPtrTy, i32_ty, scratchPtr, gmemBufSizeOffset);
     b.store(b.i32_val(bufferSizeInWords * 4), gmemBufSizePtr);
 
+=======
+>>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
     // Add the 'else' block and the condition.
     Block *thenBlock = rewriter.splitBlock(ifBlock, op->getIterator());
     rewriter.setInsertionPointToEnd(prevBlock);
@@ -266,9 +291,14 @@ struct SegmentAllocOpConversion
     }
 
     Value buffer = adaptor.getBuffer();
-    auto bufferBaseTy =
-        mlir::cast<LLVM::LLVMStructType>(buffer.getType()).getBody()[0];
-    Value bufferBase = b.extract_val(bufferBaseTy, buffer, 0);
+    Value bufferBase;
+    if (isa<LLVM::LLVMPointerType>(buffer.getType())) {
+      bufferBase = buffer;
+    } else {
+      Type bufferBaseTy =
+          mlir::cast<LLVM::LLVMStructType>(buffer.getType()).getBody()[0];
+      bufferBase = b.extract_val(bufferBaseTy, buffer, 0);
+    }
     auto indexPtrTy =
         ptr_ty(rewriter.getContext(), targetInfo.getIndexPtrAddrSpace());
     auto indexPtr = rewriter.create<LLVM::AllocaOp>(

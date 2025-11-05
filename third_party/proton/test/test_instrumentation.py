@@ -7,10 +7,22 @@ import triton
 import triton.language as tl
 import triton.language.semantic
 import triton.profiler.language as pl
+<<<<<<< HEAD
 import triton.profiler as proton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from typing import NamedTuple
+=======
+from triton._internal_testing import (
+    is_cuda,
+    is_hip,
+    is_hip_cdna2,
+    is_hip_cdna4,
+    supports_tma,
+    supports_ws,
+)
+from triton.tools.tensor_descriptor import TensorDescriptor
+>>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
 
 pl.enable_semantic("triton")
 
@@ -150,6 +162,42 @@ def test_record(method, tmp_path: pathlib.Path):
     assert "proton.record start" in ttir
     assert "proton.record end" in ttir
 
+<<<<<<< HEAD
+=======
+    # check ttir line info
+    start_loc = None
+    end_loc = None
+    for line in ttir.split("\n"):
+        if "proton.record start" in line:
+            start_loc = line.split("loc(")[1].split(")")[0]
+        elif "proton.record end" in line:
+            end_loc = line.split("loc(")[1].split(")")[0]
+        elif start_loc and f"#loc{start_loc}" in line:
+            assert "test_instrumentation.py" in line
+        elif end_loc and f"#loc{end_loc}" in line:
+            assert "test_instrumentation.py" in line
+
+    assert start_loc is not None and end_loc is not None
+
+    # check llir line info
+    llir_lines = pgm.asm["llir"].splitlines()
+    clock_instr = "clock" if is_cuda() else "memtime"
+    clock_loc = None
+    for line in llir_lines:
+        if clock_instr not in line or "!dbg" not in line:
+            continue
+        suffix = line.split("!dbg ")[1]
+        clock_loc = suffix.split(",")[0].split()[0]
+        break
+    assert clock_loc is not None
+    loc_line = next(
+        (line for line in llir_lines if clock_loc in line and "DILocation" in line),
+        None,
+    )
+    assert loc_line is not None
+    assert "line: " in loc_line and "line: 0" not in loc_line
+
+>>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
 
 @pytest.mark.parametrize("hook", ["triton", None])
 def test_tree(tmp_path: pathlib.Path, hook):
@@ -611,3 +659,123 @@ def test_timeline(tmp_path: pathlib.Path):
         assert trace_events[-1]["tid"][0:4] == "warp"
         assert trace_events[-1]["args"]["call_stack"][-1] == "foo"
         assert trace_events[-1]["args"]["call_stack"][-2] == "test"
+<<<<<<< HEAD
+=======
+
+
+@pytest.mark.skipif(is_hip_cdna4(), reason="nondeterministic failure")
+def test_globaltime(tmp_path: pathlib.Path):
+    temp_file = tmp_path / "test_globaltime.chrome_trace"
+    mode = proton.mode.Default(
+        metric_type="cycle",
+        optimizations="clock32,time_shift",
+        sampling_strategy="selective",
+        sampling_options="0",
+    )
+    proton.start(
+        str(temp_file.with_suffix("")),
+        data="trace",
+        backend="instrumentation",
+        mode=mode,
+    )
+
+    @triton.jit()
+    def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pl.enter_scope("elementwise_add_kernel")
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
+        pl.exit_scope("elementwise_add_kernel")
+
+    size = 1024 * 2000
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, BLOCK_SIZE), )
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE, num_warps=16)
+    proton.finalize()
+
+    with temp_file.open() as f:
+        data = json.load(f)
+        trace_events = data["traceEvents"]
+        target = sorted(
+            [event for event in trace_events if "Core0 " in event["pid"]],
+            key=lambda x: x["ts"],
+        )
+        s = len(target)
+        assert s > 1
+        ts_diff = target[s - 1]["ts"] - target[0]["ts"]
+        assert ts_diff >= target[0]["dur"]
+
+
+@pytest.mark.skipif(is_hip(), reason="not implemented yet")
+def test_gmem_buffer(tmp_path: pathlib.Path):
+
+    @triton.jit
+    def add_kernel(
+        x_ptr,
+        y_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        with pl.scope("kernel"):
+            pid = tl.program_id(axis=0)
+            block_start = pid * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            with pl.scope("load_ops"):
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+            output = x + y
+            tl.store(output_ptr + offsets, output, mask=mask)
+
+    size = 512
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    temp_file = tmp_path / "test_gmem_buffer.chrome_trace"
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = (1, 1, 1)
+    mode = proton.mode.Default(buffer_type="global")
+    proton.start(
+        str(temp_file.with_suffix("")),
+        backend="instrumentation",
+        data="trace",
+        mode=mode,
+    )
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024, num_warps=2)
+    proton.finalize()
+
+    with open(temp_file, "rb") as f:
+        data = json.load(f)
+        events = data["traceEvents"]
+
+        # Assert we have exactly 4 events (2 warps × 2 scopes)
+        assert len(events) == 4
+
+        # Assert all events have the expected common fields
+        for event in events:
+            assert "ts" in event
+            assert "dur" in event
+            assert event["dur"] > 0
+
+        # Assert we have 2 kernel events and 2 load_ops events
+        kernel_events = [e for e in events if e["name"] == "kernel"]
+        load_ops_events = [e for e in events if e["name"] == "load_ops"]
+        assert len(kernel_events) == 2
+        assert len(load_ops_events) == 2
+
+        # Assert we have events from both warps
+        warp0_events = [e for e in events if "warp 0" in e["tid"]]
+        warp1_events = [e for e in events if "warp 1" in e["tid"]]
+        assert len(warp0_events) == 2
+        assert len(warp1_events) == 2
+>>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
