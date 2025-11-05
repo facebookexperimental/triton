@@ -318,6 +318,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 
 @gluon.jit
+def shared_memory_permute_kernel():
+    layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    smem = ttgl.allocate_shared_memory(ttgl.float16, [4, 128], layout)
+    perm = smem.permute((1, 0))
+    ttgl.static_assert(perm.layout == ttgl.SwizzledSharedLayout(1, 1, 1, [0, 1]))
+
+
+@pytest.mark.parametrize("target", ALL_TARGETS)
+def test_shared_memory_permute(target):
+    mod = run_parser(shared_memory_permute_kernel, target=target)
+    expecttest.assert_expected_inline(
+        anonymize_ir(mod.str_nodebug()), """\
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @shared_memory_permute_kernel() attributes {noinline = false} {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<4x128xf16, #shared, #smem, mutable>
+    %1 = ttg.memdesc_trans %0 {order = array<i32: 1, 0>} : !ttg.memdesc<4x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x4xf16, #shared1, #smem, mutable>
+    tt.return
+  }
+}
+""")
+
+
+@gluon.jit
 def shared_memory_cast_kernel():
     layout_a: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=64, transposed=False, element_bitwidth=8,
                                                       rank=2)
@@ -807,6 +833,24 @@ def test_mlir_attr_error():
         run_parser(kernel)
 
     assert "order must be a permutation of 0..(rank-1), but was [1]" in str(e.value.__cause__)
+
+
+def test_tensor_layout_type_changed():
+
+    @gluon.jit
+    def kernel():
+        layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32],
+                                                    warps_per_cta=[1, 4], order=[1, 0])
+        x = ttgl.zeros([128], ttgl.float32)
+        y = ttgl.zeros([128, 128], ttgl.float32, layout=layout)
+        c = ttgl.to_tensor(True)
+        while c:
+            x = x + y.sum(axis=0)
+
+    with pytest.raises(CompilationError) as e:
+        run_parser(kernel)
+
+    assert "Loop-carried variable x has initial type" in str(e.value)
 
 
 @gluon.jit
