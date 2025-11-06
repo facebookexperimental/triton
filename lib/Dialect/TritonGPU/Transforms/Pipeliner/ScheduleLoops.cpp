@@ -432,8 +432,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // If an op has no users (maxDist == -1) but has latency, we include its
     // latency otherwise it contributes 0 to the distance.
     //
-    // The maximum distance allowed is the maxmium number of stages.
-    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxPossibleDistance);
+    // Don't cap the distance yet. We don't yet know if the minimum distance is
+    // 0.
+    int d = lat + (maxDist < 0 ? 0 : maxDist);
     distance[op] = d;
     int c = -1;
     // We must always be scheduled as early as our earliest user for the same
@@ -465,8 +466,11 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // We only schedule ops that are downstream of a latency op
     // (had a non-negative distance due to a latency op).
     if (dist >= 0)
-      opToStage[op] = maxDistance - dist;
+      // Cap the final distance to num_stages - 1
+      opToStage[op] = std::min(maxDistance - dist, maxPossibleDistance);
   }
+  // Update the max distance now that we have normalized the stages.
+  maxDistance = std::min(maxPossibleDistance, maxDistance);
   auto stages = llvm::make_second_range(opToStage);
   int maxStage = *llvm::max_element(stages);
   int droppedStages = maxPossibleDistance - maxDistance;
