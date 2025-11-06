@@ -70,6 +70,25 @@ def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
   let assemblyFormat = "attr-dict";
 }
 
+def TTNG_MapToRemoteBufferOp : TTNG_Op<"map_to_remote_buffer", [Pure, MemDescViewTrait]> {
+  let summary = "Map shared memory buffer to the corresponding buffer in the target CTA";
+  let description = [{
+    Given a shared memory buffer mem desc `src`, return a mem desc referring to the corresponding buffer in the specified
+    target CTA.
+
+    `$ctaRank` refers to the unique CTA id in a cluster acorss all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    will be 0~7.
+  }];
+
+  let arguments = (ins TTG_MemDescType:$src, I32:$ctaRank);
+
+  let results = (outs TTG_MemDescType:$result);
+
+  let assemblyFormat = [{$src`,` $ctaRank attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
+
+  let hasVerifier = 1;
+}
+
 //
 // WarpGroupDot Op
 //
@@ -470,7 +489,7 @@ def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait"> {
 
 def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-    DeclareOpInterfaceMethods<DotOpInterface>,
+    DeclareOpInterfaceMethods<DotOpInterface, ["verifyOutputDims"]>,
     DeclareOpInterfaceMethods<MMAv5OpInterface>,
     AttrSizedOperandSegments
 ]> {

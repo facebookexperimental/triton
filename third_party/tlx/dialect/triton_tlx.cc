@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "ir.h" // TritonOpBuilder
 #include "mlir/Pass/PassManager.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -276,7 +277,7 @@ void init_triton_tlx_ir(py::module &&m) {
 
              auto singleBarrierMemDescType = ttg::MemDescType::get(
                  {1}, self.getBuilder().getI64Type(), barrierEncoding,
-                 memorySpace, /*mutableMemory=*/true);
+                 barriersMemDescType.getMemorySpace(), /*mutableMemory=*/true);
 
              // Allocate buffer in shared memory
              mlir::Value bufferViews =
@@ -439,6 +440,8 @@ void init_triton_tlx_ir(py::module &&m) {
                memorySpace = ttng::TensorMemorySpaceAttr::get(context);
              else if (storage == "smem") {
                memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             } else if (storage == "smemCluster") {
+               memorySpace = ttng::SharedClusterMemorySpaceAttr::get(context);
              } else {
                llvm_unreachable("Unknown storage type");
              }
@@ -537,6 +540,11 @@ void init_triton_tlx_ir(py::module &&m) {
                  other.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile);
            })
+      .def("create_clock64",
+           [](TritonOpBuilder &self) -> mlir::Value {
+             return self.create<triton::gpu::Clock64Op>(
+                 self.getBuilder().getIntegerType(64));
+           })
       .def("create_thread_id",
            [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
              static constexpr mlir::gpu::Dimension dims[] = {
@@ -547,6 +555,30 @@ void init_triton_tlx_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_cluster_cta_rank",
+           [](TritonOpBuilder &self) -> Value {
+             // The naming of ClusterCTAIdOp is bad. It actually returns the
+             // cluster CTA rank (1D) instead of cluster CTA ID (3D)
+             Value rank = self.create<triton::nvgpu::ClusterCTAIdOp>(
+                 self.getBuilder().getI32Type());
+             return rank;
+           })
+      .def("create_map_to_remote_buffer",
+           [](TritonOpBuilder &self, Value &src,
+              Value &clusterCTARank) -> Value {
+             auto bufferType = cast<ttg::MemDescType>(src.getType());
+             assert(
+                 isa<ttg::SharedMemorySpaceAttr>(bufferType.getMemorySpace()) &&
+                 "Input of MapToRemoteBuffer has to be local SMEM");
+             auto newBufferType = ttg::MemDescType::get(
+                 bufferType.getShape(), bufferType.getElementType(),
+                 bufferType.getEncoding(),
+                 ttng::SharedClusterMemorySpaceAttr::get(self.getContext()),
+                 bufferType.getMutableMemory(), bufferType.getAllocShape());
+             Value remoteBuf = self.create<ttng::MapToRemoteBufferOp>(
+                 newBufferType, src, clusterCTARank);
+             return remoteBuf;
            });
 }
 

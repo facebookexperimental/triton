@@ -3,6 +3,7 @@ import triton.language.core as tl
 from . import types as tlx
 from .utility import cuda_parse_arch
 from .mma_ops import require_nv_mma_shared_layout
+from .types import storage_kind
 from typing import Optional, Tuple, overload
 
 
@@ -181,6 +182,35 @@ def local_view(
 
 def _buffered_tensor_getitem(self, buffer_idx):
     return local_view(self, buffer_idx, _semantic=self.type.semantic)
+
+
+@tl.builtin
+def remote_view(
+    local_allocated_buffer: tlx.mbarrier,
+    remote_cta_rank: int | tl.constexpr | tl.tensor,
+    _semantic=None,
+) -> tlx.mbarrier:
+    """
+    Returns a remote view of the buffer. This returns a remote buf handle living in a CTA in the same CTA cluster with the
+    executing CTA.
+    :arg local_allocated_buffer: the local buffer handle we start with
+    :arg remote_cta_rank: unique ID of the remote CTA within the CTA cluster. This ID is across all dims, so e.g. for
+    a cluster of shape [2, 4] a valid unique ID could be 0~7, including the executing CTA itself
+    :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
+    """
+    assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
+    assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
+    if isinstance(remote_cta_rank, tl.constexpr) or isinstance(remote_cta_rank, int):
+        remote_cta_rank_handle = _semantic._convert_elem_to_ir_value(tl._unwrap_if_constexpr(remote_cta_rank),
+                                                                     require_i64=False)
+    else:
+        assert isinstance(
+            remote_cta_rank, tl.tensor
+        ), f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)"
+        remote_cta_rank_handle = remote_cta_rank.handle
+    remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
+                                                                      remote_cta_rank_handle)
+    return tlx.mbarrier(remote_buf_handle, 0, local_allocated_buffer.type.layout, storage_kind.smemCluster)
 
 
 tlx.buffered_tensor.__getitem__ = _buffered_tensor_getitem
