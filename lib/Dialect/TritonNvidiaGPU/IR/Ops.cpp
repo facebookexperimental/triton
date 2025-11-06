@@ -22,6 +22,7 @@
  */
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -29,12 +30,36 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir::triton::gpu;
 
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+LogicalResult MapToRemoteBufferOp::verify() {
+  // src and result should have the same type except MemorySpace
+  MemDescType localType = getSrc().getType();
+  MemDescType remoteType = getResult().getType();
+  if (!(localType.getShape() == remoteType.getShape() &&
+        localType.getElementType() == remoteType.getElementType() &&
+        localType.getEncoding() == remoteType.getEncoding() &&
+        localType.getMutableMemory() == remoteType.getMutableMemory() &&
+        localType.getAllocShape() == remoteType.getAllocShape())) {
+    return emitOpError() << "Local MemDesc not matching Remote MemDesc: "
+                         << localType << " vs " << remoteType;
+  }
+  if (!isa<SharedMemorySpaceAttr>(localType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for local MemDesc: "
+                         << localType;
+  }
+  if (!isa<SharedClusterMemorySpaceAttr>(remoteType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for remote MemDesc: "
+                         << remoteType;
+  }
+  return success();
+}
 
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
@@ -261,10 +286,78 @@ static void printToken(OpAsmPrinter &p, Operation *op, Value dep, Type token) {
   p << ']';
 }
 
+namespace {
+enum class MMADTypeKind { tf32, f16, f8f6f4, i8 };
+} // namespace
+
+static std::string strMMADTypeKind(MMADTypeKind kind) {
+  switch (kind) {
+  case MMADTypeKind::tf32:
+    return "tf32";
+  case MMADTypeKind::f16:
+    return "f16";
+  case MMADTypeKind::f8f6f4:
+    return "f8f6f4";
+  case MMADTypeKind::i8:
+    return "i8";
+  }
+  llvm_unreachable("unknown mma dtype kind");
+}
+
+static std::optional<std::pair<MMADTypeKind, SmallVector<Type>>>
+getMMAv5DTypeKindAndAcc(Type t) {
+  MLIRContext *ctx = t.getContext();
+  if (t.isF32()) {
+    return {{MMADTypeKind::tf32, {Float32Type::get(ctx)}}};
+  }
+  if (t.isF16() || t.isBF16()) {
+    return {
+        {MMADTypeKind::f16, {Float16Type::get(ctx), Float32Type::get(ctx)}}};
+  }
+  // TODO: float6 and explicit float4 types are not supported yet.
+  // TODO: tcgen05.mma supports ui8/si8 -> s32 MMA, but Triton does not.
+  // FIXME: i8 is used to represent float4 types.
+  if (isa<Float8E4M3FNType, Float8E5M2Type>(t) || t.isInteger(8)) {
+    return {
+        {MMADTypeKind::f8f6f4, {Float16Type::get(ctx), Float32Type::get(ctx)}}};
+  }
+  return std::nullopt;
+}
+
+static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
+  auto akind = getMMAv5DTypeKindAndAcc(a);
+  auto bkind = getMMAv5DTypeKindAndAcc(b);
+  if (!akind)
+    return op->emitOpError("unsupported LHS operand dtype: ") << a;
+  if (!bkind)
+    return op->emitOpError("unsupported RHS operand dtype: ") << b;
+  if (akind->first != bkind->first) {
+    return op->emitOpError(
+               "LHS and RHS operand dtypes kinds don't match: LHS kind is ")
+           << strMMADTypeKind(akind->first) << " but RHS kind is "
+           << strMMADTypeKind(bkind->first);
+  }
+  if (!llvm::is_contained(akind->second, d)) {
+    InFlightDiagnostic diag =
+        op->emitOpError("unsupported accumulator dtype for operand kind ")
+        << strMMADTypeKind(akind->first) << ", accumulator dtype is " << d
+        << " but must be one of [";
+    llvm::interleaveComma(akind->second, diag, [&](Type t) { diag << t; });
+    diag << "]";
+    return diag;
+  }
+  return success();
+}
+
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
   }
+  Type atype = getA().getType().getElementType();
+  Type btype = getB().getType().getElementType();
+  Type dtype = getD().getType().getElementType();
+  if (failed(verifyMMADType(*this, atype, btype, dtype)))
+    return failure();
   return success();
 }
 
@@ -299,6 +392,29 @@ bool TCGen5MMAOp::verifyDims() {
   return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
 }
 
+bool TCGen5MMAOp::verifyOutputDims() {
+
+  if (getTwoCtas()) {
+    // Here we have to relax the verification to support two possibilities
+    // - For TLX 2CTA:
+    //  - Full MMA shape: [2M, K] x [K, N] -> [2M, N]
+    //  - Each CTA: [M, K] x [K, N/2] -> [M, N]. We're verifying each CTA here.
+    // - For non TLX 2CTA: each CTA has [M, K] x [K, N] -> [M, N]
+    // We cannot rely on module attr to differentiate them here because this
+    // verification can run before Fixup pass. If we want to be as accurate as
+    // possible, we should have a tlxTwoCTAs flag on MMA Op in the future
+    auto aShape = getA().getType().getShape();
+    auto bShape = getB().getType().getShape();
+    auto dShape = getD().getType().getShape();
+    return dShape[dShape.size() - 2] == aShape[aShape.size() - 2] &&
+           (dShape[dShape.size() - 1] == bShape[bShape.size() - 1] /* non TLX*/
+            || dShape[dShape.size() - 1] ==
+                   2 * bShape[bShape.size() - 1] /* TLX 2CTA*/);
+  }
+  // 1cta case still delegates to default verifiers
+  return DotOpInterfaceTrait::verifyOutputDims();
+}
+
 Value TCGen5MMAOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAOp::setUseAccumulator(Value flag) {
@@ -330,11 +446,19 @@ void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
         useTwoCTAs ? builder.getUnitAttr() : UnitAttr());
 }
 
+bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
+
 // -- TCGen5MMAScaledOp --
 LogicalResult TCGen5MMAScaledOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
   }
+  Type atype = getA().getType().getElementType();
+  Type btype = getB().getType().getElementType();
+  Type dtype = getD().getType().getElementType();
+  if (failed(verifyMMADType(*this, atype, btype, dtype)))
+    return failure();
+  return success();
   return success();
 }
 
@@ -496,6 +620,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr());
 }
+
+bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
 
 // -- TMEMStoreOp --
 static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,

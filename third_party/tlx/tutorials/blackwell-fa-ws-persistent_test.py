@@ -391,13 +391,19 @@ class _attention(torch.autograd.Function):
 
         ctx.grid = grid
         _attn_fwd_ws[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
+            sm_scale,
+            M,  #
+            q.shape[0],
+            q.shape[1],  #
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            **extra_kern_args)
+            **extra_kern_args,
+        )
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
@@ -410,7 +416,7 @@ attention = _attention.apply
 
 @pytest.mark.skipif(
     not is_blackwell(),
-    reason="Requires Hopper GPU",
+    reason="Requires Blackwell GPU",
 )
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])

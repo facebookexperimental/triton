@@ -103,8 +103,12 @@ static Value createDescriptor(ConversionPatternRewriter &rewriter, Location loc,
     llvm::report_fatal_error("Unsupported swizzling size.");
   }
   if (swizzling == 0) {
-    desc.leadDimensionBaseOffset = 16 >> 4; // 16 bytes.
-    desc.strideDimensionBaseOffset = (8 * 16) >> 4;
+    // Because the descriptor normalizes spacing to 128-bit units, the
+    // normalized per-element stride is 16 bytes and LBO is defined as 8×that,
+    // i.e. 128 bytes.
+    desc.leadDimensionBaseOffset = 128 >> 4;
+    // Offset from first row to second row 16x16 bytes.
+    desc.strideDimensionBaseOffset = 256 >> 4;
   } else {
     desc.leadDimensionBaseOffset = (swizzling * stride) >> 4;
     desc.strideDimensionBaseOffset = swizzling >> 1;
@@ -159,10 +163,8 @@ Value mlir::triton::NVIDIA::DotOpMmaV3SmemLoader::smemLoad(
       off1 = tb.mul(tb.i32_val(elemBits / 8), offset);
     }
   } else {
-    assert(a == 0 && instrShape[0] * elemBits == 16 * 8 &&
-           "Currently expect that unswizzled case only happens for "
-           "rhs <Kx16> cases and the inner dimension is 16bytes.");
-    off1 = tb.i32_val(512 * b);
+    off1 = tb.mul(k, tb.i32_val(shape[1 - fastMovingDim]));
+    off1 = tb.add(off1, tb.mul(m, tb.i32_val(1024)));
   }
   Value smemBase = tb.ptrtoint(i32_ty, base);
   smemBase = tb.add(smemBase, off1);

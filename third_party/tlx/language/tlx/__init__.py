@@ -1,8 +1,21 @@
 from .async_task import async_task, async_tasks
-from .types import (layout_encoding, shared_layout_encoding, swizzled_shared_layout_encoding,
-                    tensor_memory_layout_encoding, nv_mma_shared_layout_encoding, storage_kind, buffered_tensor,
-                    buffered_tensor_type, mbarrier, mbarrier_type, async_token)
-from .mem_ops import (local_alloc, local_view, local_slice, subslice, async_load, async_load_commit_group,
+from .types import (
+    layout_encoding,
+    shared_layout_encoding,
+    swizzled_shared_layout_encoding,
+    tensor_memory_layout_encoding,
+    nv_mma_shared_layout_encoding,
+    storage_kind,
+    buffered_tensor,
+    buffered_tensor_type,
+    mbarrier,
+    mbarrier_type,
+    clc_response,
+    clc_response_type,
+    CLCPipelineContext,
+    async_token,
+)
+from .mem_ops import (local_alloc, local_view, remote_view, local_slice, subslice, async_load, async_load_commit_group,
                       async_load_wait_group, local_load, local_store, local_trans, local_reinterpret,
                       async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, fence_async_shared)
 from .barrier import (
@@ -19,14 +32,19 @@ from .mma_ops import (
     tcgen05_commit,
 )
 from .utility import (
+    cluster_cta_rank,
     thread_id,
     async_task_replica_id,
     dtype_of,
+    clock64,
 )
 from .dynamic_launch import (
-    alloc_clc_responses,
-    clc_issue,
-    clc_query,
+    _alloc_clc_responses,
+    _clc_issue,
+    _clc_query,
+    clc_producer,
+    clc_consumer,
+    clc_create_context,
 )
 
 from . import compiler
@@ -46,10 +64,14 @@ __all__ = [
     "buffered_tensor_type",
     "mbarrier",
     "mbarrier_type",
+    "clc_response",
+    "clc_response_type",
+    "CLCPipeliner",
     "async_token",
     # mem_ops
     "local_alloc",
     "local_view",
+    "remote_view",
     "local_slice",
     "subslice",
     "async_load",
@@ -75,11 +97,17 @@ __all__ = [
     "async_dot_wait",
     "tcgen05_commit",
     # utility
+    "cluster_cta_rank",
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    "clock64",
     # dynamic launcher ops
-    "alloc_clc_responses",
-    "clc_issue",
-    "clc_query",
+    "_alloc_clc_responses",
+    "_clc_issue",
+    "_clc_query",
+    "clc_create_context",
+    "clc_producer",
+    "clc_consumer",
+    "CLCPipelineContext",
 ]
