@@ -9,6 +9,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -16,6 +17,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -497,7 +499,17 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
   Type memdescType = ttg::MemDescType::get(bufferShape, ty.getElementType(),
                                            sharedEnc, sharedMemorySpace,
                                            /*mutableMemory=*/true);
-  Value alloc = builder.create<ttg::LocalAllocOp>(loc, memdescType);
+
+  Value alloc;
+  if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1)) {
+    alloc = builder.create<ttg::LocalAllocOp>(loc, memdescType);
+  } else {
+    size_t totalSizeBytes = calculateBufferSizeInBytes(ty, bufferShape);
+    auto namedLoc = createNamedAllocationLocation(
+        builder, loc, "pipelined", totalSizeBytes, "pipelining_utility");
+
+    alloc = builder.create<ttg::LocalAllocOp>(namedLoc, memdescType);
+  }
 
   builder.setInsertionPointAfter(insertBefore);
   builder.create<ttg::LocalDeallocOp>(insertBefore->getLoc(), alloc);

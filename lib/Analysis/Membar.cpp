@@ -1,10 +1,12 @@
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include <deque>
 
 namespace mlir {
@@ -159,7 +161,17 @@ void MembarOrFenceAnalysis::visitTerminator(
 
 void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
   OpBuilder::InsertionGuard g(*builder);
-  auto barrierOp = builder->create<gpu::BarrierOp>(op->getLoc());
+
+  if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1)) {
+    auto barrierOp = builder->create<gpu::BarrierOp>(op->getLoc());
+    return;
+  }
+
+  // Create named location for the barrier
+  std::string purpose = op->getName().getStringRef().str();
+  auto namedLoc = createNamedBarrierLocation(*builder, op->getLoc(), purpose,
+                                             "membar_analysis");
+  auto barrierOp = builder->create<gpu::BarrierOp>(namedLoc);
 }
 
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,

@@ -35,6 +35,9 @@ public:
   virtual Value getSrcOperand() { return op->getOperand(operandIdx); }
   virtual Operation *getSrcOp() { return getSrcOperand().getDefiningOp(); }
 
+  // Get a string identifier for this channel
+  std::string getChannelName() const;
+
   Relation relation; // producer task Id, a list of consumer task Ids
   Operation *op;
   unsigned operandIdx;

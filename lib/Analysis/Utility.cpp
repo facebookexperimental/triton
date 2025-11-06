@@ -13,6 +13,10 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -1238,4 +1242,103 @@ bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
          dstLayout.getFreeVariableMasks()[kWarp] == 0;
 }
 
+size_t calculateBufferSizeInBytes(RankedTensorType ty,
+                                  ArrayRef<int64_t> bufferShape) {
+  size_t elemSizeBytes = ty.getElementTypeBitWidth() / 8;
+  size_t totalElements = 1;
+  for (auto dim : bufferShape) {
+    totalElements *= dim;
+  }
+  return totalElements * elemSizeBytes;
+}
+
+mlir::Location createNamedAllocationLocation(OpBuilder &builder,
+                                             Location baseLoc,
+                                             StringRef allocType,
+                                             size_t sizeBytes,
+                                             StringRef passName) {
+  std::string name = "shared_" + allocType.str();
+  if (sizeBytes > 0) {
+    name += "_" + std::to_string(sizeBytes) + "B";
+  }
+  if (!passName.empty()) {
+    name += "_" + passName.str();
+  }
+
+  auto stringAttr = builder.getStringAttr(name);
+  return mlir::NameLoc::get(stringAttr, baseLoc);
+}
+
+mlir::Location createNamedBarrierLocation(OpBuilder &builder, Location baseLoc,
+                                          StringRef purpose,
+                                          StringRef passName) {
+  std::string name = "barrier_" + purpose.str();
+  if (!passName.empty()) {
+    name += "_" + passName.str();
+  }
+
+  auto stringAttr = builder.getStringAttr(name);
+  return mlir::NameLoc::get(stringAttr, baseLoc);
+}
+
 } // namespace mlir
+
+namespace mlir::triton::gpu {
+
+// XXX: generate this list without hardcoding
+static std::string getPartitionNameFromIndex(int idx) {
+  switch (idx) {
+  case 0:
+    return "load_producer";
+  case 1:
+    return "mma_compute";
+  case 2:
+    return "consumer";
+  case 3:
+    return "epilogue";
+  case 4:
+    return "softmax";
+  default:
+    return "id" + std::to_string(idx);
+  }
+}
+
+void renameAllocsToPartition(scf::ForOp loop) {
+  loop.walk([&](Operation *op) {
+    std::string opName = op->getName().getStringRef().str();
+    if (opName.find("alloc") == std::string::npos &&
+        opName.find("barrier") == std::string::npos)
+      return;
+
+    // Get the partition attribute
+    auto partitionAttr = op->getAttrOfType<IntegerAttr>(kPartitionAttrName);
+    if (!partitionAttr)
+      return;
+
+    // Generate partition-based name
+    int partitionIdx = partitionAttr.getInt();
+    std::string partitionName = getPartitionNameFromIndex(partitionIdx);
+    std::string allocName;
+    allocName = partitionName + "_" + opName;
+
+    // Set location with partition name
+    if (!allocName.empty()) {
+      MLIRContext *ctx = op->getContext();
+      auto stringAttr = StringAttr::get(ctx, allocName);
+      auto namedLoc = NameLoc::get(stringAttr, op->getLoc());
+      op->setLoc(namedLoc);
+    }
+  });
+}
+
+void renameAllocsToPartition(ModuleOp module) {
+  if (__builtin_expect(!triton::tools::getBoolEnv("MLIR_ENABLE_DUMP"), 1))
+    return;
+  module.walk([&](scf::ForOp loop) {
+    // Only process loops that have warp specialization
+    if (loop->hasAttr(kWarpSpecializeAttrName))
+      renameAllocsToPartition(loop);
+  });
+}
+
+} // namespace mlir::triton::gpu
