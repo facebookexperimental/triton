@@ -22,7 +22,7 @@ def _is_layout_applicable(layout) -> bool:
             return False
         return True
     elif is_hip():
-        if isinstance(layout, ttgl.PaddedSharedLayout):
+        if layout in ["padded_shared_layout_single_interval", "padded_shared_layout_multi_interval"]:
             return True
         # TODO: Add other amd layouts
         return isinstance(layout, ttgl.amd.AMDMFMALayout)
@@ -142,26 +142,59 @@ def _reduce_layouts():
                                transposed=True),
         # TODO: AMDWMMA layouts
         ttgl.DotOperandLayout(
-            parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[2, 4], ctas_per_cga=[1, 1],
-                                               cta_split_num=[1, 1], cta_order=[0, 1], instr_shape=[16, 8]),
-            operand_index=1, k_width=8),
+            parent=ttgl.NVMMADistributedLayout(
+                version=[2, 0],
+                warps_per_cta=[2, 4],
+                ctas_per_cga=[1, 1],
+                cta_split_num=[1, 1],
+                cta_order=[0, 1],
+                instr_shape=[16, 8],
+            ),
+            operand_index=1,
+            k_width=8,
+        ),
         ttgl.DotOperandLayout(
-            parent=ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[8, 1], ctas_per_cga=[1, 1],
-                                               cta_split_num=[1, 1], cta_order=[1, 0], instr_shape=[16, 32, 16]),
-            operand_index=0, k_width=2),
+            parent=ttgl.NVMMADistributedLayout(
+                version=[3, 0],
+                warps_per_cta=[8, 1],
+                ctas_per_cga=[1, 1],
+                cta_split_num=[1, 1],
+                cta_order=[1, 0],
+                instr_shape=[16, 32, 16],
+            ),
+            operand_index=0,
+            k_width=2,
+        ),
         ttgl.SliceLayout(
-            dim=0, parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1, 1], ctas_per_cga=[1, 1, 1],
-                                                      cta_split_num=[1, 1, 1], cta_order=[2, 1,
-                                                                                          0], instr_shape=[1, 16, 8])),
+            dim=0,
+            parent=ttgl.NVMMADistributedLayout(
+                version=[2, 0],
+                warps_per_cta=[4, 1, 1],
+                ctas_per_cga=[1, 1, 1],
+                cta_split_num=[1, 1, 1],
+                cta_order=[2, 1, 0],
+                instr_shape=[1, 16, 8],
+            ),
+        ),
         ttgl.SliceLayout(
-            dim=1, parent=ttgl.DotOperandLayout(
-                parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1, 1], ctas_per_cga=[1, 1, 1],
-                                                   cta_split_num=[1, 1, 1], cta_order=[2, 1, 0],
-                                                   instr_shape=[1, 16, 8]), operand_index=1, k_width=2)),
+            dim=1,
+            parent=ttgl.DotOperandLayout(
+                parent=ttgl.NVMMADistributedLayout(
+                    version=[2, 0],
+                    warps_per_cta=[4, 1, 1],
+                    ctas_per_cga=[1, 1, 1],
+                    cta_split_num=[1, 1, 1],
+                    cta_order=[2, 1, 0],
+                    instr_shape=[1, 16, 8],
+                ),
+                operand_index=1,
+                k_width=2,
+            ),
+        ),
     ])
 
     rets = []
-    for (M, N) in shapes:
+    for M, N in shapes:
         for layout in layouts:
             if isinstance(layout, (ttgl.amd.AMDMFMALayout, ttgl.NVMMADistributedLayout)):
                 instr_shape = layout.instr_shape
@@ -527,15 +560,8 @@ _intermediate_layouts = _filter_layouts([
     ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]),
     ttgl.SwizzledSharedLayout(vec=4, per_phase=2, max_phase=4, order=[1, 0]),
     ttgl.SwizzledSharedLayout(vec=2, per_phase=2, max_phase=4, order=[1, 0]),
-    ttgl.PaddedSharedLayout(interval_padding_pairs=[[32, 8]], order=[1, 0], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                            cta_order=[0, 1]),
-    ttgl.PaddedSharedLayout(
-        interval_padding_pairs=[[64, 4], [128, 8]],
-        order=[1, 0],
-        ctas_per_cga=[1, 1],
-        cta_split_num=[1, 1],
-        cta_order=[0, 1],
-    ),
+    "padded_shared_layout_single_interval",
+    "padded_shared_layout_multi_interval",
 ])
 
 
@@ -547,6 +573,10 @@ _intermediate_layouts = _filter_layouts([
 def test_convert2d_layouts(M, N, src_layout, interm_layout, dst_layout, dtype, device):
     if str(src_layout) == str(dst_layout):
         pytest.skip("Source and destination layouts are the same")
+
+    if interm_layout in ["padded_shared_layout_single_interval", "padded_shared_layout_multi_interval"]:
+        int_pad_pairs = [[32, 8]] if "single" in interm_layout else [[64, 4], [128, 8]]
+        interm_layout = ttgl.PaddedSharedLayout.with_identity_for(int_pad_pairs, [M, N], [1, 0])
 
     def compute_scratch_buffer_shape(src_layout, dst_layout, shape):
 
@@ -931,36 +961,104 @@ def test_convert_warp_local_layouts(M, N, src_layout, dst_layout, dtype, device)
 
 _ld_st_dot_layouts = _filter_layouts([
     ttgl.DotOperandLayout(
-        parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], ctas_per_cga=[1, 1],
-                                           cta_split_num=[1, 1], cta_order=[1, 0], instr_shape=[16, 8]),
-        operand_index=0, k_width=4),
+        parent=ttgl.NVMMADistributedLayout(
+            version=[2, 0],
+            warps_per_cta=[4, 1],
+            ctas_per_cga=[1, 1],
+            cta_split_num=[1, 1],
+            cta_order=[1, 0],
+            instr_shape=[16, 8],
+        ),
+        operand_index=0,
+        k_width=4,
+    ),
     ttgl.DotOperandLayout(
-        parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], ctas_per_cga=[1, 1],
-                                           cta_split_num=[1, 1], cta_order=[0, 1], instr_shape=[16, 8]),
-        operand_index=1, k_width=4),
+        parent=ttgl.NVMMADistributedLayout(
+            version=[2, 0],
+            warps_per_cta=[4, 1],
+            ctas_per_cga=[1, 1],
+            cta_split_num=[1, 1],
+            cta_order=[0, 1],
+            instr_shape=[16, 8],
+        ),
+        operand_index=1,
+        k_width=4,
+    ),
     ttgl.DotOperandLayout(
-        parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], ctas_per_cga=[1, 1],
-                                           cta_split_num=[1, 1], cta_order=[0, 1], instr_shape=[16, 8]),
-        operand_index=0, k_width=2),
+        parent=ttgl.NVMMADistributedLayout(
+            version=[2, 0],
+            warps_per_cta=[4, 1],
+            ctas_per_cga=[1, 1],
+            cta_split_num=[1, 1],
+            cta_order=[0, 1],
+            instr_shape=[16, 8],
+        ),
+        operand_index=0,
+        k_width=2,
+    ),
     ttgl.DotOperandLayout(
-        parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1], ctas_per_cga=[1, 1],
-                                           cta_split_num=[1, 1], cta_order=[1, 0], instr_shape=[16, 8]),
-        operand_index=1, k_width=2),
+        parent=ttgl.NVMMADistributedLayout(
+            version=[2, 0],
+            warps_per_cta=[4, 1],
+            ctas_per_cga=[1, 1],
+            cta_split_num=[1, 1],
+            cta_order=[1, 0],
+            instr_shape=[16, 8],
+        ),
+        operand_index=1,
+        k_width=2,
+    ),
 ])
 
 _ld_st_mma_layouts = _filter_layouts([
-    ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                                cta_order=[0, 1], instr_shape=[16, 8]),
-    ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 1], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                                cta_order=[0, 1], instr_shape=[16, 128, 16]),
-    ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 2], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                                cta_order=[0, 1], instr_shape=[16, 128, 16]),
-    ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[4, 2], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                                cta_order=[0, 1], instr_shape=[16, 64, 16]),
-    ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[8, 1], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                                cta_order=[0, 1], instr_shape=[16, 128, 16]),
-    ttgl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[8, 4], ctas_per_cga=[1, 1], cta_split_num=[1, 1],
-                                cta_order=[0, 1], instr_shape=[16, 64, 16]),
+    ttgl.NVMMADistributedLayout(
+        version=[2, 0],
+        warps_per_cta=[1, 4],
+        ctas_per_cga=[1, 1],
+        cta_split_num=[1, 1],
+        cta_order=[0, 1],
+        instr_shape=[16, 8],
+    ),
+    ttgl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=[4, 1],
+        ctas_per_cga=[1, 1],
+        cta_split_num=[1, 1],
+        cta_order=[0, 1],
+        instr_shape=[16, 128, 16],
+    ),
+    ttgl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=[4, 2],
+        ctas_per_cga=[1, 1],
+        cta_split_num=[1, 1],
+        cta_order=[0, 1],
+        instr_shape=[16, 128, 16],
+    ),
+    ttgl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=[4, 2],
+        ctas_per_cga=[1, 1],
+        cta_split_num=[1, 1],
+        cta_order=[0, 1],
+        instr_shape=[16, 64, 16],
+    ),
+    ttgl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=[8, 1],
+        ctas_per_cga=[1, 1],
+        cta_split_num=[1, 1],
+        cta_order=[0, 1],
+        instr_shape=[16, 128, 16],
+    ),
+    ttgl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=[8, 4],
+        ctas_per_cga=[1, 1],
+        cta_split_num=[1, 1],
+        cta_order=[0, 1],
+        instr_shape=[16, 64, 16],
+    ),
 ])
 
 _ld_st_shared_layouts = _filter_layouts([
@@ -975,12 +1073,15 @@ _ld_st_shared_layouts = _filter_layouts([
 ])
 
 
-@pytest.mark.parametrize("shape, dtype", [
-    ((16, 32), "float8_e5m2"),
-    ((16, 32), "float16"),
-    ((16, 32), "float32"),
-    ((128, 128), "float16"),
-])
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        ((16, 32), "float8_e5m2"),
+        ((16, 32), "float16"),
+        ((16, 32), "float32"),
+        ((128, 128), "float16"),
+    ],
+)
 @pytest.mark.parametrize("dist_layout", _ld_st_dot_layouts + _ld_st_mma_layouts)
 @pytest.mark.parametrize("shared_layout", _ld_st_shared_layouts)
 def test_local_load_store_2d_layouts(shape, dtype, dist_layout, shared_layout, device):
@@ -995,8 +1096,14 @@ def test_local_load_store_2d_layouts(shape, dtype, dist_layout, shared_layout, d
                                         warps_per_cta=[1, num_warps], order=[0, 1])
 
     @gluon.jit
-    def kernel(x_ptr, y_ptr, shape_tuple: ttgl.constexpr, src_layout: ttgl.constexpr, dst_layout: ttgl.constexpr,
-               shared_layout: ttgl.constexpr):
+    def kernel(
+        x_ptr,
+        y_ptr,
+        shape_tuple: ttgl.constexpr,
+        src_layout: ttgl.constexpr,
+        dst_layout: ttgl.constexpr,
+        shared_layout: ttgl.constexpr,
+    ):
         M: ttgl.constexpr = shape_tuple[0]
         N: ttgl.constexpr = shape_tuple[1]
         offs_m_src = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, src_layout))[:, None]
@@ -1035,9 +1142,17 @@ _ld_st_3d_layouts = _filter_layouts([
     ttgl.BlockedLayout([4, 4, 1], [1, 8, THREADS_PER_WARP // 8], [2, 2, 1], [2, 1, 0], [1, 1, 1], [1, 1, 1], [0, 1, 2]),
     ttgl.BlockedLayout([1, 1, 4], [8, THREADS_PER_WARP // 8, 1], [2, 1, 2], [1, 2, 0], [1, 1, 1], [1, 1, 1], [0, 1, 2]),
     ttgl.DotOperandLayout(
-        parent=ttgl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[4, 1, 1], ctas_per_cga=[1, 1, 1],
-                                           cta_split_num=[1, 1, 1], cta_order=[2, 1, 0], instr_shape=[1, 16, 8]),
-        operand_index=0, k_width=1),
+        parent=ttgl.NVMMADistributedLayout(
+            version=[2, 0],
+            warps_per_cta=[4, 1, 1],
+            ctas_per_cga=[1, 1, 1],
+            cta_split_num=[1, 1, 1],
+            cta_order=[2, 1, 0],
+            instr_shape=[1, 16, 8],
+        ),
+        operand_index=0,
+        k_width=1,
+    ),
 ])
 
 _ld_st_3d_shared_layouts = _filter_layouts([
@@ -1048,9 +1163,12 @@ _ld_st_3d_shared_layouts = _filter_layouts([
 ])
 
 
-@pytest.mark.parametrize("shape, dtype", [
-    ((8, 16, 32), "float32"),
-])
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        ((8, 16, 32), "float32"),
+    ],
+)
 @pytest.mark.parametrize("dist_layout", _ld_st_3d_layouts)
 @pytest.mark.parametrize("shared_layout", _ld_st_3d_shared_layouts)
 def test_local_load_store_3d_layouts(shape, dtype, dist_layout, shared_layout, device):
@@ -1064,8 +1182,14 @@ def test_local_load_store_3d_layouts(shape, dtype, dist_layout, shared_layout, d
     )
 
     @gluon.jit
-    def kernel(x_ptr, y_ptr, shape_tuple: ttgl.constexpr, src_layout: ttgl.constexpr, dst_layout: ttgl.constexpr,
-               shared_layout: ttgl.constexpr):
+    def kernel(
+        x_ptr,
+        y_ptr,
+        shape_tuple: ttgl.constexpr,
+        src_layout: ttgl.constexpr,
+        dst_layout: ttgl.constexpr,
+        shared_layout: ttgl.constexpr,
+    ):
         M: ttgl.constexpr = shape_tuple[0]
         N: ttgl.constexpr = shape_tuple[1]
         K: ttgl.constexpr = shape_tuple[2]
@@ -1154,217 +1278,249 @@ def _gather_kernel_2d(
 
 def _gather_linear_layouts():
     if THREADS_PER_WARP == 32:
-        return [(0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 2], [2, 0]],
-                     lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[32, 16],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[2, 0], [0, 2]],
-                     lane_bases=[[0, 8], [16, 0], [1, 0], [8, 0], [4, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[32, 16],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 2], [32, 0], [2, 0], [0, 16], [0, 32], [64, 0]],
-                     lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[128, 64],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 2], [32, 0], [0, 32], [2, 0], [0, 16], [64, 0], [128, 0]],
-                     lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[256, 64],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[32]],
-                     lane_bases=[[1], [2], [4], [8], [16]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[1]],
-                     lane_bases=[[2], [4], [8], [16], [32]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 1]],
-                     lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32, 2],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 1]],
-                     lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32, 2],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[1, 0]],
-                     lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32, 2],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[1, 0]],
-                     lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[32, 2],
-                 ))]
+        return [
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 2], [2, 0]],
+                    lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[32, 16],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[2, 0], [0, 2]],
+                    lane_bases=[[0, 8], [16, 0], [1, 0], [8, 0], [4, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[32, 16],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 2], [32, 0], [2, 0], [0, 16], [0, 32], [64, 0]],
+                    lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[128, 64],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 2], [32, 0], [0, 32], [2, 0], [0, 16], [64, 0], [128, 0]],
+                    lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[256, 64],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[32]],
+                    lane_bases=[[1], [2], [4], [8], [16]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[1]],
+                    lane_bases=[[2], [4], [8], [16], [32]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 1]],
+                    lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32, 2],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 1]],
+                    lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32, 2],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[1, 0]],
+                    lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32, 2],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[1, 0]],
+                    lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[32, 2],
+                ),
+            ),
+        ]
     elif THREADS_PER_WARP == 64:
-        return [(0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 2], [2, 0]],
-                     lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0], [32, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[64, 16],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[2, 0], [0, 2]],
-                     lane_bases=[[0, 8], [16, 0], [1, 0], [8, 0], [4, 0], [32, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[64, 16],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 2], [2, 0], [0, 16], [0, 32]],
-                     lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0], [32, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[64, 64],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 2], [0, 32], [2, 0], [0, 16], [64, 0]],
-                     lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0], [32, 0]],
-                     warp_bases=[[0, 1], [0, 4]],
-                     block_bases=[],
-                     shape=[128, 64],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16], [32]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16], [32]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16], [32]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[64]],
-                     lane_bases=[[1], [2], [4], [8], [16], [32]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[128],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[1]],
-                     lane_bases=[[2], [4], [8], [16], [32], [64]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[128],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[],
-                     lane_bases=[[1], [2], [4], [8], [16], [32]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 1]],
-                     lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64, 2],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[0, 1]],
-                     lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64, 2],
-                 )),
-                (0,
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[1, 0]],
-                     lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1], [32, 0]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64, 2],
-                 ),
-                 ttgl.DistributedLinearLayout(
-                     reg_bases=[[1, 0]],
-                     lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1], [32, 0]],
-                     warp_bases=[],
-                     block_bases=[],
-                     shape=[64, 2],
-                 ))]
+        return [
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 2], [2, 0]],
+                    lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0], [32, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[64, 16],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[2, 0], [0, 2]],
+                    lane_bases=[[0, 8], [16, 0], [1, 0], [8, 0], [4, 0], [32, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[64, 16],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 2], [2, 0], [0, 16], [0, 32]],
+                    lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0], [32, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[64, 64],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 2], [0, 32], [2, 0], [0, 16], [64, 0]],
+                    lane_bases=[[0, 8], [8, 0], [1, 0], [4, 0], [16, 0], [32, 0]],
+                    warp_bases=[[0, 1], [0, 4]],
+                    block_bases=[],
+                    shape=[128, 64],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16], [32]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16], [32]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16], [32]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[64]],
+                    lane_bases=[[1], [2], [4], [8], [16], [32]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[128],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[1]],
+                    lane_bases=[[2], [4], [8], [16], [32], [64]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[128],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[],
+                    lane_bases=[[1], [2], [4], [8], [16], [32]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 1]],
+                    lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64, 2],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[0, 1]],
+                    lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64, 2],
+                ),
+            ),
+            (
+                0,
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[1, 0]],
+                    lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1], [32, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64, 2],
+                ),
+                ttgl.DistributedLinearLayout(
+                    reg_bases=[[1, 0]],
+                    lane_bases=[[2, 0], [4, 0], [8, 0], [16, 0], [0, 1], [32, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[64, 2],
+                ),
+            ),
+        ]
     else:
         raise RuntimeError(f"Unsupported THREADS_PER_WARP: {THREADS_PER_WARP}")
 
