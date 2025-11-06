@@ -18,6 +18,14 @@ def cuda_parse_arch(arch):
 
 
 @tl.builtin
+def cluster_cta_rank(_semantic=None):
+    """
+    :return the unique CTA ID within a cluster across all dims
+    """
+    return tl.tensor(_semantic.builder.create_cluster_cta_rank(), tl.int32)
+
+
+@tl.builtin
 def thread_id(axis, _semantic=None):
     """
     Returns the id of the current thread instance along the given :code:`axis`.

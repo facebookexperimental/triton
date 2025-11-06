@@ -552,6 +552,37 @@ def test_thread_id(device):
     torch.testing.assert_close(output, expected_output)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_custer_cta_rank(device):
+
+    @triton.jit
+    def test_cta_0_kernel(
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        # without multi-cta cluster launch, this test does not validate much except
+        # the fact that the IR lowering flow works
+        cta_id = tlx.cluster_cta_rank()
+        tl.store(output_ptr + offsets, cta_id, mask=mask)
+
+    tensor_size = 32
+    # init with 1, expected to be filled with 0
+    output = torch.ones(tensor_size, dtype=torch.int32, device=device)
+    kernel = test_cta_0_kernel[(1, )](output, tensor_size, tensor_size, num_warps=1)
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("nvgpu.cluster_id") == 1
+
+    torch.cuda.synchronize()
+    expected_output = torch.zeros(tensor_size, dtype=torch.int32, device=device)
+    torch.testing.assert_close(output, expected_output)
+
+
 def test_clock64(device):
 
     @triton.jit

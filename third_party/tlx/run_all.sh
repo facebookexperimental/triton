@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Hello, $USER! (Facebook-only)"
+echo "Hello! (Facebook-only)"
 
 # Build
 ask() {
@@ -90,10 +90,7 @@ read user_choice
 case $user_choice in
     c)
         echo "Verifying correctness of TLX tutorial kernels"
-        for k in third_party/tlx/tutorials/*.py; do
-            echo "Running $k"
-            pytest $k
-        done
+        pytest third_party/tlx/tutorials/*.py
         ;;
     p)
         echo "Measuring performance of TLX tutorial kernels"
