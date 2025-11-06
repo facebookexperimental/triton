@@ -1242,8 +1242,9 @@ public:
 
     auto CTALayout = ttg::getCTALayout(oldRetEncoding);
 
-    // TODO implement heuristic/option for this parameter
-    bool isTransposed = false;
+    // Use transposed wmma layout to enable larger vectorization for global
+    // store instructions.
+    bool isTransposed = true;
     wmmaEnc = ttg::AMDWmmaEncodingAttr::get(ctx, wmmaVersion, isTransposed,
                                             warpsPerTile, CTALayout);
 
@@ -1479,6 +1480,7 @@ struct TritonAMDGPUAccelerateMatmulPass
           /*benefit=*/2);
       break;
     case ISAFamily::RDNA3:
+    case ISAFamily::RDNA4:
       ttg::populateDecomposeScaledBlockedPatterns(mfmaPatterns,
                                                   /*benefit=*/3);
       mfmaPatterns.add<::BlockedToWMMA>(

@@ -27,7 +27,7 @@ class TritonTLXFixupPass : public impl::TritonTLXFixupBase<TritonTLXFixupPass> {
 
 public:
   // validate the module and error early for unsupported cases
-  LogicalResult verifyModule(ModuleOp &mod) {
+  LogicalResult verifyModule(ModuleOp &mod, bool tlx_2cta) {
     // ws should not capture RankedTensorType
     ttg::WarpSpecializeOp invalidWSOp = nullptr;
     auto result = mod.walk([&](ttg::WarpSpecializeOp op) {
@@ -43,6 +43,37 @@ public:
       return invalidWSOp.emitError() << "WarpSpecializeOp should not capture "
                                         "RankedTensorType. Try moving tensor "
                                         "computation into specific async task.";
+    }
+
+    if (tlx_2cta) {
+      if (numCTAs > 1) {
+        return mod.emitError()
+               << "num_ctas should not be set for TLX 2cta mode";
+      }
+
+      // all the async_dot ops need to be either 1cta or 2cta together
+      auto walkResult = mod.walk([&](ttng::TCGen5MMAOp tcgen05MMAOp) {
+        if (!tcgen05MMAOp.getTwoCtas()) {
+          tcgen05MMAOp.emitError()
+              << "Expecting all dot ops to be 2cta together or 1cta together";
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (walkResult.wasInterrupted()) {
+        return failure();
+      }
+    } else {
+      // Validate 1 cta mode
+      // there should not be a mapa in 1CTA mode
+      if (mod.walk([&](ttng::MapToRemoteBufferOp mapaOp) {
+               mapaOp.emitError()
+                   << "Unexpected buffer remote view in 1cta mode";
+               return WalkResult::interrupt();
+             })
+              .wasInterrupted()) {
+        return failure();
+      }
     }
     return success();
   }
@@ -92,7 +123,16 @@ public:
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    if (failed(verifyModule(mod))) {
+
+    auto hasTLXTwoCTAs = mod.walk([&](ttng::TCGen5MMAOp tcgen05MMAOp) {
+                              if (tcgen05MMAOp.getTwoCtas()) {
+                                return WalkResult::interrupt();
+                              }
+                              return WalkResult::advance();
+                            })
+                             .wasInterrupted();
+
+    if (failed(verifyModule(mod, hasTLXTwoCTAs))) {
       return signalPassFailure();
     }
 
@@ -134,8 +174,8 @@ public:
                                return WalkResult::advance();
                              })
                               .wasInterrupted();
-
-    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps) {
+    if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
+        !hasTLXTwoCTAs) {
       return;
     }
 
@@ -152,6 +192,9 @@ public:
       mod->setAttr(AttrHasExplicitLocalMemAccessName, b.getBoolAttr(true));
     if (hasWarpSpecOps)
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
+    if (hasTLXTwoCTAs) {
+      mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
+    }
   }
 };
 
