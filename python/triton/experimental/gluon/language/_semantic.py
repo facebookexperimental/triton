@@ -72,14 +72,19 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         if axis < 0:
             axis += len(input.shape)
 
-        _check(isinstance(input.type, ttgl.distributed_type),
-               lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}")
+        _check(
+            isinstance(input.type, ttgl.distributed_type),
+            lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}",
+        )
         layout = input.type.layout
-        _check(isinstance(layout, (SliceLayout, AutoLayout)),
-               lambda: f"expected expand_dims input to have a SliceLayout, but got: {layout}")
+        _check(
+            isinstance(layout, (SliceLayout, AutoLayout)),
+            lambda: f"expected expand_dims input to have a SliceLayout, but got: {layout}",
+        )
         _check(
             isinstance(layout, AutoLayout) or layout.dim == axis,
-            lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}")
+            lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}",
+        )
 
         handle = self.builder.create_expand_dims(input.handle, axis)
         return self._wrap_handle_infer_layout(handle, input.type.scalar, dst_shape)
@@ -99,8 +104,10 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         return self._wrap_tensor_infer_layout(value)
 
     def broadcast_impl_shape(self, input: TensorTy, shape: Tuple[int]) -> TensorTy:
-        _check(isinstance(input.type, ttgl.distributed_type),
-               lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}")
+        _check(
+            isinstance(input.type, ttgl.distributed_type),
+            lambda: f"expected expand_dims input to be a distributed_type but got: {input.type!r}",
+        )
         src_shape = input.type.get_block_shapes()
         _check(len(src_shape) == len(shape), lambda: f"Cannot broadcast, rank mismatch: {src_shape}, {shape}")
         if shape == src_shape:
@@ -121,10 +128,14 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         if not lhs_ty.is_block() or not rhs_ty.is_block():
             return super().broadcast_impl_value(lhs, rhs)
 
-        _check(isinstance(lhs_ty, ttgl.distributed_type),
-               lambda: f"expected broadcast left input to be a distributed_type but got: {lhs_ty!r}")
-        _check(isinstance(rhs_ty, ttgl.distributed_type),
-               lambda: f"expected broadcast right input to be a distributed_type but got: {rhs_ty!r}")
+        _check(
+            isinstance(lhs_ty, ttgl.distributed_type),
+            lambda: f"expected broadcast left input to be a distributed_type but got: {lhs_ty!r}",
+        )
+        _check(
+            isinstance(rhs_ty, ttgl.distributed_type),
+            lambda: f"expected broadcast right input to be a distributed_type but got: {rhs_ty!r}",
+        )
 
         lhs_shape = lhs_ty.get_block_shapes()
         rhs_shape = rhs_ty.get_block_shapes()
@@ -264,8 +275,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         _check(_is_int_list(shape), lambda: f"all elements of 'shape' must be integers but got {shape}")
         _check(
             math.prod(shape) == math.prod(mem_desc.shape),
-            lambda: (f"memdesc_reshape total elements mismatch: "
-                     f"{mem_desc.shape} -> {shape}"),
+            lambda: (f"memdesc_reshape total elements mismatch: {mem_desc.shape} -> {shape}"),
         )
 
         handle = self.builder.create_memdesc_reshape(mem_desc.handle, shape)
@@ -358,15 +368,43 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         handle = self.builder.create_histogram(input.handle, num_bins, mask, layout_attr)
         return self.wrap_tensor(handle, ttgl.int32, [num_bins], layout)
 
-    def warp_specialize(self, default_args, default_partition, worker_args, worker_partitions,
-                        worker_num_warps: Sequence[int], worker_num_regs: Sequence[int], generator):
+    def gather(self, src: TensorTy, index: TensorTy, axis: int) -> TensorTy:
+        _check(isinstance(src.type, ttgl.distributed_type), lambda: f"expected distributed_type but got: {src.type!r}")
+        _check(isinstance(index.type, ttgl.distributed_type),
+               lambda: f"expected distributed_type but got: {index.type!r}")
+        _check(index.type.scalar.is_int(), lambda: f"expected integer scalar type but got: {index.type.scalar!r}")
+
+        rank = len(src.type.shape)
+        _check(len(index.type.shape) == rank, "source and index tensors must have the same rank")
+        _check(-rank <= axis < rank, lambda: f"gather axis {axis} must be < source rank ({rank})")
+        if axis < 0:
+            axis += rank
+
+        for d in range(rank):
+            if d == axis:
+                continue
+            _check(
+                index.type.shape[d] == src.type.shape[d],
+                lambda: f"index dim {axis} must match the corresponding source dim",
+            )
+        gather = self.builder.create_gather(src.handle, index.handle, axis)
+        return self.wrap_tensor(gather, src.type.scalar, index.type.shape, index.type.layout)
+
+    def warp_specialize(
+        self,
+        default_args,
+        default_partition,
+        worker_args,
+        worker_partitions,
+        worker_num_warps: Sequence[int],
+        worker_num_regs: Sequence[int],
+        generator,
+    ):
         num_partitions = len(worker_partitions)
-        assert num_partitions == len(
-            worker_num_warps
-        ), f"warp specialize got {num_partitions} partitions but {len(worker_num_warps)} warp counts"
-        assert num_partitions == len(
-            worker_num_regs
-        ), f"warp specialize got {num_partitions} partitions but {len(worker_num_regs)} register counts"
+        assert num_partitions == len(worker_num_warps), (
+            f"warp specialize got {num_partitions} partitions but {len(worker_num_warps)} warp counts")
+        assert num_partitions == len(worker_num_regs), (
+            f"warp specialize got {num_partitions} partitions but {len(worker_num_regs)} register counts")
 
         builder = self.builder
         insert_pt = builder.get_insertion_point()

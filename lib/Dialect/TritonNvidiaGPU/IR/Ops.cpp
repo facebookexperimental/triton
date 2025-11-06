@@ -30,12 +30,36 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir::triton::gpu;
 
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+LogicalResult MapToRemoteBufferOp::verify() {
+  // src and result should have the same type except MemorySpace
+  MemDescType localType = getSrc().getType();
+  MemDescType remoteType = getResult().getType();
+  if (!(localType.getShape() == remoteType.getShape() &&
+        localType.getElementType() == remoteType.getElementType() &&
+        localType.getEncoding() == remoteType.getEncoding() &&
+        localType.getMutableMemory() == remoteType.getMutableMemory() &&
+        localType.getAllocShape() == remoteType.getAllocShape())) {
+    return emitOpError() << "Local MemDesc not matching Remote MemDesc: "
+                         << localType << " vs " << remoteType;
+  }
+  if (!isa<SharedMemorySpaceAttr>(localType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for local MemDesc: "
+                         << localType;
+  }
+  if (!isa<SharedClusterMemorySpaceAttr>(remoteType.getMemorySpace())) {
+    return emitOpError() << "Invalid memory space for remote MemDesc: "
+                         << remoteType;
+  }
+  return success();
+}
 
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
@@ -277,7 +301,7 @@ static std::string strMMADTypeKind(MMADTypeKind kind) {
   case MMADTypeKind::i8:
     return "i8";
   }
-  __builtin_unreachable();
+  llvm_unreachable("unknown mma dtype kind");
 }
 
 static std::optional<std::pair<MMADTypeKind, SmallVector<Type>>>
@@ -368,6 +392,29 @@ bool TCGen5MMAOp::verifyDims() {
   return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
 }
 
+bool TCGen5MMAOp::verifyOutputDims() {
+
+  if (getTwoCtas()) {
+    // Here we have to relax the verification to support two possibilities
+    // - For TLX 2CTA:
+    //  - Full MMA shape: [2M, K] x [K, N] -> [2M, N]
+    //  - Each CTA: [M, K] x [K, N/2] -> [M, N]. We're verifying each CTA here.
+    // - For non TLX 2CTA: each CTA has [M, K] x [K, N] -> [M, N]
+    // We cannot rely on module attr to differentiate them here because this
+    // verification can run before Fixup pass. If we want to be as accurate as
+    // possible, we should have a tlxTwoCTAs flag on MMA Op in the future
+    auto aShape = getA().getType().getShape();
+    auto bShape = getB().getType().getShape();
+    auto dShape = getD().getType().getShape();
+    return dShape[dShape.size() - 2] == aShape[aShape.size() - 2] &&
+           (dShape[dShape.size() - 1] == bShape[bShape.size() - 1] /* non TLX*/
+            || dShape[dShape.size() - 1] ==
+                   2 * bShape[bShape.size() - 1] /* TLX 2CTA*/);
+  }
+  // 1cta case still delegates to default verifiers
+  return DotOpInterfaceTrait::verifyOutputDims();
+}
+
 Value TCGen5MMAOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAOp::setUseAccumulator(Value flag) {
@@ -398,6 +445,8 @@ void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
         useTwoCTAs ? builder.getUnitAttr() : UnitAttr());
 }
+
+bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
 
 // -- TCGen5MMAScaledOp --
 LogicalResult TCGen5MMAScaledOp::verify() {
@@ -571,6 +620,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr());
 }
+
+bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
 
 // -- TMEMStoreOp --
 static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,

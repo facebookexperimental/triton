@@ -1,9 +1,10 @@
+import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_cuda, is_hip_cdna2
+from triton._internal_testing import is_cuda, is_hip_cdna2, is_hip
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -238,6 +239,10 @@ def matmul(a, b):
     return c
 
 
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="Requires AMD GPU",
+)
 def test_op():
     torch.manual_seed(0)
     a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
