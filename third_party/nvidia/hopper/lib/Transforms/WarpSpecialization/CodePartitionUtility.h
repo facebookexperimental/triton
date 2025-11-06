@@ -62,6 +62,9 @@ public:
   virtual Operation *getDstOpLast() { return nullptr; }
   virtual void getDstOps(SmallVector<Operation *> &dsts) {}
 
+  // Get a string identifier for this channel
+  std::string getChannelName() const;
+
   Relation relation; // producer task Id, a list of consumer task Ids
   Operation *op;
   unsigned operandIdx;
