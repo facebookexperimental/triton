@@ -56,6 +56,20 @@ void assignUserProvidedLatencies(scf::ForOp forOp,
   }
 }
 
+// Get all of the MMA consumers of the given operation. This is not
+// recursive, meaning if the MMA is a chain dot we only return the
+// first MMA in the chain, unless the original op is actually used
+// in both.
+void getMMAConsumers(Operation *op, DenseSet<ttng::MMAv5OpInterface> &users) {
+  for (auto user : op->getUsers()) {
+    if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(user)) {
+      users.insert(mma);
+    } else {
+      getMMAConsumers(user, users);
+    }
+  }
+}
+
 class AssignLoadLatencies {
 public:
   AssignLoadLatencies(scf::ForOp forOp, int numStages,
@@ -79,8 +93,34 @@ public:
       maxIndirectionLevel = std::max(maxIndirectionLevel, info.first);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
 
-    for (auto [loadOp, dist] : loadOpToIndLevel) {
-      opLatency[loadOp] = loadLatency;
+    // Grab MMA cluster info to determine the number of stages in which each
+    // load will be active.
+    MMAClusterInfo clusterInfo = getMMADistanceAndCluster(forOp, numStages);
+    if (clusterInfo.numDots) {
+      // If we have explict dot ordering then consider the chain-level
+      for (auto [loadOp, dist] : loadOpToIndLevel) {
+        DenseSet<ttng::MMAv5OpInterface> mmaConsumers;
+        getMMAConsumers(loadOp, mmaConsumers);
+        int maxDistance = 0;
+        int minChainIndex = numStages;
+        for (auto chain : clusterInfo.mmaChains) {
+          for (int i = 0; i < chain.size(); i++) {
+            auto mmaOp = chain[i];
+            if (mmaConsumers.count(mmaOp)) {
+              maxDistance = std::max(maxDistance, clusterInfo.distance[mmaOp]);
+              minChainIndex = std::min(minChainIndex, i);
+            }
+          }
+        }
+        unsigned mmaRelatedLatency =
+            ((numStages - 1) - maxDistance) / (minChainIndex + 1);
+        opLatency[loadOp] = std::min(mmaRelatedLatency, loadLatency);
+      }
+
+    } else {
+      for (auto [loadOp, dist] : loadOpToIndLevel) {
+        opLatency[loadOp] = loadLatency;
+      }
     }
   }
 
