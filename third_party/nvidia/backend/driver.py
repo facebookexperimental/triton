@@ -14,7 +14,7 @@ from triton.backends.driver import GPUDriver
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
 libdevice_dir = os.path.join(dirname, "lib")
-libraries = ['cuda']
+libraries = ["cuda"]
 PyCUtensorMap = None
 
 
@@ -31,14 +31,14 @@ def libcuda_dirs():
     env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
     if env_ld_library_path and not dirs:
         dirs = [dir for dir in env_ld_library_path.split(":") if os.path.exists(os.path.join(dir, "libcuda.so.1"))]
-    msg = 'libcuda.so cannot found!\n'
+    msg = "libcuda.so cannot found!\n"
     if locs:
-        msg += 'Possible files are located at %s.' % str(locs)
-        msg += 'Please create a symlink of libcuda.so to any of the files.'
+        msg += "Possible files are located at %s." % str(locs)
+        msg += "Please create a symlink of libcuda.so to any of the files."
     else:
         msg += 'Please make sure GPU is set up and then run "/sbin/ldconfig"'
-        msg += ' (requires sudo) to refresh the linker cache.'
-    assert any(os.path.exists(os.path.join(path, 'libcuda.so.1')) for path in dirs), msg
+        msg += " (requires sudo) to refresh the linker cache."
+    assert any(os.path.exists(os.path.join(path, "libcuda.so.1")) for path in dirs), msg
     return dirs
 
 
@@ -87,7 +87,7 @@ class CudaUtils(object):
 
 
 def ty_to_cpp(ty):
-    if ty[0] == '*':
+    if ty[0] == "*":
         return "CUdeviceptr"
     if ty.startswith("tensordesc"):
         return "CUtensorMap"
@@ -126,12 +126,8 @@ FLOAT_PACK_FUNCTION = {
     "fp64": "pack_fp64",
 }
 
-<<<<<<< HEAD
 _BASE_ARGS_FORMAT = "iiiKKpppOOOOOO"
-=======
-_BASE_ARGS_FORMAT = "iiiKKppOOOOOO"
 _BASE_ARGS_FORMAT_LEN = len(_BASE_ARGS_FORMAT)
->>>>>>> 5682fdb22 ([IMP][Launch Latency] reduce launch overhead for tensor descriptors (#7987))
 
 
 def make_launcher(constants, signature, tensordesc_meta):
@@ -185,9 +181,9 @@ def make_launcher(constants, signature, tensordesc_meta):
 
     def _extracted_type(ty):
         if isinstance(ty, tuple):
-            val = ','.join(map(_extracted_type, ty))
+            val = ",".join(map(_extracted_type, ty))
             return f"[{val}]"
-        if ty[0] == '*':
+        if ty[0] == "*":
             return "PyObject*"
         if ty in ("constexpr", "nvTmaDesc"):
             return "PyObject*"
@@ -195,9 +191,9 @@ def make_launcher(constants, signature, tensordesc_meta):
 
     def format_of(ty):
         if isinstance(ty, tuple):
-            val = ''.join(map(format_of, ty))
+            val = "".join(map(format_of, ty))
             return f"({val})"
-        if ty[0] == '*':
+        if ty[0] == "*":
             return "O"
         if ty in ("constexpr", "nvTmaDesc"):
             return "O"
@@ -219,14 +215,14 @@ def make_launcher(constants, signature, tensordesc_meta):
     expand_signature = _expand_signature(signature.values())
     signature = {i: s for i, s in enumerate(expand_signature)}
 
-    args_format = ''.join([format_of(ty) for ty in signature.values()])
+    args_format = "".join([format_of(ty) for ty in signature.values()])
     format = _BASE_ARGS_FORMAT + args_format
 
     flat_signature = []
     for sig in signature.values():
         _flatten_signature(sig, flat_signature)
     signature = {i: s for i, s in enumerate(flat_signature)}
-    args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
+    args_list = ", " + ", ".join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ""
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors, such as tensor descriptors for CUDA.
     arg_decl_list = []
@@ -237,7 +233,7 @@ def make_launcher(constants, signature, tensordesc_meta):
             arg_decl_list.append(f"{FLOAT_STORAGE_TYPE[ty]} arg{i}")
         else:
             arg_decl_list.append(f"{ty_to_cpp(ty)} arg{i}")
-    arg_decls = ', '.join(arg_decl_list)
+    arg_decls = ", ".join(arg_decl_list)
     internal_args_list = []
     for i, ty in signature.items():
         if ty[0] == "*":
@@ -252,7 +248,7 @@ def make_launcher(constants, signature, tensordesc_meta):
     params = range(len(signature))
 
     # generate glue code
-    newline = '\n  '
+    newline = "\n  "
     ptr_decls = [
         f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;"
         for i, ty in signature.items()
@@ -323,8 +319,8 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   return cuLaunchKernelExHandle;
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-  void *params[] = {{ {', '.join(params)} }};
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{", " + arg_decls if len(arg_decls) > 0 else ""}) {{
+  void *params[] = {{ {", ".join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
     // 4 attributes that we can currently pass maximum
     CUlaunchAttribute launchAttr[4];
@@ -555,7 +551,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {newline.join(tma_decls)}
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{", " + ", ".join(internal_args_list) if len(internal_args_list) > 0 else ""});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -607,6 +603,19 @@ PyMODINIT_FUNC PyInit___triton_launcher(void) {{
 }}
 """
     return src
+
+
+class TmaDescKernelParam:
+    TMA_DESC_SIZE = 128
+
+    def __init__(self):
+        import torch
+
+        self.desc = torch.empty(self.TMA_DESC_SIZE, dtype=torch.uint8, device="cpu")
+
+    # Return a CUtensorMap* pointer in host memory
+    def tma_desc_cpu_ptr(self):
+        return self.desc.data_ptr()
 
 
 # The TMA dtype enum values are slightly different on host vs device...
@@ -720,8 +729,19 @@ class CudaLauncher(object):
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
-        self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_cluster,
-                    self.launch_pdl, global_scratch, profile_scratch, *args)
+        self.launch(
+            gridX,
+            gridY,
+            gridZ,
+            stream,
+            function,
+            self.launch_cooperative_grid,
+            self.launch_cluster,
+            self.launch_pdl,
+            global_scratch,
+            profile_scratch,
+            *args,
+        )
 
 
 class CudaDriver(GPUDriver):
@@ -740,16 +760,19 @@ class CudaDriver(GPUDriver):
 
     def get_active_torch_device(self):
         import torch
+
         return torch.device("cuda", self.get_current_device())
 
     def get_device_interface(self):
         import torch
+
         return torch.cuda
 
     @staticmethod
     def is_active():
         try:
             import torch
+
             return torch.cuda.is_available() and (torch.version.hip is None)
         except ImportError:
             return False
@@ -759,6 +782,7 @@ class CudaDriver(GPUDriver):
 
     def get_benchmarker(self):
         from triton.testing import do_bench
+
         return do_bench
 
     def get_empty_cache_for_benchmark(self):
@@ -768,7 +792,7 @@ class CudaDriver(GPUDriver):
         # before each kernel call to make sure that the L2 cache
         # doesn't contain any input data before the run
         cache_size = 256 * 1024 * 1024
-        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
+        return torch.empty(int(cache_size // 4), dtype=torch.int, device="cuda")
 
     def clear_cache(self, cache):
         cache.zero_()

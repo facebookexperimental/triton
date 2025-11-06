@@ -478,6 +478,8 @@ static PyObject *fill1DTMADescriptor(PyObject *self, PyObject *args) {
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   Py_INCREF(Py_None);
   return Py_None;
+cleanup:
+  return NULL;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
@@ -542,6 +544,8 @@ static PyObject *fill2DTMADescriptor(PyObject *self, PyObject *args) {
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   Py_INCREF(Py_None);
   return Py_None;
+cleanup:
+  return NULL;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
@@ -597,6 +601,8 @@ static PyObject *fill1DTMADescriptorType(PyObject *self, PyObject *args) {
   Py_INCREF(Py_None);
 #endif
   return Py_None;
+cleanup:
+  return NULL;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
