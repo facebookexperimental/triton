@@ -288,16 +288,6 @@ def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None):
 
     if out_dtype is not None:
         input = input.to(out_dtype)
-
-    # Facebook. begin
-    input = core._promote_bfloat16_to_float32(input)
-    # Both torch.sum and Triton default promote bfloat16 to float32 before reduce
-    # and PTX does `add.f32` while Triton Beta generates `add.bf16x2`.
-    # The latter one makes more sense to me while this patch keeps Triton Beta
-    # consistent with Triton default first. More details are discussed at
-    # https://fb.workplace.com/groups/1405155842844877/posts/24616028937997573/?comment_id=24616575671276233&reply_comment_id=24617223141211486
-    # Facebook. end
-
     return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims)
 
 
