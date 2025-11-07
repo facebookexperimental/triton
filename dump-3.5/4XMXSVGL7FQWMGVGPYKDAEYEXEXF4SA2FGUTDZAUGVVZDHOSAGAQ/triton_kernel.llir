@@ -1,0 +1,237 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-p3:32:32-p4:32:32-p5:32:32-p6:32:32-p7:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+
+@assertFunc_0 = internal constant [8 x i8] c"unknown\00"
+@assertFile_0 = internal constant [8 x i8] c"unknown\00"
+@assertMessage_0 = internal constant [36 x i8] c"index out of bounds: 0 <= tmp49 < 9\00"
+
+; Function Attrs: noreturn
+declare void @__assertfail(ptr, ptr, i32, ptr, i64) local_unnamed_addr #0
+
+define ptx_kernel void @triton_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2, i32 %3, ptr addrspace(1) readnone captures(none) %4, ptr addrspace(1) readnone captures(none) %5) local_unnamed_addr #1 {
+  %7 = tail call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %8 = shl i32 %7, 6
+  %9 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %10 = shl nuw nsw i32 %9, 1
+  %11 = and i32 %10, 62
+  %12 = or disjoint i32 %11, %8
+  %13 = icmp slt i32 %12, 36
+  %14 = ashr exact i32 %12, 1
+  %15 = srem i32 %14, 6
+  %16 = sdiv i32 %12, 12
+  %17 = icmp sgt i32 %15, 4
+  %18 = udiv i32 %12, 24
+  %19 = icmp sgt i32 %12, 23
+  %20 = select i1 %19, i32 %18, i32 0
+  %21 = add nsw i32 %16, 1
+  %22 = sdiv i32 %21, 2
+  %23 = add nsw i32 %22, 1
+  %24 = icmp sgt i32 %12, 11
+  %25 = select i1 %24, i32 2, i32 0
+  %26 = icmp slt i32 %12, 12
+  %27 = select i1 %26, i32 %23, i32 0
+  %28 = add nsw i32 %27, %25
+  %29 = add nsw i32 %28, -1
+  %30 = tail call i32 @llvm.smin.i32(i32 %20, i32 %29)
+  %31 = shl nsw i32 %30, 3
+  %.lhs.trunc = trunc nsw i32 %15 to i8
+  %32 = insertelement <2 x i8> poison, i8 %.lhs.trunc, i64 0
+  %33 = shufflevector <2 x i8> %32, <2 x i8> poison, <2 x i32> zeroinitializer
+  %34 = add nsw <2 x i8> %33, <i8 1, i8 0>
+  %35 = sdiv <2 x i8> %34, splat (i8 2)
+  %36 = add nsw <2 x i8> %35, <i8 1, i8 0>
+  %37 = sext <2 x i8> %36 to <2 x i16>
+  %38 = insertelement <2 x i32> <i32 poison, i32 1>, i32 %15, i64 0
+  %39 = insertelement <2 x i32> <i32 5, i32 poison>, i32 %15, i64 1
+  %40 = icmp slt <2 x i32> %38, %39
+  %41 = select <2 x i1> %40, <2 x i16> %37, <2 x i16> zeroinitializer
+  %42 = select i1 %17, i16 4, i16 0
+  %43 = insertelement <2 x i16> <i16 poison, i16 1>, i16 %42, i64 0
+  %44 = add nsw <2 x i16> %41, %43
+  %45 = extractelement <2 x i16> %44, i64 0
+  %narrow = add nsw i16 %45, -1
+  %46 = extractelement <2 x i16> %41, i64 1
+  %47 = tail call i16 @llvm.smin.i16(i16 %46, i16 %narrow)
+  %48 = sext i16 %47 to i32
+  %49 = icmp sgt i16 %narrow, %46
+  %50 = extractelement <2 x i16> %44, i64 1
+  %narrow32 = select i1 %49, i16 %50, i16 0
+  %.not2 = icmp sgt i16 %45, %50
+  %narrow33 = select i1 %.not2, i16 0, i16 %narrow
+  %narrow34 = add nsw i16 %narrow32, %narrow33
+  %51 = sext i16 %narrow34 to i32
+  %52 = insertelement <2 x i32> poison, i32 %51, i64 0
+  %53 = insertelement <2 x i32> %52, i32 %48, i64 1
+  %54 = shl nsw <2 x i32> %53, splat (i32 1)
+  %55 = extractelement <2 x i32> %54, i64 1
+  %56 = add nsw i32 %55, %31
+  %57 = sext i32 %56 to i64
+  %58 = getelementptr i8, ptr addrspace(1) %0, i64 %57
+  %59 = tail call i16 asm sideeffect "mov.u16 $0, 0x0;\0A\09@$2 ld.global.b16 { $0 }, [ $1 + 0 ];", "=c,l,b"(ptr addrspace(1) %58, i1 %13) #5
+  %60 = getelementptr float, ptr addrspace(1) %1, i64 %57
+  %61 = tail call { i32, i32 } asm sideeffect "mov.u32 $0, 0x0;\0A\09mov.u32 $1, 0x0;\0A\09@$3 ld.global.v2.b32 { $0, $1 }, [ $2 + 0 ];", "=r,=r,l,b"(ptr addrspace(1) %60, i1 %13) #5
+  %62 = extractelement <2 x i32> %54, i64 0
+  %63 = add nsw i32 %62, %31
+  %64 = sext i32 %63 to i64
+  %65 = getelementptr i8, ptr addrspace(1) %0, i64 %64
+  %66 = tail call i16 asm sideeffect "mov.u16 $0, 0x0;\0A\09@$2 ld.global.b16 { $0 }, [ $1 + 0 ];", "=c,l,b"(ptr addrspace(1) %65, i1 %13) #5
+  %67 = getelementptr float, ptr addrspace(1) %1, i64 %64
+  %68 = tail call { i32, i32 } asm sideeffect "mov.u32 $0, 0x0;\0A\09mov.u32 $1, 0x0;\0A\09@$3 ld.global.v2.b32 { $0, $1 }, [ $2 + 0 ];", "=r,=r,l,b"(ptr addrspace(1) %67, i1 %13) #5
+  %69 = add nuw nsw i32 %20, 1
+  %70 = icmp slt i32 %20, %29
+  %71 = select i1 %70, i32 %69, i32 0
+  %.not3 = icmp sgt i32 %28, %69
+  %72 = select i1 %.not3, i32 0, i32 %29
+  %73 = add nsw i32 %71, %72
+  %74 = shl nsw i32 %73, 3
+  %75 = add nsw i32 %55, %74
+  %76 = sext i32 %75 to i64
+  %77 = getelementptr i8, ptr addrspace(1) %0, i64 %76
+  %78 = tail call i16 asm sideeffect "mov.u16 $0, 0x0;\0A\09@$2 ld.global.b16 { $0 }, [ $1 + 0 ];", "=c,l,b"(ptr addrspace(1) %77, i1 %13) #5
+  %79 = getelementptr float, ptr addrspace(1) %1, i64 %76
+  %80 = tail call { i32, i32 } asm sideeffect "mov.u32 $0, 0x0;\0A\09mov.u32 $1, 0x0;\0A\09@$3 ld.global.v2.b32 { $0, $1 }, [ $2 + 0 ];", "=r,=r,l,b"(ptr addrspace(1) %79, i1 %13) #5
+  %81 = add nsw i32 %62, %74
+  %82 = sext i32 %81 to i64
+  %83 = getelementptr i8, ptr addrspace(1) %0, i64 %82
+  %84 = tail call i16 asm sideeffect "mov.u16 $0, 0x0;\0A\09@$2 ld.global.b16 { $0 }, [ $1 + 0 ];", "=c,l,b"(ptr addrspace(1) %83, i1 %13) #5
+  %85 = bitcast i16 %84 to <2 x i8>
+  %86 = getelementptr float, ptr addrspace(1) %1, i64 %82
+  %87 = tail call { i32, i32 } asm sideeffect "mov.u32 $0, 0x0;\0A\09mov.u32 $1, 0x0;\0A\09@$3 ld.global.v2.b32 { $0, $1 }, [ $2 + 0 ];", "=r,=r,l,b"(ptr addrspace(1) %86, i1 %13) #5
+  %88 = sext <2 x i8> %85 to <2 x i32>
+  %89 = add nsw <2 x i32> %88, splat (i32 9)
+  %90 = icmp slt <2 x i8> %85, zeroinitializer
+  %91 = select <2 x i1> %90, <2 x i32> %89, <2 x i32> %88
+  %92 = freeze <2 x i32> %91
+  %93 = icmp ugt <2 x i32> %92, splat (i32 8)
+  %shift = shufflevector <2 x i1> %93, <2 x i1> poison, <2 x i32> <i32 1, i32 poison>
+  %94 = or <2 x i1> %93, %shift
+  %.not1013 = extractelement <2 x i1> %94, i64 0
+  %95 = and i1 %13, %.not1013
+  br i1 %95, label %96, label %97
+
+96:                                               ; preds = %6
+  tail call void @__assertfail(ptr nonnull @assertMessage_0, ptr nonnull @assertFile_0, i32 0, ptr nonnull @assertFunc_0, i64 1)
+  unreachable
+
+97:                                               ; preds = %6
+  %98 = icmp slt i32 %20, %28
+  %99 = icmp slt i16 %46, %45
+  %100 = and i1 %.not3, %99
+  %101 = bitcast i16 %78 to <2 x i8>
+  %102 = insertelement <2 x i32> poison, i32 %73, i64 0
+  %103 = insertelement <2 x i32> %102, i32 %30, i64 1
+  %104 = mul <2 x i32> %103, splat (i32 12)
+  %105 = and i1 %98, %.not2
+  %106 = bitcast i16 %66 to <2 x i8>
+  %107 = bitcast i16 %59 to <2 x i8>
+  %108 = extractvalue { i32, i32 } %61, 1
+  %109 = bitcast i32 %108 to float
+  %110 = extractvalue { i32, i32 } %68, 1
+  %111 = bitcast i32 %110 to float
+  %112 = extractvalue { i32, i32 } %80, 1
+  %113 = bitcast i32 %112 to float
+  %114 = shufflevector <2 x i8> %107, <2 x i8> %106, <2 x i32> <i32 0, i32 2>
+  %115 = icmp slt <2 x i8> %114, zeroinitializer
+  %116 = sext <2 x i8> %114 to <2 x i32>
+  %117 = add nsw <2 x i32> %116, splat (i32 9)
+  %118 = select <2 x i1> %115, <2 x i32> %117, <2 x i32> %116
+  %119 = freeze <2 x i32> %118
+  %120 = extractvalue { i32, i32 } %61, 0
+  %121 = bitcast i32 %120 to float
+  %122 = extractvalue { i32, i32 } %68, 0
+  %123 = bitcast i32 %122 to float
+  %124 = extractvalue { i32, i32 } %80, 0
+  %125 = bitcast i32 %124 to float
+  %126 = extractvalue { i32, i32 } %87, 1
+  %127 = bitcast i32 %126 to float
+  %128 = extractvalue { i32, i32 } %87, 0
+  %129 = bitcast i32 %128 to float
+  tail call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0)
+  %130 = add <2 x i32> %104, splat (i32 -7)
+  %131 = shufflevector <2 x i8> %101, <2 x i8> %107, <4 x i32> <i32 0, i32 3, i32 poison, i32 1>
+  %132 = shufflevector <2 x i8> %106, <2 x i8> poison, <4 x i32> <i32 poison, i32 1, i32 poison, i32 poison>
+  %133 = shufflevector <4 x i8> %131, <4 x i8> %132, <4 x i32> <i32 0, i32 1, i32 5, i32 3>
+  %134 = icmp slt <4 x i8> %133, zeroinitializer
+  %135 = sext <4 x i8> %133 to <4 x i32>
+  %136 = add nsw <4 x i32> %135, splat (i32 9)
+  %137 = select <4 x i1> %134, <4 x i32> %136, <4 x i32> %135
+  %138 = freeze <4 x i32> %137
+  %139 = shufflevector <2 x i32> %92, <2 x i32> %119, <8 x i32> <i32 1, i32 0, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>
+  %140 = shufflevector <4 x i32> %138, <4 x i32> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>
+  %141 = shufflevector <8 x i32> %139, <8 x i32> %140, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 8, i32 9, i32 10, i32 11>
+  %142 = srem <8 x i32> %141, splat (i32 3)
+  %143 = shufflevector <2 x i32> %130, <2 x i32> poison, <8 x i32> <i32 0, i32 0, i32 1, i32 1, i32 0, i32 1, i32 1, i32 0>
+  %144 = shufflevector <2 x i32> %54, <2 x i32> poison, <8 x i32> <i32 0, i32 0, i32 1, i32 0, i32 1, i32 1, i32 0, i32 1>
+  %145 = add <8 x i32> %143, %144
+  %146 = shl <8 x i32> %141, splat (i32 1)
+  %147 = sub <8 x i32> %145, %142
+  %148 = add <8 x i32> %147, %146
+  %149 = insertelement <8 x i32> poison, i32 %14, i64 0
+  %150 = shufflevector <8 x i32> %149, <8 x i32> poison, <8 x i32> zeroinitializer
+  %151 = icmp eq <8 x i32> %148, %150
+  %152 = extractelement <8 x i1> %151, i64 7
+  %153 = and i1 %100, %152
+  %154 = extractelement <8 x i1> %151, i64 6
+  %155 = and i1 %105, %154
+  %156 = extractelement <8 x i1> %151, i64 5
+  %157 = select i1 %156, float %109, float 0.000000e+00
+  %158 = fadd float %157, %111
+  %159 = select i1 %155, float %158, float %157
+  %160 = fadd float %159, %113
+  %161 = select i1 %153, float %160, float %159
+  %162 = extractelement <8 x i1> %151, i64 4
+  %163 = and i1 %100, %162
+  %164 = extractelement <8 x i1> %151, i64 3
+  %165 = and i1 %105, %164
+  %166 = extractelement <8 x i1> %151, i64 2
+  %167 = select i1 %166, float %121, float 0.000000e+00
+  %168 = fadd float %167, %123
+  %169 = select i1 %165, float %168, float %167
+  %170 = fadd float %169, %125
+  %171 = select i1 %163, float %170, float %169
+  %172 = and i1 %.not3, %.not2
+  %173 = extractelement <8 x i1> %151, i64 1
+  %174 = and i1 %172, %173
+  %175 = extractelement <8 x i1> %151, i64 0
+  %176 = and i1 %172, %175
+  %177 = fadd float %171, %129
+  %178 = fadd float %161, %127
+  %179 = select i1 %174, float %177, float %171
+  %180 = select i1 %176, float %178, float %161
+  %181 = sext i32 %12 to i64
+  %182 = getelementptr float, ptr addrspace(1) %2, i64 %181
+  %183 = bitcast float %179 to i32
+  %184 = bitcast float %180 to i32
+  tail call void asm sideeffect "@$3 st.global.v2.b32 [ $2 + 0 ], { $0, $1 };", "r,r,l,b"(i32 %183, i32 %184, ptr addrspace(1) %182, i1 %13) #5
+  ret void
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #2
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #2
+
+; Function Attrs: convergent nocallback nounwind
+declare void @llvm.nvvm.barrier.cta.sync.aligned.all(i32) #3
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.smin.i32(i32, i32) #4
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i16 @llvm.smin.i16(i16, i16) #4
+
+attributes #0 = { noreturn }
+attributes #1 = { "nvvm.reqntid"="32" }
+attributes #2 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #3 = { convergent nocallback nounwind }
+attributes #4 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #5 = { nounwind }
+
+!llvm.module.flags = !{!0, !1}
+!llvm.ident = !{!2}
+
+!0 = !{i32 2, !"Debug Info Version", i32 3}
+!1 = !{i32 4, !"nvvm-reflect-ftz", i32 1}
+!2 = !{!"clang version 3.8.0 (tags/RELEASE_380/final)"}
