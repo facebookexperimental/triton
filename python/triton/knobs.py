@@ -433,6 +433,8 @@ class JITHookCompileInfo(TypedDict):
     num_warps: int
     num_ctas: int
     num_stages: int
+    minRegAutoWS: Optional[int]
+    maxRegAutoWS: Optional[int]
     enable_fp_fusion: bool
     launch_cooperative_grid: bool
     extern_libs: tuple[tuple[str, str], ...]
@@ -484,6 +486,7 @@ class nvidia_knobs(base_knobs):
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
+    use_oai_ws: env_bool = env_bool("TRITON_USE_OAI_WS")
 
 
 class amd_knobs(base_knobs):
