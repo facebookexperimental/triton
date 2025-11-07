@@ -1,14 +1,8 @@
 #include "cuda.h"
 #include <dlfcn.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-
-typedef struct {
-  PyObject_HEAD;
-  _Alignas(128) CUtensorMap tensorMap;
-} PyCUtensorMapObject;
 
 // Raises a Python exception and returns false if code is not CUDA_SUCCESS.
 static bool gpuAssert(CUresult code, const char *file, int line) {
@@ -32,7 +26,7 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
 #define CUDA_CHECK_AND_RETURN_NULL(ans)                                        \
   do {                                                                         \
     if (!gpuAssert((ans), __FILE__, __LINE__))                                 \
-      goto cleanup;                                                            \
+      return NULL;                                                             \
   } while (0)
 
 // To be used inside a Py_{BEGIN,END}_ALLOW_THREADS block.
@@ -50,7 +44,7 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
     if ((funcPointer) == NULL) {                                               \
       (funcPointer) = (initializerFunction)();                                 \
       if ((funcPointer) == NULL) {                                             \
-        goto cleanup;                                                          \
+        return NULL;                                                           \
       }                                                                        \
     }                                                                          \
   } while (0)
@@ -93,9 +87,6 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
                        warp_size, "sm_clock_rate", sm_clock_rate,
                        "mem_clock_rate", mem_clock_rate, "mem_bus_width",
                        mem_bus_width);
-
-cleanup:
-  return NULL;
 }
 
 static PyObject *loadBinary(PyObject *self, PyObject *args) {
@@ -247,9 +238,6 @@ static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
       cuOccupancyMaxActiveClusters(&maxActiveClusters, func, &config));
   Py_END_ALLOW_THREADS;
   return PyLong_FromLong(maxActiveClusters);
-
-cleanup:
-  return NULL;
 }
 
 static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
@@ -291,43 +279,8 @@ static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
-static PyObject *PyCUtensorMap_alloc(PyTypeObject *type, Py_ssize_t n_items) {
-  PyCUtensorMapObject *self = NULL;
-  void *mem = NULL;
-  size_t size = type->tp_basicsize;
-
-  if (posix_memalign(&mem, 128, size) != 0) {
-    PyErr_NoMemory();
-    return NULL;
-  }
-
-  self = (PyCUtensorMapObject *)mem;
-  PyObject_INIT(self, type);
-  return (PyObject *)self;
-}
-
-static void PyCUtensorMap_dealloc(PyObject *self) {
-  Py_TYPE(self)->tp_free(self);
-}
-
-static void PyCUtensorMap_free(void *ptr) { free(ptr); }
-
-// clang-format off
-static PyTypeObject PyCUtensorMapType = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "triton.backends.nvidia.PyCUtensorMap",
-    .tp_basicsize = sizeof(PyCUtensorMapObject),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = "<PyCUtensorMap object>",
-    .tp_new = PyType_GenericNew,
-    .tp_alloc = PyCUtensorMap_alloc,
-    .tp_dealloc = (destructor)PyCUtensorMap_dealloc,
-    .tp_free = PyCUtensorMap_free,
-};
-// clang-format on
-
 static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
+  unsigned long long desc_address;
   unsigned long long global_address;
   int swizzle;
   int elemSize;
@@ -337,20 +290,16 @@ static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
   PyObject *strides;
   int padding;
 
-  if (!PyArg_ParseTuple(args, "KiiiOOOi", &global_address, &swizzle, &elemSize,
-                        &elemType, &blockSize, &shape, &strides, &padding)) {
-    return NULL;
-  }
-
-  PyCUtensorMapObject *desc = (PyCUtensorMapObject *)PyObject_CallObject(
-      (PyObject *)&PyCUtensorMapType, NULL);
-  if (!desc) {
+  if (!PyArg_ParseTuple(args, "KKiiiOOOi", &desc_address, &global_address,
+                        &swizzle, &elemSize, &elemType, &blockSize, &shape,
+                        &strides, &padding)) {
     return NULL;
   }
 
   PyObject *blockSizeFast = NULL;
   PyObject *shapeFast = NULL;
   PyObject *stridesFast = NULL;
+  PyObject *result = NULL;
 
   uint32_t blockSizeInt[5];
   uint64_t shapeInt[5];
@@ -421,18 +370,17 @@ static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
   INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeTiled,
                                       getCuTensorMapEncodeTiledHandle);
   CUDA_CHECK_AND_RETURN_NULL(cuTensorMapEncodeTiled(
-      &desc->tensorMap, elemType, rank, (void *)global_address, shapeInt,
-      stridesLL, blockSizeInt, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill));
-
-  return (PyObject *)desc;
+      (CUtensorMap *)desc_address, elemType, rank, (void *)global_address,
+      shapeInt, stridesLL, blockSizeInt, elementStrides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill));
+  Py_RETURN_NONE;
 
 cleanup:
   Py_XDECREF(blockSizeFast);
   Py_XDECREF(shapeFast);
   Py_XDECREF(stridesFast);
-  Py_XDECREF(desc);
-  return NULL;
+  return result;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
@@ -478,8 +426,6 @@ static PyObject *fill1DTMADescriptor(PyObject *self, PyObject *args) {
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   Py_INCREF(Py_None);
   return Py_None;
-cleanup:
-  return NULL;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
@@ -544,8 +490,6 @@ static PyObject *fill2DTMADescriptor(PyObject *self, PyObject *args) {
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   Py_INCREF(Py_None);
   return Py_None;
-cleanup:
-  return NULL;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
@@ -601,8 +545,6 @@ static PyObject *fill1DTMADescriptorType(PyObject *self, PyObject *args) {
   Py_INCREF(Py_None);
 #endif
   return Py_None;
-cleanup:
-  return NULL;
 }
 
 // Simple helper to experiment creating TMA descriptors on the host.
@@ -677,8 +619,6 @@ static PyObject *fill2DTMADescriptorType(PyObject *self, PyObject *args) {
   Py_INCREF(Py_None);
 #endif
   return Py_None;
-cleanup:
-  return NULL;
 }
 
 static PyMethodDef ModuleMethods[] = {
@@ -711,18 +651,12 @@ static struct PyModuleDef ModuleDef = {PyModuleDef_HEAD_INIT, "cuda_utils",
                                        ModuleMethods};
 
 PyMODINIT_FUNC PyInit_cuda_utils(void) {
-  if (PyType_Ready(&PyCUtensorMapType) < 0) {
-    return NULL;
-  }
-
   PyObject *m = PyModule_Create(&ModuleDef);
   if (m == NULL) {
     return NULL;
   }
 
   PyModule_AddFunctions(m, ModuleMethods);
-  Py_INCREF(&PyCUtensorMapType);
-  PyModule_AddObject(m, "PyCUtensorMap", (PyObject *)&PyCUtensorMapType);
 
   return m;
 }
