@@ -43,6 +43,7 @@ unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
                       unsigned requestedRegisters) {
   assert(asyncTaskId != 0 && "producer group should not request registers");
   // TODO: scan ops to estimate register usage
+  // only tma loads, or tma stores, or gen5
   return requestedRegisters == 0 ? 232 : requestedRegisters;
 }
 
@@ -193,9 +194,11 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   for (auto idx : keptResultVec) {
     newResultTypes.push_back(ifOp->getResultTypes()[idx]);
   }
+  builder.setLoopScheduleInfoFromOp(ifOp);
   auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
       ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
       ifOp.elseBlock());
+  builder.clearLoopScheduleInfo();
 
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
   ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
@@ -209,7 +212,9 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   // Update yields
   auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
     ifBuilder.setInsertionPoint(yield);
+    ifBuilder.setLoopScheduleInfoFromOp(yield);
     ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(yield.getLoc(), operands);
+    ifBuilder.clearLoopScheduleInfo();
     yield.erase();
   };
   if (keptResultVec.size() < ifOp->getResultTypes().size()) {
@@ -248,6 +253,15 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            AsyncTaskId asyncTaskId) {
   // Create newForOp for each task Id.
   auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
+  // This is for the epilogue partition.
+  const unsigned EpiloguePartition = 3;
+  if (asyncTaskId == EpiloguePartition) { // HACK tracked in T238592410
+    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
+    if (!parentForOp) {
+      usedArgs.pop_back();
+      LDBG("SpecializeForOp hack to remove last argIdx");
+    }
+  }
 
   // Prepare newLoopArgs.
   SmallVector<Value> newLoopArgs;
@@ -264,16 +278,34 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   auto newStep = mapping.lookupOrDefault(forOp.getStep());
 
   // Create newForOp.
+  builder.setLoopScheduleInfoFromOp(forOp);
   auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
       forOp.getLoc(), newLowerBound, newUpperBound, newStep, newLoopArgs);
-  if (forOp->getAttr("tt.loop_schedule"))
-    newForOp->setAttr("tt.loop_schedule", forOp->getAttr("tt.loop_schedule"));
+  builder.clearLoopScheduleInfo();
+  // Propagate the attributes of forOp to newForOp.
+  // This is needed to preserve tt.warp_specialize,
+  // and tt.loop_schedule among others.
+  for (auto attr : forOp->getAttrs()) {
+    // async_task_id is set in the creation step.
+    if (attr.getName() != "async_task_id") {
+      newForOp->setAttr(attr.getName(), attr.getValue());
+    }
+  }
 
   // Initialize Value mapping from forOp to newForOp
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  {
+    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
+    if (parentForOp)
+      LDBG("-- inner ForOp");
+    else
+      LDBG("-- outer ForOp");
+  }
   for (unsigned i = 0; i < usedArgs.size(); ++i) {
     auto oldArg = forOp.getRegionIterArgs()[usedArgs[i]];
     auto newArg = newForOp.getRegionIterArgs()[i];
+    LDBG("ForOp args mapping of task " << asyncTaskId << " argIdx "
+                                       << usedArgs[i]);
     mapping.map(oldArg, newArg);
   }
 
@@ -391,7 +423,12 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   for (AsyncTaskId asyncTaskId : nTaskIds) {
     if (asyncTaskId == 0)
       continue;
-    partitionNumWarps.push_back(4);
+    // HACK: hardcode 1,2,3 with 1 warp
+    // TODO: check TritonGPUAllocateWarpGroups
+    if (asyncTaskId == 1 || asyncTaskId == 2 || asyncTaskId == 3)
+      partitionNumWarps.push_back(4);
+    else
+      partitionNumWarps.push_back(4);
   }
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
@@ -419,7 +456,6 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   unsigned idx = 1;
-  SmallVector<int32_t> estRegUsage;
   for (Region *region : wsOp.getPartitionRegions()) {
     AsyncTaskId asyncTaskId = nTaskIds[idx];
     OpBuilderWithAsyncTaskIds taskBuilder(context);
@@ -434,13 +470,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
     taskBuilder.create<ttg::WarpReturnOp>(loc);
-    auto regAlloc =
-        scanRegUsage(partitionBlock, asyncTaskId, requestedRegisters);
-    estRegUsage.push_back(regAlloc);
   }
-
-  // The default region doesn't request registers.
-  wsOp.setRequestedRegisters(estRegUsage);
 
   // The capture set is the same for every partition region, so now find the
   // captures and thread them in to the regions.
@@ -476,6 +506,22 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     LDBG("\n\nWith task Id checks");
     funcOp.dump();
   });
+
+  SmallVector<Operation *> toErase;
+  wsOp.walk([&](Operation *op) {
+    unsigned numUsers = std::distance(op->user_begin(), op->user_end());
+    bool isYield = isa<scf::YieldOp>(op);
+    bool isAdd = isa<arith::AddIOp>(op);
+    if (numUsers == 0 && !isYield && isAdd && op->getNumRegions() == 0)
+      toErase.push_back(op);
+  });
+  for (auto *op : toErase) {
+    LLVM_DEBUG({
+      LDBG("erasing op due to no use ");
+      op->dump();
+    });
+    op->erase();
+  }
 
   // Remove original operations that have been cloned in reverse order.
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
