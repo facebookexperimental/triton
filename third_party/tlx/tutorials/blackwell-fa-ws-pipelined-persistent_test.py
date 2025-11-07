@@ -1366,6 +1366,118 @@ class _attention(torch.autograd.Function):
 attention = _attention.apply
 
 
+def run_attention_backward(Z, H, N_CTX, HEAD_DIM, mode="bwd", provider="triton-fp16", dtype=torch.float16):
+    """
+    Standalone function to setup and run the attention backward kernel.
+    
+    Args:
+        Z: Batch size
+        H: Number of heads
+        N_CTX: Context length
+        HEAD_DIM: Dimension of each head
+        mode: "fwd" or "bwd" (default: "bwd")
+        provider: Provider type (default: "triton-fp16")
+        dtype: Data type (default: torch.float16)
+    
+    Returns:
+        dict: Dictionary containing test results with keys:
+            - 'tri_out': Triton output
+            - 'ref_out': Reference output
+            - 'tri_dq': Triton dQ gradient (if mode=="bwd")
+            - 'tri_dk': Triton dK gradient (if mode=="bwd")
+            - 'tri_dv': Triton dV gradient (if mode=="bwd")
+            - 'ref_dq': Reference dQ gradient (if mode=="bwd")
+            - 'ref_dk': Reference dK gradient (if mode=="bwd")
+            - 'ref_dv': Reference dV gradient (if mode=="bwd")
+            - 'passed': Boolean indicating if test passed
+    """
+    if not is_blackwell():
+        raise RuntimeError("Requires Blackwell GPU to run")
+    
+    torch.manual_seed(20)
+    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    sm_scale = 0.5
+    
+    ref_dtype = dtype
+    if mode == "fwd" and "fp8" in provider:
+        ref_dtype = torch.float32
+    q = q.to(ref_dtype)
+    k = k.to(ref_dtype)
+    v = v.to(ref_dtype)
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    p = torch.softmax(p.float(), dim=-1)
+    p = p.to(ref_dtype)
+    ref_out = torch.matmul(p, v).half()
+    
+    if mode == "bwd":
+        dout = torch.randn_like(q)
+        ref_out.backward(dout)
+        ref_dv, v.grad = v.grad.clone(), None
+        ref_dk, k.grad = k.grad.clone(), None
+        ref_dq, q.grad = q.grad.clone(), None
+    
+    if mode == "fwd" and "fp8" in provider:
+        q = q.to(torch.float8_e5m2)
+        k = k.to(torch.float8_e5m2)
+        v = v.permute(0, 1, 3, 2).contiguous()
+        v = v.permute(0, 1, 3, 2)
+        v = v.to(torch.float8_e5m2)
+    
+    tri_out = attention(q, k, v, sm_scale).half()
+    
+    if mode == "fwd":
+        atol = 3 if "fp8" in provider else 1e-2
+        try:
+            torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
+            return {
+                'tri_out': tri_out,
+                'ref_out': ref_out,
+                'passed': True
+            }
+        except AssertionError as e:
+            return {
+                'tri_out': tri_out,
+                'ref_out': ref_out,
+                'passed': False,
+                'error': str(e)
+            }
+    
+    tri_out.backward(dout)
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q.grad = q.grad.clone(), None
+    
+    rtol = 0.0
+    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+        rtol = 1e-2
+    
+    try:
+        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+        torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
+        torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
+        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+        passed = True
+        error = None
+    except AssertionError as e:
+        passed = False
+        error = str(e)
+    
+    return {
+        'tri_out': tri_out,
+        'ref_out': ref_out,
+        'tri_dq': tri_dq,
+        'tri_dk': tri_dk,
+        'tri_dv': tri_dv,
+        'ref_dq': ref_dq,
+        'ref_dk': ref_dk,
+        'ref_dv': ref_dv,
+        'passed': passed,
+        'error': error
+    }
+
+
 @pytest.mark.skipif(
     not is_blackwell(),
     reason="Requires Hopper GPU",
