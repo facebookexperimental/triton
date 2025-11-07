@@ -677,6 +677,8 @@ static PyObject *fill2DTMADescriptorType(PyObject *self, PyObject *args) {
   Py_INCREF(Py_None);
 #endif
   return Py_None;
+cleanup:
+  return NULL;
 }
 
 static PyMethodDef ModuleMethods[] = {
