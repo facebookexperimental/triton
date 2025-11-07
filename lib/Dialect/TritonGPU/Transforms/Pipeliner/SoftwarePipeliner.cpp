@@ -91,10 +91,19 @@ static void expandLoops(ModuleOp moduleOp) {
   };
 
   SmallVector<scf::ForOp> loops;
-  moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+  bool hasWarpSpec = false;
+  moduleOp->walk([&](scf::ForOp forOp) {
+    if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+      hasWarpSpec = true;
+    loops.push_back(forOp);
+  });
   for (scf::ForOp forOp : loops) {
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
+      continue;
+    }
+    // Skip pipelining when we have a single stage.
+    if (schedule.getNumStages() == 1) {
       continue;
     }
 
@@ -113,14 +122,16 @@ static void expandLoops(ModuleOp moduleOp) {
     // Testing feature: allow for unresolved predicate stage ops
     // in the loop body.
     bool keepPredicateStage = forOp->hasAttr("__test_keep_predicate_stage");
-    // TODO: Enable epilogue peeling for warp specialized loops
-    // Heuristic: only peel epilogue for MMAv5 loops with waits in the last
-    // stage
+
+    // FB Change: Enable epilogue peeling for warp specialized loops
+    // This may not be fully working but seems to work based on FA testing.
     bool customEpiloguePeeling =
         hasMMAv5WaitsInLastStage(forOp, schedule) &&
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
+    if (hasWarpSpec)
+      customEpiloguePeeling = true;
 
     if (keepPredicateStage || customEpiloguePeeling) {
       options.emitPredicateStageFn =
@@ -198,15 +209,20 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
 
     {
       SmallVector<scf::ForOp> loops;
+      bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {
         // Bail out for loops with num_stage <= 1.
         if (getNumStagesOrDefault(forOp, numStages) > 1)
           loops.push_back(forOp);
+        if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
+          hasWarpSpec = true;
       });
 
-      for (scf::ForOp forOp : loops) {
-        mlir::triton::pipelineTMAStores(forOp);
-      }
+      // With Meta's warpspec, we are handling this in AutoWS.
+      if (!hasWarpSpec)
+        for (scf::ForOp forOp : loops) {
+          mlir::triton::pipelineTMAStores(forOp);
+        }
     }
   }
 };

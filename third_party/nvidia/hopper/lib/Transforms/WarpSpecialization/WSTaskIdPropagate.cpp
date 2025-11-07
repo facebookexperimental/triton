@@ -4,6 +4,7 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -24,6 +25,36 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
+  // Compute the min partition to normalize to 0
+  int64_t minPartition = INT64_MAX;
+  funcOp.walk([&](mlir::Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      int64_t idx = attr.getInt();
+      assert(idx >= 0);
+      minPartition = std::min(idx, minPartition);
+    }
+  });
+  DenseSet<AsyncTaskId> totalTaskIds;
+  // Convert ttg.partition to async_task_id
+  funcOp.walk([&](mlir::Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      int64_t idx = attr.getInt() - minPartition;
+      totalTaskIds.insert(idx);
+      assert(idx >= 0);
+      setAsyncTaskIds(op, idx);
+      op->removeAttr("ttg.partition");
+    }
+  });
+
+  std::vector<int> allTasksVec(totalTaskIds.begin(), totalTaskIds.end());
+  ArrayRef<AsyncTaskId> allTasks(allTasksVec);
+
+  // Hack: set async_task_id to all tasks for all assume ops.
+  // This is not necesssarily generally desirable because it could
+  // force data into multiple partitions. However, for now we will
+  // assume this is for the inputs and can state this as needed.
+  funcOp.walk([&](LLVM::AssumeOp op) { setAsyncTaskIds(op, allTasks); });
+
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
   DataFlowSolver solver;
@@ -57,9 +88,12 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     if (!taskIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !op->hasAttr("async_task_id"))) {
       op->setAttr("async_task_id", taskIds.getTaskIds());
-      labelParentOps(op);
     }
   });
+  // The parent operations must have the union of their children's operations.
+  // We do this in a separate walk to avoid having a parent operation treated
+  // like an anchor op and skipped by the first walk.
+  funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
   return 0;
 }
 
