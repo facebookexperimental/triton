@@ -50,6 +50,13 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Slice a `M x N` tensor at a `m x n` offset.
 
+### Remote buffer operations
+
+- `buffer = tlx.remote_view(buffer, remote_cta_rank)`
+
+  Return a remote view of the `buffer` living in another CTA in the same cluster with ID `remote_cta_rank`. NOTE: for
+  now we only support barrier as `buffer`, not general SMEM.
+
 ### Async memory access
 
 
@@ -171,13 +178,25 @@ Examples: how mbarriers are communicated in warp specialization
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task..
 
+### Other operations
+
+- `tlx.cluster_cta_rank()`
+
+  Returns the rank (unique ID) of the current CTA within the cluster.
 
 - `tlx.thread_id(axis)`
 
     Returns the id of the current thread instance along the given `axis`.
 
+- `tlx.clock64()`
 
-
+    Returns the current 64-bit hardware clock value. E.g,
+    ```
+        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start  # Number of clock cycles elapsed
+    ```
 
 
 ## Kernels Implemented with TLX

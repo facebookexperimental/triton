@@ -64,14 +64,14 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     key=["M", "N", "K"],
 )
 @triton.jit
-def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
-                                   BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-                                   GROUP_SIZE_M: tl.constexpr,  #
-                                   NUM_SMEM_BUFFERS: tl.constexpr,  #
-                                   NUM_TMEM_BUFFERS: tl.constexpr,  #
-                                   NUM_SMS: tl.constexpr,  #
-                                   EPILOGUE_SUBTILE: tl.constexpr,  #
-                                   ):
+def matmul_kernel_tma_ws_blackwell_persistent(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
+                                              BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
+                                              GROUP_SIZE_M: tl.constexpr,  #
+                                              NUM_SMEM_BUFFERS: tl.constexpr,  #
+                                              NUM_TMEM_BUFFERS: tl.constexpr,  #
+                                              NUM_SMS: tl.constexpr,  #
+                                              EPILOGUE_SUBTILE: tl.constexpr,  #
+                                              ):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
     buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
@@ -163,8 +163,14 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bars[buf], dot_phase)
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,
-                                  mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
+                    tlx.async_dot(
+                        buffers_A[buf],
+                        buffers_B[buf],
+                        tmem_buffers[cur_tmem_buf],
+                        use_acc=k > 0,
+                        mBarriers=[smem_empty_bars[buf]],
+                        out_dtype=tl.float32,
+                    )
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
@@ -195,6 +201,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             # we virtually "flatten" the two layer loop as if we're performing tma loads on
             # one big list of data
             processed_k_iters = 0
+
             for tile_id in range(start_pid, num_tiles, NUM_SMS):
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
@@ -238,7 +245,7 @@ def matmul(a, b):
         NUM_SMS,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     ), )
-    matmul_kernel_tma_ws_blackwell[grid](
+    matmul_kernel_tma_ws_blackwell_persistent[grid](
         a_desc, b_desc, c_desc,  #
         M, N, K,  #
         NUM_SMS=NUM_SMS,  #
@@ -265,24 +272,21 @@ def test_op():
 
 ref_lib = "cuBLAS"
 
-configs = []
-configs.append(
+
+@triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
         x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=[ref_lib.lower(), "triton"],  # Label name for the lines
-        line_names=[ref_lib, "Triton"],  # Line styles
+        line_vals=[ref_lib.lower(), "triton_persistent"],  # Label name for the lines
+        line_names=[ref_lib, "Triton (persisent)"],  # Line styles
         styles=[("green", "-"), ("blue", "-")],
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
         args={},
     ))
-
-
-@triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
@@ -290,8 +294,10 @@ def benchmark(M, N, K, provider):
     if provider == ref_lib.lower():
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
                                                      rep=2000)
-    if provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
+    if provider == "triton_persistent":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b, False), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
+
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 

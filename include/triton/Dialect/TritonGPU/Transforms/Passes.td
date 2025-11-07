@@ -47,6 +47,11 @@ def TritonGPUScheduleLoops : Pass<"tritongpu-schedule-loops", "mlir::ModuleOp"> 
     The `tritongpu-schedule-loops` pass performs scheduling for loop pipelining
     for loops with latency ops.
   }];
+
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "number of pipeline stages">
+  ];
 }
 
 def TritonGPUHoistTMEMAlloc : Pass<"tritongpu-hoist-tmem-alloc", "mlir::ModuleOp"> {

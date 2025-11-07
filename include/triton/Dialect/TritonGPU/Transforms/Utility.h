@@ -183,7 +183,11 @@ LogicalResult getConvertBackwardSlice(
         nullptr);
 
 // Populate pattern to remove dead cycles in ForOp.
-void populateForOpDeadArgumentElimination(RewritePatternSet &patterns);
+// opsCanBeTriviallyDead specifies the operations of which the side effect can
+// be ignored.
+void populateForOpDeadArgumentElimination(
+    RewritePatternSet &patterns,
+    const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
 
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.
@@ -215,8 +219,9 @@ std::optional<StringRef> getAMDArch(Operation *module);
 std::optional<mlir::triton::gpu::SwizzledSharedEncodingAttr>
 getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
 
-// Convert \param op operands and results to layout \param encoding.
-void convertOpEncoding(Attribute encoding, Operation *op);
+// Convert \param op to use \param encoding attribute.
+// Skips operands if they're in shared encoding.
+Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op);
 
 // Returns the original memory allocation for a memdesc value
 triton::gpu::LocalAllocOp findShmemAlloc(Value operand);

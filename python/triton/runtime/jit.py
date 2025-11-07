@@ -380,8 +380,6 @@ def create_specialize_impl(specialize_extra):
             return ("constexpr", arg.cache_key)
         elif isinstance(arg, constexpr):
             return ("constexpr", arg)
-        elif hasattr(arg, "tma_desc_cpu_ptr"):
-            return ("nvTmaDesc", None)
         elif isinstance(arg, tuple):
             spec = [specialize_impl(x) for x in arg]
             make_tuple = lambda vals: type(arg)(*vals) if hasattr(arg, "_fields") else tuple(vals)
@@ -501,7 +499,10 @@ class JITCallable:
     def __init__(self, fn):
         self.fn = fn
         self.signature = inspect.signature(fn)
-        self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
+        try:
+            self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
+        except OSError as e:
+            raise ValueError("@jit functions should be defined in a Python file") from e
         self._fn_name = get_full_name(fn)
         self._hash_lock = threading.RLock()
 
@@ -631,7 +632,24 @@ class JITFunction(JITCallable, KernelInterface[T]):
         name = self.fn.__qualname__
         module = self.fn.__module__
         arg_reprs = ", ".join([f"{param.name}: {ty}" for param, ty in zip(self.params, key[1])])
-        repr = f"{name}[num_warps={options.num_warps}, num_ctas={options.num_ctas}, num_stages={options.num_stages}, enable_fp_fusion={options.enable_fp_fusion}, launch_cooperative_grid={options.launch_cooperative_grid}]({arg_reprs})"
+        # Build repr string, only including optional params when they're set
+        repr_parts = [
+            f"num_warps={options.num_warps}",
+            f"num_ctas={options.num_ctas}",
+            f"num_stages={options.num_stages}",
+        ]
+        # Use getattr to safely access backend-specific attributes
+        minRegAutoWS = getattr(options, 'minRegAutoWS', None)
+        maxRegAutoWS = getattr(options, 'maxRegAutoWS', None)
+        if minRegAutoWS is not None:
+            repr_parts.append(f"minRegAutoWS={minRegAutoWS}")
+        if maxRegAutoWS is not None:
+            repr_parts.append(f"maxRegAutoWS={maxRegAutoWS}")
+        repr_parts.extend([
+            f"enable_fp_fusion={options.enable_fp_fusion}",
+            f"launch_cooperative_grid={options.launch_cooperative_grid}",
+        ])
+        repr = f"{name}[{', '.join(repr_parts)}]({arg_reprs})"
         full_name = get_full_name(self.fn)
 
         specialization_data = serialize_specialization_data(full_name, signature, constants, configs[0], options, key)
@@ -643,6 +661,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
             'num_warps': options.num_warps,
             'num_ctas': options.num_ctas,
             'num_stages': options.num_stages,
+            'minRegAutoWS': getattr(options, 'minRegAutoWS', None),
+            'maxRegAutoWS': getattr(options, 'maxRegAutoWS', None),
             'enable_fp_fusion': options.enable_fp_fusion,
             'launch_cooperative_grid': options.launch_cooperative_grid,
             'extern_libs': options.extern_libs,
@@ -768,10 +788,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
         super().__init__(fn)
         self.module = fn.__module__
         self.version = version
-        self.signature = inspect.signature(fn)
         self.do_not_specialize = do_not_specialize
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
-        self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
         self._repr = repr
         self.launch_metadata = launch_metadata
 
@@ -968,8 +986,17 @@ class MockTensor:
             return MockTensor(arg)
         return arg
 
-    def __init__(self, dtype):
+    def __init__(self, dtype, shape=None):
+        if shape is None:
+            shape = [1]
         self.dtype = dtype
+        self.shape = shape
+
+    def stride(self):
+        strides = [1]
+        for size in self.shape[1:]:
+            strides.append(strides[-1] * size)
+        return tuple(reversed(strides))
 
     @staticmethod
     def data_ptr():

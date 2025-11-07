@@ -89,6 +89,8 @@ void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
   ADD_PASS_OPTION_WRAPPER_2("add_hopper_warpspec",
                             mlir::createNVGPUWarpSpecialization, int, bool);
+  ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
+                            mlir::createNVGPUWSDataPartition, int);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,

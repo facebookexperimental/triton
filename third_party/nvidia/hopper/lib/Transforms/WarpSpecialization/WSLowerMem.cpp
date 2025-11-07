@@ -46,6 +46,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
   builder.setInsertionPoint(loadOp);
+  builder.setLoopScheduleInfoFromOp(loadOp);
   Value loadResult = loadOp.getResult();
   auto tensorType = dyn_cast<RankedTensorType>(loadResult.getType());
   if (!tensorType)
@@ -62,7 +63,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -93,6 +94,9 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
 
 // Create a local copy for a channel that is populated by the producer and
 // accessed by the consumer.
+// For the case where the value shared in (producer, consumer) is in tensor.
+// Global buffer for the channel is already created and passed in bufferMap.
+// This function creates LocalLoad at consumer and LocalStore at producer.
 static std::pair<Operation *, Operation *>
 createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
                 Value srcBufferIdx, Value dstBufferIdx) {
@@ -117,7 +121,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -127,6 +131,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   OpBuilderWithAsyncTaskIds builder(dstOp);
   builder.setAsyncTaskIdsFromOp(dstOp);
   builder.setInsertionPoint(dstOp);
+  builder.setLoopScheduleInfoFromOp(dstOp);
   auto dstView = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       dstOp->getLoc(), subviewTy, buffer, dstBufferIdx);
   auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
@@ -137,6 +142,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   builder.setAsynTaskIdsFromArray(channel->relation.first);
   builder.setInsertionPoint(srcOp->getParentOp());
   builder.setInsertionPointAfter(srcOp);
+  builder.setLoopScheduleInfoFromOp(srcOp);
   auto srcView = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       srcOp->getLoc(), subviewTy, buffer, srcBufferIdx);
   // Create local_alloc
@@ -145,8 +151,8 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   return {copy, sharedLoad};
 }
 
-static Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
-                              Value idx) {
+Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
+                       Value idx) {
   assert(isa<triton::gpu::MemDescType>(alloc.getType()) &&
          "Expected MemDescType");
   auto allocDescType = cast<triton::gpu::MemDescType>(alloc.getType());
@@ -157,10 +163,129 @@ static Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                allocDescType.getShape().end());
   auto viewDescType = triton::gpu::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
-      allocDescType.getMemorySpace(), allocDescType.getMutableMemory(),
-      /*allocShape=*/allocDescType.getAllocShape());
+      allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
+  //    /*allocShape=*/allocDescType.getAllocShape());
   return builder.create<triton::gpu::MemDescIndexOp>(alloc.getLoc(),
                                                      viewDescType, alloc, idx);
+}
+
+// For the case where the value shared in (producer, consumer) is in smem.
+static std::pair<Operation *, Operation *>
+createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
+               Value srcBufferIdx, Value dstBufferIdx) {
+  Operation *srcOp = channel->getSrcOp();
+  Operation *dstOp = channel->getDstOp();
+  auto buffer = bufferMap.find(channel)->second;
+  Value srcValue = channel->getSrcOperand();
+  auto memDesc = cast<triton::gpu::MemDescType>(srcValue.getType());
+
+  // Replace original smem alloc with smem_store.
+  auto oldAllocOp = cast<ttg::LocalAllocOp>(srcOp);
+  auto newAllocOp = cast<ttg::LocalAllocOp>(buffer.getDefiningOp());
+  OpBuilderWithAsyncTaskIds builder(oldAllocOp);
+  builder.setInsertionPointAfter(oldAllocOp);
+
+  assert(oldAllocOp.getSrc());
+  auto *actualSrc = oldAllocOp.getSrc().getDefiningOp();
+  builder.setLoopScheduleInfoFromOp(actualSrc);
+
+  SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(actualSrc);
+  for (auto *user : oldAllocOp->getUsers()) {
+    for (auto task : getAsyncTaskIds(user))
+      if (!llvm::is_contained(asyncTasksSubView, task))
+        asyncTasksSubView.push_back(task);
+  }
+  builder.setAsynTaskIdsFromArray(asyncTasksSubView);
+  // Will be used by both produer and consumer.
+  auto srcView = createBufferView(builder, newAllocOp, srcBufferIdx);
+
+  builder.setAsyncTaskIdsFromOp(actualSrc);
+  auto smemStoreOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+      oldAllocOp.getLoc(), oldAllocOp.getSrc(), srcView);
+
+  // Consumer will be updated.
+  oldAllocOp->getResult(0).replaceAllUsesWith(srcView);
+  oldAllocOp.erase();
+  // DstOp is the same, srcOp will be auto-adjusted to be the defining op of
+  // srcOpnd.
+  return {smemStoreOp, channel->getDstOp()};
+}
+
+static std::pair<Operation *, Operation *>
+createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
+               Value srcBufferIdx, Value dstBufferIdx) {
+  // Replace original tmem alloc with tmem_store.
+  ttng::TmemDataChannel *tmemChannel =
+      static_cast<ttng::TmemDataChannel *>(channel);
+  auto oldTMemAllocOp = cast<ttng::TMEMAllocOp>(tmemChannel->getAllocOp());
+  auto newTMemAllocOp =
+      cast<ttng::TMEMAllocOp>(bufferMap.find(channel)->second.getDefiningOp());
+  OpBuilderWithAsyncTaskIds builder(oldTMemAllocOp);
+  builder.setInsertionPointAfter(oldTMemAllocOp);
+  builder.setLoopScheduleInfoFromOp(oldTMemAllocOp);
+
+  // A tmemChannel is usually centered around a gen5 dotOp. There are two
+  // cases, one is that the channel is for the accumulator, the other is
+  // the channel is for operand A of the gen5.
+  // Here we replace tmem_alloc with tmem_store when applicable and create a
+  // subView that is used by tmem_store and also all users of tmem_alloc.
+  // Calculate the taskIds for the subView, and tmem_store.
+  // tmemStore's taskId can be the mmaOp's taskId if alloc.getSrc is available
+  // for mmaOp's taskId, otherwise, it should happen in alloc.getsrc.
+  Operation *opForStoreTask = tmemChannel->getMmaOp();
+  if (oldTMemAllocOp.getSrc()) {
+    auto taskIds = getAsyncTaskIds(opForStoreTask);
+    assert(taskIds.size() == 1);
+    // Check to see if alloc.getSrc is available for mmaOp's taskId.
+    auto *srcOp = oldTMemAllocOp.getSrc().getDefiningOp();
+    if (!hasAsyncTaskId(srcOp, taskIds[0]))
+      opForStoreTask = oldTMemAllocOp.getSrc().getDefiningOp();
+  }
+  // TaskIds for subView should be the union of tmem_store and all users of
+  // tmem_alloc.
+  SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(opForStoreTask);
+  for (auto *user : oldTMemAllocOp->getUsers()) {
+    for (auto task : getAsyncTaskIds(user))
+      if (!llvm::is_contained(asyncTasksSubView, task))
+        asyncTasksSubView.push_back(task);
+  }
+  builder.setAsynTaskIdsFromArray(asyncTasksSubView);
+
+  auto srcView = createBufferView(builder, newTMemAllocOp, srcBufferIdx);
+  LLVM_DEBUG({
+    LDBG("createTMEMCopy: srcView ");
+    srcView.dump();
+  });
+
+  if (oldTMemAllocOp.getSrc()) {
+    builder.setAsyncTaskIdsFromOp(opForStoreTask);
+    Value vTrue = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        oldTMemAllocOp.getLoc(), 1, 1);
+    // Promote TMEMAlloc to start, create TMEMStore.
+    // auto tokType = builder.getType<AsyncTokenType>();
+    // tokType, srcView, oldTMemAllocOp.getToken()
+    // We used to have token from Alloc, then to other users.
+    // FIXME: Type(), srcView, Value(),
+    // OAI's warpspec does the above.
+    auto tmemStoreOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
+        oldTMemAllocOp.getLoc(), Type(), srcView, Value(),
+        oldTMemAllocOp.getSrc(), vTrue);
+    oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
+    if (oldTMemAllocOp.getToken())
+      oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
+    oldTMemAllocOp.erase();
+    tmemChannel->tmemProducerOp = tmemStoreOp;
+    return {tmemStoreOp, channel->getDstOp()};
+  }
+  // Handle the case where there is no value for tmem_alloc.
+  oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
+  if (oldTMemAllocOp.getToken())
+    oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
+  oldTMemAllocOp.erase();
+  // We need a new srcOp now that tmemAlloc is erased, the new SrcOp will be
+  // the mmaOp.
+  tmemChannel->tmemProducerOp = tmemChannel->getMmaOp();
+  return {tmemChannel->getMmaOp(), channel->getDstOp()};
 }
 
 static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
@@ -187,14 +312,15 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
                             /*mutableMemOry=*/mutableMem);
 
-  return builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
+  auto desc = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
       buffer.getLoc(), subviewTy, buffer, bufferIdx);
+  return desc;
 }
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
@@ -202,7 +328,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
                             Value phase, Operation *headProducer,
-                            Operation *headConsumer) {
+                            Operation *headConsumer,
+                            Operation *headConsumerSameLevel, bool isPost) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -218,6 +345,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // first load.
   builder.setInsertionPoint(headProducer);
   builder.setAsyncTaskIdsFromOp(headProducer);
+  builder.setLoopScheduleInfoFromOp(headProducer);
   auto prodBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
@@ -228,6 +356,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   Operation *copy = nullptr;
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
     builder.setInsertionPoint(tmaLoad);
+    builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
     // FIXME: translateTMAIndices
@@ -237,8 +366,9 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   }
 
   // Create a wait_barrier before the first consumer.
-  builder.setInsertionPoint(headConsumer);
+  builder.setInsertionPoint(headConsumerSameLevel);
   builder.setAsyncTaskIdsFromOp(headConsumer);
+  builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
@@ -248,6 +378,23 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 
   // Convert all the consumers to local_load
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
+    if (isPost) {
+      // consumer is the user of the smem. We can't insert local_load here
+      // and use the result in local_store that is the producer for the smem
+      // channel. descriptor_load has a single user which is local_store.
+      unsigned cnt = 0;
+      Operation *localSt = nullptr;
+      for (auto *usr : tmaLoad->getUsers()) {
+        assert(isa<ttg::LocalStoreOp>(usr));
+        localSt = usr;
+        ++cnt;
+      }
+      assert(cnt == 1);
+      localSt->erase();
+      tmaLoad.erase();
+      continue;
+    }
+    builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(
         builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
     auto sharedLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
@@ -257,6 +404,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     tmaLoad.getResult().replaceAllUsesWith(sharedLoad.getResult());
     tmaLoad.erase();
   }
+  builder.clearLoopScheduleInfo();
   return copy;
 }
 
@@ -268,7 +416,8 @@ void insertAsyncCopy(
         &channelsGroupedByProducers,
     const DenseMap<Channel *, Value> &bufferMap,
     DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &regionsWithChannels) {
+    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
+    bool isPost) {
   // For each producer op, create a async_copy or local_store from the producer
   // to the buffer. Create a local_load from the buffer at the dominating
   // consumer.
@@ -326,14 +475,17 @@ void insertAsyncCopy(
           asyncTasksPC.push_back(task);
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
+    builder.clearLoopScheduleInfo();
 
     if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
+      int reuseGrp = channelInReuseGroup(kv.getFirst(), config);
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase ");
         srcOp->dump();
       });
-      getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->numBuffers,
-                           regionsWithChannels, bufferIdx, phase);
+      getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->getNumBuffers(),
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, kv.getFirst());
     } else {
       // Producer is not in a ForOp, create phase and bufferIdx here which will
       // be used by both producer and consumers.
@@ -359,9 +511,14 @@ void insertAsyncCopy(
       producerConsumerOps = createAsyncCopy(bufferMap, domininatingChannel,
                                             domininatingChannel->getSrcOp(),
                                             asyncTasksPC, bufferIdx, bufferIdx);
-    } else if (domininatingChannel->channelKind == DataChannelKind::TMEM) {
-      // TODO: will be added in a separate PR.
-    } else {
+    } else if (domininatingChannel->channelKind == DataChannelKind::TMEM &&
+               !isPost) {
+      producerConsumerOps =
+          createTMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
+    } else if (isa<ttg::LocalAllocOp>(srcOp) && !isPost) {
+      producerConsumerOps =
+          createSMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
+    } else if (!isPost) {
       assert(!isa<ttg::LocalLoadOp>(srcOp) &&
              "LocalLoadOp buffer should be reused");
       producerConsumerOps =
