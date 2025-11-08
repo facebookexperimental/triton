@@ -344,7 +344,7 @@ tlx_configs = [
         },
         num_warps=4,
         num_stages=1,
-    ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in [2, 3, 4] for t in [2] for subtile in [1,2,4]
+    ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in [2, 3, 4] for t in [2] for subtile in [1, 2, 4]
 ]
 
 
@@ -440,7 +440,6 @@ def grouped_matmul_tlx_kernel(
                             result = tlx.local_load(acc_slice)
                             c = result.to(tl.float16)
                             c_desc.store([offs_cm, offs_cn + slice_id * slice_size], c)
-
 
                         # done storing this buffer, signal MMA consumer to resume writing to it
                         tlx.barrier_arrive(tmem_empty_bars[tmem_buf], 1)
