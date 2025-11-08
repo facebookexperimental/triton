@@ -344,7 +344,7 @@ tlx_configs = [
         },
         num_warps=4,
         num_stages=1,
-    ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in [2, 3, 4] for t in [2] for subtile in [False]
+    ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in [2, 3, 4] for t in [2] for subtile in [1,2,4]
 ]
 
 
@@ -411,7 +411,7 @@ def grouped_matmul_tlx_kernel(
                         c_ptr,
                         shape=[gm, gn],
                         strides=[ldc, 1],
-                        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+                        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
                     )
 
                     # iterate through the tiles in the current gemm problem
@@ -430,21 +430,17 @@ def grouped_matmul_tlx_kernel(
                         offs_cm = tile_m_idx * BLOCK_SIZE_M
                         offs_cn = tile_n_idx * BLOCK_SIZE_N
 
-                        if EPILOGUE_SUBTILE:
-                            # We load/store the result half by half to reduce SMEM pressure
-                            acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
-                            result = tlx.local_load(acc_tmem_subslice1)
+                        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+                        for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                            acc_slice = tlx.local_slice(
+                                acc_tmem,
+                                [0, slice_id * slice_size],
+                                [BLOCK_SIZE_M, slice_size],
+                            )
+                            result = tlx.local_load(acc_slice)
                             c = result.to(tl.float16)
-                            c_desc.store([offs_cm, offs_cn], c)
+                            c_desc.store([offs_cm, offs_cn + slice_id * slice_size], c)
 
-                            acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
-                            result = tlx.local_load(acc_tmem_subslice2)
-                            c = result.to(tl.float16)
-                            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c)
-                        else:
-                            result = tlx.local_load(acc_tmem)
-                            c = result.to(tl.float16)
-                            c_desc.store([offs_cm, offs_cn], c)
 
                         # done storing this buffer, signal MMA consumer to resume writing to it
                         tlx.barrier_arrive(tmem_empty_bars[tmem_buf], 1)
