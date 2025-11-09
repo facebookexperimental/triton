@@ -25,3 +25,15 @@ void mlir::triton::tlx::TLXDialect::initialize() {
 
 #define GET_ATTRDEF_CLASSES
 #include "IR/TLXAttrDefs.cpp.inc"
+
+bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {
+  assert(op != nullptr && "expecting nonnull op for checking TLX 2cta mode");
+  auto module = op;
+  if (!isa<ModuleOp>(module)) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  assert(module != nullptr &&
+         "expecting op nested in a module for checking TLX 2cta mode");
+  auto attr = module->getAttrOfType<BoolAttr>(AttrTLXEnablePairedCTAMMAName);
+  return attr != nullptr && attr.getValue() == true;
+}
