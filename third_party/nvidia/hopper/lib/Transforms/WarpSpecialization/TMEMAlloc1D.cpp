@@ -155,48 +155,8 @@ void generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
     if (allocShape[allocShape.size() - 1] != 1) {
       builder.setInsertionPointAfter(allocOp);
       // Hardcode allocShape[0] / 2 for testing.
-      auto reinterpretOp = sliceAndReinterpretTMEMBuffer(
+      allocOpBuffer = sliceAndReinterpretTMEMBuffer(
           builder, allocOp, allocShape[allocShape.size() - 2] / 2, 1);
-
-      // If the primary allocation failed, try other TMEM allocations
-      if (!reinterpretOp) {
-        LDBG("Primary TMEM allocation failed, trying alternative allocations");
-
-        for (size_t i = 0; i < allocOps.size() && !reinterpretOp; ++i) {
-          if (i == producerTMEMStart)
-            continue; // Skip the one we already tried
-
-          auto altAllocOp = allocOps[i];
-          auto altAllocShape =
-              dyn_cast<ttg::MemDescType>(altAllocOp->getResult(0).getType())
-                  .getShape();
-
-          if (altAllocShape[altAllocShape.size() - 1] != 1) {
-            builder.setInsertionPointAfter(altAllocOp);
-            reinterpretOp = sliceAndReinterpretTMEMBuffer(
-                builder, altAllocOp,
-                altAllocShape[altAllocShape.size() - 2] / 2, 1);
-
-            if (reinterpretOp) {
-              LDBG("Successfully found alternative TMEM allocation at index "
-                   << i);
-              break;
-            }
-          }
-        }
-
-        // If all TMEM allocations failed, fall back to SMEM (LocalAllocOp)
-        if (!reinterpretOp) {
-          LDBG("All TMEM allocations failed, falling back to SMEM");
-          // Set allocOpBuffer to nullptr to signal SMEM fallback
-          // The TMEM1DAllocator will create a new allocation
-          allocOpBuffer = nullptr;
-        } else {
-          allocOpBuffer = reinterpretOp.getOperation();
-        }
-      } else {
-        allocOpBuffer = reinterpretOp.getOperation();
-      }
     } else {
       allocOpBuffer = allocOp;
     }
@@ -220,13 +180,11 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
                           Operation *user, int offset) {
   // This function is TMEM-specific - verify both allocations are TMEM
   if (!isa<ttng::TMEMAllocOp>(allocOp)) {
-    LDBG("sliceAndReinterpretMDTMEM called with non-TMEM allocOp - returning "
-         "nullptr");
+    LDBG("sliceAndReinterpretMDTMEM called with non-TMEM allocOp");
     return nullptr;
   }
   if (!isa<ttng::TMEMAllocOp>(newAlloc)) {
-    LDBG("sliceAndReinterpretMDTMEM called with non-TMEM newAlloc - returning "
-         "nullptr");
+    LDBG("sliceAndReinterpretMDTMEM called with non-TMEM newAlloc");
     return nullptr;
   }
 

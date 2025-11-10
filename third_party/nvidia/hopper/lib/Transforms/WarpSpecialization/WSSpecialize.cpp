@@ -384,6 +384,105 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   return nullptr;
 }
 
+static void logOpStillHasUsers(Operation *op) {
+  LLVM_DEBUG({
+    llvm::errs() << "Op still has users: " << op->getName();
+    if (auto partitionAttr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
+    }
+    auto taskIds = getAsyncTaskIds(op);
+    if (!taskIds.empty()) {
+      llvm::errs() << " (taskIds: ";
+      for (size_t i = 0; i < taskIds.size(); ++i) {
+        if (i > 0)
+          llvm::errs() << ", ";
+        llvm::errs() << taskIds[i];
+      }
+      llvm::errs() << ")";
+    }
+    auto attrs = op->getAttrs();
+    if (!attrs.empty()) {
+      llvm::errs() << " [attrs: ";
+      bool first = true;
+      for (auto namedAttr : attrs) {
+        if (!first)
+          llvm::errs() << ", ";
+        llvm::errs() << namedAttr.getName().str();
+        first = false;
+      }
+      llvm::errs() << "]";
+    }
+    llvm::errs() << "\n";
+    for (unsigned i = 0; i < op->getNumResults(); ++i) {
+      for (Operation *user : op->getResult(i).getUsers()) {
+        llvm::errs() << "  User: " << user->getName();
+        if (auto userPartitionAttr =
+                user->getAttrOfType<IntegerAttr>("ttg.partition")) {
+          llvm::errs() << " (partition: " << userPartitionAttr.getInt() << ")";
+        }
+        auto userTaskIds = getAsyncTaskIds(user);
+        if (!userTaskIds.empty()) {
+          llvm::errs() << " (taskIds: ";
+          for (size_t j = 0; j < userTaskIds.size(); ++j) {
+            if (j > 0)
+              llvm::errs() << ", ";
+            llvm::errs() << userTaskIds[j];
+          }
+          llvm::errs() << ")";
+        }
+        llvm::errs() << "\n";
+      }
+    }
+  });
+  llvm::errs() << "Op still has users: " << op->getName();
+  if (auto partitionAttr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+    llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
+  }
+  auto taskIds = getAsyncTaskIds(op);
+  if (!taskIds.empty()) {
+    llvm::errs() << " (taskIds: ";
+    for (size_t i = 0; i < taskIds.size(); ++i) {
+      if (i > 0)
+        llvm::errs() << ", ";
+      llvm::errs() << taskIds[i];
+    }
+    llvm::errs() << ")";
+  }
+  auto attrs = op->getAttrs();
+  if (!attrs.empty()) {
+    llvm::errs() << " [attrs: ";
+    bool first = true;
+    for (auto namedAttr : attrs) {
+      if (!first)
+        llvm::errs() << ", ";
+      llvm::errs() << namedAttr.getName().str();
+      first = false;
+    }
+    llvm::errs() << "]";
+  }
+  llvm::errs() << "\n";
+  for (unsigned i = 0; i < op->getNumResults(); ++i) {
+    for (Operation *user : op->getResult(i).getUsers()) {
+      llvm::errs() << "  User: " << user->getName();
+      if (auto userPartitionAttr =
+              user->getAttrOfType<IntegerAttr>("ttg.partition")) {
+        llvm::errs() << " (partition: " << userPartitionAttr.getInt() << ")";
+      }
+      auto userTaskIds = getAsyncTaskIds(user);
+      if (!userTaskIds.empty()) {
+        llvm::errs() << " (taskIds: ";
+        for (size_t j = 0; j < userTaskIds.size(); ++j) {
+          if (j > 0)
+            llvm::errs() << ", ";
+          llvm::errs() << userTaskIds[j];
+        }
+        llvm::errs() << ")";
+      }
+      llvm::errs() << "\n";
+    }
+  }
+}
+
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   LLVM_DEBUG({
@@ -448,6 +547,34 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     Block *defaultBlock = impB.createBlock(&wsOp.getDefaultRegion());
     taskBuilder.setInsertionPointToStart(defaultBlock);
     IRMapping mapping;
+
+    // Pre-populate mapping for ForOp results.
+    // When a ForOp result is used by operations that appear before the ForOp
+    // in the IR, we need to map those results to their init args before we
+    // start cloning operations.
+    for (Operation *op : opList) {
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        for (unsigned resIdx = 0; resIdx < forOp.getNumResults(); ++resIdx) {
+          auto result = forOp.getResult(resIdx);
+          // Check if this result is used by any operation in this partition
+          bool usedInPartition = false;
+          for (Operation *user : result.getUsers()) {
+            if (hasAsyncTaskId(user, asyncTaskId)) {
+              usedInPartition = true;
+              break;
+            }
+          }
+          // Pre-map the result to its init arg.
+          // This will be updated later when the ForOp is specialized if the
+          // result is actually produced in this partition.
+          if (usedInPartition) {
+            Value initArg = forOp.getInitArgs()[resIdx];
+            mapping.map(result, initArg);
+          }
+        }
+      }
+    }
+
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
@@ -466,6 +593,35 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     taskBuilder.setInsertionPointToStart(partitionBlock);
 
     IRMapping mapping;
+
+    // Pre-populate mapping for ForOp results.
+    // When a ForOp result is used by operations that appear before the ForOp
+    // in the IR, we need to map those results to their init args before we
+    // start cloning operations.
+    for (Operation *op : opList) {
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        for (unsigned resIdx = 0; resIdx < forOp.getNumResults(); ++resIdx) {
+          auto result = forOp.getResult(resIdx);
+          // Check if this result is used by any operation in this partition
+          bool usedInPartition = false;
+          for (Operation *user : result.getUsers()) {
+            if (hasAsyncTaskId(user, asyncTaskId)) {
+              usedInPartition = true;
+              break;
+            }
+          }
+          // Pre-map the result to its init arg.
+          // This will be updated later when the ForOp is specialized if the
+          // result is actually produced in this partition.
+          if (usedInPartition) {
+            Value initArg = forOp.getInitArgs()[resIdx];
+            mapping.map(result, initArg);
+          }
+        }
+      }
+    }
+
+    // Now clone operations in order
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
@@ -541,72 +697,13 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
+    // FIXME: we are not able to erase a few ops scenarios outside loops.
+    // Need to investigate live dependencies among these ops.
     if (!hasUse) {
       op->erase();
-    } /* else {
-       llvm::errs() << "Op still has users: " << op->getName();
-
-       // Check for partition attribute
-       if (auto partitionAttr =
-               op->getAttrOfType<IntegerAttr>("ttg.partition")) {
-         llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
-       }
-
-       // Check for async task ID
-       auto taskIds = getAsyncTaskIds(op);
-       if (!taskIds.empty()) {
-         llvm::errs() << " (taskIds: ";
-         for (size_t i = 0; i < taskIds.size(); ++i) {
-           if (i > 0)
-             llvm::errs() << ", ";
-           llvm::errs() << taskIds[i];
-         }
-         llvm::errs() << ")";
-       }
-
-       // Print all attributes
-       auto attrs = op->getAttrs();
-       if (!attrs.empty()) {
-         llvm::errs() << " [attrs: ";
-         bool first = true;
-         for (auto namedAttr : attrs) {
-           if (!first)
-             llvm::errs() << ", ";
-           llvm::errs() << namedAttr.getName().str();
-           first = false;
-         }
-         llvm::errs() << "]";
-       }
-
-       llvm::errs() << "\n";
-
-       for (unsigned i = 0; i < op->getNumResults(); ++i) {
-         for (Operation *user : op->getResult(i).getUsers()) {
-           llvm::errs() << "  User: " << user->getName();
-
-           // Check for partition attribute on user
-           if (auto userPartitionAttr =
-                   user->getAttrOfType<IntegerAttr>("ttg.partition")) {
-             llvm::errs() << " (partition: " << userPartitionAttr.getInt()
-                          << ")";
-           }
-
-           // Check for async task ID on user
-           auto userTaskIds = getAsyncTaskIds(user);
-           if (!userTaskIds.empty()) {
-             llvm::errs() << " (taskIds: ";
-             for (size_t j = 0; j < userTaskIds.size(); ++j) {
-               if (j > 0)
-                 llvm::errs() << ", ";
-               llvm::errs() << userTaskIds[j];
-             }
-             llvm::errs() << ")";
-           }
-
-           llvm::errs() << "\n";
-         }
-       }
-     }*/
+    } else {
+      logOpStillHasUsers(op);
+    }
   }
 }
 

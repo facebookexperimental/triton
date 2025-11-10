@@ -61,10 +61,17 @@ static Channel *findChannelForAlloc(Value value,
 }
 
 static void getAllAcutalUsersForChannel(Channel *TheCh,
-                                        DenseSet<Operation *> &users) {
+                                        DenseSet<Operation *> &users,
+                                        Operation *alloc = nullptr) {
   // Skip null channels
-  if (!TheCh)
+  if (!TheCh) {
+    // Allocations inside loops should have associated channels
+    // For outside loop ops, channels are not created when there is
+    // no valid producer or outside loop op has no task IDs (e.g., store)
+    assert((!alloc || !alloc->getParentOfType<scf::ForOp>()) &&
+           "Expected channel for allocation inside loop");
     return;
+  }
   Operation *src = TheCh->getSrcOp();
   // Skip channels without valid source operations (e.g., allocations outside
   // loops)
@@ -214,11 +221,12 @@ private:
 
   OperationListT livenessForSmemChannel(Value value) {
     // Find the channel for value in channels.
+    Operation *alloc = value.getDefiningOp();
     ChannelPost *TheCh =
         static_cast<ChannelPost *>(findChannelForAlloc(value, *channels));
     std::vector<Operation *> liveOps;
     DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users);
+    getAllAcutalUsersForChannel(TheCh, users, alloc);
     updateLiveOpsAcrossScopes(users, liveOps);
     return liveOps;
   }
@@ -285,7 +293,7 @@ public:
       ChannelPost *TheCh =
           static_cast<ChannelPost *>(findChannelForOp(alloc, *channels));
       DenseSet<Operation *> users;
-      getAllAcutalUsersForChannel(TheCh, users);
+      getAllAcutalUsersForChannel(TheCh, users, alloc);
       // If no users found (e.g., for allocations outside loops), not in
       // innermost loop
       if (users.empty())
@@ -392,7 +400,7 @@ OperationListT livenessForTmemChannel(Value value,
     handleOperandD(cast<ttng::TMEMAllocOp>(TheCh->getAllocOp()), liveOps);
   } else {
     DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users);
+    getAllAcutalUsersForChannel(TheCh, users, value.getDefiningOp());
     updateLiveOpsAcrossScopes(users, liveOps);
   }
   return liveOps;
@@ -526,18 +534,15 @@ static void allocateTMem(Operation *parentOp, SmallVector<Channel *> &channels,
     // FIXME: try to find a buffer with a dependency chain. For FA, we want
     // p0/alpha0/l_i0/m_i0 to reuse.
 
-    // TODO: Add allocation type compatibility check. Currently, this function
+    // FIXME: Add allocation type compatibility check. Currently, this function
     // can return a SMEM allocation for reuse with a TMEM allocation (or vice
-    // versa), causing crashes in sliceAndReinterpretMDTMEM. Buffer reuse should
-    // ONLY be allowed between allocations of the same type:
+    // versa), causing issues in sliceAndReinterpretMDTMEM. Buffer reuse should
+    // only be allowed between allocations of the same type:
     // - SMEM (ttg.local_alloc) can reuse SMEM
     // - TMEM (ttng.tmem_alloc) can reuse TMEM
     // Mixing types is not supported because TMEM operations (especially TMA)
     // require TMEM memory space and cannot fall back to SMEM.
-    // Suggested fix:
-    //   bool candIsTMEM = isa<ttng::TMEMAllocOp>(cand);
-    //   bool allocIsTMEM = isa<ttng::TMEMAllocOp>(alloc);
-    //   if (candIsTMEM != allocIsTMEM) continue;
+
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       Operation *alloc = (*it).getOperation();
       if (allocToOffsets.count(alloc)) {

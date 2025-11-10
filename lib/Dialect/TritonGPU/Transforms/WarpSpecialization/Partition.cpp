@@ -168,8 +168,8 @@ void WarpSchedule::serialize(scf::ForOp loop) const {
     }
   });
 
-  // Serialize partition attributes for post-loop operations.
-  // These are operations scheduled in partitions but outside the loop body.
+  // Serialize partition attributes for post-loop operations -
+  // operations scheduled in partitions but outside the loop body.
   for (auto &[op, partition] : opToPartition) {
     // Skip operations inside the loop (already handled above)
     if (loop->isAncestor(op))
@@ -251,7 +251,7 @@ void WarpSchedule::iterateOutputs(
     for (OpOperand &use : op->getUses()) {
       Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
 
-      // Handle post-loop operations (operations outside the loop body).
+      // Handle post-loop operations.
       if (!owner) {
         // The user is outside the loop, so it's a post-loop operation.
         // Use the operation directly.
@@ -294,7 +294,7 @@ void WarpSchedule::iterateUses(
     auto [output, use, distance] = uses.pop_back_val();
     Operation *owner = loop.getBody()->findAncestorOpInBlock(*use->getOwner());
 
-    // Handle post-loop operations (operations outside the loop body).
+    // Handle post-loop operations.
     if (!owner) {
       // The user is outside the loop, so it's a post-loop operation.
       callback(output, *use, distance);
