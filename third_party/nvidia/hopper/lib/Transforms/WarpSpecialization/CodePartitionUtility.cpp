@@ -485,7 +485,6 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), initBufferIdx);
 
   // Create 'one' with the same type as bufferIdx to ensure type compatibility
-  // for AndIOp
   Value one;
   if (bufferIdx.getType().isIndex()) {
     // For index type, create a constant index
@@ -828,8 +827,8 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
         consumers.push_back(user);
     }
   }
-  // If we couldn't find a valid producer (e.g., for allocs outside the loop),
-  // skip creating a channel for this allocation.
+  // FIXME: If we couldn't find a valid producer (e.g., for allocs outside the
+  // loop), skip creating a channel for this allocation.
   if (!producerOp)
     return;
   auto producerTaskIds = getAsyncTaskIds(producerOp);

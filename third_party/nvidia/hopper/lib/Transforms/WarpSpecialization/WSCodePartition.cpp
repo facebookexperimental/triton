@@ -35,276 +35,6 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-// Debug helper to check if an operation is inside a loop
-// Usage in debugger: "p isInsideLoop(op)"
-__attribute__((used)) static bool isInsideLoop(Operation *op) {
-  Operation *parent = op->getParentOp();
-  while (parent) {
-    if (llvm::isa<scf::ForOp>(parent)) {
-      return true;
-    }
-    parent = parent->getParentOp();
-  }
-  return false;
-}
-
-// Debug helper function for use in debugger
-__attribute__((used)) static void
-printChannels(const llvm::SmallVector<Channel *> &channels) {
-  llvm::errs() << "\n===== Printing " << channels.size() << " Channels =====\n";
-
-  // Find the parent function to dump full IR
-  triton::FuncOp parentFunc;
-  if (!channels.empty() && channels[0]->getSrcOp()) {
-    parentFunc = channels[0]->getSrcOp()->getParentOfType<triton::FuncOp>();
-  }
-
-  for (size_t i = 0; i < channels.size(); ++i) {
-    auto *ch = channels[i];
-    llvm::errs() << "\n[Channel " << i << "] ID: " << ch->uniqID
-                 << " | Kind: " << to_string(ch->channelKind)
-                 << " | NumBuffers: " << ch->getNumBuffers() << "\n";
-    llvm::errs() << "  Producer TaskID: " << ch->relation.first << "\n";
-    llvm::errs() << "  Consumer TaskIDs: [";
-    for (size_t j = 0; j < ch->relation.second.size(); ++j) {
-      if (j > 0)
-        llvm::errs() << ", ";
-      llvm::errs() << ch->relation.second[j];
-    }
-    llvm::errs() << "]\n";
-
-    if (auto *srcOp = ch->getSrcOp()) {
-      llvm::errs() << "  Source Op: " << srcOp->getName() << "\n";
-      srcOp->dump();
-    } else {
-      llvm::errs() << "  Source Op: nullptr\n";
-    }
-
-    if (auto *dstOp = ch->getDstOp()) {
-      llvm::errs() << "  Dest Op: " << dstOp->getName() << "\n";
-      dstOp->dump();
-    } else {
-      llvm::errs() << "  Dest Op: nullptr\n";
-    }
-
-    if (auto *allocOp = ch->getAllocOp()) {
-      llvm::errs() << "  Alloc Op: " << allocOp->getName() << "\n";
-      allocOp->dump();
-    }
-  }
-  llvm::errs() << "\n===== End of Channels =====\n\n";
-
-  // Dump the full IR of the parent function
-  if (parentFunc) {
-    llvm::errs() << "\n===== Full IR of Parent Function =====\n";
-    parentFunc.dump();
-    llvm::errs() << "\n===== End of Full IR =====\n\n";
-  } else {
-    llvm::errs()
-        << "\n===== No parent function found to dump full IR =====\n\n";
-  }
-}
-
-/* Debug helper function to generate GraphViz DOT format for channels and
- barriers Usage in debugger: "p dumpGraphViz(channels, tokenMap,
- "/tmp/channels.dot")"
-Graph Legend:
--------------
-
-**Nodes (Operations):**
-
-*   **Light blue boxes** = Producer/Source operations (e.g., `local_store`,
-`tmem_store`)
-*   **Light green boxes** = Consumer/Destination operations (e.g., `local_load`,
-`tcgen5.mma`)
-*   **Light yellow boxes** = Allocation operations (e.g., `local_alloc`,
-`tmem_alloc`)
-
-**Edges (Connections):**
-
-*   **Solid edges** = Channel connections (producer → consumer data flow)
-    *   **Blue** = SMEM channels
-    *   **Red** = TMEM channels
-    *   **Green** = REG channels
-    *   **Bold** = Channel has barriers (producer or consumer barriers
-allocated)
-*   **Dotted gray edges** = Allocation relationship (shows which allocation
-feeds which producer)
-    *   These connect: `allocation op → source/producer op`
-    *   Example: `tmem_alloc → tmem_store`
-
-**Edge Labels:** The solid edges have labels showing:
-
-*   Channel ID
-*   Channel kind (SMEM/TMEM/REG)
-*   Number of buffers
-*   Producer task ID
-*   Consumer task IDs
-*   Whether barriers exist (ProdBar/ConsBar)
-*/
-__attribute__((used)) static void
-dumpGraphViz(const llvm::SmallVector<Channel *> &channels,
-             const llvm::DenseMap<Channel *, CommChannel> &tokenMap,
-             const char *filename) {
-  std::error_code EC;
-  llvm::raw_fd_ostream out(filename, EC);
-  if (EC) {
-    llvm::errs() << "Error opening file " << filename << ": " << EC.message()
-                 << "\n";
-    return;
-  }
-
-  out << "digraph Channels {\n";
-  out << "  rankdir=TB;\n";
-  out << "  node [shape=box];\n\n";
-
-  // Track operations we've seen
-  llvm::DenseMap<Operation *, size_t> opToId;
-  size_t nextOpId = 0;
-
-  // Helper to get or create op ID
-  auto getOpId = [&](Operation *op) -> size_t {
-    auto it = opToId.find(op);
-    if (it != opToId.end()) {
-      return it->second;
-    }
-    size_t id = nextOpId++;
-    opToId[op] = id;
-    return id;
-  };
-
-  // Helper to escape strings for DOT format
-  auto escape = [](llvm::StringRef str) -> std::string {
-    std::string result;
-    for (char c : str) {
-      if (c == '"' || c == '\\')
-        result += '\\';
-      result += c;
-    }
-    return result;
-  };
-
-  // First pass: create nodes for all operations
-  llvm::DenseSet<Operation *> seenOps;
-  for (auto *ch : channels) {
-    if (auto *srcOp = ch->getSrcOp()) {
-      if (seenOps.insert(srcOp).second) {
-        size_t id = getOpId(srcOp);
-        SmallVector<AsyncTaskId> tasks = getAsyncTaskIds(srcOp);
-        std::string taskStr = "[";
-        for (size_t i = 0; i < tasks.size(); ++i) {
-          if (i > 0)
-            taskStr += ",";
-          taskStr += std::to_string(tasks[i]);
-        }
-        taskStr += "]";
-
-        out << "  op" << id << " [label=\""
-            << escape(srcOp->getName().getStringRef().str())
-            << "\\nTask: " << taskStr
-            << "\", style=filled, fillcolor=lightblue];\n";
-      }
-    }
-
-    if (auto *dstOp = ch->getDstOp()) {
-      if (seenOps.insert(dstOp).second) {
-        size_t id = getOpId(dstOp);
-        SmallVector<AsyncTaskId> tasks = getAsyncTaskIds(dstOp);
-        std::string taskStr = "[";
-        for (size_t i = 0; i < tasks.size(); ++i) {
-          if (i > 0)
-            taskStr += ",";
-          taskStr += std::to_string(tasks[i]);
-        }
-        taskStr += "]";
-
-        out << "  op" << id << " [label=\""
-            << escape(dstOp->getName().getStringRef().str())
-            << "\\nTask: " << taskStr
-            << "\", style=filled, fillcolor=lightgreen];\n";
-      }
-    }
-
-    if (auto *allocOp = ch->getAllocOp()) {
-      if (seenOps.insert(allocOp).second) {
-        size_t id = getOpId(allocOp);
-        out << "  op" << id << " [label=\""
-            << escape(allocOp->getName().getStringRef().str())
-            << "\\n(alloc)\", style=filled, fillcolor=lightyellow];\n";
-      }
-    }
-  }
-
-  out << "\n";
-
-  // Second pass: create edges for channels
-  for (auto *ch : channels) {
-    std::string channelLabel = "Ch" + std::to_string(ch->uniqID);
-    channelLabel += "\\n" + to_string(ch->channelKind);
-    channelLabel += "\\nBufs: " + std::to_string(ch->getNumBuffers());
-    channelLabel += "\\nProd: " + std::to_string(ch->relation.first);
-    channelLabel += "\\nCons: [";
-    for (size_t i = 0; i < ch->relation.second.size(); ++i) {
-      if (i > 0)
-        channelLabel += ",";
-      channelLabel += std::to_string(ch->relation.second[i]);
-    }
-    channelLabel += "]";
-
-    // Check if this channel has barriers
-    auto it = tokenMap.find(ch);
-    bool hasProducerBarrier =
-        (it != tokenMap.end() && it->second.producerBarrier);
-    bool hasConsumerBarrier =
-        (it != tokenMap.end() && !it->second.consumerBarriers.empty());
-
-    if (hasProducerBarrier) {
-      channelLabel += "\\nProdBar: YES";
-    }
-    if (hasConsumerBarrier) {
-      channelLabel +=
-          "\\nConsBar: " + std::to_string(it->second.consumerBarriers.size());
-    }
-
-    std::string edgeColor = "black";
-    if (ch->channelKind == DataChannelKind::SMEM) {
-      edgeColor = "blue";
-    } else if (ch->channelKind == DataChannelKind::TMEM) {
-      edgeColor = "red";
-    } else if (ch->channelKind == DataChannelKind::REG) {
-      edgeColor = "green";
-    }
-
-    std::string edgeStyle = "solid";
-    if (hasProducerBarrier || hasConsumerBarrier) {
-      edgeStyle = "bold";
-    }
-
-    if (auto *srcOp = ch->getSrcOp()) {
-      if (auto *dstOp = ch->getDstOp()) {
-        out << "  op" << getOpId(srcOp) << " -> op" << getOpId(dstOp)
-            << " [label=\"" << channelLabel << "\", color=" << edgeColor
-            << ", style=" << edgeStyle << "];\n";
-      }
-    }
-
-    // Connect alloc to src if present
-    if (auto *allocOp = ch->getAllocOp()) {
-      if (auto *srcOp = ch->getSrcOp()) {
-        out << "  op" << getOpId(allocOp) << " -> op" << getOpId(srcOp)
-            << " [style=dotted, color=gray];\n";
-      }
-    }
-  }
-
-  out << "}\n";
-  out.close();
-
-  llvm::errs() << "GraphViz DOT file written to: " << filename << "\n";
-  llvm::errs() << "Generate image with: dot -Tpng " << filename
-               << " -o channels.png\n";
-}
-
 static unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
   // Use the attribute attached to the loop if it exists otherwise use the
   // global control.
@@ -1044,61 +774,6 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   return barrierAlloc;
 }
 
-// Debug helper to print tokenMap contents
-__attribute__((used)) static void
-dumpTokenMap(const DenseMap<Channel *, CommChannel> &tokenMap,
-             ReuseConfig *config) {
-  llvm::errs() << "\n===== TOKEN MAP CONTENTS =====\n";
-  llvm::errs() << "Total entries: " << tokenMap.size() << "\n";
-
-  for (auto &item : tokenMap) {
-    llvm::errs() << "\n[Channel " << item.first->uniqID << "] "
-                 << to_string(item.first->channelKind) << "\n";
-    llvm::errs() << "  Producer Task: " << item.first->relation.first << "\n";
-    llvm::errs() << "  Consumer Tasks: [";
-    for (size_t i = 0; i < item.first->relation.second.size(); ++i) {
-      if (i > 0)
-        llvm::errs() << ", ";
-      llvm::errs() << item.first->relation.second[i];
-    }
-    llvm::errs() << "]\n";
-
-    // Check if in reuse group
-    int reuseGrp = channelInReuseGroup(item.first, config);
-    if (reuseGrp >= 0) {
-      auto *repChannel = config->getGroup(reuseGrp)->channels[0];
-      llvm::errs() << "  Reuse Group: " << reuseGrp
-                   << " (Representative: Channel " << repChannel->uniqID
-                   << ")\n";
-    }
-
-    llvm::errs() << "  Source Op: ";
-    item.first->getSrcOp()->dump();
-    llvm::errs() << "  Dest Op: ";
-    item.first->getDstOp()->dump();
-
-    llvm::errs() << "  CommChannel:\n";
-    llvm::errs() << "    Tokens (" << item.second.tokens.size() << "):\n";
-    for (auto &kv : item.second.tokens) {
-      llvm::errs() << "      Task " << kv.first << ": " << kv.second << "\n";
-    }
-
-    if (item.second.producerBarrier) {
-      llvm::errs() << "    Producer Barrier: " << *item.second.producerBarrier
-                   << "\n";
-    } else {
-      llvm::errs() << "    Producer Barrier: NONE\n";
-    }
-
-    llvm::errs() << "    Consumer Barriers ("
-                 << item.second.consumerBarriers.size() << "):\n";
-    for (auto &kv : item.second.consumerBarriers) {
-      llvm::errs() << "      Task " << kv.first << ": " << kv.second << "\n";
-    }
-  }
-  llvm::errs() << "\n===== END TOKEN MAP =====\n\n";
-}
-
 static Operation *ProducerIsGen5(Operation *producerOp) {
   if (isa<ttng::TCGen5MMAOp>(producerOp))
     return producerOp;
@@ -1156,8 +831,8 @@ void createToken(
     auto dstOp = it->second.front()->getDstOp();
 
     // Pre-allocate TMA barrier if ANY channel in the group has a TMA producer.
-    // IMPORTANT: insertAsyncComm may be called with different isPost values,
-    // so we must check both direct DescriptorLoadOp and the POST case
+    // insertAsyncComm may be called with different isPost values,
+    // so check both direct DescriptorLoadOp and the post case
     // (LocalStoreOp with DescriptorLoadOp source) to ensure we catch all TMA
     // loads.
     bool hasTMAProducer = false;
@@ -1382,10 +1057,10 @@ void createTokenPost(
     auto producerOp = it->second.front()->getSrcOp();
     auto dstOp = it->second.front()->getDstOp();
 
-    // Pre-allocate TMA barrier if ANY channel in the group has a TMA producer.
-    // IMPORTANT: insertAsyncComm is called with BOTH isPost=false AND
+    // Pre-allocate TMA barrier if any channel in the group has a TMA producer.
+    // insertAsyncComm is called with both isPost=false and
     // isPost=true, so we must check both to ensure we catch all TMA loads.
-    // Also check ALL channels in the reuse group, not just the consumer group.
+    // Also check all channels in the reuse group, not just the consumer group.
     bool hasTMAProducer = false;
     // First check channels grouped by consumer
     for (auto *c : it->second) {
@@ -1420,10 +1095,9 @@ void createTokenPost(
     // multiple consumer task IDs.
     auto *allocOp = channel->getAllocOp();
     auto *srcOp = channel->getSrcOp();
-    // auto *dstOp = channel->getDstOp();
 
-    // Special handling when srcOp or dstOp IS an scf.for operation
-    // In this case, we need to check if operations INSIDE the loop need sync
+    // Special case when srcOp or dstOp is scf.for;
+    // we need to check if operations inside the loop need sync
     bool srcIsLoop = isa<scf::ForOp>(srcOp);
     bool dstIsLoop = isa<scf::ForOp>(dstOp);
 
@@ -1485,22 +1159,6 @@ void createTokenPost(
           if (hasConsumersInLoops)
             break;
         }
-
-        if (!hasConsumersInLoops) {
-          // All consumers are outside loops - no async synchronization needed
-          LDBG("createToken: skipping channel "
-               << channel->uniqID
-               << " (consumer count=" << channel->relation.second.size()
-               << ") - producer, consumer ops, and actual consumers all "
-                  "outside loops");
-          // continue;
-        }
-        // Otherwise, fall through to create tokens - consumers are in loops
-        LDBG("createToken: creating tokens for channel "
-             << channel->uniqID
-             << " (consumer tasks=" << channel->relation.second.size()
-             << ") - producer/consumer ops outside loops but actual consumers "
-                "inside loops");
       }
     }
     for (auto consumerAsyncTaskId : channel->relation.second) {
@@ -2186,14 +1844,12 @@ DenseMap<Channel *, Value> createBufferPost(
       } else {
         // For operations outside loops (epilogue), compute the
         // correct bufferIdx and phase based on the parent loop's final
-        // iteration. Using constant 0 for phase causes deadlock when the loop
-        // completes multiple iterations, as the barrier will wait for phase 0
-        // instead of the final phase value. Find the parent loop that this
+        // iteration. Find the parent loop that this
         // operation came from by walking up the IR.
         Operation *opInsideLoop = nullptr;
 
-        // PRIORITY 1: Look at the channel's source operation, which is where
-        // the data was produced. This is the most reliable way to find the
+        // Look at the channel's source operation, which is where
+        // the data was produced, to find the
         // loop that produced the data being consumed in the epilogue.
         if (channel) {
           if (auto srcOp = channel->getSrcOp()) {
@@ -2203,9 +1859,8 @@ DenseMap<Channel *, Value> createBufferPost(
           }
         }
 
-        // PRIORITY 2: If channel doesn't have a source in a loop, try the
-        // allocation's operand (though this is less reliable since allocations
-        // are often hoisted)
+        // If channel doesn't have a source in a loop, try the
+        // allocation's operand
         if (!opInsideLoop && oldAllocOp->getNumOperands() > 0) {
           if (auto defOp = oldAllocOp->getOperand(0).getDefiningOp()) {
             if (defOp->getParentOfType<scf::ForOp>()) {
@@ -2472,7 +2127,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
             user->replaceUsesOfWith(channel->getAllocOp()->getResult(0),
                                     repCh->getAllocOp()->getResult(0));
           }
-          // channel->getAllocOp()->erase();
+          channel->getAllocOp()->erase();
           continue;
         }
         // Types don't match for SMEM - cannot reinterpret SMEM like TMEM
@@ -2489,8 +2144,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         continue;
       }
 
-      // Only TMEM channels reach here - sliceAndReinterpretMDTMEM is
-      // TMEM-specific
+      // Only TMEM channels reach here
       if (channel->channelKind != DataChannelKind::TMEMPost) {
         LDBG("Skipping non-TMEM channel " << channel->uniqID
                                           << " in buffer reuse");
@@ -2525,8 +2179,8 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         llvm_unreachable("TMEM/SMEM mismatch in buffer reuse - cannot proceed");
       }
 
-      // First pass: check if we can successfully create reinterpret for ALL
-      // users For TMEM channels, we MUST succeed - cannot fall back to SMEM
+      // First pass: check if we can successfully create reinterpret for all
+      // users For TMEM channels
       SmallVector<Operation *> users;
       for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
         users.push_back(user);
@@ -2561,7 +2215,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
                 "TMEM allocation out of bounds - no SMEM fallback available");
           }
 
-          // Try alternative representative channels for non-TMEM only
+          // Try alternative representative channels
           bool foundAlternative = false;
           for (unsigned groupIdx = 0; groupIdx < config->getGroupSize();
                ++groupIdx) {
@@ -2577,7 +2231,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
               foundAlternative = true;
               // Erase the test reinterpret since we'll recreate it in the
               // second pass
-              // altReinter.getOperation()->erase();
+              altReinter.getOperation()->erase();
               break;
             }
           }
@@ -2592,17 +2246,17 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         } else {
           // Erase the test reinterpret since we'll recreate it in the second
           // pass
-          // reinter.getOperation()->erase();
+          reinter.getOperation()->erase();
         }
       }
 
       // If we can't reuse the buffer, check if this is a TMEM channel
       if (!canReuseBuffer) {
+        // FIXME:
         // For TMEM channels (especially with TMA), we cannot fall back to SMEM
-        // This is a fatal error that requires fixing the allocation strategy
+        // This requires fixing the allocation strategy
         bool isTMEMChannel = isa<ttng::TMEMAllocOp>(channel->getAllocOp());
         if (isTMEMChannel) {
-          // Emit a clear error message
           channel->getAllocOp()->emitError(
               "Failed to allocate TMEM buffer: out of bounds. "
               "Cannot fall back to SMEM for TMEM/TMA allocations. "
@@ -2618,8 +2272,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         continue;
       }
 
-      // Second pass: actually perform the replacements (we know they will all
-      // succeed)
+      // Second pass: do the replacements (should all succeed)
       for (auto *user : users) {
         OpBuilderWithAsyncTaskIds builder(user->getContext());
         builder.setInsertionPoint(user);
@@ -2630,7 +2283,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
         auto reinter = sliceAndReinterpretMDTMEM(
             builder, repCh->getAllocOp(), channel->getAllocOp(), user, offset);
 
-        // If primary fails, try alternatives (we know one will succeed from
+        // If primary fails, try alternatives (one should succeed from
         // first pass)
         if (!reinter) {
           for (unsigned groupIdx = 0; groupIdx < config->getGroupSize();
