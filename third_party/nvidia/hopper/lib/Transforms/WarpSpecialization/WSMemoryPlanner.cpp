@@ -52,10 +52,17 @@ static Channel *findChannelForAlloc(Value value,
 }
 
 static void getAllAcutalUsersForChannel(Channel *TheCh,
-                                        DenseSet<Operation *> &users) {
+                                        DenseSet<Operation *> &users,
+                                        Operation *alloc = nullptr) {
   // Skip null channels
-  if (!TheCh)
+  if (!TheCh) {
+    // Allocations inside loops should have associated channels
+    // For outside loop ops, channels are not created when there is
+    // no valid producer or outside loop op has no task IDs (e.g., store)
+    assert((!alloc || !alloc->getParentOfType<scf::ForOp>()) &&
+           "Expected channel for allocation inside loop");
     return;
+  }
   Operation *src = TheCh->getSrcOp();
   // Skip channels without valid source operations (e.g., allocations outside
   // loops)
@@ -256,11 +263,12 @@ private:
 
   OperationListT livenessForSmemChannel(Value value) {
     // Find the channel for value in channels.
+    Operation *alloc = value.getDefiningOp();
     ChannelPost *TheCh =
         static_cast<ChannelPost *>(findChannelForAlloc(value, *channels));
     std::vector<Operation *> liveOps;
     DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users);
+    getAllAcutalUsersForChannel(TheCh, users, alloc);
     updateLiveOpsAcrossScopes(users, liveOps);
     return liveOps;
   }
@@ -327,7 +335,7 @@ public:
       ChannelPost *TheCh =
           static_cast<ChannelPost *>(findChannelForOp(alloc, *channels));
       DenseSet<Operation *> users;
-      getAllAcutalUsersForChannel(TheCh, users);
+      getAllAcutalUsersForChannel(TheCh, users, alloc);
       // If no users found (e.g., for allocations outside loops), not in
       // innermost loop
       if (users.empty())
@@ -431,10 +439,22 @@ OperationListT livenessForTmemChannel(Value value,
   ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
       findChannelForAlloc(value, channels));
   std::vector<Operation *> liveOps;
+<<<<<<< HEAD
   DenseSet<Operation *> users;
   getAllTmemUsers(TheCh, users);
   updateLiveOpsAcrossScopes(users, liveOps);
 
+=======
+  // Operand D can be associated with multiple channels. From first producer to
+  // last consumer.
+  if (TheCh->isOperandD) {
+    handleOperandD(cast<ttng::TMEMAllocOp>(TheCh->getAllocOp()), liveOps);
+  } else {
+    DenseSet<Operation *> users;
+    getAllAcutalUsersForChannel(TheCh, users, value.getDefiningOp());
+    updateLiveOpsAcrossScopes(users, liveOps);
+  }
+>>>>>>> 93d65f75f (more cleanup)
   return liveOps;
 }
 
