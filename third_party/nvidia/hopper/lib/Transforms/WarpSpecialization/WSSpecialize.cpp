@@ -551,33 +551,6 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     taskBuilder.setInsertionPointToStart(defaultBlock);
     IRMapping mapping;
 
-    // Pre-populate mapping for ForOp results.
-    // When a ForOp result is used by operations that appear before the ForOp
-    // in the IR, we need to map those results to their init args before we
-    // start cloning operations.
-    for (Operation *op : opList) {
-      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        for (unsigned resIdx = 0; resIdx < forOp.getNumResults(); ++resIdx) {
-          auto result = forOp.getResult(resIdx);
-          // Check if this result is used by any operation in this partition
-          bool usedInPartition = false;
-          for (Operation *user : result.getUsers()) {
-            if (hasAsyncTaskId(user, asyncTaskId)) {
-              usedInPartition = true;
-              break;
-            }
-          }
-          // Pre-map the result to its init arg.
-          // This will be updated later when the ForOp is specialized if the
-          // result is actually produced in this partition.
-          if (usedInPartition) {
-            Value initArg = forOp.getInitArgs()[resIdx];
-            mapping.map(result, initArg);
-          }
-        }
-      }
-    }
-
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }

@@ -2213,7 +2213,7 @@ void replaceBufferReuse(triton::FuncOp funcOp,
       if (channel->channelKind != DataChannelKind::TMEMPost) {
         LDBG("Skipping non-TMEM channel " << channel->uniqID
                                           << " in buffer reuse");
-        continue;
+        assert(false && "Only TMEMPost channels should reach this point");
       }
 
       // Verify that both channel and representative allocations are TMEM
@@ -2221,37 +2221,15 @@ void replaceBufferReuse(triton::FuncOp funcOp,
       bool channelIsTMEM = isa<ttng::TMEMAllocOp>(channel->getAllocOp());
       bool repChIsTMEM = isa<ttng::TMEMAllocOp>(repCh->getAllocOp());
 
-      if (!channelIsTMEM) {
-        LDBG("Skipping channel " << channel->uniqID
-                                 << " - allocation is not TMEM");
-        continue;
-      }
+      assert(channelIsTMEM && repChIsTMEM && "TMEM allocations required");
 
-      // If representative is not TMEM but channel is, we cannot reuse
-      // This happens when SMEM and TMEM channels are in the same reuse group
-      if (!repChIsTMEM) {
-        LDBG("Cannot reuse buffer: channel "
-             << channel->uniqID << " is TMEM but representative channel "
-             << repCh->uniqID
-             << " is SMEM. They must both be TMEM for buffer reuse.");
-        // For TMEM channels, emit an error since we cannot fall back to SMEM
-        // with TMA
-        channel->getAllocOp()->emitError(
-            "TMEM channel cannot reuse buffer from SMEM representative. "
-            "Buffer reuse requires both channels to use TMEM. "
-            "Channel ID: ")
-            << channel->uniqID << ", Representative ID: " << repCh->uniqID;
-        llvm_unreachable("TMEM/SMEM mismatch in buffer reuse - cannot proceed");
-      }
-
-      // First pass: check if we can successfully create reinterpret for all
-      // users For TMEM channels
+      // Collect all users of the allocation
       SmallVector<Operation *> users;
       for (auto *user : channel->getAllocOp()->getResult(0).getUsers()) {
         users.push_back(user);
       }
 
-      bool canReuseBuffer = true;
+      // Single pass: create reinterpret ops and replace uses
       for (auto *user : users) {
         OpBuilderWithAsyncTaskIds builder(user->getContext());
         builder.setInsertionPoint(user);
@@ -2260,96 +2238,11 @@ void replaceBufferReuse(triton::FuncOp funcOp,
             channel->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
         int64_t offset = bufferOff ? bufferOff.getInt() : 0;
 
-        // Test if we can create a valid reinterpret
+        // Try primary representative
         auto reinter = sliceAndReinterpretMDTMEM(
             builder, repCh->getAllocOp(), channel->getAllocOp(), user, offset);
 
-        if (!reinter) {
-          // For TMEM channels, emit error immediately - cannot fall back to
-          // SMEM
-          bool isTMEMChannel = isa<ttng::TMEMAllocOp>(channel->getAllocOp());
-          if (isTMEMChannel) {
-            channel->getAllocOp()->emitError(
-                "Failed to allocate TMEM buffer: out of bounds. "
-                "Cannot fall back to SMEM for TMEM/TMA allocations. "
-                "Channel ID: ")
-                << channel->uniqID << ", offset: " << offset;
-            repCh->getAllocOp()->emitRemark(
-                "Representative channel that caused the failure");
-            llvm_unreachable(
-                "TMEM allocation out of bounds - no SMEM fallback available");
-          }
-
-          // Try alternative representative channels
-          bool foundAlternative = false;
-          for (unsigned groupIdx = 0; groupIdx < config->getGroupSize();
-               ++groupIdx) {
-            auto *altRepCh = config->getGroup(groupIdx)->channels[0];
-            if (altRepCh == repCh)
-              continue;
-
-            auto altReinter =
-                sliceAndReinterpretMDTMEM(builder, altRepCh->getAllocOp(),
-                                          channel->getAllocOp(), user, offset);
-
-            if (altReinter) {
-              foundAlternative = true;
-              // Erase the test reinterpret since we'll recreate it in the
-              // second pass
-              altReinter.getOperation()->erase();
-              break;
-            }
-          }
-
-          if (!foundAlternative) {
-            canReuseBuffer = false;
-            LDBG("Cannot reuse buffer for channel "
-                 << channel->uniqID
-                 << " - failed to create reinterpret for user");
-            break;
-          }
-        } else {
-          // Erase the test reinterpret since we'll recreate it in the second
-          // pass
-          reinter.getOperation()->erase();
-        }
-      }
-
-      // If we can't reuse the buffer, check if this is a TMEM channel
-      if (!canReuseBuffer) {
-        // FIXME:
-        // For TMEM channels (especially with TMA), we cannot fall back to SMEM
-        // This requires fixing the allocation strategy
-        bool isTMEMChannel = isa<ttng::TMEMAllocOp>(channel->getAllocOp());
-        if (isTMEMChannel) {
-          channel->getAllocOp()->emitError(
-              "Failed to allocate TMEM buffer: out of bounds. "
-              "Cannot fall back to SMEM for TMEM/TMA allocations. "
-              "Channel ID: ")
-              << channel->uniqID;
-          llvm_unreachable("TMEM allocation failed - cannot use SMEM fallback");
-        }
-
-        // For SMEM channels, we can skip buffer reuse and use independent
-        // allocation
-        LDBG("Skipping buffer reuse for SMEM channel "
-             << channel->uniqID << " - will use independent allocation");
-        continue;
-      }
-
-      // Second pass: do the replacements (should all succeed)
-      for (auto *user : users) {
-        OpBuilderWithAsyncTaskIds builder(user->getContext());
-        builder.setInsertionPoint(user);
-        builder.setAsyncTaskIdsFromOp(user);
-        auto bufferOff =
-            channel->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
-        int64_t offset = bufferOff ? bufferOff.getInt() : 0;
-        auto reinter = sliceAndReinterpretMDTMEM(
-            builder, repCh->getAllocOp(), channel->getAllocOp(), user, offset);
-
-        // If primary fails, try alternatives (one should succeed from
-        // first pass)
+        // If primary fails, try alternative representatives
         if (!reinter) {
           for (unsigned groupIdx = 0; groupIdx < config->getGroupSize();
                ++groupIdx) {
@@ -2368,8 +2261,18 @@ void replaceBufferReuse(triton::FuncOp funcOp,
           }
         }
 
-        assert(reinter &&
-               "Reinterpret should succeed based on first pass check");
+        // If all representatives fail, emit error and crash
+        if (!reinter) {
+          channel->getAllocOp()->emitError(
+              "Failed to allocate TMEM buffer: out of bounds. "
+              "Cannot fall back to SMEM for TMEM/TMA allocations. "
+              "Channel ID: ")
+              << channel->uniqID << ", offset: " << offset;
+          repCh->getAllocOp()->emitRemark(
+              "Representative channel that caused the failure");
+          llvm_unreachable(
+              "TMEM allocation out of bounds - no SMEM fallback available");
+        }
 
         LLVM_DEBUG({
           LDBG("replace users for channel user ");
