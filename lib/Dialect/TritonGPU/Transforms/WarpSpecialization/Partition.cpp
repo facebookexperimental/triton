@@ -100,15 +100,19 @@ void WarpSchedule::serialize(scf::ForOp loop) const {
 
   // Serialize partition attributes for post-loop operations -
   // operations scheduled in partitions but outside the loop body.
-  for (auto &[op, partition] : opToPartition) {
-    // Skip operations inside the loop (already handled above)
-    if (loop->isAncestor(op))
-      continue;
-    // Skip root partition operations
-    if (partition == getRootPartition())
-      continue;
-    // Set partition attribute for post-loop operations
-    op->setAttr(kPartitionAttrName, b.getI32IntegerAttr(partition->getIndex()));
+  // Walk the parent op to find post-loop operations that are still in the IR
+  // fix: some operations in opToPartition are erased by inserAref pass in NVWS.
+  if (Operation *parent = loop->getParentOp()) {
+    parent->walk([&](Operation *op) {
+      // Skip operations inside the loop (already handled above)
+      if (loop->isAncestor(op))
+        return;
+      Partition *partition = opToPartition.lookup(op);
+      if (!partition || partition == getRootPartition())
+        return;
+      op->setAttr(kPartitionAttrName,
+                  b.getI32IntegerAttr(partition->getIndex()));
+    });
   }
 
   for (Partition &partition : getPartitions())
