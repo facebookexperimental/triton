@@ -412,10 +412,14 @@ static void logOpStillHasUsers(Operation *op) {
       }
       llvm::errs() << "]";
     }
+    // llvm::errs() << "  Full IR: ";
+    // op->print(llvm::errs());
     llvm::errs() << "\n";
     for (unsigned i = 0; i < op->getNumResults(); ++i) {
       for (Operation *user : op->getResult(i).getUsers()) {
         llvm::errs() << "  User: " << user->getName();
+        // llvm::errs() << "  Full IR: ";
+        // user->print(llvm::errs());
         if (auto userPartitionAttr =
                 user->getAttrOfType<IntegerAttr>("ttg.partition")) {
           llvm::errs() << " (partition: " << userPartitionAttr.getInt() << ")";
@@ -434,53 +438,6 @@ static void logOpStillHasUsers(Operation *op) {
       }
     }
   });
-  llvm::errs() << "Op still has users: " << op->getName();
-  if (auto partitionAttr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
-    llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
-  }
-  auto taskIds = getAsyncTaskIds(op);
-  if (!taskIds.empty()) {
-    llvm::errs() << " (taskIds: ";
-    for (size_t i = 0; i < taskIds.size(); ++i) {
-      if (i > 0)
-        llvm::errs() << ", ";
-      llvm::errs() << taskIds[i];
-    }
-    llvm::errs() << ")";
-  }
-  auto attrs = op->getAttrs();
-  if (!attrs.empty()) {
-    llvm::errs() << " [attrs: ";
-    bool first = true;
-    for (auto namedAttr : attrs) {
-      if (!first)
-        llvm::errs() << ", ";
-      llvm::errs() << namedAttr.getName().str();
-      first = false;
-    }
-    llvm::errs() << "]";
-  }
-  llvm::errs() << "\n";
-  for (unsigned i = 0; i < op->getNumResults(); ++i) {
-    for (Operation *user : op->getResult(i).getUsers()) {
-      llvm::errs() << "  User: " << user->getName();
-      if (auto userPartitionAttr =
-              user->getAttrOfType<IntegerAttr>("ttg.partition")) {
-        llvm::errs() << " (partition: " << userPartitionAttr.getInt() << ")";
-      }
-      auto userTaskIds = getAsyncTaskIds(user);
-      if (!userTaskIds.empty()) {
-        llvm::errs() << " (taskIds: ";
-        for (size_t j = 0; j < userTaskIds.size(); ++j) {
-          if (j > 0)
-            llvm::errs() << ", ";
-          llvm::errs() << userTaskIds[j];
-        }
-        llvm::errs() << ")";
-      }
-      llvm::errs() << "\n";
-    }
-  }
 }
 
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
@@ -503,6 +460,45 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         opList.push_back(&op);
     }
   }
+  // FIXME:
+  // Topologically sort opList to ensure dependencies are cloned before uses
+  // This is necessary because operations can appear out of order in the IR
+  DenseSet<Operation *> opsInList(opList.begin(), opList.end());
+  DenseMap<Operation *, unsigned>
+      visitState; // 0=unvisited, 1=visiting, 2=visited
+  SmallVector<Operation *> sortedOpList;
+
+  std::function<void(Operation *)> topoVisit = [&](Operation *op) {
+    auto state = visitState.lookup(op);
+    if (state == 2)
+      return; // Already visited
+    if (state == 1) {
+      // Cycle detected - just skip, maintain original order for cycles
+      return;
+    }
+
+    visitState[op] = 1; // Mark as visiting
+
+    // Visit dependencies first (operands defined by ops in opList)
+    for (auto operand : op->getOperands()) {
+      if (auto defOp = operand.getDefiningOp()) {
+        if (opsInList.count(defOp)) {
+          topoVisit(defOp);
+        }
+      }
+    }
+
+    visitState[op] = 2; // Mark as visited
+    sortedOpList.push_back(op);
+  };
+
+  // Visit all operations in original order, which will recursively visit
+  // dependencies
+  for (Operation *op : opList) {
+    topoVisit(op);
+  }
+
+  opList = std::move(sortedOpList);
 
   LLVM_DEBUG({
     LDBG("ops to be specialized: ");
@@ -641,6 +637,13 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         Value copy = impB.clone(*capture.getDefiningOp())->getResult(0);
         replaceAllUsesInRegionWith(capture, copy, *region);
       }
+      continue;
+    }
+
+    // Skip captures that are defined by operations in opList.
+    // These operations will be erased, and their results have already been
+    // cloned within the partition regions, so we don't need to capture them.
+    if (capture.getDefiningOp() && opsInList.count(capture.getDefiningOp())) {
       continue;
     }
 
