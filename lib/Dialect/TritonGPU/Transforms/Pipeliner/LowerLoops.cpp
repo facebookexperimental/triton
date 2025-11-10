@@ -779,8 +779,7 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value phase = forOp.getRegionIterArg(phaseArgIdx);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
   Value barrierIdx;
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
-  if (!metaWS || numStages > 1) {
+  if (numStages > 1) {
     barrierIdx = forOp.getRegionIterArg(barrierIdxArgIdx);
   } else {
     barrierIdx = zero;
