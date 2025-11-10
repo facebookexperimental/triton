@@ -57,6 +57,7 @@ def async_dot(
     | tl.tensor = None,  # For blackwell, compute D = A @ B + D instead of D = A @ B. If None, default to True.
     pred=None,
     mBarriers: list[tlx.mbarrier] = [],
+    two_ctas: bool = False,
     input_precision=None,
     out_dtype=tl.float32,
     _semantic=None,
@@ -85,7 +86,7 @@ def async_dot(
 
     # Perform dot_precheck shared by tl.dot
     (A, B, acc_handle, input_precision, max_num_imprecise_acc,
-     ret_ty) = _semantic.dot_precheck(A, B, acc, input_precision, None, None, out_dtype)
+     ret_ty) = _semantic.dot_precheck(A, B, acc, input_precision, None, None, out_dtype, two_ctas)
 
     assert A.shape[0] >= 64, "M must be at least 64"
     assert A.shape[1] >= 16, "K must be at least 16"
@@ -119,7 +120,8 @@ def async_dot(
                 use_acc_handle = use_acc.handle
             else:
                 use_acc_handle = _semantic.builder.get_int1(use_acc.value)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, handles)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
+                                                     handles)
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
