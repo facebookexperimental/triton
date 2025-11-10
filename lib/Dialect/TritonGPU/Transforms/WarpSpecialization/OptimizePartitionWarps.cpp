@@ -98,9 +98,9 @@ static LogicalResult relayoutWarps(ModuleAxisInfoAnalysis &axisInfo,
   });
   // Don't replace memdesc types - they are created by warp specialization
   // and cannot be recreated by ConvertTritonToTritonGPU
-  replacer.addReplacement([](MemDescType ty) -> std::pair<Type, WalkResult> {
-    return {ty, WalkResult::skip()};
-  });
+  // replacer.addReplacement([](MemDescType ty) -> std::pair<Type, WalkResult> {
+  //  return {ty, WalkResult::skip()};
+  //});
   replacer.recursivelyReplaceElementsIn(*container, /*replaceAttrs=*/false,
                                         /*replaceLocs=*/false,
                                         /*replaceTypes=*/true);
@@ -279,7 +279,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // Check if ANY partition has memdesc allocations that can't be recreated
   bool anyHasMemDesc = llvm::any_of(hasMemDescAlloc, [](bool b) { return b; });
 
-  if (anyHasMemDesc) {
+  /*if (anyHasMemDesc) {
     // CRITICAL: Kernels with memdesc allocations cannot use relayout.
     // relayoutWarps() strips encodings and re-runs ConvertTritonToTritonGPU,
     // but memdesc allocations (local_alloc, tmem_alloc) created by earlier
@@ -301,7 +301,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     // Only set register estimates
     wsOp.setRequestedRegisters(estRegUsage);
     return success();
-  }
+  }*/
 
   // No memdesc allocations - safe to proceed with normal optimization
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, estRegs] :
