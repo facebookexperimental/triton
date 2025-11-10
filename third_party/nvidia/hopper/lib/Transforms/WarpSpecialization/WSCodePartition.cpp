@@ -971,6 +971,170 @@ static Operation *isProducerTMA(Channel *ch, bool isPost) {
   return nullptr;
 }
 
+// Handle buffer index and phase computation for operations outside loops
+// (epilogue/prologue). Returns a pair of (bufferIdx, phase).
+static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
+    OpBuilderWithAsyncTaskIds &builder, Operation *user, Channel *channel,
+    Operation *oldAllocOp, unsigned numBuffers,
+    const DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
+    int reuseGrp) {
+  Value bufferIdx;
+  Value _phase;
+
+  // For operations outside loops (epilogue), compute the
+  // correct bufferIdx and phase based on the parent loop's final
+  // iteration. Find the parent loop that this
+  // operation came from by walking up the IR.
+  Operation *opInsideLoop = nullptr;
+
+  // Look at the channel's source operation, which is where
+  // the data was produced, to find the
+  // loop that produced the data being consumed in the epilogue.
+  if (channel) {
+    if (auto srcOp = channel->getSrcOp()) {
+      if (srcOp->getParentOfType<scf::ForOp>()) {
+        opInsideLoop = srcOp;
+      }
+    }
+  }
+
+  // If channel doesn't have a source in a loop, try the
+  // allocation's operand
+  if (!opInsideLoop && oldAllocOp->getNumOperands() > 0) {
+    if (auto defOp = oldAllocOp->getOperand(0).getDefiningOp()) {
+      if (defOp->getParentOfType<scf::ForOp>()) {
+        opInsideLoop = defOp;
+      }
+    }
+  }
+
+  if (opInsideLoop) {
+    // Determine if this is a prologue or epilogue operation
+    bool isPrologue = false;
+
+    // Check if this is an initialization operation (prologue)
+    // TMEMAlloc without src operand indicates the buffer needs
+    // initialization from a constant (like tl.zeros()), which should
+    // happen before the loop
+    if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAllocOp)) {
+      if (!tmemAlloc.getSrc()) {
+        // No src means this needs explicit initialization before the loop
+        isPrologue = true;
+      }
+    }
+
+    auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
+    if (isPrologue) {
+      // For prologue operations (initialization), use initial values
+      // and place before the loop
+      if (parentLoop) {
+        builder.setInsertionPoint(parentLoop);
+      }
+      bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          user->getLoc(), 0, 32);
+      _phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          user->getLoc(), 0, 1);
+    } else {
+      // For epilogue operations, compute final loop values
+      // and place after the loop to avoid forward references
+      if (parentLoop) {
+        builder.setInsertionPointAfter(parentLoop);
+      }
+      std::tie(bufferIdx, _phase) =
+          getOutOfScopeBufferIdxAndPhase(builder, opInsideLoop, numBuffers,
+                                         regionsWithChannels, config, reuseGrp);
+    }
+    // Restore insertion point to user
+    builder.setInsertionPoint(user);
+  } else {
+    // Fallback: if we can't find a parent loop, use constant 0
+    // (this should only happen for operations truly outside any loop)
+    bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        user->getLoc(), 0, 32);
+    _phase = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+        user->getLoc(), 0);
+  }
+
+  return {bufferIdx, _phase};
+}
+
+// Check if a channel needs token-based synchronization by examining if
+// actual consumers are inside loops when endpoints are outside loops
+static bool checkConsumersInLoops(Channel *channel) {
+  auto *srcOp = channel->getSrcOp();
+  auto *dstOp = channel->getDstOp();
+
+  // Special case when srcOp or dstOp is scf.for;
+  // we need to check if operations inside the loop need sync
+  bool srcIsLoop = isa<scf::ForOp>(srcOp);
+  bool dstIsLoop = isa<scf::ForOp>(dstOp);
+
+  if (srcIsLoop || dstIsLoop) {
+    // When the channel endpoints are loop operations themselves,
+    // we need to look inside the loops to determine if sync is needed
+    LDBG("createToken: channel "
+         << channel->uniqID << " has loop as endpoint (srcIsLoop=" << srcIsLoop
+         << ", dstIsLoop=" << dstIsLoop
+         << ") - proceeding with token creation");
+    // Fall through to create tokens
+    return false;
+  }
+
+  // Normal case: check if ops are outside loops
+  bool producerOutsideLoop = srcOp && !srcOp->getParentOfType<scf::ForOp>();
+  bool consumerOutsideLoop = dstOp && !dstOp->getParentOfType<scf::ForOp>();
+
+  // If both producer and consumer ops are outside loops, check if actual
+  // consumers are inside loops. This handles both cases:
+  // 1. Multiple consumer task IDs in different loops
+  // 2. Single consumer task ID but actual consumer is inside a loop
+  if (producerOutsideLoop && consumerOutsideLoop) {
+    // Collect all destination operations
+    SmallVector<Operation *> dstOps;
+    if (channel->channelKind == DataChannelKind::SMEMPost) {
+      auto *cPost = static_cast<ChannelPost *>(channel);
+      cPost->getDstOps(dstOps);
+    } else {
+      dstOps.push_back(dstOp);
+    }
+
+    // Check if actual consumers (with the consumer task IDs) are inside
+    // loops
+    bool hasConsumersInLoops = false;
+
+    // For each consumer task ID, check if operations with that task ID are
+    // in loops
+    for (auto consumerTaskId : channel->relation.second) {
+      // Check actual consumers from dstOps
+      for (auto *dst : dstOps) {
+        auto consumers = getActualConsumers(dst);
+        for (auto *consumer : consumers) {
+          auto consumerTasks = getAsyncTaskIds(consumer);
+          // Check if this consumer has the task ID we're looking for
+          if (std::find(consumerTasks.begin(), consumerTasks.end(),
+                        consumerTaskId) != consumerTasks.end()) {
+            // Check if this consumer is inside a loop
+            if (consumer->getParentOfType<scf::ForOp>()) {
+              hasConsumersInLoops = true;
+              LDBG("createToken: found consumer with task "
+                   << consumerTaskId << " inside loop for channel "
+                   << channel->uniqID);
+              break;
+            }
+          }
+        }
+        if (hasConsumersInLoops)
+          break;
+      }
+      if (hasConsumersInLoops)
+        break;
+    }
+    return hasConsumersInLoops;
+  }
+
+  return false;
+}
+
 void createTokenPost(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -1093,74 +1257,7 @@ void createTokenPost(
     // When srcOp and dstOp are both outside loops, we need to check if the
     // actual consumers are inside loops. This can happen with both single and
     // multiple consumer task IDs.
-    auto *allocOp = channel->getAllocOp();
-    auto *srcOp = channel->getSrcOp();
-
-    // Special case when srcOp or dstOp is scf.for;
-    // we need to check if operations inside the loop need sync
-    bool srcIsLoop = isa<scf::ForOp>(srcOp);
-    bool dstIsLoop = isa<scf::ForOp>(dstOp);
-
-    if (srcIsLoop || dstIsLoop) {
-      // When the channel endpoints are loop operations themselves,
-      // we need to look inside the loops to determine if sync is needed
-      LDBG("createToken: channel " << channel->uniqID
-                                   << " has loop as endpoint (srcIsLoop="
-                                   << srcIsLoop << ", dstIsLoop=" << dstIsLoop
-                                   << ") - proceeding with token creation");
-      // Fall through to create tokens
-    } else {
-      // Normal case: check if ops are outside loops
-      bool producerOutsideLoop = srcOp && !srcOp->getParentOfType<scf::ForOp>();
-      bool consumerOutsideLoop = dstOp && !dstOp->getParentOfType<scf::ForOp>();
-
-      // If both producer and consumer ops are outside loops, check if actual
-      // consumers are inside loops. This handles both cases:
-      // 1. Multiple consumer task IDs in different loops
-      // 2. Single consumer task ID but actual consumer is inside a loop
-      if (producerOutsideLoop && consumerOutsideLoop) {
-        // Collect all destination operations
-        SmallVector<Operation *> dstOps;
-        if (channel->channelKind == DataChannelKind::SMEMPost) {
-          auto *cPost = static_cast<ChannelPost *>(channel);
-          cPost->getDstOps(dstOps);
-        } else {
-          dstOps.push_back(dstOp);
-        }
-
-        // Check if actual consumers (with the consumer task IDs) are inside
-        // loops
-        bool hasConsumersInLoops = false;
-
-        // For each consumer task ID, check if operations with that task ID are
-        // in loops
-        for (auto consumerTaskId : channel->relation.second) {
-          // Check actual consumers from dstOps
-          for (auto *dst : dstOps) {
-            auto consumers = getActualConsumers(dst);
-            for (auto *consumer : consumers) {
-              auto consumerTasks = getAsyncTaskIds(consumer);
-              // Check if this consumer has the task ID we're looking for
-              if (std::find(consumerTasks.begin(), consumerTasks.end(),
-                            consumerTaskId) != consumerTasks.end()) {
-                // Check if this consumer is inside a loop
-                if (consumer->getParentOfType<scf::ForOp>()) {
-                  hasConsumersInLoops = true;
-                  LDBG("createToken: found consumer with task "
-                       << consumerTaskId << " inside loop for channel "
-                       << channel->uniqID);
-                  break;
-                }
-              }
-            }
-            if (hasConsumersInLoops)
-              break;
-          }
-          if (hasConsumersInLoops)
-            break;
-        }
-      }
-    }
+    checkConsumersInLoops(channel);
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
       // We can have multiple consumer ops for ChannelPost, or one consumer op
@@ -1846,75 +1943,9 @@ DenseMap<Channel *, Value> createBufferPost(
         // correct bufferIdx and phase based on the parent loop's final
         // iteration. Find the parent loop that this
         // operation came from by walking up the IR.
-        Operation *opInsideLoop = nullptr;
-
-        // Look at the channel's source operation, which is where
-        // the data was produced, to find the
-        // loop that produced the data being consumed in the epilogue.
-        if (channel) {
-          if (auto srcOp = channel->getSrcOp()) {
-            if (srcOp->getParentOfType<scf::ForOp>()) {
-              opInsideLoop = srcOp;
-            }
-          }
-        }
-
-        // If channel doesn't have a source in a loop, try the
-        // allocation's operand
-        if (!opInsideLoop && oldAllocOp->getNumOperands() > 0) {
-          if (auto defOp = oldAllocOp->getOperand(0).getDefiningOp()) {
-            if (defOp->getParentOfType<scf::ForOp>()) {
-              opInsideLoop = defOp;
-            }
-          }
-        }
-
-        if (opInsideLoop) {
-          // Determine if this is a prologue or epilogue operation
-          bool isPrologue = false;
-
-          // Check if this is an initialization operation (prologue)
-          // TMEMAlloc without src operand indicates the buffer needs
-          // initialization from a constant (like tl.zeros()), which should
-          // happen before the loop
-          if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAllocOp)) {
-            if (!tmemAlloc.getSrc()) {
-              // No src means this needs explicit initialization before the loop
-              isPrologue = true;
-            }
-          }
-
-          auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
-          if (isPrologue) {
-            // For prologue operations (initialization), use initial values
-            // and place before the loop
-            if (parentLoop) {
-              builder.setInsertionPoint(parentLoop);
-            }
-            bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-                user->getLoc(), 0, 32);
-            _phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-                user->getLoc(), 0, 1);
-          } else {
-            // For epilogue operations, compute final loop values
-            // and place after the loop to avoid forward references
-            if (parentLoop) {
-              builder.setInsertionPointAfter(parentLoop);
-            }
-            std::tie(bufferIdx, _phase) = getOutOfScopeBufferIdxAndPhase(
-                builder, opInsideLoop, numBuffers, regionsWithChannels, config,
-                reuseGrp);
-          }
-          // Restore insertion point to user
-          builder.setInsertionPoint(user);
-        } else {
-          // Fallback: if we can't find a parent loop, use constant 0
-          // (this should only happen for operations truly outside any loop)
-          bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-              user->getLoc(), 0, 32);
-          _phase = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
-              user->getLoc(), 0);
-        }
+        std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
+            builder, user, channel, oldAllocOp, numBuffers, regionsWithChannels,
+            config, reuseGrp);
       }
       userToBufIdx[user] = bufferIdx;
     }

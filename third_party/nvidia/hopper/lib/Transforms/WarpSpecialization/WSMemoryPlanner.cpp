@@ -620,8 +620,7 @@ public:
     //   Go through all buffers that are live in the loop
     //   Start with buffers with longest span within the loop
     //   For each buffer
-    //     either allocate ne
-    // w space (owner of a set of rows)
+    //     either allocate new space (owner of a set of rows)
     //     or reuse an existing buffer's space
     //     if this buffer interferes with all allocated buffers, allocate new
     //     space if this buffer is along the dependency chain, reuse space if

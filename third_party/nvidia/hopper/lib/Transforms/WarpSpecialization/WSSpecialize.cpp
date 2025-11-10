@@ -440,29 +440,8 @@ static void logOpStillHasUsers(Operation *op) {
   });
 }
 
-void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
-
-  LLVM_DEBUG({
-    LDBG("\n\n");
-    LDBG("Start specializing region");
-  });
-
-  MLIRContext *context = funcOp.getContext();
-  OpBuilder builder(context);
-  auto loc = funcOp.getLoc();
-
-  // Collect original operations
-  SmallVector<Operation *> opList;
-  for (auto &block : funcOp.getBody().getBlocks()) {
-    for (Operation &op : block.getOperations()) {
-      auto taskIds = getAsyncTaskIds(&op);
-      if (!taskIds.empty())
-        opList.push_back(&op);
-    }
-  }
-  // FIXME:
-  // Topologically sort opList to ensure dependencies are cloned before uses
-  // This is necessary because operations can appear out of order in the IR
+// Topologically sort operations to ensure dependencies are cloned before uses
+static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
   DenseSet<Operation *> opsInList(opList.begin(), opList.end());
   DenseMap<Operation *, unsigned>
       visitState; // 0=unvisited, 1=visiting, 2=visited
@@ -498,7 +477,35 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     topoVisit(op);
   }
 
-  opList = std::move(sortedOpList);
+  return sortedOpList;
+}
+
+void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
+
+  LLVM_DEBUG({
+    LDBG("\n\n");
+    LDBG("Start specializing region");
+  });
+
+  MLIRContext *context = funcOp.getContext();
+  OpBuilder builder(context);
+  auto loc = funcOp.getLoc();
+
+  // Collect original operations
+  SmallVector<Operation *> opList;
+  for (auto &block : funcOp.getBody().getBlocks()) {
+    for (Operation &op : block.getOperations()) {
+      auto taskIds = getAsyncTaskIds(&op);
+      if (!taskIds.empty())
+        opList.push_back(&op);
+    }
+  }
+  // FIXME:
+  // Topologically sort opList to ensure dependencies are cloned before uses
+  // This is necessary because operations can appear out of order in the IR
+  opList = topologicalSort(opList);
+
+  DenseSet<Operation *> opsInList(opList.begin(), opList.end());
 
   LLVM_DEBUG({
     LDBG("ops to be specialized: ");
@@ -700,12 +707,10 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
-    // This check has not been needed but leaving it as a placeholder.
-    if (!hasUse) {
-      op->erase();
-    } else {
+    if (hasUse)
       logOpStillHasUsers(op);
-    }
+
+    op->erase();
   }
 }
 

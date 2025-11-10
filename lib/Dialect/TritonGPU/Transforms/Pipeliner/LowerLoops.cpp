@@ -789,10 +789,8 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value numStagesVal =
       builder.create<arith::ConstantIntOp>(forOp.getLoc(), numStages, 32);
 
-  Value barrierSlice = barrierAlloc;
-  if (metaWS || numStages > 1)
-    barrierSlice =
-        triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+  Value barrierSlice =
+      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
   mma.addCompletionBarrier(barrierSlice, vTrue);
   mma.setIsAsync(true);
 
