@@ -1870,9 +1870,17 @@ DenseMap<Channel *, Value> createBufferPost(
         }
 
         if (opInsideLoop) {
+          // For out-of-loop operations that use loop results, we need to
+          // set the insertion point AFTER the loop to avoid forward references
+          auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
+          if (parentLoop) {
+            builder.setInsertionPointAfter(parentLoop);
+          }
           std::tie(bufferIdx, _phase) = getOutOfScopeBufferIdxAndPhase(
               builder, opInsideLoop, numBuffers, regionsWithChannels, config,
               reuseGrp);
+          // Restore insertion point to user
+          builder.setInsertionPoint(user);
         } else {
           // Fallback: if we can't find a parent loop, use constant 0
           // (this should only happen for operations truly outside any loop)
