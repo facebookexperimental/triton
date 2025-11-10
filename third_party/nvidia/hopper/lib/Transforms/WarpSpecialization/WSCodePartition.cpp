@@ -1870,15 +1870,41 @@ DenseMap<Channel *, Value> createBufferPost(
         }
 
         if (opInsideLoop) {
-          // For out-of-loop operations that use loop results, we need to
-          // set the insertion point AFTER the loop to avoid forward references
-          auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
-          if (parentLoop) {
-            builder.setInsertionPointAfter(parentLoop);
+          // Determine if this is a prologue or epilogue operation
+          bool isPrologue = false;
+
+          // Check if this is an initialization operation (prologue)
+          // TMEMAlloc without src operand indicates the buffer needs
+          // initialization from a constant (like tl.zeros()), which should
+          // happen before the loop
+          if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAllocOp)) {
+            if (!tmemAlloc.getSrc()) {
+              // No src means this needs explicit initialization before the loop
+              isPrologue = true;
+            }
           }
-          std::tie(bufferIdx, _phase) = getOutOfScopeBufferIdxAndPhase(
-              builder, opInsideLoop, numBuffers, regionsWithChannels, config,
-              reuseGrp);
+
+          auto parentLoop = opInsideLoop->getParentOfType<scf::ForOp>();
+          if (isPrologue) {
+            // For prologue operations (initialization), use initial values
+            // and place before the loop
+            if (parentLoop) {
+              builder.setInsertionPoint(parentLoop);
+            }
+            bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                user->getLoc(), 0, 32);
+            _phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                user->getLoc(), 0, 1);
+          } else {
+            // For epilogue operations, compute final loop values
+            // and place after the loop to avoid forward references
+            if (parentLoop) {
+              builder.setInsertionPointAfter(parentLoop);
+            }
+            std::tie(bufferIdx, _phase) = getOutOfScopeBufferIdxAndPhase(
+                builder, opInsideLoop, numBuffers, regionsWithChannels, config,
+                reuseGrp);
+          }
           // Restore insertion point to user
           builder.setInsertionPoint(user);
         } else {
