@@ -1682,7 +1682,7 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
     module.context = context
     # Facebook begin
     # TODO. bring following verify back
-    # if not module.verify_with_diagnostics():
+    # if not module.verify():
     #     if not fn.is_gluon():
     #         print(module)
     #     raise RuntimeError("error encountered during parsing")
