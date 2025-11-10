@@ -183,6 +183,9 @@ static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
                                       OperationListT &liveOps) {
   DenseSet<Operation *> userScopes;
   getUserScopes(users, userScopes);
+  // Return early if no user scopes (e.g., when users is empty)
+  if (userScopes.empty())
+    return;
   // Find the block that contains all users
   bool foundStart = false;
   auto *scope = *(userScopes.begin());
@@ -439,22 +442,10 @@ OperationListT livenessForTmemChannel(Value value,
   ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
       findChannelForAlloc(value, channels));
   std::vector<Operation *> liveOps;
-<<<<<<< HEAD
   DenseSet<Operation *> users;
   getAllTmemUsers(TheCh, users);
   updateLiveOpsAcrossScopes(users, liveOps);
 
-=======
-  // Operand D can be associated with multiple channels. From first producer to
-  // last consumer.
-  if (TheCh->isOperandD) {
-    handleOperandD(cast<ttng::TMEMAllocOp>(TheCh->getAllocOp()), liveOps);
-  } else {
-    DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users, value.getDefiningOp());
-    updateLiveOpsAcrossScopes(users, liveOps);
-  }
->>>>>>> 93d65f75f (more cleanup)
   return liveOps;
 }
 
