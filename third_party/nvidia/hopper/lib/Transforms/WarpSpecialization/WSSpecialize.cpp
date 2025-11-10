@@ -700,8 +700,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
-    // FIXME: we are not able to erase a few ops scenarios outside loops.
-    // Need to investigate live dependencies among these ops.
+    // This check has not been needed but leaving it as a placeholder.
     if (!hasUse) {
       op->erase();
     } else {
