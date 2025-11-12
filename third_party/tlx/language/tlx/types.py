@@ -401,7 +401,35 @@ class async_token(tl.base_value):
 
     def __init__(self, handle):
         self.handle = handle
+        self.type = async_token_type(handle)
 
-    @property
-    def type(self):
-        return None  # Python expects this to exist even if unused
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        """Build a frontend value with the current dtype, wrapping a list of existing handles.
+        cursor is the index of the first handle relevant to this value, and the function
+        should return the updated cursor position after any handles consumed by the created value.
+        """
+        raise NotImplementedError
+
+
+class async_token_type(tl.base_type):
+
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, async_token_type)
+
+    def __repr__(self) -> str:
+        return "async_token_type"
+
+    def mangle(self) -> str:
+        return repr(self)
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        return
+
+    def _unflatten_ir(self, handles, cursor):
+        return async_token(self.value), cursor
