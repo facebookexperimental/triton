@@ -646,6 +646,7 @@ class TmaDescKernelParam:
     def tma_desc_cpu_ptr(self):
         return self.desc.data_ptr()
 
+
 # The TMA dtype enum values are slightly different on host vs device...
 TMA_DTYPE_DEVICE_TO_HOST = dict((i, i) for i in range(16))
 TMA_DTYPE_DEVICE_TO_HOST[8] = 10
