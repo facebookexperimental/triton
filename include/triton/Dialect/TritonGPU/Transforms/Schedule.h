@@ -23,7 +23,7 @@ bool isSafeToPipeline(scf::ForOp forOp);
 // Do any preprocessing on the loop information for a given module.
 void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder);
 // TODO: Remove me and move to pass structure.
-void scheduleLoops(ModuleOp moduleOp, int defaultNumStages);
+void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useAutoWSPath);
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,

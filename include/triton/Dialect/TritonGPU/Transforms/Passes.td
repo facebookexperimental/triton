@@ -50,7 +50,10 @@ def TritonGPUScheduleLoops : Pass<"tritongpu-schedule-loops", "mlir::ModuleOp"> 
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
-           "number of pipeline stages">
+           "number of pipeline stages">,
+    Option<"useAutoWSPath", "use-autoWS-path",
+           "bool", /*default*/"true",
+           "Use the AutoWS modifications to the LoopSchedule">
   ];
 }
 
