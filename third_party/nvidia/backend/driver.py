@@ -319,8 +319,8 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   return cuLaunchKernelExHandle;
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-  void *params[] = {{ {', '.join(params)} }};
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{", " + arg_decls if len(arg_decls) > 0 else ""}) {{
+  void *params[] = {{ {", ".join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
     // 4 attributes that we can currently pass maximum
     CUlaunchAttribute launchAttr[4];
@@ -388,6 +388,7 @@ typedef struct _DevicePtrInfo {{
 
 static PyObject* data_ptr_str = NULL;
 static PyObject* py_tensor_map_type = NULL;
+static PyObject* tma_desc_cpu_ptr_str = NULL;
 
 static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
   DevicePtrInfo ptr_info;
@@ -438,10 +439,35 @@ static inline CUtensorMap* getTmaDesc(PyObject *obj) {{
     return NULL;
   }}
 
-if (Py_TYPE(obj) != (PyTypeObject*)py_tensor_map_type) {{
-    PyErr_Format(PyExc_TypeError, "object must be of type PyCUtensorMap, got %s", Py_TYPE(obj)->tp_name);
-    return NULL;
-}}
+  PyObject* attr = PyObject_GetAttrString(obj, "tma_desc_cpu_ptr");
+  if (attr) {{
+    PyObject *method_ret = PyObject_CallMethodNoArgs(obj, tma_desc_cpu_ptr_str);
+    if (method_ret) {{
+      if (!PyLong_Check(method_ret)) {{
+        PyErr_SetString(PyExc_TypeError, "tma_desc_cpu_ptr() must return 64-bit int");
+        Py_DECREF(method_ret);
+        return NULL;
+      }}
+      uint64_t ptr_as_uint = PyLong_AsUnsignedLongLong(method_ret);
+      Py_DECREF(method_ret);
+      if (!ptr_as_uint) {{
+        PyErr_SetString(PyExc_ValueError, "received NULL ptr from tma_desc_cpu_ptr()");
+        return NULL;
+      }}
+      if (ptr_as_uint % 64 != 0) {{
+        PyErr_SetString(PyExc_ValueError, "tma_desc_cpu_ptr() must be 64-byte aligned");
+        return NULL;
+      }}
+      return (CUtensorMap*)(ptr_as_uint);
+    }}
+  }} else {{
+    PyErr_Clear();
+  }}
+
+  if (Py_TYPE(obj) != (PyTypeObject*)py_tensor_map_type) {{
+      PyErr_Format(PyExc_TypeError, "object must be of type PyCUtensorMap, got %s", Py_TYPE(obj)->tp_name);
+      return NULL;
+  }}
 
   CUtensorMap* map = &((PyCUtensorMapObject*)obj)->tensorMap;
   uintptr_t align_128 = (uintptr_t)map & (128 - 1);
@@ -551,7 +577,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {newline.join(tma_decls)}
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{", " + ", ".join(internal_args_list) if len(internal_args_list) > 0 else ""});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -593,6 +619,10 @@ PyMODINIT_FUNC PyInit___triton_launcher(void) {{
   if (py_tensor_map_type == NULL) {{
     return NULL;
   }}
+  tma_desc_cpu_ptr_str = PyUnicode_InternFromString("tma_desc_cpu_ptr");
+  if(tma_desc_cpu_ptr_str == NULL) {{
+    return NULL;
+  }}
 
   PyObject *m = PyModule_Create(&ModuleDef);
   if(m == NULL) {{
@@ -615,7 +645,6 @@ class TmaDescKernelParam:
     # Return a CUtensorMap* pointer in host memory
     def tma_desc_cpu_ptr(self):
         return self.desc.data_ptr()
-
 
 
 # The TMA dtype enum values are slightly different on host vs device...
