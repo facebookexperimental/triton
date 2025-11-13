@@ -634,7 +634,24 @@ class JITFunction(JITCallable, KernelInterface[T]):
         name = self.fn.__qualname__
         module = self.fn.__module__
         arg_reprs = ", ".join([f"{param.name}: {ty}" for param, ty in zip(self.params, key[1])])
-        repr = f"{name}[num_warps={options.num_warps}, num_ctas={options.num_ctas}, num_stages={options.num_stages}, enable_fp_fusion={options.enable_fp_fusion}, launch_cooperative_grid={options.launch_cooperative_grid}]({arg_reprs})"
+        # Build repr string, only including optional params when they're set
+        repr_parts = [
+            f"num_warps={options.num_warps}",
+            f"num_ctas={options.num_ctas}",
+            f"num_stages={options.num_stages}",
+        ]
+        # Use getattr to safely access backend-specific attributes
+        minRegAutoWS = getattr(options, 'minRegAutoWS', None)
+        maxRegAutoWS = getattr(options, 'maxRegAutoWS', None)
+        if minRegAutoWS is not None:
+            repr_parts.append(f"minRegAutoWS={minRegAutoWS}")
+        if maxRegAutoWS is not None:
+            repr_parts.append(f"maxRegAutoWS={maxRegAutoWS}")
+        repr_parts.extend([
+            f"enable_fp_fusion={options.enable_fp_fusion}",
+            f"launch_cooperative_grid={options.launch_cooperative_grid}",
+        ])
+        repr = f"{name}[{', '.join(repr_parts)}]({arg_reprs})"
         full_name = get_full_name(self.fn)
 
         specialization_data = serialize_specialization_data(full_name, signature, constants, configs[0], options, key)
@@ -646,6 +663,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
             'num_warps': options.num_warps,
             'num_ctas': options.num_ctas,
             'num_stages': options.num_stages,
+            'minRegAutoWS': getattr(options, 'minRegAutoWS', None),
+            'maxRegAutoWS': getattr(options, 'maxRegAutoWS', None),
             'enable_fp_fusion': options.enable_fp_fusion,
             'launch_cooperative_grid': options.launch_cooperative_grid,
             'extern_libs': options.extern_libs,

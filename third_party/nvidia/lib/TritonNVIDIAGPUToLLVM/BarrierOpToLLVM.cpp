@@ -33,6 +33,8 @@
 
 using namespace mlir;
 using namespace mlir::triton;
+namespace ttg = mlir::triton::gpu;
+namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace {
 struct FenceAsyncSharedOpConversion
@@ -234,9 +236,20 @@ struct ArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    bool isRemoteBarrier = false;
+    if (auto barType = dyn_cast<ttg::MemDescType>(op.getAlloc().getType())) {
+      isRemoteBarrier =
+          isa<ttng::SharedClusterMemorySpaceAttr>(barType.getMemorySpace());
+    }
+
     // TODO: Add phase result as needed.
     std::stringstream ptxAsm;
-    ptxAsm << "@$0 mbarrier.arrive.shared::cta.b64 _, [$1]";
+    ptxAsm << "@$0 mbarrier.arrive.shared::";
+    if (isRemoteBarrier)
+      ptxAsm << "cluster";
+    else
+      ptxAsm << "cta";
+    ptxAsm << ".b64 _, [$1]";
     if (op.getCount() > 1) {
       ptxAsm << ", " << op.getCount();
     }

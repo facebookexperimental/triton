@@ -87,14 +87,14 @@ FailureOr<WarpSchedule> WarpSchedule::deserialize(scf::ForOp loop) {
 void WarpSchedule::serialize(scf::ForOp loop) const {
   SmallVector<Attribute> stages;
   Builder b(loop.getContext());
-  for (Operation &op : loop.getBody()->without_terminator()) {
-    if (Partition *partition = opToPartition.lookup(&op)) {
+  loop.walk([&](Operation *op) {
+    if (Partition *partition = opToPartition.lookup(op)) {
       if (partition == getRootPartition())
-        continue;
-      op.setAttr(kPartitionAttrName,
-                 b.getI32IntegerAttr(partition->getIndex()));
+        return;
+      op->setAttr(kPartitionAttrName,
+                  b.getI32IntegerAttr(partition->getIndex()));
     }
-  }
+  });
   for (Partition &partition : getPartitions())
     stages.push_back(b.getI32IntegerAttr(partition.getStage()));
   loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));

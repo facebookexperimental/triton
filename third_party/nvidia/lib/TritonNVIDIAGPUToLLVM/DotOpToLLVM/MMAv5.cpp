@@ -3,6 +3,7 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "Utility.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 
 using namespace mlir;
@@ -372,7 +373,8 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
                     Value b, Value loadedA, Value loadedB,
                     MemDescType dTensorTy, Value useDFlag, Value pred,
                     ValueRange barriers, ValueRange barrierPreds, bool twoCTAs,
-                    bool opKindIsMXFP4, const DotConversion &op) {
+                    bool tlxPairedMMA, bool opKindIsMXFP4,
+                    const DotConversion &op) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
@@ -380,10 +382,18 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
   Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(0));
   if (twoCTAs) {
-    // TODO: we have to sync the two CTAs because we currently don't use remove
-    // barriers for the copies.
-    rewriter.create<ttng::ClusterArriveOp>(loc, false);
-    rewriter.create<ttng::ClusterWaitOp>(loc);
+    // - In TLX 2cta mode, we'll have explicit remote barrier arrival in kernel,
+    // and implicit cluster sync inserted earlier than this.
+    // - In non-TLX 2cta mode (Triton default), we keep the code unchanged. Note
+    // inserting cluster sync here will hang WarpSpec - only MMA warps would
+    // execute ClusterArriveOp but ClusterWaitOp expects all threads in the
+    // cluster
+    if (!tlxPairedMMA) {
+      // TODO: we have to sync the two CTAs because we currently don't use
+      // remove barriers for the copies.
+      rewriter.create<ttng::ClusterArriveOp>(loc, false);
+      rewriter.create<ttng::ClusterWaitOp>(loc);
+    }
 
     Value clusterId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
     Value cluster0 = tb.icmp_eq(clusterId, tb.i32_val(0));
@@ -534,8 +544,8 @@ void convertDot(const LLVMTypeConverter &typeConverter,
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), twoCTAs, /*opKindIsMXFP4=*/false,
-                 dot);
+                 adaptor.getBarrierPreds(), twoCTAs,
+                 tlx::tlxEnablePairedMMA(op), /*opKindIsMXFP4=*/false, dot);
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {
@@ -649,8 +659,8 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), /*twoCTAs=*/false, opKindIsMXFP4,
-                 dot);
+                 adaptor.getBarrierPreds(), /*twoCTAs=*/false,
+                 /*tlxPairedMMA*/ false, opKindIsMXFP4, dot);
 }
 
 //===----------------------------------------------------------------------===//
@@ -708,7 +718,7 @@ struct TCGen5CommitOpConversion
       pred = b.and_(adaptor.getPred(), pred);
 
     createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred,
-                    op.getTwoCtas());
+                    op.getTwoCtas() || tlx::tlxEnablePairedMMA(op));
     rewriter.eraseOp(op);
     return success();
   }

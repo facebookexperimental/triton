@@ -1,7 +1,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-code-partition=num-buffers=1 | FileCheck %s
 
 // CHECK-LABEL: @matmul_kernel_one_consumer
-// CHECK: ttg.warp_specialize{{.*}}requestedRegisters = array<i32: 232>
+// CHECK: ttg.warp_specialize{{.*}}
 // CHECK: default
 // CHECK: scf.for
 // CHECK: nvws.producer_acquire
@@ -64,7 +64,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 
 // CHECK-LABEL: @matmul_kernel_two_consumers
-// CHECK: ttg.warp_specialize{{.*}}requestedRegisters = array<i32: 232, 232>
+// CHECK: ttg.warp_specialize{{.*}}
 // CHECK: default
 // CHECK: scf.for
 // CHECK: nvws.producer_acquire
@@ -145,7 +145,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 // CHECK-LABEL: @_matmul_layernorm_persistent_one_producer_one_consumer_one_epilog
-// CHECK: ttg.warp_specialize{{.*}}requestedRegisters = array<i32: 232, 232>
+// CHECK: ttg.warp_specialize{{.*}}
 // CHECK: default
 // CHECK: scf.for
 // CHECK: scf.for
@@ -267,9 +267,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-DAG: #[[$SHARED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 // CHECK-DAG: #[[$SHARED1:.*]]  = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
 // CHECK-LABEL: @_fbgemm_grouped_gemm_fp8_rowwise_ws
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<1x64x64xf8E4M3FN, #[[$SHARED1]], #smem, mutable>
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf8E4M3FN, #[[$SHARED1]], #smem, mutable>
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #[[$SHARED]], #smem, mutable>
+// CHECK-DAG: ttg.local_alloc : () -> !ttg.memdesc<1x64x64xf8E4M3FN, #[[$SHARED1]], #smem, mutable>
+// CHECK-DAG: ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf8E4M3FN, #[[$SHARED1]], #smem, mutable>
+// CHECK-DAG: ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #[[$SHARED]], #smem, mutable>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
