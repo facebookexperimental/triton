@@ -1587,6 +1587,7 @@ class TritonSemantic(Generic[TensorTy]):
         allow_tf32,
         max_num_imprecise_acc: int,
         out_dtype: tl.dtype,
+        tlx_paired_ctas: bool = False,
     ) -> Tuple[Any]:
         input_precision = tl._unwrap_if_constexpr(input_precision)
         allow_tf32 = tl._unwrap_if_constexpr(allow_tf32)
@@ -1676,7 +1677,10 @@ class TritonSemantic(Generic[TensorTy]):
             ret_scalar_ty = out_dtype
 
         M = lhs.type.shape[-2]
-        N = rhs.type.shape[-1]
+        if tlx_paired_ctas:
+            N = 2 * rhs.type.shape[-1]  # rhs is actually [K, N/2] in two_ctas mode so we scale it back
+        else:
+            N = rhs.type.shape[-1]
         K = lhs.type.shape[-1]
         B = lhs.type.shape[0] if lhs_rank == 3 else None
         ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])

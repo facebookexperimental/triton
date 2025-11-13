@@ -723,6 +723,13 @@ void init_triton_ir(py::module &&m) {
                return py::none();
              return py::int_(ret.getInt());
            })
+      .def("get_bool_attr",
+           [](ModuleOp &self, const std::string &name) -> py::object {
+             auto ret = self->getAttrOfType<BoolAttr>(name);
+             if (!ret)
+               return py::none();
+             return py::bool_(ret.getValue());
+           })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
       .def("create_location_snapshot",
            [](ModuleOp &self, const std::string &fileName) -> void {

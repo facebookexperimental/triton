@@ -141,7 +141,7 @@ class CUDAOptions:
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
-               "num_warps must be a power of 2"
+            "num_warps must be a power of 2"
 
     def hash(self):
         hash_dict = dict(self.__dict__)
@@ -341,7 +341,15 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod)
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+
+        tlx_enable_paired_cta_mma = mod.get_bool_attr("tlx.enable_paired_cta_mma") or False
+        metadata["tlx_enable_paired_cta_mma"] = tlx_enable_paired_cta_mma
+        if tlx_enable_paired_cta_mma:
+            assert cluster_info.clusterDimX == 1 and cluster_info.clusterDimY == 1 and cluster_info.clusterDimZ == 1, \
+                f"Unexpected cluster dims before TLX override:({cluster_info.clusterDimX}, {cluster_info.clusterDimY}, {cluster_info.clusterDimZ})"
+            metadata["cluster_dims"] = (2, 1, 1)
+        else:
+            metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
@@ -460,7 +468,7 @@ class CUDABackend(BaseBackend):
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas().path
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
-            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
+                tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
             fsrc.write(src)
             fsrc.flush()
             fbin = fsrc.name + '.o'
