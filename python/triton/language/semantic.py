@@ -1647,7 +1647,7 @@ class TritonSemantic(Generic[TensorTy]):
             f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})")
 
         assert tl._unwrap_if_constexpr(lhs.shape[-1]) == tl._unwrap_if_constexpr(rhs.shape[-2]), (
-            f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
+            f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({tl._unwrap_if_constexpr(lhs.shape[-1])}) must be equal to first index of second shape ({tl._unwrap_if_constexpr(rhs.shape[-2])})"
         )
 
         assert self.builder.codegen_fns.get("min_dot_size") is not None, (
