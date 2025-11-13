@@ -1852,3 +1852,23 @@ def test_local_index(BLOCK_SIZE, device):
     local_index[grid](x, output, n_elements, BLOCK_SIZE)
     y = torch.tensor([10., 10., 10., 10.], device='cuda:0')
     torch.testing.assert_close(y, output)
+
+
+def test_async_token_error(device):
+
+    @triton.jit
+    def asycn_copy_kernel(x_ptr, y_ptr, cond):
+        buffers = tlx.local_alloc((128, ), tl.float32, 1)
+        offsets = tl.arange(0, 128)
+        if cond:
+            token = tlx.async_load(x_ptr + offsets, buffers[0])
+        else:
+            token = tlx.async_load(y_ptr + offsets, buffers[0])
+        tlx.async_load_commit_group([token])
+
+    x = torch.tensor([128], dtype=torch.float32, device=device)
+    y = torch.tensor([128], dtype=torch.float32, device=device)
+    grid = lambda meta: (1, )
+    kernel = asycn_copy_kernel[grid](x, y, True)
+    assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
+    assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
