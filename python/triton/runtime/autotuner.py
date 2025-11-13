@@ -336,7 +336,8 @@ class Config:
     """
 
     def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None,
-                 minRegAutoWS=None, maxRegAutoWS=None):
+                 minRegAutoWS=None, maxRegAutoWS=None, num_buffers_warp_spec=0, num_consumer_groups=0,
+                 reg_dec_producer=0, reg_inc_consumer=0):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
