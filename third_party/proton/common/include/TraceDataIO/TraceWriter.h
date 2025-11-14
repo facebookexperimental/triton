@@ -55,7 +55,11 @@ public:
 
 private:
   void writeKernel(nlohmann::json &object, const KernelTrace &kernelTrace,
+<<<<<<< HEAD
                    uint64_t kernelTimeStart);
+=======
+                   const uint64_t minInitTime);
+>>>>>>> 11c876bd5 ([Proton] Fix global time trace precision (#8309))
 
   const std::vector<std::string> kChromeColor = {"cq_build_passed",
                                                  "cq_build_failed",
