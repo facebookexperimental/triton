@@ -746,7 +746,8 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value phase = forOp.getRegionIterArg(phaseArgIdx);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
   Value barrierIdx;
-  if (numStages > 1) {
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  if (!metaWS || numStages > 1) {
     barrierIdx = forOp.getRegionIterArg(barrierIdxArgIdx);
   } else {
     barrierIdx = zero;
@@ -755,8 +756,10 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value numStagesVal =
       builder.create<arith::ConstantIntOp>(forOp.getLoc(), numStages, 32);
 
-  Value barrierSlice =
-      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+  Value barrierSlice = barrierAlloc;
+  if (metaWS || numStages > 1)
+    barrierSlice =
+        triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
   mma.addCompletionBarrier(barrierSlice, vTrue);
   mma.setIsAsync(true);
 

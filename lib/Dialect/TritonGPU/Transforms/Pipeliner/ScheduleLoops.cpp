@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
@@ -399,6 +400,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     }
   }
 
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   DominanceInfo domInfo(forOp);
   // The return value is a tuple of <distance, cluster number>.
   // If the cluster number is -1, then the op will eventually be
@@ -433,7 +435,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     // latency otherwise it contributes 0 to the distance.
     //
     // The maximum distance allowed is the maxmium number of stages.
-    int d = std::min(lat + (maxDist < 0 ? 0 : maxDist), maxPossibleDistance);
+    int d = lat + (maxDist < 0 ? 0 : maxDist);
+    if (metaWS)
+      d = std::min(d, maxPossibleDistance);
     distance[op] = d;
     int c = -1;
     // We must always be scheduled as early as our earliest user for the same
@@ -487,7 +491,9 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     minIndex = std::min(minIndex, clusterIdx);
     maxIndex = std::max(maxIndex, clusterIdx);
   }
-  int numClusters = maxIndex - minIndex + 1;
+  int numClusters = maxStage + 1;
+  if (metaWS)
+    numClusters = maxIndex - minIndex + 1;
   CoarseSchedule schedule(maxStage + 1);
   SmallVector<CoarseSchedule::Cluster> clusters(numClusters);
   for (int i = 0; i < numClusters; i++) {
@@ -503,7 +509,8 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       auto dist = maxDistance - stage;
       clusterIdx = maxClusterPerDistance[dist];
     }
-    schedule.insert(op, stage, clusters[clusterIdx - minIndex]);
+    schedule.insert(
+        op, stage, clusters[metaWS ? clusterIdx - minIndex : maxStage - stage]);
   }
 
   // Move `scf.if` ops in the current schedule (forward slice of the latency
@@ -543,6 +550,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
   if (hasLatenciesAssigned(forOp, opLatency))
     return scheduleKeyOps(forOp, opLatency, defaultNumStages);
 
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
   if (forOp->hasAttr(kWarpSpecializeAttrName) &&
@@ -568,7 +576,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
       // FIXME: This should assert all latency ops have an assigned stage.
       if (schedule.count(&op))
         latencyStages.insert(schedule[&op].first);
-      else
+      else if (metaWS)
         assert(false);
     }
     if (latencyStages.size() <= 1) {
@@ -669,8 +677,9 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
     DBGS() << "Final coarse schedule:\n" << forOp << "\n";
   });
 
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   // Write the schedule to the IR
-  schedule.serialize(forOp, false);
+  schedule.serialize(forOp, !metaWS);
 }
 } // namespace
 
