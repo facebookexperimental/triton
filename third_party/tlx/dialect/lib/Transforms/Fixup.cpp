@@ -38,6 +38,8 @@ public:
     options.omitBlockArguments = false;
     options.inclusive = true;
 
+    // we put a worklist here to do exhaustive backward search until all related
+    // operands are reached whether they're block args or not
     while (!worklist.empty()) {
       Value nextTarget = worklist.back();
       worklist.pop_back();

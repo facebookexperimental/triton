@@ -1011,6 +1011,11 @@ def test_async_dot_blackwell_not_use_d(device):
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma(device):
+    run_async_dot_blackwell_2cta_tma(device, False)  # A in SMEM
+    run_async_dot_blackwell_2cta_tma(device, True)  # A in TMEM
+
+
+def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
     """
     Test 2cta collective D = A*B for 1 tile.
     """
@@ -1023,7 +1028,8 @@ def test_async_dot_blackwell_2cta_tma(device):
     @triton.jit
     def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
                                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                  OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+                                  OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                                  A_TMEM: tl.constexpr):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
@@ -1068,8 +1074,14 @@ def test_async_dot_blackwell_2cta_tma(device):
         acc_tmem = tlx.local_view(buffers, 0)
 
         # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
-        tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
-
+        if A_TMEM:
+            buf_alloc_a_tmem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
+            a_reg = tlx.local_load(a_smem)
+            tlx.local_store(buf_alloc_a_tmem[0], a_reg)
+            tlx.async_dot(buf_alloc_a_tmem[0], b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True,
+                          out_dtype=OUT_DTYPE)
+        else:
+            tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
         result = tlx.local_load(acc_tmem)
 
         c = result.to(tl.float16)
@@ -1089,7 +1101,8 @@ def test_async_dot_blackwell_2cta_tma(device):
     BLOCK_N = N
     BLOCK_K = K
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K
+        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
+        'A_TMEM': A_TMEM
     }
     kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
                                                                      y.stride(1), z, z.stride(0), z.stride(1),
