@@ -727,23 +727,23 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   // evaluated with {stage + 1}.
   //
   auto isEarlierBarrierLocation = [&](Operation *newOp, Operation *oldOp) {
-    if (schedule.isOpBefore(newOp, oldOp)) {
-      if (schedule.isOpBefore(newOp, mma)) {
-        auto newSchedule = schedule[newOp];
-        auto oldSchedule = schedule[oldOp];
-        auto newStage = newSchedule.first + 1;
-        auto oldStage = oldSchedule.first;
-        if (newStage == oldStage) {
-          return schedule.isOpInEarlierCluster(newOp, oldOp);
-        } else {
-          return newStage < oldStage;
-        }
-      } else {
-        return true;
-      }
-    } else {
-      return false;
+    auto [aStage, aCluster] = schedule[newOp];
+    auto [bStage, bCluster] = schedule[oldOp];
+    // We care about the first location after the MMA, not the first location
+    // in the IR.
+    if (schedule.isOpBefore(newOp, mma)) {
+      aStage += 1;
     }
+    if (schedule.isOpBefore(oldOp, mma)) {
+      bStage += 1;
+    }
+    if (aStage != bStage) {
+      return aStage < bStage;
+    }
+    if (aCluster != bCluster) {
+      return schedule.clusters.isBefore(aCluster, bCluster);
+    }
+    return newOp->isBeforeInBlock(oldOp);
   };
 
   if (!mmaPipeHelper.isPipelineable &&
