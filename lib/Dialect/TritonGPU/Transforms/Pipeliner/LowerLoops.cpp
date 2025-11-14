@@ -713,12 +713,45 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   }
 
+  // Note: We cannot depend on schedule.isOpBefore here because the relevant
+  // stage depends on the location relative to the MMA. For example, imagine
+  // the following setup:
+  // load {cluster: 1, stage: 0}
+  // mma {cluster: 1, stage: 0}
+  // tmem_load {cluster: 0, stage: 1}
+  //
+  // If we just check which occurs first in the schedule, we will insert the
+  // barrier before the load in the loop. However, this will actually happen
+  // after the tmem_load, which is not what we want. To handle this, we need
+  // to account for any operation that occurs before the mma needs its location
+  // evaluated with {stage + 1}.
+  //
+  auto isEarlierBarrierLocation = [&](Operation *newOp, Operation *oldOp) {
+    if (schedule.isOpBefore(newOp, oldOp)) {
+      if (schedule.isOpBefore(newOp, mma)) {
+        auto newSchedule = schedule[newOp];
+        auto oldSchedule = schedule[oldOp];
+        auto newStage = newSchedule.first + 1;
+        auto oldStage = oldSchedule.first;
+        if (newStage == oldStage) {
+          return schedule.isOpInEarlierCluster(newOp, oldOp);
+        } else {
+          return newStage < oldStage;
+        }
+      } else {
+        return true;
+      }
+    } else {
+      return false;
+    }
+  };
+
   if (!mmaPipeHelper.isPipelineable &&
       mmaPipeHelper.isOperandsStateDetermined) {
     // If the operands are not pipelineable, we need to insert a sync point
     // before the earliest operand load
     for (auto def : updatedDefs) {
-      if (!latestSyncPoint || schedule.isOpBefore(def, *latestSyncPoint)) {
+      if (!latestSyncPoint || isEarlierBarrierLocation(def, *latestSyncPoint)) {
         latestSyncPoint = def;
       }
     }
