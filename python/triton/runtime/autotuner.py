@@ -315,7 +315,7 @@ class Config:
     :ivar ir_override: filename of a user-defined IR (*.{ttgir|llir|ptx|amdgcn}).
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None, minRegAutoWS=None, maxRegAutoWS=None):
+    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None, minRegAutoWS=None, maxRegAutoWS=None, pingpongAutoWS=None):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
@@ -325,6 +325,7 @@ class Config:
         self.ir_override = ir_override
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
+        self.pingpongAutoWS = pingpongAutoWS
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -336,6 +337,7 @@ class Config:
         self.ir_override = state.get("ir_override", None)
         self.minRegAutoWS = state.get("minRegAutoWS", None)
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
+        self.pingpongAutoWS = state.get("pingpongAutoWS", None)
 
     def all_kwargs(self):
         return {
@@ -349,6 +351,7 @@ class Config:
                     ("ir_override", self.ir_override),
                     ("minRegAutoWS", self.minRegAutoWS),
                     ("maxRegAutoWS", self.maxRegAutoWS),
+                    ("pingpongAutoWS", self.pingpongAutoWS),
                 ) if v is not None
             }
         }
@@ -363,6 +366,7 @@ class Config:
         res.append(f"maxnreg: {self.maxnreg}")
         res.append(f"minRegAutoWS: {self.minRegAutoWS}")
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
+        res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         return ", ".join(res)
 
     def __hash__(self):
