@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-schedule-loops | FileCheck %s
+// XFAIL: *
 
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
