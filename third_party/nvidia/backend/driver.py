@@ -736,7 +736,8 @@ class CudaLauncher(object):
         )
 
         self.tlx_enable_paired_cta_mma = metadata.tlx_enable_paired_cta_mma
-        if self.tlx_enable_paired_cta_mma:
+        self.tlx_num_reduction_ctas = metadata.tlx_num_reduction_ctas
+        if self.tlx_enable_paired_cta_mma or self.tlx_num_reduction_ctas > 1:
             self.num_ctas = 1
         else:
             self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
@@ -746,7 +747,7 @@ class CudaLauncher(object):
         self.profile_scratch_size = metadata.profile_scratch_size
         self.profile_scratch_align = metadata.profile_scratch_align
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
-        self.launch_cluster = metadata.launch_cluster or self.tlx_enable_paired_cta_mma
+        self.launch_cluster = metadata.launch_cluster or self.tlx_enable_paired_cta_mma or (self.tlx_num_reduction_ctas > 1)
         self.launch_pdl = metadata.launch_pdl
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):

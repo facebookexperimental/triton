@@ -37,3 +37,15 @@ bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {
   auto attr = module->getAttrOfType<BoolAttr>(AttrTLXEnablePairedCTAMMAName);
   return attr != nullptr && attr.getValue() == true;
 }
+
+unsigned mlir::triton::tlx::tlxNumReductionCTA(Operation *op) {
+  assert(op != nullptr && "expecting nonnull op for getting num reduction ctas");
+  auto module = op;
+  if (!isa<ModuleOp>(module)) {
+    module = op->getParentOfType<ModuleOp>();
+  }
+  assert(module != nullptr &&
+         "expecting op nested in a module for getting num reduction ctas");
+  auto attr = module->getAttrOfType<IntegerAttr>(AttrTLXNumReductionCTAsName);
+  return attr != nullptr && attr.getValue() == true;
+}

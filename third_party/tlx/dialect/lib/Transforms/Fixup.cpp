@@ -174,8 +174,11 @@ public:
                                return WalkResult::advance();
                              })
                               .wasInterrupted();
+    //TODO: plumb the num_reduction_ctas from frontend
+    auto numReductionCTAs = 2;
+
     if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
-        !hasTLXTwoCTAs) {
+        !hasTLXTwoCTAs && numReductionCTAs == 1) {
       return;
     }
 
@@ -194,6 +197,9 @@ public:
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
     if (hasTLXTwoCTAs) {
       mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
+    }
+    if (numReductionCTAs > 1) {
+      mod->setAttr(AttrTLXNumReductionCTAsName, b.getI32IntegerAttr(numReductionCTAs));
     }
   }
 };

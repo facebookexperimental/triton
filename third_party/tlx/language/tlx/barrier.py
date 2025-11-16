@@ -2,6 +2,9 @@ import triton.language.core as tl
 from . import types as tlx
 from .utility import is_hip
 
+@tl.builtin
+def cluster_barrier(_semantic=None):
+    _semantic.builder.create_cluster_barrier()
 
 @tl.builtin
 def alloc_barriers(

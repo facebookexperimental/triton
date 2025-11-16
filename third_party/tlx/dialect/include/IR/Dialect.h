@@ -25,8 +25,11 @@ constexpr static char AttrHasTLXOpsName[] = "tlx.has_tlx_ops";
 constexpr static char AttrHasWarpSpecOpsName[] = "tlx.has_warp_spec_ops";
 constexpr static char AttrTLXEnablePairedCTAMMAName[] =
     "tlx.enable_paired_cta_mma";
+constexpr static char AttrTLXNumReductionCTAsName[] =
+    "tlx.num_reduction_ctas";
 
 bool tlxEnablePairedMMA(Operation *op);
+unsigned tlxNumReductionCTA(Operation *op);
 } // namespace tlx
 } // namespace triton
 } // namespace mlir
