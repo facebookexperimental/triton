@@ -27,7 +27,7 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages);
 llvm::MapVector<Operation *, std::pair<int, Operation *>>
 loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                          int numStages, bool filterSmall = true);
+                          int numStages, llvm::DenseMap<Operation *, int> &opLatency, bool filterSmall = true);
 
 }; // namespace gpu
 
