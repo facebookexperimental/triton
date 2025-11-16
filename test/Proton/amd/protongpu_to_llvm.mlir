@@ -138,41 +138,12 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignme
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignment = 128 : i32, ttg.profile_scratch_memory_size = 384 : i32} {
   // CHECK-LABEL: convert_smem_finalize
-<<<<<<< HEAD
-  // CHECK: llvm.inline_asm asm_dialect = att operand_attrs = [] "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 3)", "=s"  : () -> i32
-  // CHECK: llvm.inline_asm asm_dialect = att operand_attrs = [] "s_getreg_b32 $0, hwreg(HW_REG_HW_ID, 8, 4)", "=s"  : () -> i32
-  // CHECK: llvm.inline_asm asm_dialect = att operand_attrs = [] "s_getreg_b32 $0, hwreg(HW_REG_HW_ID, 13, 3)", "=s"  : () -> i32
-  // CONVERT-BUILTIN: llvm.cond_br %{{.*}}, ^bb1, ^bb9
-  // CONVERT-BUILTIN: ^bb1:  // pred: ^bb0
-  // CONVERT-BUILTIN: llvm.store %{{.*}}, %{{.*}} : i32, !llvm.ptr<1>
-  // CONVERT-BUILTIN: llvm.br ^bb2(%{{.*}} : i32)
-  // CONVERT-BUILTIN: ^bb2(%{{.*}}: i32):  // 2 preds: ^bb1, ^bb8
-  // CONVERT-BUILTIN: llvm.cond_br %1, ^bb3, ^bb4
-  // CONVERT-BUILTIN: bb3:  // pred: ^bb2
-  // CONVERT-BUILTIN: %{{.*}} = llvm.load %{{.*}} : !llvm.ptr<3> -> i32
-  // CONVERT-BUILTIN: llvm.br ^bb5(%{{.*}} : i32)
-  // CONVERT-BUILTIN: ^bb4:  // pred: ^bb2
-  // CONVERT-BUILTIN: llvm.br ^bb5(%{{.*}} : i32)
-  // CONVERT-BUILTIN: ^bb5(%{{.*}}: i32):  // 2 preds: ^bb3, ^bb4
-  // CONVERT-BUILTIN: llvm.store %{{.*}}, %{{.*}} : i32, !llvm.ptr<1>
-  // CONVERT-BUILTIN: llvm.cond_br %{{.*}}, ^bb6, ^bb7
-  // CONVERT-BUILTIN: ^bb6:  // pred: ^bb5
-  // CONVERT-BUILTIN: %{{.*}} = llvm.load %{{.*}} : !llvm.ptr<3> -> i32
-  // CONVERT-BUILTIN: llvm.br ^bb8(%{{.*}} : i32)
-  // CONVERT-BUILTIN: ^bb7:  // pred: ^bb5
-  // CONVERT-BUILTIN: llvm.br ^bb8(%{{.*}} : i32)
-  // CONVERT-BUILTIN: ^bb8(%{{.*}}: i32):  // 2 preds: ^bb6, ^bb7
-  // CONVERT-BUILTIN: llvm.store %{{.*}}, %{{.*}} : i32, !llvm.ptr<1>
-  // CONVERT-BUILTIN: llvm.cond_br %{{.*}}, ^bb2(%{{.*}} : i32), ^bb9
-  // CONVERT-BUILTIN: ^bb9:  // 2 preds: ^bb0, ^bb8
-=======
   // CONVERT-BUILTIN: llvm.call_intrinsic "llvm.amdgcn.s.memrealtime"() : () -> i64
   // CONVERT-BUILTIN: llvm.store %{{.*}}, %{{.*}} : i64, !llvm.ptr<1>
   // CONVERT-BUILTIN: llvm.br ^bb{{.*}}(%{{.*}} : i32)
   // CONVERT-BUILTIN: llvm.call_intrinsic "llvm.amdgcn.s.memrealtime"() : () -> i64
   // CONVERT-BUILTIN: llvm.store %{{.*}}, %{{.*}} : i64, !llvm.ptr<1>
   // CONVERT-BUILTIN: llvm.br ^bb{{.*}}
->>>>>>> 1f715ec66 ([PROTON] Capture global timestamps for consistent cross-CTA timeline (#7729))
   // CHECK: llvm.return
   llvm.func @convert_smem_finalize(%arg: !llvm.ptr<1>) attributes {noinline = false, nvvm.kernel = 1 : ui1} {
     %0 = ttg.local_alloc : () -> !ttg.memdesc<512xi32, #shared, #smem, mutable>
