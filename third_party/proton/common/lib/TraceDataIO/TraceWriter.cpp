@@ -58,16 +58,10 @@ void StreamChromeTraceWriter::write(std::ostream &outfile) {
 
   json object = {{"displayTimeUnit", "ns"}, {"traceEvents", json::array()}};
 
-<<<<<<< HEAD
-  int totalKernelNum = streamTrace.size();
-  for (int i = 0; i < totalKernelNum; i++) {
-    writeKernel(object, streamTrace[i], kKernelTimeGap * i);
-=======
   const auto minInitTime = getMinInitTime(streamTrace);
 
   for (const auto &kernelTrace : streamTrace) {
     writeKernel(object, kernelTrace, minInitTime);
->>>>>>> 11c876bd5 ([Proton] Fix global time trace precision (#8309))
   }
   outfile << object.dump() << "\n";
 }
@@ -169,11 +163,7 @@ std::vector<int> assignLineIds(
 
 void StreamChromeTraceWriter::writeKernel(json &object,
                                           const KernelTrace &kernelTrace,
-<<<<<<< HEAD
-                                          uint64_t kernelTimeStart) {
-=======
                                           const uint64_t minInitTime) {
->>>>>>> 11c876bd5 ([Proton] Fix global time trace precision (#8309))
   auto result = kernelTrace.first;
   auto metadata = kernelTrace.second;
 
@@ -222,10 +212,6 @@ void StreamChromeTraceWriter::writeKernel(json &object,
           else
             name = metadata->scopeName.at(scopeId);
 
-<<<<<<< HEAD
-          int64_t ts =
-              static_cast<int64_t>(event.first->cycle) + cycleAdjust[ctaId];
-=======
           // Unit: MHz, we assume freq is 1000MHz (1GHz)
           double freq = 1000.0;
 
@@ -235,7 +221,6 @@ void StreamChromeTraceWriter::writeKernel(json &object,
               static_cast<int64_t>(bt->initTime - minInitTime) -
               static_cast<int64_t>(blockToMinCycle[ctaId]);
           int64_t ts = static_cast<int64_t>(event.first->cycle) + cycleAdjust;
->>>>>>> 11c876bd5 ([Proton] Fix global time trace precision (#8309))
           int64_t dur =
               static_cast<int64_t>(event.second->cycle) - event.first->cycle;
 
@@ -246,13 +231,8 @@ void StreamChromeTraceWriter::writeKernel(json &object,
           element["ph"] = "X";
           element["pid"] = pid;
           element["tid"] = tid;
-<<<<<<< HEAD
-          element["ts"] = static_cast<float>(ts) / 1000.0;
-          element["dur"] = static_cast<float>(dur) / 1000.0;
-=======
           element["ts"] = static_cast<double>(ts) / freq;
           element["dur"] = static_cast<double>(dur) / freq;
->>>>>>> 11c876bd5 ([Proton] Fix global time trace precision (#8309))
           json args;
           args["Unit"] = "GPU cycle";
           args["Kernel Gap"] = std::to_string(kKernelTimeGap) + "cycle(ns)";
