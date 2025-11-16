@@ -189,15 +189,6 @@ struct FinalizeOpConversion
     Value gmemHwidPtr = b.gep(scratchPtrTy, i32_ty, scratchPtr, gmemHwidOffset);
     b.store(hwid, gmemHwidPtr);
 
-<<<<<<< HEAD
-    // Write back 'buffer size in byte'.
-    Value gmemBufSizeOffset = b.i32_val(3);
-    Value gmemBufSizePtr =
-        b.gep(scratchPtrTy, i32_ty, scratchPtr, gmemBufSizeOffset);
-    b.store(b.i32_val(bufferSizeInWords * 4), gmemBufSizePtr);
-
-=======
->>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
     // Add the 'else' block and the condition.
     Block *thenBlock = rewriter.splitBlock(ifBlock, op->getIterator());
     rewriter.setInsertionPointToEnd(prevBlock);

@@ -7,12 +7,6 @@ import triton
 import triton.language as tl
 import triton.language.semantic
 import triton.profiler.language as pl
-<<<<<<< HEAD
-import triton.profiler as proton
-from triton.tools.tensor_descriptor import TensorDescriptor
-
-from typing import NamedTuple
-=======
 from triton._internal_testing import (
     is_cuda,
     is_hip,
@@ -22,7 +16,6 @@ from triton._internal_testing import (
     supports_ws,
 )
 from triton.tools.tensor_descriptor import TensorDescriptor
->>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
 
 pl.enable_semantic("triton")
 
@@ -162,8 +155,6 @@ def test_record(method, tmp_path: pathlib.Path):
     assert "proton.record start" in ttir
     assert "proton.record end" in ttir
 
-<<<<<<< HEAD
-=======
     # check ttir line info
     start_loc = None
     end_loc = None
@@ -197,7 +188,6 @@ def test_record(method, tmp_path: pathlib.Path):
     assert loc_line is not None
     assert "line: " in loc_line and "line: 0" not in loc_line
 
->>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
 
 @pytest.mark.parametrize("hook", ["triton", None])
 def test_tree(tmp_path: pathlib.Path, hook):
@@ -659,8 +649,6 @@ def test_timeline(tmp_path: pathlib.Path):
         assert trace_events[-1]["tid"][0:4] == "warp"
         assert trace_events[-1]["args"]["call_stack"][-1] == "foo"
         assert trace_events[-1]["args"]["call_stack"][-2] == "test"
-<<<<<<< HEAD
-=======
 
 
 @pytest.mark.skipif(is_hip_cdna4(), reason="nondeterministic failure")
@@ -778,4 +766,3 @@ def test_gmem_buffer(tmp_path: pathlib.Path):
         warp1_events = [e for e in events if "warp 1" in e["tid"]]
         assert len(warp0_events) == 2
         assert len(warp1_events) == 2
->>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))

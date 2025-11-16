@@ -288,9 +288,6 @@ public:
       auto sharedBufferType = triton::gpu::MemDescType::get(
           {allocBufferSize / 4}, builder.getI32Type(), encoding,
           sharedMemorySpace, /*mutable_memory=*/true);
-<<<<<<< HEAD
-      buffer = builder.create<triton::gpu::LocalAllocOp>(loc, sharedBufferType);
-=======
       buffer =
           triton::gpu::LocalAllocOp::create(builder, loc, sharedBufferType);
       Attribute memorySpace =
@@ -300,7 +297,6 @@ public:
       auto segmentType = gpu::SegmentType::get(
           context, allocBufferSize, memorySpace, granularity, selectIdVec);
       segment = gpu::SegmentAllocOp::create(builder, loc, segmentType, buffer);
->>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
     } else if (bufferType == gpu::BufferType::GLOBAL) {
       Attribute memorySpace = gpu::GlobalMemorySpaceAttr::get(context);
       auto segmentType = gpu::SegmentType::get(
@@ -321,27 +317,8 @@ public:
     auto memorySpace =
         mlir::cast<triton::gpu::MemDescType>(buffer.getType()).getMemorySpace();
     auto segmentType = gpu::SegmentType::get(
-        context, allocBufferSize, memorySpace, granularity, selectIdVec);
-    Value segment =
-        builder.create<gpu::SegmentAllocOp>(loc, segmentType, buffer);
-
-    ModuleScopeIdAllocation &scopeInfo = getAnalysis<ModuleScopeIdAllocation>();
-
-    // Set insertion point to the start of the function
-    builder.setInsertionPointToStart(&func.getBody().front());
-
-    Value profileMem = builder.create<gpu::GlobalScratchAllocOp>(
-        loc, triton::getPointerType(builder.getI32Type()),
-        allocProfileScratchSize, profileScratchAlignment);
-
-=======
-    ModuleScopeIdAllocation &scopeInfo = getAnalysis<ModuleScopeIdAllocation>();
-
->>>>>>> c567e1325 ([Proton] Global memory support for proton intra kernel profiler (#8641))
-    if (hasOperator<Operation, triton::gpu::WarpSpecializeOp>(
             func.getOperation()))
       builder.create<gpu::InitCtxOp>(loc, profileMem);
-
     instrumentWarpSpecializeOps(func, buffer, profileMem);
 
     if (failed(replaceProtonRecordOp(builder, func, segment, metricType,
