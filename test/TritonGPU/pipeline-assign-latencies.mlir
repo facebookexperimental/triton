@@ -377,6 +377,63 @@ tt.func @intermediate_use_cust_stages(%lb : index, %ub : index, %step : index,
   } {tt.num_stages = 3 : i32}
   tt.return %loop#2: tensor<128x128xf32, #C>
 }
+
+// Check that when you annotate 0 as the latency on a load that all other
+// latency is unchanged.
+
+// CHECK-LABEL: @annotated_zero
+tt.func @annotated_zero(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = 16 : i32, tt.contiguity = 32 : i32},
+                  %b_ptr_init : tensor<32x128x!tt.ptr<f16>, #BL> {tt.divisibility = 16 : i32, tt.contiguity = 32 : i32}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x32xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<32x128xi32, #BL>
+
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 0 : i32}
+    %a_ = tt.load %a_ptr {tt.latency = 0 : i32} : tensor<128x32x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
+    // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+    %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<32x128xf16, #BL> -> tensor<32x128xf16, #B>
+
+    %c = tt.dot %a, %b, %prev_c : tensor<128x32xf16, #A> * tensor<32x128xf16, #B> -> tensor<128x128xf32, #C>
+
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<128x32xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<32x128x!tt.ptr<f16>, #BL>, tensor<32x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
+
+// Check that when you annotate 1 as the latency on a load that no compiler
+// derived latency is computed.
+
+// CHECK-LABEL: @annotated_one
+tt.func @annotated_one(%lb : index, %ub : index, %step : index,
+                  %a_ptr_init : tensor<128x32x!tt.ptr<f16>, #AL> {tt.divisibility = 16 : i32, tt.contiguity = 32 : i32},
+                  %b_ptr_init : tensor<32x128x!tt.ptr<f16>, #BL> {tt.divisibility = 16 : i32, tt.contiguity = 32 : i32}) -> tensor<128x128xf32, #C> {
+  %c_init = arith.constant dense<0.00e+00> : tensor<128x128xf32, #C>
+  %a_off = arith.constant dense<4> : tensor<128x32xi32, #AL>
+  %b_off = arith.constant dense<4> : tensor<32x128xi32, #BL>
+
+  %loop:3 = scf.for %iv = %lb to %ub step %step iter_args(%a_ptr = %a_ptr_init, %b_ptr = %b_ptr_init, %prev_c = %c_init) -> (tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>) {
+    // CHECK: tt.load {{.*}} {tt.latency = 1 : i32}
+    %a_ = tt.load %a_ptr {tt.latency = 1 : i32} : tensor<128x32x!tt.ptr<f16>, #AL>
+    %a = ttg.convert_layout %a_ : tensor<128x32xf16, #AL> -> tensor<128x32xf16, #A>
+    // CHECK: tt.load
+    // CHECK-NOT: {tt.latency = .*}
+    %b_ = tt.load %b_ptr : tensor<32x128x!tt.ptr<f16>, #BL>
+    %b = ttg.convert_layout %b_ : tensor<32x128xf16, #BL> -> tensor<32x128xf16, #B>
+
+    %c = tt.dot %a, %b, %prev_c : tensor<128x32xf16, #A> * tensor<32x128xf16, #B> -> tensor<128x128xf32, #C>
+
+    %next_a_ptr = tt.addptr %a_ptr, %a_off : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<128x32xi32, #AL>
+    %next_b_ptr = tt.addptr %b_ptr, %b_off : tensor<32x128x!tt.ptr<f16>, #BL>, tensor<32x128xi32, #BL>
+    scf.yield %next_a_ptr, %next_b_ptr, %c : tensor<128x32x!tt.ptr<f16>, #AL>, tensor<32x128x!tt.ptr<f16>, #BL>, tensor<128x128xf32, #C>
+  }
+  tt.return %loop#2: tensor<128x128xf32, #C>
+}
 }
 
 // -----
