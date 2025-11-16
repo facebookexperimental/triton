@@ -124,8 +124,6 @@ proton.start(
     backend="instrumentation",
     mode="<mode0>=<option0>:<mode1>=<option1>:..."
 )
-<<<<<<< HEAD
-=======
 
 # or
 
@@ -136,7 +134,6 @@ proton.start(
     backend="instrumentation",
     mode=pmode.Default() # collect metrics from every warp
 )
->>>>>>> 48ff763d1 ([Proton] Intra kernel profiling tutorial and examples (#8334))
 ```
 
 **Kernel-side usage:**
