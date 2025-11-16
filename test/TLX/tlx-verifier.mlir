@@ -68,3 +68,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func public @tlx_bar_init_ws() attributes {noinline = false} {
+    ttg.warp_specialize()
+    default {
+      %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %c0_i32 = arith.constant 0 : i32
+      %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      // expected-error @+1 {{Barrier init outside of the first block in function is not supported}}
+      ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %0 = tt.get_program_id x : i32
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
