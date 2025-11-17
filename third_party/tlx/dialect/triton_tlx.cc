@@ -5,6 +5,7 @@
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -13,6 +14,7 @@
 namespace py = pybind11;
 using namespace ir;
 using namespace mlir;
+namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
@@ -67,9 +69,11 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
              Type newType;
              if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+               // consider allocation type for subslice
                newType = ttg::MemDescType::get(
                    type.getShape(), type.getElementType(), encoding,
-                   type.getMemorySpace(), type.getMutableMemory());
+                   type.getMemorySpace(), type.getMutableMemory(),
+                   type.getAllocShape());
                return self.create<tlx::RequireLayoutOp>(newType, v);
              } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
                newType = RankedTensorType::get(type.getShape(),
@@ -130,7 +134,7 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<unsigned> order, Type &elemType,
               std::vector<unsigned> CTAsPerCGA,
               std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
-              bool fp4Padded) {
+              bool fp4Padded, bool swizzled) {
              /* Validation logic for user defined layout encoding begin */
              assert(shape.size() == order.size());
              assert(order.size() == CTAsPerCGA.size());
@@ -141,8 +145,15 @@ void init_triton_tlx_ir(py::module &&m) {
              auto context = self.getBuilder().getContext();
              auto CTALayout = ttg::CTALayoutAttr::get(context, CTAsPerCGA,
                                                       CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
-                 context, shape, order, CTALayout, elemType, fp4Padded));
+             if (swizzled) {
+               return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
+                   context, shape, order, CTALayout, elemType, fp4Padded));
+             } else {
+               return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
+                   context, /*swizzlingByteWidth=*/0,
+                   /*transposed=*/order[0] == 0,
+                   elemType.getIntOrFloatBitWidth(), fp4Padded, CTALayout));
+             }
            })
       .def("make_nv_mma_encoding_attr",
            [](TritonOpBuilder &self, Value opndA, Value opndAcc,
@@ -382,6 +393,26 @@ void init_triton_tlx_ir(py::module &&m) {
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
+                 ValueRange(mBarriers), ValueRange(barrierPreds),
+                 !mBarriers.empty() /* is_async */);
+           })
+      .def("create_tcgen5_dot_scaled",
+           [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
+              Value bScale, tt::ScaleDotElemType aType,
+              tt::ScaleDotElemType bType, std::optional<Value> useD,
+              std::optional<Value> pred, std::vector<Value> mBarriers) -> void {
+             Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
+             std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
+             auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
+             // assert aScale and bScale are in either smem or tmem
+             assert(isa<ttg::MemDescType>(aScale.getType()) &&
+                    "Expect MemDescType for aScale");
+             assert(isa<ttg::MemDescType>(bScale.getType()) &&
+                    "Expect MemDescType for bScale");
+             self.create<ttng::TCGen5MMAScaledOp>(
+                 tokType, a, b, d, Value(), aScale, bScale, aType, bType,
+                 useD.has_value() ? useD.value() : predTrue /*useD*/,
+                 pred.has_value() ? pred.value() : predTrue /*pred*/,
                  ValueRange(mBarriers), ValueRange(barrierPreds),
                  !mBarriers.empty() /* is_async */);
            })

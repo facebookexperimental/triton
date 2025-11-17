@@ -125,7 +125,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded):
+    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded, swizzled):
         super().__init__()
         self.shape = shape
         self.order = order
@@ -134,6 +134,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         self.numCTASplit = numCTASplit
         self.numCTAOrder = numCTAOrder
         self.fp4Padded = fp4Padded
+        self.swizzled = swizzled
 
     """
     Make a default NVMMA shared layout encoding.
@@ -142,9 +143,16 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
     @classmethod
     def make_default(cls, shape, elemType):
         rank = len(shape)
-        return cls(shape=shape, order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
-                   elemType=elemType, numCTAsPerCGA=[1] * rank, numCTASplit=[1] * rank, numCTAOrder=[1] * rank,
-                   fp4Padded=False)
+        return cls(
+            shape=shape,
+            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
+            elemType=elemType,
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=[1] * rank,
+            fp4Padded=False,
+            swizzled=True,
+        )
 
     """
     Create a new layout that is a permutation of the given layout.
@@ -152,8 +160,16 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
-        return nv_mma_shared_layout_encoding(self.shape, permuted_order, self.elemType, self.numCTAsPerCGA,
-                                             self.numCTASplit, self.numCTAOrder, self.fp4Padded)
+        return nv_mma_shared_layout_encoding(
+            self.shape,
+            permuted_order,
+            self.elemType,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+            self.fp4Padded,
+            self.swizzled,
+        )
 
     def to_ir(self, builder: ir.builder) -> None:
         return builder.make_nv_mma_shared_encoding_attr(
@@ -167,7 +183,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         )
 
     def __str__(self) -> str:
-        return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}>"
+        return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
 
     def __eq__(self, other) -> bool:
         return (type(self) is type(other) and self.shape == other.shape and self.order == other.order

@@ -92,7 +92,7 @@ While this approach places more responsibility on the user, it reduces the compi
 - `acc = tlx.async_dot(a[i], b[i], acc)`
 - `acc = tlx.async_dot(a_reg, b[i], acc)`
 - `acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)`
-
+- `acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], b_scale[i])`
 - `acc = tlx.async_dot_wait(pendings, acc)`
 
     Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.

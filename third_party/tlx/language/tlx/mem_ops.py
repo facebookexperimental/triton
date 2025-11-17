@@ -82,6 +82,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.numCTASplit,
                     layout.numCTAOrder,
                     layout.fp4Padded,
+                    layout.swizzled,
                 )
         else:
             layout = tlx.tensor_memory_layout_encoding.make_default(shape)
@@ -440,7 +441,7 @@ def async_descriptor_load(
     assert isinstance(desc, tl.tensor_descriptor_base)
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-    result_handle = require_nv_mma_shared_layout(result, _semantic.builder)
+    result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
@@ -462,7 +463,7 @@ def async_descriptor_store(
     assert isinstance(desc, tl.tensor_descriptor_base)
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-    source_handle = require_nv_mma_shared_layout(source, _semantic.builder)
+    source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
     _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle)
 

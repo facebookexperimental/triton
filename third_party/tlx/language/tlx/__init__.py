@@ -28,6 +28,7 @@ from .barrier import (
 )
 from .mma_ops import (
     async_dot,
+    async_dot_scaled,
     async_dot_wait,
     tcgen05_commit,
 )
@@ -94,6 +95,7 @@ __all__ = [
     "named_barrier_arrive",
     # mma_ops
     "async_dot",
+    "async_dot_scaled",
     "async_dot_wait",
     "tcgen05_commit",
     # utility
