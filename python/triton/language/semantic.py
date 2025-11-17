@@ -1099,6 +1099,7 @@ class TritonSemantic(Generic[TensorTy]):
         cache_modifier: str,
         eviction_policy: str,
         is_volatile: bool,
+        latency: Optional[int], 
     ) -> TensorTy:
         # Cache, eviction and padding options
         cache = self._str_to_load_cache_modifier(cache_modifier)
@@ -1107,17 +1108,22 @@ class TritonSemantic(Generic[TensorTy]):
 
         if ptr.type.is_ptr() and ptr.type.element_ty.is_block():
             # Load by a block pointer: `pointer_type<block_type<>>`
-            return self._load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+            x = self._load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
         else:
             # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
-            return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+            x = self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+        if latency is not None:
+            if not isinstance(latency, int) or latency < 0:
+                raise TypeError(f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
+            x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
+        return x
 
     def reinterpret_tensor_descriptor(self, desc_ptr: tl.tensor, block_ty: tl.block_type):
         handle = self.builder.create_reinterpret_tensor_descriptor(desc_ptr.handle, block_ty.to_ir(self.builder))
         return tl.tensor_descriptor_base(handle, block_ty)
 
     def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str,
-                        eviction_policy: str) -> TensorTy:
+                        eviction_policy: str, latency: Optional[int]) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base)
         ndim = len(desc.block_shape)
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
@@ -1129,6 +1135,10 @@ class TritonSemantic(Generic[TensorTy]):
             self._str_to_load_cache_modifier(cache_modifier),
             self._str_to_eviction_policy(eviction_policy),
         )
+        if latency is not None:
+            if not isinstance(latency, int) or latency < 0:
+                raise TypeError(f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
+            x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
         return self.tensor(x, desc.block_type)
 
     def validate_store_like(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> None:
