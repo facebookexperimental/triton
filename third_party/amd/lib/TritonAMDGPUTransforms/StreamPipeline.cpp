@@ -559,9 +559,9 @@ preprocessLoop(triton::AMD::ModuleAxisInfoAnalysis &axisInfoAnalysis,
       isaFamily != triton::AMD::ISAFamily::CDNA4 && !isRDNA(isaFamily);
   llvm::DenseMap<Operation *, int> unusedOpLatency;
   llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel =
-      triton::gpu::loadOpsToIndirectionLevel(forOp, pipelineWithoutDot,
-                                             axisInfoAnalysis, numStages, unusedOpLatency,
-                                             filterSmallVectors);
+      triton::gpu::loadOpsToIndirectionLevel(
+          forOp, pipelineWithoutDot, axisInfoAnalysis, numStages,
+          unusedOpLatency, filterSmallVectors);
 
   LLVM_DEBUG({
     LDBG("Found " << loadOpToIndLevel.size() << " loads to pipeline:");

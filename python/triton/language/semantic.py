@@ -1099,7 +1099,7 @@ class TritonSemantic(Generic[TensorTy]):
         cache_modifier: str,
         eviction_policy: str,
         is_volatile: bool,
-        latency: Optional[int], 
+        latency: Optional[int],
     ) -> TensorTy:
         # Cache, eviction and padding options
         cache = self._str_to_load_cache_modifier(cache_modifier)
@@ -1114,7 +1114,8 @@ class TritonSemantic(Generic[TensorTy]):
             x = self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
         if latency is not None:
             if not isinstance(latency, int) or latency < 0:
-                raise TypeError(f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
+                raise TypeError(
+                    f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
             x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
         return x
 
@@ -1122,8 +1123,8 @@ class TritonSemantic(Generic[TensorTy]):
         handle = self.builder.create_reinterpret_tensor_descriptor(desc_ptr.handle, block_ty.to_ir(self.builder))
         return tl.tensor_descriptor_base(handle, block_ty)
 
-    def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str,
-                        eviction_policy: str, latency: Optional[int]) -> TensorTy:
+    def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str, eviction_policy: str,
+                        latency: Optional[int]) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base)
         ndim = len(desc.block_shape)
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
@@ -1137,7 +1138,8 @@ class TritonSemantic(Generic[TensorTy]):
         )
         if latency is not None:
             if not isinstance(latency, int) or latency < 0:
-                raise TypeError(f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
+                raise TypeError(
+                    f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
             x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
         return self.tensor(x, desc.block_type)
 
