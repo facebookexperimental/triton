@@ -579,8 +579,10 @@ struct ConvertWarpSpecializeToLLVM
       if (failed(lowerWarpSpecialize(kernel, targetInfo)))
         return signalPassFailure();
 
-    // insert cluster sync right before every return op after ws lowering to
-    // make sure all warps execute it
+    // Insert cluster sync right before every return op after ws lowering to
+    // make sure all warps execute it. Note: we put this piece of code here to
+    // make sure it's executed right after WS lowering, but it's not part of WS
+    // lowering, so without WS ops this piece should still execute
     if (tlx::tlxEnablePairedMMA(mod)) {
       for (LLVM::LLVMFuncOp kernel : kernels) {
         kernel.walk([&](LLVM::ReturnOp ret) {
@@ -590,8 +592,7 @@ struct ConvertWarpSpecializeToLLVM
 
           // for 2cta, this is needed
           // "When the current CTA issues the operation, the peer CTA should be
-          // active and should not have exited." todo: find a better way to
-          // implement this
+          // active and should not have exited."
           auto unitAttr = UnitAttr::get(ctx);
           rewriter.setInsertionPoint(ret);
           rewriter.create<NVVM::ClusterArriveOp>(loc, unitAttr);

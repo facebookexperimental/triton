@@ -236,7 +236,7 @@ private:
 
     BackwardSliceOptions options;
     options.omitUsesFromAbove = false;
-    options.omitBlockArguments = false;
+    options.omitBlockArguments = true;
     options.inclusive = true;
 
     while (!worklist.empty()) {
@@ -250,24 +250,12 @@ private:
           auto wsOp = wsPartitionOp->getParentOfType<ttg::WarpSpecializeOp>();
           // map to WSOp's operand at the same index
           nextTarget = wsOp.getOperand(argIndex);
-        } else if (auto forOp =
-                       dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())) {
-          for (auto operand : forOp.getOperands()) {
-            worklist.insert(operand);
-          }
-          continue;
         } else {
-          // Conservatively throw errors here if we see unexpected block
-          // structures
-
           // ttg::WarpSpecializeOp's default region just captures
-          // from trunk so no need to special handle the defining block args
-          auto parentOpName =
-              arg.getOwner()->getParentOp()->getName().getStringRef().str();
-          llvm_unreachable(
-              ("Unexpected block structure that needs special handling: " +
-               parentOpName)
-                  .c_str());
+          // from trunk so no need to special handle the defining block args.
+          // We should omit block args for other block structures like scf.For,
+          // and the captures would still be handled automatically
+          continue;
         }
       }
 

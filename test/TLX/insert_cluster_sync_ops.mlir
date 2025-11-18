@@ -101,8 +101,8 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %c1_i32 = arith.constant 1 : i32
     %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
-    // CHECK: nvvm.cluster.wait {aligned}
+    // CHECK-NEXT: nvvm.cluster.arrive {aligned}
+    // CHECK-NEXT: nvvm.cluster.wait {aligned}
     ttng.init_barrier %2, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %c0_i32_0 = arith.constant 0 : i32
     %c300_i32 = arith.constant 300 : i32
