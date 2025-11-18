@@ -376,7 +376,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   DenseMap<Operation *, int> clusterMap;
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t numDots = 0;
-  SmallVector<int> maxClusterPerDistance(maxStages, -1);
+  SmallVector<int> maxClusterPerDistance(maxPossibleDistance, -1);
   if (success) {
     size_t maxChainLength = 0;
     for (auto &chain : chains) {
@@ -435,7 +435,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (int i = 0; i < maxStages; i++) {
+  for (int i = 0; i < maxPossibleDistance; i++) {
     if (maxClusterPerDistance[i] == -1) {
       maxClusterPerDistance[i] = numDots + offset++;
     }
@@ -523,7 +523,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - stage;
+      auto dist = maxDistance - (stage + minDistance);
       clusterIdx = maxClusterPerDistance[dist];
     }
     minIndex = std::min(minIndex, clusterIdx);
@@ -542,7 +542,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - stage;
+      auto dist = maxDistance - (stage + minDistance);
       clusterIdx = maxClusterPerDistance[dist];
     }
     schedule.insert(op, stage, clusters[clusterIdx - minIndex]);
