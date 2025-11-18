@@ -318,9 +318,11 @@ private:
       return success();
     }
 
+    bool hasMapaOp = false;
     SetVector<Operation *> barAllocOps;
     // Find all bar alloc op in the back slice of mapa ops
     mod.walk([&](ttng::MapToRemoteBufferOp mapaOp) {
+      hasMapaOp = true;
       SetVector<Operation *> ops;
       getBackwardSliceWithWS(mapaOp.getResult(), &ops);
 
@@ -330,6 +332,12 @@ private:
         }
       }
     });
+
+    // If there's no mapa, it's not possible to access remote barrier so
+    // skipping
+    if (!hasMapaOp) {
+      return success();
+    }
 
     assert(!barAllocOps.empty() &&
            "Failed to find bar alloc op for remote bar");
