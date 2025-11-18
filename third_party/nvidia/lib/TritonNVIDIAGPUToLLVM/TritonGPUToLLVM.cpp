@@ -288,8 +288,9 @@ private:
     }
   }
 
-  LogicalResult ensureEarlyRemoteBarInit(ModuleOp &mod,
-                                         SetVector<Operation *> &barInitOps) {
+  LogicalResult
+  ensureEarlyRemoteBarInit(ModuleOp &mod,
+                           SetVector<Operation *> &remoteBarInitOps) {
     triton::FuncOp funcOp = nullptr;
     mod.walk([&](triton::FuncOp op) {
       if (triton::isKernel(op)) {
@@ -299,7 +300,7 @@ private:
       return WalkResult::advance();
     });
     assert(funcOp && "Expecting to find a kernel func but got none.");
-    for (auto op : barInitOps) {
+    for (auto op : remoteBarInitOps) {
       if (op->getBlock() != &funcOp.front()) {
         op->emitError() << "Barrier init outside of the first block in "
                            "function is not supported for remote barriers";
@@ -330,34 +331,31 @@ private:
       }
     });
 
-    // Find all the bar init op from the alloc ops who had a mapa usage later
-    SetVector<Operation *> barInitOps;
-    for (auto barAllocOp : barAllocOps) {
-      SetVector<Operation *> ops;
-      // Do not go into WS Op as we enforced remote bar init to be in trunk
-      // blocks
-      ForwardSliceOptions fwdOpt;
-      fwdOpt.filter = [&](Operation *op) {
-        return !isa<ttg::WarpSpecializeOp>(op);
-      };
-      getForwardSlice(barAllocOp, &ops, fwdOpt);
-      for (auto op : ops) {
-        if (isa<ttng::InitBarrierOp>(op)) {
-          barInitOps.insert(op);
-        }
-      }
-    }
+    assert(!barAllocOps.empty() &&
+           "Failed to find bar alloc op for remote bar");
 
-    if (barInitOps.empty()) {
-      return success();
-    }
+    // Find the init op for remote barriers
+    SetVector<Operation *> remoteBarInitOps;
+    mod.walk([&](ttng::InitBarrierOp barInitOp) {
+      SetVector<Operation *> ops;
+      getBackwardSliceWithWS(barInitOp.getAlloc(), &ops);
+      if (llvm::any_of(
+              ops, [&](Operation *op) { return barAllocOps.contains(op); })) {
+        // barInitOp is for remote bar
+        remoteBarInitOps.insert(barInitOp);
+      }
+    });
+
+    assert(!remoteBarInitOps.empty() &&
+           "Failed to find bar init op for remote bar");
 
     // Enforcing front end for 2cta kernels:
-    // All barrier init ops need to happen at the first block of function. This
-    // is to make 2cta cluster sync insertion easier for WarpSpec case. If in
-    // the future there's a need to really alloc/init barriers after a WS op, we
-    // can seek to relax this limitation and fix cluster sync insertions.
-    if (failed(ensureEarlyRemoteBarInit(mod, barInitOps))) {
+    // All remote barrier init ops need to happen at the first block of
+    // function. This is to make 2cta cluster sync insertion easier for WarpSpec
+    // case. If in the future there's a need to really alloc/init barriers after
+    // a WS op, we can seek to relax this limitation and fix cluster sync
+    // insertions.
+    if (failed(ensureEarlyRemoteBarInit(mod, remoteBarInitOps))) {
       return failure();
     }
 
@@ -366,10 +364,10 @@ private:
     // block of the kernel func op, as we currently enforce earlier in this
     // pass. If that assumption changes, we should revisit this heuristic here.
     ttng::InitBarrierOp lastBarInitOp;
-    auto firstBlock = barInitOps.front()->getBlock();
+    auto firstBlock = remoteBarInitOps.front()->getBlock();
     for (auto it = firstBlock->rbegin(), e = firstBlock->rend(); it != e;
          ++it) {
-      if (barInitOps.contains(&*it)) {
+      if (remoteBarInitOps.contains(&*it)) {
         lastBarInitOp = cast<ttng::InitBarrierOp>(*it);
         break;
       }
