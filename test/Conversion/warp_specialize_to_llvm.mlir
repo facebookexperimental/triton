@@ -822,3 +822,45 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
 }
 
 }
+
+// -----
+
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @paired_cta_cluster_sync
+
+// non default warps arrive before jumping to switch loop
+// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: llvm.br
+
+// sync before return for tmem dealloc
+// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: llvm.return
+
+// default warps keep arrive/wait after bar init
+// CHECK: mbarrier.init.shared::cta.b64
+// CHECK-NEXT: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: nvvm.cluster.wait {aligned}
+
+// sync before return for tmem dealloc
+// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: llvm.return
+llvm.func @paired_cta_cluster_sync(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
+  %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
+  nvvm.cluster.arrive {aligned}
+  nvvm.cluster.wait {aligned}
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    %1 = llvm.mlir.constant(32 : i32) : i32
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+}
