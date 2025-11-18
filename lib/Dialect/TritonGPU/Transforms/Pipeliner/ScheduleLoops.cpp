@@ -324,7 +324,6 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   if (latOps.empty())
     return CoarseSchedule(0);
 
-
   // Determine the minimum distance value that will exist for normalizing
   // the result. This is based on the lowest latency value that is present
   // in opLatency and used in this kernel.
@@ -333,7 +332,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   // the lit tests, so we are conservative and actually traverse the graph
   // instead.
   DenseMap<Operation *, int> minDistanceMap;
-  std::function<int (Operation *)> computeMinimumDistance =
+  std::function<int(Operation *)> computeMinimumDistance =
       [&](Operation *op) -> int {
     auto it = minDistanceMap.find(op);
     if (it != minDistanceMap.end())
