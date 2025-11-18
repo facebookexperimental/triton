@@ -233,25 +233,6 @@ static LogicalResult rewriteWarpGroupBarriers(LLVM::LLVMFuncOp func,
   return success();
 }
 
-// If necessary, create a block for cluster sync before jumping to target block
-// returns the intermediate block created, or the targetBlock if no new block
-Block *maybeCreateClusterSyncBlock(LLVM::LLVMFuncOp func, Block *targetBlock) {
-  if (tlx::tlxEnablePairedMMA(func)) {
-    auto ctx = func.getContext();
-    TritonLLVMIRRewriter b(func.getLoc(), ctx);
-    auto unitAttr = UnitAttr::get(ctx);
-
-    Block *clusterSyncBlock = b.createBlock(targetBlock);
-    b.setInsertionPointToStart(clusterSyncBlock);
-    b.create<NVVM::ClusterArriveOp>(unitAttr);
-    // no need for all warps to do cluster wait, non default warps will wait for
-    // default warps to be done with trunk code to start execution
-    b.create<LLVM::BrOp>(targetBlock);
-    return clusterSyncBlock;
-  }
-  return targetBlock;
-}
-
 static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
                                     const NVIDIA::TargetInfo &targetInfo,
                                     int lowRegs) {
@@ -384,11 +365,6 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
       func.getArguments(), [](BlockArgument arg) { return arg.getLoc(); }));
   Block *header = b.createBlock(entry, func.getArgumentTypes(), argLocs);
   Block *switchLoop = b.createBlock(entry);
-
-  // insert cluster sync for non-default warp before jumping to switchloop, and
-  // before any CTA level sync
-  Block *maybeClusterSyncBlock = maybeCreateClusterSyncBlock(func, switchLoop);
-
   b.setInsertionPointToStart(header);
 
   // This is the absolute thread ID.
@@ -397,7 +373,17 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
-  b.create<LLVM::CondBrOp>(isDefault, entry, maybeClusterSyncBlock);
+  if (tlx::tlxEnablePairedMMA(func)) {
+    // Non default warps should just do a cluster arrive unconditionally
+    PTXBuilder ptxBuilder;
+    auto clusterArriveOp =
+        *ptxBuilder.create<>("@!$0 barrier.cluster.arrive.aligned;");
+    clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
+                    /*onlyAttachMLIRArgs=*/true);
+    auto voidTy = void_ty(ctx);
+    ptxBuilder.launch(b, func.getLoc(), voidTy);
+  }
+  b.create<LLVM::CondBrOp>(isDefault, entry, switchLoop);
 
   // Forward arguments from the header into the old entry block.
   for (auto [arg, oldArg] :

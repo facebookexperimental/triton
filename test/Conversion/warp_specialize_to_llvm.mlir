@@ -832,8 +832,9 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 // CHECK-LABEL: @paired_cta_cluster_sync
 
 // non default warps arrive before jumping to switch loop
-// CHECK: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: llvm.br
+// CHECK: llvm.inline_asm
+// CHECK-SAME: @!$0 barrier.cluster.arrive.aligned
+// CHECK-NEXT: llvm.cond_br
 
 // sync before return for tmem dealloc
 // CHECK: nvvm.cluster.arrive {aligned}
