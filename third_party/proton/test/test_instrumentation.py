@@ -700,7 +700,7 @@ def test_gmem_buffer(tmp_path: pathlib.Path):
         assert len(warp0_events) == 2
         assert len(warp1_events) == 2
 
-        
+
 def test_threaded_kernel_call(tmp_path: pathlib.Path):
 
     import threading
