@@ -1,26 +1,27 @@
-import torch
-import pathlib
-import pytest
 import json
+import pathlib
+
+from typing import NamedTuple
+import triton.profiler as proton
+
+import pytest
+import torch
 
 import triton
 import triton.language as tl
 import triton.language.semantic
 import triton.profiler.language as pl
-import triton.profiler as proton
+from triton._internal_testing import (
+    is_cuda,
+    is_hip,
+    is_hip_cdna2,
+    is_hip_cdna4,
+    # supports_tma,
+    # supports_ws,
+)
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from typing import NamedTuple
-
 pl.enable_semantic("triton")
-
-
-def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
 def supports_tma():
@@ -31,13 +32,27 @@ def supports_ws():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
 
+def unsupport_amd():
+    return is_hip_cdna2()
+
+
+# Skip all tests if the AMD GPU version is not supported
+pytestmark = pytest.mark.skipif(unsupport_amd(), reason="old AMD GPUs are not supported")
+
 HAS_TENSOR_DESC = supports_tma() and hasattr(tl, "make_tensor_descriptor")
 HAS_HOST_TENSOR_DESC = supports_tma() and hasattr(triton.tools.tensor_descriptor, "TensorDescriptor")
 HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
 
 
-@pytest.mark.parametrize("mode",
-                         ["default", "default:metric_type=cycle", "default:metric_type=cycle:buffer_size=4096", "mma"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "default",
+        "default:metric_type=cycle",
+        "default:metric_type=cycle:buffer_size=4096",
+        "mma",
+    ],
+)
 def test_mode_str(mode, tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_mode_str.hatchet"
     proton.start(str(temp_file.with_suffix("")), backend="instrumentation", mode=mode)
@@ -75,7 +90,7 @@ def test_jit(tmp_path):
     assert len(foo.device_caches[device][0]) == 1, "Kernel should be cached"
     proton.finalize()
     foo[(1, )](x, 1, y, num_warps=4)
-    assert len(foo.device_caches[device][0]) == 2, "Instrumented and uninstrumented kernels both should be cached"
+    assert (len(foo.device_caches[device][0]) == 2), "Instrumented and uninstrumented kernels both should be cached"
 
 
 @pytest.mark.parametrize("method", ["operator", "context_manager"])
@@ -127,18 +142,21 @@ def test_record(method, tmp_path: pathlib.Path):
     with instrumentation(temp_file):
         pgm = add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024, METHOD=method)
         # FIXME(fywkevin): have a dedicated place to put those decoding related constants
-        payload_offset = int.from_bytes(proton.hooks.InstrumentationHook.host_buffer[12:16].numpy().tobytes(), "little")
+        payload_offset = int.from_bytes(
+            proton.hooks.InstrumentationHook.host_buffer[12:16].numpy().tobytes(),
+            "little",
+        )
         host_buffer = proton.hooks.InstrumentationHook.host_buffer[payload_offset:]
         preamble = host_buffer[0:4]
         assert int.from_bytes(preamble.numpy().tobytes(), "little") == 0xDEADBEEF
-        header_size = 16
+        header_size = 40
         metadata_size = header_size + pgm.metadata.num_warps * 4
         start_tag = host_buffer[metadata_size:metadata_size + 4]
         start_clock = host_buffer[metadata_size + 4:metadata_size + 8]
         end_tag = host_buffer[metadata_size + 8:metadata_size + 12]
         end_clock = host_buffer[metadata_size + 12:metadata_size + 16]
         assert int.from_bytes(start_tag.numpy().tobytes(), "little") & 0xFFFFF800 == 0
-        assert int.from_bytes(end_tag.numpy().tobytes(), "little") & 0xFFFFF800 == 0x80000000
+        assert (int.from_bytes(end_tag.numpy().tobytes(), "little") & 0xFFFFF800 == 0x80000000)
         start_clock_val = int.from_bytes(start_tag.numpy().tobytes(), "little") & 0x7FF << 32 | int.from_bytes(
             start_clock.numpy().tobytes(), "little")
         end_clock_val = int.from_bytes(end_tag.numpy().tobytes(), "little") & 0x7FF << 32 | int.from_bytes(
@@ -149,6 +167,39 @@ def test_record(method, tmp_path: pathlib.Path):
     ttir = pgm.asm["ttir"]
     assert "proton.record start" in ttir
     assert "proton.record end" in ttir
+
+    # check ttir line info
+    start_loc = None
+    end_loc = None
+    for line in ttir.split("\n"):
+        if "proton.record start" in line:
+            start_loc = line.split("loc(")[1].split(")")[0]
+        elif "proton.record end" in line:
+            end_loc = line.split("loc(")[1].split(")")[0]
+        elif start_loc and f"#loc{start_loc}" in line:
+            assert "test_instrumentation.py" in line
+        elif end_loc and f"#loc{end_loc}" in line:
+            assert "test_instrumentation.py" in line
+
+    assert start_loc is not None and end_loc is not None
+
+    # check llir line info
+    llir_lines = pgm.asm["llir"].splitlines()
+    clock_instr = "clock" if is_cuda() else "memtime"
+    clock_loc = None
+    for line in llir_lines:
+        if clock_instr not in line or "!dbg" not in line:
+            continue
+        suffix = line.split("!dbg ")[1]
+        clock_loc = suffix.split(",")[0].split()[0]
+        break
+    assert clock_loc is not None
+    loc_line = next(
+        (line for line in llir_lines if clock_loc in line and "DILocation" in line),
+        None,
+    )
+    assert loc_line is not None
+    assert "line: " in loc_line and "line: 0" not in loc_line
 
 
 @pytest.mark.parametrize("hook", ["triton", None])
@@ -385,96 +436,6 @@ def test_autotune(tmp_path: pathlib.Path):
         assert "add_1024" in names
 
 
-def test_sched_barrier(tmp_path: pathlib.Path):
-    if is_cuda():
-        pytest.skip("CUDA backend does not support instruction scheduling barriers")
-
-    @triton.jit
-    def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
-                      stride_bk, stride_bn,  #
-                      stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                      BLOCK_SIZE_K: tl.constexpr,  #
-                      GROUP_SIZE_M: tl.constexpr,  #
-                      ):
-        pl.enter_scope("warpgroup_1")
-        pid = tl.program_id(axis=0)
-        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
-
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        pl.exit_scope("warpgroup_1")
-        pl.enter_scope("warpgroup_2")
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-            accumulator = tl.dot(a, b, accumulator)
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
-        pl.exit_scope("warpgroup_2")
-
-        pl.enter_scope("warpgroup_3")
-        c = accumulator.to(tl.float16)
-        pl.exit_scope("warpgroup_3")
-
-        pl.enter_scope("warpgroup_4")
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
-        pl.exit_scope("warpgroup_4")
-
-    torch.manual_seed(0)
-    a = torch.randn((512, 512), device="cuda", dtype=torch.float16)
-    b = torch.randn((512, 512), device="cuda", dtype=torch.float16)
-
-    M, K = a.shape
-    K, N = b.shape
-
-    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 256, 64
-    GROUP_SIZE_M = 8
-
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    grid = lambda META: (triton.cdiv(M, 128) * triton.cdiv(N, 256), )
-
-    temp_file = tmp_path / "test_sched_barrier.hatchet"
-    mode = proton.mode.Default(metric_type="cycle", optimizations="sched_barriers")
-    proton.start(str(temp_file.with_suffix("")), backend="instrumentation", mode=mode)
-
-    grid = lambda META: (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N), )
-    kernel = matmul_kernel[grid](
-        a, b, c,  #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
-    proton.finalize()
-
-    asm = kernel.asm["amdgcn"]
-
-    # Make sure a sched barrier is inserted before every s_memtime call
-    lines = asm.splitlines()
-    for i, line in enumerate(lines):
-        if "s_memtime" in line:
-            if ".loc" in lines[i - 1]:
-                assert "sched_barrier" in lines[i - 2]
-            else:
-                assert "sched_barrier" in lines[i - 1]
-
-
 def test_warp_spec(tmp_path: pathlib.Path):
     if not HAS_WARP_SPECIALIZE:
         pytest.skip("target backend does not support warp specialization")
@@ -544,8 +505,12 @@ def test_warp_spec(tmp_path: pathlib.Path):
             return (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
 
         matmul_kernel_tma[grid](
-            a_desc, b_desc, c_desc,  #
-            M, N, K,  #
+            a_desc,
+            b_desc,
+            c_desc,  #
+            M,
+            N,
+            K,  #
             BLOCK_SIZE_M=128,  #
             BLOCK_SIZE_N=256,  #
             BLOCK_SIZE_K=128,  #
@@ -553,7 +518,8 @@ def test_warp_spec(tmp_path: pathlib.Path):
             FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
             WARP_SPECIALIZE=warp_specialize,  #
             num_stages=2,  #
-            num_warps=8)
+            num_warps=8,
+        )
         return c
 
     mode = proton.mode.Default(metric_type="cycle", optimizations="clock32")
@@ -571,8 +537,8 @@ def test_warp_spec(tmp_path: pathlib.Path):
     with open(temp_file, "rb") as f:
         data = json.load(f)
         kernel_level = data[0]["children"][0]["children"][0]
-        assert kernel_level["children"][0]["frame"]["name"] == 'loop'
-        assert kernel_level["children"][0]["metrics"]['cycles'] > 0
+        assert kernel_level["children"][0]["frame"]["name"] == "loop"
+        assert kernel_level["children"][0]["metrics"]["cycles"] > 0
         assert kernel_level["frame"]["name"] == "kernel"
         assert kernel_level["metrics"]["cycles"] > 0
 
@@ -580,7 +546,12 @@ def test_warp_spec(tmp_path: pathlib.Path):
 def test_timeline(tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_timeline.chrome_trace"
     mode = proton.mode.Default(metric_type="cycle", optimizations="time_shift")
-    proton.start(str(temp_file.with_suffix("")), data="trace", backend="instrumentation", mode=mode)
+    proton.start(
+        str(temp_file.with_suffix("")),
+        data="trace",
+        backend="instrumentation",
+        mode=mode,
+    )
 
     @triton.jit
     def foo(x, y, size: tl.constexpr):
@@ -611,3 +582,180 @@ def test_timeline(tmp_path: pathlib.Path):
         assert trace_events[-1]["tid"][0:4] == "warp"
         assert trace_events[-1]["args"]["call_stack"][-1] == "foo"
         assert trace_events[-1]["args"]["call_stack"][-2] == "test"
+
+
+@pytest.mark.skipif(is_hip_cdna4(), reason="nondeterministic failure")
+def test_globaltime(tmp_path: pathlib.Path):
+    temp_file = tmp_path / "test_globaltime.chrome_trace"
+    mode = proton.mode.Default(
+        metric_type="cycle",
+        optimizations="clock32,time_shift",
+        sampling_strategy="selective",
+        sampling_options="0",
+    )
+    proton.start(
+        str(temp_file.with_suffix("")),
+        data="trace",
+        backend="instrumentation",
+        mode=mode,
+    )
+
+    @triton.jit()
+    def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pl.enter_scope("elementwise_add_kernel")
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
+        pl.exit_scope("elementwise_add_kernel")
+
+    size = 1024 * 2000
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, BLOCK_SIZE), )
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE, num_warps=16)
+    proton.finalize()
+
+    with temp_file.open() as f:
+        data = json.load(f)
+        trace_events = data["traceEvents"]
+        target = sorted(
+            [event for event in trace_events if "Core0 " in event["pid"]],
+            key=lambda x: x["ts"],
+        )
+        s = len(target)
+        assert s > 1
+        ts_diff = target[s - 1]["ts"] - target[0]["ts"]
+        assert ts_diff >= target[0]["dur"]
+
+
+@pytest.mark.skipif(is_hip(), reason="not implemented yet")
+def test_gmem_buffer(tmp_path: pathlib.Path):
+
+    @triton.jit
+    def add_kernel(
+        x_ptr,
+        y_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        with pl.scope("kernel"):
+            pid = tl.program_id(axis=0)
+            block_start = pid * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            with pl.scope("load_ops"):
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+            output = x + y
+            tl.store(output_ptr + offsets, output, mask=mask)
+
+    size = 512
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    temp_file = tmp_path / "test_gmem_buffer.chrome_trace"
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = (1, 1, 1)
+    mode = proton.mode.Default(buffer_type="global")
+    proton.start(
+        str(temp_file.with_suffix("")),
+        backend="instrumentation",
+        data="trace",
+        mode=mode,
+    )
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024, num_warps=2)
+    proton.finalize()
+
+    with open(temp_file, "rb") as f:
+        data = json.load(f)
+        events = data["traceEvents"]
+
+        # Assert we have exactly 4 events (2 warps × 2 scopes)
+        assert len(events) == 4
+
+        # Assert all events have the expected common fields
+        for event in events:
+            assert "ts" in event
+            assert "dur" in event
+            assert event["dur"] > 0
+
+        # Assert we have 2 kernel events and 2 load_ops events
+        kernel_events = [e for e in events if e["name"] == "kernel"]
+        load_ops_events = [e for e in events if e["name"] == "load_ops"]
+        assert len(kernel_events) == 2
+        assert len(load_ops_events) == 2
+
+        # Assert we have events from both warps
+        warp0_events = [e for e in events if "warp 0" in e["tid"]]
+        warp1_events = [e for e in events if "warp 1" in e["tid"]]
+        assert len(warp0_events) == 2
+        assert len(warp1_events) == 2
+
+
+def test_threaded_kernel_call(tmp_path: pathlib.Path):
+
+    import threading
+
+    @triton.jit
+    def add_kernel(
+        x_ptr,
+        y_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        with pl.scope("kernel"):
+            pid = tl.program_id(axis=0)
+            block_start = pid * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            output = x + y
+            tl.store(output_ptr + offsets, output, mask=mask)
+
+    size = 256
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = (1, 1, 1)
+
+    temp_file = tmp_path / "test_threaded.chrome_trace"
+    proton.start(
+        str(temp_file.with_suffix("")),
+        backend="instrumentation",
+        data="trace",
+    )
+
+    exception_holder = []
+
+    def run_kernel():
+        try:
+            add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+        except Exception as e:
+            exception_holder.append(e)
+
+    thread = threading.Thread(target=run_kernel)
+    thread.start()
+    thread.join()
+
+    proton.finalize()
+
+    assert len(exception_holder) == 0, f"Kernel raised exception: {exception_holder[0] if exception_holder else None}"
+
+    with open(temp_file, "rb") as f:
+        data = json.load(f)
+        events = data["traceEvents"]
+        assert len(events) > 0
+        kernel_events = [e for e in events if e["name"] == "kernel"]
+        assert len(kernel_events) > 0

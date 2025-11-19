@@ -692,7 +692,6 @@ def make_tensordesc_arg(arg, metadata):
 
     return [cu_tensor_map, *shape, *strides]
 
-
 def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
     has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
     if not has_tensor_desc_arg:
@@ -735,14 +734,18 @@ class CudaLauncher(object):
             libraries=libraries,
         )
 
-        self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
+        self.tlx_enable_paired_cta_mma = metadata.tlx_enable_paired_cta_mma
+        if self.tlx_enable_paired_cta_mma:
+            self.num_ctas = 1
+        else:
+            self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
         self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
         self.profile_scratch_align = metadata.profile_scratch_align
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
-        self.launch_cluster = metadata.launch_cluster
+        self.launch_cluster = metadata.launch_cluster or self.tlx_enable_paired_cta_mma
         self.launch_pdl = metadata.launch_pdl
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):

@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
@@ -305,9 +306,11 @@ determineIndependentDotChains(scf::ForOp forOp, int maxStages) {
   return {dotChains, true};
 }
 
-CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
-                              const DenseMap<Operation *, int> &opLatency,
-                              int defaultNumStages) {
+CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
+                                    const DenseMap<Operation *, int> &opLatency,
+                                    int defaultNumStages) {
+  // TODO(njriasan): Refactor this so we can more easily share code with
+  // upstream. This is currently a complete split to enable proper debugging.
   llvm::MapVector<Operation *, int> opToStage;
   // Find terminator for later reference
   auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -321,9 +324,48 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   if (latOps.empty())
     return CoarseSchedule(0);
 
+  // Determine the minimum distance value that will exist for normalizing
+  // the result. This is based on the lowest latency value that is present
+  // in opLatency and used in this kernel.
+  //
+  // Note: opLatency may be shared across multiple functions, at least in
+  // the lit tests, so we are conservative and actually traverse the graph
+  // instead.
+  DenseMap<Operation *, int> minDistanceMap;
+  std::function<int(Operation *)> computeMinimumDistance =
+      [&](Operation *op) -> int {
+    auto it = minDistanceMap.find(op);
+    if (it != minDistanceMap.end())
+      return it->second;
+    // Compute min distance among all users that are inside the loop body
+    int minDist = INT_MAX;
+    for (Operation *user : op->getUsers()) {
+      // Only consider users inside the same block and not the terminator
+      Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
+      if (!inBlockUser || inBlockUser == terminator)
+        continue;
+      int distUser = computeMinimumDistance(inBlockUser);
+      minDist = std::min(minDist, distUser);
+    }
+    int lat = 0;
+    if (opLatency.count(op))
+      lat = opLatency.lookup(op);
+    // Only return the latency for the current op if minDist is INT_MAX
+    int d = (minDist == INT_MAX) ? lat : lat + minDist;
+    minDistanceMap[op] = d;
+    return d;
+  };
+  int minDistance = INT_MAX;
+  for (Operation *latOp : latOps) {
+    minDistance = std::min(minDistance, computeMinimumDistance(latOp));
+  }
+  // Default to already normalized if we didn't find a distance.
+  if (minDistance == INT_MAX)
+    minDistance = 0;
+
   // Schedule parallel dot pattern.
   int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
-  int maxPossibleDistance = maxStages - 1;
+  int maxPossibleDistance = maxStages - 1 + minDistance;
   // Compute the longest path to the yield for each operation reachable
   // from any latency operation. We also use this to embed stage information
   // for mmas.
@@ -334,7 +376,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   DenseMap<Operation *, int> clusterMap;
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t numDots = 0;
-  SmallVector<int> maxClusterPerDistance(maxStages, -1);
+  SmallVector<int> maxClusterPerDistance(maxPossibleDistance, -1);
   if (success) {
     size_t maxChainLength = 0;
     for (auto &chain : chains) {
@@ -353,7 +395,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       // We initialize the distance to (chain_length - 1)
       // and decrement to 0.
       // Note the max stage is numStages - 1.
-      int currDistance = (chain.size() - 1);
+      int currDistance = (chain.size() - 1) + minDistance;
       for (auto &op : chain) {
         int nextOffset = (lastOffset + incrementValue) % numDots;
         if (nextOffset < lastOffset) {
@@ -393,7 +435,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (int i = 0; i < maxStages; i++) {
+  for (int i = 0; i < maxPossibleDistance; i++) {
     if (maxClusterPerDistance[i] == -1) {
       maxClusterPerDistance[i] = numDots + offset++;
     }
@@ -481,7 +523,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - stage;
+      auto dist = maxDistance - (stage + minDistance);
       clusterIdx = maxClusterPerDistance[dist];
     }
     minIndex = std::min(minIndex, clusterIdx);
@@ -500,7 +542,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - stage;
+      auto dist = maxDistance - (stage + minDistance);
       clusterIdx = maxClusterPerDistance[dist];
     }
     schedule.insert(op, stage, clusters[clusterIdx - minIndex]);
@@ -526,8 +568,116 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       continue;
     schedule.insert(ifOp, stage, epilogue);
   }
+  return schedule;
+}
+
+CoarseSchedule
+scheduleKeyOpsUpstream(scf::ForOp forOp,
+                       const DenseMap<Operation *, int> &opLatency) {
+  llvm::MapVector<Operation *, int> opToStage;
+  // Find terminator for later reference
+  auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  // Determine all operations that have a non-zero latency
+  SmallVector<Operation *> latOps;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (opLatency.count(&op))
+      latOps.push_back(&op);
+  }
+  // If no latency ops, nothing to schedule
+  if (latOps.empty())
+    return CoarseSchedule(0);
+
+  DominanceInfo domInfo(forOp);
+  // Compute the longest path to the yield for each operation reachable
+  // from any latency operation.
+  DenseMap<Operation *, int> distance;
+  std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
+    auto it = distance.find(op);
+    if (it != distance.end())
+      return it->second;
+    // Compute max distance among all users that are inside the loop body
+    int maxDist = -1;
+    for (Operation *user : op->getUsers()) {
+      // Only consider users inside the same block and not the terminator
+      Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
+      if (!inBlockUser || inBlockUser == terminator)
+        continue;
+      int distUser = computeDistance(inBlockUser);
+      if (distUser > maxDist)
+        maxDist = distUser;
+    }
+    int lat = 0;
+    if (opLatency.count(op))
+      lat = opLatency.lookup(op);
+    // If an op has no users (maxDist == -1) but has latency, we include its
+    // latency otherwise it contributes 0 to the distance.
+    int d = lat + (maxDist < 0 ? 0 : maxDist);
+    distance[op] = d;
+    return d;
+  };
+
+  // Compute distances for all latency-starting ops
+  int maxDistance = 0;
+  for (Operation *latOp : latOps) {
+    int d = computeDistance(latOp);
+    if (d > maxDistance)
+      maxDistance = d;
+  }
+
+  // Assign stage to each op reachable from a latency op
+  for (auto [op, dist] : distance) {
+    // We only schedule ops that are downstream of a latency op
+    // (had a non-negative distance due to a latency op).
+    if (dist >= 0)
+      opToStage[op] = maxDistance - dist;
+  }
+
+  auto stages = llvm::make_second_range(opToStage);
+  int maxStage = *llvm::max_element(stages);
+  CoarseSchedule schedule(maxStage + 1);
+  SmallVector<CoarseSchedule::Cluster> clusters(maxStage + 1);
+  for (int i = 0; i <= maxStage; i++) {
+    clusters[i] = schedule.clusters.newAtBack();
+  }
+  // Assign ops to the clusters in reverse-stage order;
+  // ops with higher stage numbers are assigned first. This way we will
+  // end up with roughly reverse program order in the clusters.
+  for (auto [op, stage] : opToStage)
+    schedule.insert(op, stage, clusters[maxStage - stage]);
+
+  // Move `scf.if` ops in the current schedule (forward slice of the latency
+  // ops) into a new epilogue cluster at the end of the schedule, pushing them
+  // as close to the end of the loop body as possible.
+  CoarseSchedule::Cluster epilogue = schedule.clusters.newAtBack();
+  for (auto [op, stage] : opToStage) {
+    auto ifOp = dyn_cast<scf::IfOp>(op);
+    if (!ifOp)
+      continue;
+    // If the `scf.if` op itself is a latency op, skip it.
+    if (opLatency.contains(ifOp))
+      continue;
+    // Ensure this does not create scheduling conflicts by ensuring the forward
+    // slice of the `scf.if` does not contain ops that are already scheduled, as
+    // this will cause the `scf.if` to be scheduled after its dependents.
+    SetVector<Operation *> slice;
+    getForwardSlice(ifOp, &slice);
+    if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
+      continue;
+    schedule.insert(ifOp, stage, epilogue);
+  }
 
   return schedule;
+}
+
+CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
+                              const DenseMap<Operation *, int> &opLatency,
+                              int defaultNumStages) {
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  if (metaWS) {
+    return scheduleKeyOpsMetaWS(forOp, opLatency, defaultNumStages);
+  } else {
+    return scheduleKeyOpsUpstream(forOp, opLatency);
+  }
 }
 
 // Get an initial schedule for the loop. This is the base schedule from which
@@ -543,6 +693,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
   if (hasLatenciesAssigned(forOp, opLatency))
     return scheduleKeyOps(forOp, opLatency, defaultNumStages);
 
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
   if (forOp->hasAttr(kWarpSpecializeAttrName) &&
@@ -568,7 +719,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
       // FIXME: This should assert all latency ops have an assigned stage.
       if (schedule.count(&op))
         latencyStages.insert(schedule[&op].first);
-      else
+      else if (metaWS)
         assert(false);
     }
     if (latencyStages.size() <= 1) {
@@ -669,8 +820,9 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
     DBGS() << "Final coarse schedule:\n" << forOp << "\n";
   });
 
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   // Write the schedule to the IR
-  schedule.serialize(forOp, false);
+  schedule.serialize(forOp, !metaWS);
 }
 } // namespace
 

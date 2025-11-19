@@ -713,12 +713,45 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   }
 
+  // Note: We cannot depend on schedule.isOpBefore here because the relevant
+  // stage depends on the location relative to the MMA. For example, imagine
+  // the following setup:
+  // load {cluster: 1, stage: 0}
+  // mma {cluster: 1, stage: 0}
+  // tmem_load {cluster: 0, stage: 1}
+  //
+  // If we just check which occurs first in the schedule, we will insert the
+  // barrier before the load in the loop. However, this will actually happen
+  // after the tmem_load, which is not what we want. To handle this, we need
+  // to account for any operation that occurs before the mma needs its location
+  // evaluated with {stage + 1}.
+  //
+  auto isEarlierBarrierLocation = [&](Operation *newOp, Operation *oldOp) {
+    auto [aStage, aCluster] = schedule[newOp];
+    auto [bStage, bCluster] = schedule[oldOp];
+    // We care about the first location after the MMA, not the first location
+    // in the IR.
+    if (schedule.isOpBefore(newOp, mma)) {
+      aStage += 1;
+    }
+    if (schedule.isOpBefore(oldOp, mma)) {
+      bStage += 1;
+    }
+    if (aStage != bStage) {
+      return aStage < bStage;
+    }
+    if (aCluster != bCluster) {
+      return schedule.clusters.isBefore(aCluster, bCluster);
+    }
+    return newOp->isBeforeInBlock(oldOp);
+  };
+
   if (!mmaPipeHelper.isPipelineable &&
       mmaPipeHelper.isOperandsStateDetermined) {
     // If the operands are not pipelineable, we need to insert a sync point
     // before the earliest operand load
     for (auto def : updatedDefs) {
-      if (!latestSyncPoint || schedule.isOpBefore(def, *latestSyncPoint)) {
+      if (!latestSyncPoint || isEarlierBarrierLocation(def, *latestSyncPoint)) {
         latestSyncPoint = def;
       }
     }
@@ -746,7 +779,8 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value phase = forOp.getRegionIterArg(phaseArgIdx);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
   Value barrierIdx;
-  if (numStages > 1) {
+  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  if (!metaWS || numStages > 1) {
     barrierIdx = forOp.getRegionIterArg(barrierIdxArgIdx);
   } else {
     barrierIdx = zero;
@@ -755,8 +789,10 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value numStagesVal =
       builder.create<arith::ConstantIntOp>(forOp.getLoc(), numStages, 32);
 
-  Value barrierSlice =
-      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+  Value barrierSlice = barrierAlloc;
+  if (metaWS || numStages > 1)
+    barrierSlice =
+        triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
   mma.addCompletionBarrier(barrierSlice, vTrue);
   mma.setIsAsync(true);
 

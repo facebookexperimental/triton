@@ -1099,6 +1099,7 @@ class TritonSemantic(Generic[TensorTy]):
         cache_modifier: str,
         eviction_policy: str,
         is_volatile: bool,
+        latency: Optional[int],
     ) -> TensorTy:
         # Cache, eviction and padding options
         cache = self._str_to_load_cache_modifier(cache_modifier)
@@ -1107,17 +1108,23 @@ class TritonSemantic(Generic[TensorTy]):
 
         if ptr.type.is_ptr() and ptr.type.element_ty.is_block():
             # Load by a block pointer: `pointer_type<block_type<>>`
-            return self._load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+            x = self._load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
         else:
             # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
-            return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+            x = self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+        if latency is not None:
+            if not isinstance(latency, int) or latency < 0:
+                raise TypeError(
+                    f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
+            x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
+        return x
 
     def reinterpret_tensor_descriptor(self, desc_ptr: tl.tensor, block_ty: tl.block_type):
         handle = self.builder.create_reinterpret_tensor_descriptor(desc_ptr.handle, block_ty.to_ir(self.builder))
         return tl.tensor_descriptor_base(handle, block_ty)
 
-    def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str,
-                        eviction_policy: str) -> TensorTy:
+    def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str, eviction_policy: str,
+                        latency: Optional[int]) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base)
         ndim = len(desc.block_shape)
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
@@ -1129,6 +1136,11 @@ class TritonSemantic(Generic[TensorTy]):
             self._str_to_load_cache_modifier(cache_modifier),
             self._str_to_eviction_policy(eviction_policy),
         )
+        if latency is not None:
+            if not isinstance(latency, int) or latency < 0:
+                raise TypeError(
+                    f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
+            x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
         return self.tensor(x, desc.block_type)
 
     def validate_store_like(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> None:
@@ -1572,6 +1584,10 @@ class TritonSemantic(Generic[TensorTy]):
         input_precision = input_precision.upper()
         if input_precision == "TF32X3":
             input_precision = "TF32x3"
+        if input_precision == "BF16X3":
+            input_precision = "BF16x3"
+        if input_precision == "BF16X6":
+            input_precision = "BF16x6"
         return getattr(ir.INPUT_PRECISION, input_precision)
 
     # def dot(self, lhs: TensorTy, rhs: TensorTy, acc: TensorTy, input_precision: Optional[str],
@@ -1587,6 +1603,7 @@ class TritonSemantic(Generic[TensorTy]):
         allow_tf32,
         max_num_imprecise_acc: int,
         out_dtype: tl.dtype,
+        tlx_paired_ctas: bool = False,
     ) -> Tuple[Any]:
         input_precision = tl._unwrap_if_constexpr(input_precision)
         allow_tf32 = tl._unwrap_if_constexpr(allow_tf32)
@@ -1647,7 +1664,7 @@ class TritonSemantic(Generic[TensorTy]):
             f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})")
 
         assert tl._unwrap_if_constexpr(lhs.shape[-1]) == tl._unwrap_if_constexpr(rhs.shape[-2]), (
-            f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[-1].value}) must be equal to first index of second shape ({rhs.shape[-2].value})"
+            f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({tl._unwrap_if_constexpr(lhs.shape[-1])}) must be equal to first index of second shape ({tl._unwrap_if_constexpr(rhs.shape[-2])})"
         )
 
         assert self.builder.codegen_fns.get("min_dot_size") is not None, (
@@ -1676,7 +1693,10 @@ class TritonSemantic(Generic[TensorTy]):
             ret_scalar_ty = out_dtype
 
         M = lhs.type.shape[-2]
-        N = rhs.type.shape[-1]
+        if tlx_paired_ctas:
+            N = 2 * rhs.type.shape[-1]  # rhs is actually [K, N/2] in two_ctas mode so we scale it back
+        else:
+            N = rhs.type.shape[-1]
         K = lhs.type.shape[-1]
         B = lhs.type.shape[0] if lhs_rank == 3 else None
         ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])

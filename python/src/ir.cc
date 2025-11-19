@@ -334,6 +334,8 @@ void init_triton_ir(py::module &&m) {
       .value("TF32", InputPrecision::TF32)
       .value("TF32x3", InputPrecision::TF32x3)
       .value("IEEE", InputPrecision::IEEE)
+      .value("BF16x3", InputPrecision::BF16x3)
+      .value("BF16x6", InputPrecision::BF16x6)
       .export_values();
 
   py::enum_<ScaleDotElemType>(m, "ScaleDotElemTypeTY", py::module_local())
@@ -722,6 +724,13 @@ void init_triton_ir(py::module &&m) {
              if (!ret)
                return py::none();
              return py::int_(ret.getInt());
+           })
+      .def("get_bool_attr",
+           [](ModuleOp &self, const std::string &name) -> py::object {
+             auto ret = self->getAttrOfType<BoolAttr>(name);
+             if (!ret)
+               return py::none();
+             return py::bool_(ret.getValue());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
       .def("create_location_snapshot",

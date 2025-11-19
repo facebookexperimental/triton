@@ -25,6 +25,9 @@
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 
+namespace ttg = mlir::triton::gpu;
+namespace ttng = mlir::triton::nvidia_gpu;
+
 namespace mlir {
 namespace triton {
 #define GEN_PASS_DEF_CONVERTTRITONGPUTOLLVM
@@ -89,6 +92,9 @@ struct ConvertTritonGPUToLLVM
                  targetInfo));
     ModuleMembarAnalysis membarPass(&allocation);
     membarPass.run();
+    if (failed(maybeInsertClusterSync(mod))) {
+      return signalPassFailure();
+    }
 
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
@@ -221,6 +227,158 @@ private:
         "global_smem", /*value=*/Attribute(), /*alignment=*/16,
         // Add ROCm support.
         static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace));
+  }
+
+  void getBackwardSliceWithWS(Value target,
+                              SetVector<Operation *> *backwardSlice) {
+    SetVector<Value> worklist;
+    worklist.insert(target);
+
+    BackwardSliceOptions options;
+    options.omitUsesFromAbove = false;
+    options.omitBlockArguments = true;
+    options.inclusive = true;
+
+    while (!worklist.empty()) {
+      Value nextTarget = worklist.back();
+      worklist.pop_back();
+
+      if (auto arg = dyn_cast<BlockArgument>(nextTarget)) {
+        if (auto wsPartitionOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(
+                arg.getOwner()->getParentOp())) {
+          auto argIndex = arg.getArgNumber();
+          auto wsOp = wsPartitionOp->getParentOfType<ttg::WarpSpecializeOp>();
+          // map to WSOp's operand at the same index
+          nextTarget = wsOp.getOperand(argIndex);
+        } else {
+          // ttg::WarpSpecializeOp's default region just captures
+          // from trunk so no need to special handle the defining block args.
+          // We should omit block args for other block structures like scf.For,
+          // and the captures would still be handled automatically
+          continue;
+        }
+      }
+
+      SetVector<Operation *> ops;
+      if (failed(getBackwardSlice(nextTarget, &ops, options))) {
+        llvm_unreachable("getBackwardSlice failed");
+      }
+
+      for (auto op : ops) {
+        if (backwardSlice->insert(op)) {
+          for (auto operand : op->getOperands()) {
+            if (isa<BlockArgument>(operand)) {
+              worklist.insert(operand);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  LogicalResult
+  ensureEarlyRemoteBarInit(ModuleOp &mod,
+                           SetVector<Operation *> &remoteBarInitOps) {
+    triton::FuncOp funcOp = nullptr;
+    mod.walk([&](triton::FuncOp op) {
+      if (triton::isKernel(op)) {
+        funcOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    assert(funcOp && "Expecting to find a kernel func but got none.");
+    for (auto op : remoteBarInitOps) {
+      if (op->getBlock() != &funcOp.front()) {
+        op->emitError() << "Barrier init outside of the first block in "
+                           "function is not supported for remote barriers";
+        return failure();
+      }
+    }
+
+    return success();
+  }
+
+  // If we're doing TLX 2cta paired MMA, insert cluster sync properly to
+  // bootstrap remote bars
+  LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
+    if (!tlx::tlxEnablePairedMMA(mod)) {
+      return success();
+    }
+
+    bool hasMapaOp = false;
+    SetVector<Operation *> barAllocOps;
+    // Find all bar alloc op in the back slice of mapa ops
+    mod.walk([&](ttng::MapToRemoteBufferOp mapaOp) {
+      hasMapaOp = true;
+      SetVector<Operation *> ops;
+      getBackwardSliceWithWS(mapaOp.getResult(), &ops);
+
+      for (auto op : ops) {
+        if (isa<ttg::LocalAllocOp>(op)) {
+          barAllocOps.insert(op);
+        }
+      }
+    });
+
+    // If there's no mapa, it's not possible to access remote barrier so
+    // skipping
+    if (!hasMapaOp) {
+      return success();
+    }
+
+    assert(!barAllocOps.empty() &&
+           "Failed to find bar alloc op for remote bar");
+
+    // Find the init op for remote barriers
+    SetVector<Operation *> remoteBarInitOps;
+    mod.walk([&](ttng::InitBarrierOp barInitOp) {
+      SetVector<Operation *> ops;
+      getBackwardSliceWithWS(barInitOp.getAlloc(), &ops);
+      if (llvm::any_of(
+              ops, [&](Operation *op) { return barAllocOps.contains(op); })) {
+        // barInitOp is for remote bar
+        remoteBarInitOps.insert(barInitOp);
+      }
+    });
+
+    assert(!remoteBarInitOps.empty() &&
+           "Failed to find bar init op for remote bar");
+
+    // Enforcing front end for 2cta kernels:
+    // All remote barrier init ops need to happen at the first block of
+    // function. This is to make 2cta cluster sync insertion easier for WarpSpec
+    // case. If in the future there's a need to really alloc/init barriers after
+    // a WS op, we can seek to relax this limitation and fix cluster sync
+    // insertions.
+    if (failed(ensureEarlyRemoteBarInit(mod, remoteBarInitOps))) {
+      return failure();
+    }
+
+    // Follow the program order and identify the last bar init op.
+    // This is based on the assumption that all bar init happens at the first
+    // block of the kernel func op, as we currently enforce earlier in this
+    // pass. If that assumption changes, we should revisit this heuristic here.
+    ttng::InitBarrierOp lastBarInitOp;
+    auto firstBlock = remoteBarInitOps.front()->getBlock();
+    for (auto it = firstBlock->rbegin(), e = firstBlock->rend(); it != e;
+         ++it) {
+      if (remoteBarInitOps.contains(&*it)) {
+        lastBarInitOp = cast<ttng::InitBarrierOp>(*it);
+        break;
+      }
+    }
+
+    OpBuilder builder(lastBarInitOp);
+    builder.setInsertionPointAfter(lastBarInitOp);
+    // need to insert cluster arrive and wait to prevent CTA_X from arriving
+    // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
+    builder.create<ttng::ClusterArriveOp>(lastBarInitOp.getLoc(),
+                                          /*relaxed*/ false);
+    builder.create<ttng::ClusterWaitOp>(lastBarInitOp.getLoc());
+
+    return success();
   }
 };
 

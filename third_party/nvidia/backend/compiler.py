@@ -124,7 +124,7 @@ class CUDAOptions:
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15")
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
     default_dot_input_precision: str = "tf32"
-    allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee")
+    allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee", 'bf16x3', 'bf16x6')
     max_num_imprecise_acc_default: bool = None
     extern_libs: dict = None
     debug: bool = False
@@ -141,7 +141,7 @@ class CUDAOptions:
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
-               "num_warps must be a power of 2"
+            "num_warps must be a power of 2"
 
     def hash(self):
         hash_dict = dict(self.__dict__)
@@ -267,13 +267,13 @@ class CUDABackend(BaseBackend):
             cluster_info.clusterDimZ = opt.cluster_dims[2]
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
+        emuTF32 = (capability // 10 >= 8)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
-        if capability // 10 >= 8:
-            passes.ttgpuir.add_f32_dot_tc(pm)
+        passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
         nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)
         passes.ttgpuir.add_remove_layout_conversions(pm)
@@ -303,7 +303,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages)
-            if knobs.nvidia.use_oai_ws:
+            if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
@@ -332,7 +332,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 10 and not knobs.nvidia.use_oai_ws:
+        if capability // 10 >= 10 and knobs.nvidia.use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
@@ -341,7 +341,15 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod)
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+
+        tlx_enable_paired_cta_mma = mod.get_bool_attr("tlx.enable_paired_cta_mma") or False
+        metadata["tlx_enable_paired_cta_mma"] = tlx_enable_paired_cta_mma
+        if tlx_enable_paired_cta_mma:
+            assert cluster_info.clusterDimX == 1 and cluster_info.clusterDimY == 1 and cluster_info.clusterDimZ == 1, \
+                f"Unexpected cluster dims before TLX override:({cluster_info.clusterDimX}, {cluster_info.clusterDimY}, {cluster_info.clusterDimZ})"
+            metadata["cluster_dims"] = (2, 1, 1)
+        else:
+            metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
@@ -460,7 +468,7 @@ class CUDABackend(BaseBackend):
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas().path
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
-            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
+                tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
             fsrc.write(src)
             fsrc.flush()
             fbin = fsrc.name + '.o'
