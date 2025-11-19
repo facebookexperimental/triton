@@ -3,6 +3,8 @@
 
 from . import math
 from . import extra
+# Import TLX features (async_task, async_tasks) for backward compatibility
+from .extra.tlx import async_task, async_tasks
 from .standard import (
     argmax,
     argmin,
@@ -154,6 +156,8 @@ __all__ = [
     "argmax",
     "argmin",
     "associative_scan",
+    "async_task",
+    "async_tasks",
     "assume",
     "atomic_add",
     "atomic_and",
