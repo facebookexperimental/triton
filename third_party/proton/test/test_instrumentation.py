@@ -2,6 +2,7 @@ import json
 import pathlib
 
 from typing import NamedTuple
+import triton.profiler as proton
 
 import pytest
 import torch
@@ -15,10 +16,11 @@ from triton._internal_testing import (
     is_hip,
     is_hip_cdna2,
     is_hip_cdna4,
-    supports_tma,
-    supports_ws,
+    # supports_tma,
+    # supports_ws,
 )
 from triton.tools.tensor_descriptor import TensorDescriptor
+
 pl.enable_semantic("triton")
 
 
