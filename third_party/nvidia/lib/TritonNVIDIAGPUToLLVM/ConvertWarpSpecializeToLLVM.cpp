@@ -9,6 +9,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -372,6 +373,16 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
+  if (tlx::tlxEnablePairedMMA(func)) {
+    // Non default warps should just do a cluster arrive unconditionally
+    PTXBuilder ptxBuilder;
+    auto clusterArriveOp =
+        *ptxBuilder.create<>("@!$0 barrier.cluster.arrive.aligned;");
+    clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
+                    /*onlyAttachMLIRArgs=*/true);
+    auto voidTy = void_ty(ctx);
+    ptxBuilder.launch(b, func.getLoc(), voidTy);
+  }
   b.create<LLVM::CondBrOp>(isDefault, entry, switchLoop);
 
   // Forward arguments from the header into the old entry block.
@@ -567,6 +578,28 @@ struct ConvertWarpSpecializeToLLVM
     for (LLVM::LLVMFuncOp kernel : kernels)
       if (failed(lowerWarpSpecialize(kernel, targetInfo)))
         return signalPassFailure();
+
+    // Insert cluster sync right before every return op after ws lowering to
+    // make sure all warps execute it. Note: we put this piece of code here to
+    // make sure it's executed right after WS lowering, but it's not part of WS
+    // lowering, so without WS ops this piece should still execute
+    if (tlx::tlxEnablePairedMMA(mod)) {
+      for (LLVM::LLVMFuncOp kernel : kernels) {
+        kernel.walk([&](LLVM::ReturnOp ret) {
+          auto ctx = ret->getContext();
+          auto loc = ret.getLoc();
+          IRRewriter rewriter(kernel.getContext());
+
+          // for 2cta, this is needed
+          // "When the current CTA issues the operation, the peer CTA should be
+          // active and should not have exited."
+          auto unitAttr = UnitAttr::get(ctx);
+          rewriter.setInsertionPoint(ret);
+          rewriter.create<NVVM::ClusterArriveOp>(loc, unitAttr);
+          rewriter.create<NVVM::ClusterWaitOp>(loc, unitAttr);
+        });
+      }
+    }
   }
 };
 } // namespace
