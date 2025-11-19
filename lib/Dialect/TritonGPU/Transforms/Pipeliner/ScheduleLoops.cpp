@@ -324,9 +324,48 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   if (latOps.empty())
     return CoarseSchedule(0);
 
+  // Determine the minimum distance value that will exist for normalizing
+  // the result. This is based on the lowest latency value that is present
+  // in opLatency and used in this kernel.
+  //
+  // Note: opLatency may be shared across multiple functions, at least in
+  // the lit tests, so we are conservative and actually traverse the graph
+  // instead.
+  DenseMap<Operation *, int> minDistanceMap;
+  std::function<int(Operation *)> computeMinimumDistance =
+      [&](Operation *op) -> int {
+    auto it = minDistanceMap.find(op);
+    if (it != minDistanceMap.end())
+      return it->second;
+    // Compute min distance among all users that are inside the loop body
+    int minDist = INT_MAX;
+    for (Operation *user : op->getUsers()) {
+      // Only consider users inside the same block and not the terminator
+      Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
+      if (!inBlockUser || inBlockUser == terminator)
+        continue;
+      int distUser = computeMinimumDistance(inBlockUser);
+      minDist = std::min(minDist, distUser);
+    }
+    int lat = 0;
+    if (opLatency.count(op))
+      lat = opLatency.lookup(op);
+    // Only return the latency for the current op if minDist is INT_MAX
+    int d = (minDist == INT_MAX) ? lat : lat + minDist;
+    minDistanceMap[op] = d;
+    return d;
+  };
+  int minDistance = INT_MAX;
+  for (Operation *latOp : latOps) {
+    minDistance = std::min(minDistance, computeMinimumDistance(latOp));
+  }
+  // Default to already normalized if we didn't find a distance.
+  if (minDistance == INT_MAX)
+    minDistance = 0;
+
   // Schedule parallel dot pattern.
   int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
-  int maxPossibleDistance = maxStages - 1;
+  int maxPossibleDistance = maxStages - 1 + minDistance;
   // Compute the longest path to the yield for each operation reachable
   // from any latency operation. We also use this to embed stage information
   // for mmas.
@@ -337,7 +376,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   DenseMap<Operation *, int> clusterMap;
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t numDots = 0;
-  SmallVector<int> maxClusterPerDistance(maxStages, -1);
+  SmallVector<int> maxClusterPerDistance(maxPossibleDistance, -1);
   if (success) {
     size_t maxChainLength = 0;
     for (auto &chain : chains) {
@@ -356,7 +395,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
       // We initialize the distance to (chain_length - 1)
       // and decrement to 0.
       // Note the max stage is numStages - 1.
-      int currDistance = (chain.size() - 1);
+      int currDistance = (chain.size() - 1) + minDistance;
       for (auto &op : chain) {
         int nextOffset = (lastOffset + incrementValue) % numDots;
         if (nextOffset < lastOffset) {
@@ -396,7 +435,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (int i = 0; i < maxStages; i++) {
+  for (int i = 0; i < maxPossibleDistance; i++) {
     if (maxClusterPerDistance[i] == -1) {
       maxClusterPerDistance[i] = numDots + offset++;
     }
@@ -484,7 +523,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - stage;
+      auto dist = maxDistance - (stage + minDistance);
       clusterIdx = maxClusterPerDistance[dist];
     }
     minIndex = std::min(minIndex, clusterIdx);
@@ -503,7 +542,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - stage;
+      auto dist = maxDistance - (stage + minDistance);
       clusterIdx = maxClusterPerDistance[dist];
     }
     schedule.insert(op, stage, clusters[clusterIdx - minIndex]);
