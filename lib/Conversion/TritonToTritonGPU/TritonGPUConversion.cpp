@@ -119,7 +119,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
 
   addDynamicallyLegalOp<
       triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
-      triton::gpu::LocalStoreOp, triton::nvidia_gpu::WarpGroupDotWaitOp,
+      triton::gpu::LocalStoreOp,  triton::gpu::RemoteShmemStoreOp, triton::nvidia_gpu::WarpGroupDotWaitOp,
       triton::tlx::RequireLayoutOp, triton::tlx::ReleaseLayoutOp,
       triton::tlx::LocalAliasOp>([&](Operation *op) -> bool {
     // make sure every RankedTensorType operand has encoding

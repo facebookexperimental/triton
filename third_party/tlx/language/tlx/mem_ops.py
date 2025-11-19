@@ -236,12 +236,10 @@ def remote_shmem_store(
     storage = dst.type.storage
     if (storage == tlx.storage_kind.smemCluster):
         print("tlx.remote_shmem_store only supports smem dst, it internally calls mapa(dst)")
-    assert storage == tlx.storage_kind.smem, "remote_shmem_store only supports smem"
+    assert storage == tlx.storage_kind.smem, "remote_shmem_store only supports local smem for dst. dst will be internally mapped to remote_cta_rank's shmem"
     assert remote_cta_rank is not None, "remote_cta_rank is required for remote_shmem_store"
-    # remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
-    if isinstance(remote_cta_rank, tl.constexpr) or isinstance(remote_cta_rank, int):
-        remote_cta_rank = tl._unwrap_if_constexpr(remote_cta_rank)
-    return tl.tensor(_semantic.builder.create_remote_store(dst.handle, src.handle, remote_cta_rank), tl.void)
+    remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
+    return tl.tensor(_semantic.builder.create_remote_store(dst.handle, src.handle, remote_cta_rank_handle), tl.void)
 
 
 tlx.buffered_tensor.__getitem__ = _buffered_tensor_getitem

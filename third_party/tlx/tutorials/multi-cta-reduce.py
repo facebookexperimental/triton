@@ -1,6 +1,4 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
-from urllib.request import UnknownHandler
 import torch
 
 import triton
@@ -17,7 +15,6 @@ M = 4
 N = 128 * 1024
 BLOCK_SIZE_M = 4
 BLOCK_SIZE_N = triton.next_power_of_2(N // num_reduction_ctas)
-use_2d_grid = True
 torch.manual_seed(42)
 
 # @triton.autotune(
@@ -89,6 +86,35 @@ def kernel_sum(
 
 
 @triton.jit
+def kernel_sum_keep_dim(
+    X,
+    Y,
+    row_stride,
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    # pdb.set_trace()
+    row_offsets = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    col_offsets = tl.arange(0, BLOCK_SIZE_N)
+    mask_row = row_offsets < M
+    mask_col = col_offsets < N
+
+    store_col_offsets = tl.arange(0, 1)
+    store_offsets = (row_offsets[:, None] * 1) + store_col_offsets[None, :]
+    store_col_mask = store_col_offsets < 1
+    store_mask = mask_row[:, None] & store_col_mask[None, :]
+
+    X_ptr = X + (row_offsets[:, None] * row_stride) + col_offsets[None, :]
+    Y_ptr = Y + store_offsets
+
+    x = tl.load(X_ptr, mask=mask_row[:, None] & mask_col[None, :], other=0.0)
+    sum = tl.sum(x, axis=1, keep_dims=True)
+    tl.store(Y_ptr, sum, mask=store_mask)
+
+
+@triton.jit
 def kernel_sum_keep_dim_multi_cta(
     X,
     Y,
@@ -138,19 +164,16 @@ def kernel_sum_keep_dim_multi_cta(
         tl.store(Y_ptr, final_sum, mask=store_mask)
 
 
-def sum(x, y, M, N, dtype):
+def do_sum(x, y, M, N, dtype, single_cta=True):
     BLOCK_SIZE_M = 4
-    BLOCK_SIZE_N = triton.next_power_of_2(N // num_reduction_ctas)
     def grid_1d(meta):
         return (triton.cdiv(M, meta["BLOCK_SIZE_M"]),)
     
     def grid_2d(meta):
         return (triton.cdiv(M, meta["BLOCK_SIZE_M"]), triton.cdiv(N, meta["BLOCK_SIZE_N"]))
 
-    grid = grid_2d if use_2d_grid else grid_1d
-
     if not kd:
-        kernel_sum[grid](
+        kernel_sum[grid_1d](
             x,
             y,
             x.stride(0),
@@ -161,16 +184,31 @@ def sum(x, y, M, N, dtype):
             num_ctas=2,
         )
     else:
-        kernel_sum_keep_dim_multi_cta[grid](
-            x,
-            y,
-            x.stride(0),
-            M,
-            N,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            num_reduction_ctas=num_reduction_ctas,
-        )
+        if not single_cta:
+            BLOCK_SIZE_N = triton.next_power_of_2(N // num_reduction_ctas)
+            kernel_sum_keep_dim_multi_cta[grid_2d](
+                x,
+                y,
+                x.stride(0),
+                M,
+                N,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                num_reduction_ctas=num_reduction_ctas,
+            )
+        else:
+            BLOCK_SIZE_N = triton.next_power_of_2(N)
+            kernel_sum_keep_dim[grid_1d](
+                x,
+                y,
+                x.stride(0),
+                M,
+                N,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                # num_ctas=1,
+                # num_warps=1
+            )
     return y
 
 
@@ -183,7 +221,7 @@ configs = [
         x_vals=[f"{s[0]},{s[1]}" for s in shapes],
         args={"dtype": torch.float32},
         line_arg="provider",
-        line_vals=["tlx-sum", "torch.sum"],
+        line_vals=["tlx-sum", "triton-1-cta", "torch.sum"],
         line_names=["tlx-sum", "torch.sum"],
         plot_name="sum (X, Y) -> (X, 1)",
     )
@@ -204,7 +242,7 @@ def test_sum(M, N, dtype, device=DEVICE):
     if kd:
         y = torch.unsqueeze(y, 1)
     y_ref = torch.sum(x, dim=1, keepdim=kd)
-    y = sum(x, y, M, N, dtype)
+    y = do_sum(x, y, M, N, dtype, single_cta=False)
     print("Verifying tlx 2cta sum with torch.sum")
     print(x.shape, dtype)
     if torch.allclose(y, y_ref, atol=1e-2, rtol=0):
@@ -224,11 +262,18 @@ def benchmark(shape:str, provider, dtype):
     if provider == "tlx-sum":    
         y = torch.zeros((M, N), dtype=dtype, device=DEVICE)
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: sum(x, y, M, N, dtype), quantiles=quantiles
+            lambda: do_sum(x, y, M, N, dtype, single_cta=False), quantiles=quantiles
         )
     elif provider == "torch.sum":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: torch.sum(x, dim=1, keepdim=kd), quantiles=quantiles
+        )
+    elif provider == "triton-1-cta":
+        y = torch.zeros((M), dtype=dtype, device=DEVICE)
+        if kd:
+            y = torch.unsqueeze(y, 1)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: do_sum(x, y, M, N, dtype, single_cta=True), quantiles=quantiles
         )
     perf = lambda ms: M * N * 1e-12 / (ms * 1e-3)
     
