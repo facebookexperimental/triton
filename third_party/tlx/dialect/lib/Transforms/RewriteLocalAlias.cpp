@@ -135,8 +135,15 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
     if (maxType != baseAllocType) {
       // Need a new alloc with the larger type.
       builder.setInsertionPoint(baseAllocOp);
-      auto newAllocOp =
-          builder.create<ttg::LocalAllocOp>(baseAllocOp->getLoc(), maxType);
+      Operation *newAllocOp = nullptr;
+      if (isa<ttg::LocalAllocOp>(baseAllocOp)) {
+        newAllocOp =
+            builder.create<ttg::LocalAllocOp>(baseAllocOp->getLoc(), maxType);
+      } else {
+        assert(isa<ttng::TMEMAllocOp>(baseAllocOp) && "Unexpected alloc op");
+        newAllocOp = builder.create<ttng::TMEMAllocOp>(baseAllocOp->getLoc(),
+                                                       maxType, nullptr);
+      }
       // Save mapping so we can rewrite uses later.
       allocToNewAlloc[baseAllocOp] = newAllocOp;
     }
