@@ -67,6 +67,13 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=["M", "N", "K"],
+    # Uncomment do_bench for stable autotuning when running perf benchmarks
+    # do_bench=lambda kernel_call, quantiles: triton.testing.do_bench(
+    #     kernel_call,
+    #     warmup=100,
+    #     rep=2000,
+    #     quantiles=quantiles,
+    # )
 )
 @triton.jit
 def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
