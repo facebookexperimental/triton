@@ -10,6 +10,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 sum_only = True
 kernel_configs = [triton.Config({"BLOCK_SIZE_M": m}, num_warps=nw) for m in [1, 2] for nw in [1, 2, 4, 8, 16, 32]]
+kernel_configs_multi_cta = [triton.Config({"BLOCK_SIZE_M": m, "num_reduction_ctas" : ctas}, num_warps=nw) for m in [1, 2] for nw in [1, 2, 4, 8, 16, 32] for ctas in [2, 4, 8]]
 torch.manual_seed(42)
 
 @triton.autotune(
@@ -43,9 +44,10 @@ def kernel_norm(
     tl.store(Y_ptr, norm, mask=read_write_mask)
 
 @triton.autotune(
-    configs = kernel_configs,
+    configs = kernel_configs_multi_cta,
     key=['M', 'N'],
 )
+@triton.heuristics({"BLOCK_SIZE_N": lambda args: triton.next_power_of_2(args["N"] // args["num_reduction_ctas"])})
 @triton.jit
 def kernel_norm_multi_cta(
     X,
@@ -79,15 +81,23 @@ def kernel_norm_multi_cta(
     # reduction is complete in , say Cluster0. 
     tlx.cluster_barrier()
 
-    local_buff = tlx.local_alloc((BLOCK_SIZE_M, 1), tlx.dtype_of(X_ptr), 1)
-    local_buff_view = tlx.local_view(local_buff, 0)
+    local_buff = tlx.local_alloc((BLOCK_SIZE_M, 1), tlx.dtype_of(X_ptr), num_reduction_ctas - 1)
     cta_rank = tlx.cluster_cta_rank()
     # send reduction result to other cluster
-    tlx.remote_shmem_store(dst=local_buff_view, src=local_partial_sum, remote_cta_rank=tlx.cluster_cta_rank()^1)   
+    for i in range(num_reduction_ctas):
+        if i != cta_rank:
+            remote_local_buff_view = tlx.local_view(local_buff, cta_rank)
+            tlx.remote_shmem_store(dst=remote_local_buff_view, src=local_partial_sum, remote_cta_rank=i)
     tlx.cluster_barrier()
 
-    remote_partial_sum = tlx.local_load(local_buff_view)
-    final_sum = local_partial_sum + remote_partial_sum
+    final_sum = tl.zeros((BLOCK_SIZE_M, 1), dtype=tlx.dtype_of(X_ptr))
+
+    for i in range(num_reduction_ctas):
+        if i == cta_rank:
+            final_sum += local_partial_sum
+        else:
+            remote_local_buff_view = tlx.local_view(local_buff, i)
+            final_sum += tlx.local_load(remote_local_buff_view)
     norm = x / final_sum
     tl.store(Y_ptr, norm, mask=read_write_mask)
 
@@ -100,16 +110,12 @@ def do_norm(x, y, M, N, dtype, single_cta=True):
         return (triton.cdiv(M, meta["BLOCK_SIZE_M"]), triton.cdiv(N, meta["BLOCK_SIZE_N"]))
 
     if not single_cta:
-        num_reduction_ctas = 2
-        BLOCK_SIZE_N = triton.next_power_of_2(N // num_reduction_ctas)
         kernel_norm_multi_cta[grid_2d](
             x,
             y,
             x.stride(0),
             M,
             N,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            num_reduction_ctas=num_reduction_ctas,
         )
     else:
         BLOCK_SIZE_N = triton.next_power_of_2(N)
@@ -129,9 +135,6 @@ shapes = [(4, 16*1024), (16, 16*1024), (4, 32*1024), (16, 32*1024), (4, 131072),
 # shapes = [(4, 16*1024)]
 
 impls = ["tlx-norm", "triton-1-cta-norm", "torch-norm"]
-# impls = ["tlx-sum"]
-# impls = ["tlx-sum", "triton-1-cta"]
-
 
 benchmark_configs = [
     triton.testing.Benchmark(
