@@ -262,7 +262,7 @@ class CUDABackend(BaseBackend):
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
 
         if opt.pingpongAutoWS is not None:
-            mod.set_attr("ttg.pingpong_auto_ws", ir.builder(mod.context).get_int32_attr(opt.pingpongAutoWS))
+            mod.set_attr("ttg.pingpong_auto_ws", ir.builder(mod.context).get_bool_attr(opt.pingpongAutoWS))
 
         cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:
