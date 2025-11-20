@@ -131,11 +131,32 @@ public:
                               return WalkResult::advance();
                             })
                              .wasInterrupted();
+    // TODO: Find a better way to set/get numReductionCTAs
+    // from the frontend
+    int numReductionCTAs = 1;
+    mod.walk([&](ttg::SetNumReductionCTAsOp op) {
+      // set numReductionCTAs to invalid value and
+      // expect the walk to set a valid value
+      numReductionCTAs = -1;
+      auto constIntOp = op.getNumReductionCTAs().getDefiningOp<arith::ConstantOp>();
+      if (constIntOp) {
+        auto intAttr = dyn_cast<IntegerAttr>(constIntOp.getValue());
+        if (intAttr) {
+          numReductionCTAs = intAttr.getInt();
+          op.erase();
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    }).wasInterrupted();
+    if(numReductionCTAs <1  || numReductionCTAs > 16) {
+      mod.emitError() << "Invalid numReductionCTAs " << numReductionCTAs;
+    } 
 
     if (failed(verifyModule(mod, hasTLXTwoCTAs))) {
       return signalPassFailure();
     }
-
+  
     if (failed(insertInvalBarrier(mod))) {
       return signalPassFailure();
     }
@@ -174,16 +195,16 @@ public:
                                return WalkResult::advance();
                              })
                               .wasInterrupted();
-    //TODO: plumb the num_reduction_ctas from frontend
-    auto numReductionCTAs = 2;
 
+    Builder b(&getContext());
+    mod->setAttr(AttrTLXNumReductionCTAsName, b.getI32IntegerAttr(numReductionCTAs));                      
     if (!hasTLXOps && !hasExplicitLocalMemAccess && !hasWarpSpecOps &&
-        !hasTLXTwoCTAs && numReductionCTAs == 1) {
+        !hasTLXTwoCTAs) {
       return;
     }
 
     // Attach metadata to the module.
-    Builder b(&getContext());
+    
     mod->setAttr(ttg::AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(ttg::AttrNumThreadsPerWarp,
                  b.getI32IntegerAttr(threadsPerWarp));
@@ -197,9 +218,6 @@ public:
       mod->setAttr(AttrHasWarpSpecOpsName, b.getBoolAttr(true));
     if (hasTLXTwoCTAs) {
       mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
-    }
-    if (numReductionCTAs > 1) {
-      mod->setAttr(AttrTLXNumReductionCTAsName, b.getI32IntegerAttr(numReductionCTAs));
     }
   }
 };

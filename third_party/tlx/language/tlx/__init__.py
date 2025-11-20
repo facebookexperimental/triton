@@ -39,6 +39,7 @@ from .utility import (
     async_task_replica_id,
     dtype_of,
     clock64,
+    set_num_reduction_ctas,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -107,6 +108,7 @@ __all__ = [
     "async_task_replica_id",
     "dtype_of",
     "clock64",
+    "set_num_reduction_ctas",
     # dynamic launcher ops
     "_alloc_clc_responses",
     "_clc_issue",

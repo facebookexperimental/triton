@@ -112,6 +112,14 @@ void init_triton_tlx_ir(py::module &&m) {
              auto bufferType = cast<ttg::MemDescType>(dst.getType());
             auto remote_store =  self.create<ttg::RemoteShmemStoreOp>(regValues, dst, remoteCTARank);
            })
+      // TODO: Find a better way to pass numReductionCTAs
+      // from the frontend
+      .def("create_set_num_reduction_ctas",
+           [](TritonOpBuilder &self, unsigned numCTAs) -> void {
+             auto loc = self.getLastLoc();
+             Value numCTAsVal = self.getBuilder().create<arith::ConstantIntOp>(loc, numCTAs, 32);
+             self.create<ttg::SetNumReductionCTAsOp>(numCTAsVal);
+           })
       .def("make_swizzled_shared_encoding_attr",
            [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
               unsigned maxPhase, std::vector<unsigned> order,

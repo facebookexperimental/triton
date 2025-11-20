@@ -421,6 +421,12 @@ def TTG_MaskOp: TTG_Op<"mask",
     let regions = (region SizedRegion<1>:$region);
 }
 
+def TTG_SetNumReductionCTAsOp: TTG_Op<"set_num_reduction_ctas"> {
+    let summary = "set_num_reduction_ctas op for multi-CTA reduction";
+    let arguments = (ins I32:$numReductionCTAs);
+    let results = (outs);
+}
+
 def TTG_MaskReturnOp: TTG_Op<"mask.return",
                              [HasParent<"MaskOp">, Pure, Terminator, ReturnLike]> {
     let summary = "terminator for mask operator";
