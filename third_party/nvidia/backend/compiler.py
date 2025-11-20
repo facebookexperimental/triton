@@ -110,6 +110,7 @@ class CUDAOptions:
     warp_size: int = 32
     minRegAutoWS: int = 24
     maxRegAutoWS: int = 152
+    pingpongAutoWS: bool = False
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -252,13 +253,16 @@ class CUDABackend(BaseBackend):
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
 
-        # Add minRegAutoWS attribute (you need to add this)
+        # Add minRegAutoWS attribute
         if opt.minRegAutoWS is not None:
             mod.set_attr("ttg.min_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.minRegAutoWS))
 
-        # Add maxRegAutoWS attribute (you need to add this)
+        # Add maxRegAutoWS attribute
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
+
+        if opt.pingpongAutoWS is not None:
+            mod.set_attr("ttg.pingpong_auto_ws", ir.builder(mod.context).get_int32_attr(opt.pingpongAutoWS))
 
         cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:
