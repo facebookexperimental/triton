@@ -15,7 +15,7 @@ torch.manual_seed(42)
 
 @triton.autotune(
     configs = kernel_configs,
-    key=['M', ''],
+    key=['M', 'N'],
 )
 @triton.jit
 def kernel_norm(
@@ -146,7 +146,7 @@ benchmark_configs = [
         # line_names=["triton-1-cta"],
         line_vals=impls,
         line_names=impls,
-        plot_name="sum (X, Y) -> (X, 1)",
+        plot_name="norm((X, Y)) -> (X, Y) / sum((X, Y), dim=1, keepdim=True)",
     )
 ]
 
