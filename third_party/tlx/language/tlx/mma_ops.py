@@ -243,11 +243,9 @@ def async_dot_scaled(
 
     # Require the shared memory layout for A_scale and B_scale
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"
+    assert A_scale.type.storage == tlx.storage_kind.smem, "A_scale must be a shared memory tensor"
     assert isinstance(B_scale, tlx.buffered_tensor), "B_scale must be a buffered tensor"
-
-    # if isinstance(A_scale.type.storage, tlx.storage_kind.smem):
-    #     # convert A_scale to a tensor memory encoding
-    #     A_scale_handle = require_nv_mma_shared_layout(A_scale, _semantic.builder)
+    assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be a shared memory tensor"
 
     A_scale_handle = require_nv_mma_shared_layout(A_scale, False, _semantic.builder)
     B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)

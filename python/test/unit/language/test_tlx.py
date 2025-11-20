@@ -1285,8 +1285,6 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tile[0], A_format, b_scale_tile[0], B_format,
                              use_acc=False)
 
-        # mma_bar = tlx.alloc_barriers(tl.constexpr(1))
-        # tlx.tcgen05_commit(mma_bar[0])
         result = tlx.local_load(c_tile[0])
         c = result.to(tlx.dtype_of(c_desc))
         c_desc.store([0, 0], c)
