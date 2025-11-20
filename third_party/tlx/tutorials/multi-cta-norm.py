@@ -146,7 +146,7 @@ benchmark_configs = [
         # line_names=["triton-1-cta"],
         line_vals=impls,
         line_names=impls,
-        plot_name="norm((X, Y)) -> (X, Y) / sum((X, Y), dim=1, keepdim=True)",
+        plot_name="norm",
     )
 ]
 
