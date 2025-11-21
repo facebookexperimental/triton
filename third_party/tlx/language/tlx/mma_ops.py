@@ -4,25 +4,31 @@ from . import types as tlx
 from .utility import cuda_parse_arch
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, _builder=None):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
-    if isinstance(x.type.layout, tlx.swizzled_shared_layout_encoding):
-        layout = tlx.nv_mma_shared_layout_encoding(shape=x.shape, order=x.type.layout.order, elemType=x.dtype,
-                                                   numCTAsPerCGA=[1, 1], numCTASplit=[1, 1], numCTAOrder=[1, 1],
-                                                   fp4Padded=False)
-        layout_handle = _builder.make_nv_mma_shared_encoding_attr(
-            [int(x) for x in layout.shape],
-            layout.order,
-            layout.elemType.to_ir(_builder),
-            layout.numCTAsPerCGA,
-            layout.numCTASplit,
-            layout.numCTAOrder,
-            layout.fp4Padded,
-        )
-        return _builder.create_require_layout(x.handle, layout_handle)
-    else:
-        assert isinstance(x.type.layout, tlx.nv_mma_shared_layout_encoding), "input must be a shared mma tensor"
-        return x.handle
+    rank = len(x.shape)
+    layout = tlx.nv_mma_shared_layout_encoding(
+        shape=x.shape,
+        order=x.type.layout.order,
+        elemType=x.dtype,
+        numCTAsPerCGA=[1] * rank,
+        numCTASplit=[1] * rank,
+        numCTAOrder=[1] * rank,
+        fp4Padded=False,
+        swizzled=swizzled,
+    )
+
+    layout_handle = _builder.make_nv_mma_shared_encoding_attr(
+        [int(x) for x in layout.shape],
+        layout.order,
+        layout.elemType.to_ir(_builder),
+        layout.numCTAsPerCGA,
+        layout.numCTASplit,
+        layout.numCTAOrder,
+        layout.fp4Padded,
+        layout.swizzled,
+    )
+    return _builder.create_require_layout(x.handle, layout_handle)
 
 
 def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=None):
@@ -97,7 +103,7 @@ def async_dot(
 
     # TODO. batched dot is not supported yet
     if isinstance(A, tlx.buffered_tensor) and A.type.storage == tlx.storage_kind.smem:
-        A_handle = require_nv_mma_shared_layout(A, _semantic.builder)
+        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder)
     elif isinstance(A, tl.tensor):
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
@@ -105,7 +111,7 @@ def async_dot(
         # set unpacked to False for A
         A_handle = require_tmem_layout_unpacked(A, False, _semantic.builder)
 
-    B_handle = require_nv_mma_shared_layout(B, _semantic.builder)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder)
 
     if version == 5:
         assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
@@ -134,6 +140,140 @@ def async_dot(
         # Release the mma layout for the output to conform to what the user expects
         output = _semantic.builder.create_release_layout(output)
         return tl.tensor(output, ret_ty)
+
+
+@tl.builtin
+def async_dot_scaled(
+    A: tlx.buffered_tensor,
+    B: tlx.buffered_tensor,
+    acc: tlx.buffered_tensor,
+    A_scale: tlx.buffered_tensor,
+    A_format: str,
+    B_scale: tlx.buffered_tensor,
+    B_format: str,
+    use_acc: tl.constexpr
+    | tl.tensor = None,  # For blackwell, compute D = A @ B + D instead of D = A @ B. If None, default to True.
+    pred=None,
+    mBarriers: list[tlx.mbarrier] = [],
+    out_dtype=tl.float32,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Performs a warp-group asynchronous scaled matrix multiply-accumulate (MMA)
+    using Blackwell's `tcgen05.mma` instruction. This primitive is available only
+    on NVIDIA Blackwell GPUs.
+
+    The operation computed is:
+
+        D = (A * A_scale) @ (B * B_scale) + D   (if use_acc is True)
+        D = (A * A_scale) @ (B * B_scale)       (if use_acc is False)
+
+    Inputs
+    ------
+    A : tlx.buffered_tensor
+        Tile of matrix A, resident in shared memory (SMEM).
+
+    B : tlx.buffered_tensor
+        Tile of matrix B, resident in shared memory.
+
+    acc : tlx.buffered_tensor
+        Accumulator tile D, stored in tensor memory (TMEM). Used as both input
+        and output when `use_acc=True`.
+
+    A_scale : tlx.buffered_tensor
+        Per-tile or per-subgroup scaling factors for operand A. Typically encoded
+        as FP8 (E8M0) and stored in SMEM or TMEM.
+
+    A_format : str
+        FP8 format string for operand A (e.g., "e4m3", "e5m2"). Determines how
+        the hardware interprets and scales FP8 inputs during MMA.
+
+    B_scale : tlx.buffered_tensor
+        Scaling factors for operand B, same semantics as A_scale.
+
+    B_format : str
+        FP8 format string for operand B.
+
+    use_acc : tl.constexpr | tl.tensor, optional
+        If True, performs an accumulate (D = A@B + D).
+        If False, overwrites (D = A@B).
+        If None, the default behavior is hardware-dependent (typically True).
+
+    pred : optional
+        Optional predicate masking for partial/conditional execution.
+
+    mBarriers : list[tlx.mbarrier]
+        Optional mbarriers used to coordinate producer/consumer warp-groups
+        when `async_dot_scaled` participates in a pipelined MMA schedule.
+
+    out_dtype : tl.dtype
+        Output accumulation type before final store (default: fp32).
+
+    Returns
+    -------
+    tl.tensor
+        A TMEM tensor representing the updated accumulator tile D.
+    """
+
+    assert A.shape[0] >= 64, "M must be at least 64"
+    assert A.shape[1] >= 16, "K must be at least 16"
+    assert B.shape[1] >= 32, "N must be at least 32"
+
+    cuda_compute_capability = int(cuda_parse_arch(_semantic.builder.options.arch))
+    version = 5 if cuda_compute_capability >= 100 else 3
+    assert version == 5, "async_dot_scaled is only available on Blackwell"
+
+    assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
+    assert A.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
+    assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
+    assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
+
+    # Require the shared memory layout for A and B
+    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder)
+
+    # Handle input formats
+    supported_formats = {"e2m1", "e4m3", "e5m2"}
+    A_format = tl._unwrap_if_constexpr(A_format)
+    B_format = tl._unwrap_if_constexpr(B_format)
+    assert A_format in supported_formats, f"Unsupported A_format: {A_format}"
+    assert B_format in supported_formats, f"Unsupported B_format: {B_format}"
+    A_type = _semantic._str_to_fp_type(A_format)
+    B_type = _semantic._str_to_fp_type(B_format)
+
+    # Require the shared memory layout for A_scale and B_scale
+    assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"
+    assert A_scale.type.storage == tlx.storage_kind.smem, "A_scale must be a shared memory tensor"
+    assert isinstance(B_scale, tlx.buffered_tensor), "B_scale must be a buffered tensor"
+    assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be a shared memory tensor"
+
+    A_scale_handle = require_nv_mma_shared_layout(A_scale, False, _semantic.builder)
+    B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)
+
+    # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
+    acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
+    bar_handles = [t.handle for t in mBarriers]
+    use_acc_handle = None
+    if use_acc is not None:
+        assert isinstance(use_acc, tl.tensor) or isinstance(
+            use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
+        if isinstance(use_acc, tl.tensor):
+            use_acc_handle = use_acc.handle
+        else:
+            use_acc_handle = _semantic.builder.get_int1(use_acc.value)
+    output = _semantic.builder.create_tcgen5_dot_scaled(
+        A_handle,
+        B_handle,
+        acc_handle,
+        A_scale_handle,
+        B_scale_handle,
+        A_type,
+        B_type,
+        use_acc_handle,
+        pred,
+        bar_handles,
+    )
+    return tl.tensor(output, tl.void)
 
 
 @tl.builtin
