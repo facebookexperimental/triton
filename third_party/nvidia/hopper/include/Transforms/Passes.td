@@ -20,6 +20,12 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
     Option<"numStages", "num-stages",
            "int32_t", /*default*/"0",
            "number of buffers for warp specialization">,
+    Option<"capability", "capability",
+           "int32_t", /*default*/"10",
+           "NVIDIA compute capability">,
+    Option<"pingpongAutoWS", "pingpong-auto-ws",
+           "bool", /*default*/"false",
+           "Enable ping pong barrier insertion around critical regions">,
     Option<"dumpIntermediateSteps", "dump-intermediate-steps",
            "bool", /*default*/"false",
            "Dump intermediate steps">
@@ -117,7 +123,10 @@ def NVGPUTestPingPongSync : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> 
   let options = [
     Option<"numWarpGroups", "num-warp-groups",
            "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">
+           "number of warp groups for warp specialization">,
+    Option<"capability", "capability",
+           "int32_t", /*default*/"10",
+           "NVIDIA compute capability">
   ];
 }
 
