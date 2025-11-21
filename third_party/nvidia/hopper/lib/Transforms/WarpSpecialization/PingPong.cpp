@@ -247,7 +247,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
   }
 }
 
-void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups, int capability) {
+void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
+                    int capability) {
   // Insert sync points in ForOp for consumer warp groups. Enable this pass
   // when number of consumer warp groups == 2.
   if (numWarpGroups != 3)
