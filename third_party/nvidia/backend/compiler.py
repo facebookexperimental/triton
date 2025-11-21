@@ -110,6 +110,7 @@ class CUDAOptions:
     warp_size: int = 32
     minRegAutoWS: int = 24
     maxRegAutoWS: int = 152
+    pingpongAutoWS: bool = False
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -252,11 +253,11 @@ class CUDABackend(BaseBackend):
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
 
-        # Add minRegAutoWS attribute (you need to add this)
+        # Add minRegAutoWS attribute
         if opt.minRegAutoWS is not None:
             mod.set_attr("ttg.min_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.minRegAutoWS))
 
-        # Add maxRegAutoWS attribute (you need to add this)
+        # Add maxRegAutoWS attribute
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
 
@@ -289,7 +290,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
+            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
@@ -308,7 +309,7 @@ class CUDABackend(BaseBackend):
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
                 passes.ttgpuir.add_partition_scheduling(pm)
-                nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
+                nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
