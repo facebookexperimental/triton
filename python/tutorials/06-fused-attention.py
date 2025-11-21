@@ -57,7 +57,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     elif STAGE == 2:
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
-    # causal = False
+    #causal = False
     else:
         lo, hi = 0, N_CTX
     offsetk_y = offset_y + lo
@@ -66,7 +66,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     else:
         offsetv_y = offset_y + lo
     # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
+    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize, disallow_acc_multi_buffer=True):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = desc_k.load([offsetk_y, 0]).T
@@ -133,7 +133,13 @@ else:
     NUM_STAGES_OPTIONS = [2, 3, 4]
 
 configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
+    triton.Config({'BLOCK_M': BM,
+        'BLOCK_N': BN},
+        num_stages=s,
+        num_warps=w,
+        pre_hook=_host_descriptor_pre_hook,
+        ir_override="/home/pka/.triton/dump/_attn_fwd_override.ttgir",
+    ) \
     for BM in [64, 128]\
     for BN in [32, 64, 128]\
     for s in NUM_STAGES_OPTIONS \
@@ -614,13 +620,13 @@ TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 @pytest.mark.parametrize("H", [2, 48])
 @pytest.mark.parametrize("N_CTX", [128, 1024, (2 if is_hip() else 4) * 1024])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
-@pytest.mark.parametrize("causal", [True])  # FIXME: Non-causal tests do not pass at the moment.
+@pytest.mark.parametrize("causal", [False])  # FIXME: Non-causal tests do not pass at the moment.
 @pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
-    if mode == "fwd" and "fp16" in provider:
-        pytest.skip("Avoid running the forward computation twice.")
+    #if mode == "fwd" and "fp16" in provider:
+    #    pytest.skip("Avoid running the forward computation twice.")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)

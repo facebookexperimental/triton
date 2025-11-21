@@ -468,10 +468,18 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
 std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                              Location loc, Value accumCnt,
                                              unsigned numBuffers) {
-  Value numBuffersVal =
-      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
-  numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-      loc, builder.getI64Type(), numBuffersVal);
+  // ensure type compatibility
+  Value numBuffersVal;
+  if (accumCnt.getType().isIndex()) {
+    // accumCnt is index type, create an index constant
+    numBuffersVal =
+        builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, numBuffers);
+  } else {
+    // accumCnt is integer type, create a matching integer constant
+    auto intType = llvm::cast<IntegerType>(accumCnt.getType());
+    numBuffersVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        loc, numBuffers, intType.getWidth());
+  }
   // Calculate accumCnt / numBuffers
   // initBufferIdx = accumCnt - accumCnt / numBuffers * numBuffers
   // initPhase = (accumCnt / numBuffers) & 1
@@ -481,14 +489,46 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                                              numBuffersVal);
   Value initBufferIdx =
       builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, mulOp);
-  initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
-      loc, builder.getI32Type(), initBufferIdx);
 
-  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  // Convert to i32 for buffer indexing
+  if (initBufferIdx.getType().isIndex()) {
+    // For index type, use index_cast to convert to i32
+    initBufferIdx = builder.createWithAsyncTaskIds<arith::IndexCastOp>(
+        loc, builder.getI32Type(), initBufferIdx);
+  } else {
+    // For integer types, truncate to i32
+    initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+        loc, builder.getI32Type(), initBufferIdx);
+  }
+
+  // ensure type compatibility
+  Value one;
+  if (bufferIdx.getType().isIndex()) {
+    // For index type, create a constant index
+    one = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, 1);
+  } else if (auto intType = llvm::dyn_cast<IntegerType>(bufferIdx.getType())) {
+    // For integer types, create a constant with matching bit width
+    one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        loc, 1, intType.getWidth());
+  } else {
+    llvm_unreachable("bufferIdx must be either index or integer type");
+  }
   bufferIdx =
       builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
-  Value initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
-      loc, builder.getI1Type(), bufferIdx);
+
+  // Convert to i1 for phase
+  Value initPhase;
+  if (bufferIdx.getType().isIndex()) {
+    // For index type, first cast to i32, then truncate to i1
+    Value bufferIdxI32 = builder.createWithAsyncTaskIds<arith::IndexCastOp>(
+        loc, builder.getI32Type(), bufferIdx);
+    initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+        loc, builder.getI1Type(), bufferIdxI32);
+  } else {
+    // For integer types, truncate to i1
+    initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+        loc, builder.getI1Type(), bufferIdx);
+  }
   return {initBufferIdx, initPhase};
 }
 
@@ -511,6 +551,14 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
   auto parentForOp = op->getParentOfType<scf::ForOp>();
+
+  // Handle operations outside loops (e.g., epilogue operations).
+  // These operations don't participate in buffer cycling, so return constant 0.
+  if (!parentForOp) {
+    LDBG("getAccumCount: operation outside loop, returning constant 0");
+    return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
+  }
+
   auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
@@ -578,8 +626,16 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   }
   // Increment accumCnt if there are multiple channels in the reuseGroup in this
   // region.
-  Value idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      op->getLoc(), theIdx, 64);
+  // Create idxVal with the same type as accumCnt to ensure type compatibility
+  Value idxVal;
+  if (accumCnt.getType().isIndex()) {
+    idxVal = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+        op->getLoc(), theIdx);
+  } else {
+    auto intType = llvm::cast<IntegerType>(accumCnt.getType());
+    idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        op->getLoc(), theIdx, intType.getWidth());
+  }
   Value addRes = builder.createWithAsyncTaskIds<arith::AddIOp>(
       op->getLoc(), accumCnt, idxVal);
 
@@ -808,6 +864,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
         consumers.push_back(user);
     }
   }
+  // FIXME: If we couldn't find a valid producer (e.g., for allocs outside the
+  // loop), skip creating a channel for this allocation.
+  if (!producerOp)
+    return;
   auto producerTaskIds = getAsyncTaskIds(producerOp);
   assert(producerTaskIds.size() == 1);
   auto producerTaskId = producerTaskIds.front();

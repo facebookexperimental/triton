@@ -52,8 +52,22 @@ static Channel *findChannelForAlloc(Value value,
 }
 
 static void getAllAcutalUsersForChannel(Channel *TheCh,
-                                        DenseSet<Operation *> &users) {
+                                        DenseSet<Operation *> &users,
+                                        Operation *alloc = nullptr) {
+  // Skip null channels
+  if (!TheCh) {
+    // Allocations inside loops should have associated channels
+    // For outside loop ops, channels are not created when there is
+    // no valid producer or outside loop op has no task IDs (e.g., store)
+    assert((!alloc || !alloc->getParentOfType<scf::ForOp>()) &&
+           "Expected channel for allocation inside loop");
+    return;
+  }
   Operation *src = TheCh->getSrcOp();
+  // Skip channels without valid source operations (e.g., allocations outside
+  // loops)
+  if (!src)
+    return;
   SmallVector<Operation *> dsts;
   TheCh->getDstOps(dsts);
   users.insert(src);
@@ -109,6 +123,10 @@ static Operation *getLiftedScope(Operation *a, Operation *b) {
 // will be lifted up.
 static void getUserScopes(DenseSet<Operation *> &users,
                           DenseSet<Operation *> &userScopes) {
+  // Skip if users is empty (e.g., channels without valid operations)
+  if (users.empty())
+    return;
+
   bool first = true;
   for (auto user : users) {
     if (first) {
@@ -165,6 +183,9 @@ static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
                                       OperationListT &liveOps) {
   DenseSet<Operation *> userScopes;
   getUserScopes(users, userScopes);
+  // Return early if no user scopes (e.g., when users is empty)
+  if (userScopes.empty())
+    return;
   // Find the block that contains all users
   bool foundStart = false;
   auto *scope = *(userScopes.begin());
@@ -245,11 +266,12 @@ private:
 
   OperationListT livenessForSmemChannel(Value value) {
     // Find the channel for value in channels.
+    Operation *alloc = value.getDefiningOp();
     ChannelPost *TheCh =
         static_cast<ChannelPost *>(findChannelForAlloc(value, *channels));
     std::vector<Operation *> liveOps;
     DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users);
+    getAllAcutalUsersForChannel(TheCh, users, alloc);
     updateLiveOpsAcrossScopes(users, liveOps);
     return liveOps;
   }
@@ -273,6 +295,14 @@ private:
         value.dump();
       });
       auto liveOperations = livenessForSmemChannel(value);
+
+      // If no live operations found (e.g., for allocations outside loops
+      // without valid channels), return an empty interval at the beginning.
+      // This allocation won't interfere with any operations.
+      if (liveOperations.empty()) {
+        return Interval<size_t>(0, 0);
+      }
+
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
       llvm::for_each(liveOperations, [&](Operation *liveOp) {
@@ -308,14 +338,22 @@ public:
       ChannelPost *TheCh =
           static_cast<ChannelPost *>(findChannelForOp(alloc, *channels));
       DenseSet<Operation *> users;
-      getAllAcutalUsersForChannel(TheCh, users);
+      getAllAcutalUsersForChannel(TheCh, users, alloc);
+      // If no users found (e.g., for allocations outside loops), not in
+      // innermost loop
+      if (users.empty())
+        return false;
       // All users are in the same block and in the innermost loop.
       auto *first = *(users.begin());
       for (auto *user : users) {
         if (user->getBlock() != first->getBlock())
           return false;
       }
-      return isInnermostLoop(first->getParentOfType<scf::ForOp>());
+      auto parentLoop = first->getParentOfType<scf::ForOp>();
+      // If users are outside loops, they're not in the innermost loop
+      if (!parentLoop)
+        return false;
+      return isInnermostLoop(parentLoop);
     };
     // Keep track of unique element types. We don't support casting between
     // different element types.
@@ -582,7 +620,8 @@ public:
     //   Go through all buffers that are live in the loop
     //   Start with buffers with longest span within the loop
     //   For each buffer
-    //     either allocate new space (owner of a set of rows)
+    //     either allocate ne
+    // w space (owner of a set of rows)
     //     or reuse an existing buffer's space
     //     if this buffer interferes with all allocated buffers, allocate new
     //     space if this buffer is along the dependency chain, reuse space if
