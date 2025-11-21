@@ -644,6 +644,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<ReturnOp>,
       GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
       GenericOpPattern<triton::gpu::LocalStoreOp>,
+      GenericOpPattern<triton::gpu::RemoteShmemStoreOp>,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       TritonFuncOpPattern>(typeConverter, context);

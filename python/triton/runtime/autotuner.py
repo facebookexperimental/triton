@@ -101,6 +101,7 @@ class Autotuner(KernelInterface):
                           stacklevel=1)
             if use_cuda_graph:
                 from ..testing import do_bench_cudagraph
+                print("Using CUDA graph")
                 self._do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
                     kernel_call,
                     rep=rep if rep is not None else 100,
@@ -109,6 +110,7 @@ class Autotuner(KernelInterface):
                 return
 
             import triton.testing
+            print("Using do_bench benchmarking interface")
             self._do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
                 kernel_call,
                 warmup=warmup if warmup is not None else 25,

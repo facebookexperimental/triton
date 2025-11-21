@@ -343,11 +343,16 @@ class CUDABackend(BaseBackend):
         pm.run(mod)
 
         tlx_enable_paired_cta_mma = mod.get_bool_attr("tlx.enable_paired_cta_mma") or False
+        tlx_num_reduction_ctas = mod.get_int_attr("tlx.num_reduction_ctas")
         metadata["tlx_enable_paired_cta_mma"] = tlx_enable_paired_cta_mma
+        metadata["tlx_num_reduction_ctas"] = tlx_num_reduction_ctas
         if tlx_enable_paired_cta_mma:
             assert cluster_info.clusterDimX == 1 and cluster_info.clusterDimY == 1 and cluster_info.clusterDimZ == 1, \
                 f"Unexpected cluster dims before TLX override:({cluster_info.clusterDimX}, {cluster_info.clusterDimY}, {cluster_info.clusterDimZ})"
             metadata["cluster_dims"] = (2, 1, 1)
+        elif tlx_num_reduction_ctas > 1:
+            # TODO: Pick correct clustering dim based on reduction-dim
+            metadata["cluster_dims"] = (cluster_info.clusterDimX, tlx_num_reduction_ctas, cluster_info.clusterDimZ)
         else:
             metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         tensordesc_meta = mod.get_tensordesc_metadata()

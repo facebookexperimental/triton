@@ -224,6 +224,23 @@ struct CanonicalizeConvertFromLocalStore
   }
 };
 
+// remote_store(cvt) -> local_store
+struct CanonicalizeConvertRemoteShmemStore
+    : public mlir::OpRewritePattern<triton::gpu::RemoteShmemStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::gpu::RemoteShmemStoreOp op,
+                  PatternRewriter &rewriter) const override {
+    auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::gpu::RemoteShmemStoreOp>(op, convert.getSrc(),
+                                                           op.getDst(), op.getCtaRank());
+    return mlir::success();
+  }
+};
+
 struct CanonicalizeConvertFromSplit
     : public mlir::OpRewritePattern<triton::SplitOp> {
   using OpRewritePattern::OpRewritePattern;

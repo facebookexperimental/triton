@@ -16,6 +16,14 @@ def cuda_parse_arch(arch):
         raise ValueError(f"TRITON_OVERRIDE_ARCH must have the form {pattern}")
     return int(match.group(1))
 
+@tl.builtin
+def set_num_reduction_ctas(num_ctas:int|tl.constexpr, _semantic=None):
+    """
+    Sets the number of CTAs used for reduction.
+    """
+    num_ctas = tl._unwrap_if_constexpr(num_ctas)
+    assert num_ctas >= 1 and num_ctas <=16 , "set_num_reduction_ctas only accepts positive int"
+    _semantic.builder.create_set_num_reduction_ctas(num_ctas)
 
 @tl.builtin
 def cluster_cta_rank(_semantic=None):

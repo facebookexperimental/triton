@@ -362,13 +362,42 @@ def TTG_LocalStoreOp : TTG_Op<"local_store"> {
   }];
   let arguments = (ins
     TT_Tensor:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
+    OptionalAttr<I32Attr>:$ctaRank
   );
+
+  let builders = [
+   OpBuilder<(ins "Value":$src, "Value":$dst), [{
+      build($_builder, $_state, src, dst, /*ctaRank=*/IntegerAttr());
+    }]>
+  ];
 
   let hasVerifier = 1;
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
   let assemblyFormat = [{
     $src `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))
+  }];
+}
+
+def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
+  let summary = "Store a distributed tensor into a buffer in remote shared memory";
+
+  let description = [{
+    Store a distributed tensor into a buffer in remote shared memory.
+    `$ctaRank` refers to the unique CTA id in a cluster acorss all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    will be 0~7.
+  }];
+  let arguments = (ins
+    TT_Tensor:$src,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
+    I32:$ctaRank
+
+  );
+  // TODO Add a verifier
+  let hasVerifier = 0;
+  // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
+  let assemblyFormat = [{
+    $src `,` `rank` $ctaRank `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))
   }];
 }
 
@@ -390,6 +419,12 @@ def TTG_MaskOp: TTG_Op<"mask",
     let arguments = (ins I1:$pred);
     let results = (outs Variadic<AnyType>:$result);
     let regions = (region SizedRegion<1>:$region);
+}
+
+def TTG_SetNumReductionCTAsOp: TTG_Op<"set_num_reduction_ctas"> {
+    let summary = "set_num_reduction_ctas op for multi-CTA reduction";
+    let arguments = (ins I32:$numReductionCTAs);
+    let results = (outs);
 }
 
 def TTG_MaskReturnOp: TTG_Op<"mask.return",

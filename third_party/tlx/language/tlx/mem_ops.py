@@ -158,7 +158,11 @@ def local_view(
     elif isinstance(local_allocated_buffers, tlx.clc_response):
         return tlx.clc_response(view_handle, 0, local_allocated_buffers.type.layout)
     else:
-        # Calculate the correct shape for the subview according to create_memdesc_subview logic
+        return _get_shmem_buffered_tensor_for_view(local_allocated_buffers, view_handle)
+
+
+def _get_shmem_buffered_tensor_for_view(local_allocated_buffers: tlx.buffered_tensor, view_handle, storage_kind=None) -> tlx.buffered_tensor:   
+     # Calculate the correct shape for the subview according to create_memdesc_subview logic
         original_shape = local_allocated_buffers.shape
         if local_allocated_buffers.type.num == 0:
             if len(original_shape) == 1:
@@ -175,19 +179,28 @@ def local_view(
             local_allocated_buffers.type.scalar,
             new_shape,
             0,
-            local_allocated_buffers.type.storage,
+            local_allocated_buffers.type.storage if storage_kind is None else storage_kind,
             local_allocated_buffers.type.layout,
             local_allocated_buffers.type.semantic,
         )
 
-
 def _buffered_tensor_getitem(self, buffer_idx):
     return local_view(self, buffer_idx, _semantic=self.type.semantic)
 
+def _get_remote_cta_rank_handle(remote_cta_rank, _semantic):
+    if isinstance(remote_cta_rank, tl.constexpr) or isinstance(remote_cta_rank, int):
+        remote_cta_rank_handle = _semantic._convert_elem_to_ir_value(tl._unwrap_if_constexpr(remote_cta_rank),
+                                                                     require_i64=False)
+    else:
+        assert isinstance(
+            remote_cta_rank, tl.tensor
+        ), f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)"
+        remote_cta_rank_handle = remote_cta_rank.handle
+    return remote_cta_rank_handle
 
 @tl.builtin
 def remote_view(
-    local_allocated_buffer: tlx.mbarrier,
+    local_allocated_buffer: tlx.buffered_tensor | tlx.mbarrier,
     remote_cta_rank: int | tl.constexpr | tl.tensor,
     _semantic=None,
 ) -> tlx.mbarrier:
@@ -199,19 +212,34 @@ def remote_view(
     a cluster of shape [2, 4] a valid unique ID could be 0~7, including the executing CTA itself
     :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
     """
-    assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
+    # assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
     assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
-    if isinstance(remote_cta_rank, tl.constexpr) or isinstance(remote_cta_rank, int):
-        remote_cta_rank_handle = _semantic._convert_elem_to_ir_value(tl._unwrap_if_constexpr(remote_cta_rank),
-                                                                     require_i64=False)
-    else:
-        assert isinstance(
-            remote_cta_rank, tl.tensor
-        ), f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)"
-        remote_cta_rank_handle = remote_cta_rank.handle
+    remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
                                                                       remote_cta_rank_handle)
-    return tlx.mbarrier(remote_buf_handle, 0, local_allocated_buffer.type.layout, storage_kind.smemCluster)
+    if isinstance(local_allocated_buffer, tlx.mbarrier):
+        return tlx.mbarrier(remote_buf_handle, 0, local_allocated_buffer.type.layout, storage_kind.smemCluster)
+    elif isinstance(local_allocated_buffer, tlx.buffered_tensor):
+        return _get_shmem_buffered_tensor_for_view(local_allocated_buffer, remote_buf_handle, storage_kind.smemCluster)
+
+
+@tl.builtin
+def remote_shmem_store(
+    dst: tlx.buffered_tensor,
+    src: tl.tensor,
+    remote_cta_rank:int|tl.constexpr,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Store a distributed tensor into a buffer into the remote shared memory of a cluster.
+    """
+    storage = dst.type.storage
+    if (storage == tlx.storage_kind.smemCluster):
+        print("tlx.remote_shmem_store only supports smem dst, it internally calls mapa(dst)")
+    assert storage == tlx.storage_kind.smem, "remote_shmem_store only supports local smem for dst. dst will be internally mapped to remote_cta_rank's shmem"
+    assert remote_cta_rank is not None, "remote_cta_rank is required for remote_shmem_store"
+    remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
+    return tl.tensor(_semantic.builder.create_remote_store(dst.handle, src.handle, remote_cta_rank_handle), tl.void)
 
 
 tlx.buffered_tensor.__getitem__ = _buffered_tensor_getitem

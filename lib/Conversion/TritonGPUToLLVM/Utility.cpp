@@ -567,7 +567,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 std::function<Value(Value)> calcPaddedOffset,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-                std::optional<int> maybeMaxVecElems, Operation *localLoadOp) {
+                std::optional<int> maybeMaxVecElems, Operation *localLoadOp, std::optional<Value> ctaRank) {
 
   bool isStore = !valsArray.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -579,7 +579,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
     if (isStore) {
       Value valsVec =
           packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
-      targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt, valsVec,
+      targetInfo.storeDShared(rewriter, loc, shmemAddr, ctaRank, valsVec,
                               /*pred=*/b.true_val());
       return {};
     } else {
@@ -695,7 +695,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                ArrayRef<Value> valsArray, // Input for store, empty for load
                Type llvmElemTy, triton::gpu::MemDescType srcTy,
                SharedMemoryObject smemObj, RewriterBase &rewriter,
-               const TargetInfoBase &targetInfo, Operation *localLoadOp) {
+               const TargetInfoBase &targetInfo, Operation *localLoadOp, std::optional<Value> ctaRank) {
   assert(cvt.getNumOutDims() == 1);
   assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
   auto calcPaddedOffset = [&](Value smemOffset) {
@@ -720,7 +720,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
       inVals = removeBroadcastSrc.apply(inVals);
     }
     auto outVals = lowerLocalLdSt(loc, ctx, prmtCvt, inVals, llvmElemTy, srcTy,
-                                  smemObj, rewriter, targetInfo, localLoadOp);
+                                  smemObj, rewriter, targetInfo, localLoadOp, ctaRank);
     if (!isStore) {
       outVals = broadcastAs(outVals, cvt);
     }
@@ -738,7 +738,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
   return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy,
                          smemObj.getBase(), calcPaddedOffset, affineOffset,
                          maskSpanAffineOffset, rewriter, targetInfo,
-                         maybeMaxVecElems, localLoadOp);
+                         maybeMaxVecElems, localLoadOp, ctaRank);
 }
 
 bool emitTransferBetweenRegistersAndShared(
