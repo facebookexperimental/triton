@@ -4,6 +4,7 @@ import re
 import contextlib
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -283,7 +284,20 @@ def update_symlink(link_path, source_path):
     link_path.symlink_to(source_path.absolute(), target_is_directory=True)
 
 
-def get_thirdparty_packages(packages: list):
+def fix_package_permissions(package_dir):
+    bin_dir = os.path.join(package_dir, "bin")
+    for root, _, files in os.walk(bin_dir):
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            current_perm = stat.S_IMODE(os.stat(file_path).st_mode)
+            # Add execution bits for user, group, and others
+            new_perm = current_perm | 0o111
+            if current_perm != new_perm:
+                os.chmod(file_path, new_perm)
+                print(f"Updated permissions for {file_path}: {oct(current_perm)} -> {oct(new_perm)}")
+
+
+def get_thirdparty_packages(packages: list, should_fix_permissions: bool = False):
     triton_cache_path = get_triton_cache_path()
     thirdparty_cmake_args = []
     for p in packages:
@@ -324,6 +338,8 @@ def get_thirdparty_packages(packages: list):
         if p.sym_name is not None:
             sym_link_path = os.path.join(package_root_dir, p.sym_name)
             update_symlink(sym_link_path, package_dir)
+        if should_fix_permissions:
+            fix_package_permissions(package_dir)
 
     return thirdparty_cmake_args
 
@@ -442,7 +458,8 @@ class CMakeBuild(build_ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
         # lit is used by the test suite
-        thirdparty_cmake_args = get_thirdparty_packages([get_llvm_package_info()])
+        thirdparty_cmake_args = get_thirdparty_packages([get_llvm_package_info()],
+                                                        check_env_flag("TRITON_OVERRIDE_PACKAGE_PERMISSIONS"))
         thirdparty_cmake_args += self.get_pybind11_cmake_args()
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.path)))
         wheeldir = os.path.dirname(extdir)
