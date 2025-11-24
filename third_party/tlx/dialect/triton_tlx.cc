@@ -591,7 +591,6 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
               Value rbits) -> Value {
-             // TODO: verify rbits size
              // Create rounding mode attribute
              auto roundingAttr = tt::RoundingModeAttr::get(
                  self.getContext(), tt::RoundingMode::RS);

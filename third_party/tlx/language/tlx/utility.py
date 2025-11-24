@@ -119,6 +119,17 @@ def stoch_round(
     assert dst_ty in [tl.float8e5, tl.float8e4nv, tl.float16,
                       tl.bfloat16], (f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}")
 
+    # Verify rbits shape matches src shape
+    rbits_ty = rand_bits.type
+    if src_ty.is_block() and rbits_ty.is_block():
+        assert src_ty.shape == rbits_ty.shape, f"rand_bits shape {rbits_ty.shape} must match src shape {src_ty.shape}"
+    elif not src_ty.is_block() and not rbits_ty.is_block():
+        # Both are scalars - OK
+        pass
+    else:
+        raise ValueError(f"src and rand_bits must both be blocks or both be scalars, "
+                         f"got src_ty.is_block()={src_ty.is_block()}, rbits_ty.is_block()={rbits_ty.is_block()}")
+
     if src_sca_ty == dst_ty:
         return src
     # Construct the proper result type (block type if source is block)

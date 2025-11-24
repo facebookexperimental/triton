@@ -488,7 +488,6 @@ struct FpToFpOpConversion
     // Check that we have rbits operand
     assert(op.getRbits() && "Stochastic rounding mode requires rbits operand");
 
-    // Validate that stochastic rounding is only supported for specific
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     // Get source operands - unpack from the adaptor
@@ -499,7 +498,12 @@ struct FpToFpOpConversion
     auto rbitsValue = adaptor.getRbits();
     auto rbitsOperands = unpackLLElements(loc, rbitsValue, rewriter);
 
-    // Determine pack size based on destination type
+    // Determine pack size based on destination type:
+    // - FP8: 4 elements (cvt.rs.satfinite.{e4m3,e5m2}x4.f32)
+    // - BF16/FP16: 2 elements (cvt.rs.satfinite.{bf16,f16}x2.f32)
+    // Note: If a thread processes fewer elements than packSize, we will pad
+    // with undef values to fill the complete pack required by the PTX
+    // instruction.
     unsigned packSize = 1;
     if (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(dstElementType)) {
       packSize = 4; // FP8 packs 4 elements
