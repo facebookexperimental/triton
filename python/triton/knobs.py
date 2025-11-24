@@ -435,6 +435,7 @@ class JITHookCompileInfo(TypedDict):
     num_stages: int
     minRegAutoWS: Optional[int]
     maxRegAutoWS: Optional[int]
+    pingpongAutoWS: Optional[bool]
     enable_fp_fusion: bool
     launch_cooperative_grid: bool
     extern_libs: tuple[tuple[str, str], ...]

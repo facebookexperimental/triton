@@ -643,10 +643,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # Use getattr to safely access backend-specific attributes
         minRegAutoWS = getattr(options, 'minRegAutoWS', None)
         maxRegAutoWS = getattr(options, 'maxRegAutoWS', None)
+        pingpongAutoWS = getattr(options, 'pingpongAutoWS', None)
         if minRegAutoWS is not None:
             repr_parts.append(f"minRegAutoWS={minRegAutoWS}")
         if maxRegAutoWS is not None:
             repr_parts.append(f"maxRegAutoWS={maxRegAutoWS}")
+        if pingpongAutoWS is not None:
+            repr_parts.append(f"pingpongAutoWS={pingpongAutoWS}")
         repr_parts.extend([
             f"enable_fp_fusion={options.enable_fp_fusion}",
             f"launch_cooperative_grid={options.launch_cooperative_grid}",
@@ -665,6 +668,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             'num_stages': options.num_stages,
             'minRegAutoWS': getattr(options, 'minRegAutoWS', None),
             'maxRegAutoWS': getattr(options, 'maxRegAutoWS', None),
+            'pingpongAutoWS': getattr(options, 'pingpongAutoWS', None),
             'enable_fp_fusion': options.enable_fp_fusion,
             'launch_cooperative_grid': options.launch_cooperative_grid,
             'extern_libs': options.extern_libs,

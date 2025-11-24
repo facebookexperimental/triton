@@ -24,7 +24,8 @@ void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
-void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups);
+void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
+                    int capability);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -77,7 +78,7 @@ public:
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
     // FIXME: skip data partitioning with on-host TMA.
     // FIXME: skip data partitioning for Blackwell.
-    const int ForBlackWell = true;
+    bool ForBlackWell = (capability / 10) > 9;
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;
     if (!ForBlackWell) {
       bool success = false;
@@ -146,8 +147,9 @@ public:
           << "// -----// WarpSpec internal IR Dump After: doCodePartition\n"
           << moduleOp << "\n\n\n";
     }
-    if (!ForBlackWell) {
-      doPingPongSync(funcOp, numWarpGroups);
+
+    if (pingpongAutoWS) {
+      doPingPongSync(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
         llvm::dbgs()
             << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n"
