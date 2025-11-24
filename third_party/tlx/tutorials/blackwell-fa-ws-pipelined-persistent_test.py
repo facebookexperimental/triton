@@ -1642,11 +1642,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
     q = q.to(ref_dtype)
     k = k.to(ref_dtype)
     v = v.to(ref_dtype)
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    p = torch.softmax(p.float(), dim=-1)
-    p = p.to(ref_dtype)
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v).half()
+    ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
     if mode == "bwd":
         dout = torch.randn_like(q)
         ref_out.backward(dout)
