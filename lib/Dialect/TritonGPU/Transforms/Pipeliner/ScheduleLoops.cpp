@@ -351,7 +351,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (opLatency.count(op))
       lat = opLatency.lookup(op);
     // Only return the latency for the current op if minDist is INT_MAX
-    int d = (minDist == INT_MAX) ? lat : lat + minDist;
+    int d = (minDist == INT_MAX) ? lat : minDist;
     minDistanceMap[op] = d;
     return d;
   };
@@ -376,7 +376,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   DenseMap<Operation *, int> clusterMap;
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t numDots = 0;
-  SmallVector<int> maxClusterPerDistance(maxPossibleDistance, -1);
+  SmallVector<int> maxClusterPerDistance(maxPossibleDistance + 1, -1);
   if (success) {
     size_t maxChainLength = 0;
     for (auto &chain : chains) {
