@@ -88,35 +88,30 @@ def stoch_round(
     _semantic=None,
 ) -> tl.tensor:
     """
-    Stochastic-rounding convert with optional saturation and ReLU.
+    Hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions.
 
-    Semantics (conceptually):
-        y = cvt_sr(x, rbits, dst, satfinite=True, relu=False)
+    Requires Blackwell GPU (compute capability >= 100).
 
-    Maps to (on Blackwell):
-        cvt.rs{.relu}.satfinite.<f8x4type>.f32  d, {a,b,e,f}, rbits
-        or corresponding bf16/f16 variants.
+    Semantics:
+        y = tlx.stoch_round(src, dst_ty, rand_bits)
+
+    Maps to PTX (on Blackwell):
+        cvt.rs.satfinite.{e4m3x4,e5m2x4}.f32  d, {a,b,c,d}, rbits  (for FP8)
+        cvt.rs.satfinite.{bf16x2,f16x2}.f32   d, {a,b}, rbits      (for BF16/F16)
 
     Args:
-        x:
-            Source values (typically fp32 / bf16 / f16). Shape defines output shape.
-        rbits:
-            List of random bits used for stochastic rounding. Must be a list of uint32 tensors
-            or values broadcastable to `x` .
-        dst:
-            Target low-precision format. Examples:
-                "bf16", "f16",
-                "e4m3", "e5m2",
-                "e4m3x2", "e4m3x4", "e5m2x2", "e5m2x4".
-        satfinite:
-            If True, clamp out-of-range values to the maximum finite value
-            representable in `dst` instead of producing inf/NaN.
-        relu:
-            If True, fuse ReLU: y = max(0, y) in the same instruction (where supported).
+        src:
+            Source FP32 tensor. Shape defines output shape.
+        dst_ty:
+            Destination dtype: tl.float8e5, tl.float8e4nv, tl.float16, or tl.bfloat16
+        rand_bits:
+            Random bits (uint32 tensor) for entropy, must match src shape
 
     Returns:
-        Tensor with dtype implied by `dst` and shape compatible with `x`.
+        Tensor with dtype dst_ty and shape matching src.
     """
+    capability = int(cuda_parse_arch(_semantic.builder.options.arch))
+    assert capability >= 100, "stoch_round only available on Blackwell"
     src_ty = src.type
     src_sca_ty = src_ty.scalar
 
