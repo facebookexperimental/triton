@@ -9,92 +9,11 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 DTYPE = torch.float32
 
 
-def detailed_tensor_comparison(a, b, rtol=1e-5, atol=1e-8, max_print=20):
-    """Comprehensive tensor comparison with detailed output."""
-
-    print("\n" + "=" * 80)
-    print("TENSOR COMPARISON")
-    print("=" * 80)
-
-    # Shape check
-    print(f"\nShapes: {a.shape} vs {b.shape}")
-    if a.shape != b.shape:
-        print("❌ Shape mismatch!")
-        return False
-
-    # Dtype check
-    print(f"Dtypes: {a.dtype} vs {b.dtype}")
-    if a.dtype != b.dtype:
-        print("⚠️  Warning: Different dtypes")
-
-    # Find mismatches
-    mismatch_mask = ~torch.isclose(a, b, rtol=rtol, atol=atol)
-    num_mismatches = mismatch_mask.sum().item()
-    total_elements = a.numel()
-
-    print(f"\nTotal elements: {total_elements}")
-    print(f"Matching elements: {total_elements - num_mismatches}")
-    print(f"Mismatching elements: {num_mismatches}")
-    print(f"Match rate: {100 * (1 - num_mismatches / total_elements):.4f}%")
-
-    if num_mismatches == 0:
-        print("\n✅ TENSORS MATCH!")
-        return True
-
-    # Difference statistics
-    diff = (a - b).abs()
-    print(f"\nDifference Statistics:")
-    print(f"  Max abs diff: {diff.max().item():.6e}")
-    print(f"  Mean abs diff: {diff.mean().item():.6e}")
-    print(f"  Std abs diff: {diff.std().item():.6e}")
-    print(f"  Median abs diff: {diff.median().item():.6e}")
-
-    # Print mismatches
-    print(f"\n{'=' * 80}")
-    print(f"First {min(max_print, num_mismatches)} Mismatches:")
-    print(f"{'=' * 80}")
-    print(f"{'Index':<25} {'Tensor A':<20} {'Tensor B':<20} {'Abs Diff':<15} {'Rel Diff':<15}")
-    print("-" * 80)
-
-    mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
-    for idx in mismatch_indices[:max_print]:
-        idx_tuple = tuple(idx.tolist())
-        val_a = a[idx_tuple].item()
-        val_b = b[idx_tuple].item()
-        abs_diff = abs(val_a - val_b)
-        rel_diff = abs_diff / (abs(val_a) + 1e-10)
-
-        print(f"{str(idx_tuple):<25} {val_a:<20.8e} {val_b:<20.8e} {abs_diff:<15.8e} {rel_diff:<15.8e}")
-
-    if num_mismatches > max_print:
-        print(f"\n... and {num_mismatches - max_print} more mismatches")
-
-    print("=" * 80 + "\n")
-    return False
-
-
-def _create_input_tensors(B, M, N, elementwise_affine=True):
-    assert M == 1152, f"N is hardcoded to 1152 in this kernel, got {M}"
-    assert N == 16384, f"N is hardcoded to 16384 in this kernel, got {N}"
-    x_shape = (B, M, N)
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=DTYPE, device=DEVICE)
-    dy = 0.1 * torch.randn_like(x)
-    weight, bias = None, None
-
-    if elementwise_affine:
-        w_shape = (x_shape[-1],)
-        weight = torch.randn(w_shape, dtype=DTYPE, device=DEVICE, requires_grad=True)
-
-        bias = torch.randn(w_shape, dtype=DTYPE, device=DEVICE, requires_grad=True)
-
-    x.requires_grad_(True)
-
-    return (x, dy, weight, bias)
-
-
+########################## HELION #############################
 @triton.autotune(
-    configs=[triton.Config({"_BLOCK_SIZE_0": 1, "_REDUCTION_BLOCK_1": 4096})],
+    configs=[triton.Config({"_BLOCK_SIZE_0": 1, "_REDUCTION_BLOCK_1": 4096}, num_warps=16, num_stages=3)],
     key=["x"],
+    
 )
 @triton.jit
 def _helion_layer_norm_fwd(
@@ -175,7 +94,31 @@ def _helion_layer_norm_fwd(
         tl.store(out + (indices_0[:, None] * 16384 + rindex_1[None, :] * 1), v_21, None)
 
 
-def layer_norm_fwd(x_orig, weight, bias, eps):
+def layer_norm_fwd(x, mean, rstd, weight, bias, out, eps, provider:str="helion"):   
+    def grid_1d(meta):
+        return (x.size(0),)
+    m = x.size(0)
+    n = x.size(1)
+    if provider == "helion":
+        _helion_layer_norm_fwd[grid_1d](x, mean, rstd, weight, bias, out, eps)
+    else:
+        assert provider == "tlx", "type must be either helion or tlx"
+        # X, # pointer to the input
+        # Y, # pointer to the output
+        # W, # pointer to the weights
+        # B, # pointer to the biases
+        # Mean, # pointer to the mean
+        # Rstd, # pointer to the 1/std
+        # row_stride, # input row stride
+        # M, # number of rows in X
+        # N, # number of columns in X
+        # eps, # epsilon to avoid division by zero
+        # BLOCK_SIZE_N: tl.constexpr
+        kernel_norm_multi_cta[grid_1d](x, out, weight, bias, mean, rstd, x.stride(0), m, n, eps, n)
+
+    return (out, mean, rstd)
+
+def normalize_and_create_outs(x_orig, weight, bias, eps):
     """
     Performs 1D layer normalization on the input tensor using Helion.
     Args:
@@ -191,10 +134,8 @@ def layer_norm_fwd(x_orig, weight, bias, eps):
             - Reciprocal standard deviation tensor of shape [batch_size], in FP32.
     """
 
-    def grid(META):
-        return (1152,)
-
     normalized_shape = (x_orig.shape[-1],)
+    #x.shape = (B * M, N)
     x = x_orig.reshape(-1, x_orig.shape[-1])
 
     # src[layer_norm.py:283]: m, n = x.size()
@@ -226,10 +167,143 @@ def layer_norm_fwd(x_orig, weight, bias, eps):
     # src[layer_norm.py:299]:     # Compute mean
     # src[layer_norm.py:297-317]: ...
     # _launcher(_helion_layer_norm_fwd, (1152,), x, mean, rstd, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=16, num_stages=3)
-    _helion_layer_norm_fwd[grid](x, mean, rstd, weight, bias, out, eps)
+  
+    
     # src[layer_norm.py:318]: return out, mean, rstd
-    return (out, mean, rstd)
+    return (x, mean, rstd, weight, bias, out, eps)
+########################## END- HELION #############################
 
+################## TLX #################
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=16, num_stages=3)],
+    key=["x"],
+    
+)
+@triton.jit
+def kernel_norm_multi_cta(
+    X, # pointer to the input
+    Y, # pointer to the output
+    W, # pointer to the weights
+    B, # pointer to the biases
+    Mean_out, # pointer to the mean
+    Rstd_out, # pointer to the 1/std
+    row_stride, # input row stride
+    M, # number of rows in X
+    N, # number of columns in X
+    eps, # epsilon to avoid division by zero
+    BLOCK_SIZE_N: tl.constexpr
+):
+    row_offsets = tl.program_id(0)
+    # Partition reduction axes over multiple CTAs
+    col_offsets = tl.arange(0, BLOCK_SIZE_N)
+    
+    # mask_row = row_offsets < M
+    mask_col = col_offsets < N
+    read_write_offsets = (row_offsets * row_stride) + col_offsets
+    read_write_mask = mask_col
+
+    X_ptr = X + read_write_offsets
+    Y_ptr = Y + read_write_offsets
+
+    x = tl.load(X_ptr, mask=read_write_mask, other=0.0)
+    mean = tl.sum(x, axis=0) / N
+    x_minus_mean = tl.where(read_write_mask, x - mean, 0.0)
+    x_minus_mean_sq = x_minus_mean * x_minus_mean
+    var = tl.sum(x_minus_mean_sq, axis=0) / N
+    rstd = libdevice.rsqrt(var + eps)
+    tl.store(Mean_out + row_offsets, mean)
+    tl.store(Rstd_out + row_offsets, rstd)
+    w = tl.load(W + col_offsets, mask=mask_col)
+    b = tl.load(B + col_offsets, mask=mask_col)
+    x_hat = (x - mean) * rstd
+    y = x_hat * w + b
+    tl.store(Y_ptr, y, mask=read_write_mask)
+
+
+################### END-TLX ###############
+def detailed_tensor_comparison(a, b, rtol=1e-5, atol=1e-8, max_print=20):
+    """Comprehensive tensor comparison with detailed output."""
+
+    print("\n" + "=" * 80)
+    print("TENSOR COMPARISON")
+    print("=" * 80)
+
+    # Shape check
+    print(f"\nShapes: {a.shape} vs {b.shape}")
+    if a.shape != b.shape:
+        print("❌ Shape mismatch!")
+        return False
+
+    # Dtype check
+    print(f"Dtypes: {a.dtype} vs {b.dtype}")
+    if a.dtype != b.dtype:
+        print("⚠️  Warning: Different dtypes")
+
+    # Find mismatches
+    mismatch_mask = ~torch.isclose(a, b, rtol=rtol, atol=atol)
+    num_mismatches = mismatch_mask.sum().item()
+    total_elements = a.numel()
+
+    print(f"\nTotal elements: {total_elements}")
+    print(f"Matching elements: {total_elements - num_mismatches}")
+    print(f"Mismatching elements: {num_mismatches}")
+    print(f"Match rate: {100 * (1 - num_mismatches / total_elements):.4f}%")
+
+    if num_mismatches == 0:
+        print("\n✅ TENSORS MATCH!")
+        return True
+
+    # Difference statistics
+    diff = (a - b).abs()
+    print(f"\nDifference Statistics:")
+    print(f"  Max abs diff: {diff.max().item():.6e}")
+    print(f"  Mean abs diff: {diff.mean().item():.6e}")
+    print(f"  Std abs diff: {diff.std().item():.6e}")
+    print(f"  Median abs diff: {diff.median().item():.6e}")
+
+    # Print mismatches
+    print(f"\n{'=' * 80}")
+    print(f"First {min(max_print, num_mismatches)} Mismatches:")
+    print(f"{'=' * 80}")
+    print(f"{'Index':<25} {'Tensor A':<20} {'Tensor B':<20} {'Abs Diff':<15} {'Rel Diff':<15}")
+    print("-" * 80)
+
+    mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
+    for idx in mismatch_indices[:max_print]:
+        idx_tuple = tuple(idx.tolist())
+        val_a = a[idx_tuple].item()
+        val_b = b[idx_tuple].item()
+        abs_diff = abs(val_a - val_b)
+        rel_diff = abs_diff / (abs(val_a) + 1e-10)
+
+        print(f"{str(idx_tuple):<25} {val_a:<20.8e} {val_b:<20.8e} {abs_diff:<15.8e} {rel_diff:<15.8e}")
+
+    if num_mismatches > max_print:
+        print(f"\n... and {num_mismatches - max_print} more mismatches")
+
+    print("=" * 80 + "\n")
+    return False
+
+
+def _create_input_tensors(B, M, N, elementwise_affine=True, dtype=DTYPE, device=DEVICE):
+    assert B * M == 1152, f"B * M is hardcoded to 1152 in this kernel, got {B * M}"
+    assert N == 16384, f"N is hardcoded to 16384 in this kernel, got {N}"
+    x_shape = (B, M, N)
+    # x.shape = (B, M, N)
+    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
+    dy = 0.1 * torch.randn_like(x)
+    weight, bias = None, None
+
+    if elementwise_affine:
+        w_shape = (x_shape[-1],)
+        # weight.shape = (N,)
+        weight = torch.randn(w_shape, dtype=DTYPE, device=DEVICE, requires_grad=True)
+        # weight.shape = (N,)
+        bias = torch.randn(w_shape, dtype=DTYPE, device=DEVICE, requires_grad=True)
+
+    x.requires_grad_(True)
+
+    return (x, dy, weight, bias)
 
 def check_correctness_elementwise_affine_true(x, dy, weight, bias, eps=1e-5):
     _x = x.detach().clone().requires_grad_(True)
@@ -244,11 +318,14 @@ def check_correctness_elementwise_affine_true(x, dy, weight, bias, eps=1e-5):
     _x_ref = x.reshape(-1, x.shape[-1])
     y_ref = torch.nn.functional.layer_norm(_x_ref, w_shape, _weight_ref, _bias_ref, eps).to(DTYPE)
 
-    y_tri, mean, rsts = layer_norm_fwd(_x, _weight, _bias, eps)
-    if not (torch.allclose(y_ref, y_tri, rtol=1e-5, atol=1e-5)):
-        detailed_tensor_comparison(y_ref, y_tri, rtol=1e-5, atol=1e-2)
-    else:
-        print("✅ Tensor comparison passed!")
+    x, mean, rstd, weight, bias, out, eps = normalize_and_create_outs(_x, _weight, _bias, eps)
+    for p in ["helion", "tlx"]:
+        y_tri, mean, rsts = layer_norm_fwd(x, mean, rstd, weight, bias, out, eps, provider=p)
+        if not (torch.allclose(y_ref, y_tri, rtol=1e-5, atol=1e-5)):
+            print(f"FAIL! Tensor comparison failed for {p}!")
+            detailed_tensor_comparison(y_ref, y_tri, atol=1e-5, rtol=1e-5)
+        else:
+            print(f"✅ Tensor comparison passed for {p}!")
 
     # y_ref.backward(dy, retain_graph=True)
     # y_tri.backward(dy, retain_graph=True)
@@ -259,3 +336,45 @@ def check_correctness_elementwise_affine_true(x, dy, weight, bias, eps=1e-5):
 
 
 check_correctness_elementwise_affine_true(*_create_input_tensors(1, 1152, 16384, elementwise_affine=True))
+
+shapes = [(1152, 1, 16384)]
+impls = ["helion", "tlx"]
+benchmark_configs = [
+    triton.testing.Benchmark(
+        x_names=["shape"],
+        x_vals=[f"{s[0]},{s[1]}, {s[2]}" for s in shapes],
+        args={"dtype": torch.float32},
+        line_arg="provider",
+        # line_vals=["triton-1-cta"],
+        # line_names=["triton-1-cta"],
+        line_vals=impls,
+        line_names=impls,
+        plot_name="layer-norm",
+    )
+]
+quantiles = [0.5, 0.2, 0.8]
+
+@triton.testing.perf_report(benchmark_configs)
+def benchmark(shape:str, provider, dtype):
+    B, M, N = shape.split(",")
+    B = int(B)
+    M = int(M)
+    N = int(N)
+    x, dy, weight, bias = _create_input_tensors(B, M, N)
+    x, mean, rstd, weight, bias, out, eps = normalize_and_create_outs(x, weight, bias, eps=1e-5)
+    x_size = x.numel() * x.element_size()
+    w_size = weight.numel() * weight.element_size()
+    mem_size = x_size * 2 + w_size
+
+    ms, min_ms, max_ms = triton.testing.do_bench(
+            #def layer_norm_fwd(x_orig, weight, bias, eps, provider:str="helion")
+            lambda: layer_norm_fwd(x, mean, rstd, weight, bias, out, eps, provider=provider), quantiles=quantiles, rep=1000, warmup=200
+        )   
+    
+    gbps = lambda ms: mem_size * 1e-9 / (ms * 1e-3)
+    
+    print("latency", shape, provider, ms, max_ms, min_ms)
+    print("b/w", shape, provider, gbps(ms), gbps(max_ms), gbps(min_ms))
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
+
+benchmark.run(save_path=".", print_data=True)
