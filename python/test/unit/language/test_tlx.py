@@ -585,6 +585,7 @@ def test_custer_cta_rank(device):
     torch.testing.assert_close(output, expected_output)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_clock64(device):
 
     @triton.jit
@@ -1245,6 +1246,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
 
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])
 @pytest.mark.parametrize("B_DATA_TYPE", ["e5m2", "e4m3"])
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     """
     Test D = (A * A_scale)  * (B * B_scale)
@@ -1633,9 +1635,8 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
 
 # Unit test for arrive/wait
-@pytest.mark.skipif(not (is_hip() or is_hopper_or_newer()), reason="Need Hopper or newer")
+@pytest.mark.skipif(not (is_hip() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-# def test_mbarriers(BLOCK_SIZE, device):
 def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     expected_arrival_count = 4 if is_hip() else 1
     kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=expected_arrival_count)
@@ -1652,7 +1653,6 @@ def test_wait_arrive_non_ws(BLOCK_SIZE, device):
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-# def test_mbarriers(BLOCK_SIZE, device):
 def test_wait_arrive_ws(BLOCK_SIZE, device):
     kernel = run_tlx_square(tlx_square_ws, BLOCK_SIZE, device)
 
@@ -1699,7 +1699,6 @@ def test_barrier_live_range(device):
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-# def test_mbarriers(BLOCK_SIZE, device):
 def test_named_wait_arrive(BLOCK_SIZE, device):
 
     @triton.jit
@@ -2155,10 +2154,7 @@ def test_async_tasks_region_error(device):
     assert "ZeroDivisionError('division by zero')" in exc_msg, '\n\nExpected ZeroDivisionError but got: \n\n' + exc_msg + '\n\n'
 
 
-@pytest.mark.skipif(
-    not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
-    reason="Requires compute capability >= 9 for NV",
-)
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_local_index(BLOCK_SIZE, device):
 
@@ -2199,6 +2195,7 @@ def test_local_index(BLOCK_SIZE, device):
     torch.testing.assert_close(y, output)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_async_token_error(device):
 
     @triton.jit
