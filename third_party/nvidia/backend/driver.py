@@ -735,7 +735,7 @@ class CudaLauncher(object):
             libraries=libraries,
         )
 
-        self.tlx_enable_paired_cta_mma = metadata.tlx_enable_paired_cta_mma
+        self.tlx_enable_paired_cta_mma = getattr(metadata, "tlx_enable_paired_cta_mma", False)
         if self.tlx_enable_paired_cta_mma:
             self.num_ctas = 1
         else:
