@@ -570,7 +570,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems = {},
-                Operation *localLoadOp = nullptr);
+                Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -598,7 +598,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                Type llvmElemTy, triton::gpu::MemDescType srcTy,
                SharedMemoryObject smemObj, RewriterBase &rewriter,
                const TargetInfoBase &targetInfo,
-               Operation *localLoadOp = nullptr);
+               Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {});
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);
