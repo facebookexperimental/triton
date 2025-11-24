@@ -779,6 +779,8 @@ class TritonSemantic(Generic[TensorTy]):
             return ir.ROUNDING_MODE.RTNE
         if rounding_mode == "rtz":
             return ir.ROUNDING_MODE.RTZ
+        if rounding_mode == "rs":
+            return ir.ROUNDING_MODE.RS
         raise ValueError(f"Invalid rounding mode: {rounding_mode}. Supported rounding modes are 'rtne' and 'rtz'.")
 
     def bitcast(self, input: TensorTy, dst_ty: tl.dtype) -> TensorTy:

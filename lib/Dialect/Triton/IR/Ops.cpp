@@ -856,6 +856,25 @@ LogicalResult ReshapeOp::verify() {
 
 //-- FpToFpOp --
 
+// Builder for FpToFpOp without rbits (regular conversion)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Attribute rounding) {
+  state.addOperands(src);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
+// Builder for FpToFpOp with rbits (stochastic rounding)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Value rbits, Attribute rounding) {
+  state.addOperands(src);
+  state.addOperands(rbits);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
 // Fold FpToFpOp when the input operand is a constant zero.
 OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
   auto srcVal = getSrc();

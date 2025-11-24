@@ -78,3 +78,60 @@ def clock64(_semantic=None):
         elapsed = end - start  # Number of clock cycles elapsed
     """
     return tl.tensor(_semantic.builder.create_clock64(), tl.int64)
+
+
+@tl.builtin
+def stoch_round(
+    src: tl.tensor,
+    dst_ty: tl.dtype,
+    rand_bits: tl.tensor,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Stochastic-rounding convert with optional saturation and ReLU.
+
+    Semantics (conceptually):
+        y = cvt_sr(x, rbits, dst, satfinite=True, relu=False)
+
+    Maps to (on Blackwell):
+        cvt.rs{.relu}.satfinite.<f8x4type>.f32  d, {a,b,e,f}, rbits
+        or corresponding bf16/f16 variants.
+
+    Args:
+        x:
+            Source values (typically fp32 / bf16 / f16). Shape defines output shape.
+        rbits:
+            List of random bits used for stochastic rounding. Must be a list of uint32 tensors
+            or values broadcastable to `x` .
+        dst:
+            Target low-precision format. Examples:
+                "bf16", "f16",
+                "e4m3", "e5m2",
+                "e4m3x2", "e4m3x4", "e5m2x2", "e5m2x4".
+        satfinite:
+            If True, clamp out-of-range values to the maximum finite value
+            representable in `dst` instead of producing inf/NaN.
+        relu:
+            If True, fuse ReLU: y = max(0, y) in the same instruction (where supported).
+
+    Returns:
+        Tensor with dtype implied by `dst` and shape compatible with `x`.
+    """
+    src_ty = src.type
+    src_sca_ty = src_ty.scalar
+
+    assert src_sca_ty == tl.float32, f"Stochastic rounding only supports fp32 source, got {src_sca_ty}"
+    assert dst_ty in [tl.float8e5, tl.float8e4nv, tl.float16,
+                      tl.bfloat16], (f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}")
+
+    if src_sca_ty == dst_ty:
+        return src
+    # Construct the proper result type (block type if source is block)
+    if src_ty.is_block():
+        result_ty = src_ty.with_element_ty(dst_ty)
+        dst_ir_ty = result_ty.to_ir(_semantic.builder)
+    else:
+        result_ty = dst_ty
+        dst_ir_ty = dst_ty.to_ir(_semantic.builder)
+    dst = _semantic.builder.create_cvt_rs(src.handle, dst_ir_ty, rand_bits.handle)
+    return tl.tensor(dst, result_ty)

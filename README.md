@@ -198,6 +198,26 @@ Examples: how mbarriers are communicated in warp specialization
         elapsed = end - start  # Number of clock cycles elapsed
     ```
 
+- `tlx.stoch_round(src, dst_dtype, rand_bits)`
+
+    Performs hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions on Blackwell GPUs (compute capability ≥ 100). Uses PTX `cvt.rs.satfinite` instructions for probabilistic rounding.
+
+    Parameters:
+    - `src`: Source FP32 tensor
+    - `dst_dtype`: Destination dtype (FP8 E5M2, FP8 E4M3FN, BF16, or FP16)
+    - `rand_bits`: Random bits (uint32 tensor) for entropy, same shape as src
+
+    Example:
+    ```python
+        # Generate random bits for entropy
+        offsets = tl.arange(0, BLOCK_SIZE // 4)
+        r0, r1, r2, r3 = tl.randint4x(seed, offsets, n_rounds=7)
+        rbits = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(x.shape)
+
+        # Apply stochastic rounding
+        y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    ```
+
 
 ## Kernels Implemented with TLX
 
