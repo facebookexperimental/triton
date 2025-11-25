@@ -180,6 +180,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             self.numCTASplit,
             self.numCTAOrder,
             self.fp4Padded,
+            self.swizzled,
         )
 
     def __str__(self) -> str:
@@ -189,7 +190,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
                 and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
                 and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
-                and self.fp4Padded == other.fp4Padded)
+                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
 
 
 class storage_kind(enum.Enum):
