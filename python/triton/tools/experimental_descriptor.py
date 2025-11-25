@@ -80,3 +80,7 @@ def create_1d_tma_descriptor_type(ptr, dim, block_dim, dtype):
 
 def create_2d_tma_descriptor_type(ptr, dim1, dim0, block_dim1, block_dim0, dtype):
     return TmaDescKernelParamType(ptr, [dim1, dim0], [block_dim1, block_dim0], dtype)
+
+
+def enable_in_pytorch():
+    return False
