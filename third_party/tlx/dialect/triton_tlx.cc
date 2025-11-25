@@ -588,6 +588,14 @@ void init_triton_tlx_ir(py::module &&m) {
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
            })
+      .def("create_cvt_rs",
+           [](TritonOpBuilder &self, Value &src, Type &dstType,
+              Value rbits) -> Value {
+             // Create rounding mode attribute
+             auto roundingAttr = tt::RoundingModeAttr::get(
+                 self.getContext(), tt::RoundingMode::RS);
+             return self.create<FpToFpOp>(dstType, src, rbits, roundingAttr);
+           })
       .def("create_cluster_cta_rank",
            [](TritonOpBuilder &self) -> Value {
              // The naming of ClusterCTAIdOp is bad. It actually returns the

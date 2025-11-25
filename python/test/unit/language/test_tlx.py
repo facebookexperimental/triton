@@ -2214,3 +2214,90 @@ def test_async_token_error(device):
     kernel = asycn_copy_kernel[grid](x, y, True)
     assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
     assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype",
+    [
+        ("float32", "float8_e5m2"),
+        ("float32", "float8_e4m3fn"),
+        ("float32", "float16"),
+        ("float32", "bfloat16"),
+    ],
+)
+def test_stoch_round(src_dtype, dst_dtype, device):
+
+    @triton.jit
+    def stoch_round_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        x = tl.load(x_ptr + offsets)
+        # Generate 1/4 shape for each random stream
+        offsets_quarter = tl.arange(0, BLOCK_SIZE // 4)
+        r0, r1, r2, r3 = tl.randint4x(0, offsets_quarter, n_rounds=7)
+        # Combine the 4 blocks into a single vector of random values
+        # r0,r1,r2,r3: each [BLOCK_SIZE//4]
+        # after joins: rbits: [BLOCK_SIZE]
+        rbits = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(x.shape)
+        y = tlx.stoch_round(
+            x,
+            tlx.dtype_of(y_ptr),
+            rbits,
+        )
+        tl.store(y_ptr + offsets, y)
+
+    # Map string names to torch dtypes
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e5m2": torch.float8_e5m2,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+    }
+
+    src_dtype_torch = dtype_map[src_dtype]
+    dst_dtype_torch = dtype_map[dst_dtype]
+
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device=device).to(src_dtype_torch)
+    b = torch.empty([SIZE], dtype=torch.float32, device=device).to(dst_dtype_torch)
+    grid = lambda meta: (1, )
+    kernel = stoch_round_kernel[grid](
+        a,
+        b,
+        BLOCK_SIZE=SIZE,
+        num_warps=1,
+    )
+    assert kernel.asm["ptx"].count("cvt.rs.satfinite") > 0
+
+    # Compare against PyTorch baseline
+    # PyTorch doesn't have stochastic rounding, so we verify the result
+    # is within the representable range and matches deterministic rounding
+    # for most values (stochastic should be close on average)
+    a_f32 = a.float()
+    b_ref = a_f32.to(dst_dtype_torch)  # PyTorch uses round-to-nearest-even
+
+    # Convert to float32 for validation (FP8 doesn't support all PyTorch ops)
+    b_back = b.float()
+
+    # Verify all values are in valid range (no NaN/Inf introduced)
+    assert not torch.isnan(b_back).any(), "Stochastic rounding produced NaN"
+    assert not torch.isinf(b_back).any(), "Stochastic rounding produced Inf"
+
+    # For values that don't need rounding (exact in FP8), should match exactly
+    exact_mask = b_back == a_f32
+    if exact_mask.any():
+        assert torch.equal(b[exact_mask],
+                           b_ref[exact_mask]), ("Values that don't need rounding should match deterministic rounding")
+
+    # For values that need rounding, verify they're in a reasonable range
+    # (stochastic rounding can pick either of two adjacent representable values,
+    # so we can't easily validate without knowing FP8 representation details)
+    needs_rounding = ~exact_mask
+    if needs_rounding.any():
+        # Basic sanity check: stochastic result should be reasonably close to input
+        # For FP8 e5m2, max representable is 57344, so use that as scale
+        max_expected_diff = 100.0  # Conservative bound for FP8 rounding error
+        diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
+        assert (diff < max_expected_diff).all(), (
+            f"Stochastic rounding produced unreasonably large errors: max diff = {diff.max()}")

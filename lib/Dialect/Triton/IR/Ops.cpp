@@ -856,6 +856,25 @@ LogicalResult ReshapeOp::verify() {
 
 //-- FpToFpOp --
 
+// Builder for FpToFpOp without rbits (regular conversion)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Attribute rounding) {
+  state.addOperands(src);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
+// Builder for FpToFpOp with rbits (stochastic rounding)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Value rbits, Attribute rounding) {
+  state.addOperands(src);
+  state.addOperands(rbits);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
 // Fold FpToFpOp when the input operand is a constant zero.
 OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
   auto srcVal = getSrc();
@@ -884,6 +903,105 @@ OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
   }
 
   return {};
+}
+
+//-- FpToFpOp --
+ParseResult FpToFpOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Parse: $src (`, rbits = ` $rbits `:` type($rbits))? (`, rounding = `
+  // $rounding)? attr-dict `:` type($src) `->` type($result)
+
+  OpAsmParser::UnresolvedOperand src;
+  Type srcType, resultType;
+
+  // Parse src operand
+  if (parser.parseOperand(src))
+    return failure();
+
+  // Try to parse optional clauses after comma
+  OpAsmParser::UnresolvedOperand rbits;
+  Type rbitsType;
+  bool hasRbits = false;
+  bool hasRounding = false;
+
+  while (succeeded(parser.parseOptionalComma())) {
+    // Check which clause we have
+    if (!hasRbits && succeeded(parser.parseOptionalKeyword("rbits"))) {
+      if (parser.parseEqual() || parser.parseOperand(rbits) ||
+          parser.parseColon() || parser.parseType(rbitsType))
+        return failure();
+      hasRbits = true;
+    } else if (!hasRounding &&
+               succeeded(parser.parseOptionalKeyword("rounding"))) {
+      // Parse rounding mode enum value
+      StringRef roundingStr;
+      if (parser.parseEqual() || parser.parseKeyword(&roundingStr))
+        return failure();
+
+      // Convert string to RoundingMode enum
+      auto roundingMode = triton::symbolizeRoundingMode(roundingStr);
+      if (!roundingMode) {
+        return parser.emitError(parser.getCurrentLocation(),
+                                "invalid rounding mode: ")
+               << roundingStr;
+      }
+
+      // Create RoundingModeAttr
+      auto roundingAttr =
+          triton::RoundingModeAttr::get(parser.getContext(), *roundingMode);
+      result.attributes.append("rounding", roundingAttr);
+      hasRounding = true;
+    } else {
+      return failure();
+    }
+  }
+
+  // Parse attr-dict (for any additional attributes)
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse `:` type($src) `->` type($result)
+  if (parser.parseColon() || parser.parseType(srcType) || parser.parseArrow() ||
+      parser.parseType(resultType))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperand(src, srcType, result.operands))
+    return failure();
+
+  if (hasRbits) {
+    if (parser.resolveOperand(rbits, rbitsType, result.operands))
+      return failure();
+  }
+
+  // Add result type
+  result.addTypes(resultType);
+
+  return success();
+}
+
+void FpToFpOp::print(OpAsmPrinter &p) {
+  // Print: $src (`, rbits = ` $rbits `:` type($rbits))? (`, rounding = `
+  // $rounding)? `:` type($src) `->` type($result)
+
+  p << " " << getSrc();
+
+  // Print rbits if present
+  if (getRbits()) {
+    p << ", rbits = " << getRbits() << " : " << getRbits().getType();
+  }
+
+  // Print rounding if present
+  if (getRounding()) {
+    p << ", rounding = " << getRounding();
+  }
+
+  // Don't print attributes that were explicitly handled
+  SmallVector<StringRef> elidedAttrs;
+  if (getRounding())
+    elidedAttrs.push_back("rounding");
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+
+  p << " : " << getSrc().getType() << " -> " << getType();
 }
 
 LogicalResult FpToFpOp::verify() {
