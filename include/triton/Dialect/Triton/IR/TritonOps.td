@@ -115,8 +115,6 @@ def TT_FpToFpOp : TT_Op<"fp_to_fp", [Elementwise,
     let hasVerifier = 1;
 
     let hasFolder = 1;
-
-    let hasCustomAssemblyFormat = 1;
 }
 
 //
