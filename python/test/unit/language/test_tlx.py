@@ -2219,6 +2219,7 @@ def test_async_token_error(device):
     assert kernel.asm["ttgir"].count("ttg.async_commit_group") == 1
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize(
     "src_dtype, dst_dtype",
     [
