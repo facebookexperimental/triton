@@ -43,7 +43,28 @@ configs = [
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 6,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
 ]
+
+
+def prune_configs_by_hdim(configs, named_args, **kwargs):
+    HEAD_DIM = kwargs["HEAD_DIM"]
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
+    # Only match HEAD_DIM for BLOCK_N
+    return [conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers]
 
 
 @triton.jit
@@ -243,7 +264,11 @@ def _softmax_inner_loop(
     return m_i, l_i, accum_cnt_qk
 
 
-@triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"])
+@triton.autotune(
+    configs=configs,
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"],
+    prune_configs_by={"early_config_prune": prune_configs_by_hdim},
+)
 @triton.jit
 def _attn_fwd_ws(sm_scale, M,  #
                  Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -258,7 +283,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
                  ):
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -1621,7 +1645,7 @@ attention = _attention.apply
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("N_CTX", [1024])
-@pytest.mark.parametrize("HEAD_DIM", [128])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("causal", [True, False])
@@ -1633,7 +1657,9 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
-    if mode == "fwd" and not causal:
+    if mode == "bwd" and HEAD_DIM == 64:
+        pytest.skip("Only test bwd with 128")
+    elif mode == "fwd" and not causal and HEAD_DIM == 128:
         pytest.skip("Only test fwd with causal")
     elif mode == "bwd" and causal:
         pytest.skip("Causal not supported for bwd yet")
