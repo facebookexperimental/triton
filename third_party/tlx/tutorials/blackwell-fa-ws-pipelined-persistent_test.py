@@ -182,7 +182,7 @@ def _mask_scalar(qk, col_limit_right, s, i):
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit_right, HEAD_DIM: tl.constexpr):
+def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -190,7 +190,7 @@ def _apply_causal_mask(qk, col_limit_right, HEAD_DIM: tl.constexpr):
     #
     # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
-    offs_n = tl.arange(0, HEAD_DIM)[None, :]
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF
     i = offs_n & 0xF
     return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
@@ -230,7 +230,7 @@ def _softmax_inner_loop(
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
-            qk = _apply_causal_mask(qk, col_limit_right, HEAD_DIM)
+            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
         # compute m_i, p in registers
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
