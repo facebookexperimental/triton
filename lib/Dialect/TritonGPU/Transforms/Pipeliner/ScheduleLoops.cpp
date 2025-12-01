@@ -351,7 +351,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (opLatency.count(op))
       lat = opLatency.lookup(op);
     // Only return the latency for the current op if minDist is INT_MAX
-    int d = (minDist == INT_MAX) ? lat : lat + minDist;
+    int d = (minDist == INT_MAX) ? lat : minDist;
     minDistanceMap[op] = d;
     return d;
   };
@@ -376,7 +376,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   DenseMap<Operation *, int> clusterMap;
   auto [chains, success] = determineIndependentDotChains(forOp, maxStages);
   size_t numDots = 0;
-  SmallVector<int> maxClusterPerDistance(maxPossibleDistance, -1);
+  SmallVector<int> maxClusterPerDistance(maxPossibleDistance + 1, -1);
   if (success) {
     size_t maxChainLength = 0;
     for (auto &chain : chains) {
@@ -671,9 +671,8 @@ scheduleKeyOpsUpstream(scf::ForOp forOp,
 
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency,
-                              int defaultNumStages) {
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
-  if (metaWS) {
+                              int defaultNumStages, bool useMetaWS) {
+  if (useMetaWS) {
     return scheduleKeyOpsMetaWS(forOp, opLatency, defaultNumStages);
   } else {
     return scheduleKeyOpsUpstream(forOp, opLatency);
@@ -684,16 +683,15 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency,
-                                  int defaultNumStages) {
+                                  int defaultNumStages, bool useMetaWS) {
   if (!isSafeToPipeline(forOp))
     return CoarseSchedule(0);
 
   // If the loop has assigned latencies, use them to determine the initial
   // schedule.
   if (hasLatenciesAssigned(forOp, opLatency))
-    return scheduleKeyOps(forOp, opLatency, defaultNumStages);
+    return scheduleKeyOps(forOp, opLatency, defaultNumStages, useMetaWS);
 
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
   if (forOp->hasAttr(kWarpSpecializeAttrName) &&
@@ -719,7 +717,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
       // FIXME: This should assert all latency ops have an assigned stage.
       if (schedule.count(&op))
         latencyStages.insert(schedule[&op].first);
-      else if (metaWS)
+      else if (useMetaWS)
         assert(false);
     }
     if (latencyStages.size() <= 1) {
@@ -787,10 +785,10 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
 }
 
 void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
-                  int defaultNumStages) {
+                  int defaultNumStages, bool useMetaWS) {
   // Based on the latencies, schedule the key ops to the stages.
   CoarseSchedule schedule =
-      getInitialSchedule(forOp, opLatency, defaultNumStages);
+      getInitialSchedule(forOp, opLatency, defaultNumStages, useMetaWS);
   if (schedule.empty())
     return;
   LLVM_DEBUG({
@@ -820,21 +818,20 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
     DBGS() << "Final coarse schedule:\n" << forOp << "\n";
   });
 
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   // Write the schedule to the IR
-  schedule.serialize(forOp, !metaWS);
+  schedule.serialize(forOp, !useMetaWS);
 }
 } // namespace
 
 /// Schedule the loops based on the latencies assigned to the operations.
-void scheduleLoops(ModuleOp moduleOp, int defaultNumStages) {
+void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
   DenseMap<Operation *, int> opLatency = deserializeLatencies(moduleOp);
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   if (loops.empty())
     return;
   for (auto forOp : loops) {
-    scheduleLoop(forOp, opLatency, defaultNumStages);
+    scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS);
   }
 }
 //===----------------------------------------------------------------------===//
@@ -847,7 +844,9 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages) {
 struct ScheduleLoops : public impl::TritonGPUScheduleLoopsBase<ScheduleLoops> {
   using TritonGPUScheduleLoopsBase::TritonGPUScheduleLoopsBase;
 
-  void runOnOperation() override { scheduleLoops(getOperation(), numStages); }
+  void runOnOperation() override {
+    scheduleLoops(getOperation(), numStages, useMetaWS);
+  }
 };
 
 } // namespace mlir::triton::gpu

@@ -170,7 +170,7 @@ public:
                       "doLoopSchedulePreprocessing\n"
                    << moduleOp << "\n\n\n";
     }
-    triton::gpu::scheduleLoops(moduleOp, defaultNumStages);
+    triton::gpu::scheduleLoops(moduleOp, defaultNumStages, true);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                       "doLoopSchedule\n"
