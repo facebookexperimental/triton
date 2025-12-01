@@ -344,7 +344,7 @@ def get_thirdparty_packages(packages: list, should_fix_permissions: bool = False
     return thirdparty_cmake_args
 
 
-def download_and_copy(name, src_func, dst_path, variable, version, url_func):
+def download_and_copy(name, src_func, dst_path, variable, version, url_func, should_fix_permissions=False):
     if is_offline_build():
         return
     triton_cache_path = get_triton_cache_path()
@@ -359,7 +359,8 @@ def download_and_copy(name, src_func, dst_path, variable, version, url_func):
     url = url_func(supported[system], arch, version)
     src_path = src_func(supported[system], arch, version)
     tmp_path = os.path.join(triton_cache_path, "nvidia", name)  # path to cache the download
-    dst_path = os.path.join(base_dir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    backend_path = os.path.join(base_dir, "third_party", "nvidia", "backend")
+    dst_path = os.path.join(backend_path, dst_path)  # final binary path
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if os.path.exists(dst_path) and system == "Linux" and shutil.which(dst_path) is not None:
@@ -377,6 +378,9 @@ def download_and_copy(name, src_func, dst_path, variable, version, url_func):
         shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
     else:
         shutil.copy(src_path, dst_path)
+
+    if should_fix_permissions:
+        fix_package_permissions(backend_path)
 
 
 # ---- cmake extension ----
@@ -553,6 +557,7 @@ def download_and_copy_dependencies():
         NVIDIA_TOOLCHAIN_VERSION = json.load(nvidia_version_file)
 
     exe_extension = sysconfig.get_config_var("EXE")
+    triton_override_package_permissions = check_env_flag("TRITON_OVERRIDE_PACKAGE_PERMISSIONS")
     download_and_copy(
         name="nvcc",
         src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
@@ -561,6 +566,7 @@ def download_and_copy_dependencies():
         version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
         url_func=lambda system, arch, version:
         f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        should_fix_permissions=triton_override_package_permissions,
     )
     download_and_copy(
         name="cuobjdump",
@@ -571,6 +577,7 @@ def download_and_copy_dependencies():
         version=NVIDIA_TOOLCHAIN_VERSION["cuobjdump"],
         url_func=lambda system, arch, version:
         f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cuobjdump/{system}-{arch}/cuda_cuobjdump-{system}-{arch}-{version}-archive.tar.xz",
+        should_fix_permissions=triton_override_package_permissions,
     )
     download_and_copy(
         name="nvdisasm",
@@ -581,6 +588,7 @@ def download_and_copy_dependencies():
         version=NVIDIA_TOOLCHAIN_VERSION["nvdisasm"],
         url_func=lambda system, arch, version:
         f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvdisasm/{system}-{arch}/cuda_nvdisasm-{system}-{arch}-{version}-archive.tar.xz",
+        should_fix_permissions=triton_override_package_permissions,
     )
     download_and_copy(
         name="nvcc",
