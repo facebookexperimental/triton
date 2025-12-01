@@ -43,7 +43,28 @@ configs = [
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 6,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
 ]
+
+
+def prune_configs_by_hdim(configs, named_args, **kwargs):
+    HEAD_DIM = kwargs["HEAD_DIM"]
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
+    # Only match HEAD_DIM for BLOCK_N
+    return [conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers]
 
 
 @triton.jit
@@ -161,7 +182,7 @@ def _mask_scalar(qk, col_limit_right, s, i):
 
 
 @triton.jit
-def _apply_causal_mask(qk, col_limit_right, HEAD_DIM: tl.constexpr):
+def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # Credit to Tri Dao,
@@ -169,7 +190,7 @@ def _apply_causal_mask(qk, col_limit_right, HEAD_DIM: tl.constexpr):
     #
     # NOTE: We use map_elementiwse here in order to generate an interleaved sequence of instructions
     # that processes one element of qk at a time. This improves ptxas's resulting SASS.
-    offs_n = tl.arange(0, HEAD_DIM)[None, :]
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
     s = offs_n & ~0xF
     i = offs_n & 0xF
     return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
@@ -209,7 +230,7 @@ def _softmax_inner_loop(
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
-            qk = _apply_causal_mask(qk, col_limit_right, HEAD_DIM)
+            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
         # compute m_i, p in registers
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -217,8 +238,8 @@ def _softmax_inner_loop(
         # -- compute correction factor
         alpha = tl.math.exp2(m_i - m_ij)
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
-        # Use alpha[0] for cid=0, and alpha[HEAD_DIM] for cid=1
-        tlx.local_store(tlx.local_view(alpha_tiles, cid * HEAD_DIM), alpha[:, None])
+        # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
+        tlx.local_store(tlx.local_view(alpha_tiles, cid * BLOCK_N), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
@@ -243,7 +264,11 @@ def _softmax_inner_loop(
     return m_i, l_i, accum_cnt_qk
 
 
-@triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"])
+@triton.autotune(
+    configs=configs,
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"],
+    prune_configs_by={"early_config_prune": prune_configs_by_hdim},
+)
 @triton.jit
 def _attn_fwd_ws(sm_scale, M,  #
                  Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -258,7 +283,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
                  ):
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -357,8 +381,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
                         # -- update output accumulator --
                         tlx.barrier_wait(alpha_fulls[cid], phase)
-                        # Use alpha[0] for cid=0, and alpha[HEAD_DIM] for cid=1
-                        alpha_1 = tlx.local_load(alpha_tiles[cid * HEAD_DIM])
+                        # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
+                        alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
                         tlx.barrier_arrive(alpha_empties[cid])
                         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                             subslice = tlx.subslice(
@@ -377,11 +401,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue
                     tlx.barrier_wait(l_fulls[cid], phase)
-                    # Use l[1]/l[1+HEAD_DIM] and m[2][2 + HEAD_DIM]
-                    # to disambigulate from alpha[0]/alpha[HEAD_DIM]
-                    l = tlx.local_load(l_tiles[cid * HEAD_DIM + 1])
+                    # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
+                    # to disambigulate from alpha[0]/alpha[BLOCK_N]
+                    l = tlx.local_load(l_tiles[cid * BLOCK_N + 1])
                     tlx.barrier_arrive(qk_empties[cid])
-                    m = tlx.local_load(m_tiles[cid * HEAD_DIM + 2])
+                    m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
                     m += tl.math.log2(l)
                     offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
                     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -479,10 +503,10 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
 
                 # prepare l_i for the epilog
-                # Use l[1]/l[1+HEAD_DIM] and m[2][2 + HEAD_DIM]
-                # to disambigulate from alpha[0]/alpha[HEAD_DIM]
-                tlx.local_store(l_tiles[cid * HEAD_DIM + 1], l_i[:, None])
-                tlx.local_store(m_tiles[cid * HEAD_DIM + 2], m_i[:, None])
+                # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
+                # to disambigulate from alpha[0]/alpha[BLOCK_N]
+                tlx.local_store(l_tiles[cid * BLOCK_N + 1], l_i[:, None])
+                tlx.local_store(m_tiles[cid * BLOCK_N + 2], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_idx += num_progs
 
@@ -1621,7 +1645,7 @@ attention = _attention.apply
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("N_CTX", [1024])
-@pytest.mark.parametrize("HEAD_DIM", [128])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("causal", [True, False])
@@ -1633,7 +1657,9 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
-    if mode == "fwd" and not causal:
+    if mode == "bwd" and HEAD_DIM == 64:
+        pytest.skip("Only test bwd with 128")
+    elif mode == "fwd" and not causal and HEAD_DIM == 128:
         pytest.skip("Only test fwd with causal")
     elif mode == "bwd" and causal:
         pytest.skip("Causal not supported for bwd yet")
