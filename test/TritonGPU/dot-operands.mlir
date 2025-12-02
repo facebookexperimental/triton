@@ -201,7 +201,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %cst_scales = arith.constant dense<127> : tensor<128x4xi8, #linear>
     %true = arith.constant true
 
-    %desc = tt.make_tensor_descriptor %scale_desc_ptr, [%c1_i32, %c2_i32, %c1_i32, %c32_i32, %c16_i32], [%c1024_i64, %c512_i64, %c512_i64, %c16_i64, %c1_i64] : !tt.ptr<i8>, <tensor<1x2x1x32x16xi8>>
+    %desc = tt.make_tensor_descriptor %scale_desc_ptr, [%c1_i32, %c2_i32, %c1_i32, %c32_i32, %c16_i32], [%c1024_i64, %c512_i64, %c512_i64, %c16_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<tensor<1x2x1x32x16xi8>>
     // CHECK: %[[DESC_LOAD:.*]] = tt.descriptor_load {{.*}} !tt.tensordesc<tensor<1x2x1x32x16xi8>> -> tensor<1x2x1x32x16xi8, #[[BLOCKED5]]>
     %83 = tt.descriptor_load %desc[%c0_i32, %c0_i32, %c0_i32, %c0_i32, %c0_i32] : !tt.tensordesc<tensor<1x2x1x32x16xi8>> -> tensor<1x2x1x32x16xi8, #blocked5>
     // CHECK: %[[SCALE_ALLOC:.*]] = ttg.local_alloc %[[DESC_LOAD]] : (tensor<1x2x1x32x16xi8, #[[BLOCKED5]]>) -> !ttg.memdesc<1x2x1x32x16xi8, #[[SHARED2]], #[[SMEM]]>

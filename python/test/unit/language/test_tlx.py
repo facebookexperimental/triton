@@ -2425,3 +2425,60 @@ def test_stoch_round_entropy_quality(device):
     different_count = (b1.float() != b2.float()).sum().item()
     assert different_count > SIZE * 0.1, (f"Different seeds should produce different results, "
                                           f"but only {different_count}/{SIZE} values differ")
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_make_tensor_descriptor(device):
+    """Test global_alloc and make_tensor_descriptor together with TMA operations."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr, SIZE, BLOCK_SIZE: tl.constexpr):
+        # Allocate descriptor in global scratch memory using global_alloc
+        desc_ptr = tlx.global_alloc(nbytes=256, alignment=128)
+
+        # Create tensor descriptor using the global scratch pointer
+        desc_in = tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr,
+            base=input_ptr,
+            shape=[SIZE],
+            strides=[tl.constexpr(1)],
+            block_shape=[BLOCK_SIZE],
+        )
+
+        desc_out = tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr + 128,
+            base=output_ptr,
+            shape=[SIZE],
+            strides=[tl.constexpr(1)],
+            block_shape=[BLOCK_SIZE],
+        )
+
+        # Compute tile offset
+        pid = tl.program_id(0)
+        offset = pid * BLOCK_SIZE
+
+        # Load and store using standard descriptors
+        x = desc_in.load([offset])
+        desc_out.store([offset], x)
+
+    triton.set_allocator(alloc_fn)
+    SIZE = 128
+    BLOCK_SIZE = 64
+    x = torch.ones((SIZE, ), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(SIZE, BLOCK_SIZE), )
+
+    compiled_kernel = kernel[grid](x, y, SIZE, BLOCK_SIZE=BLOCK_SIZE)
+
+    # Check that both global_scratch_alloc and tensormap_create were generated in IR
+    ttgir = compiled_kernel.asm["ttgir"]
+    assert ttgir.count("ttg.global_scratch_alloc") == 1, "Expected 1 global_scratch_alloc operation"
+    assert ttgir.count("ttng.tensormap_create") == 2, "Expected 2 tensormap_create operations"
+
+    # Verify the data was copied correctly through TMA operations
+    torch.testing.assert_close(x, y)
