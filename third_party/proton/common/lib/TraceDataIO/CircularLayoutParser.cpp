@@ -37,8 +37,13 @@ const CircularLayoutParserConfig &CircularLayoutParser::getConfig() const {
 
 void CircularLayoutParser::parseMetadata() {
   uint32_t preamble = decoder.decode<I32Entry>()->value;
-  if (preamble != kPreamble)
+  if (preamble != kPreamble) {
+    if (std::getenv("PROTON_DISABLE_PREAMBLE_CHECK")) {
+      std::cerr << "Warning: Invalid preamble" << std::endl;
+      return;
+    }
     throw PreambleException("Invalid preamble");
+  }
   auto &bt = result->blockTraces.emplace_back();
   bt.blockId = decoder.decode<I32Entry>()->value;
   bt.procId = decoder.decode<I32Entry>()->value;

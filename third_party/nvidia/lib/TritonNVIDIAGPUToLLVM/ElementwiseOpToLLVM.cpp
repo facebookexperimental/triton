@@ -467,6 +467,143 @@ struct FpToFpOpConversion
             convDesc.numElements};
   }
 
+  SmallVector<Value>
+  lowerFpToFpWithStochRounding(mlir::triton::FpToFpOp op, OpAdaptor adaptor,
+                               ConversionPatternRewriter &rewriter, Type elemTy,
+                               Location loc) const {
+    // Check compute capability
+    assert(
+        computeCapability >= 100 &&
+        "Stochastic rounding requires compute capability >= 100 (Blackwell)");
+
+    auto srcElementType = getElementType(op.getSrc());
+    auto dstElementType = getElementType(op.getResult());
+
+    assert(
+        (llvm::isa<Float32Type>(srcElementType) &&
+         llvm::isa<Float8E4M3FNType, Float8E5M2Type, Float16Type, BFloat16Type>(
+             dstElementType)) &&
+        "Stochastic rounding only works for fp32->fp16 or fp32->fp8");
+
+    // Check that we have rbits operand
+    assert(op.getRbits() && "Stochastic rounding mode requires rbits operand");
+
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    // Get source operands - unpack from the adaptor
+    auto srcValue = adaptor.getSrc();
+    auto srcOperands = unpackLLElements(loc, srcValue, rewriter);
+
+    // Get rbits operands - unpack from the adaptor
+    auto rbitsValue = adaptor.getRbits();
+    auto rbitsOperands = unpackLLElements(loc, rbitsValue, rewriter);
+
+    // Determine pack size based on destination type:
+    // - FP8: 4 elements (cvt.rs.satfinite.{e4m3,e5m2}x4.f32)
+    // - BF16/FP16: 2 elements (cvt.rs.satfinite.{bf16,f16}x2.f32)
+    // Note: If a thread processes fewer elements than packSize, we will pad
+    // with undef values to fill the complete pack required by the PTX
+    // instruction.
+    unsigned packSize = 1;
+    if (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(dstElementType)) {
+      packSize = 4; // FP8 packs 4 elements
+    } else if (dstElementType.isBF16() || dstElementType.isF16()) {
+      packSize = 2; // BF16/FP16 packs 2 elements
+    }
+
+    SmallVector<Value> outVals;
+
+    // Helper to generate PTX instruction string for stochastic rounding
+    auto getPTXInstructionForStochRounding =
+        [](Type dstElementType) -> std::string {
+      if (llvm::isa<Float8E4M3FNType>(dstElementType))
+        return "cvt.rs.satfinite.e4m3x4.f32 $0, {$1, $2, $3, $4}, $5;";
+      if (llvm::isa<Float8E5M2Type>(dstElementType))
+        return "cvt.rs.satfinite.e5m2x4.f32 $0, {$1, $2, $3, $4}, $5;";
+      if (dstElementType.isBF16())
+        return "cvt.rs.satfinite.bf16x2.f32 $0, $1, $2, $3;";
+      if (dstElementType.isF16())
+        return "cvt.rs.satfinite.f16x2.f32 $0, $1, $2, $3;";
+      llvm_unreachable("Unsupported destination type for stochastic rounding");
+    };
+
+    std::string ptxAsm = getPTXInstructionForStochRounding(dstElementType);
+
+    // Process elements in packs
+    for (unsigned i = 0; i < srcOperands.size(); i += packSize) {
+      SmallVector<Value> srcPack;
+      SmallVector<Value> rbitsPack;
+
+      // Collect pack of source values and corresponding rbits
+      for (unsigned j = 0; j < packSize && i + j < srcOperands.size(); ++j) {
+        srcPack.push_back(srcOperands[i + j]);
+        if (i + j < rbitsOperands.size()) {
+          rbitsPack.push_back(rbitsOperands[i + j]);
+        }
+      }
+
+      // Remember how many real elements we have before padding
+      unsigned numRealElements = srcPack.size();
+
+      // Pad with undef if we have fewer elements than packSize
+      // (This can happen when each thread processes fewer elements than the
+      // pack size)
+      auto f32Ty = f32_ty;
+      auto i32Ty = int_ty(32);
+      while (srcPack.size() < packSize) {
+        srcPack.push_back(b.undef(f32Ty));
+        rbitsPack.push_back(b.undef(i32Ty));
+      }
+
+      // Create entropy pool by combining random bits using XOR and bit shifts
+      // Pattern: rbits = r0 ^ (r1 << 1) ^ (r2 << 2) ^ (r3 << 3)
+      //
+      // This ensures each packed element gets a unique random value for
+      // stochastic rounding. The shift-XOR combination distributes entropy
+      // across all bit positions, preventing correlation between adjacent
+      // elements in the pack which could introduce rounding bias.
+      //
+      // Hardware requirement: The PTX cvt.rs instruction expects a single
+      // uint32 entropy value per pack (not per element), which is why we
+      // combine multiple random bits this way.
+      Value rbits = rbitsPack[0];
+
+      for (unsigned j = 1; j < rbitsPack.size(); ++j) {
+        // Shift r[j] by j positions to decorrelate bit patterns
+        Value shiftAmount = b.i32_val(j);
+        Value shifted =
+            rewriter.create<LLVM::ShlOp>(loc, i32Ty, rbitsPack[j], shiftAmount);
+        // XOR with accumulated rbits to mix entropy sources
+        rbits = rewriter.create<LLVM::XOrOp>(loc, i32Ty, rbits, shifted);
+      }
+
+      // Emit PTX inline assembly for stochastic rounding
+      PTXBuilder builder;
+      auto &ptxOp = *builder.create(ptxAsm);
+      auto res = builder.newOperand("=r", "r");
+      SmallVector<PTXBuilder::Operand *> operands;
+      operands.push_back(res);
+      for (Value v : srcPack) {
+        operands.push_back(builder.newOperand(v, "r"));
+      }
+      operands.push_back(builder.newOperand(rbits, "r"));
+      ptxOp(operands, /*onlyAttachMLIRArgs=*/true);
+
+      // Extract and unpack result
+      auto outElementType = getTypeConverter()->convertType(dstElementType);
+      auto outType = vec_ty(outElementType, packSize);
+      Value result = builder.launch(rewriter, loc, outType, false);
+
+      // Only extract the real (non-padded) elements
+      for (unsigned j = 0; j < numRealElements; ++j) {
+        outVals.push_back(
+            b.extract_element(outElementType, result, b.i32_val(j)));
+      }
+    }
+
+    return outVals;
+  }
+
   SmallVector<Value> createDestOps(FpToFpOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
@@ -475,6 +612,10 @@ struct FpToFpOpConversion
     auto srcElementType = getElementType(op.getSrc());
     auto dstElementType = getElementType(op.getResult());
     auto roundingMode = op.getRounding();
+
+    if (roundingMode.has_value() && roundingMode.value() == RoundingMode::RS) {
+      return lowerFpToFpWithStochRounding(op, adaptor, rewriter, elemTy, loc);
+    }
 
     if (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(dstElementType)) {
       assert(roundingMode.has_value() &&

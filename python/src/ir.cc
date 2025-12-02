@@ -324,7 +324,8 @@ void init_triton_ir(py::module &&m) {
 
   py::enum_<RoundingMode>(m, "ROUNDING_MODE", py::module_local())
       .value("RTZ", RoundingMode::RTZ)
-      .value("RTNE", RoundingMode::RTNE);
+      .value("RTNE", RoundingMode::RTNE)
+      .value("RS", RoundingMode::RS);
 
   py::enum_<PropagateNan>(m, "PROPAGATE_NAN", py::module_local())
       .value("NONE", PropagateNan::NONE)

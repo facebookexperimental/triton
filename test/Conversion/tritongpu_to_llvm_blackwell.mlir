@@ -34,6 +34,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @fp32_to_fp8_stochastic_rounding
+  tt.func @fp32_to_fp8_stochastic_rounding(%arg0: tensor<128xf32, #blocked>,
+                                           %rbits: tensor<128xi32, #blocked>) {
+    // Test stochastic rounding with rbits parameter on Blackwell
+    // CHECK: cvt.rs.satfinite.e5m2x4.f32
+    %0 = tt.fp_to_fp %arg0, rbits = %rbits : tensor<128xi32, #blocked>, rounding = rs : tensor<128xf32, #blocked> -> tensor<128xf8E5M2, #blocked>
+    // CHECK: cvt.rs.satfinite.e4m3x4.f32
+    %1 = tt.fp_to_fp %arg0, rbits = %rbits : tensor<128xi32, #blocked>, rounding = rs : tensor<128xf32, #blocked> -> tensor<128xf8E4M3FN, #blocked>
+    // CHECK: cvt.rs.satfinite.bf16x2.f32
+    %2 = tt.fp_to_fp %arg0, rbits = %rbits : tensor<128xi32, #blocked>, rounding = rs : tensor<128xf32, #blocked> -> tensor<128xbf16, #blocked>
+    // CHECK: cvt.rs.satfinite.f16x2.f32
+    %3 = tt.fp_to_fp %arg0, rbits = %rbits : tensor<128xi32, #blocked>, rounding = rs : tensor<128xf32, #blocked> -> tensor<128xf16, #blocked>
+    tt.return
+  }
+}
+
+
+// -----
+
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16}>
