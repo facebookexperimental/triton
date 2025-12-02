@@ -903,7 +903,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %strides_x: i64,
     %strides_y: i64) -> (){
     scf.for %iv = %lb to %ub step %step : index {
-      %desc = tt.make_tensor_descriptor %A, [%shape_x, %shape_y], [%strides_x, %strides_y] {loop.cluster = 0 : i32, loop.stage = 1 : i32} : <f16>, <tensor<128x128xf16, #nvmma_128>>
+      %desc = tt.make_tensor_descriptor %A, [%shape_x, %shape_y], [%strides_x, %strides_y] {loop.cluster = 0 : i32, loop.stage = 1 : i32} : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #nvmma_128>>
       "use"(%desc) {loop.cluster = 0 : i32, loop.stage = 1 : i32} : (!tt.tensordesc<tensor<128x128xf16, #nvmma_128>>) -> ()
     } {tt.scheduled_max_stage = 1 : i32}
     tt.return
@@ -1401,9 +1401,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c32_i32 = arith.constant 32 : i32
     %c32_i64 = arith.constant 32 : i64
     %cst_0 = arith.constant dense<127> : tensor<128x4xi8, #linear>
-    %0 = tt.make_tensor_descriptor %arg6, [%c32_i32, %c32_i32], [%c32_i64, %c1_i64] : <f8E4M3FN>, <tensor<1x128xf8E4M3FN, #shared>>
-    %1 = tt.make_tensor_descriptor %arg9, [%c32_i32, %c32_i32, %c32_i32], [%c32_i64, %c32_i64, %c1_i64] : <i8>, <tensor<1x64x256xi8, #shared1>>
-    %2 = tt.make_tensor_descriptor %arg12, [%c32_i32, %c32_i32, %c32_i32, %c32_i32, %c16_i32], [%c32_i64, %c32_i64, %c32_i64, %c16_i64, %c1_i64] : <i8>, <tensor<1x2x1x32x16xi8, #shared2>>
+    %0 = tt.make_tensor_descriptor %arg6, [%c32_i32, %c32_i32], [%c32_i64, %c1_i64] : !tt.ptr<f8E4M3FN>, !tt.tensordesc<tensor<1x128xf8E4M3FN, #shared>>
+    %1 = tt.make_tensor_descriptor %arg9, [%c32_i32, %c32_i32, %c32_i32], [%c32_i64, %c32_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<tensor<1x64x256xi8, #shared1>>
+    %2 = tt.make_tensor_descriptor %arg12, [%c32_i32, %c32_i32, %c32_i32, %c32_i32, %c16_i32], [%c32_i64, %c32_i64, %c32_i64, %c16_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<tensor<1x2x1x32x16xi8, #shared2>>
     %3 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #blocked1}>>
     %4 = ttng.tmem_alloc %cst_0 : (tensor<128x4xi8, #linear>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
     %5, %acc_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
