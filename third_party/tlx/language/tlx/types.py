@@ -7,7 +7,6 @@ from triton._C.libtriton import ir
 
 
 class layout_encoding:
-
     def __init__(self):
         pass
 
@@ -19,7 +18,6 @@ class layout_encoding:
 
 
 class shared_layout_encoding(layout_encoding):
-
     def __init__(self):
         super().__init__()
         pass
@@ -37,7 +35,6 @@ class shared_layout_encoding(layout_encoding):
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
-
     def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
         super().__init__()
         self.vectorSize = vectorSize
@@ -96,7 +93,6 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
-
     def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
@@ -130,7 +126,6 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
-
     def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded, swizzled):
         super().__init__()
         self.shape = shape
@@ -193,10 +188,17 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
 
     def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
-                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
-                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
-                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
+        return (
+            type(self) is type(other)
+            and self.shape == other.shape
+            and self.order == other.order
+            and self.elemType == other.elemType
+            and self.numCTAsPerCGA == other.numCTAsPerCGA
+            and self.numCTASplit == other.numCTASplit
+            and self.numCTAOrder == other.numCTAOrder
+            and self.fp4Padded == other.fp4Padded
+            and self.swizzled == other.swizzled
+        )
 
 
 class storage_kind(enum.Enum):
@@ -261,7 +263,6 @@ class buffered_tensor(tl.base_value):
 
 
 class buffered_tensor_type(tl.block_type):
-
     def __init__(
         self,
         element_ty: tl.dtype,
@@ -293,8 +294,12 @@ class buffered_tensor_type(tl.block_type):
         return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
 
     def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
-                and self.num == other.num)
+        return (
+            type(self) is type(other)
+            and self.shape == other.shape
+            and self.layout == other.layout
+            and self.num == other.num
+        )
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
@@ -327,7 +332,8 @@ class mbarrier(tl.base_value):
         storage: storage_kind = storage_kind.smem,
     ):
         assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
-            "mbarrier requires storage to be smem or smemCluster")
+            "mbarrier requires storage to be smem or smemCluster"
+        )
         self.handle = handle
         self.type = mbarrier_type(num, layout, storage)
         self.num = num
@@ -344,7 +350,6 @@ class mbarrier(tl.base_value):
 
 
 class mbarrier_type(buffered_tensor_type):
-
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage):
         super().__init__(tl.int64, [1], num, storage, layout)
 
@@ -445,7 +450,6 @@ class async_token(tl.base_value):
 
 
 class async_token_type(tl.base_type):
-
     def __init__(self, value):
         self.value = value
 
@@ -463,3 +467,62 @@ class async_token_type(tl.base_type):
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int):
         return async_token(handles[cursor]), cursor + 1
+
+
+class tensor_descriptor_ptr(tl.base_value):
+    """
+    A pointer type for tensor descriptors with 128-byte stride semantics.
+    When performing pointer arithmetic (ptr + 1), the pointer advances by 128 bytes,
+    which is the size of a single tensor descriptor.
+    """
+
+    def __init__(self, handle, num: int, descriptor_size: int):
+        super().__init__()
+        self.handle = handle
+        self.type = tensor_descriptor_ptr_type(num, descriptor_size)
+
+    @property
+    def num(self) -> int:
+        """Number of descriptors this pointer can access."""
+        return self.type.num
+
+    @property
+    def descriptor_size(self) -> int:
+        """Size of each descriptor in bytes."""
+        return self.type.size
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        raise NotImplementedError
+
+
+class tensor_descriptor_ptr_type(tl.pointer_type):
+    """
+    Type for pointers to tensor descriptors.
+    Encodes size-byte stride semantics for pointer arithmetic.
+    """
+
+    def __init__(self, num: int, size: int = 128):
+        # Initialize with a block type of size int8 elements to get size-byte stride
+        element_type = tl.block_type(tl.int8, [size])
+        super().__init__(element_type, address_space=1)
+        # Number of descriptors this pointer can access (1 means single descriptor)
+        self.num = num
+        # Size of each descriptor in bytes
+        self.size = size
+
+    def __eq__(self, other):
+        return isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size
+
+    def __repr__(self) -> str:
+        return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"
+
+    def mangle(self) -> str:
+        if self.num > 1:
+            return f"tensor_desc_ptr_{self.num}_{self.size}"
+        return f"tensor_desc_ptr_{self.size}"
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int):
+        return tensor_descriptor_ptr(handles[cursor], self.num, self.size), cursor + 1

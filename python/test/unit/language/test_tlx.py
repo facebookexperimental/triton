@@ -2629,7 +2629,7 @@ def test_stoch_round_entropy_quality(device):
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_make_tensor_descriptor(device):
-    """Test global_alloc and make_tensor_descriptor together with TMA operations."""
+    """Test allocate_tensor_descriptor and make_tensor_descriptor together with TMA operations."""
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
@@ -2638,20 +2638,20 @@ def test_make_tensor_descriptor(device):
 
     @triton.jit
     def kernel(input_ptr, output_ptr, SIZE, BLOCK_SIZE: tl.constexpr):
-        # Allocate descriptor in global scratch memory using global_alloc
-        desc_ptr = tlx.global_alloc(nbytes=256, alignment=128)
+        # Allocate descriptor in global scratch memory using allocate_tensor_descriptor
+        desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
 
         # Create tensor descriptor using the global scratch pointer
-        desc_in = tlx.make_tensor_descriptor(
-            desc_ptr=desc_ptr,
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
             base=input_ptr,
             shape=[SIZE],
             strides=[tl.constexpr(1)],
             block_shape=[BLOCK_SIZE],
         )
 
-        desc_out = tlx.make_tensor_descriptor(
-            desc_ptr=desc_ptr + 128,
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptrs[1],
             base=output_ptr,
             shape=[SIZE],
             strides=[tl.constexpr(1)],
@@ -2663,6 +2663,17 @@ def test_make_tensor_descriptor(device):
         offset = pid * BLOCK_SIZE
 
         # Load and store using standard descriptors
+        # Reinterpret pointers as tensor descriptors
+        desc_in = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
+            block_shape=[BLOCK_SIZE],
+            dtype=tlx.dtype_of(input_ptr),
+        )
+        desc_out = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptrs[1],
+            block_shape=[BLOCK_SIZE],
+            dtype=tlx.dtype_of(output_ptr),
+        )
         x = desc_in.load([offset])
         desc_out.store([offset], x)
 
@@ -2679,6 +2690,7 @@ def test_make_tensor_descriptor(device):
     ttgir = compiled_kernel.asm["ttgir"]
     assert ttgir.count("ttg.global_scratch_alloc") == 1, "Expected 1 global_scratch_alloc operation"
     assert ttgir.count("ttng.tensormap_create") == 2, "Expected 2 tensormap_create operations"
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 2, "Expected 2 reinterpret_tensor_descriptor operations"
 
     # Verify the data was copied correctly through TMA operations
     torch.testing.assert_close(x, y)
