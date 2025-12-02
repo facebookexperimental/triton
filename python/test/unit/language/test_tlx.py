@@ -2311,7 +2311,7 @@ def test_stoch_round_partial_pack(dst_dtype, device):
 
     @triton.jit
     def stoch_round_partial_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr, BLOCK_SIZE_ROUNDED: tl.constexpr,
-                                    QUARTER_SIZE_ROUNDED: tl.constexpr):
+                                   QUARTER_SIZE_ROUNDED: tl.constexpr):
         # Use power-of-2 size for arange (triton requirement), then mask to actual size
         offsets_full = tl.arange(0, BLOCK_SIZE_ROUNDED)
         mask = offsets_full < BLOCK_SIZE
@@ -2357,8 +2357,8 @@ def test_stoch_round_partial_pack(dst_dtype, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-@pytest.mark.parametrize("invalid_src, invalid_dst",
-                         [("float16", "float8_e5m2"), ("bfloat16", "float16"), ("float32", "int32")])
+@pytest.mark.parametrize("invalid_src, invalid_dst", [("float16", "float8_e5m2"), ("bfloat16", "float16"),
+                                                      ("float32", "int32")])
 def test_stoch_round_invalid_dtypes(invalid_src, invalid_dst, device):
     """Test that invalid dtype combinations raise proper errors."""
 
@@ -2423,6 +2423,5 @@ def test_stoch_round_entropy_quality(device):
 
     # Results should be different for at least some values
     different_count = (b1.float() != b2.float()).sum().item()
-    assert different_count > SIZE * 0.1, (
-        f"Different seeds should produce different results, "
-        f"but only {different_count}/{SIZE} values differ")
+    assert different_count > SIZE * 0.1, (f"Different seeds should produce different results, "
+                                          f"but only {different_count}/{SIZE} values differ")
