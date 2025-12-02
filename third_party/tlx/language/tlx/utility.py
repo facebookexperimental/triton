@@ -111,21 +111,16 @@ def stoch_round(
         Tensor with dtype dst_ty and shape matching src.
     """
     capability = int(cuda_parse_arch(_semantic.builder.options.arch))
-    assert capability >= 100, (
-        f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
-        f"current capability: {capability}"
-    )
+    assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
+                               f"current capability: {capability}")
     src_ty = src.type
     src_sca_ty = src_ty.scalar
 
-    assert src_sca_ty == tl.float32, (
-        f"Stochastic rounding only supports fp32 source, got {src_sca_ty}. "
-        f"Source must be float32."
-    )
-    assert dst_ty in [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16], (
-        f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}. "
-        f"Supported types: float8e5 (fp8 E5M2), float8e4nv (fp8 E4M3FN), float16, bfloat16"
-    )
+    assert src_sca_ty == tl.float32, (f"Stochastic rounding only supports fp32 source, got {src_sca_ty}. "
+                                      f"Source must be float32.")
+    assert dst_ty in [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16
+                      ], (f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}. "
+                          f"Supported types: float8e5 (fp8 E5M2), float8e4nv (fp8 E4M3FN), float16, bfloat16")
 
     # Verify rbits shape matches src shape
     rbits_ty = rand_bits.type
