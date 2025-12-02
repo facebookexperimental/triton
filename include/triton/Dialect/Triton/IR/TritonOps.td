@@ -1054,7 +1054,7 @@ def TT_MakeTensorPtrOp : TT_Op<"make_tensor_ptr",
 //
 def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
     Pure,
-    SameVariadicOperandSize,
+    AttrSizedOperandSegments,
 ]> {
   let summary = "Make a tensor descriptor type with meta information of the parent tensor and block size";
 
@@ -1067,15 +1067,18 @@ def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
     TT_Ptr:$base,
     Variadic<I32>:$shape,
     Variadic<I64>:$strides,
+    Optional<TT_Ptr>:$descPtr,
     DefaultValuedAttr<TT_PaddingOptionAttr, "::mlir::triton::PaddingOption::PAD_ZERO">:$padding
   );
 
   let results = (outs TT_TensorDescType:$result);
 
-  let assemblyFormat = "$base `,` `[` $shape `]` `,` `[` $strides `]` attr-dict `:` type($base) `,` type($result)";
+  let hasCustomAssemblyFormat = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$base, "ValueRange":$shape, "ValueRange":$strides, "ArrayRef<int32_t>":$blockShape, "bool":$isSignedInteger,
+    "triton::PaddingOption":$padding)>,
+    OpBuilder<(ins "Value":$base, "ValueRange":$shape, "ValueRange":$strides, "Value":$descPtr, "ArrayRef<int32_t>":$blockShape, "bool":$isSignedInteger,
     "triton::PaddingOption":$padding)>
   ];
 

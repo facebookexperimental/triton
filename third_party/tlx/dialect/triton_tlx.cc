@@ -619,6 +619,24 @@ void init_triton_tlx_ir(py::module &&m) {
              Value remoteBuf = self.create<ttng::MapToRemoteBufferOp>(
                  newBufferType, src, clusterCTARank);
              return remoteBuf;
+           })
+      .def("create_global_scratch_alloc",
+           [](TritonOpBuilder &self, int nbytes, int alignment) -> Value {
+             auto context = self.getBuilder().getContext();
+             auto ptrType = triton::PointerType::get(
+                 self.getBuilder().getI8Type(), /*addressSpace=*/1);
+             return self.create<ttg::GlobalScratchAllocOp>(ptrType, nbytes,
+                                                           alignment);
+           })
+      // Make a tensor descriptor with optional desc_ptr
+      .def("create_make_tensor_descriptor",
+           [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
+              std::vector<Value> &strides, Value &descPtr,
+              std::vector<int32_t> &tensorShape, bool isSignedInteger,
+              tt::PaddingOption paddingOption) -> Value {
+             return self.create<tt::MakeTensorDescOp>(
+                 base, shape, strides, descPtr, tensorShape, isSignedInteger,
+                 paddingOption);
            });
 }
 

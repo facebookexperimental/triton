@@ -69,6 +69,39 @@ While this approach places more responsibility on the user, it reduces the compi
 
    Store a chunk of data from local memory into global memory buffer. The global address, strides, and buffer size are defined by the memory descriptor.
 
+- `tlx.make_tensor_descriptor(desc_ptr, base, shape, strides, block_shape, padding_option)`
+
+   Create a TMA (Tensor Memory Accelerator) descriptor for efficient asynchronous data movement on Hopper and Blackwell GPUs.
+
+   **Parameters:**
+   - `desc_ptr` (optional): Pointer to global memory for descriptor storage. Pass `None` for automatic allocation.
+   - `base`: Base pointer to the tensor in global memory
+   - `shape`: List of tensor dimensions (dynamic, runtime values)
+   - `strides`: List of tensor strides (dynamic, runtime values)
+   - `block_shape`: Shape of the block to be loaded/stored (compile-time constants)
+   - `padding_option`: Padding option for out-of-bounds accesses (default: "zero")
+
+   **Example:**
+   ```python
+   # Create a 2D tensor descriptor with automatic scratch allocation
+   desc = tlx.make_tensor_descriptor(
+       desc_ptr=None,  # Compiler allocates scratch memory automatically
+       base=tensor_ptr,
+       shape=[M, N],
+       strides=[N, tl.constexpr(1)],
+       block_shape=[64, 64],
+   )
+
+   # Or with explicit scratch allocation for advanced use cases
+   desc_ptr = tlx.global_alloc(nbytes=128, alignment=128)
+   desc = tlx.make_tensor_descriptor(
+       desc_ptr=desc_ptr,
+       base=tensor_ptr,
+       shape=[M, N],
+       strides=[N, tl.constexpr(1)],
+       block_shape=[64, 64],
+   )
+   ```
 
 - `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`
 
