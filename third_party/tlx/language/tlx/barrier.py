@@ -27,8 +27,11 @@ def alloc_barriers(
         layout.numCTASplit,
         layout.numCTAOrder,
     )
-    return tlx.mbarrier(_semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count.value, layout_handle),
-                        num_barriers, layout, _semantic)
+    return tlx.mbarrier(
+        _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count.value, layout_handle),
+        num_barriers,
+        layout,
+    )
 
 
 @tl.builtin

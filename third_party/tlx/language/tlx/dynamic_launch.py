@@ -1,6 +1,7 @@
 import triton.language.core as tl
 
 from . import types as tlx
+from .mem_ops import local_view
 from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
 
 # Blackwell-only
@@ -25,7 +26,6 @@ def _alloc_clc_responses(
         _semantic.builder.create_alloc_clc_responses(num_responses, layout_handle),
         num_responses,
         layout,
-        _semantic,
     )
 
 
@@ -60,30 +60,34 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
         clc_mbars_empty=alloc_barriers(num_barriers=num_stages, arrive_count=num_consumers, _semantic=_semantic),
         clc_mbars_full=alloc_barriers(num_barriers=num_stages, _semantic=_semantic),
         clc_responses=_alloc_clc_responses(num_responses=num_stages, _semantic=_semantic),
-        _semantic=_semantic,
     )
 
 
 @tl.builtin
 def clc_producer(context, k, p_producer, _semantic=None):
     # acquire
-    barrier_wait(context._clc_mbars_empty[k], p_producer, _semantic=_semantic)
+    barrier_wait(local_view(context._clc_mbars_empty, k, _semantic=_semantic), p_producer, _semantic=_semantic)
 
     # commit
-    barrier_expect_bytes(context._clc_mbars_full[k], tl.constexpr(16), _semantic=_semantic)
-    _clc_issue(context._clc_responses[k], context._clc_mbars_full[k], _semantic=_semantic)
+    barrier_expect_bytes(local_view(context._clc_mbars_full, k, _semantic=_semantic), tl.constexpr(16),
+                         _semantic=_semantic)
+    _clc_issue(
+        local_view(context._clc_responses, k, _semantic=_semantic),
+        local_view(context._clc_mbars_full, k, _semantic=_semantic),
+        _semantic=_semantic,
+    )
 
 
 @tl.builtin
 def clc_consumer(context, k, p_consumer, _semantic=None):
     # wait
-    barrier_wait(context._clc_mbars_full[k], p_consumer, _semantic=_semantic)
+    barrier_wait(local_view(context._clc_mbars_full, k, _semantic=_semantic), p_consumer, _semantic=_semantic)
 
     # extract
-    stolen_tile_id = _clc_query(context._clc_responses[k], _semantic=_semantic)
+    stolen_tile_id = _clc_query(local_view(context._clc_responses, k, _semantic=_semantic), _semantic=_semantic)
 
     # release
-    barrier_arrive(context._clc_mbars_empty[k], _semantic=_semantic)
+    barrier_arrive(local_view(context._clc_mbars_empty, k, _semantic=_semantic), _semantic=_semantic)
 
     # return
     return stolen_tile_id

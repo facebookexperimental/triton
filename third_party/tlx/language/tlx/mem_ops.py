@@ -112,7 +112,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle)
 
-    return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout, _semantic)
+    return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
 
 # overload declarations just to make linter happy
@@ -178,12 +178,12 @@ def local_view(
             0,
             local_allocated_buffers.type.storage,
             local_allocated_buffers.type.layout,
-            local_allocated_buffers.type.semantic,
         )
 
 
-def _buffered_tensor_getitem(self, buffer_idx):
-    return local_view(self, buffer_idx, _semantic=self.type.semantic)
+@tl.builtin
+def _buffered_tensor_getitem(self, buffer_idx, _semantic=None):
+    return local_view(self, buffer_idx, _semantic=_semantic)
 
 
 @tl.builtin
@@ -270,7 +270,6 @@ def local_slice(
             0,
             buffer.type.storage,
             buffer.type.layout,
-            buffer.type.semantic,
         )
 
 
