@@ -1379,45 +1379,8 @@ def _attn_bwd_ws(
                     tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
                     curr_m += step_m
                     blk_idx += 1
-            if STAGE & 2:
-                lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE=2)
-                num_steps = (hi - lo) // BLOCK_M1
-                for _ in range(num_steps):
-                    tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                    ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-
-                    offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                    m = tl.load(M + offs_m)
-
-                    # wait for qkT = tl.dot(k, qT)
-                    tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
-                    qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-                    tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
-
-                    pT = tl.math.exp2(qkT - m[None, :])
-
-                    # ppT *= qk_scale
-                    ppT = pT
-                    ppT = ppT.to(do_out_dtype)
-                    tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
-                    tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
-
-                    # D (= delta) is pre-divided by ds_scale.
-                    Di = tl.load(D + offs_m)
-
-                    # Wait for dpT = tl.dot(v, tl.trans(do))
-                    tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
-                    dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-                    # No need to release dP, as dP uses the same tmem as dQ
-                    # in the same iteration. Release dQ instead later.
-                    dsT = pT * (dpT - Di[None, :])
-                    dsT = dsT.to(q_out_dtype)
-                    tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
-                    tlx.fence_async_shared()
-                    tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
-                    curr_m += step_m
-                    blk_idx += 1
-
+            # TODO: Add the STAGE & 2 handling when we can determine bounds to divide
+            # the work across two loops, based on optimizing out the mask.
             # epilogue
             kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
 
