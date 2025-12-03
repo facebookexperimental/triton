@@ -5,8 +5,6 @@ import enum
 from abc import abstractmethod
 from triton._C.libtriton import ir
 
-from triton.language.semantic import TritonSemantic
-
 
 class layout_encoding:
 
@@ -74,8 +72,16 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
     def make_permute(self, dims):
         permuted_order = tuple(self.order[d] for d in dims)
-        return swizzled_shared_layout_encoding(self.vectorSize, self.perPhase, self.maxPhase, permuted_order,
-                                               self.numCTAs, self.numCTAsPerCGA, self.numCTASplit, self.numCTAOrder)
+        return swizzled_shared_layout_encoding(
+            self.vectorSize,
+            self.perPhase,
+            self.maxPhase,
+            permuted_order,
+            self.numCTAs,
+            self.numCTAsPerCGA,
+            self.numCTASplit,
+            self.numCTAOrder,
+        )
 
     def to_ir(self, builder: ir.builder) -> None:
         return builder.make_swizzled_shared_encoding_attr(
@@ -220,15 +226,22 @@ class buffered_tensor(tl.base_value):
         handle: The backing IR value representing the buffer allocation.
     """
 
-    def __init__(self, handle, element_ty: tl.dtype, shape: List, num: int, storage: storage_kind,
-                 layout: Optional[shared_layout_encoding] = None, semantic: TritonSemantic = None):
+    def __init__(
+        self,
+        handle,
+        element_ty: tl.dtype,
+        shape: List,
+        num: int,
+        storage: storage_kind,
+        layout: Optional[shared_layout_encoding] = None,
+    ):
         """Not called by user code."""
         super().__init__()
         # IR handle
         self.handle = handle
         # Block shape
         self.shape = shape
-        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout, semantic)
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
@@ -249,8 +262,14 @@ class buffered_tensor(tl.base_value):
 
 class buffered_tensor_type(tl.block_type):
 
-    def __init__(self, element_ty: tl.dtype, shape: List, num: int, storage: storage_kind,
-                 layout: Optional[shared_layout_encoding] = None, semantic: TritonSemantic = None):
+    def __init__(
+        self,
+        element_ty: tl.dtype,
+        shape: List,
+        num: int,
+        storage: storage_kind,
+        layout: Optional[shared_layout_encoding] = None,
+    ):
         super().__init__(element_ty, shape)
         # Storage
         self.storage = storage
@@ -258,20 +277,17 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
-        assert semantic or num == 0, "buffered_tensor array must be created with a builder"
-        self.semantic = semantic
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
-        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.num, self.storage, self.layout,
-                                self.semantic)
+        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.num, self.storage, self.layout)
         return value, cursor + 1
 
     def mangle(self) -> str:
         elt = self.scalar.mangle()
-        shape = '_'.join(map(str, self.shape))
+        shape = "_".join(map(str, self.shape))
         if self.num > 0:
-            shape += f'_{self.num}'
-        return f'buffered_{elt}S{shape}'
+            shape += f"_{self.num}"
+        return f"buffered_{elt}S{shape}"
 
     def __str__(self) -> str:
         return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
@@ -285,7 +301,6 @@ class buffered_tensor_type(tl.block_type):
 
     def to_ir(self, builder: ir.builder) -> None:
         shape = self.shape
-        builder = self.semantic.builder
         if self.num >= 1:
             shape = [self.num] + list(shape)
         return builder.get_memdesc_type(
@@ -304,11 +319,17 @@ class mbarrier(tl.base_value):
     Define a mbarrier object
     """
 
-    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding],
-                 semantics: TritonSemantic = None, storage: storage_kind = storage_kind.smem):
-        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, "mbarrier requires storage to be smem or smemCluster"
+    def __init__(
+        self,
+        handle,
+        num: int,
+        layout: Optional[swizzled_shared_layout_encoding],
+        storage: storage_kind = storage_kind.smem,
+    ):
+        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
+            "mbarrier requires storage to be smem or smemCluster")
         self.handle = handle
-        self.type = mbarrier_type(num, layout, semantics, storage)
+        self.type = mbarrier_type(num, layout, storage)
         self.num = num
 
     def _flatten_ir(self, handles) -> None:
@@ -324,15 +345,14 @@ class mbarrier(tl.base_value):
 
 class mbarrier_type(buffered_tensor_type):
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic, storage):
-        super().__init__(tl.int64, [1], num, storage, layout, semantic)
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage):
+        super().__init__(tl.int64, [1], num, storage, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
-        value = mbarrier(handles[cursor], self.num, self.layout, self.semantic)
+        value = mbarrier(handles[cursor], self.num, self.layout, self.storage)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
-        builder = self.semantic.builder
         if self.num >= 1:
             shape = [self.num]
         else:
@@ -350,10 +370,9 @@ class clc_response(tl.base_value):
     Define a CLC response object
     """
 
-    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding],
-                 semantic: TritonSemantic = None):
+    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding]):
         self.handle = handle
-        self.type = clc_response_type(num, layout, semantic)
+        self.type = clc_response_type(num, layout)
         self.num = num
 
     def _flatten_ir(self, handles) -> None:
@@ -372,15 +391,14 @@ class clc_response_type(buffered_tensor_type):
     # since we have two concrete use cases now (mbarrier and clc_response)
     # both of which are opaque objects with fixed size
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], semantic: TritonSemantic):
-        super().__init__(tl.int64, [1], num, storage_kind.smem, layout, semantic)
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
         value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
-        builder = self.semantic.builder
         if self.num >= 1:
             shape = [self.num]
         else:
@@ -404,7 +422,6 @@ class CLCPipelineContext:
         clc_mbars_empty: mbarrier,
         clc_mbars_full: mbarrier,
         clc_responses: clc_response,
-        semantic: TritonSemantic = None,
     ):
         self._clc_mbars_empty = clc_mbars_empty
         self._clc_mbars_full = clc_mbars_full

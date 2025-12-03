@@ -81,13 +81,13 @@ def test_async_tasks(BLOCK_SIZE, device):
     )
     ttgir = kernel.asm["ttgir"]
     # print(ttgir)
-    pattern_ws = (r'ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 120, 100, 100>}')
+    pattern_ws = r"ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 120, 100, 100>}"
     assert re.search(pattern_ws, ttgir, flags=re.DOTALL)
-    pattern_p0 = (r'partition0\([^\n]*\)\s+num_warps\(4\)')
+    pattern_p0 = r"partition0\([^\n]*\)\s+num_warps\(4\)"
     assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
-    pattern_p1 = (r'partition1\([^\n]*\)\s+num_warps\(1\)')
+    pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(1\)"
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
-    pattern_p2 = (r'partition2\([^\n]*\)\s+num_warps\(1\)')
+    pattern_p2 = r"partition2\([^\n]*\)\s+num_warps\(1\)"
     assert re.search(pattern_p2, ttgir, flags=re.DOTALL)
 
     # Check that the replica_id is correctly passed to non-default regions
@@ -103,7 +103,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     #   %13 = arith.addf %9, %cst
     #   %14 = arith.subf %12, %cst
     #   ...}
-    pattern_cst = (r'= arith.constant dense\<.*\>')
+    pattern_cst = r"= arith.constant dense\<.*\>"
     found = re.findall(pattern_cst, ttgir)
     assert len(found) == 4, "Expected 4 cst by calling `tlx.async_task_replica_id()` in all regions"
     assert found[0] != found[1], "Two matches MUST be different"
@@ -544,12 +544,12 @@ def test_thread_id(device):
         if tid == 0:
             tl.store(output_ptr + offsets, value, mask=mask)
 
-    output = torch.zeros(32, dtype=torch.int32, device='cuda')
+    output = torch.zeros(32, dtype=torch.int32, device="cuda")
     n_elements = output.numel()
     value = 42
     store_from_thread_0_kernel[(1, )](output, value, n_elements, 0, 32, num_warps=1)
     torch.cuda.synchronize()
-    expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
+    expected_output = torch.zeros(32, dtype=torch.int32, device="cuda")
     expected_output[0] = value
     torch.testing.assert_close(output, expected_output)
 
@@ -791,8 +791,20 @@ def test_local_reinterpret(device):
 def test_async_dot(device):
 
     @triton.jit
-    def wgmma_kernel_A_smem(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def wgmma_kernel_A_smem(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -819,8 +831,20 @@ def test_async_dot(device):
         tl.store(c_ptrs, c)
 
     @triton.jit
-    def wgmma_kernel_A_reg(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def wgmma_kernel_A_reg(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -851,7 +875,7 @@ def test_async_dot(device):
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
     # test smem
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
     kernel = wgmma_kernel_A_smem[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                          z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
@@ -860,7 +884,7 @@ def test_async_dot(device):
     torch.testing.assert_close(z, z_ref)
 
     # test reg
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
     kernel = wgmma_kernel_A_reg[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                         z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
@@ -875,8 +899,21 @@ def test_async_dot_blackwell(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -922,7 +959,7 @@ def test_async_dot_blackwell(device):
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
     kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                        z.stride(1), **kern_kwargs)
 
@@ -948,9 +985,22 @@ def test_async_dot_blackwell_not_use_d(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
-                          c_ptr2, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                          OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr1,
+        stride_cm,
+        stride_cn,
+        c_ptr2,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
         pid = tl.program_id(axis=0)
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
@@ -996,7 +1046,7 @@ def test_async_dot_blackwell_not_use_d(device):
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
     z2 = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
     kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
                                        z1.stride(1), z2, **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
@@ -1029,10 +1079,25 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                  OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                                  A_TMEM: tl.constexpr):
+    def tcgen5_dot_kernel2cta_tma(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        A_TMEM: tl.constexpr,
+    ):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
@@ -1104,17 +1169,24 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
     BLOCK_N = N
     BLOCK_K = K
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'A_TMEM': A_TMEM
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "OUT_DTYPE": tl.float32,
+        "M": M,
+        "N": N,
+        "K": K,
+        "A_TMEM": A_TMEM,
     }
     kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
                                                                      y.stride(1), z, z.stride(0), z.stride(1),
                                                                      **kern_kwargs)
 
     # verify kernel launch cluster
-    assert kernel.metadata.cluster_dims == (
-        2, 1, 1), f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}"
-    assert kernel.metadata.num_ctas == 1, f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}"
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("nvgpu.cluster_id") == 1
@@ -1142,9 +1214,24 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def tcgen5_dot_kernel2cta_tma_ws(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm,
-                                     stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                     OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    def tcgen5_dot_kernel2cta_tma_ws(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+    ):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
@@ -1214,16 +1301,23 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     BLOCK_N = N
     BLOCK_K = K
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "OUT_DTYPE": tl.float32,
+        "M": M,
+        "N": N,
+        "K": K,
     }
     kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
                                                                         y.stride(1), z, z.stride(0), z.stride(1),
                                                                         **kern_kwargs)
 
     # verify kernel launch cluster
-    assert kernel.metadata.cluster_dims == (
-        2, 1, 1), f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}"
-    assert kernel.metadata.num_ctas == 1, f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}"
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("nvgpu.cluster_id") == 1
@@ -1363,9 +1457,22 @@ def test_tcgen05_commit(device):
     """
 
     @triton.jit
-    def tcgen5_commit_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
-                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                             OUT_DTYPE: tl.constexpr, NUM_DOT: tl.constexpr):
+    def tcgen5_commit_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr1,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        NUM_DOT: tl.constexpr,
+    ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -1413,16 +1520,27 @@ def test_tcgen05_commit(device):
     x = torch.randn((M, K), device=device, dtype=torch.float16)
     y = torch.randn((K, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
 
     num_dot = 4
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
-    kernel = tcgen5_commit_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
-                                          z1.stride(1), NUM_DOT=num_dot, **kern_kwargs)
+    kernel = tcgen5_commit_kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z1,
+        z1.stride(0),
+        z1.stride(1),
+        NUM_DOT=num_dot,
+        **kern_kwargs,
+    )
     ptx = kernel.asm["ptx"]
     assert ptx.count("tcgen05.mma") == 4 * num_dot  # loop unrolled so 4 mma ops per dot
-    assert ptx.count(
-        "tcgen05.commit") == 1 + num_dot  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
+    assert (ptx.count("tcgen05.commit") == 1 + num_dot
+            )  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
     assert ptx.count("mbarrier.try_wait") == 2  # one for first sync dot, one for final wait
     ref_out = torch.zeros_like(z1)
     for _ in range(num_dot):
@@ -1431,12 +1549,23 @@ def test_tcgen05_commit(device):
 
     num_dot = 3
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
-    kernel = tcgen5_commit_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
-                                          z1.stride(1), NUM_DOT=num_dot, **kern_kwargs)
+    kernel = tcgen5_commit_kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z1,
+        z1.stride(0),
+        z1.stride(1),
+        NUM_DOT=num_dot,
+        **kern_kwargs,
+    )
     ptx = kernel.asm["ptx"]
     assert ptx.count("tcgen05.mma") == 4 * num_dot  # loop unrolled so 4 mma ops per dot
-    assert ptx.count(
-        "tcgen05.commit") == 1 + num_dot  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
+    assert (ptx.count("tcgen05.commit") == 1 + num_dot
+            )  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
     assert ptx.count("mbarrier.try_wait") == 2  # one for first sync dot, one for final wait
     ref_out = torch.zeros_like(z1)
     for _ in range(num_dot):
@@ -1451,9 +1580,21 @@ def test_async_dot_blackwell_tmem_A(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel_tmem_A(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                 OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel_tmem_A(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -1500,7 +1641,7 @@ def test_async_dot_blackwell_tmem_A(device):
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
     kernel = tcgen5_dot_kernel_tmem_A[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                               z.stride(1), **kern_kwargs)
 
@@ -1592,7 +1733,6 @@ def tlx_square_ws(
     phase = 0
     with tlx.async_tasks():
         with tlx.async_task("default"):
-
             tlx.barrier_wait(bar=b1, phase=phase ^ 1)
 
             # Placeholder block to do something
@@ -1600,7 +1740,6 @@ def tlx_square_ws(
             tlx.barrier_arrive(bar=b0)  # Release
 
         with tlx.async_task(num_warps=4):
-
             tlx.barrier_wait(bar=b0, phase=phase)  # Wait
 
             # Some arith ops TODO. add WS
@@ -1614,7 +1753,6 @@ def tlx_square_ws(
 
 
 def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
-
     # prepare inputs
     torch.manual_seed(0)
     size = 98432
@@ -1643,12 +1781,12 @@ def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
     if is_hip():
-        assert (ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase")
-                                                              == 3) and (ttgir.count("amdgpu.arrive_barrier")
-                                                                         == 3), f"TTGIR {ttgir}"
+        assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
+                and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
     else:
-        assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3) and (
-            ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
+        assert ((ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3)
+                and (ttgir.count("ttng.barrier_expect") == 0)
+                and (ttgir.count("ttng.arrive_barrier") == 3)), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -1658,10 +1796,9 @@ def test_wait_arrive_ws(BLOCK_SIZE, device):
 
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
-    assert (ttgir.count("ttng.init_barrier")
-            == 2) and (ttgir.count("ttng.wait_barrier") == 2) and (ttgir.count("ttng.barrier_expect") == 0) and (
-                ttgir.count("ttng.arrive_barrier")
-                == 2) and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1), f"TTGIR {ttgir}"
+    assert ((ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2)
+            and (ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 2)
+            and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1)), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -1901,7 +2038,7 @@ def test_loop_carry_var_check(device):
     with pytest.raises(triton.CompilationError) as e:
         loop_carry_shadow[grid]()
     list_msg = traceback.format_exception(e.type, e.value, e.tb, chain=True)
-    assert "Please make sure that the type stays consistent" in '\n'.join(list_msg)
+    assert "Please make sure that the type stays consistent" in "\n".join(list_msg)
 
 
 @triton.jit
@@ -1913,7 +2050,6 @@ def _global_tmem_func(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
-
     offs_m = tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_N)
     x_ptr_offsets = x_ptr + (offs_m[:, None] * stride_m + offs_n[None, :] * stride_n)
@@ -1984,8 +2120,23 @@ def test_async_dots_blackwell_tmem(device):
     """
 
     @triton.jit
-    def tcgen5_fa_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn, d_ptr,
-                         stride_dm, stride_dn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def tcgen5_fa_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        d_ptr,
+        stride_dm,
+        stride_dn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
         a_tiles = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
         b_tiles = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
         c_tiles = tlx.local_alloc((BLOCK_N, BLOCK_N), tl.float16, tl.constexpr(1), reuse=a_tiles)
@@ -2062,9 +2213,23 @@ def test_async_dots_blackwell_tmem(device):
     c = torch.ones((N, N), device=device, dtype=torch.float16)
     d = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
-    kernel = tcgen5_fa_kernel[(1, 1)](a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c, c.stride(0),
-                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=4)
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
+    kernel = tcgen5_fa_kernel[(1, 1)](
+        a,
+        a.stride(0),
+        a.stride(1),
+        b,
+        b.stride(0),
+        b.stride(1),
+        c,
+        c.stride(0),
+        c.stride(1),
+        d,
+        d.stride(0),
+        d.stride(1),
+        **kern_kwargs,
+        num_warps=4,
+    )
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.tmem_alloc") == 2
@@ -2129,11 +2294,11 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
     ptx = kernel.asm["ptx"]
 
-    assert re.search((r'clusterlaunchcontrol.try_cancel'), ptx, flags=re.DOTALL)
-    assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
-    assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
+    assert re.search((r"clusterlaunchcontrol.try_cancel"), ptx, flags=re.DOTALL)
+    assert re.search((r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128"), ptx, flags=re.DOTALL)
+    assert re.search((r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128"), ptx, flags=re.DOTALL)
 
-    assert (torch.count_nonzero(output) == size)
+    assert torch.count_nonzero(output) == size
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -2151,7 +2316,8 @@ def test_async_tasks_region_error(device):
     with pytest.raises(triton.CompilationError) as e:
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
-    assert "ZeroDivisionError('division by zero')" in exc_msg, '\n\nExpected ZeroDivisionError but got: \n\n' + exc_msg + '\n\n'
+    assert "ZeroDivisionError('division by zero')" in exc_msg, ("\n\nExpected ZeroDivisionError but got: \n\n" +
+                                                                exc_msg + "\n\n")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -2191,7 +2357,7 @@ def test_local_index(BLOCK_SIZE, device):
     n_elements = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     local_index[grid](x, output, n_elements, BLOCK_SIZE)
-    y = torch.tensor([10., 10., 10., 10.], device='cuda:0')
+    y = torch.tensor([10.0, 10.0, 10.0, 10.0], device="cuda:0")
     torch.testing.assert_close(y, output)
 
 
@@ -2347,8 +2513,14 @@ def test_stoch_round_partial_pack(dst_dtype, device):
         a = torch.randn([SIZE], dtype=torch.float32, device=device)
         b = torch.empty([SIZE], dtype=torch.float32, device=device).to(dst_dtype_torch)
         grid = lambda meta: (1, )
-        stoch_round_partial_kernel[grid](a, b, BLOCK_SIZE=SIZE, BLOCK_SIZE_ROUNDED=SIZE_ROUNDED,
-                                         QUARTER_SIZE_ROUNDED=QUARTER_SIZE_ROUNDED, num_warps=1)
+        stoch_round_partial_kernel[grid](
+            a,
+            b,
+            BLOCK_SIZE=SIZE,
+            BLOCK_SIZE_ROUNDED=SIZE_ROUNDED,
+            QUARTER_SIZE_ROUNDED=QUARTER_SIZE_ROUNDED,
+            num_warps=1,
+        )
 
         # Verify no NaN/Inf
         b_back = b.float()
@@ -2423,8 +2595,8 @@ def test_stoch_round_entropy_quality(device):
 
     # Results should be different for at least some values
     different_count = (b1.float() != b2.float()).sum().item()
-    assert different_count > SIZE * 0.1, (f"Different seeds should produce different results, "
-                                          f"but only {different_count}/{SIZE} values differ")
+    assert different_count > SIZE * 0.1, (
+        f"Different seeds should produce different results, but only {different_count}/{SIZE} values differ")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -2482,3 +2654,46 @@ def test_make_tensor_descriptor(device):
 
     # Verify the data was copied correctly through TMA operations
     torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_buffer_indexing_in_function_call(device):
+    """Test that buffer indexing with [] syntax works correctly in function calls"""
+
+    @triton.jit
+    def helper_function(buffers, idx, data):
+        """Helper function that receives buffers and performs indexing inside"""
+        tlx.local_store(buffers[idx], data)  # Indexing happens inside the helper
+        result = tlx.local_load(buffers[idx])  # Indexing again
+        return result
+
+    @triton.jit
+    def kernel_with_indexing(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        # Allocate buffer with multiple stages
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, num=tl.constexpr(4))
+
+        # Load data
+        x = tl.load(x_ptr + offsets, mask=mask)
+
+        # Pass buffers to helper function which performs ALL indexing
+        result = helper_function(buffers, 0, x)
+
+        # Store result
+        tl.store(y_ptr + offsets, result, mask=mask)
+
+    torch.manual_seed(0)
+    size = 1024
+    x = torch.rand(size, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(size, BLOCK_SIZE), )
+    kernel_with_indexing[grid](x, y, size, BLOCK_SIZE)
+
+    # Verify correctness
+    assert torch.allclose(y, x), "Buffer indexing in function call failed"
