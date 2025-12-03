@@ -1872,8 +1872,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
-    if mode == "bwd" and causal:
-        pytest.skip("Causal not supported for bwd yet")
     if mode == "fwd" and "fp8" in provider:
         ref_dtype = torch.float32
     q = q.to(ref_dtype)
