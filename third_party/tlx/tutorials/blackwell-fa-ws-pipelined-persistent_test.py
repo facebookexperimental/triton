@@ -867,7 +867,7 @@ def _attn_fwd_ws(sm_scale, M,  #
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          Delta,  #
-                         Z, H, N_CTX,  #
+                         N_CTX,  #
                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1068,7 +1068,7 @@ def bwd_caculate_offsets(
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     start_n = pid * BLOCK_N1
     start_m = 0
-    start_m, hi = _get_fused_loop_bounds(start_n, BLOCK_M1, STAGE)
+    start_m, hi = _get_fused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE)
     num_steps = (N_CTX - start_m) // BLOCK_M1
     return off_chz, off_bh, start_m, start_n, num_steps
 
@@ -1318,7 +1318,7 @@ def _attn_bwd_ws(
             # offset pointers for batch/head
             M += off_chz
             D += off_chz
-            curr_m = start_m
+            curr_m = start_n
             step_m = BLOCK_M1
             do_out_dtype = tlx.dtype_of(desc_do)
             q_out_dtype = tlx.dtype_of(desc_q)
@@ -1751,6 +1751,7 @@ class _attention(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
         return o
 
     @staticmethod
@@ -1774,7 +1775,7 @@ class _attention(torch.autograd.Function):
         _attn_bwd_preprocess[pre_grid](
             o, do,  #
             delta,  #
-            BATCH, N_HEAD, N_CTX,  #
+            N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
         )
 
