@@ -1174,6 +1174,7 @@ def _bwd_compute_inner_loop(
         tlx.fence_async_shared()
         tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
         curr_m += step_m
+    return curr_m
 
 
 @triton.autotune(configs=configs_bwd_tlx, key=["N_CTX", "HEAD_DIM"])
