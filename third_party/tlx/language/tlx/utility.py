@@ -6,7 +6,7 @@ import triton.runtime.driver as driver
 
 def is_hip():
     target = driver.active.get_current_target()
-    return target.backend == 'hip'
+    return target.backend == "hip"
 
 
 def cuda_parse_arch(arch):
@@ -42,8 +42,9 @@ def thread_id(axis, _semantic=None):
 @tl.builtin
 def async_task_replica_id(_semantic=None):
     from triton.language.extra.tlx.compiler.code_generator import region_replica_id_stack
-    assert len(region_replica_id_stack
-               ) > 0, "async_task_replica_id must be called inside an async region where the stack must be non-empty"
+
+    assert len(region_replica_id_stack) > 0, (
+        "async_task_replica_id must be called inside an async region where the stack must be non-empty")
     return tl.constexpr(region_replica_id_stack[-1])
 
 
@@ -61,6 +62,15 @@ def dtype_of(v, _semantic=None) -> tl.dtype:
         return v.dtype
     else:
         raise ValueError(f"dtype_of only works on tensors and tensor descriptors, but got {v}")
+
+
+@tl.builtin
+def size_of(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
+    """
+    Returns the size of a given dtype.
+    """
+    assert isinstance(dtype, tl.dtype), f"size_of expects a dtype, but got {type(dtype)}"
+    return tl.constexpr(dtype.primitive_bitwidth // 8)
 
 
 @tl.builtin
