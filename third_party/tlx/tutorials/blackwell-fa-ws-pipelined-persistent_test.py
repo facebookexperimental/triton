@@ -170,10 +170,10 @@ def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
 def _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3
-        lo, hi = 0, 1 * BLOCK_M
+        lo, hi = 0, N_CTX
     elif STAGE == 2:
         # Second part of STAGE == 3 in this function
-        lo, hi = 1 * BLOCK_M, N_CTX
+        lo, hi = N_CTX, N_CTX
     else:
         tl.static_assert(STAGE == 3)
         lo, hi = 0, N_CTX
