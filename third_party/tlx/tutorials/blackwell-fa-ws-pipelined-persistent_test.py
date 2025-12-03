@@ -1456,7 +1456,7 @@ def _attn_bwd_ws(
                     BLOCK_N1,
                 )
 
-                kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
+                kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
                 tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
                 tlx.barrier_wait(v_fulls[kv_buf_id], kv_phase)
 
