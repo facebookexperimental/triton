@@ -1,4 +1,5 @@
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
@@ -91,32 +92,29 @@ public:
                                 "auto insert InvalBarrierOp.";
     }
 
-    // Find all barrier init ops in the module
-    std::vector<Value> barriers;
-    mod.walk(
-        [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
+    SetVector<triton::FuncOp> funcOps;
+    mod.walk([&](triton::FuncOp op) { funcOps.insert(op); });
+    for (auto funcOp : funcOps) {
+      DominanceInfo domInfo(funcOp);
 
-    // Find the entry funcOp
-    triton::FuncOp funcOp = nullptr;
-    mod.walk([&](triton::FuncOp op) {
-      if (triton::isKernel(op)) {
-        funcOp = op;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-
-    // todo: consider removing all the inval op that's located right before
-    // return in a later pass to save a few cycles.
-    // Insert InvalBarrierOp before returnOp of
-    // entry funcOp
-    funcOp.walk([&](triton::ReturnOp op) {
-      OpBuilder builder(op); // Insert *before* returnOp
-      Location loc = op.getLoc();
-      for (auto barrier : barriers) {
-        builder.create<ttng::InvalBarrierOp>(loc, barrier);
-      }
-    });
+      // Find all barrier init ops in the func
+      std::vector<Value> barriers;
+      mod.walk(
+          [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
+      // todo: consider removing all the inval op that's located right before
+      // return in a later pass to save a few cycles.
+      // Insert InvalBarrierOp before returnOp of
+      // entry funcOp
+      funcOp.walk([&](triton::ReturnOp op) {
+        OpBuilder builder(op); // Insert *before* returnOp
+        Location loc = op.getLoc();
+        for (auto barrier : barriers) {
+          if (domInfo.properlyDominates(barrier, op)) {
+            builder.create<ttng::InvalBarrierOp>(loc, barrier);
+          }
+        }
+      });
+    }
 
     return success();
   }
