@@ -1163,7 +1163,6 @@ def _bwd_compute_inner_loop(
         # wait for qkT = tl.dot(k, qT)
         tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
         qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
 
         pT = tl.math.exp2(qkT - m[None, :])
         if STAGE == 1:
@@ -1379,7 +1378,6 @@ def _attn_bwd_ws(
                         # wait for qkT = tl.dot(k, qT)
                         tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
                         qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-                        # tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
 
                         pT = tl.math.exp2(qkT - m[None, :])
                         if STAGE == 3:
