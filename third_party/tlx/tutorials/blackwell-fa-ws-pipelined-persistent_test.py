@@ -1060,6 +1060,7 @@ def bwd_caculate_offsets(
     N_CTX,  #
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
+    STAGE: tl.constexpr,
 ):
     bhid = tl.program_id(2)
     pid = tl.program_id(0)
@@ -1067,6 +1068,7 @@ def bwd_caculate_offsets(
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     start_n = pid * BLOCK_N1
     start_m = 0
+    start_m, hi = _get_fused_loop_bounds(start_n, BLOCK_M1, STAGE)
     num_steps = (N_CTX - start_m) // BLOCK_M1
     return off_chz, off_bh, start_m, start_n, num_steps
 
@@ -1139,6 +1141,7 @@ def _attn_bwd_ws(
     NUM_BUFFERS_DS: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
+    STAGE: tl.constexpr,
 ):
     # allocate smem buffers
     k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
@@ -1200,8 +1203,16 @@ def _attn_bwd_ws(
     with tlx.async_tasks():
         # reduction
         with tlx.async_task("default"):
-            off_chz, off_bh, start_m, _, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX,
-                                                                          BLOCK_M1, BLOCK_N1)
+            off_chz, off_bh, start_m, _, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+                STAGE,
+            )
             curr_m = start_m
             step_m = BLOCK_M1
             for blk_idx in range(num_steps):
@@ -1227,8 +1238,16 @@ def _attn_bwd_ws(
 
         # compute
         with tlx.async_task(num_warps=8, registers=192, replicate=1):
-            off_chz, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H,
-                                                                                N_CTX, BLOCK_M1, BLOCK_N1)
+            off_chz, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+                STAGE,
+            )
 
             # offset pointers for batch/head
             M += off_chz
@@ -1303,8 +1322,16 @@ def _attn_bwd_ws(
 
         # mma
         with tlx.async_task(num_warps=1, registers=48):
-            _, _, start_m, _, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX, BLOCK_M1,
-                                                               BLOCK_N1)
+            _, _, start_m, _, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+                STAGE,
+            )
 
             kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
             tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
@@ -1469,8 +1496,16 @@ def _attn_bwd_ws(
 
         # load
         with tlx.async_task(num_warps=1, registers=88):
-            _, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX,
-                                                                          BLOCK_M1, BLOCK_N1)
+            _, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+                STAGE,
+            )
             # Load K
             kv_buf_id, _ = _get_bufidx_phase(0, NUM_BUFFERS_KV)
             tlx.barrier_expect_bytes(k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
@@ -1716,6 +1751,8 @@ class _attention(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
+        stage = 3 if ctx.causal else 1
+
         _attn_bwd_ws[grid](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             M, delta,  #
@@ -1723,6 +1760,7 @@ class _attention(torch.autograd.Function):
             N_HEAD, N_CTX,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
+            STAGE=stage,  #
         )
 
         return dq, dk, dv, None, None, None, None
