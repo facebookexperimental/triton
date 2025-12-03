@@ -1255,6 +1255,7 @@ def _attn_bwd_ws(
 
     # allocate barriers for smem buffers
     k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
@@ -1631,6 +1632,7 @@ def _attn_bwd_ws(
                         dq_fulls[tmem_buf_id],
                     ],
                 )
+                tlx.tcgen05_commit(k_empties[kv_buf_id])
                 tile_idx += num_progs
 
         # load
@@ -1650,6 +1652,7 @@ def _attn_bwd_ws(
                 )
                 # Load K
                 kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
+                tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                 tlx.barrier_expect_bytes(k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
                 tlx.async_descriptor_load(
                     desc_k,
