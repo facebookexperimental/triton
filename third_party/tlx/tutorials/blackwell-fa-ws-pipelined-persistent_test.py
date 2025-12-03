@@ -1069,7 +1069,7 @@ def bwd_caculate_offsets(
     start_n = pid * BLOCK_N1
     start_m = 0
     start_m, hi = _get_fused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE)
-    num_steps = (N_CTX - start_m) // BLOCK_M1
+    num_steps = (hi - start_m) // BLOCK_M1
     return off_chz, off_bh, start_m, start_n, num_steps
 
 
@@ -1125,6 +1125,7 @@ def _bwd_compute_inner_loop(
     M,
     D,
     curr_m,
+    blk_idx,
     step_m,
     do_out_dtype,
     q_out_dtype,
@@ -1138,7 +1139,7 @@ def _bwd_compute_inner_loop(
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     lo, hi = _get_unfused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE)
     num_steps = (hi - lo) // BLOCK_M1
-    for blk_idx in range(num_steps):
+    for _ in range(num_steps):
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
@@ -1175,7 +1176,8 @@ def _bwd_compute_inner_loop(
         tlx.fence_async_shared()
         tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
         curr_m += step_m
-    return curr_m
+        blk_idx += 1
+    return curr_m, blk_idx
 
 
 @triton.autotune(configs=configs_bwd_tlx, key=["N_CTX", "HEAD_DIM"])
@@ -1328,7 +1330,8 @@ def _attn_bwd_ws(
                 offs_n = start_n + tl.arange(0, BLOCK_N1)
                 lo, hi = _get_unfused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE=4 - STAGE)
                 num_steps = (hi - lo) // BLOCK_M1
-                for blk_idx in range(num_steps):
+                blk_idx = 0
+                for _ in range(num_steps):
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
@@ -1365,11 +1368,11 @@ def _attn_bwd_ws(
                     tlx.fence_async_shared()
                     tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
                     curr_m += step_m
+                    blk_idx += 1
             if STAGE & 2:
-                offs_n = start_n + tl.arange(0, BLOCK_N1)
                 lo, hi = _get_unfused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE=2)
                 num_steps = (hi - lo) // BLOCK_M1
-                for blk_idx in range(num_steps):
+                for _ in range(num_steps):
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
@@ -1403,6 +1406,7 @@ def _attn_bwd_ws(
                     tlx.fence_async_shared()
                     tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
                     curr_m += step_m
+                    blk_idx += 1
 
             # epilogue
             kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
