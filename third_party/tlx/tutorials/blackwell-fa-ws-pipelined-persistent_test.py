@@ -1674,6 +1674,7 @@ def _attn_bwd_ws(
                     q_fulls[q_buf_id],
                 )
 
+                # Note: No need for v_empties because q is finished after v.
                 # Load V
                 tlx.barrier_expect_bytes(v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
                 tlx.async_descriptor_load(
