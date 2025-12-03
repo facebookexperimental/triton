@@ -15,10 +15,26 @@ from .types import (
     CLCPipelineContext,
     async_token,
 )
-from .mem_ops import (local_alloc, local_view, remote_view, local_slice, subslice, async_load, async_load_commit_group,
-                      async_load_wait_group, local_load, local_store, local_trans, local_reinterpret, global_alloc,
-                      async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, fence_async_shared,
-                      make_tensor_descriptor)
+from .mem_ops import (
+    local_alloc,
+    local_view,
+    remote_view,
+    local_slice,
+    subslice,
+    async_load,
+    async_load_commit_group,
+    async_load_wait_group,
+    local_load,
+    local_store,
+    local_trans,
+    local_reinterpret,
+    global_alloc,
+    async_descriptor_load,
+    async_descriptor_store,
+    async_descriptor_store_wait,
+    fence_async_shared,
+    make_tensor_descriptor,
+)
 from .barrier import (
     alloc_barriers,
     barrier_expect_bytes,
@@ -38,6 +54,7 @@ from .utility import (
     thread_id,
     async_task_replica_id,
     dtype_of,
+    size_of,
     clock64,
     stoch_round,
 )
@@ -107,6 +124,7 @@ __all__ = [
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    "size_of",
     "clock64",
     "stoch_round",
     # dynamic launcher ops

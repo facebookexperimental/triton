@@ -542,7 +542,7 @@ def grouped_matmul_tlx_kernel(
                             buf, phase = _get_bufidx_phase(accum_cnt, NUM_SMEM_BUFFERS)
                             tlx.barrier_wait(smem_empty_bars[buf], phase ^ 1)
                             tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                                     2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
+                                                     tlx.size_of(dtype) * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)
                             tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, kk * BLOCK_SIZE_K],
                                                       smem_full_bars[buf])
                             tlx.async_descriptor_load(b_desc, buffers_B[buf], [kk * BLOCK_SIZE_K, offs_bn],

@@ -221,6 +221,24 @@ Examples: how mbarriers are communicated in warp specialization
 
     Returns the id of the current thread instance along the given `axis`.
 
+- `tlx.dtype_of(v)`
+
+    Returns the dtype of a tensor or tensor descriptor.
+
+- `tlx.size_of(dtype)`
+
+    Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.
+
+    Example:
+    ```python
+    # Instead of hardcoding size values
+    tlx.barrier_expect_bytes(barrier, 2 * BLOCK_M * BLOCK_K)  # Assumes float16
+
+    # Use size_of for dtype-aware computation
+    tlx.barrier_expect_bytes(barrier,
+                           tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)
+    ```
+
 - `tlx.clock64()`
 
     Returns the current 64-bit hardware clock value. E.g,

@@ -1977,6 +1977,34 @@ def test_inline_tmem(BLOCK_SIZE, device):
     assert kerenl_info.asm["ttir"].count("store") == 1
 
 
+def test_size_of(device):
+
+    @triton.jit
+    def size_of_kernel(output_ptr):
+        # Test size_of for various dtypes
+        size_fp32 = tlx.size_of(tl.float32)
+        size_fp16 = tlx.size_of(tl.float16)
+        size_int32 = tlx.size_of(tl.int32)
+        size_int8 = tlx.size_of(tl.int8)
+        size_int64 = tlx.size_of(tl.int64)
+
+        # Store results
+        tl.store(output_ptr + 0, size_fp32)
+        tl.store(output_ptr + 1, size_fp16)
+        tl.store(output_ptr + 2, size_int32)
+        tl.store(output_ptr + 3, size_int8)
+        tl.store(output_ptr + 4, size_int64)
+
+    # Expected sizes in bytes
+    expected_sizes = torch.tensor([4, 2, 4, 1, 8], dtype=torch.int32, device=device)
+    output = torch.zeros(5, dtype=torch.int32, device=device)
+
+    grid = lambda meta: (1, )
+    size_of_kernel[grid](output)
+
+    torch.testing.assert_close(output, expected_sizes)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dots_blackwell_tmem(device):
     """
