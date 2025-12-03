@@ -1296,12 +1296,15 @@ def _attn_bwd_ws(
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    p_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
     dv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -1392,6 +1395,7 @@ def _attn_bwd_ws(
                         # ppT *= qk_scale
                         ppT = pT
                         ppT = ppT.to(do_out_dtype)
+                        tlx.barrier_wait(tlx.local_view(p_empties, tmem_buf_id), tmem_phase ^ 1)
                         tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
                         tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
 
@@ -1430,6 +1434,7 @@ def _attn_bwd_ws(
                         [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
                         dv.to(tlx.dtype_of(desc_dv)),
                     )
+                tlx.barrier_arrive(dv_empties[kv_buf_id])
 
                 tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
@@ -1444,6 +1449,7 @@ def _attn_bwd_ws(
                         [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
                         dk.to(tlx.dtype_of(desc_dk)),
                     )
+                tlx.barrier_arrive(dv_empties[kv_buf_id])
                 tile_idx += num_progs
 
         # mma
@@ -1515,7 +1521,11 @@ def _attn_bwd_ws(
                     do_tiles[do_buf_id],
                     dv_tiles[tmem_buf_id],
                     use_acc=False,
-                    mBarriers=[do_empties[do_buf_id]],
+                    mBarriers=[
+                        do_empties[do_buf_id],
+                        dv_empties[kv_buf_id],
+                        p_empties[tmem_buf_id],
+                    ],
                 )
                 blk_idx += 1
 
@@ -1571,6 +1581,7 @@ def _attn_bwd_ws(
                         mBarriers=[
                             q_empties[q_buf_id_prev],
                             ds_empties2[ds_buf_id_prev],
+                            dk_empties[tmem_buf_id_prev],
                         ],
                     )
 
@@ -1595,7 +1606,11 @@ def _attn_bwd_ws(
                         do_tiles[do_buf_id],
                         dv_tiles[tmem_buf_id],
                         use_acc=True,
-                        mBarriers=[do_empties[do_buf_id]],
+                        mBarriers=[
+                            do_empties[do_buf_id],
+                            dv_empties[kv_buf_id],
+                            p_empties[tmem_buf_id],
+                        ],
                     )
                     blk_idx += 1
 
@@ -1622,6 +1637,7 @@ def _attn_bwd_ws(
                         q_empties[q_buf_id],
                         dk_fulls[kv_buf_id],
                         ds_empties1[ds_buf_id],
+                        dk_empties[tmem_buf_id],
                     ],
                 )
 
