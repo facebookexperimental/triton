@@ -1163,6 +1163,7 @@ def _bwd_compute_inner_loop(
         # wait for qkT = tl.dot(k, qT)
         tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
         qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
+        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
 
         pT = tl.math.exp2(qkT - m[None, :])
         if STAGE == 1:
@@ -1378,6 +1379,7 @@ def _attn_bwd_ws(
                         # wait for qkT = tl.dot(k, qT)
                         tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
                         qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
+                        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
 
                         pT = tl.math.exp2(qkT - m[None, :])
                         if STAGE == 3:
@@ -1508,10 +1510,7 @@ def _attn_bwd_ws(
                     do_tiles[do_buf_id],
                     dv_tiles[tmem_buf_id],
                     use_acc=False,
-                    mBarriers=[
-                        do_empties[do_buf_id],
-                        qk_empties[tmem_buf_id],
-                    ],
+                    mBarriers=[do_empties[do_buf_id]],
                 )
                 blk_idx += 1
 
@@ -1523,7 +1522,7 @@ def _attn_bwd_ws(
                 # 4. dpT = tl.dot(v, tl.trans(do))
                 # 5. dv += tl.dot(ppT, do)
                 # -----------------------------------------------------------
-                for _ in range(1, num_steps):
+                for i in range(1, num_steps):
                     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     # Compute qkT = tl.dot(k, qT)
@@ -1562,7 +1561,7 @@ def _attn_bwd_ws(
                         ds_tiles[ds_buf_id_prev],
                         q_tiles[q_buf_id_prev],
                         dk_tiles[tmem_buf_id_prev],
-                        use_acc=prev_blk_idx > 0,
+                        use_acc=(i - 1) > 0,
                         mBarriers=[
                             q_empties[q_buf_id_prev],
                         ],
@@ -1589,10 +1588,7 @@ def _attn_bwd_ws(
                         do_tiles[do_buf_id],
                         dv_tiles[tmem_buf_id],
                         use_acc=True,
-                        mBarriers=[
-                            do_empties[do_buf_id],
-                            qk_empties[tmem_buf_id],
-                        ],
+                        mBarriers=[do_empties[do_buf_id]],
                     )
                     blk_idx += 1
 
