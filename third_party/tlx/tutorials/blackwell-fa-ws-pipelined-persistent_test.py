@@ -167,6 +167,20 @@ def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
 
 
 @triton.jit
+def _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M, STAGE: tl.constexpr):
+    if STAGE == 1:
+        # First part of STAGE == 3
+        lo, hi = 0, 1 * BLOCK_M
+    elif STAGE == 2:
+        # Second part of STAGE == 3 in this function
+        lo, hi = 1 * BLOCK_M, N_CTX
+    else:
+        tl.static_assert(STAGE == 3)
+        lo, hi = 0, N_CTX
+    return lo, hi
+
+
+@triton.jit
 def _get_fused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         return 0, N_CTX
@@ -1060,7 +1074,6 @@ def bwd_caculate_offsets(
     N_CTX,  #
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
-    STAGE: tl.constexpr,
 ):
     bhid = tl.program_id(2)
     pid = tl.program_id(0)
@@ -1068,8 +1081,7 @@ def bwd_caculate_offsets(
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     start_n = pid * BLOCK_N1
     start_m = 0
-    start_m, hi = _get_fused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE)
-    num_steps = (hi - start_m) // BLOCK_M1
+    num_steps = (N_CTX - start_m) // BLOCK_M1
     return off_chz, off_bh, start_m, start_n, num_steps
 
 
@@ -1137,7 +1149,7 @@ def _bwd_compute_inner_loop(
     STAGE: tl.constexpr,
 ):
     offs_n = start_n + tl.arange(0, BLOCK_N1)
-    lo, hi = _get_unfused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE)
+    lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE)
     num_steps = (hi - lo) // BLOCK_M1
     for _ in range(num_steps):
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -1282,7 +1294,6 @@ def _attn_bwd_ws(
                 N_CTX,
                 BLOCK_M1,
                 BLOCK_N1,
-                STAGE,
             )
             curr_m = start_m
             step_m = BLOCK_M1
@@ -1317,7 +1328,6 @@ def _attn_bwd_ws(
                 N_CTX,
                 BLOCK_M1,
                 BLOCK_N1,
-                STAGE,
             )
             # offset pointers for batch/head
             M += off_chz
@@ -1328,7 +1338,7 @@ def _attn_bwd_ws(
             q_out_dtype = tlx.dtype_of(desc_q)
             if STAGE & 1:
                 offs_n = start_n + tl.arange(0, BLOCK_N1)
-                lo, hi = _get_unfused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE=4 - STAGE)
+                lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE=4 - STAGE)
                 num_steps = (hi - lo) // BLOCK_M1
                 blk_idx = 0
                 for _ in range(num_steps):
@@ -1370,7 +1380,7 @@ def _attn_bwd_ws(
                     curr_m += step_m
                     blk_idx += 1
             if STAGE & 2:
-                lo, hi = _get_unfused_loop_bounds(start_n, N_CTX, BLOCK_M1, STAGE=2)
+                lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE=2)
                 num_steps = (hi - lo) // BLOCK_M1
                 for _ in range(num_steps):
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -1449,7 +1459,6 @@ def _attn_bwd_ws(
                 N_CTX,
                 BLOCK_M1,
                 BLOCK_N1,
-                STAGE,
             )
 
             kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
@@ -1623,7 +1632,6 @@ def _attn_bwd_ws(
                 N_CTX,
                 BLOCK_M1,
                 BLOCK_N1,
-                STAGE,
             )
             # Load K
             kv_buf_id, _ = _get_bufidx_phase(0, NUM_BUFFERS_KV)
