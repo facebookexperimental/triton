@@ -1365,7 +1365,7 @@ def _attn_bwd_ws(
                     BLOCK_N1,
                 )
                 # offset pointers for batch/head
-                M_Updated = M + off_chz
+                M_updated = M + off_chz
                 D_updated = D + off_chz
                 curr_m = 0
                 step_m = BLOCK_M1
@@ -1380,7 +1380,7 @@ def _attn_bwd_ws(
                         ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
                         offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                        m = tl.load(M_Updated + offs_m)
+                        m = tl.load(M_updated + offs_m)
 
                         # wait for qkT = tl.dot(k, qT)
                         tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
@@ -1646,7 +1646,7 @@ def _attn_bwd_ws(
                 dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
                 tlx.async_dot(
                     dsT_view,
-                    k_tiles[0],
+                    k_tiles[kv_buf_id],
                     dq_tiles[tmem_buf_id],
                     use_acc=False,
                     mBarriers=[
@@ -1686,7 +1686,6 @@ def _attn_bwd_ws(
                 # Load Q
                 curr_m = start_m
                 step_m = BLOCK_M1
-                blk_idx = 0
                 q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
