@@ -38,6 +38,22 @@ configs = [
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 4,
         },
         num_stages=0,
         num_warps=4,
@@ -52,6 +68,22 @@ configs = [
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+        },
+        num_stages=0,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 6,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 4,
         },
         num_stages=0,
         num_warps=4,
@@ -62,9 +94,13 @@ configs = [
 
 def prune_configs_by_hdim(configs, named_args, **kwargs):
     HEAD_DIM = kwargs["HEAD_DIM"]
+    STAGE = kwargs["STAGE"]
     target_kv_buffers = 6 if HEAD_DIM == 64 else 3
-    # Only match HEAD_DIM for BLOCK_N
-    return [conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers]
+    target_group_size_n = 4 if STAGE == 3 else 1
+    return [
+        conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
+        and conf.kwargs.get("GROUP_SIZE_N", 0) == target_group_size_n
+    ]
 
 
 @triton.jit
@@ -131,6 +167,20 @@ def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
 
 
 @triton.jit
+def _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M, STAGE: tl.constexpr):
+    if STAGE == 1:
+        # First part of STAGE == 3
+        lo, hi = 0, N_CTX
+    elif STAGE == 2:
+        # Second part of STAGE == 3 in this function
+        lo, hi = N_CTX, N_CTX
+    else:
+        tl.static_assert(STAGE == 3)
+        lo, hi = 0, N_CTX
+    return lo, hi
+
+
+@triton.jit
 def _get_fused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         return 0, N_CTX
@@ -140,9 +190,21 @@ def _get_fused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
 
 
 @triton.jit
-def _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE: tl.constexpr):
-    start_m = tile_idx % n_tile_num
-    off_hz = tile_idx // n_tile_num
+def _compute_offsets(
+    tile_idx,
+    H,
+    num_pid_n,
+    num_pid_in_group,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    STAGE: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr,
+):
+    group_id = tile_idx // num_pid_in_group
+    first_pid_n = group_id * GROUP_SIZE_N
+    group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+    start_m = (tile_idx % num_pid_in_group) // group_size_n
+    off_hz = first_pid_n + (tile_idx % group_size_n)
     off_z = off_hz // H
     off_h = off_hz % H
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
@@ -282,6 +344,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_BUFFERS_QK: tl.constexpr,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
+                 GROUP_SIZE_N: tl.constexpr,  #
                  ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -292,10 +355,12 @@ def _attn_fwd_ws(sm_scale, M,  #
     # original grid
     #   triton.cdiv(q.shape[2], META["BLOCK_M"]),
     #   q.shape[0] * q.shape[1],
-    n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
-    total_tiles = n_tile_num * Z * H
+    num_pid_m = tl.cdiv(N_CTX, BLOCK_M)
+    num_pid_n = Z * H
+    num_pid_in_group = num_pid_m * GROUP_SIZE_N
+    total_tiles = num_pid_m * Z * H
 
     tiles_per_sm = total_tiles // num_progs
     if prog_id < total_tiles % num_progs:
@@ -375,7 +440,15 @@ def _attn_fwd_ws(sm_scale, M,  #
             for i in range(0, tiles_per_sm):
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE)
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
+                )
                 for _ in tl.range(lo, hi, BLOCK_N):
                     _, phase = _get_bufidx_phase(accum_cnt, 1)
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
@@ -439,7 +512,15 @@ def _attn_fwd_ws(sm_scale, M,  #
             for i in range(0, tiles_per_sm):
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE)
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
+                )
                 # initialize pointer to m and l
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
                 l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
@@ -517,7 +598,16 @@ def _attn_fwd_ws(sm_scale, M,  #
 
             for j in range(0, tiles_per_sm):
                 # initialize offsets
-                _, _, lo, hi, _, _ = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE)
+                _, _, lo, hi, _, _ = _compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
+                )
 
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
@@ -685,8 +775,16 @@ def _attn_fwd_ws(sm_scale, M,  #
             accum_cnt_kv = 0
             for i in range(0, tiles_per_sm):
                 # initialize offsets
-                _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M,
-                                                                          STAGE)
+                _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
+                )
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
@@ -758,7 +856,16 @@ def _attn_fwd_ws(sm_scale, M,  #
             # initialize offsets
             for i in range(0, tiles_per_sm):
                 # initialize offsets
-                _, _, _, _, qo_offset_y, _ = _compute_offsets(tile_idx, n_tile_num, H, N_CTX, BLOCK_M, STAGE)
+                _, _, _, _, qo_offset_y, _ = _compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
+                )
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
@@ -774,7 +881,7 @@ def _attn_fwd_ws(sm_scale, M,  #
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          Delta,  #
-                         Z, H, N_CTX,  #
+                         N_CTX,  #
                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1014,6 +1121,77 @@ configs_bwd_tlx = [
 ]
 
 
+# TODO: Unused. Fix layout issue inside TLX.
+@triton.jit
+def _bwd_compute_inner_loop(
+    start_n,
+    qk_fulls,
+    qk_tiles,
+    qk_empties,
+    p_tiles,
+    p_fulls,
+    dp_fulls,
+    dp_tiles,
+    ds_tiles,
+    ds_fulls,
+    M,
+    D,
+    curr_m,
+    blk_idx,
+    step_m,
+    do_out_dtype,
+    q_out_dtype,
+    N_CTX,
+    NUM_BUFFERS_TMEM: tl.constexpr,
+    NUM_BUFFERS_DS: tl.constexpr,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    offs_n = start_n + tl.arange(0, BLOCK_N1)
+    lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE)
+    num_steps = (hi - lo) // BLOCK_M1
+    for _ in range(num_steps):
+        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+        ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+        m = tl.load(M + offs_m)
+
+        # wait for qkT = tl.dot(k, qT)
+        tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
+        qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
+        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
+
+        pT = tl.math.exp2(qkT - m[None, :])
+        if STAGE == 1:
+            mask = offs_m[None, :] >= offs_n[:, None]
+            pT = tl.where(mask, pT, 0.0)
+
+        # ppT *= qk_scale
+        ppT = pT
+        ppT = ppT.to(do_out_dtype)
+        tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
+        tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
+
+        # D (= delta) is pre-divided by ds_scale.
+        Di = tl.load(D + offs_m)
+
+        # Wait for dpT = tl.dot(v, tl.trans(do))
+        tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
+        dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
+        # No need to release dP, as dP uses the same tmem as dQ
+        # in the same iteration. Release dQ instead later.
+        dsT = pT * (dpT - Di[None, :])
+        dsT = dsT.to(q_out_dtype)
+        tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
+        tlx.fence_async_shared()
+        tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+        curr_m += step_m
+        blk_idx += 1
+    return curr_m, blk_idx
+
+
 @triton.autotune(configs=configs_bwd_tlx, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_ws(
@@ -1046,6 +1224,7 @@ def _attn_bwd_ws(
     NUM_BUFFERS_DS: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
+    STAGE: tl.constexpr,
 ):
     # allocate smem buffers
     k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
@@ -1107,8 +1286,15 @@ def _attn_bwd_ws(
     with tlx.async_tasks():
         # reduction
         with tlx.async_task("default"):
-            off_chz, off_bh, start_m, _, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX,
-                                                                          BLOCK_M1, BLOCK_N1)
+            off_chz, off_bh, start_m, _, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+            )
             curr_m = start_m
             step_m = BLOCK_M1
             for blk_idx in range(num_steps):
@@ -1134,49 +1320,67 @@ def _attn_bwd_ws(
 
         # compute
         with tlx.async_task(num_warps=8, registers=192, replicate=1):
-            off_chz, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H,
-                                                                                N_CTX, BLOCK_M1, BLOCK_N1)
-
+            off_chz, off_bh, _, start_n, _ = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+            )
             # offset pointers for batch/head
             M += off_chz
             D += off_chz
-            curr_m = start_m
+            curr_m = 0
             step_m = BLOCK_M1
-            for blk_idx in range(num_steps):
-                tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+            do_out_dtype = tlx.dtype_of(desc_do)
+            q_out_dtype = tlx.dtype_of(desc_q)
+            if STAGE & 1:
+                offs_n = start_n + tl.arange(0, BLOCK_N1)
+                lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE=4 - STAGE)
+                num_steps = (hi - lo) // BLOCK_M1
+                blk_idx = 0
+                for _ in range(num_steps):
+                    tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+                    ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-                offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                m = tl.load(M + offs_m)
+                    offs_m = curr_m + tl.arange(0, BLOCK_M1)
+                    m = tl.load(M + offs_m)
 
-                # wait for qkT = tl.dot(k, qT)
-                tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
-                qkT = tlx.local_load(qk_tiles[tmem_buf_id])
-                tlx.barrier_arrive(qk_empties[tmem_buf_id])
+                    # wait for qkT = tl.dot(k, qT)
+                    tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
+                    qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
+                    tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
 
-                pT = tl.math.exp2(qkT - m[None, :])
+                    pT = tl.math.exp2(qkT - m[None, :])
+                    if STAGE == 3:
+                        mask = offs_m[None, :] >= offs_n[:, None]
+                        pT = tl.where(mask, pT, 0.0)
 
-                # ppT *= qk_scale
-                ppT = pT
-                ppT = ppT.to(tlx.dtype_of(desc_do))
-                tlx.local_store(p_tiles[tmem_buf_id], ppT)
-                tlx.barrier_arrive(p_fulls[tmem_buf_id])
+                    # ppT *= qk_scale
+                    ppT = pT
+                    ppT = ppT.to(do_out_dtype)
+                    tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
+                    tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
 
-                # D (= delta) is pre-divided by ds_scale.
-                Di = tl.load(D + offs_m)
+                    # D (= delta) is pre-divided by ds_scale.
+                    Di = tl.load(D + offs_m)
 
-                # Wait for dpT = tl.dot(v, tl.trans(do))
-                tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-                dpT = tlx.local_load(dp_tiles[tmem_buf_id])
-                # No need to release dP, as dP uses the same tmem as dQ
-                # in the same iteration. Release dQ instead later.
-                dsT = pT * (dpT - Di[None, :])
-                dsT = dsT.to(tlx.dtype_of(desc_q))
-                tlx.local_store(ds_tiles[ds_buf_id], dsT)
-                tlx.fence_async_shared()
-                tlx.barrier_arrive(ds_fulls[ds_buf_id])
-                curr_m += step_m
-
+                    # Wait for dpT = tl.dot(v, tl.trans(do))
+                    tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
+                    dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
+                    # No need to release dP, as dP uses the same tmem as dQ
+                    # in the same iteration. Release dQ instead later.
+                    dsT = pT * (dpT - Di[None, :])
+                    dsT = dsT.to(q_out_dtype)
+                    tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
+                    tlx.fence_async_shared()
+                    tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+                    curr_m += step_m
+                    blk_idx += 1
+            # TODO: Add the STAGE & 2 handling when we can determine bounds to divide
+            # the work across two loops, based on optimizing out the mask.
             # epilogue
             kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
 
@@ -1210,8 +1414,15 @@ def _attn_bwd_ws(
 
         # mma
         with tlx.async_task(num_warps=1, registers=48):
-            _, _, start_m, _, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX, BLOCK_M1,
-                                                               BLOCK_N1)
+            _, _, start_m, _, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+            )
 
             kv_buf_id, kv_phase = _get_bufidx_phase(0, NUM_BUFFERS_KV)
             tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
@@ -1376,8 +1587,15 @@ def _attn_bwd_ws(
 
         # load
         with tlx.async_task(num_warps=1, registers=88):
-            _, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(stride_z, stride_h, stride_tok, H, N_CTX,
-                                                                          BLOCK_M1, BLOCK_N1)
+            _, off_bh, start_m, start_n, num_steps = bwd_caculate_offsets(
+                stride_z,
+                stride_h,
+                stride_tok,
+                H,
+                N_CTX,
+                BLOCK_M1,
+                BLOCK_N1,
+            )
             # Load K
             kv_buf_id, _ = _get_bufidx_phase(0, NUM_BUFFERS_KV)
             tlx.barrier_expect_bytes(k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
@@ -1539,6 +1757,7 @@ class _attention(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
         return o
 
     @staticmethod
@@ -1562,7 +1781,7 @@ class _attention(torch.autograd.Function):
         _attn_bwd_preprocess[pre_grid](
             o, do,  #
             delta,  #
-            BATCH, N_HEAD, N_CTX,  #
+            N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
         )
 
@@ -1623,6 +1842,8 @@ class _attention(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
+        stage = 3 if ctx.causal else 1
+
         _attn_bwd_ws[grid](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             M, delta,  #
@@ -1630,6 +1851,7 @@ class _attention(torch.autograd.Function):
             N_HEAD, N_CTX,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
+            STAGE=stage,  #
         )
 
         return dq, dk, dv, None, None, None, None
@@ -1657,12 +1879,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
     sm_scale = 0.5
     # reference implementation
     ref_dtype = dtype
-    if mode == "bwd" and HEAD_DIM == 64:
-        pytest.skip("Only test bwd with 128")
-    elif mode == "fwd" and not causal and HEAD_DIM == 128:
-        pytest.skip("Only test fwd with causal")
-    elif mode == "bwd" and causal:
-        pytest.skip("Causal not supported for bwd yet")
     if mode == "fwd" and "fp8" in provider:
         ref_dtype = torch.float32
     q = q.to(ref_dtype)

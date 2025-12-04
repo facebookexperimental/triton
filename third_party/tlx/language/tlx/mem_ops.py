@@ -5,6 +5,7 @@ from .utility import cuda_parse_arch
 from .mma_ops import require_nv_mma_shared_layout
 from .types import storage_kind
 from typing import Optional, Tuple, overload
+from triton._C.libtriton import ir
 
 
 def _assert_blackwell_for_tmem(arch):
@@ -111,7 +112,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle)
 
-    return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout, _semantic)
+    return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
 
 # overload declarations just to make linter happy
@@ -177,12 +178,12 @@ def local_view(
             0,
             local_allocated_buffers.type.storage,
             local_allocated_buffers.type.layout,
-            local_allocated_buffers.type.semantic,
         )
 
 
-def _buffered_tensor_getitem(self, buffer_idx):
-    return local_view(self, buffer_idx, _semantic=self.type.semantic)
+@tl.builtin
+def _buffered_tensor_getitem(self, buffer_idx, _semantic=None):
+    return local_view(self, buffer_idx, _semantic=_semantic)
 
 
 @tl.builtin
@@ -205,18 +206,52 @@ def remote_view(
         remote_cta_rank_handle = _semantic._convert_elem_to_ir_value(tl._unwrap_if_constexpr(remote_cta_rank),
                                                                      require_i64=False)
     else:
-        assert isinstance(
-            remote_cta_rank, tl.tensor
-        ), f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)"
+        assert isinstance(remote_cta_rank, tl.tensor), (
+            f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)")
         remote_cta_rank_handle = remote_cta_rank.handle
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
                                                                       remote_cta_rank_handle)
     return tlx.mbarrier(remote_buf_handle, 0, local_allocated_buffer.type.layout, storage_kind.smemCluster)
 
 
+@tl.builtin
+def _tensor_descriptor_ptr_getitem(self, index, _semantic=None):
+    """
+    Index into the tensor descriptor pointer array.
+    Returns a pointer to the descriptor at the given index.
+    Advances by descriptor_size bytes per index.
+
+    :param index: The index into the descriptor array (can be int, constexpr, or tensor)
+    :return: A new tensor_descriptor_ptr pointing to the indexed descriptor
+    """
+    descriptor_size = self.descriptor_size
+
+    # Convert index to IR value
+    if isinstance(index, tl.tensor):
+        # If it's a tensor, use its handle directly
+        index_handle = index.handle
+    elif isinstance(index, int) or isinstance(index, tl.constexpr):
+        index_val = tl._unwrap_if_constexpr(index)
+        index_handle = _semantic.builder.get_int32(index_val)
+    else:
+        raise TypeError(f"Index must be int, constexpr, or tensor, got {type(index)}")
+
+    # Multiply index by descriptor_size to get byte offset
+    size_handle = _semantic.builder.get_int32(descriptor_size)
+    offset_handle = _semantic.builder.create_mul(index_handle, size_handle)
+
+    # Create addptr to advance by index * descriptor_size bytes
+    indexed_handle = _semantic.builder.create_addptr(self.handle, offset_handle)
+
+    # Return a new tensor_descriptor_ptr, preserving the original num and descriptor_size
+    # This allows proper bounds tracking across the entire array
+    return tlx.tensor_descriptor_ptr(indexed_handle, self.num, descriptor_size)
+
+
 tlx.buffered_tensor.__getitem__ = _buffered_tensor_getitem
 tlx.mbarrier.__getitem__ = _buffered_tensor_getitem
 tlx.clc_response.__getitem__ = _buffered_tensor_getitem
+tlx.tensor_descriptor_ptr.__getitem__ = _tensor_descriptor_ptr_getitem
 
 
 @tl.builtin
@@ -255,7 +290,6 @@ def local_slice(
     shape: list[int],
     _semantic=None,
 ) -> tlx.buffered_tensor:
-
     if buffer.type.storage == tlx.storage_kind.tmem:
         # TMEM can only slice along the innermost dimension
         assert len(offset) == 2 and len(shape) == 2
@@ -271,7 +305,6 @@ def local_slice(
             0,
             buffer.type.storage,
             buffer.type.layout,
-            buffer.type.semantic,
         )
 
 
@@ -384,14 +417,14 @@ def local_store(
 @tl.builtin
 def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic=None) -> tlx.buffered_tensor:
     """
-        Permutes the dimensions of a tensor.
+    Permutes the dimensions of a tensor.
 
-        If the parameter :code:`dims` is not specified, the function defaults to a (1,0) permutation,
-        effectively transposing a 2D tensor.
+    If the parameter :code:`dims` is not specified, the function defaults to a (1,0) permutation,
+    effectively transposing a 2D tensor.
 
-        :param input: The input tensor.
-        :param dims: The desired ordering of dimensions.  For example,
-            :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
+    :param input: The input tensor.
+    :param dims: The desired ordering of dimensions.  For example,
+        :code:`(2, 1, 0)` reverses the order dims in a 3D tensor.
     """
     if len(input.type.shape) != len(dims):
         raise ValueError("permute dims must have the same length as input shape")
@@ -406,14 +439,13 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic
 def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, shape: list[tl.constexpr] = None,
                       _semantic=None) -> tlx.buffered_tensor:
     """
-        Reinterpret the dtype and shape of a buffered tensor. Layout is preserved.
+    Reinterpret the dtype and shape of a buffered tensor. Layout is preserved.
     """
     if shape is None:
         shape = src.type.shape
     else:
-        assert isinstance(
-            src, tlx.buffered_tensor
-        ) and src.type.storage == tlx.storage_kind.smem, "TLX local_reinterpret with reshaping only supports SMEM"
+        assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
+            "TLX local_reinterpret with reshaping only supports SMEM")
 
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
                                                                               dtype.to_ir(_semantic.builder), shape)
@@ -486,3 +518,194 @@ def fence_async_shared(_semantic=None, ) -> None:
     Order memory operations that go through the shared memory.
     """
     _semantic.builder.create_fence_async_shared(False)
+
+
+@tl.builtin
+def allocate_tensor_descriptor(
+    num: tl.constexpr,
+    _semantic=None,
+) -> tlx.tensor_descriptor_ptr:
+    """
+    Allocates buffer in global memory for tensor descriptor storage with builtin parameters
+    (nbytes=128, alignment=128) and returns a tensor descriptor pointer.
+    The returned pointer advances by 128 bytes when incremented by 1 (ptr + 1).
+    Supports indexing operation: ptr[i] to access the i-th descriptor.
+
+    :param num: Number of tensor descriptors to allocate
+    :return: A tensor_descriptor_ptr with 128-byte stride semantics and num tracking
+    """
+    if not isinstance(num, tl.constexpr):
+        raise ValueError("`num` must be a constexpr")
+
+    # Use builtin values for tensor descriptor allocation
+    unwrapped_num = tl._unwrap_if_constexpr(num)
+    descriptor_size = 128
+    nbytes = descriptor_size * unwrapped_num
+    alignment = 128
+
+    tensor_handle = _semantic.builder.create_global_scratch_alloc(nbytes, alignment)
+
+    # Return a tensor_descriptor_ptr which has built-in 128-byte stride semantics
+    # Pass num and descriptor_size so the type knows how many descriptors it can access
+    return tlx.tensor_descriptor_ptr(tensor_handle, unwrapped_num, descriptor_size)
+
+
+@tl.builtin
+def make_tensor_descriptor(
+    desc_ptr: tlx.tensor_descriptor_ptr | None,
+    base: tl.tensor,
+    shape: list[tl.tensor],
+    strides: list[tl.tensor],
+    block_shape: list[tl.constexpr],
+    padding_option="zero",
+    _semantic=None,
+) -> tl.tensor_descriptor_base:
+    """
+    Create a TMA descriptor on device for loading/storing data from global memory.
+
+    This function creates a tt.make_tensor_descriptor operation that can be used with
+    async TMA operations for efficient data movement.
+
+    .. note::
+        The `desc_ptr` parameter is optional. If provided, the descriptor will use the
+        provided tensor descriptor pointer (from tlx.allocate_tensor_descriptor). If None, the
+        compiler will automatically allocate global scratch memory for the descriptor.
+
+    :param desc_ptr: Optional tensor_descriptor_ptr for descriptor storage (from tlx.allocate_tensor_descriptor). Pass None to auto-allocate.
+    :param base: Base pointer to the tensor in global memory
+    :param shape: List of tensor dimensions (dynamic, runtime values)
+    :param strides: List of tensor strides (dynamic, runtime values)
+    :param block_shape: Shape of the block to be loaded/stored (compile-time constants)
+    :param padding_option: Padding option for out-of-bounds accesses (default: "zero")
+
+    Example:
+    --------
+    .. code-block:: python
+
+        # Allocate storage for descriptors
+        desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+
+        # Create a 2D tensor descriptor at index 0
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
+            base=tensor_ptr,
+            shape=[M, N],
+            strides=[N, tl.constexpr(1)],
+            block_shape=[64, 64],
+        )
+
+        # Reinterpret the descriptor for TMA operations
+        desc = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
+            block_shape=[64, 64],
+            dtype=tl.float16,
+        )
+
+        # Use with async TMA load
+        tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)
+    """
+    # Type check desc_ptr
+    if desc_ptr is not None and not isinstance(desc_ptr, tlx.tensor_descriptor_ptr):
+        raise TypeError(f"desc_ptr must be None or tlx.tensor_descriptor_ptr, got {type(desc_ptr)}. "
+                        f"Use tlx.allocate_tensor_descriptor() to allocate descriptor storage.")
+    ndim = len(shape)
+    if not (1 <= ndim <= 5):
+        raise ValueError(f"Expected 1 <= ndim <= 5 but got {ndim} dimensions")
+    if len(strides) != ndim:
+        raise ValueError(f"Expected {ndim} strides but got {len(strides)}")
+    if len(block_shape) != ndim:
+        raise ValueError(f"Expected block_shape to have {ndim} dimensions but got {len(strides)}")
+    assert isinstance(base.dtype, tl.pointer_type)
+    elem_size = base.dtype.element_ty.primitive_bitwidth // 8
+    contig_dim_size = tl._unwrap_if_constexpr(block_shape[-1])
+    if contig_dim_size * elem_size < 16:
+        raise ValueError(
+            f"Descriptor block shape must have at least 16 bytes in the last dimension, but got {contig_dim_size} * {elem_size} = {contig_dim_size * elem_size} bytes"
+        )
+
+    last_stride = tl._unwrap_if_constexpr(strides[-1])
+    if last_stride != 1:
+        raise ValueError(f"Tensor descriptor last dim must be 1 but got {last_stride}")
+
+    shape = [_semantic.make_scalar(x, tl.int32) for x in shape]
+    strides = [_semantic.make_scalar(tl._unwrap_if_constexpr(x), tl.int64) for x in strides]
+
+    # Check whether `block_shape` is static
+    block_shape = tl._unwrap_shape(block_shape)
+
+    assert isinstance(base.type, tl.pointer_type)
+    block_type = tl.block_type(base.type.element_ty, block_shape)
+    base_handle = base.handle
+    is_signed_int = base.type.element_ty.is_int_signed()
+
+    padding = _semantic._str_to_padding_option(padding_option)
+
+    if base.type.element_ty.is_int() and padding == ir.PADDING_OPTION.PAD_NAN:
+        raise ValueError("Padding option `nan` is not supported for integer blocks")
+
+    desc_handle = desc_ptr.handle if desc_ptr is not None else None
+    if desc_handle:
+        handle = _semantic.builder.create_make_tensor_descriptor(
+            base_handle,
+            [s.handle for s in shape],
+            [s.handle for s in strides],
+            desc_handle,
+            block_shape,
+            is_signed_int,
+            padding,
+        )
+    else:
+        handle = _semantic.builder.create_make_tensor_descriptor(base_handle, [s.handle for s in shape],
+                                                                 [s.handle for s in strides], block_shape,
+                                                                 is_signed_int, padding)
+    return tl.tensor_descriptor(handle, shape, strides, block_type)
+
+
+@tl.builtin
+def reinterpret_tensor_descriptor(
+    desc_ptr: tlx.tensor_descriptor_ptr,
+    block_shape: list[tl.constexpr],
+    dtype: tl.dtype,
+    _semantic=None,
+) -> tl.tensor_descriptor_base:
+    """
+    Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.
+
+    This function creates a tensor descriptor from a tensor_descriptor_ptr
+    (e.g., from tlx.allocate_tensor_descriptor). This is useful when you have
+    allocated descriptor storage and need to convert it to a tensor descriptor
+    for use with TMA operations.
+
+    :param desc_ptr: A tensor_descriptor_ptr pointing to the TMA descriptor
+    :param block_shape: Shape of the block to be loaded/stored (compile-time constants)
+    :param dtype: Data type of the tensor elements
+
+    Example:
+    --------
+    .. code-block:: python
+
+        # Allocate storage for 4 tensor descriptors
+        desc_ptrs = tlx.allocate_tensor_descriptor(num=4)
+
+        # Reinterpret the first descriptor
+        desc = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
+            block_shape=[64],
+            dtype=tl.int16,
+        )
+
+        # Now you can use desc with TMA operations
+        tlx.async_descriptor_load(desc, buffer, offsets=[0], barrier=mbar)
+    """
+    # Type check desc_ptr
+    if not isinstance(desc_ptr, tlx.tensor_descriptor_ptr):
+        raise TypeError(f"desc_ptr must be tlx.tensor_descriptor_ptr, got {type(desc_ptr)}. "
+                        f"Use tlx.allocate_tensor_descriptor() to allocate descriptor storage.")
+
+    # Extract the IR handle from the tensor_descriptor_ptr
+    # Create a tl.tensor wrapper for compatibility with reinterpret_tensor_descriptor
+    ptr_type = tl.pointer_type(tl.int8)
+    tensor_wrapper = tl.tensor(desc_ptr.handle, ptr_type)
+
+    block_ty = tl.block_type(tl._unwrap_if_constexpr(dtype), block_shape)
+    return _semantic.reinterpret_tensor_descriptor(tensor_wrapper, block_ty)

@@ -7,7 +7,7 @@ module {
     %c0_i32 = arith.constant 0 : i32
     %c128_i32 = arith.constant 128 : i32
     %c256_i32 = arith.constant 256 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : <f32>, <tensor<128x128xf32>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<tensor<128x128xf32>>
     %3 = tt.descriptor_load %0[%arg1, %arg2] : !tt.tensordesc<tensor<128x128xf32>> -> tensor<128x128xf32>
     tt.return %3 : tensor<128x128xf32>
   }
@@ -62,7 +62,7 @@ module {
     %c0_i32 = arith.constant 0 : i32
     %c128_i32 = arith.constant 128 : i32
     %c256_i32 = arith.constant 256 : i32
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : <f32>, <tensor<128x128xf32>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c1_i64, %c256_i64] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<tensor<128x128xf32>>
     tt.descriptor_store %0[%arg1, %arg2], %arg3 : !tt.tensordesc<tensor<128x128xf32>>, tensor<128x128xf32>
     tt.return
   }
@@ -118,7 +118,7 @@ module {
     %c1_i64 = arith.constant 1 : i64
     %c256_i32 = arith.constant 256 : i32
     %c256_i64 = arith.constant 256 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c256_i64, %c1_i64] {order = array<i32: 0>} : <f32>, <tensor<128x128xf32>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c256_i32, %c256_i32], [%c256_i64, %c1_i64] {order = array<i32: 0>} : !tt.ptr<f32>, !tt.tensordesc<tensor<128x128xf32>>
     %1 = tt.call @callee(%0) : (!tt.tensordesc<tensor<128x128xf32>>) -> !tt.tensordesc<tensor<128x128xf32>>
     tt.return
   }

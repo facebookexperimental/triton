@@ -41,10 +41,10 @@
 // CHECK:           %[[VAL_28:.*]] = arith.divsi %[[VAL_27]], %[[VAL_16]] : i32
 // CHECK:           %[[VAL_29:.*]] = arith.muli %[[VAL_24]], %[[VAL_26]] : i32
 // CHECK:           %[[VAL_30:.*]] = arith.extsi %[[VAL_5]] : i32 to i64
-// CHECK:           %[[VAL_31:.*]] = tt.make_tensor_descriptor %[[VAL_0]], {{\[}}%[[VAL_3]], %[[VAL_5]]], {{\[}}%[[VAL_30]], %[[VAL_17]]] : <f16>, <tensor<128x64xf16, #[[$ATTR_2]]>>
-// CHECK:           %[[VAL_32:.*]] = tt.make_tensor_descriptor %[[VAL_1]], {{\[}}%[[VAL_4]], %[[VAL_5]]], {{\[}}%[[VAL_30]], %[[VAL_17]]] : <f16>, <tensor<256x64xf16, #[[$ATTR_2]]>>
+// CHECK:           %[[VAL_31:.*]] = tt.make_tensor_descriptor %[[VAL_0]], {{\[}}%[[VAL_3]], %[[VAL_5]]], {{\[}}%[[VAL_30]], %[[VAL_17]]] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #[[$ATTR_2]]>>
+// CHECK:           %[[VAL_32:.*]] = tt.make_tensor_descriptor %[[VAL_1]], {{\[}}%[[VAL_4]], %[[VAL_5]]], {{\[}}%[[VAL_30]], %[[VAL_17]]] : !tt.ptr<f16>, !tt.tensordesc<tensor<256x64xf16, #[[$ATTR_2]]>>
 // CHECK:           %[[VAL_33:.*]] = arith.extsi %[[VAL_4]] : i32 to i64
-// CHECK:           %[[VAL_34:.*]] = tt.make_tensor_descriptor %[[VAL_2]], {{\[}}%[[VAL_3]], %[[VAL_4]]], {{\[}}%[[VAL_33]], %[[VAL_17]]] : <f16>, <tensor<128x256xf16, #[[$ATTR_2]]>>
+// CHECK:           %[[VAL_34:.*]] = tt.make_tensor_descriptor %[[VAL_2]], {{\[}}%[[VAL_3]], %[[VAL_4]]], {{\[}}%[[VAL_33]], %[[VAL_17]]] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x256xf16, #[[$ATTR_2]]>>
 // CHECK:           %[[VAL_35:.*]] = arith.divsi %[[VAL_29]], %[[VAL_10]] : i32
 // CHECK:           %[[VAL_36:.*]] = arith.remsi %[[VAL_29]], %[[VAL_10]] : i32
 // CHECK:           %[[VAL_37:.*]] = arith.cmpi slt, %[[VAL_22]], %[[VAL_36]] : i32
@@ -169,10 +169,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %6 = arith.divsi %5, %c64_i32 : i32
     %7 = arith.muli %2, %4 : i32
     %8 = arith.extsi %arg5 : i32 to i64
-    %9 = tt.make_tensor_descriptor %arg0, [%arg3, %arg5], [%8, %c1_i64] : <f16>, <tensor<128x64xf16, #nvmma_128>>
-    %10 = tt.make_tensor_descriptor %arg1, [%arg4, %arg5], [%8, %c1_i64] : <f16>, <tensor<256x64xf16, #nvmma_128>>
+    %9 = tt.make_tensor_descriptor %arg0, [%arg3, %arg5], [%8, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #nvmma_128>>
+    %10 = tt.make_tensor_descriptor %arg1, [%arg4, %arg5], [%8, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<256x64xf16, #nvmma_128>>
     %11 = arith.extsi %arg4 : i32 to i64
-    %12 = tt.make_tensor_descriptor %arg2, [%arg3, %arg4], [%11, %c1_i64] : <f16>, <tensor<128x256xf16, #nvmma_128>>
+    %12 = tt.make_tensor_descriptor %arg2, [%arg3, %arg4], [%11, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x256xf16, #nvmma_128>>
     %13 = arith.divsi %7, %c132_i32 : i32
     %14 = arith.remsi %7, %c132_i32 : i32
     %15 = arith.cmpi slt, %0, %14 : i32
@@ -199,11 +199,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
         %38 = arith.cmpi eq, %37, %c1_i32 : i32
         %39:4 = scf.if %38 -> (!tt.tensordesc<tensor<128x64xf16, #nvmma_128>>, !tt.tensordesc<tensor<256x64xf16, #nvmma_128>>, !tt.tensordesc<tensor<128x256xf16, #nvmma_128>>, i32) {
           %51 = tt.addptr %arg0, %19 : !tt.ptr<f16>, i32
-          %52 = tt.make_tensor_descriptor %51, [%arg3, %arg5], [%8, %c1_i64] : <f16>, <tensor<128x64xf16, #nvmma_128>>
+          %52 = tt.make_tensor_descriptor %51, [%arg3, %arg5], [%8, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #nvmma_128>>
           %53 = tt.addptr %arg1, %19 : !tt.ptr<f16>, i32
-          %54 = tt.make_tensor_descriptor %53, [%arg4, %arg5], [%8, %c1_i64] : <f16>, <tensor<256x64xf16, #nvmma_128>>
+          %54 = tt.make_tensor_descriptor %53, [%arg4, %arg5], [%8, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<256x64xf16, #nvmma_128>>
           %55 = tt.addptr %arg2, %19 : !tt.ptr<f16>, i32
-          %56 = tt.make_tensor_descriptor %55, [%arg3, %arg4], [%11, %c1_i64] : <f16>, <tensor<128x256xf16, #nvmma_128>>
+          %56 = tt.make_tensor_descriptor %55, [%arg3, %arg4], [%11, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x256xf16, #nvmma_128>>
           scf.yield %52, %54, %56, %c0_i32 : !tt.tensordesc<tensor<128x64xf16, #nvmma_128>>, !tt.tensordesc<tensor<256x64xf16, #nvmma_128>>, !tt.tensordesc<tensor<128x256xf16, #nvmma_128>>, i32
         } else {
           scf.yield %arg8, %arg9, %arg10, %37 : !tt.tensordesc<tensor<128x64xf16, #nvmma_128>>, !tt.tensordesc<tensor<256x64xf16, #nvmma_128>>, !tt.tensordesc<tensor<128x256xf16, #nvmma_128>>, i32

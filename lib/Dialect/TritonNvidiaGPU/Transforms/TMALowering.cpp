@@ -197,14 +197,24 @@ public:
                                 PatternRewriter &rewriter) const override {
     MLIRContext *ctx = op.getContext();
     auto loc = op.getLoc();
-    auto alloc = rewriter.create<triton::gpu::GlobalScratchAllocOp>(
-        loc, getPointerType(rewriter.getI8Type()), TMA_SIZE_BYTES, TMA_ALIGN);
-    if (failed(createTMADesc(alloc, op, rewriter))) {
+
+    Value descPtr;
+    // If desc_ptr is provided, use it directly without creating global scratch
+    if (op.getDescPtr()) {
+      descPtr = op.getDescPtr();
+    } else {
+      // Create global scratch allocation when desc_ptr is not provided
+      auto alloc = rewriter.create<triton::gpu::GlobalScratchAllocOp>(
+          loc, getPointerType(rewriter.getI8Type()), TMA_SIZE_BYTES, TMA_ALIGN);
+      descPtr = alloc.getResult();
+    }
+
+    if (failed(createTMADesc(descPtr, op, rewriter))) {
       return failure();
     }
-    rewriter.create<TensormapFenceproxyAcquireOp>(loc, alloc.getResult());
-    auto newDesc = rewriter.create<ReinterpretTensorDescOp>(loc, op.getType(),
-                                                            alloc.getResult());
+    rewriter.create<TensormapFenceproxyAcquireOp>(loc, descPtr);
+    auto newDesc =
+        rewriter.create<ReinterpretTensorDescOp>(loc, op.getType(), descPtr);
     rewriter.replaceOp(op, newDesc);
     return success();
   }

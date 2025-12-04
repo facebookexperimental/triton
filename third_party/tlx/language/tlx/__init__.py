@@ -14,10 +14,30 @@ from .types import (
     clc_response_type,
     CLCPipelineContext,
     async_token,
+    tensor_descriptor_ptr,
+    tensor_descriptor_ptr_type,
 )
-from .mem_ops import (local_alloc, local_view, remote_view, local_slice, subslice, async_load, async_load_commit_group,
-                      async_load_wait_group, local_load, local_store, local_trans, local_reinterpret,
-                      async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, fence_async_shared)
+from .mem_ops import (
+    local_alloc,
+    local_view,
+    remote_view,
+    local_slice,
+    subslice,
+    async_load,
+    async_load_commit_group,
+    async_load_wait_group,
+    local_load,
+    local_store,
+    local_trans,
+    local_reinterpret,
+    allocate_tensor_descriptor,
+    async_descriptor_load,
+    async_descriptor_store,
+    async_descriptor_store_wait,
+    fence_async_shared,
+    make_tensor_descriptor,
+    reinterpret_tensor_descriptor,
+)
 from .barrier import (
     alloc_barriers,
     barrier_expect_bytes,
@@ -37,6 +57,7 @@ from .utility import (
     thread_id,
     async_task_replica_id,
     dtype_of,
+    size_of,
     clock64,
     stoch_round,
 )
@@ -70,6 +91,8 @@ __all__ = [
     "clc_response_type",
     "CLCPipeliner",
     "async_token",
+    "tensor_descriptor_ptr",
+    "tensor_descriptor_ptr_type",
     # mem_ops
     "local_alloc",
     "local_view",
@@ -83,10 +106,13 @@ __all__ = [
     "local_store",
     "local_trans",
     "local_reinterpret",
+    "allocate_tensor_descriptor",
     "async_descriptor_load",
     "async_descriptor_store",
     "async_descriptor_store_wait",
     "fence_async_shared",
+    "make_tensor_descriptor",
+    "reinterpret_tensor_descriptor",
     # barriers
     "alloc_barriers",
     "barrier_expect_bytes",
@@ -104,6 +130,7 @@ __all__ = [
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    "size_of",
     "clock64",
     "stoch_round",
     # dynamic launcher ops

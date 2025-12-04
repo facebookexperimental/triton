@@ -213,7 +213,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %0 = tt.get_program_id x : i32
     %1 = tt.get_program_id y : i32
     %2 = arith.extsi %arg3 : i32 to i64
-    %3 = tt.make_tensor_descriptor %arg0, [%arg2, %arg3], [%2, %c1_i64] : <i16>, <tensor<64x64xsi16>>
+    %3 = tt.make_tensor_descriptor %arg0, [%arg2, %arg3], [%2, %c1_i64] : !tt.ptr<i16>, !tt.tensordesc<tensor<64x64xsi16>>
     // CHECK: ttg.local_alloc : () -> !ttg.memdesc<1x64x64xi16, #[[$SHARED]], #smem, mutable>
     %4 = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xi16, #shared, #smem, mutable>
     %5 = ttg.memdesc_index %4[%c0_i32] : !ttg.memdesc<1x64x64xi16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xi16, #shared, #smem, mutable>
@@ -654,8 +654,8 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %10 = arith.muli %arg18, %arg15 : i32
     %11 = arith.muli %arg16, %c128_i32 : i32
     %12 = arith.extsi %11 : i32 to i64
-    %13 = tt.make_tensor_descriptor %arg2, [%10, %11], [%12, %c1_i64] : <bf16>, <tensor<128x128xbf16>>
-    %14 = tt.make_tensor_descriptor %arg4, [%10, %11], [%12, %c1_i64] : <bf16>, <tensor<128x128xbf16>>
+    %13 = tt.make_tensor_descriptor %arg2, [%10, %11], [%12, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16>>
+    %14 = tt.make_tensor_descriptor %arg4, [%10, %11], [%12, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16>>
     %15 = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xbf16, #shared, #smem, mutable>
     %16 = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xbf16, #shared, #smem, mutable>
     %17 = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xbf16, #shared, #smem, mutable>
@@ -784,7 +784,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
           %result_4 = ttng.tmem_load %76 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked2>
           %77 = tlx.release_layout %result_4 : tensor<128x128xf32, #blocked2> -> tensor<128x128xf32, #blocked3>
           ttng.arrive_barrier %45, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-          %78 = tt.make_tensor_descriptor %arg5, [%58, %11], [%12, %c1_i64] : <bf16>, <tensor<128x128xbf16>>
+          %78 = tt.make_tensor_descriptor %arg5, [%58, %11], [%12, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16>>
           %79 = arith.truncf %77 : tensor<128x128xf32, #blocked3> to tensor<128x128xbf16, #blocked3>
           %80 = arith.addi %56, %71 : i32
           %81 = arith.trunci %70 : i64 to i32
@@ -875,7 +875,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
           }
           %76 = arith.muli %arg21, %c128_i32_13 : i32
           %77 = arith.extsi %76 : i32 to i64
-          %78 = tt.make_tensor_descriptor %arg24, [%63, %76], [%77, %c1_i64_6] : <bf16>, <tensor<128x128xbf16>>
+          %78 = tt.make_tensor_descriptor %arg24, [%63, %76], [%77, %c1_i64_6] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16>>
           %79 = ttg.memdesc_index %arg38[%c0_i32_11] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
           %result_14 = ttng.tmem_load %79 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked2>
           %80 = tlx.release_layout %result_14 : tensor<128x128xf32, #blocked2> -> tensor<128x128xf32, #blocked3>
@@ -1071,7 +1071,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
         %75:2 = scf.if %74 -> (i32, i32) {
           %77 = arith.muli %arg21, %c128_i32_7 : i32
           %78 = arith.extsi %77 : i32 to i64
-          %79 = tt.make_tensor_descriptor %arg25, [%65, %77], [%78, %c1_i64_6] : <bf16>, <tensor<128x128xbf16>>
+          %79 = tt.make_tensor_descriptor %arg25, [%65, %77], [%78, %c1_i64_6] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16>>
           %80 = arith.andi %arg61, %c1_i32_10 : i32
           %81 = ttg.memdesc_index %arg31[%c0_i32_9] : !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
           %82 = arith.xori %80, %c1_i32_10 : i32
