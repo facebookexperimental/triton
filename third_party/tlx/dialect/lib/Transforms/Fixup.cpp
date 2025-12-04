@@ -99,7 +99,7 @@ public:
 
       // Find all barrier init ops in the func
       std::vector<Value> barriers;
-      mod.walk(
+      funcOp.walk(
           [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
       // todo: consider removing all the inval op that's located right before
       // return in a later pass to save a few cycles.
