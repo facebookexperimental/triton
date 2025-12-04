@@ -1053,8 +1053,8 @@ def TT_MakeTensorPtrOp : TT_Op<"make_tensor_ptr",
 // Make Tensor Descriptor Op
 //
 def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
-    Pure,
     AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
 ]> {
   let summary = "Make a tensor descriptor type with meta information of the parent tensor and block size";
 

@@ -463,3 +463,62 @@ class async_token_type(tl.base_type):
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int):
         return async_token(handles[cursor]), cursor + 1
+
+
+class tensor_descriptor_ptr(tl.base_value):
+    """
+    A pointer type for tensor descriptors with 128-byte stride semantics.
+    When performing pointer arithmetic (ptr + 1), the pointer advances by 128 bytes,
+    which is the size of a single tensor descriptor.
+    """
+
+    def __init__(self, handle, num: int, descriptor_size: int):
+        super().__init__()
+        self.handle = handle
+        self.type = tensor_descriptor_ptr_type(num, descriptor_size)
+
+    @property
+    def num(self) -> int:
+        """Number of descriptors this pointer can access."""
+        return self.type.num
+
+    @property
+    def descriptor_size(self) -> int:
+        """Size of each descriptor in bytes."""
+        return self.type.size
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _unflatten_ir(self, handles, cursor):
+        raise NotImplementedError
+
+
+class tensor_descriptor_ptr_type(tl.pointer_type):
+    """
+    Type for pointers to tensor descriptors.
+    Encodes size-byte stride semantics for pointer arithmetic.
+    """
+
+    def __init__(self, num: int, size: int = 128):
+        # Initialize with a block type of size int8 elements to get size-byte stride
+        element_type = tl.block_type(tl.int8, [size])
+        super().__init__(element_type, address_space=1)
+        # Number of descriptors this pointer can access (1 means single descriptor)
+        self.num = num
+        # Size of each descriptor in bytes
+        self.size = size
+
+    def __eq__(self, other):
+        return isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size
+
+    def __repr__(self) -> str:
+        return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"
+
+    def mangle(self) -> str:
+        if self.num > 1:
+            return f"tensor_desc_ptr_{self.num}_{self.size}"
+        return f"tensor_desc_ptr_{self.size}"
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int):
+        return tensor_descriptor_ptr(handles[cursor], self.num, self.size), cursor + 1
