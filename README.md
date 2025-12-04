@@ -28,9 +28,9 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
-- `buffer = tlx.local_view(buffers, buffer_idx)`
+- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]`
 
-    Return a subview of the buffer indexed by `buffer_idx` from `buffers`.
+    Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
 - `distributed_tensor = tlx.local_load(buffer, optional_token)`
@@ -69,12 +69,33 @@ While this approach places more responsibility on the user, it reduces the compi
 
    Store a chunk of data from local memory into global memory buffer. The global address, strides, and buffer size are defined by the memory descriptor.
 
+- `desc_ptrs = tlx.allocate_tensor_descriptor(num)`
+
+   Allocates global memory for tensor descriptor storage with built-in parameters (nbytes=128, alignment=128 per descriptor).
+   Returns a `tensor_descriptor_ptr` with 128-byte stride semantics that supports indexing.
+
+   **Parameters:**
+   - `num`: Number of tensor descriptors to allocate (must be a constexpr)
+
+   **Returns:**
+   - A `tensor_descriptor_ptr` where indexing (e.g., `desc_ptrs[0]`, `desc_ptrs[1]`) advances by 128 bytes per index
+
+   **Example:**
+   ```python
+   # Allocate storage for 4 tensor descriptors
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=4)
+
+   # Access individual descriptors using indexing
+   desc_ptr_0 = desc_ptrs[0]  # First descriptor
+   desc_ptr_1 = desc_ptrs[1]  # Second descriptor (128 bytes offset)
+   ```
+
 - `tlx.make_tensor_descriptor(desc_ptr, base, shape, strides, block_shape, padding_option)`
 
    Create a TMA (Tensor Memory Accelerator) descriptor for efficient asynchronous data movement on Hopper and Blackwell GPUs.
 
    **Parameters:**
-   - `desc_ptr` (optional): Pointer to global memory for descriptor storage. Pass `None` for automatic allocation.
+   - `desc_ptr` (optional): Tensor descriptor pointer from `allocate_tensor_descriptor()`. Pass `None` for automatic allocation.
    - `base`: Base pointer to the tensor in global memory
    - `shape`: List of tensor dimensions (dynamic, runtime values)
    - `strides`: List of tensor strides (dynamic, runtime values)
@@ -92,15 +113,47 @@ While this approach places more responsibility on the user, it reduces the compi
        block_shape=[64, 64],
    )
 
-   # Or with explicit scratch allocation for advanced use cases
-   desc_ptr = tlx.global_alloc(nbytes=128, alignment=128)
-   desc = tlx.make_tensor_descriptor(
-       desc_ptr=desc_ptr,
+   # Or with explicit descriptor allocation for advanced use cases (e.g., pipelining)
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+
+   # Create descriptor at index 0
+   tlx.make_tensor_descriptor(
+       desc_ptr=desc_ptrs[0],
        base=tensor_ptr,
        shape=[M, N],
        strides=[N, tl.constexpr(1)],
        block_shape=[64, 64],
    )
+
+   # Reinterpret the descriptor for TMA operations
+   desc = tlx.reinterpret_tensor_descriptor(
+       desc_ptr=desc_ptrs[0],
+       block_shape=[64, 64],
+       dtype=tl.float16,
+   )
+
+   # Use with async TMA operations
+   tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)
+   ```
+
+- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)`
+
+   Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.
+
+   **Parameters:**
+   - `desc_ptr`: A `tensor_descriptor_ptr` pointing to the TMA descriptor (from `allocate_tensor_descriptor`)
+   - `block_shape`: Shape of the block to be loaded/stored (compile-time constants)
+   - `dtype`: Data type of the tensor elements
+
+   **Example:**
+   ```python
+   # Allocate and create descriptor
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+   tlx.make_tensor_descriptor(desc_ptr=desc_ptrs[0], base=a_ptr, shape=[M, K], strides=[K, 1], block_shape=[128, 64])
+
+   # Reinterpret for use with TMA
+   a_desc = tlx.reinterpret_tensor_descriptor(desc_ptr=desc_ptrs[0], block_shape=[128, 64], dtype=tl.float16)
+   tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
    ```
 
 - `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`
