@@ -1288,6 +1288,16 @@ void MakeTensorDescOp::print(OpAsmPrinter &p) {
   p << " : " << getBase().getType() << ", " << getType();
 }
 
+void MakeTensorDescOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // If descPtr operand is present, this operation writes to global memory
+  if (getDescPtr()) {
+    effects.emplace_back(MemoryEffects::Write::get(), GlobalMemory::get());
+  }
+  // Otherwise, the operation is pure (no effects)
+}
+
 // The following ops, including `call`, `func`, and `return` are copied and
 // modified from
 // https://github.com/llvm/llvm-project/blob/main/mlir/lib/Dialect/Func/IR/FuncOps.cpp
