@@ -1806,6 +1806,11 @@ def test_barrier_live_range(device):
 
     @triton.jit
     def bar_live_kernel():
+        # an intentional early return here to check that we're considering dominance when inserting inval bar ops
+        pid = tl.program_id(axis=0)
+        if pid == 258:
+            return
+
         # use bars1 after bars2/3 init
         bars1 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
 
