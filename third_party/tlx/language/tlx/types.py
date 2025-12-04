@@ -7,6 +7,7 @@ from triton._C.libtriton import ir
 
 
 class layout_encoding:
+
     def __init__(self):
         pass
 
@@ -18,6 +19,7 @@ class layout_encoding:
 
 
 class shared_layout_encoding(layout_encoding):
+
     def __init__(self):
         super().__init__()
         pass
@@ -35,6 +37,7 @@ class shared_layout_encoding(layout_encoding):
 
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
+
     def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
         super().__init__()
         self.vectorSize = vectorSize
@@ -93,6 +96,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
+
     def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
@@ -126,6 +130,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
+
     def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded, swizzled):
         super().__init__()
         self.shape = shape
@@ -188,17 +193,10 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
         return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
 
     def __eq__(self, other) -> bool:
-        return (
-            type(self) is type(other)
-            and self.shape == other.shape
-            and self.order == other.order
-            and self.elemType == other.elemType
-            and self.numCTAsPerCGA == other.numCTAsPerCGA
-            and self.numCTASplit == other.numCTASplit
-            and self.numCTAOrder == other.numCTAOrder
-            and self.fp4Padded == other.fp4Padded
-            and self.swizzled == other.swizzled
-        )
+        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
+                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
+                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
+                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
 
 
 class storage_kind(enum.Enum):
@@ -263,6 +261,7 @@ class buffered_tensor(tl.base_value):
 
 
 class buffered_tensor_type(tl.block_type):
+
     def __init__(
         self,
         element_ty: tl.dtype,
@@ -294,12 +293,8 @@ class buffered_tensor_type(tl.block_type):
         return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
 
     def __eq__(self, other) -> bool:
-        return (
-            type(self) is type(other)
-            and self.shape == other.shape
-            and self.layout == other.layout
-            and self.num == other.num
-        )
+        return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
+                and self.num == other.num)
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
@@ -332,8 +327,7 @@ class mbarrier(tl.base_value):
         storage: storage_kind = storage_kind.smem,
     ):
         assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
-            "mbarrier requires storage to be smem or smemCluster"
-        )
+            "mbarrier requires storage to be smem or smemCluster")
         self.handle = handle
         self.type = mbarrier_type(num, layout, storage)
         self.num = num
@@ -350,6 +344,7 @@ class mbarrier(tl.base_value):
 
 
 class mbarrier_type(buffered_tensor_type):
+
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage):
         super().__init__(tl.int64, [1], num, storage, layout)
 
@@ -450,6 +445,7 @@ class async_token(tl.base_value):
 
 
 class async_token_type(tl.base_type):
+
     def __init__(self, value):
         self.value = value
 
