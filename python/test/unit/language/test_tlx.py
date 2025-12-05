@@ -2742,3 +2742,66 @@ def test_buffer_indexing_in_function_call(device):
 
     # Verify correctness
     assert torch.allclose(y, x), "Buffer indexing in function call failed"
+
+
+@pytest.mark.parametrize("BLOCK_SIZE", [64])
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="Requires compute capability >= 9 (Hopper+)")
+def test_tensor_descriptor_ws_capture(BLOCK_SIZE, device):
+    """Test that tensor descriptor parameters are properly captured in WS regions when used in inlined functions."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def load_helper(desc, offset):
+        """Helper function that uses descriptor - will be inlined."""
+        return desc.load([offset])
+
+    @triton.jit
+    def store_helper(desc, offset, data):
+        """Helper function that stores using descriptor - will be inlined."""
+        desc.store([offset], data)
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr, SIZE, BLOCK_SIZE: tl.constexpr):
+        # Create tensor descriptors
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[SIZE],
+            strides=[tl.constexpr(1)],
+            block_shape=[BLOCK_SIZE],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[SIZE],
+            strides=[tl.constexpr(1)],
+            block_shape=[BLOCK_SIZE],
+        )
+
+        pid = tl.program_id(0)
+        offset = pid * BLOCK_SIZE
+
+        # Use tensor descriptor in WS regions with inlined function
+        # The descriptor and its expanded parameters should be properly captured in non-default region
+        with tlx.async_tasks(warp_specialize=True):
+            with tlx.async_task("default"):
+                # Default task does some trivial work
+                dummy = pid + 1
+                dummy = dummy * 2
+            with tlx.async_task(num_warps=4):
+                # Call helper functions that will be inlined in non-default region
+                # The descriptor and its expanded parameters need to be captured from outer scope
+                x = load_helper(desc_in, offset)
+                store_helper(desc_out, offset, x)
+
+    triton.set_allocator(alloc_fn)
+    SIZE = 256
+    input_data = torch.arange(SIZE, dtype=torch.float32, device=device)
+    output_data = torch.zeros(SIZE, dtype=torch.float32, device=device)
+
+    grid = lambda meta: (triton.cdiv(SIZE, BLOCK_SIZE), )
+    kernel[grid](input_data, output_data, SIZE, BLOCK_SIZE)
+    assert torch.allclose(output_data, input_data), "Tensor descriptor capture in WS region failed"

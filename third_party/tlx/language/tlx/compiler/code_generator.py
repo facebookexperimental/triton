@@ -54,10 +54,21 @@ def visit_withAsyncTask(self, node):
 
 @tlx_enter_sub_region()
 def visit_withAsyncTasks(self, node):
-    from triton.compiler.code_generator import (enter_sub_region, _is_list_like, _is_constexpr)
+    from triton.compiler.code_generator import enter_sub_region, _is_list_like, _is_constexpr
+
     with enter_sub_region(self) as sr:
         liveins, _ = sr
         ip, last_loc = self._get_insertion_point_and_loc()
+
+        def _flatten_value_handles(val):
+            handles = []
+            # Prefer the generic flatten hook to support multi-result values (e.g. tensor descriptors)
+            if hasattr(val, "_flatten_ir"):
+                val._flatten_ir(handles)
+            else:
+                handles.append(val.handle)
+            return handles
+
         stmts = node.body
         # Ensure that stmts is iterable
         if not _is_list_like(stmts):
@@ -98,8 +109,8 @@ def visit_withAsyncTasks(self, node):
         assert num_default == 1, "Default task must be one and only one"
         block.erase()
 
-        assert len(taskNumRegs) in [0,
-                                    len(taskNumWarps)], "Registers are set for either ALL or NONE of non-default tasks"
+        assert len(taskNumRegs) in [0, len(taskNumWarps)
+                                    ], ("Registers are set for either ALL or NONE of non-default tasks")
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
@@ -132,9 +143,11 @@ def visit_withAsyncTasks(self, node):
             if getattr(val, "__triton_aggregate__", False):
                 for field in val.type.fields:
                     v = getattr(val, field[0])
-                    ws_op.append_operand(v.handle)
+                    for h in _flatten_value_handles(v):
+                        ws_op.append_operand(h)
             else:
-                ws_op.append_operand(val.handle)
+                for h in _flatten_value_handles(val):
+                    ws_op.append_operand(h)
 
         # real codegen
         index = 0
@@ -171,11 +184,13 @@ def visit_withAsyncTasks(self, node):
                     if getattr(val, "__triton_aggregate__", False):
                         for field in val.type.fields:
                             v = getattr(val, field[0])
-                            arg = task_body.add_argument(v.handle.get_type())
-                            block.replace_use_in_block_with(v.handle, arg)
+                            for h in _flatten_value_handles(v):
+                                arg = task_body.add_argument(h.get_type())
+                                block.replace_use_in_block_with(h, arg)
                     else:
-                        arg = task_body.add_argument(val.handle.get_type())
-                        block.replace_use_in_block_with(val.handle, arg)
+                        for h in _flatten_value_handles(val):
+                            arg = task_body.add_argument(h.get_type())
+                            block.replace_use_in_block_with(h, arg)
 
                 self.builder.create_warp_return_op()
                 region_replica_id_stack.pop()
