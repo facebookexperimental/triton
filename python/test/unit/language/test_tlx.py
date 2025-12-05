@@ -2745,7 +2745,7 @@ def test_buffer_indexing_in_function_call(device):
 
 
 @pytest.mark.parametrize("BLOCK_SIZE", [64])
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason="Requires compute capability >= 9 (Hopper+)")
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_tensor_descriptor_ws_capture(BLOCK_SIZE, device):
     """Test that tensor descriptor parameters are properly captured in WS regions when used in inlined functions."""
 
