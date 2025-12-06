@@ -1108,6 +1108,12 @@ static size_t getSharedMemorySize(Type type) {
       return 8;
     return 8 + desc.getRank() * 4;
   }
+  // Handle RankedTensorType - these are passed as pointers to shared memory
+  // when captured by warp specialization
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
+    // Tensor captures are passed as pointers (8 bytes)
+    return 8;
+  }
   llvm::report_fatal_error(
       Twine("shared memory size for scalar type is unspecified: ") +
       mlir::debugString(type));
