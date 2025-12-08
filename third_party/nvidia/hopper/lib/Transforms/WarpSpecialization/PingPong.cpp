@@ -1,10 +1,12 @@
 #include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Location.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <unordered_set>
@@ -50,6 +52,8 @@ public:
     registerExpensiveOp("math.exp2");           // Exponential base 2
 
     // For exp2 operations, critical region might end at tmem_store
+    registerEndOfCriticalOpType("ttng.warp_group_dot", "ttng.warp_group_dot");
+    registerEndOfCriticalOpType("math.exp", "ttng.tmem_store");
     registerEndOfCriticalOpType("math.exp2", "ttng.tmem_store");
   }
 
@@ -275,7 +279,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     if (!loopDepth.empty()) {
       numPartitionWithLoops += 1;
     }
-    // Check the partition a single outer loop
+    // Check the partition a single outer loop, i.e. loop of depth 0
     if (loopDepth[0].size() != 1) {
       hasSingleOuterLoop = false;
     }
@@ -346,14 +350,17 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     Operation *expStartOp = nullptr; // exp critical region start
     Operation *expEndOp = nullptr;   // exp critical region end
     SmallVector<Operation *> expOps;
-    for (auto &op : innermostForOp.getBody()->without_terminator()) {
-      // Check for exp or exp2 operations
-      if (isa<math::Exp2Op, math::ExpOp>(op)) {
-        auto tensorTy = dyn_cast<RankedTensorType>(op.getOperand(0).getType());
-        if (tensorTy && tensorTy.getRank() > 1)
-          expOps.push_back(&op);
+    region->walk<WalkOrder::PreOrder>([&](Operation *op) {
+      // Check if this is a warp_group_dot operation
+      if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
+        LDBG("Found op with pingpong id " << pingpongIdAttr.getInt());
+        expOps.push_back(op);
+        if (crManager.hasPingPongBoundarySetup(
+                op->getName().getStringRef().str())) {
+          return; // Already setup, skip
+        }
       }
-    }
+    });
 
     if (expOps.empty())
       continue;
@@ -493,14 +500,6 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
   }
 }
 
-Operation* lookUpPingPongOp(Operation *currentOp, const llvm::DenseSet<Operation *> &opSet) {
-  for (Operation *refOp : opSet) {
-    if (currentOp->getName() == refOp->getName())
-      return refOp;
-  }
-  return nullptr;
-}
-
 bool areControlFlowEquivalent(Operation *op1, Operation *op2,
                               DominanceInfo &domInfo,
                               PostDominanceInfo &postDomInfo) {
@@ -518,18 +517,38 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2,
     return false;
 }
 
+static Operation* getSplitOp(Operation *op) {
+  for (Value operand : op->getOperands()) {
+    if (auto result = dyn_cast<OpResult>(operand)) {
+      if (isa<tt::SplitOp>(result.getOwner())) {
+        return result.getOwner();
+      }
+    }
+  }
+  return nullptr;
+}
+
+static std::optional<NameLoc> getNameLoc(Operation *op) {
+  Location loc = op->getLoc();
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
+      return nameLoc;
+    }
+  }
+  return std::nullopt;
+}
+
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
   CriticalRegionManager crManager;
 
+  // Initialize the dominance and post-dominance info
   mlir::DominanceInfo domInfo(funcOp);
   mlir::PostDominanceInfo postDomInfo(funcOp);
 
-  // pingpong attribute id
-  unsigned pingpongRID = 0;
-
-  // Set of expensive ops that have been not paired
-  llvm::DenseSet<Operation*> expensiveOps;
+  // A list of expensive ops grouped in vectors.
+  // Each vector contains ops that belong to the same pingpong region.
+  llvm::SmallVector<llvm::SmallVector<Operation*, 4>> expensiveOps;
 
   // Scan all operations in the function to find expensive ops
   funcOp.walk([&](Operation *op) {
@@ -542,38 +561,92 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     // Only 2D tensor operations are considered expensive
     auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
     if (tensorTy && tensorTy.getRank() > 1) {
-      Operation *lookUpOp = lookUpPingPongOp(op, expensiveOps);
-      LDBG("Found expensive op: " << op->getName().getStringRef().str());
-      if (lookUpOp == nullptr) {
-        expensiveOps.insert(op);
-        LDBG("No paired expensive op found, insert op " << op->getName().getStringRef().str() << " to expensiveOps set");
-      } else {
-        LDBG("Found paired expensive op, op name: " << op->getName().getStringRef().str() << ", lookUpOp name: " << lookUpOp->getName().getStringRef().str());
-        if (areControlFlowEquivalent(lookUpOp, op, domInfo, postDomInfo)) {
-          int thisOpTaskId = getSingleTaskId(op);
-          int pairOpTaskId = getSingleTaskId(lookUpOp);
-          assert(thisOpTaskId >= 0 && pairOpTaskId >= 0);
+      LDBG("Found expensive op " << op->getName().getStringRef().str() << ", location" << op->getLoc());
 
-          // Make sure the two ops are in different partitions
-          if (thisOpTaskId == pairOpTaskId)
-            return;
+      bool foundGroup = false;
+      for (auto &group : expensiveOps) {
+        bool matchType = true;
+        bool matchVar = false;
+        for (auto &refOp : group) {
+          // Check 1: Same Operation Name
+          if (op->getName() != refOp->getName()) {
+            matchType = false;
+            break;
+          }
+          // Check 2: Control Flow Equivalent
+          if (!areControlFlowEquivalent(op, refOp, domInfo, postDomInfo)) {
+            matchType = false;
+            break;
+          }
 
-          op->setAttr("pingpong_id",
-                        IntegerAttr::get(IntegerType::get(op->getContext(), 32),
-                                        pingpongRID));
-          lookUpOp->setAttr("pingpong_id",
-                        IntegerAttr::get(IntegerType::get(lookUpOp->getContext(), 32),
-                                        pingpongRID));
-          LDBG("Assign pingpong_id " << pingpongRID << " to op '"
-                                        << lookUpOp->getName().getStringRef().str()
-                                        << "' with task_id " << pairOpTaskId
-                                        << " and " << thisOpTaskId);
-          pingpongRID += 1;
-          expensiveOps.erase(lookUpOp);
-         }
+          // Check 3: If in the same partition, the op is dependent on the same tt.split
+          int opTaskId = getSingleTaskId(op);
+          int refTaskId = getSingleTaskId(refOp);
+          if (opTaskId == refTaskId) {
+            Operation *opSplit = getSplitOp(op);
+            Operation *refSplit = getSplitOp(refOp);
+            if (opSplit == refSplit) {
+              LDBG("Same split op");
+              matchVar = true;
+            }
+          } else { // Check 4: If in different partitions, the op is called from the same source var
+            std::optional<NameLoc> opLoc = getNameLoc(op);
+            std::optional<NameLoc> refLoc = getNameLoc(refOp);
+            if (opLoc.has_value() && refLoc.has_value()) {
+              LDBG("op loc: "<< opLoc << ", refLoc" << refLoc);
+              if (opLoc.value() == refLoc.value()) {
+                LDBG("Same source var");
+                matchVar = true;
+              }
+            }
+          }
+        }
+        foundGroup = matchType && matchVar;
+        if (foundGroup) {
+          LDBG("Insert to ref op group " << group[0]->getName().getStringRef().str());
+          group.push_back(op);
+          break;
+        }
+      }
+
+      if (!foundGroup) {
+        LDBG("Create new group for op " << op->getName().getStringRef().str());
+        expensiveOps.push_back({op});
       }
     }
   });
+
+  // pingpong region id
+  unsigned pingpongRID = 0;
+
+  // Assign pingpong IDs to groups
+  for (auto &group : expensiveOps) {
+    if (group.size() < 2)
+      continue;
+
+    // Check if ops are in different partitions
+    bool differentPartitions = false;
+    int firstTaskId = getSingleTaskId(group[0]);
+    for (size_t i = 1; i < group.size(); ++i) {
+      if (getSingleTaskId(group[i]) != firstTaskId) {
+        differentPartitions = true;
+        break;
+      }
+    }
+
+    if (!differentPartitions)
+      continue;
+
+    for (auto *op : group) {
+      op->setAttr("pingpong_id",
+                  IntegerAttr::get(IntegerType::get(op->getContext(), 32),
+                                   pingpongRID));
+      LDBG("Assign pingpong_id " << pingpongRID << " to op '"
+                                 << op->getName().getStringRef().str()
+                                 << "' with task_id " << getSingleTaskId(op));
+    }
+    pingpongRID++;
+  }
 }
 
 #define GEN_PASS_DEF_NVGPUTESTPINGPONGSYNC
