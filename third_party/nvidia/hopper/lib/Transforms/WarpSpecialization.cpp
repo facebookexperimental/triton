@@ -27,6 +27,8 @@ void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
+void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
+                    int capability);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
 
@@ -125,6 +127,15 @@ public:
         llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                         "doTaskIdPropagate\n"
                      << moduleOp << "\n\n\n";
+      }
+    }
+
+    if (pingpongAutoWS) {
+      doPingPongPrep(funcOp, numWarpGroups, capability);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs()
+              << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
+              << moduleOp << "\n\n\n";
       }
     }
 
