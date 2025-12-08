@@ -503,21 +503,21 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 bool areControlFlowEquivalent(Operation *op1, Operation *op2,
                               DominanceInfo &domInfo,
                               PostDominanceInfo &postDomInfo) {
-    if (op1->getBlock() != op2->getBlock())
-        return false;
-
-    // Check if op1 dominates op2 AND op2 post-dominates op1
-    if (domInfo.dominates(op1, op2) && postDomInfo.postDominates(op2, op1))
-        return true;
-
-    // Check the reverse (op2 dominates op1 AND op1 post-dominates op2)
-    if (domInfo.dominates(op2, op1) && postDomInfo.postDominates(op1, op2))
-        return true;
-
+  if (op1->getBlock() != op2->getBlock())
     return false;
+
+  // Check if op1 dominates op2 AND op2 post-dominates op1
+  if (domInfo.dominates(op1, op2) && postDomInfo.postDominates(op2, op1))
+    return true;
+
+  // Check the reverse (op2 dominates op1 AND op1 post-dominates op2)
+  if (domInfo.dominates(op2, op1) && postDomInfo.postDominates(op1, op2))
+    return true;
+
+  return false;
 }
 
-static Operation* getSplitOp(Operation *op) {
+static Operation *getSplitOp(Operation *op) {
   for (Value operand : op->getOperands()) {
     if (auto result = dyn_cast<OpResult>(operand)) {
       if (isa<tt::SplitOp>(result.getOwner())) {
@@ -548,7 +548,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
 
   // A list of expensive ops grouped in vectors.
   // Each vector contains ops that belong to the same pingpong region.
-  llvm::SmallVector<llvm::SmallVector<Operation*, 4>> expensiveOps;
+  llvm::SmallVector<llvm::SmallVector<Operation *, 4>> expensiveOps;
 
   // Scan all operations in the function to find expensive ops
   funcOp.walk([&](Operation *op) {
@@ -561,7 +561,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     // Only 2D tensor operations are considered expensive
     auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
     if (tensorTy && tensorTy.getRank() > 1) {
-      LDBG("Found expensive op " << op->getName().getStringRef().str() << ", location" << op->getLoc());
+      LDBG("Found expensive op " << op->getName().getStringRef().str()
+                                 << ", location" << op->getLoc());
 
       bool foundGroup = false;
       for (auto &group : expensiveOps) {
@@ -579,7 +580,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
             break;
           }
 
-          // Check 3: If in the same partition, the op is dependent on the same tt.split
+          // Check 3: If in the same partition, the op is dependent on the same
+          // tt.split
           int opTaskId = getSingleTaskId(op);
           int refTaskId = getSingleTaskId(refOp);
           if (opTaskId == refTaskId) {
@@ -589,11 +591,12 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
               LDBG("Same split op");
               matchVar = true;
             }
-          } else { // Check 4: If in different partitions, the op is called from the same source var
+          } else { // Check 4: If in different partitions, the op is called from
+                   // the same source var
             std::optional<NameLoc> opLoc = getNameLoc(op);
             std::optional<NameLoc> refLoc = getNameLoc(refOp);
             if (opLoc.has_value() && refLoc.has_value()) {
-              LDBG("op loc: "<< opLoc << ", refLoc" << refLoc);
+              LDBG("op loc: " << opLoc << ", refLoc" << refLoc);
               if (opLoc.value() == refLoc.value()) {
                 LDBG("Same source var");
                 matchVar = true;
@@ -603,7 +606,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
         }
         foundGroup = matchType && matchVar;
         if (foundGroup) {
-          LDBG("Insert to ref op group " << group[0]->getName().getStringRef().str());
+          LDBG("Insert to ref op group "
+               << group[0]->getName().getStringRef().str());
           group.push_back(op);
           break;
         }
@@ -659,7 +663,7 @@ public:
       NVGPUTestPingPongSyncPass>::NVGPUTestPingPongSyncBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-      doPingPongSync(funcOp, numWarpGroups, capability);
+    doPingPongSync(funcOp, numWarpGroups, capability);
   }
 
   void runOnOperation() override {
