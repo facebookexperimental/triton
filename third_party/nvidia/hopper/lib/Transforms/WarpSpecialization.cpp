@@ -150,6 +150,15 @@ public:
       }
     }
 
+    if (pingpongAutoWS) {
+      doPingPongPrep(funcOp, numWarpGroups, capability);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs()
+              << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
+              << moduleOp << "\n\n\n";
+      }
+    }
+
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
