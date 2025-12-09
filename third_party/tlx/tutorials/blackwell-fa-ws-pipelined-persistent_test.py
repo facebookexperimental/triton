@@ -1427,7 +1427,6 @@ def _attn_bwd_ws(
                         dv.to(tlx.dtype_of(desc_dv)),
                     )
                 tlx.barrier_arrive(dv_empties[kv_buf_id])
-
                 tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     dk_slice = tlx.local_slice(
@@ -1442,7 +1441,6 @@ def _attn_bwd_ws(
                         dk.to(tlx.dtype_of(desc_dk)),
                     )
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
-
                 tile_idx += num_progs
 
         # mma
@@ -1613,7 +1611,7 @@ def _attn_bwd_ws(
                     q_tiles[q_buf_id],
                     dk_tiles[kv_buf_id],
                     use_acc=num_steps > 1,
-                    mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
+                    mBarriers=[q_empties[q_buf_id], dk_fulls[tmem_buf_id]],
                 )
 
                 # Compute dq = tl.dot(tl.trans(dsT), k)

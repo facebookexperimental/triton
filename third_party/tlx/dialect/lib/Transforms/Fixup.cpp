@@ -119,6 +119,11 @@ public:
     return success();
   }
 
+  bool isAMD() const {
+    // target is set up as f"hip:{options.arch}"
+    return (target.getValue().find("hip:") == 0);
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
@@ -134,7 +139,8 @@ public:
       return signalPassFailure();
     }
 
-    if (failed(insertInvalBarrier(mod))) {
+    // InvalBarrierOp insertion is not needed for AMD
+    if (!isAMD() && failed(insertInvalBarrier(mod))) {
       return signalPassFailure();
     }
 
