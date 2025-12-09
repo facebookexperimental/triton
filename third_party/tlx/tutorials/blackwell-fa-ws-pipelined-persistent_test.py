@@ -1105,7 +1105,7 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
 configs_bwd_tlx = [
     triton.Config(
         {
-            "BLOCK_M1": 128,
+            "BLOCK_M1": 64,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
@@ -1114,7 +1114,7 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "EPILOGUE_SUBTILE": 4,
+            "EPILOGUE_SUBTILE": 2,
         },
         num_warps=4,
         num_stages=1,
@@ -1547,7 +1547,7 @@ def _attn_bwd_ws(
                     ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
                     # Compute dq = tl.dot(tl.trans(dsT), k) from previous iteration
-                    tlx.barrier_wait(ds_fulls[tmem_buf_id_prev], ds_phase_prev)
+                    tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
                     tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
                     dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
                     tlx.async_dot(
@@ -1608,7 +1608,7 @@ def _attn_bwd_ws(
                 tmem_buf_id, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                 ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
                 # Compute dk += tl.dot(dsT, tl.trans(qT))
-                tlx.barrier_wait(ds_fulls[tmem_buf_id], ds_phase)
+                tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
                 tlx.async_dot(
                     ds_tiles[ds_buf_id],
                     q_tiles[q_buf_id],
