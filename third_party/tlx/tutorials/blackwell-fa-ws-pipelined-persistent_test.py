@@ -1132,6 +1132,7 @@ def _bwd_compute_inner_loop(
     qk_empties,
     p_tiles,
     p_fulls,
+    dp_empties,
     dp_fulls,
     dp_tiles,
     ds_tiles,
@@ -1182,6 +1183,7 @@ def _bwd_compute_inner_loop(
         # Wait for dpT = tl.dot(v, tl.trans(do))
         tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
         dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
+        tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
         # No need to release dP, as dP uses the same tmem as dQ
         # in the same iteration. Release dQ instead later.
         dsT = pT * (dpT - Di[None, :])
@@ -1293,6 +1295,7 @@ def _attn_bwd_ws(
     qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
@@ -1399,8 +1402,7 @@ def _attn_bwd_ws(
                         # Wait for dpT = tl.dot(v, tl.trans(do))
                         tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
                         dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-                        # No need to release dP, as dP uses the same tmem as dQ
-                        # in the same iteration. Release dQ instead later.
+                        tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
                         dsT = pT * (dpT - Di[None, :])
                         dsT = dsT.to(q_out_dtype)
                         tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
@@ -1492,8 +1494,7 @@ def _attn_bwd_ws(
 
                 # Compute dpT = tl.dot(v, tl.trans(do))
                 tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
-                # As dP uses the same tmem as dQ, wait for dQ release.
-                tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+                tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
                 doT = tlx.local_trans(do_tiles[do_buf_id])
                 tlx.async_dot(
                     v_tiles[kv_buf_id],
