@@ -1284,7 +1284,6 @@ def _attn_bwd_ws(
         tl.float32,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
-        reuse=dp_tiles,
     )
     dv_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
     dk_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
@@ -1614,7 +1613,7 @@ def _attn_bwd_ws(
                     q_tiles[q_buf_id],
                     dk_tiles[kv_buf_id],
                     use_acc=num_steps > 1,
-                    mBarriers=[q_empties[q_buf_id], dk_fulls[tmem_buf_id]],
+                    mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
                 )
 
                 # Compute dq = tl.dot(tl.trans(dsT), k)
