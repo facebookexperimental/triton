@@ -1349,7 +1349,7 @@ def _attn_bwd_ws(
         with tlx.async_task(num_warps=8, registers=192, replicate=1):
             blk_idx = 0
             for i in range(0, tiles_per_sm):
-                off_chz, off_bh, _, start_n, _ = bwd_calculate_offsets(
+                off_chz, off_bh, start_m, start_n, _ = bwd_calculate_offsets(
                     tile_idx,
                     n_tile_num,
                     stride_z,
@@ -1363,7 +1363,7 @@ def _attn_bwd_ws(
                 # offset pointers for batch/head
                 M_updated = M + off_chz
                 D_updated = D + off_chz
-                curr_m = 0
+                curr_m = start_m
                 step_m = BLOCK_M1
                 do_out_dtype = tlx.dtype_of(desc_do)
                 q_out_dtype = tlx.dtype_of(desc_q)
@@ -1428,6 +1428,7 @@ def _attn_bwd_ws(
                         dv.to(tlx.dtype_of(desc_dv)),
                     )
                 tlx.barrier_arrive(dv_empties[kv_buf_id])
+
                 tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     dk_slice = tlx.local_slice(
@@ -1442,13 +1443,14 @@ def _attn_bwd_ws(
                         dk.to(tlx.dtype_of(desc_dk)),
                     )
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
+
                 tile_idx += num_progs
 
         # mma
         with tlx.async_task(num_warps=1, registers=48):
             blk_idx = 0
             for i in range(0, tiles_per_sm):
-                _, _, start_m, _, num_steps = bwd_calculate_offsets(
+                _, _, _, _, num_steps = bwd_calculate_offsets(
                     tile_idx,
                     n_tile_num,
                     stride_z,
@@ -1466,8 +1468,6 @@ def _attn_bwd_ws(
 
                 # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
                 tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
-                curr_m = start_m
-                step_m = BLOCK_M1
 
                 # -----------------------------------------------------------
                 # Prolog
@@ -1905,7 +1905,6 @@ class _attention(torch.autograd.Function):
             )
 
         stage = 3 if ctx.causal else 1
-
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             M, delta,  #
