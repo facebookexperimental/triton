@@ -1427,7 +1427,6 @@ def _attn_bwd_ws(
                         [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
                         dv.to(tlx.dtype_of(desc_dv)),
                     )
-                    tlx.async_descriptor_store_wait(0)
                 tlx.barrier_arrive(dv_empties[kv_buf_id])
                 tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
@@ -1442,7 +1441,6 @@ def _attn_bwd_ws(
                         [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
                         dk.to(tlx.dtype_of(desc_dk)),
                     )
-                tlx.async_descriptor_store_wait(0)
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
                 tile_idx += num_progs
 
@@ -1498,8 +1496,8 @@ def _attn_bwd_ws(
                 # Compute dpT = tl.dot(v, tl.trans(do))
                 tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
                 # # TODO: Optimize the
-                tlx.barrier_wait(dv_empties[kv_buf_id], kv_phase ^ 1)
                 # tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
+                # tlx.barrier_wait(dv_empties[kv_buf_id], kv_phase ^ 1)
                 # As dP uses the same tmem as dQ, wait for dQ release.
                 tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
                 doT = tlx.local_trans(do_tiles[do_buf_id])
