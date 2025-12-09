@@ -778,7 +778,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
             # launch kernel
-            launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+            try:
+                launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+            except Exception:
+                return None
             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
                        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
         return kernel
