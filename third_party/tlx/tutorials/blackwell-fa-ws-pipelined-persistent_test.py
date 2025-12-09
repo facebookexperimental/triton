@@ -1526,7 +1526,7 @@ def _attn_bwd_ws(
                 # 5. dv += tl.dot(ppT, do)
                 # -----------------------------------------------------------
                 tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
-                for i in range(1, num_steps):
+                for j in range(1, num_steps):
                     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     # Compute qkT = tl.dot(k, qT)
@@ -1565,7 +1565,7 @@ def _attn_bwd_ws(
                         ds_tiles[ds_buf_id_prev],
                         q_tiles[q_buf_id_prev],
                         dk_tiles[kv_buf_id],
-                        use_acc=(i - 1) > 0,
+                        use_acc=(j - 1) > 0,
                         mBarriers=[
                             q_empties[q_buf_id_prev],
                         ],
