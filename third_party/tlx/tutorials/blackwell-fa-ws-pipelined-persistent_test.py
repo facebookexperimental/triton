@@ -1572,8 +1572,7 @@ def _attn_bwd_ws(
                     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
                     # Compute dpT = tl.dot(v, tl.trans(do))
                     tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
-                    # As dP uses the same tmem as dQ, wait for dQ release.
-                    tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+                    tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
                     doT = tlx.local_trans(do_tiles[do_buf_id])
                     tlx.async_dot(
                         v_tiles[kv_buf_id],
