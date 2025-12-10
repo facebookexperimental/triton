@@ -57,7 +57,8 @@ void ScopeIdAllocation::run() {
       opToIdMap[recordIntPairOp] = id;
       id++;
     } else {
-      // RecordIntPairOp with same name can appear multiple times, use existing ID
+      // RecordIntPairOp with same name can appear multiple times, use existing
+      // ID
       opToIdMap[recordIntPairOp] = nameToIdMap.lookup(name);
     }
   });
@@ -65,7 +66,8 @@ void ScopeIdAllocation::run() {
   if (nameToIdMap.size() > 0) {
     // Only report errors for RecordOp pairs, not RecordIntPairOp
     for (auto &[name, _] : nameToIdMap) {
-      // Check if this name is from a RecordOp (would be an error) or RecordIntPairOp (ok)
+      // Check if this name is from a RecordOp (would be an error) or
+      // RecordIntPairOp (ok)
       bool isFromRecordIntPair = false;
       funcOp->walk([&](RecordIntPairOp op) {
         if (op.getName() == name) {

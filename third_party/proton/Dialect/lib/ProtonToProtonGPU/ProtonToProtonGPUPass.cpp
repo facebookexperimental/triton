@@ -57,8 +57,7 @@ template <typename T, typename OP> bool hasOperator(T *o) {
   return exist;
 }
 
-template <typename OpType>
-bool hasAnyProtonOp(Operation *op) {
+template <typename OpType> bool hasAnyProtonOp(Operation *op) {
   return hasOperator<Operation, proton::RecordOp>(op) ||
          hasOperator<Operation, proton::RecordIntPairOp>(op);
 }
