@@ -47,210 +47,126 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
+enum class CriticalOpType : uint8_t {
+  /// Operations that cannot be reordered by ptxas (warp_group_dot, etc.)
+  NonReorderable = 0,
+  /// Pure arithmetic operations that can be reordered (exp, exp2, etc.)
+  // The ops should have memory ops as ping-pong boundary
+  PureArithmetic = 1,
+};
+
 // Manages expensive operations for critical region identification and
 // assigns unique barrier IDs to each operation type.
 class CriticalRegionManager {
 private:
-  // Map from operation name to assigned barrier ID
-  llvm::StringMap<unsigned> opNameToBarrierId;
-
-  // Next barrier ID to assign (wraps around in range [5, 15])
-  unsigned nextBarrierId = 5;
-
   // Barrier ID range constants
   static constexpr unsigned MIN_BARRIER_ID = 0;
   static constexpr unsigned MAX_BARRIER_ID = 15;
 
 public:
-  // Map from expensive operation name to the set of operations that mark
-  // the critical region's start and end
-  llvm::DenseMap<int, SmallVector<Operation *>> expensiveOpToPingBoundaryOps;
-  llvm::DenseMap<int, SmallVector<Operation *>> expensiveOpToPongBoundaryOps;
+  // Current barrier ID to assign (wraps around in range [0, 15])
+  int barrierId;
 
-  // Map from expensive operation name to the set of operation names that mark
-  // the end of its critical region
-  llvm::StringMap<SmallVector<std::string>> expensiveOpToEndOps;
+  // Map from critical operation name to its operation type
+  llvm::StringMap<CriticalOpType> keyOpNameToType;
+
+  // Map from pingpong region id to its barrier ID
+  llvm::DenseMap<int, std::pair<int, int>> pingpongIdToBarrierId;
+
+  // Map from pingpong region id to its critical operations
+  llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToKeyOps;
+
+  // Map from pingpong region id to operations that mark
+  // the critical region's start and end
+  llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPingBoundaryOps;
+  llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPongBoundaryOps;
 
   CriticalRegionManager() {
+    // Randomly initialize barrier ID to a value in range [0, 15]
+    barrierId = MIN_BARRIER_ID + 5;
+
     // Register default expensive operations
     // IMPORTANT: Assume operations are expensive only for 2D tensors
-    registerExpensiveOp("ttng.warp_group_dot"); // GEMM/Dot operation on Hopper
-    registerExpensiveOp("math.exp");            // Exponential
-    registerExpensiveOp("math.exp2");           // Exponential base 2
-
-    // For exp2 operations, critical region might end at tmem_store
-    registerEndOfCriticalOpType("ttng.warp_group_dot", "ttng.warp_group_dot");
-    registerEndOfCriticalOpType("math.exp", "ttng.tmem_store");
-    registerEndOfCriticalOpType("math.exp2", "ttng.tmem_store");
+    registerCriticalOp("ttng.warp_group_dot", CriticalOpType::NonReorderable); // GEMM/Dot operation on Hopper
+    registerCriticalOp("math.exp", CriticalOpType::PureArithmetic);            // Exponential
+    registerCriticalOp("math.exp2", CriticalOpType::PureArithmetic);           // Exponential base 2
   }
 
   // Register a new expensive operation TYPE and assign it a unique barrier ID.
-  unsigned registerExpensiveOp(const std::string &opTypeName) {
-    auto it = opNameToBarrierId.find(opTypeName);
-    if (it != opNameToBarrierId.end()) {
-      return it->second;
+  void registerCriticalOp(const std::string &opTypeName, CriticalOpType type) {
+    // Ensure the operation type is not already registered
+    if (keyOpNameToType.count(opTypeName) > 0) {
+      LDBG("Operation type '" << opTypeName << "' already registered.");
+      return;
     }
 
-    unsigned barrierId = nextBarrierId;
-    opNameToBarrierId[opTypeName] = barrierId;
-
-    LDBG("Registered expensive op type '" << opTypeName << "' with barrier ID "
-                                          << barrierId);
-
-    // Increment and wrap around
-    nextBarrierId += 2;
-    if (nextBarrierId > MAX_BARRIER_ID) {
-      nextBarrierId = MIN_BARRIER_ID;
-    }
-
-    return barrierId;
-  }
-
-  // Register an operation TYPE that marks the end of a critical region
-  void registerEndOfCriticalOpType(const std::string &expensiveOpTypeName,
-                                   const std::string &endOpTypeName) {
-    if (opNameToBarrierId.count(expensiveOpTypeName) == 0) {
-      registerExpensiveOp(expensiveOpTypeName);
-    }
-
-    auto &endOps = expensiveOpToEndOps[expensiveOpTypeName];
-    if (llvm::find(endOps, endOpTypeName) == endOps.end()) {
-      endOps.push_back(endOpTypeName);
-      LDBG("Registered '" << endOpTypeName << "' as end-of-critical-op for '"
-                          << expensiveOpTypeName << "'");
-    }
-  }
-
-  // Check if the given operation marks the end of a critical region
-  // for ANY registered expensive operation. Returns the expensive op name if
-  // found.
-  std::optional<std::string> findExpensiveOpForEndOp(Operation *op) const {
-    std::string opName = op->getName().getStringRef().str();
-
-    for (const auto &entry : expensiveOpToEndOps) {
-      if (llvm::find(entry.second, opName) != entry.second.end()) {
-        return entry.first().str(); // Convert StringRef to std::string
-      }
-    }
-    return std::nullopt;
+    // Register a new critical operation
+    keyOpNameToType[opTypeName] = type;
+    LDBG("Registered '" << opTypeName << "' as expensive operation.");
   }
 
   // Check if an operation is registered as an expensive operation
   bool isExpensiveOp(Operation *op) const {
-    // First check by name
     std::string opName = op->getName().getStringRef().str();
-    return opNameToBarrierId.count(opName) > 0;
+    return keyOpNameToType.count(opName) > 0;
   }
 
   // Get the barrier ID assigned to an operation.
   // Returns std::nullopt if the operation is not registered.
-  std::optional<unsigned> getBarrierId(std::string opName) const {
-    // std::string opName = op->getName().getStringRef().str();
-    auto it = opNameToBarrierId.find(opName);
-    if (it != opNameToBarrierId.end()) {
-      return it->second;
+  void assignBarrierId(int pingpongId) {
+    if (pingpongIdToBarrierId.count(pingpongId) > 0) {
+      LDBG("Barrier ID already assigned for pingpong region '" << pingpongId
+                                                               << "'.");
+      return;
     }
-    return std::nullopt;
-  }
 
-  // Add an operation to the ping boundary list for a specific expensive
-  // operation
-  void addPingBoundaryOp(int pingpongRegionId, Operation *boundaryOp) {
-    // std::string expensiveOpName = expensiveOp->getName().getStringRef().str();
-
-    // // Ensure the expensive op is registered first
-    // if (opNameToBarrierId.count(expensiveOpName) == 0) {
-    //   registerExpensiveOp(expensiveOpName);
-    // }
-
-    auto &boundaryOps = expensiveOpToPingBoundaryOps[pingpongRegionId];
-    boundaryOps.push_back(boundaryOp);
-    LDBG("Added ping boundary op for '" << pingpongRegionId
-                                        << "' in Ping region.");
-  }
-
-  // Add an operation to the pong boundary list for a specific expensive
-  // operation
-  void addPongBoundaryOp(int pingpongRegionId, Operation *boundaryOp) {
-    // std::string expensiveOpName = expensiveOp->getName().getStringRef().str();
-
-    // // Ensure the expensive op is registered first
-    // if (opNameToBarrierId.count(expensiveOpName) == 0) {
-    //   registerExpensiveOp(expensiveOpName);
-    // }
-
-    auto &boundaryOps = expensiveOpToPongBoundaryOps[pingpongRegionId];
-    boundaryOps.push_back(boundaryOp);
-    LDBG("Added pong boundary op for '" << pingpongRegionId
-                                        << "' in Pong region.");
-  }
-
-  // Get the ping barrier ID for an expensive operation (barrierId)
-  std::optional<unsigned> getPingBarrierId(std::string opName) const {
-    auto barrierId = getBarrierId(opName);
-    if (barrierId) {
-      return *barrierId; // Ping uses the base barrier ID
+    // Assign barrier ID to the pingpong region
+    int barrierId = this->barrierId;
+    int barrierId_1 = this->barrierId + 1;
+    if (barrierId_1 > MAX_BARRIER_ID) {
+      barrierId_1 = MIN_BARRIER_ID;
     }
-    return std::nullopt;
+    pingpongIdToBarrierId[pingpongId] = {barrierId, barrierId_1};
+    LDBG("Assigned barrier ID {" << barrierId << ", " << barrierId_1 << "} to pingpong region '"
+                                 << pingpongId << "'.");
+
+    // Increment the barrier ID counter
+    this->barrierId = (barrierId + 2 > MAX_BARRIER_ID) ? MIN_BARRIER_ID : barrierId + 2;
   }
 
-  // Get the pong barrier ID for an expensive operation (barrierId + 1)
-  std::optional<unsigned> getPongBarrierId(std::string opName) const {
-    auto barrierId = getBarrierId(opName);
-    if (barrierId) {
-      return *barrierId + 1; // Pong uses barrierId + 1
-    }
-    return std::nullopt;
+  bool hasPingBoundary(int pingpongRegionId) const {
+    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) and
+           (pingpongIdToPingBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
-  bool hasPingBoundarySetup(int pingpongRegionId) const {
-    // std::string expensiveOpName =
-    // expensiveOp->getName().getStringRef().str();
-    return (expensiveOpToPingBoundaryOps.count(pingpongRegionId) > 0) and
-           (expensiveOpToPingBoundaryOps.at(pingpongRegionId).size() == 2);
-  }
-
-  bool hasPongBoundarySetup(int pingpongRegionId) const {
-    // std::string expensiveOpName =
-    // expensiveOp->getName().getStringRef().str();
-    return (expensiveOpToPongBoundaryOps.count(pingpongRegionId) > 0) and
-           (expensiveOpToPongBoundaryOps.at(pingpongRegionId).size() == 2);
+  bool hasPongBoundary(int pingpongRegionId) const {
+    return (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) and
+           (pingpongIdToPongBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
   bool hasPingPongBoundarySetup(int pingpongRegionId) const {
-    // std::string expensiveOpName =
-    // expensiveOp->getName().getStringRef().str();
-    return (expensiveOpToPingBoundaryOps.count(pingpongRegionId) > 0) and
-           (expensiveOpToPingBoundaryOps.at(pingpongRegionId).size() == 2) and
-           (expensiveOpToPongBoundaryOps.count(pingpongRegionId) > 0) and
-           (expensiveOpToPongBoundaryOps.at(pingpongRegionId).size() == 2);
+    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) and
+           (pingpongIdToPingBoundaryOps.at(pingpongRegionId).size() == 2) and
+           (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) and
+           (pingpongIdToPongBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
   void dumpBoundaryOps() const {
     LDBG("===== Critical Region Manager Dump =====");
-    LDBG("expensiveOpToPingBoundaryOps");
-    for (const auto &entry : expensiveOpToPingBoundaryOps) {
-      LDBG("expensiveOp: " << entry.first);
+    LDBG("pingpongIdToPingBoundaryOps");
+    for (const auto &entry : pingpongIdToPingBoundaryOps) {
+      LDBG("pingpongId: " << entry.first);
       for (const auto &op : entry.second) {
         LDBG("  ping boundary op:" << op->getName().getStringRef().str());
       }
     }
-    LDBG("expensiveOpToPongBoundaryOps");
-    for (const auto &entry : expensiveOpToPongBoundaryOps) {
-      LDBG("expensiveOp: " << entry.first);
+    LDBG("pingpongIdToPongBoundaryOps");
+    for (const auto &entry : pingpongIdToPongBoundaryOps) {
+      LDBG("pingpongId: " << entry.first);
       for (const auto &op : entry.second) {
         LDBG("  pong boundary op:" << op->getName().getStringRef().str());
       }
     }
-  }
-
-  // Clear all registered operations and reset barrier ID counter
-  void clear() {
-    opNameToBarrierId.clear();
-    expensiveOpToEndOps.clear();
-    expensiveOpToPingBoundaryOps.clear();
-    expensiveOpToPongBoundaryOps.clear();
-    nextBarrierId = MIN_BARRIER_ID;
   }
 };
 
@@ -300,167 +216,178 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2,
   return false;
 }
 
-Operation* findEndOp(CriticalRegionManager &crManager, Operation *op, mlir::DominanceInfo &domInfo, mlir::PostDominanceInfo &postDomInfo) {
-  std::string opName = op->getName().getStringRef().str();
-  assert(crManager.expensiveOpToEndOps.count(opName) && "Critical region end ops not registered for op");
-  SmallVector<std::string> endOps = crManager.expensiveOpToEndOps[opName];
-  Operation* curOp = op;
-  while (curOp) {
-    std::string curOpName = curOp->getName().getStringRef().str();
-    if (llvm::find(endOps, curOpName) != endOps.end())
-      return curOp;
-    // Set end op to the end of the control flow equivalent region
-    if (!areControlFlowEquivalent(curOp, curOp->getNextNode(), domInfo, postDomInfo))
-      return curOp;
-    curOp = curOp->getNextNode();
-  }
-  return nullptr;
-}
+// Operation* findEndOp(CriticalRegionManager &crManager, Operation *op, mlir::DominanceInfo &domInfo, mlir::PostDominanceInfo &postDomInfo) {
+//   std::string opName = op->getName().getStringRef().str();
+//   assert(crManager.expensiveOpToEndOps.count(opName) && "Critical region end ops not registered for op");
+//   SmallVector<std::string> endOps = crManager.expensiveOpToEndOps[opName];
+//   Operation* curOp = op;
+//   while (curOp) {
+//     std::string curOpName = curOp->getName().getStringRef().str();
+//     if (llvm::find(endOps, curOpName) != endOps.end())
+//       return curOp;
+//     // Set end op to the end of the control flow equivalent region
+//     if (!areControlFlowEquivalent(curOp, curOp->getNextNode(), domInfo, postDomInfo))
+//       return curOp;
+//     curOp = curOp->getNextNode();
+//   }
+//   return nullptr;
+// }
 
-static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
-  auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
-  assert(funcOp != nullptr);
-  // Construct dominance info from the function
-  mlir::DominanceInfo domInfo(funcOp);
-  mlir::PostDominanceInfo postDomInfo(funcOp);
+// Operation* unionOfEndOps(SmallVector<Operation *> &endOps) {
 
-  // Store loops and loop depths of each partition.
-  SmallVector<DenseMap<unsigned, SmallVector<Operation *>>> partitionLoopDepths;
-  unsigned partitionId = 0;
-  SmallVector<Region *> computeRegions;
+//   Operation* curOp = endOps[0];
+//   return curOp;
+// }
 
-  // Collect all compute regions and their loop depths.
-  for (Region *region : wsOp.getPartitionRegions()) {
-    computeRegions.push_back(region);
-    DenseMap<unsigned, SmallVector<Operation *>> loopDepths;
-    getNestedFor(region, loopDepths);
-    partitionLoopDepths.push_back(loopDepths);
-    // Dump partitionLoopDepths
-    LDBG("partition " << partitionId << " has " << loopDepths.size());
-    for (auto &loopDepth : loopDepths) {
-      LDBG("loop depth " << loopDepth.first << " has "
-                         << loopDepth.second.size());
-    }
-    ++partitionId;
-  }
+// static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
+//   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
+//   assert(funcOp != nullptr);
+//   // Construct dominance info from the function
+//   mlir::DominanceInfo domInfo(funcOp);
+//   mlir::PostDominanceInfo postDomInfo(funcOp);
 
-  LDBG("Found " << partitionLoopDepths.size() << " compute regions");
+//   // Store loops and loop depths of each partition.
+//   SmallVector<DenseMap<unsigned, SmallVector<Operation *>>> partitionLoopDepths;
+//   unsigned partitionId = 0;
+//   SmallVector<Region *> computeRegions;
 
-  unsigned numPartitionWithLoops = 0;
-  bool hasSingleOuterLoop = true;
-  for (auto &loopDepth : partitionLoopDepths) {
-    // Check the partition has at lease a loop
-    if (!loopDepth.empty()) {
-      numPartitionWithLoops += 1;
-    }
-    // Check that every partition should have a single outer loop, i.e. loop of depth 0
-    if (loopDepth[0].size() != 1) {
-      hasSingleOuterLoop = false;
-    }
-  }
-  if (numPartitionWithLoops < 2 || hasSingleOuterLoop == false)
-    return;
+//   // Collect all compute regions and their loop depths.
+//   for (Region *region : wsOp.getPartitionRegions()) {
+//     computeRegions.push_back(region);
+//     DenseMap<unsigned, SmallVector<Operation *>> loopDepths;
+//     getNestedFor(region, loopDepths);
+//     partitionLoopDepths.push_back(loopDepths);
+//     // Dump partitionLoopDepths
+//     LDBG("partition " << partitionId << " has " << loopDepths.size());
+//     for (auto &loopDepth : loopDepths) {
+//       LDBG("loop depth " << loopDepth.first << " has "
+//                          << loopDepth.second.size());
+//     }
+//     ++partitionId;
+//   }
 
-  // Find the critical region boundaries
-  // Initialize the critical region manager
-  CriticalRegionManager crManager;
-  // Process each partition to find expensive operations and their boundaries
-  for (unsigned iter = 0; iter < computeRegions.size(); ++iter) {
-    Region *region = computeRegions[iter];
-    LDBG("Processing partition " << iter);
+//   LDBG("Found " << partitionLoopDepths.size() << " compute regions");
 
-    llvm::DenseMap<int, SmallVector<Operation *>> keyOps;
-    region->walk<WalkOrder::PreOrder>([&](Operation *op) {
-      // Check if this is a warp_group_dot operation
-      if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
-        LDBG("Found op with pingpong id " << pingpongIdAttr.getInt());
-        keyOps[pingpongIdAttr.getInt()].push_back(op);
-      }
-    });
+//   unsigned numPartitionWithLoops = 0;
+//   bool hasSingleOuterLoop = true;
+//   for (auto &loopDepth : partitionLoopDepths) {
+//     // Check the partition has at lease a loop
+//     if (!loopDepth.empty()) {
+//       numPartitionWithLoops += 1;
+//     }
+//     // Check that every partition should have a single outer loop, i.e. loop of depth 0
+//     if (loopDepth[0].size() != 1) {
+//       hasSingleOuterLoop = false;
+//     }
+//   }
+//   if (numPartitionWithLoops < 2 || hasSingleOuterLoop == false)
+//     return;
 
-    if (keyOps.empty())
-      continue;
+//   // Initialize the critical region manager
+//   CriticalRegionManager crManager;
+//   // Step 1: Process each partition to find expensive operations and their boundaries
 
-    for (auto &keyEntry: keyOps) {
-      int pingpongRegionId = keyEntry.first;
-      // TODO: choose the end of region op to be closest to the terminator
-      Operation* keyOp = keyEntry.second[0];
-      Operation* endOp = findEndOp(crManager, keyOp, domInfo, postDomInfo);
-      bool hasPingBoundarySetup = crManager.hasPingBoundarySetup(pingpongRegionId);
-      bool hasPongBoundarySetup = crManager.hasPongBoundarySetup(pingpongRegionId);
-      LDBG("parition " << iter << " has ping boundary setup: " << hasPingBoundarySetup << " pong boundary setup: " << hasPongBoundarySetup);
-      if (!hasPingBoundarySetup) {
-        crManager.addPingBoundaryOp(pingpongRegionId, keyOp); // push back key op
-        crManager.addPingBoundaryOp(pingpongRegionId, keyOp); // Start and end are the same op
-        crManager.addPingBoundaryOp(pingpongRegionId, endOp);
-      }
-      if (hasPingBoundarySetup && !hasPongBoundarySetup) {
-        crManager.addPongBoundaryOp(pingpongRegionId, keyOp); // push back key op
-        crManager.addPongBoundaryOp(pingpongRegionId, keyOp); // Start and end are the same op
-        crManager.addPongBoundaryOp(pingpongRegionId, endOp);
-      }
-    }
-  }
+//   for (unsigned iter = 0; iter < computeRegions.size(); ++iter) {
+//     Region *region = computeRegions[iter];
+//     LDBG("Processing partition " << iter);
+//     // Map pingpong region id to the expensive ops in the partition
+//     llvm::DenseMap<int, SmallVector<Operation *>> keyOps;
+//     region->walk<WalkOrder::PreOrder>([&](Operation *op) {
+//       // Check if this is a warp_group_dot operation
+//       if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
+//         LDBG("Found op with pingpong id " << pingpongIdAttr.getInt());
+//         keyOps[pingpongIdAttr.getInt()].push_back(op);
+//       }
+//     });
 
-  // Step 2: Insert pingpong barriers to the IR
-  auto &opToPingBoundary = crManager.expensiveOpToPingBoundaryOps;
-  auto &opToPongBoundary = crManager.expensiveOpToPongBoundaryOps;
-  crManager.dumpBoundaryOps();
-  for (auto &pingEntry : opToPingBoundary) {
-    int pingpongRegionId = pingEntry.first;
-    Operation* keyOp = pingEntry.second[0];
-    if (!crManager.hasPingPongBoundarySetup(pingpongRegionId))
-      continue;
-    auto pingBarrierId = crManager.getPingBarrierId(keyOp->getName().getStringRef().str());
-    auto pongBarrierId = crManager.getPongBarrierId(keyOp->getName().getStringRef().str());
-    if (!pingBarrierId || !pongBarrierId)
-      continue;
-    // Insert barriers for the ping partition
-    Operation *pingStart = pingEntry.second[1];
-    Operation *pingEnd = pingEntry.second[2];
-    Region *pingRegion = pingStart->getParentRegion();
-    Block &pingRegionBlock = pingRegion->front();
-    OpBuilder builder(&pingRegionBlock, pingRegionBlock.begin());
-    auto pingRegionLoc = pingRegionBlock.front().getLoc();
-    Value pingBarrier =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, *pingBarrierId, 32);
-    Value pongBarrier =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, *pongBarrierId, 32);
-    Value pingNumThreads =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, 256, 32);
-    builder.create<ttng::NamedBarrierArriveOp>(pingRegionLoc, pongBarrier,
-                                               pingNumThreads);
-    builder.setInsertionPoint(pingStart);
-    builder.create<ttng::NamedBarrierWaitOp>(pingStart->getLoc(), pingBarrier,
-                                             pingNumThreads);
-    // Insert AFTER the pingEnd op
-    builder.setInsertionPointAfter(pingEnd);
-    builder.create<ttng::NamedBarrierArriveOp>(pingEnd->getLoc(), pongBarrier,
-                                               pingNumThreads);
+//     if (keyOps.empty())
+//       continue;
 
-    // Insert barriers for the pong partition
-    Operation *pongStart = opToPongBoundary[pingpongRegionId][1];
-    Operation *pongEnd = opToPongBoundary[pingpongRegionId][2];
-    Region *pongRegion = pongStart->getParentRegion();
-    Block &pongRegionBlock = pongRegion->front();
-    OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
-    auto pongRegionLoc = pongRegionBlock.front().getLoc();
-    Value pingBarrier2 = builder2.create<arith::ConstantIntOp>(
-        pongRegionLoc, *pingBarrierId, 32);
-    Value pongBarrier2 = builder2.create<arith::ConstantIntOp>(
-        pongRegionLoc, *pongBarrierId, 32);
-    Value pingNumThreads2 =
-        builder2.create<arith::ConstantIntOp>(pongRegionLoc, 256, 32);
-    builder2.setInsertionPoint(pongStart);
-    builder2.create<ttng::NamedBarrierWaitOp>(pongStart->getLoc(), pongBarrier2,
-                                              pingNumThreads2);
-    // Insert AFTER the pongEnd op
-    builder2.setInsertionPointAfter(pongEnd);
-    builder2.create<ttng::NamedBarrierArriveOp>(pongEnd->getLoc(), pingBarrier2,
-                                                pingNumThreads2);
-  }
-}
-} // anonymous namespace
+//     for (auto &keyEntry: keyOps) {
+//       int pingpongRegionId = keyEntry.first;
+//       // TODO: choose the end of region op to be closest to the terminator
+//       SmallVector<Operation*> endOps;
+//       for (auto &keyOp : keyEntry.second) {
+//         Operation* endOp = findEndOp(crManager, keyOp, domInfo, postDomInfo);
+//         endOps.push_back(endOp);
+//       }
+//       // Operation* endOp = findEndOp(crManager, keyOp, domInfo, postDomInfo);
+//       bool hasPingBoundarySetup = crManager.hasPingBoundarySetup(pingpongRegionId);
+//       bool hasPongBoundarySetup = crManager.hasPongBoundarySetup(pingpongRegionId);
+//       LDBG("parition " << iter << " has ping boundary setup: " << hasPingBoundarySetup << " pong boundary setup: " << hasPongBoundarySetup);
+//       Operation* keyOp = keyEntry.second[0];
+//       Operation* commonEndOp = unionOfEndOps(endOps);
+//       if (!hasPingBoundarySetup) {
+//         crManager.addPingBoundaryOp(pingpongRegionId, keyOp); // push back key op
+//         crManager.addPingBoundaryOp(pingpongRegionId, keyOp); // Start and end are the same op
+//         crManager.addPingBoundaryOp(pingpongRegionId, commonEndOp);
+//       }
+//       if (hasPingBoundarySetup && !hasPongBoundarySetup) {
+//         crManager.addPongBoundaryOp(pingpongRegionId, keyOp); // push back key op
+//         crManager.addPongBoundaryOp(pingpongRegionId, keyOp); // Start and end are the same op
+//         crManager.addPongBoundaryOp(pingpongRegionId, commonEndOp);
+//       }
+//     }
+//   }
+
+//   // Step 2: Insert pingpong barriers to the IR
+//   auto &opToPingBoundary = crManager.expensiveOpToPingBoundaryOps;
+//   auto &opToPongBoundary = crManager.expensiveOpToPongBoundaryOps;
+//   crManager.dumpBoundaryOps();
+//   for (auto &pingEntry : opToPingBoundary) {
+//     int pingpongRegionId = pingEntry.first;
+//     Operation* keyOp = pingEntry.second[0];
+//     if (!crManager.hasPingPongBoundarySetup(pingpongRegionId))
+//       continue;
+//     auto pingBarrierId = crManager.getPingBarrierId(keyOp->getName().getStringRef().str());
+//     auto pongBarrierId = crManager.getPongBarrierId(keyOp->getName().getStringRef().str());
+//     if (!pingBarrierId || !pongBarrierId)
+//       continue;
+//     // Insert barriers for the ping partition
+//     Operation *pingStart = pingEntry.second[1];
+//     Operation *pingEnd = pingEntry.second[2];
+//     Region *pingRegion = pingStart->getParentRegion();
+//     Block &pingRegionBlock = pingRegion->front();
+//     OpBuilder builder(&pingRegionBlock, pingRegionBlock.begin());
+//     auto pingRegionLoc = pingRegionBlock.front().getLoc();
+//     Value pingBarrier =
+//         builder.create<arith::ConstantIntOp>(pingRegionLoc, *pingBarrierId, 32);
+//     Value pongBarrier =
+//         builder.create<arith::ConstantIntOp>(pingRegionLoc, *pongBarrierId, 32);
+//     Value pingNumThreads =
+//         builder.create<arith::ConstantIntOp>(pingRegionLoc, 256, 32);
+//     builder.create<ttng::NamedBarrierArriveOp>(pingRegionLoc, pongBarrier,
+//                                                pingNumThreads);
+//     builder.setInsertionPoint(pingStart);
+//     builder.create<ttng::NamedBarrierWaitOp>(pingStart->getLoc(), pingBarrier,
+//                                              pingNumThreads);
+//     // Insert AFTER the pingEnd op
+//     builder.setInsertionPointAfter(pingEnd);
+//     builder.create<ttng::NamedBarrierArriveOp>(pingEnd->getLoc(), pongBarrier,
+//                                                pingNumThreads);
+
+//     // Insert barriers for the pong partition
+//     Operation *pongStart = opToPongBoundary[pingpongRegionId][1];
+//     Operation *pongEnd = opToPongBoundary[pingpongRegionId][2];
+//     Region *pongRegion = pongStart->getParentRegion();
+//     Block &pongRegionBlock = pongRegion->front();
+//     OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
+//     auto pongRegionLoc = pongRegionBlock.front().getLoc();
+//     Value pingBarrier2 = builder2.create<arith::ConstantIntOp>(
+//         pongRegionLoc, *pingBarrierId, 32);
+//     Value pongBarrier2 = builder2.create<arith::ConstantIntOp>(
+//         pongRegionLoc, *pongBarrierId, 32);
+//     Value pingNumThreads2 =
+//         builder2.create<arith::ConstantIntOp>(pongRegionLoc, 256, 32);
+//     builder2.setInsertionPoint(pongStart);
+//     builder2.create<ttng::NamedBarrierWaitOp>(pongStart->getLoc(), pongBarrier2,
+//                                               pingNumThreads2);
+//     // Insert AFTER the pongEnd op
+//     builder2.setInsertionPointAfter(pongEnd);
+//     builder2.create<ttng::NamedBarrierArriveOp>(pongEnd->getLoc(), pingBarrier2,
+//                                                 pingNumThreads2);
+//   }
+// }
 
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
@@ -469,7 +396,7 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
     for (Operation &bodyOp : block.getOperations()) {
       Operation *op = &bodyOp;
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        handleWarpSpec(wsOp, capability);
+        // handleWarpSpec(wsOp);
       }
     }
   }
@@ -546,6 +473,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
           if (opTaskId == refTaskId) {
             Operation *opSplit = getSplitOp(op);
             Operation *refSplit = getSplitOp(refOp);
+            // Are from the same data split op
             if (opSplit == refSplit) {
               LDBG("Same split op");
               matchVar = true;
@@ -580,7 +508,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   });
 
   // pingpong region id
-  unsigned pingpongRID = 0;
+  unsigned pingpongID = 0;
 
   // Assign pingpong IDs to groups
   for (auto &group : expensiveOps) {
@@ -603,12 +531,12 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     for (auto *op : group) {
       op->setAttr("pingpong_id",
                   IntegerAttr::get(IntegerType::get(op->getContext(), 32),
-                                   pingpongRID));
-      LDBG("Assign pingpong_id " << pingpongRID << " to op '"
+                                   pingpongID));
+      LDBG("Assign pingpong_id " << pingpongID << " to op '"
                                  << op->getName().getStringRef().str()
                                  << "' with task_id " << getSingleTaskId(op));
     }
-    pingpongRID++;
+    pingpongID++;
   }
 }
 
