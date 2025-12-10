@@ -1105,7 +1105,11 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
 configs_bwd_tlx = [
     triton.Config(
         {
-            "BLOCK_M1": 64,
+            # Note: BLOCK_M1 is removed from this autotuning step
+            # so that we can test alternative code paths based on
+            # BLOCK_M1.
+            # Not all EPILOGUE_SUBTILE are viable with all BLOCK_M1
+            # and H-DIM options, so we set those in the kernel as well.
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
@@ -1114,7 +1118,6 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "EPILOGUE_SUBTILE": 2,
         },
         num_warps=4,
         num_stages=1,
@@ -1150,6 +1153,7 @@ def _bwd_compute_inner_loop(
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     STAGE: tl.constexpr,
+    REUSE_DP_FOR_DQ: tl.constexpr,
 ):
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     lo, hi = _get_unfused_bwd_loop_bounds(N_CTX, BLOCK_M1, STAGE)
@@ -1183,9 +1187,10 @@ def _bwd_compute_inner_loop(
         # Wait for dpT = tl.dot(v, tl.trans(do))
         tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
         dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-        tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
-        # No need to release dP, as dP uses the same tmem as dQ
-        # in the same iteration. Release dQ instead later.
+        # We can only signal the arrive if DP is not shared with DQ.
+        # Otherwise we need to wait for DQ to be done.
+        if not REUSE_DP_FOR_DQ:
+            tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
@@ -1231,6 +1236,14 @@ def _attn_bwd_ws(
     EPILOGUE_SUBTILE: tl.constexpr,
     STAGE: tl.constexpr,
 ):
+
+    # If we have BLOCK_M1 == 128 and HEAD_DIM == 128 we don't have enough
+    # TMEM. We may need to expand this condition across other configs in
+    # the future.
+    # Note: Setting REUSE_DP_FOR_DQ=False with BLOCK_M1 == 64 and
+    # HEAD_DIM == 128 will result in an accuracy issue.
+    REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128)
+
     # original grid
     #   triton.cdiv(q.shape[2], META["BLOCK_N1"]),
     #   1,
@@ -1281,12 +1294,6 @@ def _attn_bwd_ws(
         tlx.storage_kind.tmem,
     )
 
-    dq_tiles = tlx.local_alloc(
-        (BLOCK_M1, HEAD_DIM),
-        tl.float32,
-        NUM_BUFFERS_TMEM,
-        tlx.storage_kind.tmem,
-    )
     dv_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
     dk_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
 
@@ -1295,7 +1302,6 @@ def _attn_bwd_ws(
     qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
@@ -1303,6 +1309,27 @@ def _attn_bwd_ws(
     dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+
+    # Establish the barriers and allocations we will use if we need to
+    # share TMEM for dq and dp. For barriers we cannot modify the definition
+    # of dp_empties because we can only signal the arrive if the barrier
+    if REUSE_DP_FOR_DQ:
+        dq_tiles = tlx.local_alloc(
+            (BLOCK_M1, HEAD_DIM),
+            tl.float32,
+            NUM_BUFFERS_TMEM,
+            tlx.storage_kind.tmem,
+            reuse=dp_tiles,
+        )
+        dp_empties = dq_empties
+    else:
+        dq_tiles = tlx.local_alloc(
+            (BLOCK_M1, HEAD_DIM),
+            tl.float32,
+            NUM_BUFFERS_TMEM,
+            tlx.storage_kind.tmem,
+        )
+        dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -1402,7 +1429,10 @@ def _attn_bwd_ws(
                         # Wait for dpT = tl.dot(v, tl.trans(do))
                         tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
                         dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-                        tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
+                        # We can only signal the arrive if DP is not shared with DQ.
+                        # Otherwise we need to wait for DQ to be done.
+                        if not REUSE_DP_FOR_DQ:
+                            tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
                         dsT = pT * (dpT - Di[None, :])
                         dsT = dsT.to(q_out_dtype)
                         tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
@@ -1722,7 +1752,7 @@ def _attn_bwd_ws(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal):
+    def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -1811,6 +1841,9 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
+        # Store BLOCK_M1 for bwd so we can test divergent
+        # code paths.
+        ctx.BWD_BLOCK_M1 = BWD_BLOCK_M1
         return o
 
     @staticmethod
@@ -1902,6 +1935,7 @@ class _attention(torch.autograd.Function):
             )
 
         stage = 3 if ctx.causal else 1
+        EPILOGUE_SUBTILE = 4 if ctx.BWD_BLOCK_M1 == 128 and ctx.HEAD_DIM == 128 else 2
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             M, delta,  #
@@ -1911,6 +1945,8 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
+            BLOCK_M1=ctx.BWD_BLOCK_M1,  #
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,  #
         )
 
         return dq, dk, dv, None, None, None, None
@@ -1930,7 +1966,8 @@ attention = _attention.apply
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("causal", [True, False])
-def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
+@pytest.mark.parametrize("BLOCK_M1", [64, 128])
+def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, BLOCK_M1, dtype=torch.float16):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -1957,7 +1994,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, sm_scale, causal).half()
+    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
