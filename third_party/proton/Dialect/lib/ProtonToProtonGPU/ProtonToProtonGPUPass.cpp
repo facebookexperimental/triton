@@ -57,10 +57,16 @@ template <typename T, typename OP> bool hasOperator(T *o) {
   return exist;
 }
 
+template <typename OpType>
+bool hasAnyProtonOp(Operation *op) {
+  return hasOperator<Operation, proton::RecordOp>(op) ||
+         hasOperator<Operation, proton::RecordIntPairOp>(op);
+}
+
 void instrumentWarpSpecializeOps(FuncOp func, Value buffer, Value profileMem) {
   for (auto wsOp : func.getOps<triton::gpu::WarpSpecializeOp>()) {
     auto loc = wsOp.getLoc();
-    if (hasOperator<Operation, proton::RecordOp>(wsOp.getOperation())) {
+    if (hasAnyProtonOp<Operation>(wsOp.getOperation())) {
       wsOp->insertOperands(wsOp->getNumOperands(), {buffer, profileMem});
       for (Region *region : wsOp.getPartitionRegions()) {
         region->addArgument(buffer.getType(), loc);
@@ -129,6 +135,77 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
     builder.create<gpu::CircularStoreOp>(loc, segment, counter,
                                          record.getIsStart(), scopeId);
     record.erase();
+  });
+
+  return success();
+}
+
+// Replace proton::RecordIntPairOp with two CircularStoreOp operations.
+// Unlike RecordOp which appears in start/end pairs and uses ReadCounterOp,
+// RecordIntPairOp is a single operation that stores two user-provided values.
+LogicalResult replaceProtonRecordIntPairOp(OpBuilder &builder, FuncOp func,
+                                           Value segment) {
+  int scopeId = 0;
+
+  // Replace all proton::RecordIntPairOp in worker warps.
+  func->walk([&](triton::gpu::WarpSpecializePartitionsOp partitions) {
+    auto loc = partitions.getLoc();
+    for (auto &partition : partitions.getPartitionRegions()) {
+      if (hasOperator<Region, proton::RecordIntPairOp>(&partition)) {
+        Block &block = partition.front();
+        builder.setInsertionPointToStart(&block);
+        int argNum = block.getNumArguments();
+        auto bufferArg = block.getArgument(argNum - 2);
+        auto profileMemArg = block.getArgument(argNum - 1);
+
+        // Create a new segment for the worker warp.
+        Value newSegment = builder.create<gpu::SegmentAllocOp>(
+            loc, segment.getType(), bufferArg);
+
+        // Restore warp-level context before profiling.
+        builder.create<gpu::RestoreCtxOp>(loc, newSegment, profileMemArg);
+
+        // Replace all proton::RecordIntPairOp.
+        partition.walk([&](proton::RecordIntPairOp recordIntPair) {
+          builder.setInsertionPoint(recordIntPair);
+          auto opLoc = recordIntPair.getLoc();
+
+          // Store val1 as "start" entry
+          builder.create<gpu::CircularStoreOp>(opLoc, newSegment,
+                                               recordIntPair.getVal1(),
+                                               /*isStart=*/true, scopeId);
+          // Store val2 as "end" entry (paired with same scopeId)
+          builder.create<gpu::CircularStoreOp>(opLoc, newSegment,
+                                               recordIntPair.getVal2(),
+                                               /*isStart=*/false, scopeId);
+          scopeId++;
+          recordIntPair.erase();
+        });
+
+        // Save warp-level context after profiling.
+        partition.walk([&](triton::gpu::WarpReturnOp ret) {
+          builder.setInsertionPoint(ret);
+          builder.create<gpu::SaveCtxOp>(loc, newSegment, profileMemArg);
+        });
+      }
+    }
+  });
+
+  // Replace all proton::RecordIntPairOp in the master warps.
+  func->walk([&](proton::RecordIntPairOp recordIntPair) {
+    builder.setInsertionPoint(recordIntPair);
+    auto opLoc = recordIntPair.getLoc();
+
+    // Store val1 as "start" entry
+    builder.create<gpu::CircularStoreOp>(opLoc, segment,
+                                         recordIntPair.getVal1(),
+                                         /*isStart=*/true, scopeId);
+    // Store val2 as "end" entry (paired with same scopeId)
+    builder.create<gpu::CircularStoreOp>(opLoc, segment,
+                                         recordIntPair.getVal2(),
+                                         /*isStart=*/false, scopeId);
+    scopeId++;
+    recordIntPair.erase();
   });
 
   return success();
@@ -324,6 +401,9 @@ public:
                                      scopeInfo, clockExtension)))
       return failure();
 
+    if (failed(replaceProtonRecordIntPairOp(builder, func, segment)))
+      return failure();
+
     func.walk([&](triton::ReturnOp ret) {
       builder.setInsertionPoint(ret);
       builder.create<mlir::gpu::BarrierOp>(loc);
@@ -358,7 +438,8 @@ public:
     FuncOp func = *m.getOps<triton::FuncOp>().begin();
 
     // Check if there are any proton records to process
-    if (!hasOperator<Operation, proton::RecordOp>(func.getOperation())) {
+    if (!hasOperator<Operation, proton::RecordOp>(func.getOperation()) &&
+        !hasOperator<Operation, proton::RecordIntPairOp>(func.getOperation())) {
       return; // No proton records to process, silently return
     }
 

@@ -44,10 +44,38 @@ void ScopeIdAllocation::run() {
     }
   });
 
+  // Also process RecordIntPairOp operations - these don't have start/end pairs,
+  // each operation represents a single scope
+  funcOp->walk([&](RecordIntPairOp recordIntPairOp) {
+    auto name = recordIntPairOp.getName();
+    LDBG("Processing RecordIntPairOp: " << recordIntPairOp);
+    if (!nameToIdMap.contains(name)) {
+      nameToIdMap[name] = id;
+      idToNameMap[id] = name;
+      LDBG("Assigning new scope id " << id << " to name '" << name
+                                     << "' (RecordIntPairOp)");
+      opToIdMap[recordIntPairOp] = id;
+      id++;
+    } else {
+      // RecordIntPairOp with same name can appear multiple times, use existing ID
+      opToIdMap[recordIntPairOp] = nameToIdMap.lookup(name);
+    }
+  });
+
   if (nameToIdMap.size() > 0) {
+    // Only report errors for RecordOp pairs, not RecordIntPairOp
     for (auto &[name, _] : nameToIdMap) {
-      mlir::emitError(funcOp->getLoc(), "Scope name '")
-          << name << "' must appear in pairs";
+      // Check if this name is from a RecordOp (would be an error) or RecordIntPairOp (ok)
+      bool isFromRecordIntPair = false;
+      funcOp->walk([&](RecordIntPairOp op) {
+        if (op.getName() == name) {
+          isFromRecordIntPair = true;
+        }
+      });
+      if (!isFromRecordIntPair) {
+        mlir::emitError(funcOp->getLoc(), "Scope name '")
+            << name << "' must appear in pairs";
+      }
     }
   }
 }

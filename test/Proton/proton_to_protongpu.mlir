@@ -186,3 +186,94 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     tt.return
   }
 }
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: record_int_pair_simple
+  // CHECK-SAME: (%[[VAL1:.*]]: i32, %[[VAL2:.*]]: i32)
+  // CHECK: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+  // CHECK: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
+  // CHECK: %[[BUF:.*]] = ttg.local_alloc  : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+  // CHECK: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[BUF]]
+  // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[VAL1]] {scopeId = 0 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+  // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[VAL2]] {scopeId = 0 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+  // CHECK: gpu.barrier
+  // CHECK: proton_gpu.finalize %[[SEGMENT]], %[[SCRATCH]] : !proton_gpu.segment<1024, #smem, warp>, !tt.ptr<i32>
+  // CHECK: tt.return
+  tt.func @record_int_pair_simple(%val1 : i32, %val2 : i32) {
+    proton.record_int_pair "barrier_op", %val1, %val2 : i32, i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: record_int_pair_multiple
+  // CHECK-SAME: (%[[VAL1:.*]]: i32, %[[VAL2:.*]]: i32, %[[VAL3:.*]]: i32, %[[VAL4:.*]]: i32)
+  // CHECK: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+  // CHECK: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
+  // CHECK: %[[BUF:.*]] = ttg.local_alloc  : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+  // CHECK: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[BUF]]
+  // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[VAL1]] {scopeId = 0 : i32}
+  // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[VAL2]] {scopeId = 0 : i32}
+  // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[VAL3]] {scopeId = 1 : i32}
+  // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[VAL4]] {scopeId = 1 : i32}
+  // CHECK: gpu.barrier
+  // CHECK: proton_gpu.finalize %[[SEGMENT]], %[[SCRATCH]]
+  // CHECK: tt.return
+  tt.func @record_int_pair_multiple(%val1 : i32, %val2 : i32, %val3 : i32, %val4 : i32) {
+    proton.record_int_pair "barrier_op1", %val1, %val2 : i32, i32
+    proton.record_int_pair "barrier_op2", %val3, %val4 : i32, i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: record_int_pair_i64
+  // CHECK-SAME: (%[[VAL1:.*]]: i64, %[[VAL2:.*]]: i64)
+  // CHECK: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc {alignment = 128 : i32, nbytes = 1152 : i32} : !tt.ptr<i32>
+  // CHECK: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
+  // CHECK: %[[BUF:.*]] = ttg.local_alloc  : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+  // CHECK: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[BUF]]
+  // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[VAL1]] {scopeId = 0 : i32} : !proton_gpu.segment<1024, #smem, warp>, i64
+  // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[VAL2]] {scopeId = 0 : i32} : !proton_gpu.segment<1024, #smem, warp>, i64
+  // CHECK: gpu.barrier
+  // CHECK: proton_gpu.finalize %[[SEGMENT]], %[[SCRATCH]]
+  // CHECK: tt.return
+  tt.func @record_int_pair_i64(%val1 : i64, %val2 : i64) {
+    proton.record_int_pair "barrier_op", %val1, %val2 : i64, i64
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: record_int_pair_mixed_with_record
+  // CHECK-SAME: (%[[VAL1:.*]]: i32, %[[VAL2:.*]]: i32)
+  // CHECK: %[[SCRATCH:.*]] = proton_gpu.global_scratch_alloc
+  // CHECK: proton_gpu.initialize %[[SCRATCH]]
+  // CHECK: %[[BUF:.*]] = ttg.local_alloc
+  // CHECK: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[BUF]]
+  // Record ops get their scope IDs first from the analysis pass
+  // CHECK: %[[START:.*]] = proton_gpu.read_counter
+  // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[START]] {scopeId = 0 : i32}
+  // CHECK: %[[END:.*]] = proton_gpu.read_counter
+  // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[END]] {scopeId = 0 : i32}
+  // record_int_pair ops get their scope IDs separately - uses the provided values directly
+  // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[VAL1]] {scopeId = 0 : i32}
+  // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[VAL2]] {scopeId = 0 : i32}
+  // CHECK: gpu.barrier
+  // CHECK: proton_gpu.finalize
+  // CHECK: tt.return
+  tt.func @record_int_pair_mixed_with_record(%val1 : i32, %val2 : i32) {
+    proton.record start "scope1"
+    proton.record end "scope1"
+    proton.record_int_pair "barrier_op", %val1, %val2 : i32, i32
+    tt.return
+  }
+}
