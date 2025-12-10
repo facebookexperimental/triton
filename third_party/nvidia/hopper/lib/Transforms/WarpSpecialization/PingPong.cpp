@@ -537,7 +537,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     builder.create<ttng::NamedBarrierWaitOp>(pingStart->getLoc(), pingBarrier,
                                              pingNumThreads);
     // Insert AFTER the pingEnd op
-    builder.setInsertionPointAfter(pingEnd->getNextNode());
+    builder.setInsertionPointAfter(pingEnd);
     builder.create<ttng::NamedBarrierArriveOp>(pingEnd->getLoc(), pongBarrier,
                                                pingNumThreads);
 
@@ -558,7 +558,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     builder2.create<ttng::NamedBarrierWaitOp>(pongStart->getLoc(), pongBarrier2,
                                               pingNumThreads2);
     // Insert AFTER the pongEnd op
-    builder2.setInsertionPointAfter(pongEnd->getNextNode());
+    builder2.setInsertionPointAfter(pongEnd);
     builder2.create<ttng::NamedBarrierArriveOp>(pongEnd->getLoc(), pingBarrier2,
                                                 pingNumThreads2);
   }
