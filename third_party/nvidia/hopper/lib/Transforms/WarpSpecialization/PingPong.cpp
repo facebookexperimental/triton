@@ -81,6 +81,9 @@ public:
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPingBoundaryOps;
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPongBoundaryOps;
 
+  // Map from pingpong region id to the participating thread number
+  llvm::DenseMap<int, int> pingpongIdToThreadNum;
+
   CriticalRegionManager() {
     // Initialize barrier ID to be 9
     barrierId = MIN_BARRIER_ID;
@@ -430,25 +433,40 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     });
   }
 
-  // Step 2: Find the boundaries for each pingpong region
-  // Process each pingpong region at a time
+  // Step 2: For each pingpong region,
+  //         i) find the boundaries and
+  //         ii) calculate the participating thread number
   for (auto &[pingpongId, keyOps] : crManager.pingpongIdToKeyOps) {
     // Map from the ping and pong partition id to the start and end ops
     llvm::DenseMap<int, SmallVector<Operation *>> startOps;
     llvm::DenseMap<int, SmallVector<Operation *>> endOps;
+
+    // Map from the ping and pong partition id to its number of warps
+    llvm::DenseMap<int, int> numWarps;
+
+    // Find the start and end ops for each key operation in the pingpong region
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       Operation *startOp = findStartOp(crManager, keyOp, domInfo, postDomInfo);
       Operation *endOp = findEndOp(crManager, keyOp, domInfo, postDomInfo);
       startOps[partitionId].push_back(startOp);
       endOps[partitionId].push_back(endOp);
+      // Look up the number of warps for each partition
+      if (numWarps.count(partitionId) == 0) {
+        numWarps[partitionId] = mlir::triton::gpu::lookupNumWarps(keyOp);
+        LDBG("numWarps of " << partitionId << " is " << numWarps[partitionId]);
+      }
     }
 
-    if (startOps.size() != 2 || endOps.size() != 2) {
+    if (startOps.size() != 2 || endOps.size() != 2 || numWarps.size() != 2) {
       LDBG("pingpong ops are not in two partitions");
       continue;
     }
+
+    int numberOfThreads = 0;
     for (auto [partitionId, startOp] : startOps) {
+      // The start and end ops are unioned for each partition to find the
+      // boundary ops
       Operation *unionStartOp = unionOfStartOps(startOp);
       Operation *unionEndOp = unionOfEndOps(endOps[partitionId]);
       if (!crManager.hasPingBoundary(pingpongId)) {
@@ -460,7 +478,17 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
             unionStartOp);
         crManager.pingpongIdToPongBoundaryOps[pingpongId].push_back(unionEndOp);
       }
+      // The number of participating threads is summed up from ping and pong
+      // partitions
+      numberOfThreads += numWarps[partitionId] * 32; // 32 threads per warp
+      LDBG("numberOfThreads " << numberOfThreads);
     }
+
+    if (crManager.pingpongIdToThreadNum.count(pingpongId) == 0) {
+      crManager.pingpongIdToThreadNum[pingpongId] = numberOfThreads;
+      LDBG("pingpongId " << pingpongId << " has " << numberOfThreads);
+    }
+
     crManager.dumpBoundaryOps();
   }
 
@@ -475,6 +503,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
 
     int pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
     int pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
+
+    int numThreads = crManager.pingpongIdToThreadNum[pingpongId];
 
     // Insert barriers for the ping partition
     Operation *pingStart = pingBoundOps[0];
@@ -500,9 +530,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
         builder.create<arith::ConstantIntOp>(pingRegionLoc, pingBarrierId, 32);
     Value pongBarrier =
         builder.create<arith::ConstantIntOp>(pingRegionLoc, pongBarrierId, 32);
-    // TODO: Should decide the number of threads using heuristics
     Value pingNumThreads =
-        builder.create<arith::ConstantIntOp>(pingRegionLoc, 256, 32);
+        builder.create<arith::ConstantIntOp>(pingRegionLoc, numThreads, 32);
     // Insert arrive barrier for the ping partition to allow the initial entry
     builder.create<ttng::NamedBarrierArriveOp>(pingRegionLoc, pongBarrier,
                                                pingNumThreads);
@@ -526,7 +555,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     Value pongBarrier2 =
         builder2.create<arith::ConstantIntOp>(pongRegionLoc, pongBarrierId, 32);
     Value pingNumThreads2 =
-        builder2.create<arith::ConstantIntOp>(pongRegionLoc, 256, 32);
+        builder2.create<arith::ConstantIntOp>(pongRegionLoc, numThreads, 32);
     builder2.setInsertionPoint(pongStart);
     builder2.create<ttng::NamedBarrierWaitOp>(pongStart->getLoc(), pongBarrier2,
                                               pingNumThreads2);
@@ -537,7 +566,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
   }
 }
 
-/// doPingPongSync pass: Insert pingpong barriers to the IR
+/// doPingPongPrep pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
   for (auto &block : funcOp.getBody().getBlocks()) {
@@ -571,6 +600,7 @@ static std::optional<NameLoc> getNameLoc(Operation *op) {
   return std::nullopt;
 }
 
+/// doPingPongPrep pass: Group expensive ops into pingpong regions
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
   CriticalRegionManager crManager;
@@ -579,8 +609,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   mlir::DominanceInfo domInfo(funcOp);
   mlir::PostDominanceInfo postDomInfo(funcOp);
 
-  // A list of expensive ops grouped in vectors.
-  // Each vector contains ops that belong to the same pingpong region.
+  // A list of expensive op groups.
+  // Each group contains ops at the same pingpong region.
   llvm::SmallVector<llvm::SmallVector<Operation *, 4>> expensiveOps;
 
   // Scan all operations in the function to find expensive ops
@@ -597,6 +627,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       LDBG("Found expensive op " << op->getName().getStringRef().str()
                                  << ", location" << op->getLoc());
 
+      // Check if the expensive op belongs to an existing group
       bool foundGroup = false;
       for (auto &group : expensiveOps) {
         bool matchType = true;
@@ -654,15 +685,15 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     }
   });
 
-  // pingpong region id
+  // pingpong region ID
   unsigned pingpongID = 0;
 
-  // Assign pingpong IDs to groups
+  // Assign pingpong region IDs to groups
   for (auto &group : expensiveOps) {
     if (group.size() < 2)
       continue;
 
-    // Check if ops are in different partitions
+    // Check if ops are from different partitions
     bool differentPartitions = false;
     int firstTaskId = getSingleTaskId(group[0]);
     for (size_t i = 1; i < group.size(); ++i) {
