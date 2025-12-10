@@ -154,8 +154,8 @@ public:
       doPingPongPrep(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
         llvm::dbgs()
-              << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
-              << moduleOp << "\n\n\n";
+            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
+            << moduleOp << "\n\n\n";
       }
     }
 
