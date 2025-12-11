@@ -1070,14 +1070,12 @@ def bwd_calculate_offsets(
     tile_idx,
     n_tile_num,
     num_pid_m,
-    num_pid_in_group,
     stride_z,
     stride_h,
     stride_tok,
     H,
     N_CTX,  #
     BLOCK_M1: tl.constexpr,
-    BLOCK_N1: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
     bhid = tile_idx // n_tile_num
@@ -1260,7 +1258,6 @@ def _attn_bwd_ws(
     #   q.shape[0] * q.shape[1],
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
     num_pid_m = Z * H
-    num_pid_in_group = GROUP_SIZE_M * n_tile_num
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
     total_tiles = n_tile_num * Z * H
@@ -1354,14 +1351,12 @@ def _attn_bwd_ws(
                     tile_idx,
                     n_tile_num,
                     num_pid_m,
-                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
                     H,
                     N_CTX,
                     BLOCK_M1,
-                    BLOCK_N1,
                     GROUP_SIZE_M,
                 )
                 curr_m = start_m
@@ -1397,13 +1392,11 @@ def _attn_bwd_ws(
                     tile_idx,
                     n_tile_num,
                     num_pid_m,
-                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
                     H,
                     N_CTX,
-                    BLOCK_M1,
                     BLOCK_N1,
                     GROUP_SIZE_M,
                 )
@@ -1539,14 +1532,12 @@ def _attn_bwd_ws(
                     tile_idx,
                     n_tile_num,
                     num_pid_m,
-                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
                     H,
                     N_CTX,
                     BLOCK_M1,
-                    BLOCK_N1,
                     GROUP_SIZE_M,
                 )
 
@@ -1726,14 +1717,12 @@ def _attn_bwd_ws(
                     tile_idx,
                     n_tile_num,
                     num_pid_m,
-                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
                     H,
                     N_CTX,
                     BLOCK_M1,
-                    BLOCK_N1,
                     GROUP_SIZE_M,
                 )
                 start_block_n = start_n * BLOCK_N1
