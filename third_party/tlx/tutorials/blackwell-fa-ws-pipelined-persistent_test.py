@@ -1069,6 +1069,8 @@ def _attn_bwd_triton(
 def bwd_calculate_offsets(
     tile_idx,
     n_tile_num,
+    num_pid_m,
+    num_pid_in_group,
     stride_z,
     stride_h,
     stride_tok,
@@ -1076,9 +1078,11 @@ def bwd_calculate_offsets(
     N_CTX,  #
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     bhid = tile_idx // n_tile_num
     pid = tile_idx % n_tile_num
+    pid, bhid = tl.swizzle2d(pid, bhid, n_tile_num, num_pid_m, GROUP_SIZE_M)
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     start_n = pid * BLOCK_N1
@@ -1235,7 +1239,12 @@ def _attn_bwd_ws(
     NUM_BUFFERS_TMEM: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     STAGE: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
+    # Kernel hangs if NUM_BUFFERS_Q != 2.
+    tl.static_assert(NUM_BUFFERS_Q == 2)
+    # Runtime error if NUM_BUFFERS_DO != 1
+    tl.static_assert(NUM_BUFFERS_DO == 1)
 
     # If we have BLOCK_M1 == 128 and HEAD_DIM == 128 we don't have enough
     # TMEM. We may need to expand this condition across other configs in
@@ -1249,6 +1258,8 @@ def _attn_bwd_ws(
     #   1,
     #   q.shape[0] * q.shape[1],
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
+    num_pid_m = Z * H
+    num_pid_in_group = GROUP_SIZE_M * n_tile_num
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
     total_tiles = n_tile_num * Z * H
@@ -1341,6 +1352,8 @@ def _attn_bwd_ws(
                 off_chz, off_bh, start_m, _, num_steps = bwd_calculate_offsets(
                     tile_idx,
                     n_tile_num,
+                    num_pid_m,
+                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
@@ -1348,6 +1361,7 @@ def _attn_bwd_ws(
                     N_CTX,
                     BLOCK_M1,
                     BLOCK_N1,
+                    GROUP_SIZE_M,
                 )
                 curr_m = start_m
                 step_m = BLOCK_M1
@@ -1381,6 +1395,8 @@ def _attn_bwd_ws(
                 off_chz, off_bh, start_m, start_n, _ = bwd_calculate_offsets(
                     tile_idx,
                     n_tile_num,
+                    num_pid_m,
+                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
@@ -1388,6 +1404,7 @@ def _attn_bwd_ws(
                     N_CTX,
                     BLOCK_M1,
                     BLOCK_N1,
+                    GROUP_SIZE_M,
                 )
                 # offset pointers for batch/head
                 M_updated = M + off_chz
@@ -1482,6 +1499,8 @@ def _attn_bwd_ws(
                 _, _, _, _, num_steps = bwd_calculate_offsets(
                     tile_idx,
                     n_tile_num,
+                    num_pid_m,
+                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
@@ -1489,6 +1508,7 @@ def _attn_bwd_ws(
                     N_CTX,
                     BLOCK_M1,
                     BLOCK_N1,
+                    GROUP_SIZE_M,
                 )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
@@ -1666,6 +1686,8 @@ def _attn_bwd_ws(
                 _, off_bh, start_m, start_n, num_steps = bwd_calculate_offsets(
                     tile_idx,
                     n_tile_num,
+                    num_pid_m,
+                    num_pid_in_group,
                     stride_z,
                     stride_h,
                     stride_tok,
@@ -1673,6 +1695,7 @@ def _attn_bwd_ws(
                     N_CTX,
                     BLOCK_M1,
                     BLOCK_N1,
+                    GROUP_SIZE_M,
                 )
                 # Load K
                 kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
@@ -1752,7 +1775,7 @@ def _attn_bwd_ws(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1):
+    def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -1844,6 +1867,7 @@ class _attention(torch.autograd.Function):
         # Store BLOCK_M1 for bwd so we can test divergent
         # code paths.
         ctx.BWD_BLOCK_M1 = BWD_BLOCK_M1
+        ctx.GROUP_SIZE_M = GROUP_SIZE_M
         return o
 
     @staticmethod
@@ -1947,9 +1971,10 @@ class _attention(torch.autograd.Function):
             STAGE=stage,  #
             BLOCK_M1=ctx.BWD_BLOCK_M1,  #
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,  #
+            GROUP_SIZE_M=ctx.GROUP_SIZE_M,  #
         )
 
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 attention = _attention.apply
@@ -1967,7 +1992,19 @@ attention = _attention.apply
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
-def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, BLOCK_M1, dtype=torch.float16):
+@pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
+def test_op(
+    Z,
+    H,
+    N_CTX,
+    HEAD_DIM,
+    mode,
+    provider,
+    causal,
+    BLOCK_M1,
+    GROUP_SIZE_M,
+    dtype=torch.float16,
+):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -1994,7 +2031,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, BLOCK_M1, dtype=torch
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1).half()
+    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
