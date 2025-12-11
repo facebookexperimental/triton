@@ -60,15 +60,16 @@ enum class CriticalOpType : uint8_t {
 class CriticalRegionManager {
 private:
   // Barrier ID range constants
-  static constexpr unsigned MIN_BARRIER_ID = 9;
+  static constexpr unsigned MIN_BARRIER_ID = 7;
   static constexpr unsigned MAX_BARRIER_ID = 15;
 
 public:
   // Current barrier ID to assign (wraps around in range [0, 15])
   int barrierId;
 
-  // Map from critical operation name to its operation type
-  llvm::StringMap<CriticalOpType> keyOpNameToType;
+  // Map from compute capability to a map of critical operation name to its
+  // operation type
+  llvm::DenseMap<int, llvm::StringMap<CriticalOpType>> keyOpNameToType;
 
   // Map from pingpong region id to its barrier ID
   llvm::DenseMap<int, std::pair<int, int>> pingpongIdToBarrierId;
@@ -85,39 +86,69 @@ public:
   llvm::DenseMap<int, int> pingpongIdToThreadNum;
 
   CriticalRegionManager() {
-    // Initialize barrier ID to be 9
+    // Initialize barrier ID to be 7
     barrierId = MIN_BARRIER_ID;
 
     /// Register default expensive operations
-    // Use specific op names of GEMM, such as ttng.warp_group_dot for Hopper,
-    // to avoid matching other GEMM ops using DotInterface
-    // (e.g., ttng.tc_gen5_mma for Blackwell) that we don't enforce pingpong on
+    // Hopper (compute capability 9)
     registerCriticalOp(
-        "ttng.warp_group_dot",
+        9, "ttng.warp_group_dot",
         CriticalOpType::NonReorderable); // GEMM/Dot operation on Hopper
-    registerCriticalOp("math.exp",
+    // Blackwell (compute capability 10)
+    registerCriticalOp(10, "math.exp",
                        CriticalOpType::PureArithmetic); // Exponential
-    registerCriticalOp("math.exp2",
+    registerCriticalOp(10, "math.exp2",
                        CriticalOpType::PureArithmetic); // Exponential base 2
   }
 
   // Register a new expensive operation TYPE and assign it a unique barrier ID.
-  void registerCriticalOp(const std::string &opTypeName, CriticalOpType type) {
-    // Ensure the operation type is not already registered
-    if (keyOpNameToType.count(opTypeName) > 0) {
-      LDBG("Operation type '" << opTypeName << "' already registered.");
+  void registerCriticalOp(int computeCapability, const std::string &opTypeName,
+                          CriticalOpType type) {
+    // Initialize the inner map for this compute capability if it doesn't exist
+    if (keyOpNameToType.count(computeCapability) == 0) {
+      keyOpNameToType[computeCapability] = llvm::StringMap<CriticalOpType>();
+    }
+
+    // Ensure the operation type is not already registered for this compute
+    // capability
+    if (keyOpNameToType[computeCapability].count(opTypeName) > 0) {
+      LDBG("Operation type '" << opTypeName
+                              << "' already registered for compute capability "
+                              << computeCapability << ".");
       return;
     }
 
-    // Register a new critical operation
-    keyOpNameToType[opTypeName] = type;
-    LDBG("Registered '" << opTypeName << "' as expensive operation.");
+    // Register a new critical operation for this compute capability
+    keyOpNameToType[computeCapability][opTypeName] = type;
+    LDBG("Registered '" << opTypeName
+                        << "' as expensive operation for compute capability "
+                        << computeCapability << ".");
   }
 
-  // Check if an operation is registered as an expensive operation
-  bool isExpensiveOp(Operation *op) const {
+  // Check if an operation is registered as an expensive operation for the given
+  // compute capability
+  bool isExpensiveOp(Operation *op, int computeCapability) const {
     std::string opName = op->getName().getStringRef().str();
-    return keyOpNameToType.count(opName) > 0;
+    auto it = keyOpNameToType.find(computeCapability);
+    if (it == keyOpNameToType.end()) {
+      return false;
+    }
+    return it->second.count(opName) > 0;
+  }
+
+  // Get the CriticalOpType for an operation (for the given compute capability)
+  std::optional<CriticalOpType> getCriticalOpType(Operation *op,
+                                                  int computeCapability) const {
+    std::string opName = op->getName().getStringRef().str();
+    auto it = keyOpNameToType.find(computeCapability);
+    if (it == keyOpNameToType.end()) {
+      return std::nullopt;
+    }
+    auto opIt = it->second.find(opName);
+    if (opIt == it->second.end()) {
+      return std::nullopt;
+    }
+    return opIt->second;
   }
 
   // Get the barrier ID assigned to an operation.
@@ -186,8 +217,41 @@ public:
 // Returns the taskId if op has a single taskId, otherwise, returns -1.
 static int getSingleTaskId(Operation *op) {
   auto asyncTasks = getAsyncTaskIds(op);
-  if (asyncTasks.size() != 1)
+  if (asyncTasks.size() > 1)
     return -1;
+  if (asyncTasks.empty()) {
+    // No async_task_id or ttg.partition
+    // Fall back to find warp_spec op
+
+    Region *curRegion = op->getParentRegion();
+    Region *partitionRegion = nullptr;
+    ttg::WarpSpecializeOp wsOp = nullptr;
+    // walk up to the partition region of the warp_spec op
+    while (curRegion) {
+      Operation *parentOp = curRegion->getParentOp();
+      if (isa<ttg::WarpSpecializePartitionsOp>(parentOp)) {
+        partitionRegion = curRegion;
+      } else if (auto ws = dyn_cast<ttg::WarpSpecializeOp>(parentOp)) {
+        wsOp = ws;
+        break;
+      }
+      curRegion = parentOp->getParentRegion();
+    }
+    if (!partitionRegion || !wsOp) {
+      LDBG("No partition region or warp_spec op found.");
+      return -1;
+    }
+    if (partitionRegion == &wsOp.getDefaultRegion()) {
+      return 0;
+    }
+    auto partitionRegions = wsOp.getPartitionRegions();
+    for (auto [idx, region] : llvm::enumerate(partitionRegions)) {
+      if (partitionRegion == region) {
+        return idx + 1; // partition 1, 2, ... for partition regions
+      }
+    }
+    return -1; // Should not reach here
+  }
   return asyncTasks[0];
 }
 
@@ -212,6 +276,19 @@ void getNestedFor(Region *partition,
   });
 }
 
+/// Check if there's a loop operation between two operations in the same block
+static bool hasInterveningLoop(Operation *earlier, Operation *later) {
+  // Walk from earlier to later, checking for loop operations
+  Operation *current = earlier->getNextNode();
+  while (current && current != later) {
+    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(current)) {
+      return true;
+    }
+    current = current->getNextNode();
+  }
+  return false;
+}
+
 bool areControlFlowEquivalent(Operation *op1, Operation *op2,
                               DominanceInfo &domInfo,
                               PostDominanceInfo &postDomInfo) {
@@ -219,12 +296,24 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2,
     return false;
 
   // Check if op1 dominates op2 AND op2 post-dominates op1
-  if (domInfo.dominates(op1, op2) && postDomInfo.postDominates(op2, op1))
+  if (domInfo.dominates(op1, op2) && postDomInfo.postDominates(op2, op1)) {
+    // Additional check: ensure no loop separates them
+    if (hasInterveningLoop(op1, op2)) {
+      LDBG("Ops separated by a loop, not control flow equivalent");
+      return false;
+    }
     return true;
+  }
 
   // Check the reverse (op2 dominates op1 AND op1 post-dominates op2)
-  if (domInfo.dominates(op2, op1) && postDomInfo.postDominates(op1, op2))
+  if (domInfo.dominates(op2, op1) && postDomInfo.postDominates(op1, op2)) {
+    // Additional check: ensure no loop separates them
+    if (hasInterveningLoop(op2, op1)) {
+      LDBG("Ops separated by a loop, not control flow equivalent");
+      return false;
+    }
     return true;
+  }
 
   return false;
 }
@@ -278,17 +367,20 @@ Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp,
 /// For now, we apply the same rule for NonReorderable and PureArithmetic --
 /// the end op is the first op with memory side effect after the critical op.
 Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
-                     mlir::DominanceInfo &domInfo,
+                     int computeCapability, mlir::DominanceInfo &domInfo,
                      mlir::PostDominanceInfo &postDomInfo) {
   // Set the end op of this pingpong region to be the first op with memory side
   // effect after this critical op
   std::string opName = keyOp->getName().getStringRef().str();
-  if (crManager.keyOpNameToType.count(opName) == 0) {
+  auto opTypeOpt = crManager.getCriticalOpType(keyOp, computeCapability);
+  if (!opTypeOpt.has_value()) {
     LDBG("Operation " << opName
-                      << " is not registered as an expensive operation.");
+                      << " is not registered as an expensive operation for "
+                         "compute capability "
+                      << computeCapability << ".");
     return nullptr;
   }
-  CriticalOpType opType = crManager.keyOpNameToType[opName];
+  CriticalOpType opType = opTypeOpt.value();
   if (opType == CriticalOpType::NonReorderable) {
     LDBG("Operation " << opName << " is not reorderable.");
     // Find the first op with memory side effect after this critical op
@@ -373,7 +465,7 @@ Operation *unionOfEndOps(SmallVector<Operation *> &endOps) {
   return latestOp;
 }
 
-static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
+static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   // Get the function op
   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
   assert(funcOp != nullptr);
@@ -456,12 +548,13 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       Operation *startOp = findStartOp(crManager, keyOp, domInfo, postDomInfo);
-      Operation *endOp = findEndOp(crManager, keyOp, domInfo, postDomInfo);
+      Operation *endOp =
+          findEndOp(crManager, keyOp, computeCapability, domInfo, postDomInfo);
       startOps[partitionId].push_back(startOp);
       endOps[partitionId].push_back(endOp);
       // Look up the number of warps for each partition
       if (numWarps.count(partitionId) == 0) {
-        numWarps[partitionId] = mlir::triton::gpu::lookupNumWarps(keyOp);
+        numWarps[partitionId] = ttg::lookupNumWarps(keyOp);
         LDBG("numWarps of " << partitionId << " is " << numWarps[partitionId]);
       }
     }
@@ -574,14 +667,33 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
   }
 }
 
+static int getCapability(ModuleOp moduleOp, int defaultCapability) {
+  LDBG("defaultCapability: " << defaultCapability);
+  if (auto targetAttr =
+          moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName)) {
+    StringRef ref = targetAttr.strref();
+    if (ref.starts_with("cuda:")) {
+      StringRef capabilityStr = ref.drop_front(5); // drop the "cuda:"
+      int parsedCapability;
+      if (!capabilityStr.getAsInteger(10, parsedCapability)) {
+        LDBG("Using compute capability from module: " << parsedCapability);
+        return parsedCapability / 10;
+      }
+    }
+  }
+  return defaultCapability;
+}
+
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
+  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+  capability = getCapability(moduleOp, capability);
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &bodyOp : block.getOperations()) {
       Operation *op = &bodyOp;
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        handleWarpSpec(wsOp);
+        handleWarpSpec(wsOp, capability);
       }
     }
   }
@@ -600,17 +712,71 @@ static Operation *getSplitOp(Operation *op) {
 
 static std::optional<NameLoc> getNameLoc(Operation *op) {
   Location loc = op->getLoc();
+  // Check if loc is directly a NameLoc
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return nameLoc;
+  }
+  // Check if loc is a CallSiteLoc with a NameLoc callee
   if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
     if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
       return nameLoc;
     }
   }
+  // Check if loc is a FusedLoc and extract NameLoc from it
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
+        return nameLoc;
+      }
+      if (auto callSiteLoc = dyn_cast<CallSiteLoc>(subLoc)) {
+        if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
+          return nameLoc;
+        }
+      }
+    }
+  }
   return std::nullopt;
+}
+
+/// Check if two operations have equivalent locations
+/// Returns true if they have matching NameLoc or equivalent raw Location
+static bool areLocationsEquivalent(Operation *op1, Operation *op2) {
+  // First, try to compare using NameLoc
+  std::optional<NameLoc> nameLoc1 = getNameLoc(op1);
+  std::optional<NameLoc> nameLoc2 = getNameLoc(op2);
+
+  if (nameLoc1.has_value() && nameLoc2.has_value()) {
+    LDBG("op1 nameLoc: " << nameLoc1.value()
+                         << ", op2 nameLoc: " << nameLoc2.value());
+    return nameLoc1.value() == nameLoc2.value();
+  }
+
+  // Fallback: compare raw Location objects for equivalence
+  Location loc1 = op1->getLoc();
+  Location loc2 = op2->getLoc();
+
+  // FileLineColLoc comparison
+  if (auto fileLoc1 = dyn_cast<FileLineColLoc>(loc1)) {
+    if (auto fileLoc2 = dyn_cast<FileLineColLoc>(loc2)) {
+      LDBG("Comparing FileLineColLoc: " << fileLoc1 << " vs " << fileLoc2);
+      return fileLoc1.getFilename() == fileLoc2.getFilename() &&
+             fileLoc1.getLine() == fileLoc2.getLine() &&
+             fileLoc1.getColumn() == fileLoc2.getColumn();
+    }
+  }
+
+  // Direct Location comparison (works for simple cases)
+  LDBG("Comparing raw locations: " << loc1 << " vs " << loc2);
+  return loc1 == loc2;
 }
 
 /// doPingPongPrep pass: Group expensive ops into pingpong regions
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
+  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+  capability = getCapability(moduleOp, capability);
+
+  // Initialize the critical region manager
   CriticalRegionManager crManager;
 
   // Initialize the dominance and post-dominance info
@@ -623,73 +789,88 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
 
   // Scan all operations in the function to find expensive ops
   funcOp.walk([&](Operation *op) {
-    if (!crManager.isExpensiveOp(op))
+    if (!crManager.isExpensiveOp(op, capability))
       return;
 
     if (op->getNumOperands() == 0)
       return;
 
-    // IMPORTANT: Assume operations are expensive only for 2D tensors
-    auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
-    if (tensorTy && tensorTy.getRank() > 1) {
-      LDBG("Found expensive op " << op->getName().getStringRef().str()
-                                 << ", location" << op->getLoc());
+    // IMPORTANT: Assume operations are expensive only for 2D shaped types
+    Type operandType = op->getOperand(0).getType();
+    int64_t rank = -1;
 
-      // Check if the expensive op belongs to an existing group
-      bool foundGroup = false;
-      for (auto &group : expensiveOps) {
-        bool matchType = true;
-        bool matchVar = false;
-        for (auto &refOp : group) {
-          // Check 1: Same Operation Name
-          if (op->getName() != refOp->getName()) {
-            matchType = false;
-            break;
-          }
-          // Check 2: Control Flow Equivalent
+    if (auto tensorTy = dyn_cast<RankedTensorType>(operandType)) {
+      rank = tensorTy.getRank();
+      LDBG("RankedTensorType: " << tensorTy << ", rank " << rank);
+    } else if (auto memDescTy = dyn_cast<ttg::MemDescType>(operandType)) {
+      rank = memDescTy.getRank();
+      LDBG("MemDescType: " << memDescTy << ", rank " << rank);
+    } else if (auto shapedTy = dyn_cast<ShapedType>(operandType)) {
+      // Fallback for other ShapedTypes
+      if (shapedTy.hasRank()) {
+        rank = shapedTy.getRank();
+        LDBG("ShapedType: " << shapedTy << ", rank " << rank);
+      }
+    }
+
+    if (rank < 2) {
+      LDBG("Operand type is not a 2D shaped type, skipping");
+      return;
+    }
+
+    // Check if the expensive op belongs to an existing group
+    bool foundGroup = false;
+    for (auto &group : expensiveOps) {
+      bool matchType = true;
+      bool matchVar = false;
+      for (auto &refOp : group) {
+        // Check 1: Same Operation Name
+        if (op->getName() != refOp->getName()) {
+          matchType = false;
+          break;
+        }
+
+        int opTaskId = getSingleTaskId(op);
+        int refTaskId = getSingleTaskId(refOp);
+        if (opTaskId == -1 || refTaskId == -1) {
+          continue;
+        }
+        if (opTaskId == refTaskId) {
+          // Check 2: If in the same partition, they should be control Flow
+          // Equivalent
           if (!areControlFlowEquivalent(op, refOp, domInfo, postDomInfo)) {
             matchType = false;
             break;
           }
-
-          // Check 3: If in the same partition, the op is dependent on the same
-          // tt.split
-          int opTaskId = getSingleTaskId(op);
-          int refTaskId = getSingleTaskId(refOp);
-          if (opTaskId == refTaskId) {
-            Operation *opSplit = getSplitOp(op);
-            Operation *refSplit = getSplitOp(refOp);
-            // Are from the same data split op
-            if (opSplit == refSplit) {
-              LDBG("Same split op");
-              matchVar = true;
-            }
-          } else { // Check 4: If in different partitions, the op is called from
-                   // the same source var
-            std::optional<NameLoc> opLoc = getNameLoc(op);
-            std::optional<NameLoc> refLoc = getNameLoc(refOp);
-            if (opLoc.has_value() && refLoc.has_value()) {
-              LDBG("op loc: " << opLoc << ", refLoc" << refLoc);
-              if (opLoc.value() == refLoc.value()) {
-                LDBG("Same source var");
-                matchVar = true;
-              }
-            }
+          // Check 3: the op is dependent on the same tt.split
+          Operation *opSplit = getSplitOp(op);
+          Operation *refSplit = getSplitOp(refOp);
+          // Are from the same data split op
+          if (opSplit && refSplit && (opSplit == refSplit)) {
+            LDBG("Same split op");
+            matchVar = true;
+          }
+        } else {
+          // Check 4: If in different partitions, the op is called from
+          // the same source var
+          if (areLocationsEquivalent(op, refOp)) {
+            LDBG("Same source var (locations equivalent)");
+            matchVar = true;
           }
         }
-        foundGroup = matchType && matchVar;
-        if (foundGroup) {
-          LDBG("Insert to ref op group "
-               << group[0]->getName().getStringRef().str());
-          group.push_back(op);
-          break;
-        }
       }
+      foundGroup = matchType && matchVar;
+      if (foundGroup) {
+        LDBG("Insert to ref op group "
+             << group[0]->getName().getStringRef().str());
+        group.push_back(op);
+        break;
+      }
+    }
 
-      if (!foundGroup) {
-        LDBG("Create new group for op " << op->getName().getStringRef().str());
-        expensiveOps.push_back({op});
-      }
+    if (!foundGroup) {
+      LDBG("Create new group for op " << op->getName().getStringRef().str());
+      expensiveOps.push_back({op});
     }
   });
 
