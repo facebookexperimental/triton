@@ -88,8 +88,10 @@ public:
     // Initialize barrier ID to be 9
     barrierId = MIN_BARRIER_ID;
 
-    // Register default expensive operations
-    // IMPORTANT: Assume operations are expensive only for 2D tensors
+    /// Register default expensive operations
+    // Use specific op names of GEMM, such as ttng.warp_group_dot for Hopper,
+    // to avoid matching other GEMM ops using DotInterface
+    // (e.g., ttng.tc_gen5_mma for Blackwell) that we don't enforce pingpong on
     registerCriticalOp(
         "ttng.warp_group_dot",
         CriticalOpType::NonReorderable); // GEMM/Dot operation on Hopper
@@ -227,13 +229,6 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2,
   return false;
 }
 
-Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp,
-                       mlir::DominanceInfo &domInfo,
-                       mlir::PostDominanceInfo &postDomInfo) {
-  // Set the start op of this pingpong region to be the critical op
-  return keyOp;
-}
-
 /// Dump memory effects of an operation for debugging
 void dumpMemoryEffects(Operation *op) {
   auto memInterface = dyn_cast<MemoryEffectOpInterface>(op);
@@ -271,6 +266,17 @@ void dumpMemoryEffects(Operation *op) {
   }
 }
 
+Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp,
+                       mlir::DominanceInfo &domInfo,
+                       mlir::PostDominanceInfo &postDomInfo) {
+  // Set the start op of this pingpong region to be the critical op
+  return keyOp;
+}
+
+/// Find the end boundary op for the critical region.
+/// Rules are specific to the CriticalOpType.
+/// For now, we apply the same rule for NonReorderable and PureArithmetic --
+/// the end op is the first op with memory side effect after the critical op.
 Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
                      mlir::DominanceInfo &domInfo,
                      mlir::PostDominanceInfo &postDomInfo) {
@@ -285,6 +291,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
   CriticalOpType opType = crManager.keyOpNameToType[opName];
   if (opType == CriticalOpType::NonReorderable) {
     LDBG("Operation " << opName << " is not reorderable.");
+    // Find the first op with memory side effect after this critical op
     Operation *curOp = keyOp;
     while (curOp) {
       if (!isMemoryEffectFree(curOp)) {
@@ -300,6 +307,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
     }
   } else if (opType == CriticalOpType::PureArithmetic) {
     LDBG("Operation " << opName << " is pure arithmetic.");
+    // Find the first op with memory side effect after this critical op
     Operation *curOp = keyOp;
     while (curOp) {
       if (!isMemoryEffectFree(curOp)) {
@@ -566,7 +574,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp) {
   }
 }
 
-/// doPingPongPrep pass: Insert pingpong barriers to the IR
+/// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
   for (auto &block : funcOp.getBody().getBlocks()) {
@@ -621,7 +629,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     if (op->getNumOperands() == 0)
       return;
 
-    // Only 2D tensor operations are considered expensive
+    // IMPORTANT: Assume operations are expensive only for 2D tensors
     auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
     if (tensorTy && tensorTy.getRank() > 1) {
       LDBG("Found expensive op " << op->getName().getStringRef().str()
@@ -717,6 +725,24 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     pingpongID++;
   }
 }
+
+#define GEN_PASS_DEF_NVGPUTESTPINGPONGPREP
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestPingPongPrepPass
+    : public impl::NVGPUTestPingPongPrepBase<NVGPUTestPingPongPrepPass> {
+public:
+  using impl::NVGPUTestPingPongPrepBase<
+      NVGPUTestPingPongPrepPass>::NVGPUTestPingPongPrepBase;
+
+  void runOnFuncOp(triton::FuncOp funcOp) {
+    doPingPongPrep(funcOp, numWarpGroups, capability);
+  }
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
+  }
+};
 
 #define GEN_PASS_DEF_NVGPUTESTPINGPONGSYNC
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
