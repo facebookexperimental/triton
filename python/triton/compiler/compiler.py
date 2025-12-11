@@ -449,7 +449,7 @@ class AsmDict(dict):
 
 
 def _raise_error(err_ref, *args, **kwargs):
-    exc = err_ref()          # follow the weak ref
+    exc = err_ref()  # follow the weak ref
     if exc is None:
         raise RuntimeError("Original exception has been garbage-collected")
     raise exc
@@ -497,6 +497,7 @@ class CompiledKernel:
         def raise_(err):
             self._run = functools.partial(_raise_error, weakref.ref(err))
             raise err
+
         # Facebook end
 
         device = driver.active.get_current_device()
