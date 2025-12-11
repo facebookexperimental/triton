@@ -15,6 +15,7 @@ import re
 import functools
 import os
 import time
+import weakref
 
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
 #    and any following whitespace
@@ -447,8 +448,11 @@ class AsmDict(dict):
         return value
 
 
-def _raise_error(err, *args, **kwargs):
-    raise err
+def _raise_error(err_ref, *args, **kwargs):
+    exc = err_ref()          # follow the weak ref
+    if exc is None:
+        raise RuntimeError("Original exception has been garbage-collected")
+    raise exc
 
 
 class CompiledKernel:
@@ -488,9 +492,12 @@ class CompiledKernel:
         if self.module is not None:
             return
 
+        # Facebook begin
+        # https://fb.workplace.com/groups/1405155842844877/permalink/26366525132947936/
         def raise_(err):
-            self._run = functools.partial(_raise_error, err)
+            self._run = functools.partial(_raise_error, weakref.ref(err))
             raise err
+        # Facebook end
 
         device = driver.active.get_current_device()
         # create launcher
