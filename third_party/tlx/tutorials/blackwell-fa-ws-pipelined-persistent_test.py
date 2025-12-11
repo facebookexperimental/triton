@@ -1080,16 +1080,12 @@ def bwd_calculate_offsets(
     BLOCK_N1: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    # Apply PID swizzling similar to _compute_offsets_persistent
-    group_id = tile_idx // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    start_n = (tile_idx % num_pid_in_group) // group_size_m
-    bhid = first_pid_m + (tile_idx % group_size_m)
-
+    bhid = tile_idx // n_tile_num
+    pid = tile_idx % n_tile_num
+    pid, bhid = tl.swizzle2d(pid, bhid, n_tile_num, num_pid_m, GROUP_SIZE_M)
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
-    start_n = start_n * BLOCK_N1
+    start_n = pid * BLOCK_N1
     start_m = 0
     num_steps = (N_CTX - start_m) // BLOCK_M1
     return off_chz, off_bh, start_m, start_n, num_steps
@@ -1997,7 +1993,18 @@ attention = _attention.apply
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
 @pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
-def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, BLOCK_M1, GROUP_SIZE_M, dtype=torch.float16):
+def test_op(
+    Z,
+    H,
+    N_CTX,
+    HEAD_DIM,
+    mode,
+    provider,
+    causal,
+    BLOCK_M1,
+    GROUP_SIZE_M,
+    dtype=torch.float16,
+):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
