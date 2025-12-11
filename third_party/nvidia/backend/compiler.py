@@ -1,19 +1,20 @@
-from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, nvidia, tlx
-from triton import knobs
-from triton.runtime.errors import PTXASError
+import functools
+import hashlib
+import os
+import re
+import signal
+import subprocess
+import tempfile
 
 from dataclasses import dataclass
-import functools
-from typing import Any, Dict, Tuple, Optional
-from types import ModuleType
-import hashlib
-import re
-import tempfile
-import signal
-import os
-import subprocess
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Dict, Optional, Tuple
+
+from triton import knobs
+from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
+from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.runtime.errors import PTXASError
 
 
 def min_dot_size(target: GPUTarget):
@@ -46,11 +47,11 @@ def get_ptxas_version():
 
 @functools.lru_cache()
 def ptx_get_version(cuda_version) -> int:
-    '''
+    """
     Get the highest PTX version supported by the current CUDA driver.
-    '''
+    """
     assert isinstance(cuda_version, str)
-    major, minor = map(int, cuda_version.split('.'))
+    major, minor = map(int, cuda_version.split("."))
     if major == 12:
         if minor < 6:
             return 80 + minor
@@ -86,7 +87,7 @@ def get_features(options, arch: int):
     # and run a test.  If it's not supported, LLVM will print a warning
     # like "+ptx8.4 is not a recognized feature for this target".
     llvm_ptx_version = min(86, ptx_version)
-    features = f'+ptx{llvm_ptx_version}'
+    features = f"+ptx{llvm_ptx_version}"
     return features
 
 
@@ -114,7 +115,9 @@ class CUDAOptions:
     cluster_dims: tuple = (1, 1, 1)
     ptx_version: int = None
     ptx_options: str = None
-    ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
+    ir_override: Optional[str] = (
+        None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
+    )
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
@@ -126,20 +129,19 @@ class CUDAOptions:
     max_num_imprecise_acc_default: bool = None
     extern_libs: dict = None
     debug: bool = False
-    backend_name: str = 'cuda'
+    backend_name: str = "cuda"
     sanitize_overflow: bool = True
     arch: str = None
     instrumentation_mode: str = ""
 
     def __post_init__(self):
-        default_libdir = Path(__file__).parent / 'lib'
+        default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
-        if not extern_libs.get('libdevice', None):
-            extern_libs['libdevice'] = knobs.nvidia.libdevice_path or str(default_libdir / 'libdevice.10.bc')
+        if not extern_libs.get("libdevice", None):
+            extern_libs["libdevice"] = knobs.nvidia.libdevice_path or str(default_libdir / "libdevice.10.bc")
 
-        object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
-        assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
-               "num_warps must be a power of 2"
+        object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
+        assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
 
     def hash(self):
         hash_dict = dict(self.__dict__)
@@ -153,7 +155,7 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
-        return target.backend == 'cuda'
+        return target.backend == "cuda"
 
     def _parse_arch(self, arch):
         pattern = r"^sm(\d+)$"
@@ -171,7 +173,7 @@ class CUDABackend(BaseBackend):
         self.binary_ext = "cubin"
 
     def parse_options(self, opts) -> Any:
-        args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
+        args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
 
@@ -209,16 +211,19 @@ class CUDABackend(BaseBackend):
 
     def get_codegen_implementation(self, options):
         import triton.language.extra.cuda as cuda
+
         capability = int(self._parse_arch(options.arch))
         codegen_fns = {
             "convert_custom_types":
-            cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70, "min_dot_size":
-            min_dot_size(self.target)
+            (cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70),
+            "min_dot_size":
+            min_dot_size(self.target),
         }
         return codegen_fns
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.cuda import libdevice
+
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
@@ -321,7 +326,11 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod)
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        metadata["cluster_dims"] = (
+            cluster_info.clusterDimX,
+            cluster_info.clusterDimY,
+            cluster_info.clusterDimZ,
+        )
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
@@ -387,7 +396,7 @@ class CUDABackend(BaseBackend):
         llvm_mod = llvm.to_module(mod, context)
         proc = sm_arch_from_capability(capability)
         features = get_features(options, self.target.arch)
-        triple = 'nvptx64-nvidia-cuda'
+        triple = "nvptx64-nvidia-cuda"
         nvidia.set_short_ptr()
         llvm.attach_datalayout(llvm_mod, triple, proc, features)
         nvidia.set_nvvm_reflect_ftz(llvm_mod)
@@ -407,8 +416,8 @@ class CUDABackend(BaseBackend):
         metadata["tmem_size"] = src.get_int_attr("ttg.tensor_memory_size")
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
-        metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
-        metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
+        metadata["profile_scratch_size"] = (src.get_int_attr("ttg.profile_scratch_memory_size") or 0)
+        metadata["profile_scratch_align"] = (src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1)
         ret = str(llvm_mod)
         del llvm_mod
         del context
@@ -417,18 +426,19 @@ class CUDABackend(BaseBackend):
     def make_ptx(self, src, metadata, opt, capability):
         ptx_version = get_ptx_version_from_options(opt, self.target.arch)
 
-        triple = 'nvptx64-nvidia-cuda'
+        triple = "nvptx64-nvidia-cuda"
         proc = sm_arch_from_capability(capability)
         features = get_features(opt, self.target.arch)
-        ret = llvm.translate_to_asm(src, triple, proc, features, [], opt.enable_fp_fusion, False)
+        flags = ["nvptx-mad-wide-opt"]
+        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1
         metadata["name"] = names[0]
         # post-process
-        ptx_version = f'{ptx_version//10}.{ptx_version%10}'
-        ret = re.sub(r'\.version \d+\.\d+', f'.version {ptx_version}', ret, flags=re.MULTILINE)
-        ret = re.sub(r'\.target sm_\d+', f'.target sm_{capability}', ret, flags=re.MULTILINE)
+        ptx_version = f"{ptx_version//10}.{ptx_version%10}"
+        ret = re.sub(r"\.version \d+\.\d+", f".version {ptx_version}", ret, flags=re.MULTILINE)
+        ret = re.sub(r"\.target sm_\d+", f".target sm_{capability}", ret, flags=re.MULTILINE)
         # Remove the debug flag that prevents ptxas from optimizing the code
         ret = re.sub(r",\s*debug|debug,\s*", "", ret)
         if knobs.nvidia.dump_nvptx:
@@ -438,11 +448,11 @@ class CUDABackend(BaseBackend):
 
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas().path
-        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
-            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc, tempfile.NamedTemporaryFile(
+                delete=False, mode="r", suffix=".log") as flog:
             fsrc.write(src)
             fsrc.flush()
-            fbin = fsrc.name + '.o'
+            fbin = fsrc.name + ".o"
 
             debug_info = []
             if knobs.compilation.disable_line_info:
@@ -459,14 +469,22 @@ class CUDABackend(BaseBackend):
             arch = sm_arch_from_capability(capability)
 
             # Disable ptxas optimizations if requested
-            disable_opt = ['--opt-level', '0'] if knobs.nvidia.disable_ptxas_opt else []
+            disable_opt = ["--opt-level", "0"] if knobs.nvidia.disable_ptxas_opt else []
 
             # Accept more ptxas options if provided
             ptx_extra_options = opt.ptx_options.split(" ") if opt.ptx_options else []
 
             ptxas_cmd = [
-                ptxas, *debug_info, *fmad, '-v', *disable_opt, *ptx_extra_options, f'--gpu-name={arch}', fsrc.name,
-                '-o', fbin
+                ptxas,
+                *debug_info,
+                *fmad,
+                "-v",
+                *disable_opt,
+                *ptx_extra_options,
+                f"--gpu-name={arch}",
+                fsrc.name,
+                "-o",
+                fbin,
             ]
             try:
                 subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
@@ -485,11 +503,11 @@ class CUDABackend(BaseBackend):
                     os.remove(flog.name)
 
                 if e.returncode == 255:
-                    error = 'Internal Triton PTX codegen error'
+                    error = "Internal Triton PTX codegen error"
                 elif e.returncode == 128 + signal.SIGSEGV:
-                    error = '`ptxas` raised SIGSEGV'
+                    error = "`ptxas` raised SIGSEGV"
                 else:
-                    error = f'`ptxas` failed with error code {e.returncode}'
+                    error = f"`ptxas` failed with error code {e.returncode}"
 
                 error = (f"{error}\n"
                          f"`ptxas` stderr:\n{log}\n"
@@ -506,7 +524,7 @@ please share the reproducer above with Triton project.
 """)
                 raise PTXASError(error)
 
-            with open(fbin, 'rb') as f:
+            with open(fbin, "rb") as f:
                 cubin = f.read()
             if os.path.exists(fbin):
                 os.remove(fbin)
@@ -526,4 +544,4 @@ please share the reproducer above with Triton project.
     @functools.lru_cache()
     def hash(self):
         version = get_ptxas_version()
-        return f'{version}-{self.target.arch}'
+        return f"{version}-{self.target.arch}"
