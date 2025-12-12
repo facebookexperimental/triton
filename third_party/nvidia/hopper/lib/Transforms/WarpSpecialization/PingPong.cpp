@@ -63,7 +63,7 @@ private:
   static constexpr unsigned MAX_BARRIER_ID = 15;
 
 public:
-  // Current barrier ID to assign (wraps around in range [0, 15])
+  /// Current barrier ID to assign (wraps around in range [MIN_BARRIER_ID, MAX_BARRIER_ID])
   int barrierId;
 
   // Map from compute capability to a map of critical operation name to its
