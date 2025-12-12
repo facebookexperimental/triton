@@ -12,8 +12,13 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 def get_cuda_autotune_config():
     return [
         triton.Config(
-            {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'NUM_STAGES': 3},
-            num_warps=8),
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "NUM_STAGES": 3},
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "NUM_STAGES": 10},
+            num_warps=8,
+        ),
     ]
 
 
