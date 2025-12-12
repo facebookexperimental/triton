@@ -134,7 +134,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
                 tlx.named_barrier_wait(9, 256)
             else:
-                # Consumer 1 signals its arrival at barrier 9
+                # Consumer 1 signals its arrival at barrier 9.
                 tlx.named_barrier_arrive(9, 256)
                 # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
                 tlx.named_barrier_wait(10, 256)
