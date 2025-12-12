@@ -151,20 +151,20 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()
 
-    # Estimate the runtime of the function
-    start_event = di.Event(enable_timing=True)
-    end_event = di.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5):
-        runtime.driver.active.clear_cache(cache)
-        fn()
-    end_event.record()
-    di.synchronize()
-    estimate_ms = start_event.elapsed_time(end_event) / 5
+    # # Estimate the runtime of the function
+    # start_event = di.Event(enable_timing=True)
+    # end_event = di.Event(enable_timing=True)
+    # start_event.record()
+    # for _ in range(5):
+    #     runtime.driver.active.clear_cache(cache)
+    #     fn()
+    # end_event.record()
+    # di.synchronize()
+    # estimate_ms = start_event.elapsed_time(end_event) / 5
 
     # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
+    n_warmup = 1
+    n_repeat = 1
     start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
