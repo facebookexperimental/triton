@@ -33,7 +33,6 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <unordered_set>
@@ -92,12 +91,12 @@ public:
     /// Register default expensive operations
     // Hopper (compute capability 9)
     registerCriticalOp(
-        9, "ttng.warp_group_dot",
+        90, "ttng.warp_group_dot",
         CriticalOpType::NonReorderable); // GEMM/Dot operation on Hopper
     // Blackwell (compute capability 10)
-    registerCriticalOp(10, "math.exp",
+    registerCriticalOp(100, "math.exp",
                        CriticalOpType::PureArithmetic); // Exponential
-    registerCriticalOp(10, "math.exp2",
+    registerCriticalOp(100, "math.exp2",
                        CriticalOpType::PureArithmetic); // Exponential base 2
   }
 
@@ -667,28 +666,11 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   }
 }
 
-static int getCapability(ModuleOp moduleOp, int defaultCapability) {
-  LDBG("defaultCapability: " << defaultCapability);
-  if (auto targetAttr =
-          moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName)) {
-    StringRef ref = targetAttr.strref();
-    if (ref.starts_with("cuda:")) {
-      StringRef capabilityStr = ref.drop_front(5); // drop the "cuda:"
-      int parsedCapability;
-      if (!capabilityStr.getAsInteger(10, parsedCapability)) {
-        LDBG("Using compute capability from module: " << parsedCapability);
-        return parsedCapability / 10;
-      }
-    }
-  }
-  return defaultCapability;
-}
-
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  capability = getCapability(moduleOp, capability);
+  capability = getNVIDIAComputeCapability(moduleOp);
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &bodyOp : block.getOperations()) {
       Operation *op = &bodyOp;
@@ -774,7 +756,7 @@ static bool areLocationsEquivalent(Operation *op1, Operation *op2) {
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  capability = getCapability(moduleOp, capability);
+  capability = getNVIDIAComputeCapability(moduleOp);
 
   // Initialize the critical region manager
   CriticalRegionManager crManager;
