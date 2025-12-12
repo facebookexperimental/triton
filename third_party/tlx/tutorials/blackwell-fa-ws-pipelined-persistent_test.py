@@ -167,10 +167,19 @@ def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
 
 
 @triton.jit
+def _get_start_m_bwd(start_n, BLOCK_N1, STAGE: tl.constexpr):
+    if STAGE == 1:
+        return 0
+    else:
+        tl.static_assert(STAGE == 3)
+        return start_n * BLOCK_N1
+
+
+@triton.jit
 def _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3
-        lo, hi = 0, (start_n + 1) * BLOCK_N1
+        lo, hi = start_n * BLOCK_N1, (start_n + 1) * BLOCK_N1
     elif STAGE == 2:
         # Second part of STAGE == 3 in this function
         lo, hi = (start_n + 1) * BLOCK_N1, N_CTX
@@ -1076,7 +1085,9 @@ def bwd_calculate_offsets(
     H,
     N_CTX,  #
     BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    STAGE: tl.constexpr,
 ):
     bhid = tile_idx // n_tile_num
     pid = tile_idx % n_tile_num
@@ -1084,7 +1095,7 @@ def bwd_calculate_offsets(
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     start_n = pid
-    start_m = 0
+    start_m = _get_start_m_bwd(start_n, BLOCK_N1, STAGE)
     num_steps = (N_CTX - start_m) // BLOCK_M1
     return off_chz, off_bh, start_m, start_n, num_steps
 
@@ -1357,7 +1368,9 @@ def _attn_bwd_ws(
                     H,
                     N_CTX,
                     BLOCK_M1,
+                    BLOCK_N1,
                     GROUP_SIZE_M,
+                    STAGE,
                 )
                 curr_m = start_m
                 step_m = BLOCK_M1
@@ -1397,8 +1410,10 @@ def _attn_bwd_ws(
                     stride_tok,
                     H,
                     N_CTX,
+                    BLOCK_M1,
                     BLOCK_N1,
                     GROUP_SIZE_M,
+                    STAGE,
                 )
                 start_block_n = start_n * BLOCK_N1
                 # offset pointers for batch/head
@@ -1538,7 +1553,9 @@ def _attn_bwd_ws(
                     H,
                     N_CTX,
                     BLOCK_M1,
+                    BLOCK_N1,
                     GROUP_SIZE_M,
+                    STAGE,
                 )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
@@ -1723,7 +1740,9 @@ def _attn_bwd_ws(
                     H,
                     N_CTX,
                     BLOCK_M1,
+                    BLOCK_N1,
                     GROUP_SIZE_M,
+                    STAGE,
                 )
                 start_block_n = start_n * BLOCK_N1
                 # Load K
