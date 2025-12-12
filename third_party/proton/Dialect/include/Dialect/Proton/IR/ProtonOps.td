@@ -42,4 +42,32 @@ def PT_RecordOp : PT_Op<"record", [
   let assemblyFormat = "(`start` $isStart^):(`end`)? $name attr-dict";
 }
 
+def PT_RecordIntPairOp : PT_Op<"record_int_pair", [
+  MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
+]> {
+  let summary = "Record an integer pair event";
+
+  let description = [{
+    This operation records a pair of integer values at a single point in time.
+    Unlike proton.record which appears in start/end pairs, this is a single
+    operation that stores two values (e.g., barrier array ID and barrier index).
+
+    Example:
+
+    ```mlir
+    proton.record_int_pair "barrier_op" %barrier_array_id, %barrier_index : i32, i32
+    ```
+
+    This is used for barrier dependency extraction where we need to record
+    which barrier array and barrier index are being used at runtime.
+  }];
+  let arguments = (
+    ins StrAttr: $name,
+    AnyTypeOf<[I32, I64]>: $val1,
+    AnyTypeOf<[I32, I64]>: $val2
+  );
+
+  let assemblyFormat = "$name `,` $val1 `,` $val2 attr-dict `:` type($val1) `,` type($val2)";
+}
+
 #endif // PROTON_OPS

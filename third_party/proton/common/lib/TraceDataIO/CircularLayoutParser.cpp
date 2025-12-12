@@ -128,7 +128,12 @@ void CircularLayoutParser::parseSegment(
 
           if (activeProfileEvent.first->cycle >
               activeProfileEvent.second->cycle) {
-            throw ClockOverflowException("Clock overflow");
+            if (std::getenv("PROTON_DISABLE_CHECK_CLOCK_OVERFLOW")) {
+              std::cerr << "Warning: Clock overflow (check disabled)"
+                        << std::endl;
+            } else {
+              throw ClockOverflowException("Clock overflow");
+            }
           }
           trace.profileEvents.push_back(activeProfileEvent);
         } else {

@@ -29,6 +29,9 @@ public:
     if (auto recordOp = dyn_cast<RecordOp>(op)) {
       return opToIdMap.lookup(recordOp);
     }
+    if (auto recordIntPairOp = dyn_cast<RecordIntPairOp>(op)) {
+      return opToIdMap.lookup(recordIntPairOp);
+    }
     llvm_unreachable("unexpected operation type");
   }
 
