@@ -88,7 +88,7 @@ public:
     // Initialize barrier ID to be 7
     barrierId = MIN_BARRIER_ID;
 
-    /// Register default expensive operations
+    // Register default expensive operations
     // Hopper (compute capability 9)
     registerCriticalOp(
         90, "ttng.warp_group_dot",
