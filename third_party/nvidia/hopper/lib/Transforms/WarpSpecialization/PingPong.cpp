@@ -51,7 +51,7 @@ enum class CriticalOpType : uint8_t {
   /// Operations that cannot be reordered by ptxas (warp_group_dot, etc.)
   NonReorderable = 0,
   /// Pure arithmetic operations that can be reordered (exp, exp2, etc.)
-  // The ops should have memory ops as ping-pong boundary
+  /// The ops should have memory ops as ping-pong boundary
   PureArithmetic = 1,
 };
 
