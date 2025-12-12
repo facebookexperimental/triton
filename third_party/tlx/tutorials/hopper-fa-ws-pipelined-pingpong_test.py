@@ -131,19 +131,21 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             k_tile = tlx.local_trans(k_tiles[k_buf_id])
 
             if cid == 0:
-                # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
-                tlx.named_barrier_wait(9, 256)
+                # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 7.
+                tlx.named_barrier_wait(7, 256)
             else:
-                # Consumer 1 signals its arrival at barrier 9.
+                # Consumer 1 signals its arrival at barrier 7
+                tlx.named_barrier_arrive(7, 256)
+                # Consumer 1 signals its arrival at barrier 9 to unblock pingpong in the loop body
                 tlx.named_barrier_arrive(9, 256)
-                # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
-                tlx.named_barrier_wait(10, 256)
+                # Then waits at barrier 8 until Consumer 0 finishes issuing its async_dot.
+                tlx.named_barrier_wait(8, 256)
 
             qk = tlx.async_dot(q_tiles[cid], k_tile)
 
             if cid == 0:
                 # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
-                tlx.named_barrier_arrive(10, 256)
+                tlx.named_barrier_arrive(8, 256)
 
             # wait for the MMA using to complete
             qk = tlx.async_dot_wait(0, qk)
@@ -174,7 +176,21 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                 # compute qk for the current iteration
                 k_tile = tlx.local_trans(k_tiles[k_buf_id])
+
+                if cid == 0:
+                    # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+                    tlx.named_barrier_wait(9, 256)
+                else:
+                    # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+                    tlx.named_barrier_wait(10, 256)
+
                 qk = tlx.async_dot(q_tiles[cid], k_tile)
+
+                if cid == 0:
+                    # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+                    tlx.named_barrier_arrive(10, 256)
+                else:
+                    tlx.named_barrier_arrive(9, 256)
 
                 # compute pv from the previous iteration
                 # wait for the previous V buffer to be populated by the producer
