@@ -323,6 +323,9 @@ def _softmax_inner_loop(
             p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
             p_i = tl.math.exp2(qks[slice_id])
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
+            # Ensure the SMEM writes preceding this point are globally visible, espeically
+            # to the pv mma operation, before barrier on the p tile.
+            tlx.fence_async_shared()
             tlx.barrier_arrive(tlx.local_view(p_fulls, slice_id + cid * NUM_MMA_SLICES))
             ps = ps + (p_i, )
 
