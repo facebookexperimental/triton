@@ -54,38 +54,38 @@ enum class CriticalOpType : uint8_t {
   PureArithmetic = 1,
 };
 
-// Manages expensive operations for critical region identification and
-// assigns unique barrier IDs to each operation type.
+/// Manages expensive operations for critical region identification and
+/// assigns unique barrier IDs to each operation type.
 class CriticalRegionManager {
 private:
-  // Barrier ID range constants
+  /// Barrier ID range constants
   static constexpr unsigned MIN_BARRIER_ID = 7;
   static constexpr unsigned MAX_BARRIER_ID = 15;
 
 public:
-  /// Current barrier ID to assign (wraps around in range [MIN_BARRIER_ID, MAX_BARRIER_ID])
+  /// Current barrier ID to assign (range [MIN_BARRIER_ID, MAX_BARRIER_ID])
   int barrierId;
 
-  // Map from compute capability to a map of critical operation name to its
-  // operation type
+  /// Map from compute capability to a map of critical operation name to its
+  /// operation type
   llvm::DenseMap<int, llvm::StringMap<CriticalOpType>> keyOpNameToType;
 
-  // Map from pingpong region id to its barrier ID
+  /// Map from pingpong region id to its barrier ID
   llvm::DenseMap<int, std::pair<int, int>> pingpongIdToBarrierId;
 
-  // Map from pingpong region id to its critical operations
+  /// Map from pingpong region id to its critical operations
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToKeyOps;
 
-  // Map from pingpong region id to operations that mark
-  // the critical region's start and end
+  /// Map from pingpong region id to operations that mark
+  /// the critical region's start and end
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPingBoundaryOps;
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPongBoundaryOps;
 
-  // Map from pingpong region id to the participating thread number
+  /// Map from pingpong region id to the participating thread number
   llvm::DenseMap<int, int> pingpongIdToThreadNum;
 
   CriticalRegionManager() {
-    // Initialize barrier ID to be 7
+    // Initialize barrier ID to be MIN_BARRIER_ID
     barrierId = MIN_BARRIER_ID;
 
     // Register default expensive operations
@@ -100,7 +100,7 @@ public:
                        CriticalOpType::PureArithmetic); // Exponential base 2
   }
 
-  // Register a new expensive operation TYPE and assign it a unique barrier ID.
+  /// Register a new expensive operation TYPE and assign it a unique barrier ID.
   void registerCriticalOp(int computeCapability, const std::string &opTypeName,
                           CriticalOpType type) {
     // Initialize the inner map for this compute capability if it doesn't exist
@@ -124,8 +124,8 @@ public:
                         << computeCapability << ".");
   }
 
-  // Check if an operation is registered as an expensive operation for the given
-  // compute capability
+  /// Check if an operation is registered as an expensive operation for the
+  /// given compute capability
   bool isExpensiveOp(Operation *op, int computeCapability) const {
     std::string opName = op->getName().getStringRef().str();
     auto it = keyOpNameToType.find(computeCapability);
@@ -135,7 +135,7 @@ public:
     return it->second.count(opName) > 0;
   }
 
-  // Get the CriticalOpType for an operation (for the given compute capability)
+  /// Get the CriticalOpType for an operation (for the given compute capability)
   std::optional<CriticalOpType> getCriticalOpType(Operation *op,
                                                   int computeCapability) const {
     std::string opName = op->getName().getStringRef().str();
@@ -150,8 +150,8 @@ public:
     return opIt->second;
   }
 
-  // Get the barrier ID assigned to an operation.
-  // Returns std::nullopt if the operation is not registered.
+  /// Get the barrier ID assigned to an operation.
+  /// Returns std::nullopt if the operation is not registered.
   void assignBarrierId(int pingpongId) {
     if (pingpongIdToBarrierId.count(pingpongId) > 0) {
       LDBG("Barrier ID {" << pingpongIdToBarrierId[pingpongId].first << ", "
@@ -213,7 +213,7 @@ public:
   }
 };
 
-// Returns the taskId if op has a single taskId, otherwise, returns -1.
+/// Returns the taskId if op has a single taskId, otherwise, returns -1.
 static int getSingleTaskId(Operation *op) {
   auto asyncTasks = getAsyncTaskIds(op);
   if (asyncTasks.size() > 1)
@@ -264,7 +264,7 @@ static unsigned getLoopDepth(Operation *op) {
   return depth;
 }
 
-// Return a map of loop depth to the loop ops in the partition.
+/// Return a map of loop depth to the loop ops in the partition.
 void getNestedFor(Region *partition,
                   DenseMap<unsigned, SmallVector<Operation *>> &loopDepthMap) {
   partition->walk([&](Operation *subOp) {
