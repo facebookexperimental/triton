@@ -374,14 +374,13 @@ struct AsyncCLCTryCancelOpConversion
   }
 };
 
-struct AsyncCLCQueryCancelOpConversion
-    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncCLCQueryCancelOp> {
+struct CLCQueryCancelOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::CLCQueryCancelOp> {
   using ConvertOpToLLVMPattern<
-      triton::nvidia_gpu::AsyncCLCQueryCancelOp>::ConvertOpToLLVMPattern;
+      triton::nvidia_gpu::CLCQueryCancelOp>::ConvertOpToLLVMPattern;
 
   LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::AsyncCLCQueryCancelOp op,
-                  OpAdaptor adaptor,
+  matchAndRewrite(triton::nvidia_gpu::CLCQueryCancelOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
 
@@ -404,7 +403,7 @@ struct AsyncCLCQueryCancelOpConversion
     SmallVector<PTXBuilder::Operand *, 2> operands = {
         builder.newOperand("=r", true),
         builder.newOperand(adaptor.getClcResAlloc(), "r")};
-    queryOp(operands, /*onlyAttachMLIRArgs=*/true);
+    queryOp(operands, /*onlyAttachMLIRArgs=*/false);
 
     Value ctaId = builder.launch(rewriter, op.getLoc(), i32_ty, false);
 
@@ -427,5 +426,5 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
   patterns.add<NamedBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);
   patterns.add<AsyncCLCTryCancelOpConversion>(typeConverter, benefit);
-  patterns.add<AsyncCLCQueryCancelOpConversion>(typeConverter, benefit);
+  patterns.add<CLCQueryCancelOpConversion>(typeConverter, benefit);
 }
