@@ -2767,12 +2767,12 @@ def test_async_tasks_warp_group_start_ids(BLOCK_SIZE, device):
                 y = tl.load(y_ptr + offsets, mask=mask)
                 output = x + y
                 tl.store(z_ptr + offsets, output, mask=mask)
-            with tlx.async_task(num_warps=2, warp_group_start_id=4):
+            with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 x = tl.load(x_ptr + offsets, mask=mask)
                 tl.store(z_ptr + offsets, x, mask=mask)
-            with tlx.async_task(num_warps=1, warp_group_start_id=6):
+            with tlx.async_task(num_warps=1, warp_group_start_id=8):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 y = tl.load(y_ptr + offsets, mask=mask)
@@ -2796,15 +2796,19 @@ def test_async_tasks_warp_group_start_ids(BLOCK_SIZE, device):
     ttgir = kernel.asm["ttgir"]
 
     # Verify that warpGroupStartIds attribute is present in the IR with the correct values
-    pattern_ws = r"ttg.warp_specialize.*warpGroupStartIds = array<i32: 4, 6>"
+    pattern_ws = r"ttg.warp_specialize.*warpGroupStartIds = array<i32: 4, 6, 8>"
     assert re.search(pattern_ws, ttgir,
-                     flags=re.DOTALL), (f"Expected warpGroupStartIds = array<i32: 4, 6> in ttgir, got:\n{ttgir}")
+                     flags=re.DOTALL), (f"Expected warpGroupStartIds = array<i32: 4, 6, 8> in ttgir, got:\n{ttgir}")
 
     # Verify partition structure
+    # Task 1 has replicate=2 with num_warps=2, so partition0 and partition1 both have 2 warps
+    # Task 2 has replicate=1 with num_warps=1, so partition2 has 1 warp
     pattern_p0 = r"partition0\([^\n]*\)\s+num_warps\(2\)"
     assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
-    pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(1\)"
+    pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(2\)"
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
+    pattern_p2 = r"partition2\([^\n]*\)\s+num_warps\(1\)"
+    assert re.search(pattern_p2, ttgir, flags=re.DOTALL)
 
 
 @pytest.mark.parametrize("BLOCK_SIZE", [64])
