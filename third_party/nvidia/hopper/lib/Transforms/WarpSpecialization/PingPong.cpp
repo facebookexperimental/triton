@@ -66,6 +66,9 @@ public:
   /// Current barrier ID to assign (range [MIN_BARRIER_ID, MAX_BARRIER_ID])
   int barrierId;
 
+  /// Indicator of whether we run out of barrier IDs
+  bool barrierIdExhausted;
+
   /// Map from compute capability to a map of critical operation name to its
   /// operation type
   llvm::DenseMap<int, llvm::StringMap<CriticalOpType>> keyOpNameToType;
@@ -87,6 +90,7 @@ public:
   CriticalRegionManager() {
     // Initialize barrier ID to be MIN_BARRIER_ID
     barrierId = MIN_BARRIER_ID;
+    barrierIdExhausted = false;
 
     // Register default expensive operations
     // Hopper (compute capability 9)
@@ -150,8 +154,8 @@ public:
     return opIt->second;
   }
 
-  /// Get the barrier ID assigned to an operation.
-  /// Returns std::nullopt if the operation is not registered.
+  /// Assign barrier IDs for a pingpong region.
+  /// Sets barrier IDs to -1 if we have exhausted available barriers.
   void assignBarrierId(int pingpongId) {
     if (pingpongIdToBarrierId.count(pingpongId) > 0) {
       LDBG("Barrier ID {" << pingpongIdToBarrierId[pingpongId].first << ", "
@@ -161,20 +165,34 @@ public:
       return;
     }
 
+    // If barrier IDs are exhausted, assign -1 to indicate invalid barriers
+    if (barrierIdExhausted) {
+      pingpongIdToBarrierId[pingpongId] = {-1, -1};
+      LDBG("Barrier IDs exhausted, assigning {-1, -1} to pingpong region '"
+           << pingpongId << "'.");
+      return;
+    }
+
     // Assign barrier ID to the pingpong region
     int barrierId = this->barrierId;
     int barrierId_1 = this->barrierId + 1;
-    if (barrierId_1 > MAX_BARRIER_ID) {
-      barrierId_1 = MIN_BARRIER_ID;
+
+    // Check if we would exceed the maximum barrier ID
+    if (barrierId > MAX_BARRIER_ID || barrierId_1 > MAX_BARRIER_ID) {
+      barrierIdExhausted = true;
+      pingpongIdToBarrierId[pingpongId] = {-1, -1};
+      LDBG("Barrier IDs exhausted, assigning {-1, -1} to pingpong region '"
+           << pingpongId << "'.");
+      return;
     }
+
     pingpongIdToBarrierId[pingpongId] = {barrierId, barrierId_1};
     LDBG("Assigned barrier ID {" << barrierId << ", " << barrierId_1
                                  << "} to pingpong region '" << pingpongId
                                  << "'.");
 
     // Increment the barrier ID counter
-    this->barrierId =
-        (barrierId + 2 > MAX_BARRIER_ID) ? MIN_BARRIER_ID : barrierId + 2;
+    this->barrierId = barrierId + 2;
   }
 
   bool hasPingBoundary(int pingpongRegionId) const {
@@ -603,6 +621,12 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 
     int pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
     int pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
+
+    if (pingBarrierId == -1 || pongBarrierId == -1) {
+      LDBG("Named barriers have run out for the pingpong region " << pingpongId
+                                                                  << ".");
+      continue;
+    }
 
     int numThreads = crManager.pingpongIdToThreadNum[pingpongId];
 
