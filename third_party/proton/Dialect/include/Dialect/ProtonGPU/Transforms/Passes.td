@@ -12,4 +12,22 @@ def ScheduleBufferStorePass: Pass<"proton-schedule-buffer-store", "mlir::ModuleO
   let dependentDialects = ["gpu::ProtonGPUDialect"];
 }
 
+def MppStoreBarrierInfoPass: Pass<"proton-mpp-store-barrier-info", "mlir::ModuleOp"> {
+  let summary = "Replace ReadCounterOp with barrier allocOpId and index for barrier record ops";
+
+  let description = [{
+    This pass finds RecordOp pairs that track barrier operations and replaces
+    the generated ReadCounterOp with barrier allocation IDs (for start records)
+    and barrier indices (for end records).
+
+    The pass is gated by the PROTON_ENABLE_MPP_STORE_BARRIER_INFO_PASS environment variable.
+    When enabled, it tracks barrier info (allocOpId, index) through value propagation
+    and replaces the counter values in CircularStoreOp with the computed values.
+  }];
+
+  let dependentDialects = ["gpu::ProtonGPUDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 #endif  // PROTONGPU_TRANSFORMS_PASSES
