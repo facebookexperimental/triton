@@ -135,7 +135,7 @@ public:
   /// Check if an operation is registered as an expensive operation for the
   /// given compute capability
   bool isExpensiveOp(Operation *op, int computeCapability) const {
-    std::string opName = op->getName().getStringRef().str();
+    llvm::StringRef opName = op->getName().getStringRef();
     auto it = keyOpNameToType.find(computeCapability);
     if (it == keyOpNameToType.end()) {
       return false;
@@ -146,7 +146,7 @@ public:
   /// Get the CriticalOpType for an operation (for the given compute capability)
   std::optional<CriticalOpType> getCriticalOpType(Operation *op,
                                                   int computeCapability) const {
-    std::string opName = op->getName().getStringRef().str();
+    llvm::StringRef opName = op->getName().getStringRef();
     auto it = keyOpNameToType.find(computeCapability);
     if (it == keyOpNameToType.end()) {
       return std::nullopt;
@@ -222,14 +222,14 @@ public:
     for (const auto &entry : pingpongIdToPingBoundaryOps) {
       LDBG("pingpongId: " << entry.first);
       for (const auto &op : entry.second) {
-        LDBG("  ping boundary op: " << op->getName().getStringRef().str());
+        LDBG("  ping boundary op: " << op->getName().getStringRef());
       }
     }
     LDBG("pingpongIdToPongBoundaryOps");
     for (const auto &entry : pingpongIdToPongBoundaryOps) {
       LDBG("pingpongId: " << entry.first);
       for (const auto &op : entry.second) {
-        LDBG("  pong boundary op: " << op->getName().getStringRef().str());
+        LDBG("  pong boundary op: " << op->getName().getStringRef());
       }
     }
   }
@@ -343,7 +343,7 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2,
 void dumpMemoryEffects(Operation *op) {
   auto memInterface = dyn_cast<MemoryEffectOpInterface>(op);
   if (!memInterface) {
-    LDBG("  Op '" << op->getName().getStringRef().str()
+    LDBG("  Op '" << op->getName().getStringRef()
                   << "' does not implement MemoryEffectOpInterface");
     return;
   }
@@ -352,13 +352,13 @@ void dumpMemoryEffects(Operation *op) {
   memInterface.getEffects(effects);
 
   if (effects.empty()) {
-    LDBG("  Op '" << op->getName().getStringRef().str()
+    LDBG("  Op '" << op->getName().getStringRef()
                   << "' has no memory effects");
     return;
   }
 
   for (const auto &effect : effects) {
-    std::string effectType;
+    llvm::StringRef effectType;
     if (isa<MemoryEffects::Read>(effect.getEffect()))
       effectType = "Read";
     else if (isa<MemoryEffects::Write>(effect.getEffect()))
@@ -370,8 +370,8 @@ void dumpMemoryEffects(Operation *op) {
     else
       effectType = "Unknown";
 
-    std::string resourceName = effect.getResource()->getName().str();
-    LDBG("  Op '" << op->getName().getStringRef().str() << "' has effect: "
+    llvm::StringRef resourceName = effect.getResource()->getName();
+    LDBG("  Op '" << op->getName().getStringRef() << "' has effect: "
                   << effectType << " on resource: " << resourceName);
   }
 }
@@ -392,7 +392,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
                      mlir::PostDominanceInfo &postDomInfo) {
   // Set the end op of this pingpong region to be the first op with memory side
   // effect after this critical op
-  std::string opName = keyOp->getName().getStringRef().str();
+  llvm::StringRef opName = keyOp->getName().getStringRef();
   auto opTypeOpt = crManager.getCriticalOpType(keyOp, computeCapability);
   if (!opTypeOpt.has_value()) {
     LDBG("Operation " << opName
@@ -616,7 +616,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       // Check if this is a warp_group_dot operation
       if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
         int pingpongId = pingpongIdAttr.getInt();
-        LDBG("Found op " << op->getName().getStringRef().str()
+        LDBG("Found op " << op->getName().getStringRef()
                          << " with pingpong id " << pingpongId);
         // Prepare CriticalRegionManager for this pingpong region
         crManager.pingpongIdToKeyOps[pingpongId].push_back(op);
@@ -873,14 +873,14 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       foundGroup = matchType && matchVar;
       if (foundGroup) {
         LDBG("Insert to ref op group "
-             << group[0]->getName().getStringRef().str());
+             << group[0]->getName().getStringRef());
         group.push_back(op);
         break;
       }
     }
 
     if (!foundGroup) {
-      LDBG("Create new group for op " << op->getName().getStringRef().str());
+      LDBG("Create new group for op " << op->getName().getStringRef());
       expensiveOps.push_back({op});
     }
   });
@@ -911,7 +911,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
           "pingpong_id",
           IntegerAttr::get(IntegerType::get(op->getContext(), 32), pingpongID));
       LDBG("Assign pingpong_id " << pingpongID << " to op '"
-                                 << op->getName().getStringRef().str()
+                                 << op->getName().getStringRef()
                                  << "' with task_id " << getSingleTaskId(op));
     }
     pingpongID++;
