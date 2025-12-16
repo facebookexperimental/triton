@@ -1,4 +1,5 @@
 import functools
+import os
 from typing import Dict, Optional, Union, Any
 
 import triton
@@ -166,6 +167,10 @@ class InstrumentationHook(Hook):
                                                           self.profile_buffer_size, self.profile_buffer_alignment,
                                                           is_long_clk)
             triton_passes.common.add_cse(pm)
+
+            # Store barrier info if enabled via env var
+            if os.getenv("PROTON_ENABLE_MPP_STORE_BARRIER_INFO_PASS"):
+                triton_proton.add_mpp_store_barrier_info(pm)
 
             if mode.Optimize.SCHED_STORES in self.mode.optimizations:
                 triton_proton.add_schedule_buffer_store(pm)
