@@ -46,6 +46,7 @@ namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
+namespace { // anonymous namespace
 enum class CriticalOpType : uint8_t {
   /// Operations that cannot be reordered by ptxas (warp_group_dot, etc.)
   NonReorderable = 0,
@@ -59,6 +60,8 @@ enum class CriticalOpType : uint8_t {
 class CriticalRegionManager {
 private:
   /// Barrier ID range constants
+  /// This pass only uses named barriers 7 - 15 and reserves 0 - 6 for other
+  /// uses.
   static constexpr unsigned MIN_BARRIER_ID = 7;
   static constexpr unsigned MAX_BARRIER_ID = 15;
 
@@ -98,6 +101,7 @@ public:
         90, "ttng.warp_group_dot",
         CriticalOpType::NonReorderable); // GEMM/Dot operation on Hopper
     // Blackwell (compute capability 10)
+    // Blackwell increases performance for GEMM which is no longer a bottleneck
     registerCriticalOp(100, "math.exp",
                        CriticalOpType::PureArithmetic); // Exponential
     registerCriticalOp(100, "math.exp2",
@@ -482,6 +486,77 @@ Operation *unionOfEndOps(SmallVector<Operation *> &endOps) {
   return latestOp;
 }
 
+static Operation *getSplitOp(Operation *op) {
+  for (Value operand : op->getOperands()) {
+    if (auto result = dyn_cast<OpResult>(operand)) {
+      if (isa<tt::SplitOp>(result.getOwner())) {
+        return result.getOwner();
+      }
+    }
+  }
+  return nullptr;
+}
+
+static std::optional<NameLoc> getNameLoc(Operation *op) {
+  Location loc = op->getLoc();
+  // Check if loc is directly a NameLoc
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return nameLoc;
+  }
+  // Check if loc is a CallSiteLoc with a NameLoc callee
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
+      return nameLoc;
+    }
+  }
+  // Check if loc is a FusedLoc and extract NameLoc from it
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
+        return nameLoc;
+      }
+      if (auto callSiteLoc = dyn_cast<CallSiteLoc>(subLoc)) {
+        if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
+          return nameLoc;
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+/// Check if two operations have equivalent locations
+/// Returns true if they have matching NameLoc or equivalent raw Location
+static bool areLocationsEquivalent(Operation *op1, Operation *op2) {
+  // First, try to compare using NameLoc
+  std::optional<NameLoc> nameLoc1 = getNameLoc(op1);
+  std::optional<NameLoc> nameLoc2 = getNameLoc(op2);
+
+  if (nameLoc1.has_value() && nameLoc2.has_value()) {
+    LDBG("op1 nameLoc: " << nameLoc1.value()
+                         << ", op2 nameLoc: " << nameLoc2.value());
+    return nameLoc1.value() == nameLoc2.value();
+  }
+
+  // Fallback: compare raw Location objects for equivalence
+  Location loc1 = op1->getLoc();
+  Location loc2 = op2->getLoc();
+
+  // FileLineColLoc comparison
+  if (auto fileLoc1 = dyn_cast<FileLineColLoc>(loc1)) {
+    if (auto fileLoc2 = dyn_cast<FileLineColLoc>(loc2)) {
+      LDBG("Comparing FileLineColLoc: " << fileLoc1 << " vs " << fileLoc2);
+      return fileLoc1.getFilename() == fileLoc2.getFilename() &&
+             fileLoc1.getLine() == fileLoc2.getLine() &&
+             fileLoc1.getColumn() == fileLoc2.getColumn();
+    }
+  }
+
+  // Direct Location comparison (works for simple cases)
+  LDBG("Comparing raw locations: " << loc1 << " vs " << loc2);
+  return loc1 == loc2;
+}
+
 static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   // Get the function op
   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
@@ -689,6 +764,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
                                                 pingNumThreads2);
   }
 }
+} // anonymous namespace
 
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
@@ -703,77 +779,6 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
       }
     }
   }
-}
-
-static Operation *getSplitOp(Operation *op) {
-  for (Value operand : op->getOperands()) {
-    if (auto result = dyn_cast<OpResult>(operand)) {
-      if (isa<tt::SplitOp>(result.getOwner())) {
-        return result.getOwner();
-      }
-    }
-  }
-  return nullptr;
-}
-
-static std::optional<NameLoc> getNameLoc(Operation *op) {
-  Location loc = op->getLoc();
-  // Check if loc is directly a NameLoc
-  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
-    return nameLoc;
-  }
-  // Check if loc is a CallSiteLoc with a NameLoc callee
-  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
-    if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
-      return nameLoc;
-    }
-  }
-  // Check if loc is a FusedLoc and extract NameLoc from it
-  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
-    for (Location subLoc : fusedLoc.getLocations()) {
-      if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
-        return nameLoc;
-      }
-      if (auto callSiteLoc = dyn_cast<CallSiteLoc>(subLoc)) {
-        if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
-          return nameLoc;
-        }
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-/// Check if two operations have equivalent locations
-/// Returns true if they have matching NameLoc or equivalent raw Location
-static bool areLocationsEquivalent(Operation *op1, Operation *op2) {
-  // First, try to compare using NameLoc
-  std::optional<NameLoc> nameLoc1 = getNameLoc(op1);
-  std::optional<NameLoc> nameLoc2 = getNameLoc(op2);
-
-  if (nameLoc1.has_value() && nameLoc2.has_value()) {
-    LDBG("op1 nameLoc: " << nameLoc1.value()
-                         << ", op2 nameLoc: " << nameLoc2.value());
-    return nameLoc1.value() == nameLoc2.value();
-  }
-
-  // Fallback: compare raw Location objects for equivalence
-  Location loc1 = op1->getLoc();
-  Location loc2 = op2->getLoc();
-
-  // FileLineColLoc comparison
-  if (auto fileLoc1 = dyn_cast<FileLineColLoc>(loc1)) {
-    if (auto fileLoc2 = dyn_cast<FileLineColLoc>(loc2)) {
-      LDBG("Comparing FileLineColLoc: " << fileLoc1 << " vs " << fileLoc2);
-      return fileLoc1.getFilename() == fileLoc2.getFilename() &&
-             fileLoc1.getLine() == fileLoc2.getLine() &&
-             fileLoc1.getColumn() == fileLoc2.getColumn();
-    }
-  }
-
-  // Direct Location comparison (works for simple cases)
-  LDBG("Comparing raw locations: " << loc1 << " vs " << loc2);
-  return loc1 == loc2;
 }
 
 /// doPingPongPrep pass: Group expensive ops into pingpong regions
