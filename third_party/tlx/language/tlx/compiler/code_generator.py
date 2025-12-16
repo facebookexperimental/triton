@@ -81,6 +81,7 @@ def visit_withAsyncTasks(self, node):
             taskNumWarps = []
             taskNumRegs = []
             taskReplica = []
+            taskWarpGroupStartIds = []
 
             global region_replica_id_stack
             region_replica_id_stack.append(-1)  # dummy placeholder
@@ -98,11 +99,15 @@ def visit_withAsyncTasks(self, node):
                         taskNumWarps.extend([self.builder.options.num_warps] * (task.replicate - 1))
                         if task.num_regs:
                             taskNumRegs.extend([task.num_regs] * (task.replicate - 1))
+                        if task.warp_group_start_id is not None:
+                            taskWarpGroupStartIds.extend([task.warp_group_start_id] * (task.replicate - 1))
                 else:
                     taskReplica.append(task.replicate)
                     taskNumWarps.extend([task.num_warps] * task.replicate)
                     if task.num_regs:
                         taskNumRegs.extend([task.num_regs] * task.replicate)
+                    if task.warp_group_start_id is not None:
+                        taskWarpGroupStartIds.extend([task.warp_group_start_id] * task.replicate)
 
             region_replica_id_stack.pop()  # revert adding dummy placeholder
 
@@ -111,11 +116,18 @@ def visit_withAsyncTasks(self, node):
 
         assert len(taskNumRegs) in [0, len(taskNumWarps)
                                     ], ("Registers are set for either ALL or NONE of non-default tasks")
+        assert len(taskWarpGroupStartIds) in [
+            0, len(taskNumWarps)
+        ], ("warp_group_start_id must be set for either ALL or NONE of non-default tasks")
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
-        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs if len(taskNumRegs) > 0 else None,
-                                                       sum(taskReplica))
+        ws_op = self.builder.create_warp_specialize_op(
+            taskNumWarps,
+            taskNumRegs if len(taskNumRegs) > 0 else None,
+            sum(taskReplica),
+            taskWarpGroupStartIds if len(taskWarpGroupStartIds) > 0 else None,
+        )
 
         # dry visit async task body to calculate captures
         index = 0
