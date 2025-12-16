@@ -2744,6 +2744,73 @@ def test_buffer_indexing_in_function_call(device):
     assert torch.allclose(y, x), "Buffer indexing in function call failed"
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_async_tasks_warp_group_start_ids(BLOCK_SIZE, device):
+    """Test that warp_group_start_id is correctly passed to warp_specialize op."""
+
+    @triton.jit
+    def warp_specialized_kernel_with_start_ids(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                output = x + y
+                tl.store(z_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                tl.store(z_ptr + offsets, x, mask=mask)
+            with tlx.async_task(num_warps=1, warp_group_start_id=8):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                y = tl.load(y_ptr + offsets, mask=mask)
+                tl.store(z_ptr + offsets, y, mask=mask)
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = warp_specialized_kernel_with_start_ids[grid](
+        x,
+        y,
+        output,
+        n_elements,
+        BLOCK_SIZE,
+        num_warps=4,
+    )
+    ttgir = kernel.asm["ttgir"]
+
+    # Verify that warpGroupStartIds attribute is present in the IR with the correct values
+    pattern_ws = r"ttg.warp_specialize.*warpGroupStartIds = array<i32: 4, 6, 8>"
+    assert re.search(pattern_ws, ttgir,
+                     flags=re.DOTALL), (f"Expected warpGroupStartIds = array<i32: 4, 6, 8> in ttgir, got:\n{ttgir}")
+
+    # Verify partition structure
+    # Task 1 has replicate=2 with num_warps=2, so partition0 and partition1 both have 2 warps
+    # Task 2 has replicate=1 with num_warps=1, so partition2 has 1 warp
+    pattern_p0 = r"partition0\([^\n]*\)\s+num_warps\(2\)"
+    assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
+    pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(2\)"
+    assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
+    pattern_p2 = r"partition2\([^\n]*\)\s+num_warps\(1\)"
+    assert re.search(pattern_p2, ttgir, flags=re.DOTALL)
+
+
 @pytest.mark.parametrize("BLOCK_SIZE", [64])
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_tensor_descriptor_ws_capture(BLOCK_SIZE, device):
