@@ -352,8 +352,7 @@ void dumpMemoryEffects(Operation *op) {
   memInterface.getEffects(effects);
 
   if (effects.empty()) {
-    LDBG("  Op '" << op->getName().getStringRef()
-                  << "' has no memory effects");
+    LDBG("  Op '" << op->getName().getStringRef() << "' has no memory effects");
     return;
   }
 
@@ -440,7 +439,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
 
 /// Returns the operation from startOps that is closest to the entry
 /// (executed earliest). All ops must be in the same block.
-Operation *unionOfStartOps(SmallVector<Operation *> &startOps) {
+Operation *unionOfStartOps(llvm::ArrayRef<Operation *> startOps) {
   if (startOps.empty())
     return nullptr;
 
@@ -464,7 +463,7 @@ Operation *unionOfStartOps(SmallVector<Operation *> &startOps) {
 
 /// Returns the operation from endOps that is closest to the terminator
 /// (executed latest). All ops must be in the same block.
-Operation *unionOfEndOps(SmallVector<Operation *> &endOps) {
+Operation *unionOfEndOps(llvm::ArrayRef<Operation *> endOps) {
   if (endOps.empty())
     return nullptr;
 
@@ -557,6 +556,10 @@ static bool areLocationsEquivalent(Operation *op1, Operation *op2) {
   return loc1 == loc2;
 }
 
+/// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
+/// Finds ops with pingpong_id attributes, computes their boundaries, assigns
+/// named barrier IDs, and inserts arrive/wait barriers to enforce mutual
+/// exclusion between ping and pong partitions.
 static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   // Get the function op
   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
@@ -616,8 +619,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       // Check if this is a warp_group_dot operation
       if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
         int pingpongId = pingpongIdAttr.getInt();
-        LDBG("Found op " << op->getName().getStringRef()
-                         << " with pingpong id " << pingpongId);
+        LDBG("Found op " << op->getName().getStringRef() << " with pingpong id "
+                         << pingpongId);
         // Prepare CriticalRegionManager for this pingpong region
         crManager.pingpongIdToKeyOps[pingpongId].push_back(op);
         crManager.assignBarrierId(pingpongId);
@@ -872,8 +875,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       }
       foundGroup = matchType && matchVar;
       if (foundGroup) {
-        LDBG("Insert to ref op group "
-             << group[0]->getName().getStringRef());
+        LDBG("Insert to ref op group " << group[0]->getName().getStringRef());
         group.push_back(op);
         break;
       }
