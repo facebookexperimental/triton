@@ -115,7 +115,7 @@ class CUDAOptions:
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
-    ctas_per_cga: tuple = None  # Alias for cluster_dims with CUDA semantics
+    ctas_per_cga: Optional[tuple] = None  # Alias for cluster_dims with CUDA semantics
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
@@ -150,6 +150,11 @@ class CUDAOptions:
         # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
         # the multiplicative semantics of num_ctas.
         if self.ctas_per_cga is not None:
+            # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
+            assert self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga, (
+                f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
+                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
 

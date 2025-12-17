@@ -119,7 +119,7 @@ def matmul(a, b):
 
     kern_kwargs = {
         'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'num_stages': 0
+        'num_stages': 0, 'ctas_per_cga': (2, 1, 1)
     }
     _ = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](a, a.stride(0), a.stride(1), b, b.stride(0),
                                                                 b.stride(1), c, c.stride(0), c.stride(1), **kern_kwargs)

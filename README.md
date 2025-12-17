@@ -1,4 +1,4 @@
-# TLX - Triton Low-level Language Extensions
+q# TLX - Triton Low-level Language Extensions
 
 ## Introduction
 
@@ -263,6 +263,62 @@ Examples: how mbarriers are communicated in warp specialization
 `tlx.async_task(default)` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks. .
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task..
+
+### CUDA Thread Block Clustering
+
+TLX supports CUDA Thread Block Clustering (available on SM90+ Hopper/Blackwell GPUs) through the `ctas_per_cga` parameter. This provides explicit control over cluster dimensions for multi-CTA cooperative kernels.
+
+#### Usage
+
+Pass `ctas_per_cga` as a tuple when launching a kernel:
+
+```python
+kernel[(grid_x, grid_y)](
+    ...,
+    ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster of CTAs
+    **kwargs
+)
+```
+
+#### Using ctas_per_cga with Autotune
+
+You can specify `ctas_per_cga` in `triton.Config` for autotuning:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128},
+            num_warps=4,
+            ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64},
+            num_warps=4,
+            ctas_per_cga=(1, 1, 1),  # No clustering
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def matmul_kernel(...):
+    ...
+```
+
+
+#### TLX vs Triton Semantics
+
+TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
+
+| Aspect | Triton's way (`num_ctas`) | TLX way (`ctas_per_cga`) |
+|--------|---------------------------|--------------------------|
+| Grid interpretation | Grid × cluster_dims = total CTAs | Grid = total CTAs |
+| Cluster definition | Multiplicative | Regrouping |
+| `num_ctas` value | `product(cluster_dims)` | Always 1 |
+| `launch_cluster` | Can be False (enabled by `num_ctas != 1`) | Always True |
+
+
+```
 
 ### Other operations
 

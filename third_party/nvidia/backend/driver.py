@@ -735,7 +735,6 @@ class CudaLauncher(object):
             libraries=libraries,
         )
 
-        self.cluster_dims = metadata.cluster_dims
         # Distinguish between Triton's way and TLX's way by checking if ctas_per_cga
         # was explicitly set:
         # - Triton's way: Uses num_ctas > 1 with cluster_dims = (1,1,1). Grid is multiplied

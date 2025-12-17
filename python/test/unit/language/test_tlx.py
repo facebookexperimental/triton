@@ -1319,9 +1319,19 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         "N": N,
         "K": K,
     }
-    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
-                                                                        y.stride(1), z, z.stride(0), z.stride(1),
-                                                                        **kern_kwargs)
+    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        ctas_per_cga=(2, 1, 1),
+        **kern_kwargs,
+    )
 
     # verify kernel launch cluster
     assert kernel.metadata.cluster_dims == (2, 1, 1), (
@@ -2827,7 +2837,10 @@ def test_ctas_per_cga(device):
 
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_SIZE": 64}, num_warps=4, ctas_per_cga=(2, 1, 1)),
+            triton.Config(
+                {"BLOCK_SIZE": 64},
+                num_warps=4,
+            ),
         ],
         key=["n_elements"],
     )
@@ -2842,7 +2855,7 @@ def test_ctas_per_cga(device):
     num_blocks = triton.cdiv(256, 64)
 
     # Launch with autotuned config containing ctas_per_cga=(2,1,1)
-    kernel = simple_kernel_clustered[(num_blocks, )](x, 256)
+    kernel = simple_kernel_clustered[(num_blocks, )](x, 256, ctas_per_cga=(2, 1, 1))
 
     # verify kernel launch cluster
     assert kernel.metadata.cluster_dims == (2, 1, 1), (
