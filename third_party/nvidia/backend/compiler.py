@@ -115,6 +115,7 @@ class CUDAOptions:
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
+    ctas_per_cga: tuple = None  # Alias for cluster_dims with CUDA semantics
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
@@ -143,6 +144,14 @@ class CUDAOptions:
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
             "num_warps must be a power of 2"
+
+        # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
+        # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
+        # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
+        # the multiplicative semantics of num_ctas.
+        if self.ctas_per_cga is not None:
+            object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
+            object.__setattr__(self, "num_ctas", 1)
 
     def hash(self):
         hash_dict = dict(self.__dict__)
@@ -344,14 +353,10 @@ class CUDABackend(BaseBackend):
 
         pm.run(mod)
 
-        tlx_enable_paired_cta_mma = mod.get_bool_attr("tlx.enable_paired_cta_mma") or False
-        metadata["tlx_enable_paired_cta_mma"] = tlx_enable_paired_cta_mma
-        if tlx_enable_paired_cta_mma:
-            assert cluster_info.clusterDimX == 1 and cluster_info.clusterDimY == 1 and cluster_info.clusterDimZ == 1, \
-                f"Unexpected cluster dims before TLX override:({cluster_info.clusterDimX}, {cluster_info.clusterDimY}, {cluster_info.clusterDimZ})"
-            metadata["cluster_dims"] = (2, 1, 1)
-        else:
-            metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        # Track whether ctas_per_cga was explicitly set to distinguish between
+        # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
+        metadata["ctas_per_cga"] = opt.ctas_per_cga
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
