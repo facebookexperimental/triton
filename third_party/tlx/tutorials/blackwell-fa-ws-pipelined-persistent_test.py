@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
@@ -323,9 +322,6 @@ def _softmax_inner_loop(
             p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
             p_i = tl.math.exp2(qks[slice_id])
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
-            # Ensure the SMEM writes preceding this point are globally visible, espeically
-            # to the pv mma operation, before barrier on the p tile.
-            tlx.fence_async_shared()
             tlx.barrier_arrive(tlx.local_view(p_fulls, slice_id + cid * NUM_MMA_SLICES))
             ps = ps + (p_i, )
 
@@ -489,8 +485,10 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
                     # to disambigulate from alpha[0]/alpha[BLOCK_N]
                     l = tlx.local_load(l_tiles[cid * BLOCK_N + 1])
-                    tlx.barrier_arrive(qk_empties[cid])
                     m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
+                    # Signal qk_empties after both l and m loads complete,
+                    # since both tiles share the same synchronization group.
+                    tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
                     offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
                     m_ptrs = M + off_hz * N_CTX + offs_m
