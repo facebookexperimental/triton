@@ -354,6 +354,13 @@ void init_triton_llvm(py::module &&m) {
         // regressions with some scheduling solution.
         tuningOptions.SLPVectorization = true;
 
+        bool disableSLPVectorization =
+            mlir::triton::tools::getBoolEnv("TRITON_DISABLE_SLPVECTORIZATION");
+
+        if (disableSLPVectorization) {
+          tuningOptions.SLPVectorization = false;
+        }
+
         std::string pluginFile =
             mlir::triton::tools::getStrEnv("LLVM_PASS_PLUGIN_PATH");
 
