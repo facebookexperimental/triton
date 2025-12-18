@@ -744,6 +744,8 @@ class CudaLauncher(object):
         # When ctas_per_cga is set, num_ctas must be 1 to prevent multiplicative behavior.
         if getattr(metadata, "ctas_per_cga", None) is not None:
             # TLX/CUDA way: ctas_per_cga defines cluster shape, num_ctas must be 1
+            assert tuple(metadata.ctas_per_cga) == tuple(metadata.cluster_dims), (
+                f"ctas_per_cga ({metadata.ctas_per_cga}) must equal cluster_dims ({metadata.cluster_dims})")
             self.num_ctas = 1
             # When using ctas_per_cga, always enable cluster launch.
             # Use True since the C code checks "launch_cluster != 0".
