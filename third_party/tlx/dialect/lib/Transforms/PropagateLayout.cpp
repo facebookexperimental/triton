@@ -72,6 +72,11 @@ public:
       if (auto requireLayoutOp = dyn_cast<tlx::RequireLayoutOp>(op))
         if (isa<gpu::MemDescType>(requireLayoutOp.getType()))
           return WalkResult::interrupt();
+
+      // Check for local_load ops that may need smem layout inference
+      if (isa<ttg::LocalLoadOp>(op))
+        return WalkResult::interrupt();
+
       return WalkResult::advance();
     });
     if (!walkResult.wasInterrupted())
