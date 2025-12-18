@@ -402,17 +402,6 @@ Operation *unionOfEndOps(llvm::ArrayRef<Operation *> endOps) {
   return latestOp;
 }
 
-static Operation *getSplitOp(Operation *op) {
-  for (Value operand : op->getOperands()) {
-    if (auto result = dyn_cast<OpResult>(operand)) {
-      if (isa<tt::SplitOp>(result.getOwner())) {
-        return result.getOwner();
-      }
-    }
-  }
-  return nullptr;
-}
-
 static std::optional<NameLoc> getNameLoc(Operation *op) {
   Location loc = op->getLoc();
   // Check if loc is directly a NameLoc
@@ -439,6 +428,36 @@ static std::optional<NameLoc> getNameLoc(Operation *op) {
     }
   }
   return std::nullopt;
+}
+
+/// Check if two operations have memory side-effects or are separated by
+/// any operations with memory side-effects.
+/// Returns true if either op has memory effects OR there are memory ops between
+/// them.
+static bool hasMemoryEffectsBetween(Operation *op1, Operation *op2) {
+  if (!op1 || !op2 || op1->getBlock() != op2->getBlock())
+    return true; // Conservative: assume memory effects if not in same block
+
+  // Check if either operation has memory side effects
+  if (!isMemoryEffectFree(op1) || !isMemoryEffectFree(op2))
+    return true;
+
+  // Determine which op comes first
+  Operation *earlier = op1;
+  Operation *later = op2;
+  if (later->isBeforeInBlock(earlier))
+    std::swap(earlier, later);
+
+  // Check for any intervening operations with memory side effects
+  for (Operation *cur = earlier->getNextNode(); cur && cur != later;
+       cur = cur->getNextNode()) {
+    if (!isMemoryEffectFree(cur)) {
+      LDBG("Found memory effect op between: " << cur->getName().getStringRef());
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /// Check if two operations have equivalent locations
@@ -738,14 +757,9 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
             matchType = false;
             break;
           }
-          // Check 3: the op is dependent on the same tt.split
-          Operation *opSplit = getSplitOp(op);
-          Operation *refSplit = getSplitOp(refOp);
-          // Are from the same data split op
-          if (opSplit && refSplit && (opSplit == refSplit)) {
-            LDBG("Same split op");
-            matchVar = true;
-          }
+          // Check 3: no memory side effect ops between two ops
+          if (hasMemoryEffectsBetween(op, refOp))
+            matchType = false;
         } else {
           // Check 4: If in different partitions, the op is called from
           // the same source var
