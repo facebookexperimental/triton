@@ -209,41 +209,8 @@ public:
 /// Returns the taskId if op has a single taskId, otherwise, returns -1.
 static int getSingleTaskId(Operation *op) {
   auto asyncTasks = getAsyncTaskIds(op);
-  if (asyncTasks.size() > 1)
+  if (asyncTasks.size() != 1)
     return -1;
-  if (asyncTasks.empty()) {
-    // No async_task_id or ttg.partition
-    // Fall back to find warp_spec op
-
-    Region *curRegion = op->getParentRegion();
-    Region *partitionRegion = nullptr;
-    ttg::WarpSpecializeOp wsOp = nullptr;
-    // walk up to the partition region of the warp_spec op
-    while (curRegion) {
-      Operation *parentOp = curRegion->getParentOp();
-      if (isa<ttg::WarpSpecializePartitionsOp>(parentOp)) {
-        partitionRegion = curRegion;
-      } else if (auto ws = dyn_cast<ttg::WarpSpecializeOp>(parentOp)) {
-        wsOp = ws;
-        break;
-      }
-      curRegion = parentOp->getParentRegion();
-    }
-    if (!partitionRegion || !wsOp) {
-      LDBG("No partition region or warp_spec op found.");
-      return -1;
-    }
-    if (partitionRegion == &wsOp.getDefaultRegion()) {
-      return 0;
-    }
-    auto partitionRegions = wsOp.getPartitionRegions();
-    for (auto [idx, region] : llvm::enumerate(partitionRegions)) {
-      if (partitionRegion == region) {
-        return idx + 1; // partition 1, 2, ... for partition regions
-      }
-    }
-    return -1; // Should not reach here
-  }
   return asyncTasks[0];
 }
 
