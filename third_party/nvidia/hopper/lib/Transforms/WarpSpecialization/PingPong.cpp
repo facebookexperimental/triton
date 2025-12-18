@@ -133,14 +133,45 @@ public:
   }
 
   /// Check if an operation is registered as an expensive operation for the
-  /// given compute capability
+  /// given compute capability. Only considers ops with 2D+ shaped operands.
   bool isExpensiveOp(Operation *op, int computeCapability) const {
     llvm::StringRef opName = op->getName().getStringRef();
     auto it = keyOpNameToType.find(computeCapability);
     if (it == keyOpNameToType.end()) {
       return false;
     }
-    return it->second.count(opName) > 0;
+    if (it->second.count(opName) == 0) {
+      return false;
+    }
+
+    // Check that the operation has at least one operand
+    if (op->getNumOperands() == 0) {
+      return false;
+    }
+
+    // Only consider operations with 2D+ shaped types as expensive
+    Type operandType = op->getOperand(0).getType();
+    int64_t rank = -1;
+
+    if (auto tensorTy = dyn_cast<RankedTensorType>(operandType)) {
+      rank = tensorTy.getRank();
+      LDBG("RankedTensorType, rank is " << rank);
+    } else if (auto memDescTy = dyn_cast<ttg::MemDescType>(operandType)) {
+      rank = memDescTy.getRank();
+      LDBG("MemDescType, rank is" << rank);
+    } else if (auto shapedTy = dyn_cast<ShapedType>(operandType)) {
+      if (shapedTy.hasRank()) {
+        rank = shapedTy.getRank();
+        LDBG("ShapedType, rank is " << rank);
+      }
+    }
+
+    if (rank < 2) {
+      LDBG("Op '" << opName << "' operand is not a multi-dim tensor, skipping");
+      return false;
+    }
+
+    return true;
   }
 
   /// Get the CriticalOpType for an operation (for the given compute capability)
@@ -805,32 +836,6 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   funcOp.walk([&](Operation *op) {
     if (!crManager.isExpensiveOp(op, capability))
       return;
-
-    if (op->getNumOperands() == 0)
-      return;
-
-    // IMPORTANT: Assume operations are expensive only for 2D shaped types
-    Type operandType = op->getOperand(0).getType();
-    int64_t rank = -1;
-
-    if (auto tensorTy = dyn_cast<RankedTensorType>(operandType)) {
-      rank = tensorTy.getRank();
-      LDBG("RankedTensorType: " << tensorTy << ", rank " << rank);
-    } else if (auto memDescTy = dyn_cast<ttg::MemDescType>(operandType)) {
-      rank = memDescTy.getRank();
-      LDBG("MemDescType: " << memDescTy << ", rank " << rank);
-    } else if (auto shapedTy = dyn_cast<ShapedType>(operandType)) {
-      // Fallback for other ShapedTypes
-      if (shapedTy.hasRank()) {
-        rank = shapedTy.getRank();
-        LDBG("ShapedType: " << shapedTy << ", rank " << rank);
-      }
-    }
-
-    if (rank < 2) {
-      LDBG("Operand type is not a 2D shaped type, skipping");
-      return;
-    }
 
     // Check if the expensive op belongs to an existing group
     bool foundGroup = false;
