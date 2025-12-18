@@ -1178,15 +1178,25 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
         "K": K,
         "A_TMEM": A_TMEM,
     }
-    kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
-                                                                     y.stride(1), z, z.stride(0), z.stride(1),
-                                                                     **kern_kwargs)
+    kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        ctas_per_cga=(2, 1, 1),  # TLX way: explicitly set cluster dims
+        **kern_kwargs,
+    )
 
     # verify kernel launch cluster
     assert kernel.metadata.cluster_dims == (2, 1, 1), (
         f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
     assert kernel.metadata.num_ctas == 1, (
-        f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
+        f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("nvgpu.cluster_id") == 1
@@ -1309,9 +1319,19 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         "N": N,
         "K": K,
     }
-    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
-                                                                        y.stride(1), z, z.stride(0), z.stride(1),
-                                                                        **kern_kwargs)
+    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        ctas_per_cga=(2, 1, 1),
+        **kern_kwargs,
+    )
 
     # verify kernel launch cluster
     assert kernel.metadata.cluster_dims == (2, 1, 1), (
@@ -2809,6 +2829,39 @@ def test_async_tasks_warp_group_start_ids(BLOCK_SIZE, device):
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
     pattern_p2 = r"partition2\([^\n]*\)\s+num_warps\(1\)"
     assert re.search(pattern_p2, ttgir, flags=re.DOTALL)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for cluster support")
+def test_ctas_per_cga(device):
+    """Test launching kernels with 2x1x1 ctas_per_cga (CUDA cluster dimensions) in autotune config."""
+
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {"BLOCK_SIZE": 64},
+                num_warps=4,
+            ),
+        ],
+        key=["n_elements"],
+    )
+    @triton.jit
+    def simple_kernel_clustered(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tl.store(x_ptr + offsets, offsets, mask=mask)
+
+    x = torch.zeros(256, dtype=torch.float32, device=device)
+    num_blocks = triton.cdiv(256, 64)
+
+    # Launch with autotuned config containing ctas_per_cga=(2,1,1)
+    kernel = simple_kernel_clustered[(num_blocks, )](x, 256, ctas_per_cga=(2, 1, 1))
+
+    # verify kernel launch cluster
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
 
 
 @pytest.mark.parametrize("BLOCK_SIZE", [64])
