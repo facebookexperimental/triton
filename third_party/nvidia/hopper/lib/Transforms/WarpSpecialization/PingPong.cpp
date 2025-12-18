@@ -47,14 +47,6 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 namespace { // anonymous namespace
-enum class CriticalOpType : uint8_t {
-  /// Operations that cannot be reordered by ptxas (warp_group_dot, etc.)
-  NonReorderable = 0,
-  /// Pure arithmetic operations that can be reordered (exp, exp2, etc.)
-  /// The ops should have memory ops as ping-pong boundary
-  PureArithmetic = 1,
-};
-
 /// Manages expensive operations for critical region identification and
 /// assigns unique barrier IDs to each operation type.
 class CriticalRegionManager {
@@ -71,10 +63,6 @@ public:
 
   /// Indicator of whether we run out of barrier IDs
   bool barrierIdExhausted;
-
-  /// Map from compute capability to a map of critical operation name to its
-  /// operation type
-  llvm::DenseMap<int, llvm::StringMap<CriticalOpType>> keyOpNameToType;
 
   /// Map from pingpong region id to its barrier ID
   llvm::DenseMap<int, std::pair<int, int>> pingpongIdToBarrierId;
@@ -94,99 +82,52 @@ public:
     // Initialize barrier ID to be MIN_BARRIER_ID
     barrierId = MIN_BARRIER_ID;
     barrierIdExhausted = false;
-
-    // Register default expensive operations
-    // Hopper (compute capability 9)
-    registerCriticalOp(
-        90, "ttng.warp_group_dot",
-        CriticalOpType::NonReorderable); // GEMM/Dot operation on Hopper
-    // Blackwell (compute capability 10)
-    // Blackwell increases performance for GEMM which is no longer a bottleneck
-    registerCriticalOp(100, "math.exp",
-                       CriticalOpType::PureArithmetic); // Exponential
-    registerCriticalOp(100, "math.exp2",
-                       CriticalOpType::PureArithmetic); // Exponential base 2
-  }
-
-  /// Register a new expensive operation TYPE and assign it a unique barrier ID.
-  void registerCriticalOp(int computeCapability, const std::string &opTypeName,
-                          CriticalOpType type) {
-    // Initialize the inner map for this compute capability if it doesn't exist
-    if (keyOpNameToType.count(computeCapability) == 0) {
-      keyOpNameToType[computeCapability] = llvm::StringMap<CriticalOpType>();
-    }
-
-    // Ensure the operation type is not already registered for this compute
-    // capability
-    if (keyOpNameToType[computeCapability].count(opTypeName) > 0) {
-      LDBG("Operation type '" << opTypeName
-                              << "' already registered for compute capability "
-                              << computeCapability << ".");
-      return;
-    }
-
-    // Register a new critical operation for this compute capability
-    keyOpNameToType[computeCapability][opTypeName] = type;
-    LDBG("Registered '" << opTypeName
-                        << "' as expensive operation for compute capability "
-                        << computeCapability << ".");
   }
 
   /// Check if an operation is registered as an expensive operation for the
   /// given compute capability. Only considers ops with 2D+ shaped operands.
   bool isExpensiveOp(Operation *op, int computeCapability) const {
     llvm::StringRef opName = op->getName().getStringRef();
-    auto it = keyOpNameToType.find(computeCapability);
-    if (it == keyOpNameToType.end()) {
-      return false;
-    }
-    if (it->second.count(opName) == 0) {
-      return false;
-    }
 
-    // Check that the operation has at least one operand
-    if (op->getNumOperands() == 0) {
-      return false;
-    }
-
-    // Only consider operations with 2D+ shaped types as expensive
-    Type operandType = op->getOperand(0).getType();
-    int64_t rank = -1;
-
-    if (auto tensorTy = dyn_cast<RankedTensorType>(operandType)) {
-      rank = tensorTy.getRank();
-      LDBG("RankedTensorType, rank is " << rank);
-    } else if (auto memDescTy = dyn_cast<ttg::MemDescType>(operandType)) {
-      rank = memDescTy.getRank();
-      LDBG("MemDescType, rank is" << rank);
-    } else if (auto shapedTy = dyn_cast<ShapedType>(operandType)) {
-      if (shapedTy.hasRank()) {
-        rank = shapedTy.getRank();
-        LDBG("ShapedType, rank is " << rank);
+    // Fast path for math.exp/math.exp2: check result rank directly
+    switch (computeCapability) {
+    case 90: // Hopper
+      // On Hopper, wgmma is expensive
+      if (isa<ttng::WarpGroupDotOp>(op)) {
+        // WarpGroupDotOp has its own verifier that checks the tensor shapes
+        // so we can directly put a WarpGroupDotOp into pingpong region
+        LDBG("Encounter a " << opName << " op on Hopper.");
+        return true;
       }
+      break;
+    case 100: // Blackwell
+      // On Blackwell, exp/exp2 uses SFU which can be expensive for multi-dim
+      // tensors Blackwell increases performance for GEMM which is no longer a
+      // bottleneck
+      if (isa<math::ExpOp, math::Exp2Op>(op)) {
+        if (op->getNumResults() == 0)
+          return false;
+        LDBG("Encounter a " << opName << " op on Blackwell.");
+        Type resultType = op->getResult(0).getType();
+        int64_t rank = -1;
+        if (auto tensorTy = dyn_cast<RankedTensorType>(resultType)) {
+          rank = tensorTy.getRank();
+          LDBG("RankedTensorType, rank is " << rank);
+        } else if (auto shapedTy = dyn_cast<ShapedType>(resultType)) {
+          if (shapedTy.hasRank()) {
+            rank = shapedTy.getRank();
+            LDBG("ShapedType, rank is " << rank);
+          }
+        }
+        if (rank > 1)
+          return true;
+        return false;
+      }
+      break;
+    default:
+      break;
     }
-
-    if (rank < 2) {
-      LDBG("Op '" << opName << "' operand is not a multi-dim tensor, skipping");
-      return false;
-    }
-
-    return true;
-  }
-
-  /// Get the CriticalOpType for an operation (for the given compute capability)
-  std::optional<CriticalOpType> getCriticalOpType(Operation *op,
-                                                  int computeCapability) const {
-    llvm::StringRef opName = op->getName().getStringRef();
-    auto it = keyOpNameToType.find(computeCapability);
-    if (it == keyOpNameToType.end()) {
-      return std::nullopt;
-    }
-    auto opIt = it->second.find(opName);
-    if (opIt == it->second.end()) {
-      return std::nullopt;
-    }
-    return opIt->second;
+    return false;
   }
 
   /// Assign barrier IDs for a pingpong region.
@@ -406,6 +347,7 @@ void dumpMemoryEffects(Operation *op) {
   }
 }
 
+/// Find the start boundary op for the critical region.
 Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp,
                        mlir::DominanceInfo &domInfo,
                        mlir::PostDominanceInfo &postDomInfo) {
@@ -414,56 +356,23 @@ Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp,
 }
 
 /// Find the end boundary op for the critical region.
-/// Rules are specific to the CriticalOpType.
-/// For now, we apply the same rule for NonReorderable and PureArithmetic --
-/// the end op is the first op with memory side effect after the critical op.
 Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
                      int computeCapability, mlir::DominanceInfo &domInfo,
                      mlir::PostDominanceInfo &postDomInfo) {
   // Set the end op of this pingpong region to be the first op with memory side
   // effect after this critical op
-  llvm::StringRef opName = keyOp->getName().getStringRef();
-  auto opTypeOpt = crManager.getCriticalOpType(keyOp, computeCapability);
-  if (!opTypeOpt.has_value()) {
-    LDBG("Operation " << opName
-                      << " is not registered as an expensive operation for "
-                         "compute capability "
-                      << computeCapability << ".");
-    return nullptr;
-  }
-  CriticalOpType opType = opTypeOpt.value();
-  if (opType == CriticalOpType::NonReorderable) {
-    LDBG("Operation " << opName << " is not reorderable.");
-    // Find the first op with memory side effect after this critical op
-    Operation *curOp = keyOp;
-    while (curOp) {
-      if (!isMemoryEffectFree(curOp)) {
-        LDBG("Found op with memory effects:");
-        dumpMemoryEffects(curOp);
-        return curOp;
-      }
-      // Set end op to the end of the control flow equivalent region
-      if (!areControlFlowEquivalent(curOp, curOp->getNextNode(), domInfo,
-                                    postDomInfo))
-        return curOp;
-      curOp = curOp->getNextNode();
+  Operation *curOp = keyOp;
+  while (curOp) {
+    if (!isMemoryEffectFree(curOp)) {
+      LDBG("Found op with memory effects:");
+      dumpMemoryEffects(curOp);
+      return curOp;
     }
-  } else if (opType == CriticalOpType::PureArithmetic) {
-    LDBG("Operation " << opName << " is pure arithmetic.");
-    // Find the first op with memory side effect after this critical op
-    Operation *curOp = keyOp;
-    while (curOp) {
-      if (!isMemoryEffectFree(curOp)) {
-        LDBG("Found op with memory effects:");
-        dumpMemoryEffects(curOp);
-        return curOp;
-      }
-      // Set end op to the end of the control flow equivalent region
-      if (!areControlFlowEquivalent(curOp, curOp->getNextNode(), domInfo,
-                                    postDomInfo))
-        return curOp;
-      curOp = curOp->getNextNode();
-    }
+    // Set end op to the end of the control flow equivalent region
+    if (!areControlFlowEquivalent(curOp, curOp->getNextNode(), domInfo,
+                                  postDomInfo))
+      return curOp;
+    curOp = curOp->getNextNode();
   }
   return nullptr;
 }
