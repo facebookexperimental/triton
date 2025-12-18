@@ -25,7 +25,6 @@
 
 #include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Location.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -269,46 +268,29 @@ void getNestedFor(Region *partition,
   });
 }
 
-/// Check if there's a loop operation between two operations in the same block
-static bool hasInterveningLoop(Operation *earlier, Operation *later) {
-  // Walk from earlier to later, checking for loop operations
-  Operation *current = earlier->getNextNode();
-  while (current && current != later) {
-    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(current)) {
-      return true;
-    }
-    current = current->getNextNode();
-  }
-  return false;
-}
+/// Returns true if both operations are in the same block with no intervening
+/// control flow operations. False otherwise.
+bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
+  if (!op1 || !op2)
+    return false;
 
-bool areControlFlowEquivalent(Operation *op1, Operation *op2,
-                              DominanceInfo &domInfo,
-                              PostDominanceInfo &postDomInfo) {
   if (op1->getBlock() != op2->getBlock())
     return false;
 
-  // Check if op1 dominates op2 AND op2 post-dominates op1
-  if (domInfo.dominates(op1, op2) && postDomInfo.postDominates(op2, op1)) {
-    // Additional check: ensure no loop separates them
-    if (hasInterveningLoop(op1, op2)) {
-      LDBG("Ops separated by a loop, not control flow equivalent");
+  // Determine which op comes first
+  Operation *earlier = op1;
+  Operation *later = op2;
+  if (later->isBeforeInBlock(earlier))
+    std::swap(earlier, later);
+
+  // Check for intervening control flow operations
+  for (Operation *cur = earlier->getNextNode(); cur && cur != later;
+       cur = cur->getNextNode()) {
+    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(cur))
       return false;
-    }
-    return true;
   }
 
-  // Check the reverse (op2 dominates op1 AND op1 post-dominates op2)
-  if (domInfo.dominates(op2, op1) && postDomInfo.postDominates(op1, op2)) {
-    // Additional check: ensure no loop separates them
-    if (hasInterveningLoop(op2, op1)) {
-      LDBG("Ops separated by a loop, not control flow equivalent");
-      return false;
-    }
-    return true;
-  }
-
-  return false;
+  return true;
 }
 
 /// Dump memory effects of an operation for debugging
@@ -348,17 +330,13 @@ void dumpMemoryEffects(Operation *op) {
 }
 
 /// Find the start boundary op for the critical region.
-Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp,
-                       mlir::DominanceInfo &domInfo,
-                       mlir::PostDominanceInfo &postDomInfo) {
+Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp) {
   // Set the start op of this pingpong region to be the critical op
   return keyOp;
 }
 
 /// Find the end boundary op for the critical region.
-Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
-                     int computeCapability, mlir::DominanceInfo &domInfo,
-                     mlir::PostDominanceInfo &postDomInfo) {
+Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp) {
   // Set the end op of this pingpong region to be the first op with memory side
   // effect after this critical op
   Operation *curOp = keyOp;
@@ -369,8 +347,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
       return curOp;
     }
     // Set end op to the end of the control flow equivalent region
-    if (!areControlFlowEquivalent(curOp, curOp->getNextNode(), domInfo,
-                                  postDomInfo))
+    if (!areControlFlowEquivalent(curOp, curOp->getNextNode()))
       return curOp;
     curOp = curOp->getNextNode();
   }
@@ -505,10 +482,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
   assert(funcOp != nullptr);
 
-  // Construct dominance info from the function
-  mlir::DominanceInfo domInfo(funcOp);
-  mlir::PostDominanceInfo postDomInfo(funcOp);
-
   // Store loops and loop depths of each partition.
   SmallVector<DenseMap<unsigned, SmallVector<Operation *>>> partitionLoopDepths;
   SmallVector<Region *> computeRegions;
@@ -582,9 +555,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     // Find the start and end ops for each key operation in the pingpong region
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
-      Operation *startOp = findStartOp(crManager, keyOp, domInfo, postDomInfo);
-      Operation *endOp =
-          findEndOp(crManager, keyOp, computeCapability, domInfo, postDomInfo);
+      Operation *startOp = findStartOp(crManager, keyOp);
+      Operation *endOp = findEndOp(crManager, keyOp);
       startOps[partitionId].push_back(startOp);
       endOps[partitionId].push_back(endOp);
       // Look up the number of warps for each partition
@@ -733,10 +705,6 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   // Initialize the critical region manager
   CriticalRegionManager crManager;
 
-  // Initialize the dominance and post-dominance info
-  mlir::DominanceInfo domInfo(funcOp);
-  mlir::PostDominanceInfo postDomInfo(funcOp);
-
   // A list of expensive op groups.
   // Each group contains ops at the same pingpong region.
   llvm::SmallVector<llvm::SmallVector<Operation *, 4>> expensiveOps;
@@ -766,7 +734,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
         if (opTaskId == refTaskId) {
           // Check 2: If in the same partition, they should be control Flow
           // Equivalent
-          if (!areControlFlowEquivalent(op, refOp, domInfo, postDomInfo)) {
+          if (!areControlFlowEquivalent(op, refOp)) {
             matchType = false;
             break;
           }
