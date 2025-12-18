@@ -369,34 +369,6 @@ Operation *unionOfEndOps(llvm::ArrayRef<Operation *> endOps) {
   return latestOp;
 }
 
-static std::optional<NameLoc> getNameLoc(Operation *op) {
-  Location loc = op->getLoc();
-  // Check if loc is directly a NameLoc
-  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
-    return nameLoc;
-  }
-  // Check if loc is a CallSiteLoc with a NameLoc callee
-  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
-    if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
-      return nameLoc;
-    }
-  }
-  // Check if loc is a FusedLoc and extract NameLoc from it
-  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
-    for (Location subLoc : fusedLoc.getLocations()) {
-      if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
-        return nameLoc;
-      }
-      if (auto callSiteLoc = dyn_cast<CallSiteLoc>(subLoc)) {
-        if (auto nameLoc = dyn_cast<NameLoc>(callSiteLoc.getCallee())) {
-          return nameLoc;
-        }
-      }
-    }
-  }
-  return std::nullopt;
-}
-
 /// Check if two operations have memory side-effects or are separated by
 /// any operations with memory side-effects.
 /// Returns true if either op has memory effects OR there are memory ops between
@@ -425,38 +397,6 @@ static bool hasMemoryEffectsBetween(Operation *op1, Operation *op2) {
   }
 
   return false;
-}
-
-/// Check if two operations have equivalent locations
-/// Returns true if they have matching NameLoc or equivalent raw Location
-static bool areLocationsEquivalent(Operation *op1, Operation *op2) {
-  // First, try to compare using NameLoc
-  std::optional<NameLoc> nameLoc1 = getNameLoc(op1);
-  std::optional<NameLoc> nameLoc2 = getNameLoc(op2);
-
-  if (nameLoc1.has_value() && nameLoc2.has_value()) {
-    LDBG("op1 nameLoc: " << nameLoc1.value()
-                         << ", op2 nameLoc: " << nameLoc2.value());
-    return nameLoc1.value() == nameLoc2.value();
-  }
-
-  // Fallback: compare raw Location objects for equivalence
-  Location loc1 = op1->getLoc();
-  Location loc2 = op2->getLoc();
-
-  // FileLineColLoc comparison
-  if (auto fileLoc1 = dyn_cast<FileLineColLoc>(loc1)) {
-    if (auto fileLoc2 = dyn_cast<FileLineColLoc>(loc2)) {
-      LDBG("Comparing FileLineColLoc: " << fileLoc1 << " vs " << fileLoc2);
-      return fileLoc1.getFilename() == fileLoc2.getFilename() &&
-             fileLoc1.getLine() == fileLoc2.getLine() &&
-             fileLoc1.getColumn() == fileLoc2.getColumn();
-    }
-  }
-
-  // Direct Location comparison (works for simple cases)
-  LDBG("Comparing raw locations: " << loc1 << " vs " << loc2);
-  return loc1 == loc2;
 }
 
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
@@ -704,7 +644,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     bool foundGroup = false;
     for (auto &group : expensiveOps) {
       bool matchType = true;
-      bool matchVar = false;
+      // bool matchVar = false;
       for (auto &refOp : group) {
         // Check 1: Same Operation Name
         if (op->getName() != refOp->getName()) {
@@ -712,31 +652,24 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
           break;
         }
 
+        // Check 2: Same block with no intervening control flow ops
+        if (!areControlFlowEquivalent(op, refOp)) {
+          matchType = false;
+          break;
+        }
+
+        // Check 3: no memory side effect ops between two ops
         int opTaskId = getSingleTaskId(op);
         int refTaskId = getSingleTaskId(refOp);
         if (opTaskId == -1 || refTaskId == -1) {
           continue;
         }
         if (opTaskId == refTaskId) {
-          // Check 2: If in the same partition, they should be control Flow
-          // Equivalent
-          if (!areControlFlowEquivalent(op, refOp)) {
-            matchType = false;
-            break;
-          }
-          // Check 3: no memory side effect ops between two ops
           if (hasMemoryEffectsBetween(op, refOp))
             matchType = false;
-        } else {
-          // Check 4: If in different partitions, the op is called from
-          // the same source var
-          if (areLocationsEquivalent(op, refOp)) {
-            LDBG("Same source var (locations equivalent)");
-            matchVar = true;
-          }
         }
       }
-      foundGroup = matchType && matchVar;
+      foundGroup = matchType;
       if (foundGroup) {
         LDBG("Insert to ref op group " << group[0]->getName().getStringRef());
         group.push_back(op);
