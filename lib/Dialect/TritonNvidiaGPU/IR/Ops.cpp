@@ -25,6 +25,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -629,6 +630,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
   if (type.getEncoding()) {
+    // Skip verification for placeholder layouts - they will be resolved later
+    if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
+      return success();
     auto enc = dyn_cast<DistributedEncodingTrait>(type.getEncoding());
     if (!enc) {
       return op->emitOpError(regName)

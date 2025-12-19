@@ -1,11 +1,12 @@
+from typing import Optional, overload, Tuple
+
 import triton.language.core as tl
+from triton._C.libtriton import ir
 
 from . import types as tlx
-from .utility import cuda_parse_arch
 from .mma_ops import require_nv_mma_shared_layout
 from .types import storage_kind
-from typing import Optional, Tuple, overload
-from triton._C.libtriton import ir
+from .utility import cuda_parse_arch
 
 
 def _assert_blackwell_for_tmem(arch):
@@ -17,13 +18,7 @@ def _create_tmem_compatible_tensor_layout_encoding(
     builder,
     tensor: tlx.buffered_tensor,
 ):
-    module_num_warps = builder.options.num_warps
-    assert module_num_warps > 0, "tmem load requires num_warps > 0"
-    num_ctas = builder.options.num_ctas
-    assert num_ctas > 0, "tmem load requires num_ctas > 0"
-    threads_per_warp = 32
-    return builder.make_default_tmem_compatible_tensor_layout_encoding(list(tensor.shape), tensor.dtype.to_ir(builder),
-                                                                       module_num_warps, threads_per_warp, num_ctas)
+    return builder.make_dummy_register_layout_attr(list(tensor.shape), tensor.dtype.to_ir(builder), True)
 
 
 @tl.builtin
@@ -201,17 +196,23 @@ def remote_view(
     :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
     """
     assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
-    assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
+    assert (local_allocated_buffer.type.storage == storage_kind.smem), "remote_view requires local smem as input"
     if isinstance(remote_cta_rank, tl.constexpr) or isinstance(remote_cta_rank, int):
         remote_cta_rank_handle = _semantic._convert_elem_to_ir_value(tl._unwrap_if_constexpr(remote_cta_rank),
                                                                      require_i64=False)
     else:
-        assert isinstance(remote_cta_rank, tl.tensor), (
-            f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)")
+        assert isinstance(
+            remote_cta_rank, tl.tensor
+        ), f"`remote_cta_rank` is in type {type(remote_cta_rank)} (must be either `tl.tensor` or `tl.constexpr`)"
         remote_cta_rank_handle = remote_cta_rank.handle
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
                                                                       remote_cta_rank_handle)
-    return tlx.mbarrier(remote_buf_handle, 0, local_allocated_buffer.type.layout, storage_kind.smemCluster)
+    return tlx.mbarrier(
+        remote_buf_handle,
+        0,
+        local_allocated_buffer.type.layout,
+        storage_kind.smemCluster,
+    )
 
 
 @tl.builtin
@@ -270,7 +271,7 @@ def subslice(
     :param size: the size of the subslice, in terms of number of elements
     """
     # this is for TMEM subslice
-    assert local_allocated_buffer.type.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
+    assert (local_allocated_buffer.type.storage == tlx.storage_kind.tmem), "subslice is only supported for tmem"
     assert isinstance(local_allocated_buffer.type, tl.block_type), "subslice src is not block type"
     subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]] + [size]
     return tlx.buffered_tensor(
@@ -385,7 +386,7 @@ def local_load(
     storage = src.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
-        tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
+        tmem_compatible_layout_encoding = (_create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src))
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
         output = _semantic.builder.create_release_layout(load_handle)
@@ -407,7 +408,7 @@ def local_store(
     storage = dst.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
-        tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, dst)
+        tmem_compatible_layout_encoding = (_create_tmem_compatible_tensor_layout_encoding(_semantic.builder, dst))
         src_handle = _semantic.builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
@@ -436,16 +437,20 @@ def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic
 
 
 @tl.builtin
-def local_reinterpret(src: tlx.buffered_tensor, dtype: tl.dtype, shape: list[tl.constexpr] = None,
-                      _semantic=None) -> tlx.buffered_tensor:
+def local_reinterpret(
+    src: tlx.buffered_tensor,
+    dtype: tl.dtype,
+    shape: list[tl.constexpr] = None,
+    _semantic=None,
+) -> tlx.buffered_tensor:
     """
     Reinterpret the dtype and shape of a buffered tensor. Layout is preserved.
     """
     if shape is None:
         shape = src.type.shape
     else:
-        assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
-            "TLX local_reinterpret with reshaping only supports SMEM")
+        assert (isinstance(src, tlx.buffered_tensor) and src.type.storage
+                == tlx.storage_kind.smem), "TLX local_reinterpret with reshaping only supports SMEM"
 
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
                                                                               dtype.to_ir(_semantic.builder), shape)
@@ -481,8 +486,16 @@ def async_descriptor_load(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
-    _semantic.builder.create_async_TMA_load(desc.handle, offsets, barrier.handle, pred_handle, result_handle, cache,
-                                            eviction, False)
+    _semantic.builder.create_async_TMA_load(
+        desc.handle,
+        offsets,
+        barrier.handle,
+        pred_handle,
+        result_handle,
+        cache,
+        eviction,
+        False,
+    )
 
 
 @tl.builtin
@@ -655,9 +668,14 @@ def make_tensor_descriptor(
             padding,
         )
     else:
-        handle = _semantic.builder.create_make_tensor_descriptor(base_handle, [s.handle for s in shape],
-                                                                 [s.handle for s in strides], block_shape,
-                                                                 is_signed_int, padding)
+        handle = _semantic.builder.create_make_tensor_descriptor(
+            base_handle,
+            [s.handle for s in shape],
+            [s.handle for s in strides],
+            block_shape,
+            is_signed_int,
+            padding,
+        )
     return tl.tensor_descriptor(handle, shape, strides, block_type)
 
 
