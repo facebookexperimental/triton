@@ -453,7 +453,7 @@ def grouped_matmul_tlx_kernel(
                         # In Pair CTA mode, if there're in fact odd number of tiles along M dim, we extend it by
                         # "one virtual tile" for the non-leader CTA of the last pair. This CTA loads operand B,
                         # do cross-CTA synchronization like usual, but just don't write to result back to SMEM
-                        if PAIR_CTA and offs_cm < gm:
+                        if (PAIR_CTA and offs_cm < gm) or not PAIR_CTA:
                             for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                                 acc_slice = tlx.local_slice(
                                     acc_tmem,
