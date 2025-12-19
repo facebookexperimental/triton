@@ -64,4 +64,28 @@ def TLXRewriteLocalAlias : Pass<"tlx-rewrite-local-alias", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 
 }
+
+def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir::ModuleOp"> {
+  let summary = "Resolve placeholder layouts after function inlining";
+
+  let description = [{
+    This pass resolves placeholder layout encodings that were generated during
+    initial lowering. After function inlining, we have more context to determine
+    the correct layouts for TMEM loads/stores and other TLX operations.
+
+    The pass replaces:
+    - DummyTMemLayoutAttr -> TensorMemoryEncodingAttr
+    - DummySMemLayoutAttr -> SwizzledSharedEncodingAttr (1D) or NvMmaSharedEncodingAttr (2D+)
+    - DummyRegisterLayoutAttr -> BlockedEncodingAttr
+
+    Each resolved layout uses the same default values as the corresponding
+    Python make_default() methods.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 #endif // TRITON_TLX_PASSES

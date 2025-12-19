@@ -1,8 +1,8 @@
 import triton.language.core as tl
 
 from . import types as tlx
+from .barrier import alloc_barriers, barrier_arrive, barrier_expect_bytes, barrier_wait
 from .mem_ops import local_view
-from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
 
 # Blackwell-only
 
@@ -12,16 +12,9 @@ def _alloc_clc_responses(
     num_responses: tl.constexpr,
     _semantic=None,
 ) -> tlx.clc_response:
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
-    layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
-        layout.vectorSize,
-        layout.perPhase,
-        layout.maxPhase,
-        layout.order,
-        layout.numCTAsPerCGA,
-        layout.numCTASplit,
-        layout.numCTAOrder,
-    )
+    # Use placeholder layout to be resolved after inlining
+    layout = tlx.DummySMemLayoutEncoding([1], tl.int64)
+    layout_handle = layout.to_ir(_semantic.builder)
     return tlx.clc_response(
         _semantic.builder.create_alloc_clc_responses(num_responses, layout_handle),
         num_responses,
@@ -66,11 +59,18 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 @tl.builtin
 def clc_producer(context, k, p_producer, _semantic=None):
     # acquire
-    barrier_wait(local_view(context._clc_mbars_empty, k, _semantic=_semantic), p_producer, _semantic=_semantic)
+    barrier_wait(
+        local_view(context._clc_mbars_empty, k, _semantic=_semantic),
+        p_producer,
+        _semantic=_semantic,
+    )
 
     # commit
-    barrier_expect_bytes(local_view(context._clc_mbars_full, k, _semantic=_semantic), tl.constexpr(16),
-                         _semantic=_semantic)
+    barrier_expect_bytes(
+        local_view(context._clc_mbars_full, k, _semantic=_semantic),
+        tl.constexpr(16),
+        _semantic=_semantic,
+    )
     _clc_issue(
         local_view(context._clc_responses, k, _semantic=_semantic),
         local_view(context._clc_mbars_full, k, _semantic=_semantic),
@@ -81,13 +81,20 @@ def clc_producer(context, k, p_producer, _semantic=None):
 @tl.builtin
 def clc_consumer(context, k, p_consumer, _semantic=None):
     # wait
-    barrier_wait(local_view(context._clc_mbars_full, k, _semantic=_semantic), p_consumer, _semantic=_semantic)
+    barrier_wait(
+        local_view(context._clc_mbars_full, k, _semantic=_semantic),
+        p_consumer,
+        _semantic=_semantic,
+    )
 
     # extract
     stolen_tile_id = _clc_query(local_view(context._clc_responses, k, _semantic=_semantic), _semantic=_semantic)
 
     # release
-    barrier_arrive(local_view(context._clc_mbars_empty, k, _semantic=_semantic), _semantic=_semantic)
+    barrier_arrive(
+        local_view(context._clc_mbars_empty, k, _semantic=_semantic),
+        _semantic=_semantic,
+    )
 
     # return
     return stolen_tile_id

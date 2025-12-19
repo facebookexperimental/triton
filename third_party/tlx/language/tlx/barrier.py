@@ -1,4 +1,5 @@
 import triton.language.core as tl
+
 from . import types as tlx
 from .utility import is_hip
 
@@ -17,16 +18,9 @@ def alloc_barriers(
     - `arrive_counts`: The number of threads that need to arrive at the barrier before it can be released.
     """
 
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
-    layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
-        layout.vectorSize,
-        layout.perPhase,
-        layout.maxPhase,
-        layout.order,
-        layout.numCTAsPerCGA,
-        layout.numCTASplit,
-        layout.numCTAOrder,
-    )
+    # Use placeholder layout to be resolved after inlining
+    layout = tlx.DummySMemLayoutEncoding([1], tl.int64)
+    layout_handle = layout.to_ir(_semantic.builder)
     return tlx.mbarrier(
         _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count.value, layout_handle),
         num_barriers,
@@ -72,9 +66,11 @@ def barrier_wait(
     if isinstance(phase, tl.tensor):
         _semantic.builder.create_barrier_wait(bar.handle, phase.handle, pred_handle)
     elif isinstance(phase, tl.constexpr):
-        _semantic.builder.create_barrier_wait(bar.handle,
-                                              _semantic._convert_elem_to_ir_value(phase.value, require_i64=False),
-                                              pred_handle)
+        _semantic.builder.create_barrier_wait(
+            bar.handle,
+            _semantic._convert_elem_to_ir_value(phase.value, require_i64=False),
+            pred_handle,
+        )
     else:
         raise RuntimeError(f"`phase` is in type {type(phase)} (must be either `tl.tensor` or `tl.constexpr`)")
 
@@ -89,7 +85,7 @@ def barrier_arrive(
     Perform the arrive operation on an mbarrier
     """
 
-    assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
+    assert (arrive_count.value == 1 or not is_hip()), "AMD backend currently only supports arrive_count == 1"
 
     # TODO. add validator logics
     _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)

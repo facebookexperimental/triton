@@ -1,9 +1,9 @@
-import triton.language.core as tl
-from triton.language.core import _aggregate as aggregate
-from typing import Optional, List, Tuple
 import enum
-from abc import abstractmethod
+from typing import List, Optional, Tuple
+
+import triton.language.core as tl
 from triton._C.libtriton import ir
+from triton.language.core import _aggregate as aggregate
 
 
 class layout_encoding:
@@ -18,185 +18,122 @@ class layout_encoding:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
 
-class shared_layout_encoding(layout_encoding):
-
-    def __init__(self):
-        super().__init__()
-        pass
-
+class DummyTMemLayoutEncoding(layout_encoding):
     """
-    Create a new layout object that is a permutation of the current layout.
+    Placeholder layout for Tensor Memory (TMEM).
+    Will be resolved to a concrete TensorMemoryEncodingAttr after inlining.
     """
 
-    @abstractmethod
-    def make_permute(self, dims):
-        raise NotImplementedError(f"{self.__class__.__name__}.make_permute() must be overridden in subclasses")
-
-    def to_ir(self, builder: ir.builder) -> None:
-        raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
-
-
-class swizzled_shared_layout_encoding(shared_layout_encoding):
-
-    def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
-        super().__init__()
-        self.vectorSize = vectorSize
-        self.perPhase = perPhase
-        self.maxPhase = maxPhase
-        self.order = order
-        self.numCTAs = numCTAs
-        self.numCTAsPerCGA = numCTAsPerCGA
-        self.numCTASplit = numCTASplit
-        self.numCTAOrder = numCTAOrder
-
-    """
-    Make a default non-swizzled shared layout encoding.
-    """
-
-    @classmethod
-    def make_default(cls, rank):
-        return cls(
-            vectorSize=1,
-            perPhase=1,
-            maxPhase=1,
-            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
-            numCTAs=[1] * rank,
-            numCTAsPerCGA=[1] * rank,
-            numCTASplit=[1] * rank,
-            numCTAOrder=[1] * rank,
-        )
-
-    """
-    Create a new layout that is a permutation of the given layout.
-    """
-
-    def make_permute(self, dims):
-        permuted_order = tuple(self.order[d] for d in dims)
-        return swizzled_shared_layout_encoding(
-            self.vectorSize,
-            self.perPhase,
-            self.maxPhase,
-            permuted_order,
-            self.numCTAs,
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
-        )
-
-    def to_ir(self, builder: ir.builder) -> None:
-        return builder.make_swizzled_shared_encoding_attr(
-            self.vectorSize,
-            self.perPhase,
-            self.maxPhase,
-            self.order,
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
-        )
-
-
-class tensor_memory_layout_encoding(shared_layout_encoding):
-
-    def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
-        super().__init__()
-        self.blockM = blockM
-        self.blockN = blockN
-        self.unpacked = unpacked
-        self.CTASplitM = CTASplitM
-        self.CTASplitN = CTASplitN
-
-    """
-    Make a default tensor memory layout encoding.
-    """
-
-    @classmethod
-    def make_default(cls, shape):
-        return cls(
-            blockM=shape[0],
-            blockN=shape[1],
-            unpacked=True,
-            CTASplitM=1,
-            CTASplitN=1,
-        )
-
-    def to_ir(self, builder: ir.builder) -> None:
-        return builder.make_tensor_memory_encoding_attr(
-            self.blockM,
-            self.blockN,
-            self.unpacked,
-            self.CTASplitM,
-            self.CTASplitN,
-        )
-
-
-class nv_mma_shared_layout_encoding(shared_layout_encoding):
-
-    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded, swizzled):
+    # TODO: Remove `unpacked` parameter and infer it in the C++ resolution pass
+    # based on usage context (e.g., whether the tensor is used as an MMA operand or accumulator).
+    def __init__(self, shape: List[int], element_type: tl.dtype, unpacked: bool = True):
         super().__init__()
         self.shape = shape
-        self.order = order
-        self.elemType = elemType
-        self.numCTAsPerCGA = numCTAsPerCGA
-        self.numCTASplit = numCTASplit
-        self.numCTAOrder = numCTAOrder
-        self.fp4Padded = fp4Padded
-        self.swizzled = swizzled
+        self.element_type = element_type
+        self.unpacked = unpacked
 
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_tmem_layout_attr(self.shape, self.element_type.to_ir(builder), self.unpacked)
+
+    def __repr__(self):
+        return f"DummyTMemLayoutEncoding<{self.shape}, {self.element_type}, unpacked={self.unpacked}>"
+
+
+class DummySMemLayoutEncoding(layout_encoding):
     """
-    Make a default NVMMA shared layout encoding.
+    Placeholder layout for Shared Memory (SMEM).
+    Will be resolved to swizzled_shared_layout_encoding or
+    nv_mma_shared_layout_encoding after inlining.
     """
 
-    @classmethod
-    def make_default(cls, shape, elemType):
-        rank = len(shape)
-        return cls(
-            shape=shape,
-            order=list(reversed(range(rank))),  # e.g, [1, 0] as a row-major order
-            elemType=elemType,
-            numCTAsPerCGA=[1] * rank,
-            numCTASplit=[1] * rank,
-            numCTAOrder=[1] * rank,
-            fp4Padded=False,
-            swizzled=True,
-        )
+    def __init__(self, shape: List[int], element_type: tl.dtype):
+        super().__init__()
+        self.shape = shape
+        self.element_type = element_type
 
-    """
-    Create a new layout that is a permutation of the given layout.
-    """
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_smem_layout_attr(self.shape, self.element_type.to_ir(builder))
 
     def make_permute(self, dims):
-        permuted_order = tuple(self.order[d] for d in dims)
-        return nv_mma_shared_layout_encoding(
+        """Create a permuted version of this placeholder."""
+        permuted_shape = [self.shape[d] for d in dims]
+        return DummySMemLayoutEncoding(permuted_shape, self.element_type)
+
+    def __repr__(self):
+        return f"DummySMemLayoutEncoding<{self.shape}, {self.element_type}>"
+
+
+class DummyRegisterLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for register-distributed tensors.
+    Will be resolved to BlockedEncodingAttr, MmaEncodingAttr,
+    DotOperandEncodingAttr, etc. after inlining.
+    """
+
+    def __init__(self, shape: List[int], element_type: tl.dtype):
+        super().__init__()
+        self.shape = shape
+        self.element_type = element_type
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_register_layout_attr(self.shape, self.element_type.to_ir(builder))
+
+    def __repr__(self):
+        return f"DummyRegisterLayoutEncoding<{self.shape}, {self.element_type}>"
+
+
+class DummyMMALayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for MMA (Matrix Multiply-Accumulate) operations.
+    Will be resolved to NvidiaMmaEncodingAttr after inlining.
+    Used for Hopper MMA accumulator layouts (version 3).
+    """
+
+    def __init__(
+        self,
+        shape: List[int],
+        element_type: tl.dtype,
+        operand_a_element_type: tl.dtype,
+    ):
+        super().__init__()
+        self.shape = shape
+        self.element_type = element_type
+        self.operand_a_element_type = operand_a_element_type
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_mma_layout_attr(
             self.shape,
-            permuted_order,
-            self.elemType,
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
-            self.fp4Padded,
-            self.swizzled,
+            self.element_type.to_ir(builder),
+            self.operand_a_element_type.to_ir(builder),
         )
 
-    def to_ir(self, builder: ir.builder) -> None:
-        return builder.make_nv_mma_shared_encoding_attr(
-            [int(x) for x in self.shape],
-            self.order,
-            self.elemType.to_ir(builder),
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
-            self.fp4Padded,
-            self.swizzled,
+    def __repr__(self):
+        return f"DummyMMALayoutEncoding<{self.shape}, {self.element_type}>"
+
+
+class DummyDotOperandLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for dot operand encodings.
+    Will be resolved to DotOperandEncodingAttr after inlining.
+    Requires a parent MMA layout to be resolved first.
+    """
+
+    def __init__(self, shape: List[int], element_type: tl.dtype, op_idx: int,  # 0 for A, 1 for B
+                 ):
+        super().__init__()
+        self.shape = shape
+        self.element_type = element_type
+        self.op_idx = op_idx
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_dot_operand_layout_attr(
+            self.shape,
+            self.element_type.to_ir(builder),
+            self.op_idx,
         )
 
-    def __str__(self) -> str:
-        return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
-
-    def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
-                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
-                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
-                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
+    def __repr__(self):
+        return f"DummyDotOperandLayoutEncoding<{self.shape}, opIdx={self.op_idx}>"
 
 
 class storage_kind(enum.Enum):
@@ -233,7 +170,7 @@ class buffered_tensor(tl.base_value):
         shape: List,
         num: int,
         storage: storage_kind,
-        layout: Optional[shared_layout_encoding] = None,
+        layout: Optional[DummySMemLayoutEncoding] = None,
     ):
         """Not called by user code."""
         super().__init__()
@@ -268,7 +205,7 @@ class buffered_tensor_type(tl.block_type):
         shape: List,
         num: int,
         storage: storage_kind,
-        layout: Optional[shared_layout_encoding] = None,
+        layout: Optional[DummySMemLayoutEncoding] = None,
     ):
         super().__init__(element_ty, shape)
         # Storage
@@ -279,7 +216,14 @@ class buffered_tensor_type(tl.block_type):
         self.num = num
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
-        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.num, self.storage, self.layout)
+        value = buffered_tensor(
+            handles[cursor],
+            self.scalar,
+            self.shape,
+            self.num,
+            self.storage,
+            self.layout,
+        )
         return value, cursor + 1
 
     def mangle(self) -> str:
@@ -323,11 +267,11 @@ class mbarrier(tl.base_value):
         self,
         handle,
         num: int,
-        layout: Optional[swizzled_shared_layout_encoding],
+        layout: Optional[DummySMemLayoutEncoding],
         storage: storage_kind = storage_kind.smem,
     ):
-        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
-            "mbarrier requires storage to be smem or smemCluster")
+        assert (storage == storage_kind.smem
+                or storage == storage_kind.smemCluster), "mbarrier requires storage to be smem or smemCluster"
         self.handle = handle
         self.type = mbarrier_type(num, layout, storage)
         self.num = num
@@ -345,7 +289,7 @@ class mbarrier(tl.base_value):
 
 class mbarrier_type(buffered_tensor_type):
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage):
+    def __init__(self, num: int, layout: Optional[DummySMemLayoutEncoding], storage):
         super().__init__(tl.int64, [1], num, storage, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
@@ -370,7 +314,7 @@ class clc_response(tl.base_value):
     Define a CLC response object
     """
 
-    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+    def __init__(self, handle, num: int, layout: Optional[DummySMemLayoutEncoding]):
         self.handle = handle
         self.type = clc_response_type(num, layout)
         self.num = num
@@ -391,7 +335,7 @@ class clc_response_type(buffered_tensor_type):
     # since we have two concrete use cases now (mbarrier and clc_response)
     # both of which are opaque objects with fixed size
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+    def __init__(self, num: int, layout: Optional[DummySMemLayoutEncoding]):
         super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
@@ -510,7 +454,7 @@ class tensor_descriptor_ptr_type(tl.pointer_type):
         self.size = size
 
     def __eq__(self, other):
-        return isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size
+        return (isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size)
 
     def __repr__(self) -> str:
         return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"

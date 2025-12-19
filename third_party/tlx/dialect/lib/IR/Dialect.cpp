@@ -1,6 +1,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 // clang-format off
 #include "IR/Dialect.h"
