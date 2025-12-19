@@ -21,7 +21,7 @@ def local_alloc(
     num: tl.constexpr,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     reuse: Optional[tlx.buffered_tensor] = None,
-    layout: Optional[tlx.shared_layout_encoding] = None,
+    layout: Optional[tlx.DummySMemLayoutEncoding] = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """

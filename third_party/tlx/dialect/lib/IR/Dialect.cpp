@@ -11,6 +11,10 @@
 using namespace mlir;
 using namespace mlir::triton::tlx;
 
+//===----------------------------------------------------------------------===//
+// Dialect Initialization
+//===----------------------------------------------------------------------===//
+
 void mlir::triton::tlx::TLXDialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST

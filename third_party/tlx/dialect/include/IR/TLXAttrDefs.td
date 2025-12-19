@@ -38,7 +38,7 @@ def TLX_DummyTMemLayoutAttr : TLX_Attr<"DummyTMemLayout", []> {
     "bool":$unpacked
   );
 
-  let assemblyFormat = "`<` $shape `,` $elementType `,` `unpacked` `=` $unpacked `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `,` $unpacked `>`";
 }
 
 def TLX_DummySMemLayoutAttr : TLX_Attr<"DummySMemLayout", []> {
@@ -63,7 +63,7 @@ def TLX_DummySMemLayoutAttr : TLX_Attr<"DummySMemLayout", []> {
     "Type":$elementType
   );
 
-  let assemblyFormat = "`<` $shape `,` $elementType `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `>`";
 }
 
 def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
@@ -90,7 +90,7 @@ def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
     "Type":$elementType
   );
 
-  let assemblyFormat = "`<` $shape `,` $elementType `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `>`";
 }
 
 def TLX_DummyMMALayoutAttr : TLX_Attr<"DummyMMALayout", []> {
@@ -118,7 +118,7 @@ def TLX_DummyMMALayoutAttr : TLX_Attr<"DummyMMALayout", []> {
     "Type":$operandAElementType
   );
 
-  let assemblyFormat = "`<` $shape `,` $elementType `,` `opA` `=` $operandAElementType `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `,` $operandAElementType `>`";
 }
 
 def TLX_DummyDotOperandLayoutAttr : TLX_Attr<"DummyDotOperandLayout", []> {
@@ -145,7 +145,7 @@ def TLX_DummyDotOperandLayoutAttr : TLX_Attr<"DummyDotOperandLayout", []> {
     "unsigned":$opIdx
   );
 
-  let assemblyFormat = "`<` $shape `,` $elementType `,` `opIdx` `=` $opIdx `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `,` $opIdx `>`";
 }
 
 #endif // PROTON_ATTRDEFS
