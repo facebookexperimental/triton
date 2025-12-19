@@ -121,9 +121,9 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type elementType) -> Attribute {
-             return tlx::DummyRegisterLayoutAttr::get(self.getContext(), shape,
-                                                      elementType);
+              Type elementType, bool tmemCompatible) -> Attribute {
+             return tlx::DummyRegisterLayoutAttr::get(
+                 self.getContext(), shape, elementType, tmemCompatible);
            })
       .def("make_dummy_mma_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,

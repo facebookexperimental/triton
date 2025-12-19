@@ -354,9 +354,9 @@ def local_load(
     storage = src.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
-        # Create a dummy register layout to be resolved after inlining
+        # Create a TMEM-compatible register layout to be resolved after inlining
         tmem_compatible_layout_encoding = (_semantic.builder.make_dummy_register_layout_attr(
-            list(src.shape), src.dtype.to_ir(_semantic.builder)))
+            list(src.shape), src.dtype.to_ir(_semantic.builder), True))
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
         output = _semantic.builder.create_release_layout(load_handle)
@@ -378,9 +378,9 @@ def local_store(
     storage = dst.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
-        # Create a dummy register layout to be resolved after inlining
+        # Create a TMEM-compatible register layout to be resolved after inlining
         tmem_compatible_layout_encoding = (_semantic.builder.make_dummy_register_layout_attr(
-            list(dst.shape), dst.dtype.to_ir(_semantic.builder)))
+            list(dst.shape), dst.dtype.to_ir(_semantic.builder), True))
         src_handle = _semantic.builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 

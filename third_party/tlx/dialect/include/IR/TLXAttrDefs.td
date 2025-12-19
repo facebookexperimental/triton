@@ -77,20 +77,23 @@ def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
 
     After function inlining, a pass will resolve this to a concrete layout such as:
     - BlockedEncodingAttr (default blocked distribution)
+    - TMEM-compatible BlockedEncodingAttr (for tensors loaded from TMEM)
     - MmaEncodingAttr (for MMA operation results)
     - DotOperandEncodingAttr (for dot operation inputs)
 
     Parameters:
     - shape: The shape of the tensor
     - elementType: The element type
+    - tmemCompatible: If true, create a layout compatible with TMEM load/store
   }];
 
   let parameters = (ins
     ArrayRefParameter<"int64_t">:$shape,
-    "Type":$elementType
+    "Type":$elementType,
+    "bool":$tmemCompatible
   );
 
-  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `,` $tmemCompatible `>`";
 }
 
 def TLX_DummyMMALayoutAttr : TLX_Attr<"DummyMMALayout", []> {

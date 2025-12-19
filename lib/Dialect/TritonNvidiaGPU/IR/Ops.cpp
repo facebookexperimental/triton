@@ -630,6 +630,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
   if (type.getEncoding()) {
+    // Skip verification for placeholder layouts - they will be resolved later
+    if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
+      return success();
     auto enc = dyn_cast<DistributedEncodingTrait>(type.getEncoding());
     if (!enc) {
       return op->emitOpError(regName)
@@ -648,6 +651,7 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                 << " layout is not TMEM compatible";
       for (Attribute layout : layouts)
         diag.attachNote() << "potential TMEM layout: " << layout;
+      diag.attachNote() << "Current layout: " << enc;
       return diag;
     }
   }

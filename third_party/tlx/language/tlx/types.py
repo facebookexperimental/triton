@@ -82,25 +82,30 @@ class DummyRegisterLayoutEncoding(layout_encoding):
     Placeholder layout for register-distributed tensors.
     Will be resolved to BlockedEncodingAttr, MmaEncodingAttr,
     DotOperandEncodingAttr, etc. after inlining.
+
+    If tmem_compatible is True, the layout will be resolved to a
+    TMEM-compatible register layout suitable for TMEM load/store.
     """
 
-    def __init__(self, shape: List[int], element_type: tl.dtype):
+    def __init__(self, shape: List[int], element_type: tl.dtype, tmem_compatible: bool = False):
         super().__init__()
         self.shape = shape
         self.element_type = element_type
+        self.tmem_compatible = tmem_compatible
 
     def to_ir(self, builder: ir.builder):
-        return builder.make_dummy_register_layout_attr(self.shape, self.element_type.to_ir(builder))
+        return builder.make_dummy_register_layout_attr(self.shape, self.element_type.to_ir(builder),
+                                                       self.tmem_compatible)
 
     def __repr__(self):
-        return f"DummyRegisterLayoutEncoding<{self.shape}, {self.element_type}>"
+        return f"DummyRegisterLayoutEncoding<{self.shape}, {self.element_type}, tmem_compatible={self.tmem_compatible}>"
 
     def __eq__(self, other):
         return (isinstance(other, DummyRegisterLayoutEncoding) and self.shape == other.shape
-                and self.element_type == other.element_type)
+                and self.element_type == other.element_type and self.tmem_compatible == other.tmem_compatible)
 
     def __hash__(self):
-        return hash((tuple(self.shape), self.element_type))
+        return hash((tuple(self.shape), self.element_type, self.tmem_compatible))
 
 
 class DummyMMALayoutEncoding(layout_encoding):

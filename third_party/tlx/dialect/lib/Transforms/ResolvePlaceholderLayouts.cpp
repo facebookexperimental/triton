@@ -11,8 +11,8 @@
 #include <numeric>
 
 #define DEBUG_TYPE "tlx-resolve-placeholder-layouts"
-#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+#define DBGS() (llvm::errs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) DBGS() << X << "\n"
 
 using namespace mlir;
 namespace ttg = ::mlir::triton::gpu;
@@ -50,18 +50,55 @@ static Attribute getDummyLayoutFromType(Type type) {
 }
 
 /// Compute the resolved layout for a dummy register layout.
-/// Matches the Python default:
-/// make_default_tmem_compatible_tensor_layout_encoding which uses
-/// getDefaultBlockedEncoding with numWarps, threadsPerWarp, numCTAs
+/// If tmemCompatible is true, creates a TMEM-compatible register layout using
+/// getTmemCompatibleLayout (matches
+/// make_default_tmem_compatible_tensor_layout_encoding). Otherwise, creates a
+/// default BlockedEncodingAttr.
+///
+/// For TMEM-compatible layouts, we need the allocation shape (not the subsliced
+/// shape) to compute the correct layout. This is passed via allocShape
+/// parameter which should be obtained from the TMEMLoadOp's source memdesc.
 static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
+                                       ArrayRef<int64_t> allocShape,
                                        ModuleOp moduleOp) {
   auto shape = dummyLayout.getShape();
+  auto elementType = dummyLayout.getElementType();
   auto rank = shape.size();
 
   int numWarps = ttg::lookupNumWarps(moduleOp);
   int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
   int numCTAs = ttg::TritonGPUDialect::getNumCTAs(moduleOp);
 
+  if (dummyLayout.getTmemCompatible()) {
+    // Create a TMEM-compatible register layout
+    // Matches make_default_tmem_compatible_tensor_layout_encoding
+    //
+    // Use the allocation shape (not the subsliced shape) for the
+    // TMEM-compatible layout calculation. The allocation shape determines the
+    // TMEM block dimensions.
+    ArrayRef<int64_t> layoutShape = allocShape.empty() ? shape : allocShape;
+    LDBG("resolveRegisterLayout: Taking TMEM-compatible path for shape ["
+         << shape[0] << ", " << shape[1] << "], using allocShape ["
+         << layoutShape[0] << ", " << layoutShape[1] << "]");
+    assert(rank == 2 &&
+           "Only supporting 2D tensors for TMEM compatible layout.");
+    assert(!elementType.isInteger() && "Integer type not supported for TMEM.");
+    assert((numWarps == 4 || numWarps == 8) &&
+           "Currently only support numWarps 4 or 8 for TMEM load and store.");
+
+    ttg::BlockedEncodingAttr defaultBlockedEncoding =
+        ttg::getDefaultBlockedEncoding(moduleOp.getContext(), layoutShape,
+                                       numWarps, threadsPerWarp, numCTAs);
+    auto oldType =
+        RankedTensorType::get(layoutShape, elementType, defaultBlockedEncoding);
+
+    auto result = ttng::getTmemCompatibleLayout(layoutShape[0], layoutShape[1],
+                                                oldType, numWarps);
+    LDBG("resolveRegisterLayout: TMEM-compatible layout result: " << result);
+    return result;
+  }
+
+  // Default: create a standard blocked encoding
   // sizePerThread: all 1s (default)
   SmallVector<unsigned> sizePerThread(rank, 1);
 
@@ -118,18 +155,24 @@ static Attribute resolveSMemLayout(DummySMemLayoutAttr dummyLayout,
 }
 
 /// Compute the resolved layout for a dummy TMEM layout.
+/// This creates a TensorMemoryEncodingAttr for TMEM memory descriptors.
 /// Matches the Python default:
 /// tensor_memory_layout_encoding.make_default(shape) blockM=shape[0],
 /// blockN=shape[1], CTASplitM=1, CTASplitN=1
 /// TODO: Remove `unpacked` parameter and infer it in this pass based on usage
 /// context.
 static Attribute resolveTMemLayout(DummyTMemLayoutAttr dummyLayout,
+                                   ArrayRef<int64_t> allocShape,
                                    ModuleOp moduleOp) {
-  auto shape = dummyLayout.getShape();
   bool unpacked = dummyLayout.getUnpacked();
 
-  int64_t blockM = shape.size() > 0 ? shape[0] : 1;
-  int64_t blockN = shape.size() > 1 ? shape[1] : 1;
+  // Use the actual allocation shape (from MemDescType) rather than the
+  // shape stored in the dummy layout, because the tensor might be a subslice
+  // of a larger allocation
+  int64_t blockM =
+      allocShape.size() > 0 ? allocShape[allocShape.size() - 2] : 1;
+  int64_t blockN =
+      allocShape.size() > 1 ? allocShape[allocShape.size() - 1] : 1;
 
   return ttng::TensorMemoryEncodingAttr::get(moduleOp.getContext(), blockM,
                                              blockN, unpacked,
@@ -225,13 +268,40 @@ static Attribute resolveDotOperandLayout(DummyDotOperandLayoutAttr dummyLayout,
 }
 
 /// Resolve a dummy layout attribute to a concrete layout
-static Attribute resolveDummyLayout(Attribute dummyLayout, ModuleOp moduleOp) {
-  if (auto regLayout = dyn_cast<DummyRegisterLayoutAttr>(dummyLayout))
-    return resolveRegisterLayout(regLayout, moduleOp);
+/// For TMEM layouts and TMEM-compatible register layouts, allocShape is used
+/// to determine the block dimensions.
+/// For register layouts from TMEMLoadOp, definingOp is used to get the source
+/// memdesc's allocation shape.
+static Attribute resolveDummyLayout(Attribute dummyLayout,
+                                    ArrayRef<int64_t> allocShape, Value value,
+                                    ModuleOp moduleOp) {
+  if (auto regLayout = dyn_cast<DummyRegisterLayoutAttr>(dummyLayout)) {
+    // For TMEM-compatible register layouts, we need the allocation shape from
+    // the source memdesc. If the value is from a TMEMLoadOp, get the allocShape
+    // from its source.
+    ArrayRef<int64_t> regAllocShape;
+    if (regLayout.getTmemCompatible() && value) {
+      if (auto defOp = value.getDefiningOp()) {
+        if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(defOp)) {
+          auto srcType = tmemLoad.getSrc().getType();
+          regAllocShape = srcType.getAllocShape();
+        } else if (auto releaseOp = dyn_cast<ReleaseLayoutOp>(defOp)) {
+          // ReleaseLayoutOp wraps the actual load result, look through it
+          if (auto srcDefOp = releaseOp.getSrc().getDefiningOp()) {
+            if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(srcDefOp)) {
+              auto srcType = tmemLoad.getSrc().getType();
+              regAllocShape = srcType.getAllocShape();
+            }
+          }
+        }
+      }
+    }
+    return resolveRegisterLayout(regLayout, regAllocShape, moduleOp);
+  }
   if (auto smemLayout = dyn_cast<DummySMemLayoutAttr>(dummyLayout))
     return resolveSMemLayout(smemLayout, moduleOp);
   if (auto tmemLayout = dyn_cast<DummyTMemLayoutAttr>(dummyLayout))
-    return resolveTMemLayout(tmemLayout, moduleOp);
+    return resolveTMemLayout(tmemLayout, allocShape, moduleOp);
   if (auto mmaLayout = dyn_cast<DummyMMALayoutAttr>(dummyLayout))
     return resolveMMALayout(mmaLayout, moduleOp);
   if (auto dotOpLayout = dyn_cast<DummyDotOperandLayoutAttr>(dummyLayout))
@@ -249,9 +319,11 @@ static void replaceTypeWithNewEncoding(Value value, Attribute newEncoding) {
     newType = RankedTensorType::get(tensorType.getShape(),
                                     tensorType.getElementType(), newEncoding);
   } else if (auto memDescType = dyn_cast<ttg::MemDescType>(oldType)) {
+    // Preserve the allocation shape when replacing the encoding
     newType = ttg::MemDescType::get(
         memDescType.getShape(), memDescType.getElementType(), newEncoding,
-        memDescType.getMemorySpace(), memDescType.getMutableMemory());
+        memDescType.getMemorySpace(), memDescType.getMutableMemory(),
+        memDescType.getAllocShape());
   } else {
     return;
   }
@@ -272,13 +344,30 @@ LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
         valuesToResolve.emplace_back(result, dummyLayout);
       }
     }
+
+    // Check block arguments in all regions (for ops like WarpSpecializeOp)
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (BlockArgument arg : block.getArguments()) {
+          if (Attribute dummyLayout = getDummyLayoutFromType(arg.getType())) {
+            valuesToResolve.emplace_back(arg, dummyLayout);
+          }
+        }
+      }
+    }
   });
 
   LDBG("Found " << valuesToResolve.size() << " values with dummy layouts");
 
   // Resolve each dummy layout
   for (auto &[value, dummyLayout] : valuesToResolve) {
-    Attribute resolvedLayout = resolveDummyLayout(dummyLayout, moduleOp);
+    // Get allocation shape for TMEM layouts
+    ArrayRef<int64_t> allocShape;
+    if (auto memDescType = dyn_cast<ttg::MemDescType>(value.getType())) {
+      allocShape = memDescType.getAllocShape();
+    }
+    Attribute resolvedLayout =
+        resolveDummyLayout(dummyLayout, allocShape, value, moduleOp);
     LLVM_DEBUG({
       DBGS() << "Resolving dummy layout: ";
       dummyLayout.dump();

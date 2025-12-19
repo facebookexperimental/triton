@@ -796,6 +796,11 @@ LogicalResult MemDescSubsliceOp::verify() {
   if (bool(srcEnc) != bool(dstEnc)) {
     return emitError("src and result must both have or not have an encoding");
   }
+  // Skip verification for TLX placeholder layouts - they will be resolved later
+  if (isa<triton::tlx::DummySMemLayoutAttr, triton::tlx::DummyTMemLayoutAttr>(
+          srcEnc)) {
+    return success();
+  }
   if (!isa<SharedEncodingTrait>(srcEnc) || !isa<SharedEncodingTrait>(dstEnc)) {
     return emitError("src and dst must both be of shared memory encoding");
   }
