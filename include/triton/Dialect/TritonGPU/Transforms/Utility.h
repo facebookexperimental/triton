@@ -136,6 +136,8 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding);
 
 bool isExpensiveLoadOrStore(Operation *op);
 
+bool isExpensiveLocalLoad(Operation *op);
+
 bool canFoldIntoConversion(Operation *op, Attribute targetEncoding);
 
 // Replace ForOp with a new ForOp with extra operands. The YieldOp is not
