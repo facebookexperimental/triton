@@ -781,6 +781,9 @@ LogicalResult TMEMCopyOp::verify() {
 // -- TMEMSubSliceOp --
 LogicalResult TMEMSubSliceOp::verify() {
   auto srcTy = cast<triton::gpu::MemDescType>(getSrc().getType());
+  // Skip verification for placeholder layouts - they will be resolved later
+  if (isa<triton::tlx::DummyTMemLayoutAttr>(srcTy.getEncoding()))
+    return success();
   auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
       srcTy.getEncoding());
   if (!encoding)
@@ -791,6 +794,9 @@ LogicalResult TMEMSubSliceOp::verify() {
            << encoding.getBlockM();
   }
   auto dstTy = cast<triton::gpu::MemDescType>(getResult().getType());
+  // Skip verification for placeholder layouts - they will be resolved later
+  if (isa<triton::tlx::DummyTMemLayoutAttr>(dstTy.getEncoding()))
+    return success();
   auto dstEncoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
       dstTy.getEncoding());
   if (!dstEncoding)
@@ -809,6 +815,17 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   auto allocTy = cast<triton::gpu::MemDescType>(alloc.getType());
   SmallVector<int64_t> shape(allocTy.getShape());
   shape.back() = size;
+
+  // Handle placeholder layouts - pass through without modifying encoding
+  if (isa<triton::tlx::DummyTMemLayoutAttr>(allocTy.getEncoding())) {
+    auto subsliceType = gpu::MemDescType::get(
+        shape, allocTy.getElementType(), allocTy.getEncoding(),
+        allocTy.getMemorySpace(), allocTy.getMutableMemory(),
+        allocTy.getAllocShape());
+    build(builder, state, subsliceType, alloc, offset);
+    return;
+  }
+
   auto encoding =
       cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(allocTy.getEncoding());
   unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);

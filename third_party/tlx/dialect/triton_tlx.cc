@@ -291,9 +291,13 @@ void init_triton_tlx_ir(py::module &&m) {
              assert(srcTy != nullptr && "Expect MemDescType for src");
              auto encoding =
                  dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
-             auto blockN = encoding.getBlockN();
-             assert(offset >= 0 && offset < blockN && "Invalid offset");
-             assert(size > 0 && size <= blockN - offset && "Invalid size");
+             // For placeholder layouts, skip the validation checks - they will
+             // be validated after layout resolution
+             if (encoding) {
+               auto blockN = encoding.getBlockN();
+               assert(offset >= 0 && offset < blockN && "Invalid offset");
+               assert(size > 0 && size <= blockN - offset && "Invalid size");
+             }
              return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
            })
       .def("create_tcgen5_dot",
@@ -350,33 +354,38 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int32_t> order) -> mlir::Value {
              return self.create<ttg::MemDescTransOp>(arg, order);
            })
-      .def("create_memdesc_reinterpret",
-           [](TritonOpBuilder &self, Value &src, Type &newElementType,
-              std::vector<int64_t> newShape) -> mlir::Value {
-             auto oldType = cast<ttg::MemDescType>(src.getType());
-             assert(oldType && "Expect MemDescType for src");
-             auto encoding = oldType.getEncoding();
-             if (!oldType.getShape().equals(newShape)) {
-               // Only accept unswizzled encoding for now.
-               if (auto mmaEncoding =
-                       dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding)) {
-                 if (mmaEncoding.getSwizzlingByteWidth() != 0)
-                   llvm_unreachable("Only accept unswizzled encoding");
-               } else if (auto swizzledEncoding =
-                              dyn_cast<ttg::SwizzledSharedEncodingAttr>(
-                                  encoding)) {
-                 if (!(swizzledEncoding.getVec() == 1 &&
-                       swizzledEncoding.getPerPhase() == 1 &&
-                       swizzledEncoding.getMaxPhase() == 1))
-                   llvm_unreachable("Only accept unswizzled encoding");
-               }
-             }
+      .def(
+          "create_memdesc_reinterpret",
+          [](TritonOpBuilder &self, Value &src, Type &newElementType,
+             std::vector<int64_t> newShape) -> mlir::Value {
+            auto oldType = cast<ttg::MemDescType>(src.getType());
+            assert(oldType && "Expect MemDescType for src");
+            auto encoding = oldType.getEncoding();
+            if (!oldType.getShape().equals(newShape)) {
+              // Skip swizzle validation for placeholder layouts - they will
+              // be resolved later
+              if (isa<tlx::DummySMemLayoutAttr, tlx::DummyTMemLayoutAttr>(
+                      encoding)) {
+                // Placeholder layouts don't have swizzle info yet
+              } else if (auto mmaEncoding =
+                             dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding)) {
+                if (mmaEncoding.getSwizzlingByteWidth() != 0)
+                  llvm_unreachable("Only accept unswizzled encoding");
+              } else if (auto swizzledEncoding =
+                             dyn_cast<ttg::SwizzledSharedEncodingAttr>(
+                                 encoding)) {
+                if (!(swizzledEncoding.getVec() == 1 &&
+                      swizzledEncoding.getPerPhase() == 1 &&
+                      swizzledEncoding.getMaxPhase() == 1))
+                  llvm_unreachable("Only accept unswizzled encoding");
+              }
+            }
 
-             auto newType = ttg::MemDescType::get(
-                 newShape, newElementType, encoding, oldType.getMemorySpace(),
-                 oldType.getMutableMemory());
-             return self.create<ttg::MemDescReinterpretOp>(newType, src);
-           })
+            auto newType = ttg::MemDescType::get(
+                newShape, newElementType, encoding, oldType.getMemorySpace(),
+                oldType.getMutableMemory());
+            return self.create<ttg::MemDescReinterpretOp>(newType, src);
+          })
       .def("get_memdesc_type",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,
