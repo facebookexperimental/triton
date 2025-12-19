@@ -604,6 +604,25 @@ bool isExpensiveLoadOrStore(Operation *op) {
   return true;
 }
 
+bool isExpensiveLocalLoad(Operation *op) {
+  auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op);
+  if (!localLoad)
+    return false;
+  auto resultType = dyn_cast<RankedTensorType>(localLoad.getResult().getType());
+  if (!resultType)
+    return false;
+  // A size 1 tensor is not expensive since all threads will load the same
+  if (resultType.getNumElements() == 1)
+    return false;
+  // Tensor has more threads than elements - cheap due to sharing
+  auto mod = op->getParentOfType<ModuleOp>();
+  int numWarps = triton::gpu::lookupNumWarps(op);
+  int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  if (resultType.getNumElements() < numWarps * threadsPerWarp)
+    return false;
+  return true;
+}
+
 bool isExpensiveToRemat(Operation *op, Attribute &targetEncoding) {
   if (!op)
     return true;
