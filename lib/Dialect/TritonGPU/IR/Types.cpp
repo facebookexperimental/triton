@@ -1,5 +1,6 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "mlir/IR/DialectImplementation.h" // required by `Types.cpp.inc`
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -164,6 +165,10 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (bitwidth != 8) {
       return emitError() << "bitwidth must be 8";
     }
+  } else if (isa<triton::tlx::DummyTMemLayoutAttr,
+                 triton::tlx::DummySMemLayoutAttr>(encoding)) {
+    // TLX placeholder layouts are allowed - they will be resolved later
+    return success();
   } else {
     return emitError() << encoding << " is not a valid encoding";
   }

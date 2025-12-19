@@ -1,6 +1,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/DebugStringHelper.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -465,11 +466,23 @@ MemDescTransOp::inferReturnTypes(MLIRContext *context,
   Attribute argEncoding = argTy.getEncoding();
   Attribute retEncoding;
   if (argEncoding) {
-    Dialect &dialect = argEncoding.getDialect();
-    auto inferLayoutInterface = cast<DialectInferLayoutInterface>(&dialect);
-    if (failed(inferLayoutInterface->inferTransOpEncoding(
-            argEncoding, shape, order, retEncoding, loc))) {
-      return failure();
+    // Handle TLX placeholder layouts - create a new placeholder with permuted
+    // shape
+    if (auto dummySmem =
+            dyn_cast<triton::tlx::DummySMemLayoutAttr>(argEncoding)) {
+      retEncoding =
+          triton::tlx::DummySMemLayoutAttr::get(context, retShape, retEltTy);
+    } else if (auto dummyTmem =
+                   dyn_cast<triton::tlx::DummyTMemLayoutAttr>(argEncoding)) {
+      retEncoding = triton::tlx::DummyTMemLayoutAttr::get(
+          context, retShape, retEltTy, dummyTmem.getUnpacked());
+    } else {
+      Dialect &dialect = argEncoding.getDialect();
+      auto inferLayoutInterface = cast<DialectInferLayoutInterface>(&dialect);
+      if (failed(inferLayoutInterface->inferTransOpEncoding(
+              argEncoding, shape, order, retEncoding, loc))) {
+        return failure();
+      }
     }
   }
 
@@ -667,6 +680,10 @@ static LogicalResult verifySharedMemoryRank(Operation *op,
                                             RankedTensorType type,
                                             MemDescType memdesc,
                                             StringRef regName) {
+  // Skip layout verification for TLX placeholder layouts
+  if (isa<triton::tlx::DummySMemLayoutAttr, triton::tlx::DummyTMemLayoutAttr>(
+          memdesc.getEncoding()))
+    return success();
   auto enc = dyn_cast<LayoutEncodingTrait>(memdesc.getEncoding());
   if (!enc)
     return op->emitOpError("expected memdesc to have a shared memory encoding");

@@ -25,6 +25,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -655,11 +656,15 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
 
 LogicalResult TMEMStoreOp::verify() {
   if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
-           TensorMemoryScalesEncodingAttr>(getDst().getType().getEncoding()))
+           TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMemLayoutAttr>(
+          getDst().getType().getEncoding()))
     return emitOpError("should use tensor memory encoding.");
   if (!getDst().getType().getMutableMemory()) {
     return emitOpError("Cannot store into an immutable alloc");
   }
+  // Skip layout verification for placeholder layouts
+  if (isa<triton::tlx::DummyTMemLayoutAttr>(getDst().getType().getEncoding()))
+    return success();
   if (failed(verifyTMEMOperand(*this, getSrc().getType(), getDst().getType(),
                                "source")))
     return failure();
@@ -672,9 +677,12 @@ LogicalResult TMEMLoadOp::verify() {
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
           getSrc().getType().getMemorySpace()))
     return emitOpError("source must be a tensor memory buffer.");
-  if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-          getSrc().getType().getEncoding()))
+  if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
+           triton::tlx::DummyTMemLayoutAttr>(getSrc().getType().getEncoding()))
     return emitOpError("should use tensor memory encoding.");
+  // Skip layout verification for placeholder layouts
+  if (isa<triton::tlx::DummyTMemLayoutAttr>(getSrc().getType().getEncoding()))
+    return success();
   if (failed(verifyTMEMOperand(*this, getType(), getSrc().getType(), "result")))
     return failure();
   return triton::gpu::verifyMemoryOpTypes(*this, getSrc().getType(), getType());
@@ -682,9 +690,12 @@ LogicalResult TMEMLoadOp::verify() {
 
 // -- TMEMAllocOp --
 LogicalResult TMEMAllocOp::verify() {
-  if (!isa<TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr>(
-          getType().getEncoding()))
+  if (!isa<TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr,
+           triton::tlx::DummyTMemLayoutAttr>(getType().getEncoding()))
     return emitOpError("should use tensor memory encoding");
+  // Skip layout verification for placeholder layouts
+  if (isa<triton::tlx::DummyTMemLayoutAttr>(getType().getEncoding()))
+    return success();
   if (getSrc() &&
       failed(verifyTMEMOperand(*this, getSrc().getType(), getType(), "source")))
     return failure();
@@ -723,6 +734,10 @@ LogicalResult TMEMCopyOp::verify() {
     return emitOpError("Cannot copy into an immutable alloc");
   }
   auto srcTy = cast<triton::gpu::MemDescType>(getSrc().getType());
+  // Skip layout verification for placeholder layouts
+  if (isa<triton::tlx::DummySMemLayoutAttr>(srcTy.getEncoding()) ||
+      isa<triton::tlx::DummyTMemLayoutAttr>(getDst().getType().getEncoding()))
+    return success();
   auto sharedEnc =
       dyn_cast<triton::gpu::NVMMASharedEncodingAttr>(srcTy.getEncoding());
   if (!sharedEnc) {

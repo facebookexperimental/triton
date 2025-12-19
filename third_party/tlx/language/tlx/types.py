@@ -38,6 +38,13 @@ class DummyTMemLayoutEncoding(layout_encoding):
     def __repr__(self):
         return f"DummyTMemLayoutEncoding<{self.shape}, {self.element_type}, unpacked={self.unpacked}>"
 
+    def __eq__(self, other):
+        return (isinstance(other, DummyTMemLayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type and self.unpacked == other.unpacked)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type, self.unpacked))
+
 
 class DummySMemLayoutEncoding(layout_encoding):
     """
@@ -62,6 +69,13 @@ class DummySMemLayoutEncoding(layout_encoding):
     def __repr__(self):
         return f"DummySMemLayoutEncoding<{self.shape}, {self.element_type}>"
 
+    def __eq__(self, other):
+        return (isinstance(other, DummySMemLayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type))
+
 
 class DummyRegisterLayoutEncoding(layout_encoding):
     """
@@ -80,6 +94,13 @@ class DummyRegisterLayoutEncoding(layout_encoding):
 
     def __repr__(self):
         return f"DummyRegisterLayoutEncoding<{self.shape}, {self.element_type}>"
+
+    def __eq__(self, other):
+        return (isinstance(other, DummyRegisterLayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type))
 
 
 class DummyMMALayoutEncoding(layout_encoding):
@@ -110,6 +131,14 @@ class DummyMMALayoutEncoding(layout_encoding):
     def __repr__(self):
         return f"DummyMMALayoutEncoding<{self.shape}, {self.element_type}>"
 
+    def __eq__(self, other):
+        return (isinstance(other, DummyMMALayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type
+                and self.operand_a_element_type == other.operand_a_element_type)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type, self.operand_a_element_type))
+
 
 class DummyDotOperandLayoutEncoding(layout_encoding):
     """
@@ -134,6 +163,13 @@ class DummyDotOperandLayoutEncoding(layout_encoding):
 
     def __repr__(self):
         return f"DummyDotOperandLayoutEncoding<{self.shape}, opIdx={self.op_idx}>"
+
+    def __eq__(self, other):
+        return (isinstance(other, DummyDotOperandLayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type and self.op_idx == other.op_idx)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type, self.op_idx))
 
 
 class storage_kind(enum.Enum):
