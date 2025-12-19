@@ -60,9 +60,6 @@ public:
   /// Current barrier ID to assign (range [MIN_BARRIER_ID, MAX_BARRIER_ID])
   int barrierId;
 
-  /// Indicator of whether we run out of barrier IDs
-  bool barrierIdExhausted;
-
   /// Map from pingpong region id to its barrier ID
   llvm::DenseMap<int, std::pair<int, int>> pingpongIdToBarrierId;
 
@@ -80,22 +77,18 @@ public:
   CriticalRegionManager() {
     // Initialize barrier ID to be MIN_BARRIER_ID
     barrierId = MIN_BARRIER_ID;
-    barrierIdExhausted = false;
   }
 
   /// Check if an operation is registered as an expensive operation for the
   /// given compute capability. Only considers ops with 2D+ shaped operands.
   bool isExpensiveOp(Operation *op, int computeCapability) const {
-    llvm::StringRef opName = op->getName().getStringRef();
-
-    // Fast path for math.exp/math.exp2: check result rank directly
     switch (computeCapability) {
     case 90: // Hopper
       // On Hopper, wgmma is expensive
       if (isa<ttng::WarpGroupDotOp>(op)) {
         // WarpGroupDotOp has its own verifier that checks the tensor shapes
         // so we can directly put a WarpGroupDotOp into pingpong region
-        LDBG("Encounter a " << opName << " op on Hopper.");
+        LDBG("Encounter a " << op->getName() << " op on Hopper.");
         return true;
       }
       break;
@@ -104,19 +97,12 @@ public:
       // tensors Blackwell increases performance for GEMM which is no longer a
       // bottleneck
       if (isa<math::ExpOp, math::Exp2Op>(op)) {
-        if (op->getNumResults() == 0)
-          return false;
-        LDBG("Encounter a " << opName << " op on Blackwell.");
+        LDBG("Encounter a " << op->getName() << " op on Blackwell.");
         Type resultType = op->getResult(0).getType();
         int64_t rank = -1;
         if (auto tensorTy = dyn_cast<RankedTensorType>(resultType)) {
           rank = tensorTy.getRank();
           LDBG("RankedTensorType, rank is " << rank);
-        } else if (auto shapedTy = dyn_cast<ShapedType>(resultType)) {
-          if (shapedTy.hasRank()) {
-            rank = shapedTy.getRank();
-            LDBG("ShapedType, rank is " << rank);
-          }
         }
         if (rank > 1)
           return true;
@@ -140,21 +126,12 @@ public:
       return;
     }
 
-    // If barrier IDs are exhausted, assign -1 to indicate invalid barriers
-    if (barrierIdExhausted) {
-      pingpongIdToBarrierId[pingpongId] = {-1, -1};
-      LDBG("Barrier IDs exhausted, assigning {-1, -1} to pingpong region '"
-           << pingpongId << "'.");
-      return;
-    }
-
     // Assign barrier ID to the pingpong region
     int barrierId = this->barrierId;
     int barrierId_1 = this->barrierId + 1;
 
     // Check if we would exceed the maximum barrier ID
     if (barrierId > MAX_BARRIER_ID || barrierId_1 > MAX_BARRIER_ID) {
-      barrierIdExhausted = true;
       pingpongIdToBarrierId[pingpongId] = {-1, -1};
       LDBG("Barrier IDs exhausted, assigning {-1, -1} to pingpong region '"
            << pingpongId << "'.");
@@ -171,19 +148,19 @@ public:
   }
 
   bool hasPingBoundary(int pingpongRegionId) const {
-    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) and
+    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) &&
            (pingpongIdToPingBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
   bool hasPongBoundary(int pingpongRegionId) const {
-    return (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) and
+    return (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) &&
            (pingpongIdToPongBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
   bool hasPingPongBoundary(int pingpongRegionId) const {
-    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) and
-           (pingpongIdToPingBoundaryOps.at(pingpongRegionId).size() == 2) and
-           (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) and
+    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) &&
+           (pingpongIdToPingBoundaryOps.at(pingpongRegionId).size() == 2) &&
+           (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) &&
            (pingpongIdToPongBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
@@ -303,100 +280,75 @@ Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp) {
 }
 
 /// Find the end boundary op for the critical region.
-Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp) {
+/// Scans from keyOp until it finds an op with memory side effects,
+/// a control flow break, or reaches stopOp (if provided).
+/// Returns nullptr if stopOp is reached without finding a valid end boundary.
+Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
+                     Operation *stopOp = nullptr) {
+  Operation *curOp = keyOp;
+  Operation *later = stopOp;
+
+  // Determine which op comes first
+  if (stopOp) {
+    if (later->isBeforeInBlock(curOp))
+      std::swap(curOp, later);
+  }
+
   // Set the end op of this pingpong region to be the first op with memory side
   // effect after this critical op
-  Operation *curOp = keyOp;
   while (curOp) {
     if (!isMemoryEffectFree(curOp)) {
       LDBG("Found op with memory effects:");
       dumpMemoryEffects(curOp);
       return curOp;
     }
+    // If we've reached the stop op, there's no memory effect between them
+    if (stopOp && curOp == stopOp) {
+      return nullptr;
+    }
+    // Check if we've hit a control flow boundary
     // Set end op to the end of the control flow equivalent region
-    if (!areControlFlowEquivalent(curOp, curOp->getNextNode()))
+    Operation *nextOp = curOp->getNextNode();
+    if (!nextOp || !areControlFlowEquivalent(curOp, nextOp))
       return curOp;
-    curOp = curOp->getNextNode();
+    curOp = nextOp;
   }
   return nullptr;
 }
 
 /// Returns the operation from startOps that is closest to the entry
 /// (executed earliest). All ops must be in the same block.
-Operation *unionOfStartOps(llvm::ArrayRef<Operation *> startOps) {
+Operation *firstOpInBlock(llvm::ArrayRef<Operation *> startOps) {
   if (startOps.empty())
     return nullptr;
 
-  Operation *earliestOp = startOps[0];
-  Block *block = earliestOp->getBlock();
+  assert(llvm::all_of(startOps,
+                      [&](Operation *op) {
+                        return op->getBlock() == startOps[0]->getBlock();
+                      }) &&
+         "firstOpInBlock called with ops in different blocks");
 
-  for (size_t i = 1; i < startOps.size(); ++i) {
-    Operation *op = startOps[i];
-    // Verify all ops are in the same block
-    if (op->getBlock() != block) {
-      LDBG("Warning: unionOfStartOps called with ops in different blocks");
-      return nullptr;
-    }
-    // If op is before earliestOp, then op is closer to entry
-    if (op->isBeforeInBlock(earliestOp)) {
-      earliestOp = op;
-    }
-  }
-  return earliestOp;
+  auto it = llvm::min_element(startOps, [](Operation *a, Operation *b) {
+    return a->isBeforeInBlock(b);
+  });
+  return *it;
 }
 
 /// Returns the operation from endOps that is closest to the terminator
 /// (executed latest). All ops must be in the same block.
-Operation *unionOfEndOps(llvm::ArrayRef<Operation *> endOps) {
+Operation *lastOpInBlock(llvm::ArrayRef<Operation *> endOps) {
   if (endOps.empty())
     return nullptr;
 
-  Operation *latestOp = endOps[0];
-  Block *block = latestOp->getBlock();
+  assert(llvm::all_of(endOps,
+                      [&](Operation *op) {
+                        return op->getBlock() == endOps[0]->getBlock();
+                      }) &&
+         "lastOpInBlock called with ops in different blocks");
 
-  for (size_t i = 1; i < endOps.size(); ++i) {
-    Operation *op = endOps[i];
-    // Verify all ops are in the same block
-    if (op->getBlock() != block) {
-      LDBG("Warning: unionOfEndOps called with ops in different blocks");
-      return nullptr;
-    }
-    // If latestOp is before op, then op is closer to terminator
-    if (latestOp->isBeforeInBlock(op)) {
-      latestOp = op;
-    }
-  }
-  return latestOp;
-}
-
-/// Check if two operations have memory side-effects or are separated by
-/// any operations with memory side-effects.
-/// Returns true if either op has memory effects OR there are memory ops between
-/// them.
-static bool hasMemoryEffectsBetween(Operation *op1, Operation *op2) {
-  if (!op1 || !op2 || op1->getBlock() != op2->getBlock())
-    return true; // Conservative: assume memory effects if not in same block
-
-  // Check if either operation has memory side effects
-  if (!isMemoryEffectFree(op1) || !isMemoryEffectFree(op2))
-    return true;
-
-  // Determine which op comes first
-  Operation *earlier = op1;
-  Operation *later = op2;
-  if (later->isBeforeInBlock(earlier))
-    std::swap(earlier, later);
-
-  // Check for any intervening operations with memory side effects
-  for (Operation *cur = earlier->getNextNode(); cur && cur != later;
-       cur = cur->getNextNode()) {
-    if (!isMemoryEffectFree(cur)) {
-      LDBG("Found memory effect op between: " << cur->getName().getStringRef());
-      return true;
-    }
-  }
-
-  return false;
+  auto it = llvm::max_element(
+      endOps, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  return *it;
 }
 
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
@@ -482,7 +434,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       Operation *startOp = findStartOp(crManager, keyOp);
-      Operation *endOp = findEndOp(crManager, keyOp);
+      Operation *endOp = findEndOp(crManager, keyOp, nullptr);
       startOps[partitionId].push_back(startOp);
       endOps[partitionId].push_back(endOp);
       // Look up the number of warps for each partition
@@ -501,8 +453,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     for (auto [partitionId, startOp] : startOps) {
       // The start and end ops are unioned for each partition to find the
       // boundary ops
-      Operation *unionStartOp = unionOfStartOps(startOp);
-      Operation *unionEndOp = unionOfEndOps(endOps[partitionId]);
+      Operation *unionStartOp = firstOpInBlock(startOp);
+      Operation *unionEndOp = lastOpInBlock(endOps[partitionId]);
       if (!crManager.hasPingBoundary(pingpongId)) {
         crManager.pingpongIdToPingBoundaryOps[pingpongId].push_back(
             unionStartOp);
@@ -665,7 +617,12 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
           continue;
         }
         if (opTaskId == refTaskId) {
-          if (hasMemoryEffectsBetween(op, refOp))
+          // If findEndOp returns nullptr when stopOp is provided,
+          // there's no memory effect between keyOp and stopOp
+          bool hasMemEffects = (findEndOp(crManager, op, refOp) != nullptr);
+          LDBG("op in partition " << opTaskId
+                                  << " has memory effects: " << hasMemEffects);
+          if (hasMemEffects)
             matchType = false;
         }
       }
@@ -691,17 +648,16 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     if (group.size() < 2)
       continue;
 
-    // Check if ops are from different partitions
-    bool differentPartitions = false;
-    int firstTaskId = getSingleTaskId(group[0]);
-    for (size_t i = 1; i < group.size(); ++i) {
-      if (getSingleTaskId(group[i]) != firstTaskId) {
-        differentPartitions = true;
-        break;
-      }
+    // Count the number of distinct partitions in the group
+    llvm::SmallDenseSet<int, 4> partitionIds;
+    for (auto *op : group) {
+      int taskId = getSingleTaskId(op);
+      if (taskId != -1)
+        partitionIds.insert(taskId);
     }
 
-    if (!differentPartitions)
+    // Only handle pingpong for the case of 2 different partitions
+    if (partitionIds.size() != 2)
       continue;
 
     for (auto *op : group) {
