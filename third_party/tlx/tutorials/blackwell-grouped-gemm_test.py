@@ -335,16 +335,19 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
 tlx_configs = [
     triton.Config(
         {
-            "BLOCK_SIZE_M": BM,
-            "BLOCK_SIZE_N": BN,
-            "BLOCK_SIZE_K": BK,
-            "NUM_SMEM_BUFFERS": s,
-            "NUM_TMEM_BUFFERS": t,
-            "EPILOGUE_SUBTILE": subtile,
+            "BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN, "BLOCK_SIZE_K": BK, "NUM_SMEM_BUFFERS": s, "NUM_TMEM_BUFFERS": t,
+            "EPILOGUE_SUBTILE": subtile, "PAIR_CTA": pair_cta, "ctas_per_cga": (2, 1, 1) if pair_cta else None
         },
         num_warps=4,
         num_stages=1,
-    ) for BM in [128] for BN in [128, 256] for BK in [64, 128] for s in [2, 3, 4] for t in [2] for subtile in [1, 2, 4]
+    )
+    for BM in [128]
+    for BN in [128, 256]
+    for BK in [64, 128]
+    for s in [2, 3, 4]
+    for t in [2]
+    for subtile in [1, 2, 4]
+    for pair_cta in [True, False]
 ]
 
 
@@ -377,11 +380,25 @@ def grouped_matmul_tlx_kernel(
     EPILOGUE_SUBTILE: tl.constexpr,  #
     # is the output FP8 or FP16
     FP8: tl.constexpr,
+    PAIR_CTA: tl.constexpr,
 ):
     dtype = tl.float8e4nv if FP8 else tl.float16
+
+    # CTA pairs along M dim
+    if PAIR_CTA:
+        cluster_cta_rank = tlx.cluster_cta_rank()  # 2cta specific
+        pred_cta0 = cluster_cta_rank == 0
+
+        # 2cta specific
+        cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS,
+                                      arrive_count=2)  # CTA0 waits for CTA1's data before mma
+
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype, NUM_SMEM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype, NUM_SMEM_BUFFERS)
+    if PAIR_CTA:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // 2), dtype, NUM_SMEM_BUFFERS)
+    else:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype, NUM_SMEM_BUFFERS)
     # use multiple TMEM buffers to overlap MMA and epilogue
     tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
 
@@ -402,6 +419,8 @@ def grouped_matmul_tlx_kernel(
                 gn = tl.load(group_gemm_sizes + g * 3 + 1)
                 gk = tl.load(group_gemm_sizes + g * 3 + 2)
                 num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
+                if PAIR_CTA:
+                    num_m_tiles = ((num_m_tiles + 1) // 2) * 2  # round up to even number
                 num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
                 num_tiles = num_m_tiles * num_n_tiles
                 if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
@@ -418,8 +437,8 @@ def grouped_matmul_tlx_kernel(
                     while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
                         # figure out tile coordinates
                         tile_idx_in_gemm = tile_idx - last_problem_end
-                        tile_m_idx = tile_idx_in_gemm // num_n_tiles
-                        tile_n_idx = tile_idx_in_gemm % num_n_tiles
+                        tile_m_idx = tile_idx_in_gemm % num_m_tiles
+                        tile_n_idx = tile_idx_in_gemm // num_m_tiles
 
                         tmem_buf, tmem_phase = _get_bufidx_phase(accum_cnt_tmem, NUM_TMEM_BUFFERS)
                         tlx.barrier_wait(tmem_full_bars[tmem_buf], tmem_phase)
@@ -431,15 +450,19 @@ def grouped_matmul_tlx_kernel(
                         offs_cn = tile_n_idx * BLOCK_SIZE_N
 
                         slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
-                        for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                            acc_slice = tlx.local_slice(
-                                acc_tmem,
-                                [0, slice_id * slice_size],
-                                [BLOCK_SIZE_M, slice_size],
-                            )
-                            result = tlx.local_load(acc_slice)
-                            c = result.to(tl.float16)
-                            c_desc.store([offs_cm, offs_cn + slice_id * slice_size], c)
+                        # In Pair CTA mode, if there're in fact odd number of tiles along M dim, we extend it by
+                        # "one virtual tile" for the non-leader CTA of the last pair. This CTA loads operand B,
+                        # do cross-CTA synchronization like usual, but just don't write to result back to SMEM
+                        if PAIR_CTA and offs_cm < gm:
+                            for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                                acc_slice = tlx.local_slice(
+                                    acc_tmem,
+                                    [0, slice_id * slice_size],
+                                    [BLOCK_SIZE_M, slice_size],
+                                )
+                                result = tlx.local_load(acc_slice)
+                                c = result.to(tl.float16)
+                                c_desc.store([offs_cm, offs_cn + slice_id * slice_size], c)
 
                         # done storing this buffer, signal MMA consumer to resume writing to it
                         tlx.barrier_arrive(tmem_empty_bars[tmem_buf], 1)
@@ -461,6 +484,8 @@ def grouped_matmul_tlx_kernel(
                 gn = tl.load(group_gemm_sizes + g * 3 + 1)
                 gk = tl.load(group_gemm_sizes + g * 3 + 2)
                 num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
+                if PAIR_CTA:
+                    num_m_tiles = ((num_m_tiles + 1) // 2) * 2  # round up to even number
                 num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
                 num_tiles = num_m_tiles * num_n_tiles
                 if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
@@ -479,18 +504,31 @@ def grouped_matmul_tlx_kernel(
                             # wait for current phase(round) of load for this buf
                             tlx.barrier_wait(smem_full_bars[smem_buf], smem_phase)
                             # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
+                            if PAIR_CTA:
+                                cta_bar = tlx.remote_view(cta_bars[smem_buf], 0)
+                                tlx.barrier_arrive(cta_bar, 1)
+                                tlx.barrier_wait(cta_bar, phase=smem_phase, pred=pred_cta0)
+
                             tlx.async_dot(
                                 buffers_A[smem_buf],
                                 buffers_B[smem_buf],
                                 tmem_buffers[tmem_buf],
                                 use_acc=kk > 0,
                                 mBarriers=[smem_empty_bars[smem_buf]],
+                                two_ctas=PAIR_CTA,
                                 out_dtype=tl.float32,
                             )
                             accum_cnt_smem += 1
 
                         # done filling this buffer, signal epilogue consumer
-                        tlx.tcgen05_commit(tmem_full_bars[tmem_buf])
+                        if PAIR_CTA:
+                            # in pair CTA mode, we need to explicitly wait for the final MMA because tcgen05_commit
+                            # would not block non-leader CTA until MMA is done
+                            last_smem_buf, last_smem_phase = _get_bufidx_phase(accum_cnt_smem - 1, NUM_SMEM_BUFFERS)
+                            tlx.barrier_wait(smem_empty_bars[last_smem_buf], last_smem_phase)
+                            tlx.barrier_arrive(tmem_full_bars[tmem_buf], 1)
+                        else:
+                            tlx.tcgen05_commit(tmem_full_bars[tmem_buf])
                         accum_cnt_tmem += 1
                         # go to the next tile by advancing NUM_SM
                         tile_idx += NUM_SM
@@ -518,6 +556,8 @@ def grouped_matmul_tlx_kernel(
                 gn = tl.load(group_gemm_sizes + g * 3 + 1)
                 gk = tl.load(group_gemm_sizes + g * 3 + 2)
                 num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
+                if PAIR_CTA:
+                    num_m_tiles = ((num_m_tiles + 1) // 2) * 2  # round up to even number
                 num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
                 num_k_tiles = tl.cdiv(gk, BLOCK_SIZE_K)
                 num_tiles = num_m_tiles * num_n_tiles
@@ -540,20 +580,29 @@ def grouped_matmul_tlx_kernel(
                         block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
                     )
 
-                    tlx.make_tensor_descriptor(
-                        desc_ptr=desc_b_ptrs[desc_buf],
-                        base=b_ptr,
-                        shape=[gk, gn],
-                        strides=[ldb, 1],
-                        block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
-                    )
+                    if PAIR_CTA:
+                        tlx.make_tensor_descriptor(
+                            desc_ptr=desc_b_ptrs[desc_buf],
+                            base=b_ptr,
+                            shape=[gk, gn],
+                            strides=[ldb, 1],
+                            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N // 2],
+                        )
+                    else:
+                        tlx.make_tensor_descriptor(
+                            desc_ptr=desc_b_ptrs[desc_buf],
+                            base=b_ptr,
+                            shape=[gk, gn],
+                            strides=[ldb, 1],
+                            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+                        )
 
                     # iterate through the tiles in the current gemm problem
                     while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
                         # figure out tile coordinates
                         tile_idx_in_gemm = tile_idx - last_problem_end
-                        tile_m_idx = tile_idx_in_gemm // num_n_tiles
-                        tile_n_idx = tile_idx_in_gemm % num_n_tiles
+                        tile_m_idx = tile_idx_in_gemm % num_m_tiles
+                        tile_n_idx = tile_idx_in_gemm // num_m_tiles
 
                         # Reinterpret descriptor pointers for TMA operations
                         a_desc = tlx.reinterpret_tensor_descriptor(
@@ -561,21 +610,38 @@ def grouped_matmul_tlx_kernel(
                             block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
                             dtype=dtype,
                         )
-                        b_desc = tlx.reinterpret_tensor_descriptor(
-                            desc_ptr=desc_b_ptrs[desc_buf],
-                            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
-                            dtype=dtype,
-                        )
+                        if PAIR_CTA:
+                            b_desc = tlx.reinterpret_tensor_descriptor(
+                                desc_ptr=desc_b_ptrs[desc_buf],
+                                block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N // 2],
+                                dtype=dtype,
+                            )
+                        else:
+                            b_desc = tlx.reinterpret_tensor_descriptor(
+                                desc_ptr=desc_b_ptrs[desc_buf],
+                                block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+                                dtype=dtype,
+                            )
 
                         # do regular gemm here
                         offs_am = tile_m_idx * BLOCK_SIZE_M
-                        offs_bn = tile_n_idx * BLOCK_SIZE_N
+                        if PAIR_CTA:
+                            offs_bn = tile_n_idx * BLOCK_SIZE_N + cluster_cta_rank * (BLOCK_SIZE_N // 2)
+                        else:
+                            offs_bn = tile_n_idx * BLOCK_SIZE_N
 
                         for kk in range(0, num_k_tiles):
                             buf, phase = _get_bufidx_phase(accum_cnt, NUM_SMEM_BUFFERS)
                             tlx.barrier_wait(smem_empty_bars[buf], phase ^ 1)
-                            tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                                     tlx.size_of(dtype) * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)
+                            if PAIR_CTA:
+                                # todo: we can alternatively check offs_am < gm and omit loading A for the virtual tile
+                                tlx.barrier_expect_bytes(smem_full_bars[buf], 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N // 2) *
+                                                         BLOCK_SIZE_K)  # float16
+                            else:
+                                tlx.barrier_expect_bytes(
+                                    smem_full_bars[buf],
+                                    tlx.size_of(dtype) * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)
+                            # todo: we can alternatively check offs_am < gm and omit loading A for the virtual tile
                             tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, kk * BLOCK_SIZE_K],
                                                       smem_full_bars[buf])
                             tlx.async_descriptor_load(b_desc, buffers_B[buf], [kk * BLOCK_SIZE_K, offs_bn],
@@ -726,7 +792,7 @@ def test_op():
     tri_out = group_gemm_tlx_fn(group_A, group_B)
     ref_out = [torch.matmul(a, b) for a, b in zip(group_A, group_B)]
     for i in range(group_size):
-        assert torch.allclose(ref_out[i], tri_out[i], atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(ref_out[i], tri_out[i], atol=1e-2, rtol=1e-2)
 
 
 # only launch the kernel, no tensor preparation here to remove all overhead
