@@ -420,7 +420,7 @@ def grouped_matmul_tlx_kernel(
                 gk = tl.load(group_gemm_sizes + g * 3 + 2)
                 num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
                 if PAIR_CTA:
-                    num_m_tiles = ((num_m_tiles + 1) // 2) * 2  # round up to even number
+                    num_m_tiles = (num_m_tiles + 1) & ~1  # round up to even number
                 num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
                 num_tiles = num_m_tiles * num_n_tiles
                 if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
@@ -485,7 +485,7 @@ def grouped_matmul_tlx_kernel(
                 gk = tl.load(group_gemm_sizes + g * 3 + 2)
                 num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
                 if PAIR_CTA:
-                    num_m_tiles = ((num_m_tiles + 1) // 2) * 2  # round up to even number
+                    num_m_tiles = (num_m_tiles + 1) & ~1  # round up to even number
                 num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
                 num_tiles = num_m_tiles * num_n_tiles
                 if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
@@ -557,7 +557,7 @@ def grouped_matmul_tlx_kernel(
                 gk = tl.load(group_gemm_sizes + g * 3 + 2)
                 num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
                 if PAIR_CTA:
-                    num_m_tiles = ((num_m_tiles + 1) // 2) * 2  # round up to even number
+                    num_m_tiles = (num_m_tiles + 1) & ~1  # round up to even number
                 num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
                 num_k_tiles = tl.cdiv(gk, BLOCK_SIZE_K)
                 num_tiles = num_m_tiles * num_n_tiles
