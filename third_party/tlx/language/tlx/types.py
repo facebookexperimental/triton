@@ -1,9 +1,10 @@
-import triton.language.core as tl
-from triton.language.core import _aggregate as aggregate
-from typing import Optional, List, Tuple
 import enum
 from abc import abstractmethod
+from typing import List, Optional, Tuple
+
+import triton.language.core as tl
 from triton._C.libtriton import ir
+from triton.language.core import _aggregate as aggregate
 
 
 class layout_encoding:
@@ -38,7 +39,17 @@ class shared_layout_encoding(layout_encoding):
 
 class swizzled_shared_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, vectorSize, perPhase, maxPhase, order, numCTAs, numCTAsPerCGA, numCTASplit, numCTAOrder):
+    def __init__(
+        self,
+        vectorSize,
+        perPhase,
+        maxPhase,
+        order,
+        numCTAs,
+        numCTAsPerCGA,
+        numCTASplit,
+        numCTAOrder,
+    ):
         super().__init__()
         self.vectorSize = vectorSize
         self.perPhase = perPhase
@@ -131,7 +142,17 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, shape, order, elemType, numCTAsPerCGA, numCTASplit, numCTAOrder, fp4Padded, swizzled):
+    def __init__(
+        self,
+        shape,
+        order,
+        elemType,
+        numCTAsPerCGA,
+        numCTASplit,
+        numCTAOrder,
+        fp4Padded,
+        swizzled,
+    ):
         super().__init__()
         self.shape = shape
         self.order = order
@@ -197,6 +218,36 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
                 and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
                 and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
                 and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
+
+
+class DummyRegisterLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for register-distributed tensors.
+    Will be resolved to BlockedEncodingAttr, MmaEncodingAttr,
+    DotOperandEncodingAttr, etc. after inlining.
+    If tmem_compatible is True, the layout will be resolved to a
+    TMEM-compatible register layout suitable for TMEM load/store.
+    """
+
+    def __init__(self, shape: List[int], element_type: tl.dtype, tmem_compatible: bool = False):
+        super().__init__()
+        self.shape = shape
+        self.element_type = element_type
+        self.tmem_compatible = tmem_compatible
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_register_layout_attr(self.shape, self.element_type.to_ir(builder),
+                                                       self.tmem_compatible)
+
+    def __repr__(self):
+        return f"DummyRegisterLayoutEncoding<{self.shape}, {self.element_type}, tmem_compatible={self.tmem_compatible}>"
+
+    def __eq__(self, other):
+        return (isinstance(other, DummyRegisterLayoutEncoding) and self.shape == other.shape
+                and self.element_type == other.element_type and self.tmem_compatible == other.tmem_compatible)
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.element_type, self.tmem_compatible))
 
 
 class storage_kind(enum.Enum):
@@ -279,7 +330,14 @@ class buffered_tensor_type(tl.block_type):
         self.num = num
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
-        value = buffered_tensor(handles[cursor], self.scalar, self.shape, self.num, self.storage, self.layout)
+        value = buffered_tensor(
+            handles[cursor],
+            self.scalar,
+            self.shape,
+            self.num,
+            self.storage,
+            self.layout,
+        )
         return value, cursor + 1
 
     def mangle(self) -> str:
@@ -326,8 +384,8 @@ class mbarrier(tl.base_value):
         layout: Optional[swizzled_shared_layout_encoding],
         storage: storage_kind = storage_kind.smem,
     ):
-        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
-            "mbarrier requires storage to be smem or smemCluster")
+        assert (storage == storage_kind.smem
+                or storage == storage_kind.smemCluster), "mbarrier requires storage to be smem or smemCluster"
         self.handle = handle
         self.type = mbarrier_type(num, layout, storage)
         self.num = num
@@ -510,7 +568,7 @@ class tensor_descriptor_ptr_type(tl.pointer_type):
         self.size = size
 
     def __eq__(self, other):
-        return isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size
+        return (isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size)
 
     def __repr__(self) -> str:
         return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"

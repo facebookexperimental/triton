@@ -1140,7 +1140,6 @@ configs_bwd_tlx = [
 ]
 
 
-# TODO: Unused. Fix layout issue inside TLX.
 @triton.jit
 def _bwd_compute_inner_loop(
     start_n,
@@ -1425,88 +1424,61 @@ def _attn_bwd_ws(
                 do_out_dtype = tlx.dtype_of(desc_do)
                 q_out_dtype = tlx.dtype_of(desc_q)
                 if STAGE & 1:
-                    offs_n = start_block_n + tl.arange(0, BLOCK_N1)
-                    lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE=4 - STAGE)
-                    num_steps = (hi - lo) // BLOCK_M1
-                    for _ in range(num_steps):
-                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                        ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-
-                        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                        m = tl.load(M_updated + offs_m)
-
-                        # wait for qkT = tl.dot(k, qT)
-                        tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
-                        qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-                        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
-
-                        pT = tl.math.exp2(qkT - m[None, :])
-                        if STAGE == 3:
-                            mask = offs_m[None, :] >= offs_n[:, None]
-                            pT = tl.where(mask, pT, 0.0)
-
-                        # ppT *= qk_scale
-                        ppT = pT
-                        ppT = ppT.to(do_out_dtype)
-                        tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
-                        tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
-
-                        # D (= delta) is pre-divided by ds_scale.
-                        Di = tl.load(D_updated + offs_m)
-
-                        # Wait for dpT = tl.dot(v, tl.trans(do))
-                        tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
-                        dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-                        # We can only signal the arrive if DP is not shared with DQ.
-                        # Otherwise we need to wait for DQ to be done.
-                        if not REUSE_DP_FOR_DQ:
-                            tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
-                        dsT = pT * (dpT - Di[None, :])
-                        dsT = dsT.to(q_out_dtype)
-                        tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
-                        tlx.fence_async_shared()
-                        tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
-                        curr_m += step_m
-                        blk_idx += 1
+                    curr_m, blk_idx = _bwd_compute_inner_loop(
+                        start_n,
+                        qk_fulls,
+                        qk_tiles,
+                        qk_empties,
+                        p_tiles,
+                        p_fulls,
+                        dp_empties,
+                        dp_fulls,
+                        dp_tiles,
+                        ds_tiles,
+                        ds_fulls,
+                        M_updated,
+                        D_updated,
+                        curr_m,
+                        blk_idx,
+                        step_m,
+                        do_out_dtype,
+                        q_out_dtype,
+                        N_CTX,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        STAGE=4 - STAGE,
+                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                    )
                 if STAGE & 2:
-                    lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE=2)
-                    num_steps = (hi - lo) // BLOCK_M1
-                    for _ in range(num_steps):
-                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                        ds_buf_id, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-
-                        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-                        m = tl.load(M_updated + offs_m)
-
-                        # wait for qkT = tl.dot(k, qT)
-                        tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
-                        qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-                        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
-
-                        pT = tl.math.exp2(qkT - m[None, :])
-                        # ppT *= qk_scale
-                        ppT = pT
-                        ppT = ppT.to(do_out_dtype)
-                        tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
-                        tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
-
-                        # D (= delta) is pre-divided by ds_scale.
-                        Di = tl.load(D_updated + offs_m)
-
-                        # Wait for dpT = tl.dot(v, tl.trans(do))
-                        tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
-                        dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-                        # We can only signal the arrive if DP is not shared with DQ.
-                        # Otherwise we need to wait for DQ to be done.
-                        if not REUSE_DP_FOR_DQ:
-                            tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
-                        dsT = pT * (dpT - Di[None, :])
-                        dsT = dsT.to(q_out_dtype)
-                        tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
-                        tlx.fence_async_shared()
-                        tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
-                        curr_m += step_m
-                        blk_idx += 1
+                    curr_m, blk_idx = _bwd_compute_inner_loop(
+                        start_n,
+                        qk_fulls,
+                        qk_tiles,
+                        qk_empties,
+                        p_tiles,
+                        p_fulls,
+                        dp_empties,
+                        dp_fulls,
+                        dp_tiles,
+                        ds_tiles,
+                        ds_fulls,
+                        M_updated,
+                        D_updated,
+                        curr_m,
+                        blk_idx,
+                        step_m,
+                        do_out_dtype,
+                        q_out_dtype,
+                        N_CTX,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        STAGE=2,
+                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                    )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(i, NUM_BUFFERS_KV)
 

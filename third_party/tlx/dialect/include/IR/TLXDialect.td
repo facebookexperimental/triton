@@ -15,6 +15,8 @@ def TLX_Dialect : Dialect {
     "triton::TritonDialect",
     "triton::gpu::TritonGPUDialect",
   ];
+
+  let useDefaultAttributePrinterParser = 1;
 }
 
 #endif

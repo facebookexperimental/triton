@@ -189,41 +189,11 @@ void init_triton_tlx_ir(py::module &&m) {
              return ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
                                                      eltType);
            })
-      .def("make_default_tmem_compatible_tensor_layout_encoding",
+      .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type elementType, int moduleNumWarps, int threadsPerWarp,
-              int numCTAs) {
-             // Include various assert to vet the input to make sure they're
-             // valid for MMAv5. See also lib/Analysis/Utiity.cpp:supportMMA
-             assert(shape.size() == 2 &&
-                    "Only supporting 2D tensors for TMEM layout.");
-             assert((!elementType.isInteger()) &&
-                    "Integer type not supported.");
-
-             Block *parentBlock = self.getBuilder().getInsertionBlock();
-             int numWarps =
-                 ttg::maybeLookupNumWarps(parentBlock).value_or(moduleNumWarps);
-             assert((numWarps == 4 || numWarps == 8) &&
-                    "Currently only support numWarps 4 or 8 for TMEM load and "
-                    "store.");
-
-             ttg::BlockedEncodingAttr defaultBlockedEncoding =
-                 ttg::getDefaultBlockedEncoding(self.getContext(), shape,
-                                                numWarps, threadsPerWarp,
-                                                numCTAs);
-             auto oldType = RankedTensorType::get(shape, elementType,
-                                                  defaultBlockedEncoding);
-             auto oldTypeShapePerCTA = ttg::getShapePerCTA(oldType);
-             auto rank = oldTypeShapePerCTA.size();
-             assert((oldTypeShapePerCTA[rank - 2] % 64 == 0 &&
-                     ((oldTypeShapePerCTA[rank - 1] % 8 == 0) ||
-                      oldTypeShapePerCTA[rank - 1] == 1)) &&
-                    "Shape unsupported by TMEM ops.");
-
-             Attribute newDistributedEncoding =
-                 nvidia_gpu::getTmemCompatibleLayout(shape[0], shape[1],
-                                                     oldType, numWarps);
-             return newDistributedEncoding;
+              Type elementType, bool tmemCompatible) -> Attribute {
+             return tlx::DummyRegisterLayoutAttr::get(
+                 self.getContext(), shape, elementType, tmemCompatible);
            })
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self) -> void {
@@ -649,6 +619,8 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXInsertRequireLayout);
   ADD_PASS_WRAPPER_0("add_tlx_rewrite_local_alias",
                      tlx::createTLXRewriteLocalAlias);
+  ADD_PASS_WRAPPER_0("add_tlx_resolve_placeholder_layouts",
+                     tlx::createTLXResolvePlaceholderLayouts);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
                             std::string, int32_t, int32_t, int32_t);
 }
