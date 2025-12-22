@@ -377,20 +377,41 @@ def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
 
   let description = [{
     Store a distributed tensor into a buffer in remote shared memory.
-    `$ctaRank` refers to the unique CTA id in a cluster acorss all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    `$ctaRank` refers to the unique CTA id in a cluster across all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
     will be 0~7.
   }];
   let arguments = (ins
     TT_Tensor:$src,
     Arg<TTG_MemDescType>:$dst,
     I32:$ctaRank
-
   );
   // TODO Add a verifier
   let hasVerifier = 0;
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
   let assemblyFormat = [{
     $src `,` `rank` $ctaRank `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))
+  }];
+}
+
+def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
+  let summary = "Store a distributed tensor into remote shared memory with barrier completion";
+  let description = [{
+    Store a distributed tensor into a buffer in remote shared memory with barrier completion signaling.
+    Uses PTX instruction: st.async.shared::cluster.mbarrier::complete_tx::bytes
+
+    `$ctaRank` refers to the unique CTA id in a cluster across all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    will be 0~7.
+    `$barrier` is a mandatory mbarrier in local shared memory that will be signaled when the remote store completes.
+  }];
+  let arguments = (ins
+    TT_Tensor:$src,
+    Arg<TTG_MemDescType>:$dst,
+    I32:$ctaRank,
+    TTG_MemDescType:$barrier
+  );
+  let hasVerifier = 0;
+  let assemblyFormat = [{
+    $src `,` `rank` $ctaRank `,` $dst `barrier` $barrier attr-dict `:` type($src) `->` qualified(type($dst)) `barrier_ty` qualified(type($barrier))
   }];
 }
 

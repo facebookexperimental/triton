@@ -1260,6 +1260,93 @@ def test_remote_shmem_store(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("num_ctas", [1, 2])
+def test_async_remote_shmem_store(num_ctas, device):
+    """Test that remote_shmem_store correctly aggregates 2D data across multiple CTAs."""
+
+    @triton.jit
+    def remote_store_sum_kernel(
+        input_ptr,
+        output_ptr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        NUM_CTAS: tl.constexpr,
+    ):
+        # Configure the number of CTAs participating in reduction
+        BLOCK_N: tl.constexpr = triton.cdiv(N, NUM_CTAS)
+
+        # Allocate NUM_CTAS buffers in shared memory, each with shape (BLOCK_M,)
+        # to hold a 1D vector of float32 values
+        local_buffs = tlx.local_alloc((BLOCK_M, ), tl.float32, NUM_CTAS)
+
+        # Allocate barriers for synchronization across CTAs
+        # Each non-zero CTA will use a barrier to signal when its data is written
+        barriers = tlx.alloc_barriers(num_barriers=NUM_CTAS)
+
+        # CTA 0 expects to receive (NUM_CTAS - 1) tiles from other CTAs
+        # Each tile is BLOCK_M * sizeof(float32) bytes
+        for i in tl.static_range(1, NUM_CTAS):
+            tlx.barrier_expect_bytes(barriers[i], BLOCK_M * tlx.size_of(tl.float32))
+
+        # Synchronize all CTAs before starting computation
+        tlx.cluster_barrier()
+
+        # Get the rank of this CTA within the cluster
+        cta_rank = tlx.cluster_cta_rank()
+
+        # Each CTA processes its portion of the input data (2D tile)
+        # Layout: each CTA gets a different BLOCK_N columns
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = cta_rank * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        # Load 2D tile: (BLOCK_M, BLOCK_N)
+        offsets = offs_m[:, None] * N + offs_n[None, :]
+        data = tl.load(input_ptr + offsets)
+
+        # Compute sum over this tile along N dimension, resulting in shape [BLOCK_M]
+        local_sum = tl.sum(data, axis=1)
+
+        # Non-zero CTAs: send their 2D tile to CTA 0's shared memory asynchronously
+        if cta_rank != 0:
+            tlx.async_remote_shmem_store(dst=local_buffs[cta_rank],  # Destination buffer in CTA 0's shared memory
+                                         src=local_sum,  # Source 2D tensor from this CTA
+                                         remote_cta_rank=0,  # Target CTA is CTA 0
+                                         barrier=barriers[cta_rank],  # Signal barrier when write completes
+                                         )
+
+        # CTA 0: aggregate all tiles and write final result
+        if cta_rank == 0:
+            # Start with CTA 0's own local sum
+            final_sum = local_sum
+
+            # Wait for each non-zero CTA to write its data, then accumulate
+            for i in tl.static_range(1, NUM_CTAS):
+                tlx.barrier_wait(barriers[i], phase=0)  # Wait for CTA i's data
+                final_sum += tlx.local_load(local_buffs[i])  # Accumulate CTA i's sum
+
+            # Write the final aggregated sum to output
+            offs_m = tl.arange(0, BLOCK_M)
+            tl.store(output_ptr + offs_m, final_sum)
+
+    torch.manual_seed(0)
+    M = 64
+    N = 256
+    input_tensor = torch.randn((M, N), dtype=torch.float32, device=device)
+    output = torch.zeros(M, dtype=torch.float32, device=device)
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), META["NUM_CTAS"])
+
+    kernel = remote_store_sum_kernel[grid](input_tensor, output, M=M, N=N, BLOCK_M=64, NUM_CTAS=num_ctas, num_warps=1,
+                                           ctas_per_cga=(1, num_ctas, 1))
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttg.async_remote_shmem_store") == 1
+
+    expected = torch.sum(input_tensor, dim=1)
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma_ws(device):
     """
     Test 2cta collective D = A*B for 1 tile.

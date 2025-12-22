@@ -100,11 +100,15 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val,
-                              Value pred) const {
+                              std::optional<Value> ctaId, Value val, Value pred,
+                              std::optional<Value> barrierPtr) const {
   if (ctaId.has_value()) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
+  }
+  if (barrierPtr.has_value()) {
+    llvm::report_fatal_error("AMDGPU does not support barrier-based "
+                             "synchronization for remote stores");
   }
   mlir::LLVM::AMD::llStore(rewriter, loc, ptr, val, pred);
 }
