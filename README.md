@@ -28,6 +28,12 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
+
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)`
+
+    Alias this allocation to an existing `buffered_tensor` so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.
+
+
 - `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]`
 
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
@@ -253,16 +259,54 @@ Examples: how mbarriers are communicated in warp specialization
 
 ```
     with tlx.async_tasks
-        with tlx.asycn_task(default)
+        with tlx.async_task("default")
             ...
-        with tlx.asycn_task(num_warps = 4)
+        with tlx.async_task(num_warps=4)
             ...
 ```
-`tlx.async_tasks` opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block..
+`tlx.async_tasks` opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block.
 
-`tlx.async_task(default)` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks. .
+`tlx.async_task("default")` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.
 
-`tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task..
+`tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
+
+#### async_task Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `"default"` | First positional argument to mark this as the default/trunk task |
+| `num_warps` | Number of warps to reserve for this task |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning) |
+| `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
+| `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
+
+#### Explicit Warp Assignment with warp_group_start_id
+
+By default, the compiler automatically assigns warp IDs to each task. However, you can use `warp_group_start_id` to explicitly specify which warps each task should use. This is useful for:
+- Fine-grained control over warp-to-task mapping
+- Ensuring specific hardware resource allocation
+- Advanced optimization scenarios
+
+**Example:**
+```python
+with tlx.async_tasks():
+    with tlx.async_task("default"):  # Uses warps 0-3 (from num_warps=4 kernel param)
+        # Producer task
+        ...
+    with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
+        # Two replicas, each using 2 warps
+        # Replica 0: warps 4-5
+        # Replica 1: warps 6-7
+        ...
+    with tlx.async_task(num_warps=1, warp_group_start_id=8):
+        # Consumer task using warp 8
+        ...
+```
+
+**Validation Rules:**
+- Warp ranges must not overlap between tasks
+- Non-default tasks must not overlap with the default region (warps 0 to kernel's `num_warps`)
+- When using `warp_group_start_id`, it must be specified for ALL non-default tasks or NONE
 
 ### CUDA Thread Block Clustering
 
