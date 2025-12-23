@@ -278,7 +278,8 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   // Map barrier to remote address space if needed
   Value mappedBarrier;
-  if (barrierPtr.has_value() && ctaId.has_value()) {
+  if (barrierPtr.has_value()) {
+    assert(ctaId.has_value() && "barrier without ctaId");
     mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), *ctaId, pred);
   }
 
