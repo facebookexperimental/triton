@@ -4,6 +4,11 @@ from .utility import is_hip
 
 
 @tl.builtin
+def cluster_barrier(_semantic=None):
+    _semantic.builder.create_cluster_barrier()
+
+
+@tl.builtin
 def alloc_barriers(
         num_barriers: tl.constexpr,
         arrive_count: tl.constexpr = tl.constexpr(1),

@@ -7,6 +7,7 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/NVPTXAddrSpace.h"
 
 using namespace mlir;
 
@@ -154,7 +155,12 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
 
 static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
                   Value pred) {
-  return rewriter.create<NVVM::MapaOp>(loc, ptr.getType(), ptr, ctaid);
+  auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
+  assert(ptrTy.getAddressSpace() == llvm::NVPTXAS::ADDRESS_SPACE_SHARED &&
+         "Invalid src llvm addr space for mapa");
+  MLIRContext *ctx = rewriter.getContext();
+  auto dsmPtrTy = ptr_ty(ctx, llvm::NVPTXAS::ADDRESS_SPACE_SHARED_CLUSTER);
+  return rewriter.create<NVVM::MapaOp>(loc, dsmPtrTy, ptr, ctaid);
 }
 
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
@@ -272,7 +278,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   PTXBuilder builder;
   auto st = builder.create<>("st")
-                ->o("shared::cta", ctaId.has_value())
+                ->o("shared::cluster", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);

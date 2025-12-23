@@ -107,6 +107,13 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
            })
+      .def("create_remote_store",
+           [](TritonOpBuilder &self, Value &dst, Value &regValues,
+              Value remoteCTARank) -> void {
+             auto bufferType = cast<ttg::MemDescType>(dst.getType());
+             auto remote_store = self.create<ttg::RemoteShmemStoreOp>(
+                 regValues, dst, remoteCTARank);
+           })
       .def("make_swizzled_shared_encoding_attr",
            [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
               unsigned maxPhase, std::vector<unsigned> order,
@@ -303,6 +310,11 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
               Value pred) -> void {
              self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
+           })
+      .def("create_cluster_barrier",
+           [](TritonOpBuilder &self) -> void {
+             self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
+             self.create<triton::nvidia_gpu::ClusterWaitOp>();
            })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
