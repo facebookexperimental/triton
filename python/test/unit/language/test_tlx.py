@@ -1227,6 +1227,38 @@ def test_cluster_dims(device):
             in k.asm["ttgir"])
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for DSM")
+def test_remote_shmem_store(device):
+
+    @triton.jit
+    def remote_shmem_store_kernel(
+        x,
+        y,
+    ):
+        local_buff = tlx.local_alloc((1, ), tl.float32, 2)
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        remote_store_view = tlx.local_view(local_buff, cluster_cta_rank ^ 1)
+        offset = tl.arange(0, 1) + cluster_cta_rank
+        value = tl.load(x + offset) + (cluster_cta_rank + 1) * 100
+
+        tlx.remote_shmem_store(
+            dst=remote_store_view,
+            src=value,
+            remote_cta_rank=cluster_cta_rank ^ 1,
+        )
+        tlx.cluster_barrier()
+        local_load_view = tlx.local_view(local_buff, cluster_cta_rank)
+        remote_value = tlx.local_load(local_load_view)
+        tl.store(y + offset, remote_value)
+
+    x = torch.empty((2, ), device=device, dtype=torch.float32)
+    x[0] = 42.0
+    x[1] = 43.0
+    y = torch.empty((2, ), device=device, dtype=torch.float32)
+    remote_shmem_store_kernel[(2, )](x, y, ctas_per_cga=(2, 1, 1))
+    assert y[1] == 142.0 and y[0] == 243.0
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma_ws(device):
     """

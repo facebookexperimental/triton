@@ -5,6 +5,7 @@ from .barrier import (
     barrier_arrive,
     barrier_expect_bytes,
     barrier_wait,
+    cluster_barrier,
     named_barrier_arrive,
     named_barrier_wait,
 )
@@ -34,6 +35,7 @@ from .mem_ops import (
     local_view,
     make_tensor_descriptor,
     reinterpret_tensor_descriptor,
+    remote_shmem_store,
     remote_view,
     subslice,
 )
@@ -108,7 +110,9 @@ __all__ = [
     "fence_async_shared",
     "make_tensor_descriptor",
     "reinterpret_tensor_descriptor",
+    "remote_shmem_store",
     # barriers
+    "cluster_barrier",
     "alloc_barriers",
     "barrier_expect_bytes",
     "barrier_wait",
