@@ -294,10 +294,18 @@ def async_dot_wait(
 @tl.builtin
 def tcgen05_commit(
     mBarrier: tlx.mbarrier,
+    two_ctas: bool = False,
     _semantic=None,
 ) -> tl.tensor:
     """
     Make the mbarrier track the completion of all prior asynchronous tcgen5 operations.
     NOTE: DO NOT use the same mBarrier passed to async_dot. This op needs a separate dedicated mBarrier.
     """
-    return tl.tensor(_semantic.builder.create_tcgen05_commit(mBarrier.handle), tl.void)
+    if not two_ctas:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        # cluster_cta_rank() % 2 == 0
+        cta_rank = _semantic.builder.create_cluster_cta_rank()
+        mod_result = _semantic.builder.create_urem(cta_rank, _semantic.builder.get_int32(2))
+        pred_handle = _semantic.builder.create_icmpEQ(mod_result, _semantic.builder.get_int32(0))
+    return tl.tensor(_semantic.builder.create_tcgen05_commit(mBarrier.handle, pred_handle), tl.void)
