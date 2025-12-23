@@ -3495,6 +3495,20 @@ int TritonGPUDialect::getNumCTAs(ModuleOp module) {
   return 1;
 }
 
+SmallVector<int> TritonGPUDialect::getClusterDims(ModuleOp module) {
+  SmallVector<int, 3> values(3);
+  unsigned i = 0;
+  for (auto attrName : {AttrClusterDimX, AttrClusterDimY, AttrClusterDimZ}) {
+    values[i] = 1;
+    if (auto attr = module->getAttrOfType<IntegerAttr>(attrName)) {
+      auto dimVal = attr.getInt();
+      values[i] = dimVal;
+    }
+    i++;
+  }
+  return values;
+}
+
 int TritonGPUDialect::getThreadsPerWarp(ModuleOp module) {
   if (auto attr = module->getAttrOfType<IntegerAttr>(AttrNumThreadsPerWarp))
     return attr.getInt();

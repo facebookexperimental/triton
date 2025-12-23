@@ -47,6 +47,9 @@ constexpr static char AttrTargetName[] = "ttg.target";
 constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
 constexpr static char AttrMinRegAutoWSName[] = "ttg.min_reg_auto_ws";
 constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
+constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";
+constexpr static char AttrClusterDimY[] = "ttg.cluster-dim-y";
+constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
