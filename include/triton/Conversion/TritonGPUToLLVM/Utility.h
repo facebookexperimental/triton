@@ -562,15 +562,14 @@ Value emitPadding(Location loc, RewriterBase &rewriter,
 // calcPaddedOffset is a lambda that takes a base offset (mlir::Value)
 // and computes a new offset (mlir::Value) by applying padding based on
 // shared memory layout.
-SmallVector<Value>
-lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
-                ArrayRef<Value> valsArray, // Input for store, output for load
-                Type llvmElemTy, Value smemBase,
-                std::function<Value(Value)> calcPaddedOffset,
-                Value affineOffset, uint64_t maskSpanAffineOffset,
-                RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-                std::optional<int> maybeMaxVecElems = {},
-                Operation *localLoadOp = nullptr);
+SmallVector<Value> lowerLdStShared(
+    Location loc, MLIRContext *ctx, LinearLayout cvt,
+    ArrayRef<Value> valsArray, // Input for store, output for load
+    Type llvmElemTy, Value smemBase,
+    std::function<Value(Value)> calcPaddedOffset, Value affineOffset,
+    uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
+    const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
+    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -591,14 +590,13 @@ SmallVector<Value> lowerLdSt(
         lowerInst);
 
 // Lower local_load/local_store via ld.shared/st.shared
-SmallVector<Value>
-lowerLocalLdSt(Location loc, MLIRContext *ctx,
-               LinearLayout cvt,          // Map from registers to offset
-               ArrayRef<Value> valsArray, // Input for store, empty for load
-               Type llvmElemTy, triton::gpu::MemDescType srcTy,
-               SharedMemoryObject smemObj, RewriterBase &rewriter,
-               const TargetInfoBase &targetInfo,
-               Operation *localLoadOp = nullptr);
+SmallVector<Value> lowerLocalLdSt(
+    Location loc, MLIRContext *ctx,
+    LinearLayout cvt,          // Map from registers to offset
+    ArrayRef<Value> valsArray, // Input for store, empty for load
+    Type llvmElemTy, triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
+    RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {});
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);

@@ -119,28 +119,29 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
 
   addDynamicallyLegalOp<
       triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
-      triton::gpu::LocalStoreOp, triton::nvidia_gpu::WarpGroupDotWaitOp,
-      triton::tlx::RequireLayoutOp, triton::tlx::ReleaseLayoutOp,
-      triton::tlx::LocalAliasOp>([&](Operation *op) -> bool {
-    // make sure every RankedTensorType operand has encoding
-    for (auto operandType : op->getOperandTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+      triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,
+      triton::nvidia_gpu::WarpGroupDotWaitOp, triton::tlx::RequireLayoutOp,
+      triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp>(
+      [&](Operation *op) -> bool {
+        // make sure every RankedTensorType operand has encoding
+        for (auto operandType : op->getOperandTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
-      }
-    }
 
-    // make sure result type has encoding if it is RankedTensorType
-    for (auto resultType : op->getResultTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+        // make sure result type has encoding if it is RankedTensorType
+        for (auto resultType : op->getResultTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
-      }
-    }
-    return true;
-  });
+        return true;
+      });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     for (auto arg : funcOp.getArguments()) {

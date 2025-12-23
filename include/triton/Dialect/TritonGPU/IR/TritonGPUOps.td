@@ -372,6 +372,28 @@ def TTG_LocalStoreOp : TTG_Op<"local_store"> {
   }];
 }
 
+def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
+  let summary = "Store a distributed tensor into a buffer in remote shared memory";
+
+  let description = [{
+    Store a distributed tensor into a buffer in remote shared memory.
+    `$ctaRank` refers to the unique CTA id in a cluster acorss all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    will be 0~7.
+  }];
+  let arguments = (ins
+    TT_Tensor:$src,
+    Arg<TTG_MemDescType>:$dst,
+    I32:$ctaRank
+
+  );
+  // TODO Add a verifier
+  let hasVerifier = 0;
+  // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
+  let assemblyFormat = [{
+    $src `,` `rank` $ctaRank `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))
+  }];
+}
+
 def TTG_PredicateStageOp: TTG_Op<"predicate_stage",
                                 [Pure, AllTypesMatch<["iv", "ub", "step"]>]> {
   let summary = "pipeliner stage predicate";
