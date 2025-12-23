@@ -282,6 +282,19 @@ class CUDABackend(BaseBackend):
             cluster_info.clusterDimX = opt.cluster_dims[0]
             cluster_info.clusterDimY = opt.cluster_dims[1]
             cluster_info.clusterDimZ = opt.cluster_dims[2]
+            # Set cluster_info attributes on the module
+            mod.set_attr(
+                "ttg.cluster-dim-x",
+                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimX),
+            )
+            mod.set_attr(
+                "ttg.cluster-dim-y",
+                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimY),
+            )
+            mod.set_attr(
+                "ttg.cluster-dim-z",
+                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimZ),
+            )
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)

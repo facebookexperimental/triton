@@ -931,3 +931,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @not_fold_cta_id_cluster_grid
+  // CHECK: nvgpu.cluster_id
+  tt.func public @not_fold_cta_id_cluster_grid(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    %1 = nvgpu.cluster_id
+    %2 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<32x!tt.ptr<i32>, #blocked>
+    %3 = tt.addptr %2, %0 : tensor<32x!tt.ptr<i32>, #blocked>, tensor<32xi32, #blocked>
+    %4 = tt.splat %1 : i32 -> tensor<32xi32, #blocked>
+    tt.store %3, %4 : tensor<32x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
