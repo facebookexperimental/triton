@@ -1212,6 +1212,21 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
     torch.testing.assert_close(z, ref_out)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell")
+def test_cluster_dims(device):
+
+    @triton.jit
+    def test_kernel():
+        pid = tl.program_id(axis=0)
+        if pid == 0:
+            return
+
+    k = kernel = test_kernel[(2, )](ctas_per_cga=(2, 1, 1))
+    assert kernel.metadata.cluster_dims == (2, 1, 1)
+    assert ('"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32'
+            in k.asm["ttgir"])
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma_ws(device):
     """
