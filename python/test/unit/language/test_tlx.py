@@ -1259,7 +1259,7 @@ def test_remote_shmem_store(device):
     assert y[1] == 142.0 and y[0] == 243.0
 
 
-@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("num_ctas", [1, 2])
 def test_async_remote_shmem_store(num_ctas, device):
     """Test that remote_shmem_store correctly aggregates 2D data across multiple CTAs."""

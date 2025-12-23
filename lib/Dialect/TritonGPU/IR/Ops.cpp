@@ -404,6 +404,7 @@ void ConvertLayoutOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
   patterns.add<CanonicalizeConvertFromAlloc>(context);
   patterns.add<CanonicalizeConvertFromLocalStore>(context);
   patterns.add<CanonicalizeConvertRemoteShmemStore>(context);
+  patterns.add<CanonicalizeConvertAsyncRemoteShmemStore>(context);
   patterns.add<CanonicalizeConvertFromSplit>(context);
 }
 

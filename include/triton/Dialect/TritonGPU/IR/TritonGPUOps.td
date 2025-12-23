@@ -382,7 +382,7 @@ def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
   }];
   let arguments = (ins
     TT_Tensor:$src,
-    Arg<TTG_MemDescType>:$dst,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
     I32:$ctaRank
   );
   // TODO Add a verifier
@@ -405,9 +405,9 @@ def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
   }];
   let arguments = (ins
     TT_Tensor:$src,
-    Arg<TTG_MemDescType>:$dst,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
     I32:$ctaRank,
-    TTG_MemDescType:$barrier
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier
   );
   let hasVerifier = 0;
   let assemblyFormat = [{

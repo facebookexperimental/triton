@@ -582,7 +582,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
           packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
 
       Value pred = b.true_val();
-      if (barrierPtr.has_value() && ctaRank.has_value()) {
+      if (ctaRank.has_value()) {
         auto kLane = str_attr("lane");
         auto kWarp = str_attr("warp");
 
