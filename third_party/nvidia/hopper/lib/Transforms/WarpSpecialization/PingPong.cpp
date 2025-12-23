@@ -32,6 +32,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <unordered_set>
@@ -351,6 +352,37 @@ Operation *lastOpInBlock(llvm::ArrayRef<Operation *> endOps) {
   return *it;
 }
 
+/// Returns the partition ID that contains the keyOp that occurs first.
+/// Ordering is determined by:
+///   1. Stage number (lower stage executes first)
+///   2. Cluster number (lower cluster executes first if same stage)
+///   3. Program order (isBeforeInBlock if same stage and cluster)
+int arrivesFirst(llvm::ArrayRef<Operation *> keyOps) {
+  assert(llvm::all_of(
+             keyOps, [&](Operation *op) { return ttg::getStageCluster(op); }) &&
+         "Loop stage and cluster not found for all key ops");
+
+  auto it = llvm::min_element(keyOps, [](Operation *a, Operation *b) {
+    auto scA = ttg::getStageCluster(a);
+    auto scB = ttg::getStageCluster(b);
+
+    int stageA = scA->first;
+    int stageB = scB->first;
+    int clusterA = scA->second;
+    int clusterB = scB->second;
+    if (stageA == stageB) {
+      if (clusterA == clusterB) {
+        return a->isBeforeInBlock(b);
+      } else {
+        return clusterA < clusterB;
+      }
+    } else {
+      return stageA < stageB;
+    }
+  });
+  return getSingleTaskId(*it);
+}
+
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
 /// Finds ops with pingpong_id attributes, computes their boundaries, assigns
 /// named barrier IDs, and inserts arrive/wait barriers to enforce mutual
@@ -433,14 +465,17 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     // Find the start and end ops for each key operation in the pingpong region
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
-      Operation *startOp = findStartOp(crManager, keyOp);
-      Operation *endOp = findEndOp(crManager, keyOp, nullptr);
-      startOps[partitionId].push_back(startOp);
-      endOps[partitionId].push_back(endOp);
-      // Look up the number of warps for each partition
-      if (numWarps.count(partitionId) == 0) {
-        numWarps[partitionId] = ttg::lookupNumWarps(keyOp);
-        LDBG("numWarps of " << partitionId << " is " << numWarps[partitionId]);
+      if (partitionId != -1) {
+        Operation *startOp = findStartOp(crManager, keyOp);
+        Operation *endOp = findEndOp(crManager, keyOp, nullptr);
+        startOps[partitionId].push_back(startOp);
+        endOps[partitionId].push_back(endOp);
+        // Look up the number of warps for each partition
+        if (numWarps.count(partitionId) == 0) {
+          numWarps[partitionId] = ttg::lookupNumWarps(keyOp);
+          LDBG("numWarps of " << partitionId << " is "
+                              << numWarps[partitionId]);
+        }
       }
     }
 
@@ -449,13 +484,19 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       continue;
     }
 
+    // Find which partition arrives first
+    int arrivesFirstPartitionId = arrivesFirst(keyOps);
+    LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
+
     int numberOfThreads = 0;
     for (auto [partitionId, startOp] : startOps) {
       // The start and end ops are unioned for each partition to find the
       // boundary ops
       Operation *unionStartOp = firstOpInBlock(startOp);
       Operation *unionEndOp = lastOpInBlock(endOps[partitionId]);
-      if (!crManager.hasPingBoundary(pingpongId)) {
+
+      // The pong partition is the partition that arrives first
+      if (partitionId != arrivesFirstPartitionId) {
         crManager.pingpongIdToPingBoundaryOps[pingpongId].push_back(
             unionStartOp);
         crManager.pingpongIdToPingBoundaryOps[pingpongId].push_back(unionEndOp);
