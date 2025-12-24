@@ -21,6 +21,7 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace ttg = mlir::triton::gpu;
 
 namespace mlir {
 
@@ -366,6 +367,18 @@ private:
           }
         }
       });
+      if (hasOpOfAnyTypeInForwardSlice<ttg::RemoteShmemStoreOp,
+                                       ttg::AsyncRemoteShmemStoreOp>(defOp)) {
+        // For RemoteShmemStoreOp and AsyncRemoteShmemStoreOp, ensure that the
+        // liveness range of the value covers the entire function. This will
+        // prevent reuse of shmem used by remote stores. This will remove the
+        // need to add expensive cluster barriers before/after these ops to
+        // protect against memory hazards between remote CTAs writing to an
+        // shmem location on a local CTA and the local CTA reusing the same
+        // shmem location for another op
+        minId = 0;
+        maxId = operationId.size();
+      }
       return Interval(minId, maxId);
     };
 
