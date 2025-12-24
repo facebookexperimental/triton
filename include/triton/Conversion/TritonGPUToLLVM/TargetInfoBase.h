@@ -30,8 +30,8 @@ public:
   //
   // Assumes the address is aligned to the width of `val`.
   virtual void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                            std::optional<Value> ctaId, Value val,
-                            Value pred) const = 0;
+                            std::optional<Value> ctaId, Value val, Value pred,
+                            std::optional<Value> barrierPtr = {}) const = 0;
   virtual Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                             std::optional<Value> ctaId, Type elemTy, Value pred,
                             Operation *localLoadOp = nullptr) const = 0;

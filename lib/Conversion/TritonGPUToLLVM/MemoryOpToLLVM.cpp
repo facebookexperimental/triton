@@ -19,7 +19,8 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
                               const LLVMTypeConverter *typeConverter,
                               ConversionPatternRewriter &rewriter,
                               const TargetInfoBase &targetInfo,
-                              std::optional<Value> clusterCTARank = {}) {
+                              std::optional<Value> clusterCTARank = {},
+                              std::optional<Value> barrierPtr = {}) {
   auto regTy = cast<RankedTensorType>(regVal.getType());
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
 
@@ -45,7 +46,7 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   }
   cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
-                 rewriter, targetInfo, nullptr, clusterCTARank);
+                 rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
 
   return success();
 }
@@ -247,7 +248,6 @@ public:
                                                                 benefit),
         targetInfo(targetInfo) {}
 
-  // TODO: Extract the common part of LocalStoreOpConversion and this
   LogicalResult
   matchAndRewrite(triton::gpu::RemoteShmemStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -262,9 +262,61 @@ public:
                                                          llvmElemTy, rewriter);
     auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
     Value clusterCTARank = op.getCtaRank();
+
     if (failed(lowerLocalStore(loc, ctx, regVal, memDescTy, smemObj, inVals,
                                typeConverter, rewriter, targetInfo,
                                clusterCTARank))) {
+      return failure();
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
+struct AsyncRemoteShmemStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemStoreOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::AsyncRemoteShmemStoreOp>::ConvertOpToLLVMPattern;
+
+  AsyncRemoteShmemStoreOpConversion(const LLVMTypeConverter &converter,
+                                    const TargetInfoBase &targetInfo,
+                                    PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemStoreOp>(converter,
+                                                                     benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::AsyncRemoteShmemStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    Value regVal = op.getSrc();
+    Value memDescVal = op.getDst();
+    auto typeConverter = getTypeConverter();
+    auto memDescTy = cast<MemDescType>(memDescVal.getType());
+    auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
+                                                         llvmElemTy, rewriter);
+    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    Value clusterCTARank = op.getCtaRank();
+
+    auto barrierDesc = op.getBarrier();
+    auto barrierAdaptor = adaptor.getBarrier();
+    auto barrierTy = cast<MemDescType>(barrierDesc.getType());
+    auto barrierLLVMElemTy =
+        typeConverter->convertType(barrierTy.getElementType());
+    auto barrierSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, barrierAdaptor, barrierLLVMElemTy, rewriter);
+    std::optional<Value> barrierPtr = barrierSmemObj.getBase();
+
+    if (failed(lowerLocalStore(loc, ctx, regVal, memDescTy, smemObj, inVals,
+                               typeConverter, rewriter, targetInfo,
+                               clusterCTARank, barrierPtr))) {
       return failure();
     }
 
@@ -289,4 +341,6 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<RemoteShmemStoreOpConversion>(typeConverter, targetInfo,
                                              benefit);
+  patterns.add<AsyncRemoteShmemStoreOpConversion>(typeConverter, targetInfo,
+                                                  benefit);
 }

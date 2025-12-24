@@ -243,6 +243,39 @@ def remote_shmem_store(
 
 
 @tl.builtin
+def async_remote_shmem_store(
+    dst: tlx.buffered_tensor,
+    src: tl.tensor,
+    remote_cta_rank: int | tl.constexpr,
+    barrier: tlx.mbarrier,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Store a distributed tensor into a buffer into the remote shared memory of a cluster asynchronously.
+    Signals the provided mbarrier when the store completes.
+
+    Args:
+        dst: The destination buffer in local shared memory (will be internally mapped to remote CTA)
+        src: The source tensor to store
+        remote_cta_rank: The rank of the remote CTA within the cluster
+        barrier: mbarrier to signal when the store completes
+    """
+    storage = dst.type.storage
+    if storage == tlx.storage_kind.smemCluster:
+        print("tlx.async_remote_shmem_store only supports smem dst, it internally calls mapa(dst)")
+    assert storage == tlx.storage_kind.smem, (
+        "async_remote_shmem_store only supports local smem for dst. dst will be internally mapped to remote_cta_rank's shmem"
+    )
+    assert remote_cta_rank is not None, "remote_cta_rank is required for async_remote_shmem_store"
+    assert barrier is not None, "barrier is required for async_remote_shmem_store"
+    remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
+    return tl.tensor(
+        _semantic.builder.create_async_remote_store(dst.handle, src.handle, remote_cta_rank_handle, barrier.handle),
+        tl.void,
+    )
+
+
+@tl.builtin
 def _tensor_descriptor_ptr_getitem(self, index, _semantic=None):
     """
     Index into the tensor descriptor pointer array.

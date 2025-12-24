@@ -114,6 +114,13 @@ void init_triton_tlx_ir(py::module &&m) {
              auto remote_store = self.create<ttg::RemoteShmemStoreOp>(
                  regValues, dst, remoteCTARank);
            })
+      .def("create_async_remote_store",
+           [](TritonOpBuilder &self, Value &dst, Value &regValues,
+              Value remoteCTARank, Value barrier) -> void {
+             auto bufferType = cast<ttg::MemDescType>(dst.getType());
+             auto remote_store = self.create<ttg::AsyncRemoteShmemStoreOp>(
+                 regValues, dst, remoteCTARank, barrier);
+           })
       .def("make_swizzled_shared_encoding_attr",
            [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
               unsigned maxPhase, std::vector<unsigned> order,

@@ -569,7 +569,8 @@ SmallVector<Value> lowerLdStShared(
     std::function<Value(Value)> calcPaddedOffset, Value affineOffset,
     uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
-    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {});
+    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
+    std::optional<Value> barrierPtr = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -587,7 +588,8 @@ SmallVector<Value> lowerLdSt(
     std::optional<int> maybeMaxVecElems,
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
                                      Value, int, VectorType)>
-        lowerInst);
+        lowerInst,
+    std::optional<Value> barrierPtr = {});
 
 // Lower local_load/local_store via ld.shared/st.shared
 SmallVector<Value> lowerLocalLdSt(
@@ -596,7 +598,8 @@ SmallVector<Value> lowerLocalLdSt(
     ArrayRef<Value> valsArray, // Input for store, empty for load
     Type llvmElemTy, triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {});
+    Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
+    std::optional<Value> barrierPtr = {});
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);

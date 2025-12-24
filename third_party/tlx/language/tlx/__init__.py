@@ -36,6 +36,7 @@ from .mem_ops import (
     make_tensor_descriptor,
     reinterpret_tensor_descriptor,
     remote_shmem_store,
+    async_remote_shmem_store,
     remote_view,
     subslice,
 )
@@ -111,6 +112,7 @@ __all__ = [
     "make_tensor_descriptor",
     "reinterpret_tensor_descriptor",
     "remote_shmem_store",
+    "async_remote_shmem_store",
     # barriers
     "cluster_barrier",
     "alloc_barriers",

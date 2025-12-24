@@ -568,7 +568,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp,
-                std::optional<Value> ctaRank) {
+                std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
 
   bool isStore = !valsArray.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -580,8 +580,33 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
     if (isStore) {
       Value valsVec =
           packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
-      targetInfo.storeDShared(rewriter, loc, shmemAddr, ctaRank, valsVec,
-                              /*pred=*/b.true_val());
+
+      Value pred = b.true_val();
+      if (ctaRank.has_value()) {
+        auto kLane = str_attr("lane");
+        auto kWarp = str_attr("warp");
+
+        int32_t laneMask = cvt.getFreeVariableMasks()[kLane];
+        Value isRepLane = b.true_val();
+        if (laneMask != 0) {
+          auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+          isRepLane =
+              b.icmp_eq(b.and_(b.i32_val(laneMask), laneId), b.i32_val(0));
+        }
+
+        int32_t warpMask = cvt.getFreeVariableMasks()[kWarp];
+        Value isRepWarp = b.true_val();
+        if (warpMask != 0) {
+          auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+          isRepWarp =
+              b.icmp_eq(b.and_(b.i32_val(warpMask), warpId), b.i32_val(0));
+        }
+
+        pred = b.and_(isRepLane, isRepWarp);
+      }
+
+      targetInfo.storeDShared(rewriter, loc, shmemAddr, ctaRank, valsVec, pred,
+                              barrierPtr);
       return {};
     } else {
       assert(vals.empty());
@@ -594,7 +619,8 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBase,
                    calcPaddedOffset, affineOffset, maskSpanAffineOffset, laneId,
-                   warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt);
+                   warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
+                   barrierPtr);
 }
 
 SmallVector<Value> lowerLdSt(
@@ -607,7 +633,8 @@ SmallVector<Value> lowerLdSt(
     std::optional<int> maybeMaxVecElems,
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
                                      Value, int, VectorType)>
-        lowerInst) {
+        lowerInst,
+    std::optional<Value> barrierPtr) {
   auto vals = to_vector(valsArray);
   bool isStore = !vals.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -697,7 +724,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                Type llvmElemTy, triton::gpu::MemDescType srcTy,
                SharedMemoryObject smemObj, RewriterBase &rewriter,
                const TargetInfoBase &targetInfo, Operation *localLoadOp,
-               std::optional<Value> ctaRank) {
+               std::optional<Value> ctaRank, std::optional<Value> barrierPtr) {
   assert(cvt.getNumOutDims() == 1);
   assert(*cvt.getOutDimNames().begin() == str_attr("offset"));
   auto calcPaddedOffset = [&](Value smemOffset) {
@@ -723,7 +750,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
     }
     auto outVals =
         lowerLocalLdSt(loc, ctx, prmtCvt, inVals, llvmElemTy, srcTy, smemObj,
-                       rewriter, targetInfo, localLoadOp, ctaRank);
+                       rewriter, targetInfo, localLoadOp, ctaRank, barrierPtr);
     if (!isStore) {
       outVals = broadcastAs(outVals, cvt);
     }
@@ -741,7 +768,7 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
   return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy,
                          smemObj.getBase(), calcPaddedOffset, affineOffset,
                          maskSpanAffineOffset, rewriter, targetInfo,
-                         maybeMaxVecElems, localLoadOp, ctaRank);
+                         maybeMaxVecElems, localLoadOp, ctaRank, barrierPtr);
 }
 
 bool emitTransferBetweenRegistersAndShared(
@@ -1714,13 +1741,15 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
   lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
             /*calcPaddedOffset=*/noPaddingOffset, /*affineOffset=*/b.i32_val(0),
             /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter, targetInfo,
-            /*maybeMaxVecElems=*/{}, emitSt);
+            /*maybeMaxVecElems=*/{}, emitSt,
+            /*barrierPtr=*/std::nullopt);
   b.barrier();
   resultVals = lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
                          /*calcPaddedOffset=*/noPaddingOffset,
                          /*affineOffset=*/b.i32_val(0),
                          /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter,
-                         targetInfo, /*maybeMaxVecElems=*/{}, emitLd);
+                         targetInfo, /*maybeMaxVecElems=*/{}, emitLd,
+                         /*barrierPtr=*/std::nullopt);
 
   // Create the result struct and replace the operation
   Value resultStruct =

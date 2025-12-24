@@ -63,6 +63,24 @@ While this approach places more responsibility on the user, it reduces the compi
   Return a remote view of the `buffer` living in another CTA in the same cluster with ID `remote_cta_rank`. NOTE: for
   now we only support barrier as `buffer`, not general SMEM.
 
+- `tlx.remote_shmem_store(dst, src, remote_cta_rank)`
+
+  Store a distributed tensor into a buffer in the remote shared memory of a cluster (synchronous).
+
+  **Parameters:**
+  - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
+  - `src`: The source distributed tensor to store
+  - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
+
+  **Example:**
+  ```python
+  # Allocate shared memory buffer
+  buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+
+  # Store to remote CTA's shared memory (synchronous)
+  tlx.remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1)
+  ```
+
 ### Async memory access
 
 
@@ -74,6 +92,27 @@ While this approach places more responsibility on the user, it reduces the compi
 - `tlx.async_descriptor_store(memdesc, buffer, [offsets])`
 
    Store a chunk of data from local memory into global memory buffer. The global address, strides, and buffer size are defined by the memory descriptor.
+
+
+- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)`
+
+   Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.
+
+   **Parameters:**
+   - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
+   - `src`: The source distributed tensor to store
+   - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
+   - `barrier`: mbarrier to signal when the store completes
+
+   **Example:**
+   ```python
+   # Allocate shared memory buffer and barrier
+   buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+
+   # Store to remote CTA's shared memory
+   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
+   ```
 
 - `desc_ptrs = tlx.allocate_tensor_descriptor(num)`
 
