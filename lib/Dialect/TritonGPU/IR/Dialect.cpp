@@ -3496,7 +3496,7 @@ int TritonGPUDialect::getNumCTAs(ModuleOp module) {
 }
 
 SmallVector<int> TritonGPUDialect::getClusterDims(ModuleOp module) {
-  SmallVector<int, 3> values(3);
+  SmallVector<int> values(3);
   unsigned i = 0;
   for (auto attrName : {AttrClusterDimX, AttrClusterDimY, AttrClusterDimZ}) {
     values[i] = 1;
