@@ -199,14 +199,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # flip phase at the end of a round
                     dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
-                # wait for last mma to complete
-                last_buf = (processed_k_iters + k_tiles - 1) % NUM_SMEM_BUFFERS
-                # in case phase was flipped, we should use the phase value when dot op was issued
-                last_dot_phase = dot_phase ^ (last_buf == NUM_SMEM_BUFFERS - 1)
-                tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
-
-                # done filling this buffer, signal epilogue consumer
-                tlx.barrier_arrive(tmem_full_bars[cur_tmem_buf], 1)
+                tlx.tcgen05_commit(tmem_full_bars[cur_tmem_buf], two_ctas=PAIR_CTA)
 
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
