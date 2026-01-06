@@ -77,15 +77,23 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     # )
 )
 @triton.jit
-def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
-                                   BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-                                   GROUP_SIZE_M: tl.constexpr,  #
-                                   NUM_SMEM_BUFFERS: tl.constexpr,  #
-                                   NUM_TMEM_BUFFERS: tl.constexpr,  #
-                                   NUM_SMS: tl.constexpr,  #
-                                   EPILOGUE_SUBTILE: tl.constexpr,  #
-                                   PAIR_CTA: tl.constexpr,  #
-                                   ):
+def matmul_kernel_tma_ws_blackwell(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
+    NUM_SMEM_BUFFERS: tl.constexpr,  #
+    NUM_TMEM_BUFFERS: tl.constexpr,  #
+    NUM_SMS: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,  #
+    PAIR_CTA: tl.constexpr,  #
+):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
     # In pair CTA mode, each cta only needs to load half of B.
@@ -100,8 +108,9 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     # if PAIR_CTA:
     cluster_cta_rank = tlx.cluster_cta_rank()
     pred_cta0 = cluster_cta_rank == 0
-    cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS,
-                                  arrive_count=2)  # CTA0 waits for CTA1's data before mma
+    cta_bars = tlx.alloc_barriers(
+        num_barriers=NUM_SMEM_BUFFERS, arrive_count=2
+    )  # CTA0 waits for CTA1's data before mma
 
     # allocate barriers
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
@@ -128,7 +137,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             # end of common code
 
             clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-            clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
+            clc_bar_full = clc_mbars_full[0]
             clc_response = tlx.remote_view(clc_responses[0], 0)
 
             tmem_read_phase = 0
@@ -324,11 +333,13 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # buffer is now ready to be used again
                     offs_k = k * BLOCK_SIZE_K
                     if PAIR_CTA:
-                        tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                                 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N // 2) * BLOCK_SIZE_K)  # float16
+                        tlx.barrier_expect_bytes(
+                            smem_full_bars[buf], 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N // 2) * BLOCK_SIZE_K
+                        )  # float16
                     else:
-                        tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                                 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
+                        tlx.barrier_expect_bytes(
+                            smem_full_bars[buf], 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K
+                        )  # float16
                     tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
                     tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
                     # flip phase at the end of a round
@@ -369,8 +380,12 @@ def matmul(a, b):
         # ),
     )
     matmul_kernel_tma_ws_blackwell[grid](
-        a_desc, b_desc, c_desc,  #
-        M, N, K,  #
+        a_desc,
+        b_desc,
+        c_desc,  #
+        M,
+        N,
+        K,  #
         NUM_SMS=NUM_SMS,  #
     )
     return c
@@ -415,7 +430,8 @@ configs.append(
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
         args={},
-    ))
+    )
+)
 
 
 @triton.testing.perf_report(configs)
@@ -424,8 +440,9 @@ def benchmark(M, N, K, provider):
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
-                                                     rep=2000)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000
+        )
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
