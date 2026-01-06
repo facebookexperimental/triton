@@ -30,10 +30,10 @@ def get_cuda_autotune_config():
             ctas_per_cga=(2, 1, 1) if pairCTA else None,
         )
         for BM in [128]
-        for BN in [128]
-        for BK in [64]
-        for s in [2]
-        for t in [2]
+        for BN in [128, 256]
+        for BK in [64, 128]
+        for s in [2, 3, 4]
+        for t in [2, 3]
         for subtile in [True]
         for pairCTA in [True]
     ]
@@ -77,23 +77,15 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     # )
 )
 @triton.jit
-def matmul_kernel_tma_ws_blackwell(
-    a_desc,
-    b_desc,
-    c_desc,
-    M,
-    N,
-    K,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    NUM_SMEM_BUFFERS: tl.constexpr,  #
-    NUM_TMEM_BUFFERS: tl.constexpr,  #
-    NUM_SMS: tl.constexpr,  #
-    EPILOGUE_SUBTILE: tl.constexpr,  #
-    PAIR_CTA: tl.constexpr,  #
-):
+def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
+                                   BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
+                                   GROUP_SIZE_M: tl.constexpr,  #
+                                   NUM_SMEM_BUFFERS: tl.constexpr,  #
+                                   NUM_TMEM_BUFFERS: tl.constexpr,  #
+                                   NUM_SMS: tl.constexpr,  #
+                                   EPILOGUE_SUBTILE: tl.constexpr,  #
+                                   PAIR_CTA: tl.constexpr,  #
+                                   ):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
     # In pair CTA mode, each cta only needs to load half of B.
@@ -108,9 +100,8 @@ def matmul_kernel_tma_ws_blackwell(
     # if PAIR_CTA:
     cluster_cta_rank = tlx.cluster_cta_rank()
     pred_cta0 = cluster_cta_rank == 0
-    cta_bars = tlx.alloc_barriers(
-        num_barriers=NUM_SMEM_BUFFERS, arrive_count=2
-    )  # CTA0 waits for CTA1's data before mma
+    cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS,
+                                  arrive_count=2)  # CTA0 waits for CTA1's data before mma
 
     # allocate barriers
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
@@ -121,9 +112,12 @@ def matmul_kernel_tma_ws_blackwell(
     # Dynamic tiling setup
     # clc_context = tlx.clc_create_context(1, 3)
 
-    clc_mbars_empty = tlx.alloc_barriers(1, 6)
+    clc_mbars_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=6)
     clc_mbars_full = tlx.alloc_barriers(1)
     clc_responses = tlx._alloc_clc_responses(1)
+
+    clc_bar_full = clc_mbars_full[0]
+    clc_response = tlx.remote_view(clc_responses[0], 0)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -137,8 +131,6 @@ def matmul_kernel_tma_ws_blackwell(
             # end of common code
 
             clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-            clc_bar_full = clc_mbars_full[0]
-            clc_response = tlx.remote_view(clc_responses[0], 0)
 
             tmem_read_phase = 0
             cur_tmem_buf = 0
@@ -151,13 +143,12 @@ def matmul_kernel_tma_ws_blackwell(
                 #     tlx.clc_producer(clc_context, 0, clc_phase_producer)
                 #     clc_phase_producer ^= 1
 
-                tlx.barrier_wait(clc_bar_empty, clc_phase_producer, pred_cta0)
-
-                tlx.barrier_expect_bytes(clc_bar_full, 16)
+                tlx.barrier_wait(clc_bar_empty, phase=clc_phase_producer, pred=pred_cta0)
 
                 if pred_cta0:
-                    tlx._clc_issue(clc_response, clc_bar_full)
-                    clc_phase_producer ^= 1
+                    tlx.barrier_expect_bytes(clc_bar_full, 16)
+                    tlx._clc_issue(clc_response, tlx.remote_view(clc_bar_full, 0))
+                clc_phase_producer ^= 1
 
                 # for tile_id in range(start_pid, num_tiles, NUM_SMS):
                 # pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
@@ -202,8 +193,10 @@ def matmul_kernel_tma_ws_blackwell(
                 # tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
                 # clc_phase_consumer ^= 1
 
-                tlx.barrier_wait(clc_bar_full, clc_phase_consumer, pred_cta0)
+                tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
                 tile_id = tlx._clc_query(clc_response)
+                if tile_id != -1:
+                    tile_id += tlx.cluster_cta_rank()
                 tlx.barrier_arrive(clc_bar_empty, 1)
                 clc_phase_consumer ^= 1
 
@@ -218,7 +211,7 @@ def matmul_kernel_tma_ws_blackwell(
             # end of common code
 
             clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-            clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
+            # clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
             clc_response = tlx.remote_view(clc_responses[0], 0)
 
             dot_phase = 0  # the current phase of dot op
@@ -281,8 +274,10 @@ def matmul_kernel_tma_ws_blackwell(
                 # tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
                 # clc_phase_consumer ^= 1
 
-                tlx.barrier_wait(clc_bar_full, clc_phase_consumer, pred_cta0)
+                tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
                 tile_id = tlx._clc_query(clc_response)
+                if tile_id != -1:
+                    tile_id += tlx.cluster_cta_rank()
                 tlx.barrier_arrive(clc_bar_empty, 1)
                 clc_phase_consumer ^= 1
 
@@ -302,7 +297,7 @@ def matmul_kernel_tma_ws_blackwell(
             processed_k_iters = 0
 
             clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-            clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
+            # clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
             clc_response = tlx.remote_view(clc_responses[0], 0)
 
             tile_id = start_pid
@@ -333,13 +328,11 @@ def matmul_kernel_tma_ws_blackwell(
                     # buffer is now ready to be used again
                     offs_k = k * BLOCK_SIZE_K
                     if PAIR_CTA:
-                        tlx.barrier_expect_bytes(
-                            smem_full_bars[buf], 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N // 2) * BLOCK_SIZE_K
-                        )  # float16
+                        tlx.barrier_expect_bytes(smem_full_bars[buf],
+                                                 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N // 2) * BLOCK_SIZE_K)  # float16
                     else:
-                        tlx.barrier_expect_bytes(
-                            smem_full_bars[buf], 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K
-                        )  # float16
+                        tlx.barrier_expect_bytes(smem_full_bars[buf],
+                                                 2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
                     tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
                     tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
                     # flip phase at the end of a round
@@ -349,8 +342,10 @@ def matmul_kernel_tma_ws_blackwell(
                 # tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
                 # clc_phase_consumer ^= 1
 
-                tlx.barrier_wait(clc_bar_full, clc_phase_consumer, pred_cta0)
+                tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
                 tile_id = tlx._clc_query(clc_response)
+                if tile_id != -1:
+                    tile_id += tlx.cluster_cta_rank()
                 tlx.barrier_arrive(clc_bar_empty, 1)
                 clc_phase_consumer ^= 1
 
@@ -380,12 +375,8 @@ def matmul(a, b):
         # ),
     )
     matmul_kernel_tma_ws_blackwell[grid](
-        a_desc,
-        b_desc,
-        c_desc,  #
-        M,
-        N,
-        K,  #
+        a_desc, b_desc, c_desc,  #
+        M, N, K,  #
         NUM_SMS=NUM_SMS,  #
     )
     return c
@@ -430,8 +421,7 @@ configs.append(
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
         args={},
-    )
-)
+    ))
 
 
 @triton.testing.perf_report(configs)
@@ -440,9 +430,8 @@ def benchmark(M, N, K, provider):
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     quantiles = [0.5, 0.2, 0.8]
     if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000
-        )
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
+                                                     rep=2000)
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
