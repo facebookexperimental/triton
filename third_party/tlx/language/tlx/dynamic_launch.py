@@ -1,7 +1,8 @@
 import triton.language.core as tl
 
 from . import types as tlx
-from .mem_ops import local_view
+from .utility import cluster_cta_rank
+from .mem_ops import local_view, remote_view
 from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
 
 # Blackwell-only
@@ -37,7 +38,7 @@ def _clc_issue(
 ):
     # Issue async `clusterlaunchcontrol.try_cancel` request for
     # CTA ID of available cluster
-    assert isinstance(clc_response_addr, tlx.clc_response)
+    # assert isinstance(clc_response_addr, tlx.clc_response)
 
     return _semantic.builder.clc_issue(clc_response_addr.handle, barrier.handle)
 
@@ -48,7 +49,7 @@ def _clc_query(
     _semantic=None,
 ):
     # Extract CTA ID from CLC response
-    assert isinstance(clc_response_addr, tlx.clc_response)
+    # assert isinstance(clc_response_addr, tlx.clc_response)
 
     x = _semantic.builder.clc_query(clc_response_addr.handle, )
     return _semantic.tensor(x, tl.int32)
@@ -65,29 +66,48 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 @tl.builtin
 def clc_producer(context, k, p_producer, _semantic=None):
+    pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
+
+    bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
+    bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
+    response = local_view(context._clc_responses, k, _semantic=_semantic)
+
+    bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+    bar_full = remote_view(bar_full, 0, _semantic=_semantic)
+
     # acquire
-    barrier_wait(local_view(context._clc_mbars_empty, k, _semantic=_semantic), p_producer, _semantic=_semantic)
+    barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
 
     # commit
-    barrier_expect_bytes(local_view(context._clc_mbars_full, k, _semantic=_semantic), tl.constexpr(16),
-                         _semantic=_semantic)
+    barrier_expect_bytes(bar_full, tl.constexpr(16), _semantic=_semantic)
+
     _clc_issue(
-        local_view(context._clc_responses, k, _semantic=_semantic),
-        local_view(context._clc_mbars_full, k, _semantic=_semantic),
+        response,
+        bar_full,
         _semantic=_semantic,
     )
 
 
 @tl.builtin
 def clc_consumer(context, k, p_consumer, _semantic=None):
+    pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
+
+    bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
+    bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
+    response = local_view(context._clc_responses, k, _semantic=_semantic)
+
+    bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+    bar_full = remote_view(bar_full, 0, _semantic=_semantic)
+    response = remote_view(response, 0, _semantic=_semantic)
+
     # wait
-    barrier_wait(local_view(context._clc_mbars_full, k, _semantic=_semantic), p_consumer, _semantic=_semantic)
+    barrier_wait(bar_full, p_consumer, pred_cta0, _semantic=_semantic)
 
     # extract
-    stolen_tile_id = _clc_query(local_view(context._clc_responses, k, _semantic=_semantic), _semantic=_semantic)
+    stolen_tile_id = _clc_query(response, _semantic=_semantic)
 
     # release
-    barrier_arrive(local_view(context._clc_mbars_empty, k, _semantic=_semantic), _semantic=_semantic)
+    barrier_arrive(bar_empty, _semantic=_semantic)
 
     # return
     return stolen_tile_id

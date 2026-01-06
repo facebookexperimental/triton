@@ -384,8 +384,8 @@ class mbarrier(tl.base_value):
         layout: Optional[swizzled_shared_layout_encoding],
         storage: storage_kind = storage_kind.smem,
     ):
-        assert (storage == storage_kind.smem
-                or storage == storage_kind.smemCluster), "mbarrier requires storage to be smem or smemCluster"
+        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
+            "mbarrier requires storage to be smem or smemCluster")
         self.handle = handle
         self.type = mbarrier_type(num, layout, storage)
         self.num = num
@@ -428,9 +428,17 @@ class clc_response(tl.base_value):
     Define a CLC response object
     """
 
-    def __init__(self, handle, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+    def __init__(
+        self,
+        handle,
+        num: int,
+        layout: Optional[swizzled_shared_layout_encoding],
+        storage: storage_kind = storage_kind.smem,
+    ):
+        assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
+            "clc_response requires storage to be smem or smemCluster")
         self.handle = handle
-        self.type = clc_response_type(num, layout)
+        self.type = clc_response_type(num, layout, storage)
         self.num = num
 
     def _flatten_ir(self, handles) -> None:
@@ -449,11 +457,11 @@ class clc_response_type(buffered_tensor_type):
     # since we have two concrete use cases now (mbarrier and clc_response)
     # both of which are opaque objects with fixed size
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
-        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage):
+        super().__init__(tl.int64, [1], num, storage, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
-        value = clc_response(handles[cursor], self.num, self.layout)
+        value = clc_response(handles[cursor], self.num, self.layout, self.storage)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:
@@ -568,7 +576,7 @@ class tensor_descriptor_ptr_type(tl.pointer_type):
         self.size = size
 
     def __eq__(self, other):
-        return (isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size)
+        return isinstance(other, tensor_descriptor_ptr_type) and self.num == other.num and self.size == other.size
 
     def __repr__(self) -> str:
         return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"
