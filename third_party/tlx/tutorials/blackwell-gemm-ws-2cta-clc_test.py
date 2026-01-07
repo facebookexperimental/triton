@@ -253,13 +253,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
             while tile_id != -1:
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-
-                group_id = tile_id // num_pid_in_group
-                first_pid_m = group_id * GROUP_SIZE_M
-                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-                pid_m = first_pid_m + (tile_id % group_size_m)
-                pid_n = (tile_id % num_pid_in_group) // group_size_m
-
                 offs_am = pid_m * BLOCK_SIZE_M
                 # split B into two parts so each CTA has different offset
                 if PAIR_CTA:
