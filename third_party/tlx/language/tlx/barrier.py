@@ -1,5 +1,6 @@
 import triton.language.core as tl
 from . import types as tlx
+from .mem_ops import remote_view
 from .utility import is_hip
 
 
@@ -63,6 +64,7 @@ def barrier_wait(
     bar: tlx.buffered_tensor,
     phase,
     pred: tl.tensor = None,
+    remote_cta_rank: tl.tensor = None,
     _semantic=None,
 ) -> None:
     """
@@ -74,6 +76,10 @@ def barrier_wait(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
+
+    if remote_cta_rank is not None:
+        bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
+
     if isinstance(phase, tl.tensor):
         _semantic.builder.create_barrier_wait(bar.handle, phase.handle, pred_handle)
     elif isinstance(phase, tl.constexpr):
@@ -88,6 +94,7 @@ def barrier_wait(
 def barrier_arrive(
         bar: tlx.buffered_tensor,
         arrive_count: tl.constexpr = tl.constexpr(1),
+        remote_cta_rank: tl.tensor = None,
         _semantic=None,
 ) -> None:
     """
@@ -96,6 +103,8 @@ def barrier_arrive(
 
     assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
 
+    if remote_cta_rank is not None:
+        bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
     # TODO. add validator logics
     _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)
 
