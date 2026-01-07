@@ -110,14 +110,19 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     # Dynamic tiling setup
-    # clc_context = tlx.clc_create_context(1, 3)
+    clc_context = tlx.clc_create_context(1, 6)
 
-    clc_mbars_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=6)
-    clc_mbars_full = tlx.alloc_barriers(1)
-    clc_responses = tlx._alloc_clc_responses(1)
+    # clc_mbars_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=6)
+    # clc_mbars_full = tlx.alloc_barriers(1)
+    # clc_responses = tlx._alloc_clc_responses(1)
 
-    clc_bar_full = clc_mbars_full[0]
-    clc_response = tlx.remote_view(clc_responses[0], 0)
+    # clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
+    # clc_bar_full = clc_mbars_full[0]
+    # clc_response = tlx.remote_view(clc_responses[0], 0)
+
+    # clc_bar_empty = tlx.remote_view(clc_context._clc_mbars_empty[0], 0)
+    # clc_bar_full = clc_context._clc_mbars_full[0]
+    # clc_response = tlx.remote_view(clc_context._clc_responses[0], 0)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -130,8 +135,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
 
-            clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-
             tmem_read_phase = 0
             cur_tmem_buf = 0
 
@@ -139,15 +142,17 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                # if tlx.cluster_cta_rank() == 0:
-                #     tlx.clc_producer(clc_context, 0, clc_phase_producer)
-                #     clc_phase_producer ^= 1
-
-                tlx.barrier_wait(clc_bar_empty, phase=clc_phase_producer, pred=pred_cta0)
+                tlx.clc_producer_wait(clc_context, 0, clc_phase_producer, pred_cta0)
 
                 if pred_cta0:
-                    tlx.barrier_expect_bytes(clc_bar_full, 16)
-                    tlx._clc_issue(clc_response, tlx.remote_view(clc_bar_full, 0))
+                    tlx.clc_producer(clc_context, 0, clc_phase_producer)
+
+                # tlx.barrier_wait(clc_bar_empty, phase=clc_phase_producer, pred=pred_cta0)
+
+                # if pred_cta0:
+                #     tlx.barrier_expect_bytes(clc_bar_full, 16)
+                #     tlx._clc_issue(clc_response, clc_bar_full)
+
                 clc_phase_producer ^= 1
 
                 # for tile_id in range(start_pid, num_tiles, NUM_SMS):
@@ -190,14 +195,16 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
-                # tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
-                # clc_phase_consumer ^= 1
-
-                tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
-                tile_id = tlx._clc_query(clc_response)
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, pred_cta0)
                 if tile_id != -1:
                     tile_id += tlx.cluster_cta_rank()
-                tlx.barrier_arrive(clc_bar_empty, 1)
+
+                # tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
+                # tile_id = tlx._clc_query(clc_response)
+                # if tile_id != -1:
+                #     tile_id += tlx.cluster_cta_rank()
+                # tlx.barrier_arrive(clc_bar_empty, 1)
+
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
@@ -209,10 +216,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             num_tiles = num_pid_m * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             # end of common code
-
-            clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-            # clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
-            clc_response = tlx.remote_view(clc_responses[0], 0)
 
             dot_phase = 0  # the current phase of dot op
             tmem_write_phase = 1  # sync between epilogue consumer and MMA consumer
@@ -271,14 +274,15 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
 
-                # tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
-                # clc_phase_consumer ^= 1
-
-                tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
-                tile_id = tlx._clc_query(clc_response)
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, pred_cta0)
                 if tile_id != -1:
                     tile_id += tlx.cluster_cta_rank()
-                tlx.barrier_arrive(clc_bar_empty, 1)
+
+                # tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
+                # tile_id = tlx._clc_query(clc_response)
+                # if tile_id != -1:
+                #     tile_id += tlx.cluster_cta_rank()
+                # tlx.barrier_arrive(clc_bar_empty, 1)
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
@@ -295,10 +299,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             # we virtually "flatten" the two layer loop as if we're performing tma loads on
             # one big list of data
             processed_k_iters = 0
-
-            clc_bar_empty = tlx.remote_view(clc_mbars_empty[0], 0)
-            # clc_bar_full = tlx.remote_view(clc_mbars_full[0], 0)
-            clc_response = tlx.remote_view(clc_responses[0], 0)
 
             tile_id = start_pid
             clc_phase_consumer = 0
@@ -339,14 +339,15 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
 
-                # tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
-                # clc_phase_consumer ^= 1
-
-                tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
-                tile_id = tlx._clc_query(clc_response)
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, pred_cta0)
                 if tile_id != -1:
                     tile_id += tlx.cluster_cta_rank()
-                tlx.barrier_arrive(clc_bar_empty, 1)
+
+                # tlx.barrier_wait(tlx.remote_view(clc_bar_full, 0), phase=clc_phase_consumer, pred=pred_cta0)
+                # tile_id = tlx._clc_query(clc_response)
+                # if tile_id != -1:
+                #     tile_id += tlx.cluster_cta_rank()
+                # tlx.barrier_arrive(clc_bar_empty, 1)
                 clc_phase_consumer ^= 1
 
 

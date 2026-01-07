@@ -1,7 +1,6 @@
 import triton.language.core as tl
 
 from . import types as tlx
-from .utility import cluster_cta_rank
 from .mem_ops import local_view, remote_view
 from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
 
@@ -65,18 +64,35 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 
 @tl.builtin
-def clc_producer(context, k, p_producer, _semantic=None):
-    pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
+def clc_producer_wait(context, k, p_producer, pred_cta0, _semantic=None):
+    # pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
 
     bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
-    bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
-    response = local_view(context._clc_responses, k, _semantic=_semantic)
+    # bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
+    # response = local_view(context._clc_responses, k, _semantic=_semantic)
 
     bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
-    bar_full = remote_view(bar_full, 0, _semantic=_semantic)
+    # bar_full = remote_view(bar_full, 0, _semantic=_semantic)
+    # response = remote_view(response, 0, _semantic=_semantic)
 
     # acquire
     barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
+
+
+@tl.builtin
+def clc_producer(context, k, p_producer, _semantic=None):
+    # pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
+
+    # bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
+    bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
+    response = local_view(context._clc_responses, k, _semantic=_semantic)
+
+    # bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+    # bar_full = remote_view(bar_full, 0, _semantic=_semantic)
+    response = remote_view(response, 0, _semantic=_semantic)
+
+    # acquire
+    # barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
 
     # commit
     barrier_expect_bytes(bar_full, tl.constexpr(16), _semantic=_semantic)
@@ -89,8 +105,8 @@ def clc_producer(context, k, p_producer, _semantic=None):
 
 
 @tl.builtin
-def clc_consumer(context, k, p_consumer, _semantic=None):
-    pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
+def clc_consumer(context, k, p_consumer, pred_cta0, _semantic=None):
+    # pred_cta0 = cluster_cta_rank(_semantic=_semantic) == 0
 
     bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
