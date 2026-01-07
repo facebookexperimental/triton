@@ -16,7 +16,6 @@ from .dynamic_launch import (
     clc_consumer,
     clc_create_context,
     clc_producer,
-    clc_producer_wait,
 )
 from .mem_ops import (
     allocate_tensor_descriptor,
@@ -140,7 +139,7 @@ __all__ = [
     "_clc_issue",
     "_clc_query",
     "clc_create_context",
-    "clc_producer_wait",
+    "clc_producer",
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
