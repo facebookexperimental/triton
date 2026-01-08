@@ -128,7 +128,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, pred_cta0)
+                tlx.clc_producer(clc_context, 0, clc_phase_producer, True, pred_cta0)
                 clc_phase_producer ^= 1
 
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
@@ -164,7 +164,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, pred_cta0)
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, True, pred_cta0)
                 if tile_id != -1:
                     tile_id += tlx.cluster_cta_rank()
 
@@ -229,7 +229,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, pred_cta0)
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, True, pred_cta0)
                 if tile_id != -1:
                     tile_id += tlx.cluster_cta_rank()
                 clc_phase_consumer ^= 1
@@ -279,7 +279,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, pred_cta0)
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, True, pred_cta0)
                 if tile_id != -1:
                     tile_id += tlx.cluster_cta_rank()
                 clc_phase_consumer ^= 1
