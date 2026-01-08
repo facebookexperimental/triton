@@ -1,3 +1,4 @@
+from typing import Optional
 import triton.language.core as tl
 
 from . import types as tlx
@@ -60,12 +61,13 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 
 @tl.builtin
-def clc_producer(context, k, p_producer, pred_cta0: tl.tensor = None, _semantic=None):
+def clc_producer(context, k, p_producer, two_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
     bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
-    if pred_cta0 is not None:
+    if two_ctas:
+        assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
         bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
         response = remote_view(response, 0, _semantic=_semantic)
 
@@ -83,12 +85,13 @@ def clc_producer(context, k, p_producer, pred_cta0: tl.tensor = None, _semantic=
 
 
 @tl.builtin
-def clc_consumer(context, k, p_consumer, pred_cta0: tl.tensor = None, _semantic=None):
+def clc_consumer(context, k, p_consumer, two_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
     bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
-    if pred_cta0 is not None:
+    if two_ctas:
+        assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
         bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
         bar_full = remote_view(bar_full, 0, _semantic=_semantic)
         response = remote_view(response, 0, _semantic=_semantic)
