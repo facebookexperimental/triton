@@ -1840,10 +1840,11 @@ attention = _attention.apply
 @pytest.mark.parametrize("N_CTX", [1024])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"])
+@pytest.mark.parametrize("provider", ["triton"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
 @pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_op(
     Z,
     H,
@@ -1854,7 +1855,7 @@ def test_op(
     causal,
     BLOCK_M1,
     GROUP_SIZE_M,
-    dtype=torch.float16,
+    dtype,
 ):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -1882,7 +1883,7 @@ def test_op(
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).half()
+    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).to(dtype)
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -1892,16 +1893,21 @@ def test_op(
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dq, q.grad = q.grad.clone(), None
-    # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+    #
+
+    # bfloat16 has lower precision (7 mantissa bits vs 10 for float16),
+    # so we need a higher tolerance for bfloat16 tests on bwd. Largest
+    # encountered seems to be 4e-2.
+    if dtype == torch.bfloat16:
+        atol = 5e-2
+    else:
+        atol = 1e-2
     rtol = 0.0
-    # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
-    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if (torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a"):
-        rtol = 1e-2
-    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+
+    torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dv, ref_dv, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dk, ref_dk, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dq, ref_dq, atol=atol, rtol=rtol)
 
 
 try:
@@ -1938,9 +1944,9 @@ for mode in ["fwd", "bwd"]:
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, dtype=torch.float16):
     assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
+    assert dtype in [torch.float16, torch.bfloat16]
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
