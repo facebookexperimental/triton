@@ -64,21 +64,23 @@ def barrier_wait(
     bar: tlx.buffered_tensor,
     phase,
     pred: tl.tensor = None,
-    remote_cta_rank: tl.tensor = None,
     _semantic=None,
 ) -> None:
     """
-    Wait until the mbarrier phase completes
+    Wait until the mbarrier phase completes.
+
+    Note: barrier_wait only supports local mbarrier. Remote view of mbarrier is not allowed.
     """
 
-    # TODO. add validator logics
+    assert isinstance(bar, tlx.mbarrier), "barrier_wait requires a local view mbar, not a remote view"
+    assert bar.type.storage == tlx.storage_kind.smem, (
+        "barrier_wait does not support remote_view of mbarrier. "
+        "Use local mbarrier only (storage must be smem, not smemCluster).")
+
     if pred is None:
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
-
-    if remote_cta_rank is not None:
-        bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
 
     if isinstance(phase, tl.tensor):
         _semantic.builder.create_barrier_wait(bar.handle, phase.handle, pred_handle)
@@ -98,14 +100,20 @@ def barrier_arrive(
         _semantic=None,
 ) -> None:
     """
-    Perform the arrive operation on an mbarrier
+    Perform the arrive operation on an mbarrier.
+
+    Args:
+        bar: The mbarrier to signal. Can be a local mbarrier or a remote view of mbarrier.
+        arrive_count: The number of arrivals to signal.
+        remote_cta_rank: If provided, the barrier will be mapped to the remote CTA's shared memory
+                         before signaling. This allows signaling a barrier in another CTA.
     """
 
+    assert isinstance(bar, tlx.mbarrier), "barrier_arrive requires a local view mbar, not a remote view"
     assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
 
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
-    # TODO. add validator logics
     _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)
 
 

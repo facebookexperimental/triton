@@ -189,7 +189,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     # CTA0 waits for CTA0 and CTA1 to finish loading A and B before issuing dot op
                     if PAIR_CTA:
                         tlx.barrier_arrive(cta_bars[buf], arrive_count=1, remote_cta_rank=0)
-                        tlx.barrier_wait(cta_bars[buf], phase=dot_phase, pred=pred_cta0, remote_cta_rank=0)
+                        tlx.barrier_wait(cta_bars[buf], phase=dot_phase, pred=pred_cta0)
 
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
                     tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,

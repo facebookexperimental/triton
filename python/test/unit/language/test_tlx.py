@@ -1135,7 +1135,7 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
 
         # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
         tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
-        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0, remote_cta_rank=0)
+        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
         buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         acc_tmem = tlx.local_view(buffers, 0)
@@ -1418,7 +1418,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
 
                 # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
                 tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
-                tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0, remote_cta_rank=0)
+                tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
                 # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
                 tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
@@ -3163,3 +3163,26 @@ def test_tensor_descriptor_ws_capture(BLOCK_SIZE, device):
     grid = lambda meta: (triton.cdiv(SIZE, BLOCK_SIZE), )
     kernel[grid](input_data, output_data, SIZE, BLOCK_SIZE)
     assert torch.allclose(output_data, input_data), "Tensor descriptor capture in WS region failed"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_wait_no_remote_view(device):
+    """Test that barrier_wait does not allow remote_view of mbarrier."""
+
+    @triton.jit
+    def barrier_wait_remote_view_kernel():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        # Get remote view of the barrier
+        remote_bar = tlx.remote_view(bar, 0)
+        # This should raise an assertion error because barrier_wait does not support remote_view
+        tlx.barrier_wait(remote_bar, phase=0)
+
+    grid = lambda meta: (1, )
+    with pytest.raises(triton.CompilationError) as e:
+        barrier_wait_remote_view_kernel[grid](ctas_per_cga=(2, 1, 1))
+    exc_msg = str(e.value)
+    # The error can come from either assertion:
+    # 1. "barrier_wait requires an mbarrier" (if remote_view returns non-mbarrier type)
+    # 2. "barrier_wait does not support remote_view of mbarrier" (if it passes mbarrier check but fails storage check)
+    assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"
