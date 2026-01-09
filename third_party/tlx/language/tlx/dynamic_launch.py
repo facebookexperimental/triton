@@ -38,6 +38,7 @@ def _clc_issue(
 ):
     # Issue an async `clusterlaunchcontrol.try_cancel` request to obtain
     # the CTA ID of an available cluster.
+    assert isinstance(clc_response_addr, tlx.clc_response)
     return _semantic.builder.clc_issue(clc_response_addr.handle, barrier.handle)
 
 
@@ -47,6 +48,7 @@ def _clc_query(
     _semantic=None,
 ):
     # Extract the CTA ID from the CLC response.
+    assert isinstance(clc_response_addr, tlx.clc_response)
     x = _semantic.builder.clc_query(clc_response_addr.handle, )
     return _semantic.tensor(x, tl.int32)
 
