@@ -72,7 +72,6 @@ def barrier_wait(
     Note: barrier_wait only supports local mbarrier. Remote view of mbarrier is not allowed.
     """
 
-    assert isinstance(bar, tlx.mbarrier), "barrier_wait requires a local view mbar, not a remote view"
     assert bar.type.storage == tlx.storage_kind.smem, (
         "barrier_wait does not support remote_view of mbarrier. "
         "Use local mbarrier only (storage must be smem, not smemCluster).")
@@ -108,8 +107,8 @@ def barrier_arrive(
         remote_cta_rank: If provided, the barrier will be mapped to the remote CTA's shared memory
                          before signaling. This allows signaling a barrier in another CTA.
     """
-
-    assert isinstance(bar, tlx.mbarrier), "barrier_arrive requires a local view mbar, not a remote view"
+    assert bar.type.storage == tlx.storage_kind.smem, (
+        "barrier_wait does not allow users to pass a remote_view of mbarrier. Remote view is done inside barrier_wait")
     assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
 
     if remote_cta_rank is not None:

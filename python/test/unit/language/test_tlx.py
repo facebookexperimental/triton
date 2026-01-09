@@ -3182,7 +3182,4 @@ def test_barrier_wait_no_remote_view(device):
     with pytest.raises(triton.CompilationError) as e:
         barrier_wait_remote_view_kernel[grid](ctas_per_cga=(2, 1, 1))
     exc_msg = str(e.value)
-    # The error can come from either assertion:
-    # 1. "barrier_wait requires an mbarrier" (if remote_view returns non-mbarrier type)
-    # 2. "barrier_wait does not support remote_view of mbarrier" (if it passes mbarrier check but fails storage check)
     assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"
