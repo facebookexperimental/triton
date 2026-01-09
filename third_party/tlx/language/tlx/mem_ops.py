@@ -194,10 +194,10 @@ def _get_remote_cta_rank_handle(remote_cta_rank, _semantic):
 
 @tl.builtin
 def remote_view(
-    local_allocated_buffer: tlx.mbarrier | tlx.clc_response,
+    local_allocated_buffer: tlx.mbarrier,
     remote_cta_rank: int | tl.constexpr | tl.tensor,
     _semantic=None,
-) -> tlx.mbarrier | tlx.clc_response:
+) -> tlx.mbarrier:
     """
     Returns a remote view of the buffer. This returns a remote buf handle living in a CTA in the same CTA cluster with the
     executing CTA.
@@ -206,21 +206,13 @@ def remote_view(
     a cluster of shape [2, 4] a valid unique ID could be 0~7, including the executing CTA itself
     :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
     """
-    assert isinstance(local_allocated_buffer, tlx.mbarrier) or isinstance(
-        local_allocated_buffer, tlx.clc_response), ("remote_view only supports barrier/clc_response for now")
+    assert isinstance(local_allocated_buffer, tlx.mbarrier), ("remote_view only supports barrier for now")
     assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
                                                                       remote_cta_rank_handle)
     if isinstance(local_allocated_buffer, tlx.mbarrier):
         return tlx.mbarrier(
-            remote_buf_handle,
-            0,
-            local_allocated_buffer.type.layout,
-            storage_kind.smemCluster,
-        )
-    elif isinstance(local_allocated_buffer, tlx.clc_response):
-        return tlx.clc_response(
             remote_buf_handle,
             0,
             local_allocated_buffer.type.layout,
