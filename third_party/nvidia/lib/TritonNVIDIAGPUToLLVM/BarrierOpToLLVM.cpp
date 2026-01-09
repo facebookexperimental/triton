@@ -391,7 +391,7 @@ struct CLCQueryCancelOpConversion
       .reg .b128 clc_result;
       .reg .pred p1;
       mov.s32 $0, -1;
-      ld.shared::cluster.b128 clc_result, [$1];
+      ld.shared.b128 clc_result, [$1];
       clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
       @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$0, _, _, _}, clc_result;
     }

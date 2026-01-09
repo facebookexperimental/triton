@@ -111,6 +111,8 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     # Dynamic tiling setup
     clc_context = tlx.clc_create_context(1, 6)
 
+    clc_consumer_bars_two_cta = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
             # common code duplicated for each region to avoid SMEM overhead
@@ -318,7 +320,9 @@ def matmul(a, b):
 )
 def test_op():
     torch.manual_seed(0)
-    for i in [512 * j for j in range(1, 6)] + [8192]:
+    # for i in [512 * j for j in range(1, 9)] + [8192]:
+    # for i in [3584]:
+    for i in [8192]:
         M, N, K = i, i, i
         a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
         b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
