@@ -63,7 +63,7 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 
 @tl.builtin
-def clc_producer(context, k, p_producer, two_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
+def clc_producer(context, k, p_producer, multi_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
     """
     Issue a CLC try_cancel request from the first CTA in the cluster.
 
@@ -85,9 +85,11 @@ def clc_producer(context, k, p_producer, two_ctas: bool = False, pred_cta0: Opti
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
-    if two_ctas:
+    if multi_ctas:
         assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
         bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+    else:
+        assert pred_cta0 is None, "pred_cta0 must be None when two_ctas is False"
 
     # acquire
     barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
@@ -103,7 +105,7 @@ def clc_producer(context, k, p_producer, two_ctas: bool = False, pred_cta0: Opti
 
 
 @tl.builtin
-def clc_consumer(context, k, p_consumer, two_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
+def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
     """
     Decode the tile ID from a CLC response.
 
@@ -123,9 +125,11 @@ def clc_consumer(context, k, p_consumer, two_ctas: bool = False, pred_cta0: Opti
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
-    if two_ctas:
+    if multi_ctas:
         assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
         bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+    else:
+        assert pred_cta0 is None, "pred_cta0 must be None when two_ctas is False"
 
     # wait
     barrier_wait(bar_full, p_consumer, pred_cta0, _semantic=_semantic)
