@@ -69,7 +69,7 @@ def clc_producer(context, k, p_producer, two_ctas: bool = False, pred_cta0: Opti
     if two_ctas:
         assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
         bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
-        response = remote_view(response, 0, _semantic=_semantic)
+        # response = remote_view(response, 0, _semantic=_semantic)
 
     # acquire
     barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
@@ -94,7 +94,7 @@ def clc_consumer(context, k, p_consumer, two_ctas: bool = False, pred_cta0: Opti
         assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
         bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
         bar_full = remote_view(bar_full, 0, _semantic=_semantic)
-        response = remote_view(response, 0, _semantic=_semantic)
+        # response = remote_view(response, 0, _semantic=_semantic)
 
     # wait
     barrier_wait(bar_full, p_consumer, pred_cta0, _semantic=_semantic)
