@@ -108,7 +108,8 @@ def barrier_arrive(
                          before signaling. This allows signaling a barrier in another CTA.
     """
     assert bar.type.storage == tlx.storage_kind.smem, (
-        "barrier_wait does not allow users to pass a remote_view of mbarrier. Remote view is done inside barrier_wait")
+        "barrier_arrive does not allow users to pass a remote_view of mbarrier. Remote view is done inside barrier_arrive"
+    )
     assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
 
     if remote_cta_rank is not None:
