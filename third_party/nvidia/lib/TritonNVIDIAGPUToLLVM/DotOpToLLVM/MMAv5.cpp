@@ -265,17 +265,20 @@ static void createScaledGen5MMA(ConversionPatternRewriter &rewriter,
                                 MemDescOperand a, Value b, MemDescOperand d,
                                 Value scaleA, Value scaleB, Value pred,
                                 Value instDescriptor, Value useInitAcc,
-                                bool aInTmem, mxfpKind mxfpInstKind) {
+                                bool aInTmem, mxfpKind mxfpInstKind,
+                                bool twoCTAs) {
   PTXBuilder ptxBuilder;
+  std::string ctaGroup = std::to_string(twoCTAs ? 2 : 1);
   std::string opcode;
   if (mxfpInstKind == mxfpKind::mxf8f6f4) {
-    opcode =
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X";
+    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
+             ".kind::mxf8f6f4.block_scale.scale_vec::1X";
   } else if (mxfpInstKind == mxfpKind::mxf4) {
-    opcode = "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X";
+    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
+             ".kind::mxf4.block_scale.scale_vec::2X";
   } else if (mxfpInstKind == mxfpKind::mxf4nvf4) {
-    opcode =
-        "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X";
+    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
+             ".kind::mxf4nvf4.block_scale.scale_vec::4X";
   } else {
     assert(0 && "Unsupported mxfp kind.");
   }
@@ -653,13 +656,13 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
         subWordIdx, subWordIdx, mxfpInstKind);
     createScaledGen5MMA(rewriter, loc, op, a, b, accAddress, scaleA, scaleB,
                         pred, instDescriptor, useInitAcc, desc.aInTmem,
-                        mxfpInstKind);
+                        mxfpInstKind, op.getTwoCtas());
   };
 
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), /*twoCTAs=*/false,
+                 adaptor.getBarrierPreds(), op.getTwoCtas(),
                  /*tlxPairedMMA*/ false, opKindIsMXFP4, dot);
 }
 

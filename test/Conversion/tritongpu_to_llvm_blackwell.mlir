@@ -317,7 +317,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread=[1, 4], threadsPerWarp=[32, 1], warpsPerCTA=[4, 1], order=[0, 1]}>
+#shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8, CTAsPerCGA = [2, 1], CTASplitNum = [2, 1], CTAOrder = [1, 0]}>
+#shared1_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8, CTAsPerCGA = [1, 2], CTASplitNum = [1, 2], CTAOrder = [1, 0]}>
+#shared2_scales = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [2], CTASplitNum = [1], CTAOrder = [0]}>
+#tmem_scales_2ctas = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true, CTASplitM = 2>
+#tmem_scales_enc = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_scaled_2ctas
+  tt.func @tc_gen5_mma_scaled_2ctas(%a: !ttg.memdesc<256x64xf8E4M3FN, #shared_scales, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<64x128xf8E4M3FN, #shared1_scales, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<256x128xf32, #tmem_scales_2ctas, #ttng.tensor_memory, mutable>,
+                       %scale_a: !ttg.memdesc<256x2xi8, #tmem_scales_enc, #ttng.tensor_memory>,
+                       %scale_b: !ttg.memdesc<128x2xi8, #tmem_scales_enc, #ttng.tensor_memory>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2_scales, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    // CHECK: tcgen05.mma.cta_group::2.kind::mxf8f6f4
+    // CHECK: tcgen05.mma.cta_group::2.kind::mxf8f6f4
+    // CHECK: tcgen05.commit.cta_group::2.mbarrier::arrive::one
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e4m3 rhs = e4m3, %barrier[%barrierPred] {is_async, two_ctas} :
+       !ttg.memdesc<256x64xf8E4M3FN, #shared_scales, #ttg.shared_memory>,
+       !ttg.memdesc<64x128xf8E4M3FN, #shared1_scales, #ttg.shared_memory>,
+       !ttg.memdesc<256x128xf32, #tmem_scales_2ctas, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<256x2xi8, #tmem_scales_enc, #ttng.tensor_memory>,
+       !ttg.memdesc<128x2xi8, #tmem_scales_enc, #ttng.tensor_memory>,
+       !ttg.memdesc<1xi64, #shared2_scales, #ttg.shared_memory>
+    tt.return
+  }
+}
+
+// -----
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>

@@ -539,9 +539,14 @@ bool TCGen5MMAScaledOp::verifyOutputDims() {
   if (this->getBType() == ScaleDotElemType::E2M1 && transB)
     bNdim *= 2;
 
-  if (aMdim != oMdim || bNdim != oNdim)
+  if (aMdim != oMdim)
     return false;
-  return true;
+
+  // For 2-CTA TLX mode, output N should be 2 * B's N dimension
+  if (getTwoCtas()) {
+    return oNdim == bNdim || oNdim == 2 * bNdim;
+  }
+  return bNdim == oNdim;
 }
 
 Value TCGen5MMAScaledOp::useAccumulator() { return getUseD(); }
@@ -610,8 +615,9 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
                               Type token, Value a, Value b, Value d,
                               Value accDep, Value aScale, Value bScale,
                               ScaleDotElemType aType, ScaleDotElemType bType,
-                              Value useD, Value pred, ValueRange barriers,
-                              ValueRange barrierPreds, bool isAsync) {
+                              Value useD, Value pred, bool twoCTAs,
+                              ValueRange barriers, ValueRange barrierPreds,
+                              bool isAsync) {
   MLIRContext *ctx = builder.getContext();
   if (!barriers.empty()) {
     isAsync = true;
@@ -619,7 +625,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, token, a, b, d, accDep, aScale, bScale,
         ScaleDotElemTypeAttr::get(ctx, aType),
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
-        barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr());
+        barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
+        twoCTAs ? builder.getUnitAttr() : UnitAttr());
 }
 
 bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }

@@ -127,13 +127,21 @@ public:
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    auto hasTLXTwoCTAs = mod.walk([&](ttng::TCGen5MMAOp tcgen05MMAOp) {
-                              if (tcgen05MMAOp.getTwoCtas()) {
-                                return WalkResult::interrupt();
-                              }
-                              return WalkResult::advance();
-                            })
-                             .wasInterrupted();
+    auto hasTLXTwoCTAs =
+        mod.walk([&](Operation *op) {
+             if (auto tcgen05MMAOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+               if (tcgen05MMAOp.getTwoCtas()) {
+                 return WalkResult::interrupt();
+               }
+             } else if (auto tcgen05MMAScaledOp =
+                            dyn_cast<ttng::TCGen5MMAScaledOp>(op)) {
+               if (tcgen05MMAScaledOp.getTwoCtas()) {
+                 return WalkResult::interrupt();
+               }
+             }
+             return WalkResult::advance();
+           })
+            .wasInterrupted();
 
     if (failed(verifyModule(mod, hasTLXTwoCTAs))) {
       return signalPassFailure();

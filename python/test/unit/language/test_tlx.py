@@ -1492,6 +1492,193 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     torch.testing.assert_close(z, ref_out)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_scaled_2cta(device):
+    """
+    Test 2-CTA scaled MMA generates tcgen05.mma.cta_group::2 instruction.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def tcgen5_dot_scaled_2cta_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        a_scale_ptr,
+        b_scale_ptr,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+    ):
+        # difference from 1cta
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        pred_cta0 = cluster_cta_rank == 0
+        cta_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)  # CTA0 waits for signals from both CTAs
+
+        desc_a = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+
+        desc_b = tl.make_tensor_descriptor(b_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
+                                           block_shape=[BLOCK_K, BLOCK_N // 2],  # difference from 1cta
+                                           )
+
+        desc_a_scale = tl.make_tensor_descriptor(
+            a_scale_ptr,
+            shape=[M // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        desc_b_scale = tl.make_tensor_descriptor(b_scale_ptr, shape=[N // 128, K // 32 // 4, 2, 2 * 128],
+                                                 strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+                                                 block_shape=[BLOCK_N // 2 // 128, BLOCK_K // 32 // 4, 2,
+                                                              2 * 128],  # difference from 1cta: B scale is half
+                                                 )
+
+        # async load a and b into SMEM
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float8e4nv, tl.constexpr(1))  # difference from 1cta
+        a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((BLOCK_N // 2 // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8,
+                                       tl.constexpr(1))  # difference from 1cta: B scale is half
+
+        bars = tlx.alloc_barriers(tl.constexpr(4))
+        bar_a = tlx.local_view(bars, 0)
+        bar_b = tlx.local_view(bars, 1)
+        bar_a_scale = tlx.local_view(bars, 2)
+        bar_b_scale = tlx.local_view(bars, 3)
+        tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K * 1)  # fp8
+        tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 1)  # difference from 1cta
+        tlx.barrier_expect_bytes(bar_a_scale, BLOCK_M // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)
+        tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N // 2 // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)
+
+        # difference from 1cta: size and offsets
+        tlx.async_descriptor_load(desc_a, a_tile[0], [cluster_cta_rank * BLOCK_M, 0], bar_a)
+        tlx.async_descriptor_load(desc_b, b_tile[0], [0, cluster_cta_rank * BLOCK_N // 2], bar_b)
+        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [0, 0, 0, 0], bar_a_scale)
+        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0], bar_b_scale)
+
+        tlx.barrier_wait(bar_a, tl.constexpr(0))
+        tlx.barrier_wait(bar_b, tl.constexpr(0))
+        tlx.barrier_wait(bar_a_scale, tl.constexpr(0))
+        tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
+
+        # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
+        cta_bar = tlx.remote_view(cta_bars[0], 0)
+        tlx.barrier_arrive(cta_bar, 1)
+        tlx.barrier_wait(cta_bar, phase=0, pred=pred_cta0)
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
+        tlx.async_dot_scaled(
+            a_tile[0],
+            b_tile[0],
+            c_tile[0],
+            a_scale_tile[0],
+            A_format,
+            b_scale_tile[0],
+            B_format,
+            use_acc=False,
+            two_ctas=True,
+        )
+        result = tlx.local_load(c_tile[0])
+
+        c = result.to(tl.float16)
+        offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    triton.set_allocator(alloc_fn)
+    torch.manual_seed(0)
+    # Use N=256 so that BLOCK_N//2=128 (required for b_scale shape to be valid: 128//128=1)
+    M, N, K = (256, 256, 128)
+
+    DTYPE_MAP = {
+        "e5m2": torch.float8_e5m2,
+        "e4m3": torch.float8_e4m3fn,
+    }
+
+    A_DATA_TYPE = "e4m3"
+    B_DATA_TYPE = "e4m3"
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(DTYPE_MAP[A_DATA_TYPE]).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
+    a_scale = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
+    b_scale = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+
+    BLOCK_M = M // 2
+    BLOCK_N = N
+    BLOCK_K = K
+    kern_kwargs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "M": M,
+        "N": N,
+        "K": K,
+    }
+    kernel = tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
+        a,
+        a.stride(0),
+        a.stride(1),
+        b,
+        b.stride(0),
+        b.stride(1),
+        a_scale,
+        b_scale,
+        c,
+        c.stride(0),
+        c.stride(1),
+        A_DATA_TYPE,
+        B_DATA_TYPE,
+        ctas_per_cga=(2, 1, 1),  # TLX way: explicitly set cluster dims
+        **kern_kwargs,
+    )
+
+    # verify kernel launch cluster
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("ttng.map_to_remote_buffer") == 1
+    assert ttgir.count("ttng.tc_gen5_mma_scaled") >= 1
+
+    ptx = kernel.asm["ptx"]
+    # The key assertion: with two_ctas=True, should generate cta_group::2 for scaled MMA
+    assert ptx.count("tcgen05.mma.cta_group::2") > 0, (
+        f"Expected tcgen05.mma.cta_group::2 for 2-CTA scaled MMA, but found: "
+        f"cta_group::1 count={ptx.count('tcgen05.mma.cta_group::1')}, "
+        f"cta_group::2 count={ptx.count('tcgen05.mma.cta_group::2')}")
+
+
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])
 @pytest.mark.parametrize("B_DATA_TYPE", ["e5m2", "e4m3"])
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
