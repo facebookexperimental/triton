@@ -238,9 +238,8 @@ def _process_tile_mma_inner(
         tlx.barrier_wait(smem_full_bars[buf], phase)
         # CTA0 waits for CTA0 and CTA1 to finish loading A and B before issuing dot op
         if PAIR_CTA:
-            cta_bar = tlx.remote_view(cta_bars[buf], 0)
-            tlx.barrier_arrive(cta_bar, 1)
-            tlx.barrier_wait(cta_bar, phase=phase, pred=pred_cta0)
+            tlx.barrier_arrive(cta_bars[buf], arrive_count=1, remote_cta_rank=0)
+            tlx.barrier_wait(cta_bars[buf], phase=phase, pred=pred_cta0)
 
         # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
         tlx.async_dot(
