@@ -33,7 +33,7 @@ def get_cuda_autotune_config():
         for BM in [128]
         for BN in [128, 256, 512]
         for BK in [64, 128]
-        for s in [2, 3, 4, 5, 6, 7]
+        for s in [2, 3, 4, 5, 6]
         for t in [2, 3]
         for subtile in [1, 2, 4, 8]
         for pairCTA in [True, False]
@@ -535,12 +535,12 @@ ref_lib = "cuBLAS"
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-        x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
+        x_vals=[8192],  # Different possible values for `x_name`
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=[ref_lib.lower(), "triton_persistent"],  # Label name for the lines
-        line_names=[ref_lib, "Triton (persisent)"],  # Line styles
+        line_vals=[ref_lib.lower(), "triton"],  # Label name for the lines
+        line_names=[ref_lib, "Triton"],  # Line styles
         styles=[("green", "-"), ("blue", "-")],
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
@@ -553,7 +553,7 @@ def benchmark(M, N, K, provider):
     if provider == ref_lib.lower():
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
                                                      rep=2000)
-    if provider == "triton_persistent":
+    if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
 
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
