@@ -733,6 +733,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
     def run(self, *args, grid, warmup, **kwargs):
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
+        # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
+        kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
+                                                 False) or knobs.runtime.sanitize_overflow or kwargs["debug"]
 
         # parse options
         device = driver.active.get_current_device()
