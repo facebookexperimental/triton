@@ -905,176 +905,6 @@ def _attn_bwd_preprocess(O, DO,  #
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
 
 
-# The main inner-loop logic for computing dK and dV.
-@triton.jit
-def _attn_bwd_dkdv(
-    dk,
-    dv,  #
-    desc_q,
-    k,
-    v,
-    sm_scale,  #
-    desc_do,  #
-    desc_dq,
-    M,
-    D,  #
-    # shared by Q/K/V/DO.
-    stride_tok,
-    stride_d,  #
-    off_bh,
-    H,
-    N_CTX,
-    BLOCK_M1: tl.constexpr,  #
-    BLOCK_N1: tl.constexpr,  #
-    HEAD_DIM: tl.constexpr,  #
-    # Filled in by the wrapper.
-    start_n,
-    start_m,
-    num_steps,  #
-    MASK: tl.constexpr,
-):
-    offs_m = start_m + tl.arange(0, BLOCK_M1)
-    offs_n = start_n + tl.arange(0, BLOCK_N1)
-
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-
-    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
-    tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
-    curr_m = start_m
-    step_m = BLOCK_M1
-    for blk_idx in range(num_steps):
-        q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
-        qT = tl.trans(q)
-        # Load m before computing qk to reduce pipeline stall.
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
-        qkT = tl.dot(k, qT)
-        pT = tl.math.exp2(qkT - m[None, :])
-        # Autoregressive masking.
-        if MASK:
-            mask = offs_m[None, :] >= offs_n[:, None]
-            pT = tl.where(mask, pT, 0.0)
-        do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
-        # Compute dV.
-        ppT = pT
-        ppT = ppT.to(tl.float16)
-        dv += tl.dot(ppT, do)
-        # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
-        # Compute dP and dS.
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
-        dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
-        dk += tl.dot(dsT, tl.trans(qT))
-        # Compute dq = tl.dot(tl.trans(dsT), k)
-        dq = tl.dot(tl.trans(dsT), k) * LN2
-        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), 0], dq)
-        # Increment pointers.
-        curr_m += step_m
-
-    return dk, dv
-
-
-def _bwd_host_descriptor_pre_hook(nargs):
-    BLOCK_M1 = nargs["BLOCK_M1"]
-    BLOCK_N1 = nargs["BLOCK_N1"]
-    HEAD_DIM = nargs["HEAD_DIM"]
-    nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM]
-
-
-configs_bwd = [
-    triton.Config(
-        {
-            "BLOCK_M1": 32,
-            "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 32,
-        },
-        num_warps=4,
-        num_stages=1,
-        pre_hook=_bwd_host_descriptor_pre_hook,
-    )
-]
-
-
-@triton.autotune(configs=configs_bwd, key=["N_CTX", "HEAD_DIM"])
-@triton.jit
-def _attn_bwd_triton(
-    desc_q,
-    desc_k,
-    desc_v,
-    sm_scale,  #
-    desc_do,  #
-    desc_dq,
-    desc_dk,
-    desc_dv,  #
-    M,
-    D,
-    # shared by Q/K/V/DO.
-    stride_z,
-    stride_h,
-    stride_tok,
-    stride_d,  #
-    H,
-    N_CTX,  #
-    BLOCK_M1: tl.constexpr,  #
-    BLOCK_N1: tl.constexpr,  #
-    BLOCK_M2: tl.constexpr,  #
-    BLOCK_N2: tl.constexpr,  #
-    BLK_SLICE_FACTOR: tl.constexpr,  #
-    HEAD_DIM: tl.constexpr,
-):
-    bhid = tl.program_id(2)
-    off_chz = (bhid * N_CTX).to(tl.int64)
-    off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
-    pid = tl.program_id(0)
-
-    # offset pointers for batch/head
-    M += off_chz
-    D += off_chz
-
-    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-
-    start_n = pid * BLOCK_N1
-    start_m = 0
-
-    # load K and V: they stay in SRAM throughout the inner loop.
-    k = desc_k.load([(off_bh + start_n).to(tl.int32), 0])
-    v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
-    # Compute dK and dV for non-masked blocks.
-    num_steps = (N_CTX - start_m) // BLOCK_M1
-    dk, dv = _attn_bwd_dkdv(  #
-        dk, dv,  #
-        desc_q, k, v, sm_scale,  #
-        desc_do,  #
-        desc_dq, M, D,  #
-        stride_tok, stride_d,  #
-        off_bh, H, N_CTX,  #
-        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-        start_n, start_m, num_steps,  #
-        MASK=False,  #
-    )
-
-    desc_dv.store(
-        [(off_bh + start_n).to(tl.int32), 0],
-        dv.to(tlx.dtype_of(desc_dv)),
-    )
-
-    # Write back dK.
-    dk *= sm_scale
-    desc_dk.store(
-        [(off_bh + start_n).to(tl.int32), 0],
-        dk.to(tlx.dtype_of(desc_dk)),
-    )
-
-
 @triton.jit
 def bwd_calculate_offsets(
     tile_idx,
@@ -2010,10 +1840,11 @@ attention = _attention.apply
 @pytest.mark.parametrize("N_CTX", [1024])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"])
+@pytest.mark.parametrize("provider", ["triton"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
 @pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_op(
     Z,
     H,
@@ -2024,7 +1855,7 @@ def test_op(
     causal,
     BLOCK_M1,
     GROUP_SIZE_M,
-    dtype=torch.float16,
+    dtype,
 ):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -2052,7 +1883,7 @@ def test_op(
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).half()
+    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).to(dtype)
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -2062,16 +1893,21 @@ def test_op(
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dq, q.grad = q.grad.clone(), None
-    # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+    #
+
+    # bfloat16 has lower precision (7 mantissa bits vs 10 for float16),
+    # so we need a higher tolerance for bfloat16 tests on bwd. Largest
+    # encountered seems to be 4e-2.
+    if dtype == torch.bfloat16:
+        atol = 5e-2
+    else:
+        atol = 1e-2
     rtol = 0.0
-    # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
-    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if (torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a"):
-        rtol = 1e-2
-    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+
+    torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dv, ref_dv, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dk, ref_dk, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dq, ref_dq, atol=atol, rtol=rtol)
 
 
 try:
@@ -2108,9 +1944,9 @@ for mode in ["fwd", "bwd"]:
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, dtype=torch.float16):
     assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
+    assert dtype in [torch.float16, torch.bfloat16]
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
