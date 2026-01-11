@@ -2,7 +2,7 @@ from typing import Optional
 import triton.language.core as tl
 
 from . import types as tlx
-from .mem_ops import local_view, remote_view
+from .mem_ops import local_view
 from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
 
 # Blackwell-only
@@ -47,7 +47,13 @@ def _clc_query(
     clc_response_addr: tlx.clc_response,
     _semantic=None,
 ):
-    # Extract the CTA ID from the CLC response.
+    """
+    Extract tile ID from CLC response.
+
+    Returns the tile ID decoded from the CLC response buffer, or -1 if no work
+    is available. In multi-CTA mode, callers should offset by cluster_cta_rank()
+    to get unique tile assignments (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
+    """
     assert isinstance(clc_response_addr, tlx.clc_response)
     x = _semantic.builder.clc_query(clc_response_addr.handle, )
     return _semantic.tensor(x, tl.int32)
@@ -67,36 +73,35 @@ def clc_producer(context, k, p_producer, multi_ctas: bool = False, pred_cta0: Op
     """
     Issue a CLC try_cancel request from the first CTA in the cluster.
 
-    This function is lowered to the following PTX instruction:
+    Multi-CTA Synchronization ("Arrive Remote, Wait Local"):
+    ---------------------------------------------------------
+    - WAIT: Only CTA 0 waits on its LOCAL bar_empty (predicated by pred_cta0).
+            Other CTAs skip the wait since they will signal CTA 0's barrier.
+    - EXPECT: Only CTA 0 sets barrier_expect_bytes (predicated by pred_cta0).
+    - ISSUE: CLC try_cancel is issued; hardware multicasts response to all CTAs.
+
+    Key constraint: barrier_wait must use LOCAL mbarrier only (per NVIDIA spec).
+    Remote signaling is done via barrier_arrive with remote_cta_rank parameter.
+
+    PTX instruction generated:
         clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
-
-    The `.multicast::cluster::all` qualifier indicates that the response is
-    asynchronously written via weak async-proxy writes to the corresponding
-    local shared memory address of each CTA in the requesting cluster. Write
-    completion for a particular CTA is signaled through a complete-tx operation
-    on the mbarrier object in that CTA's shared memory.
-
-    Consequently, each CTA maintains its own `bar_full` and `clc_response`.
-    Although `try_cancel` is executed only on CTA-0, other CTAs in the same
-    cluster can access the CLC response from their own shared memory once their
-    respective `bar_full` barrier signals completion.
     """
     bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
     if multi_ctas:
-        assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
-        bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+        assert pred_cta0 is not None, "pred_cta0 must be provided when multi_ctas is True"
     else:
-        assert pred_cta0 is None, "pred_cta0 must be None when two_ctas is False"
+        assert pred_cta0 is None, "pred_cta0 must be None when multi_ctas is False"
 
-    # acquire
+    # Only CTA 0 waits on its LOCAL bar_empty (arrive remote, wait local)
     barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
 
-    # commit
+    # Only CTA 0 sets barrier_expect_bytes
     barrier_expect_bytes(bar_full, tl.constexpr(16), pred_cta0, _semantic=_semantic)
 
+    # CLC issue - hardware handles multicast to all CTAs
     _clc_issue(
         response,
         bar_full,
@@ -107,38 +112,43 @@ def clc_producer(context, k, p_producer, multi_ctas: bool = False, pred_cta0: Op
 @tl.builtin
 def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
     """
-    Decode the tile ID from a CLC response.
+    Decode the tile ID from a CLC response and signal completion.
 
-    Returns the tile ID if the response was written successfully, otherwise -1.
+    Multi-CTA Synchronization ("Arrive Remote, Wait Local"):
+    ---------------------------------------------------------
+    - WAIT: Only CTA 0 waits on its LOCAL bar_full (predicated by pred_cta0).
+            CLC multicasts response to all CTAs, but only CTA 0 needs to wait.
+    - QUERY: Extract tile_id from response. Caller should offset by cluster_cta_rank().
+    - SIGNAL: All CTAs signal CTA 0's bar_empty via remote_cta_rank=0.
+              This is valid because we can arrive at remote mbar, but not wait on it.
 
-    This function is lowered to the following PTX instructions:
+    Returns the tile ID if successful, otherwise -1.
+
+    PTX instructions generated:
         clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_response;
         @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128
-
-    All CTAs in the cluster will decode the same tile ID. Typically, the result
-    (if not -1) should be offset by `tlx.cluster_cta_rank()` within the kernel.
-
-    Note: We may encapsulate this offset step in the TLX frontend after
-    evaluating additional use cases.
     """
     bar_empty = local_view(context._clc_mbars_empty, k, _semantic=_semantic)
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
     if multi_ctas:
-        assert pred_cta0 is not None, "pred_cta0 must be provided when two_ctas is True"
-        bar_empty = remote_view(bar_empty, 0, _semantic=_semantic)
+        assert pred_cta0 is not None, "pred_cta0 must be provided when multi_ctas is True"
     else:
-        assert pred_cta0 is None, "pred_cta0 must be None when two_ctas is False"
+        assert pred_cta0 is None, "pred_cta0 must be None when multi_ctas is False"
 
-    # wait
+    # Only CTA 0 waits on its LOCAL bar_full
     barrier_wait(bar_full, p_consumer, pred_cta0, _semantic=_semantic)
 
-    # extract
+    # Extract tile_id (caller should offset by cluster_cta_rank() in multi-CTA mode)
     stolen_tile_id = _clc_query(response, _semantic=_semantic)
 
-    # release
-    barrier_arrive(bar_empty, _semantic=_semantic)
+    # Signal completion: all CTAs signal CTA 0's bar_empty
+    if multi_ctas:
+        # Arrive at CTA 0's bar_empty via remote_cta_rank=0
+        # (barrier_arrive handles remote_view internally)
+        barrier_arrive(bar_empty, tl.constexpr(1), 0, _semantic=_semantic)
+    else:
+        barrier_arrive(bar_empty, _semantic=_semantic)
 
-    # return
     return stolen_tile_id

@@ -182,6 +182,13 @@ def _buffered_tensor_getitem(self, buffer_idx, _semantic=None):
 
 
 def _get_remote_cta_rank_handle(remote_cta_rank, _semantic):
+    """
+    Convert remote_cta_rank to MLIR Value handle.
+
+    Handles multiple input types:
+    - tl.constexpr or int: Converted via _convert_elem_to_ir_value
+    - tl.tensor: Extract .handle attribute
+    """
     if isinstance(remote_cta_rank, tl.constexpr) or isinstance(remote_cta_rank, int):
         remote_cta_rank_handle = _semantic._convert_elem_to_ir_value(tl._unwrap_if_constexpr(remote_cta_rank),
                                                                      require_i64=False)

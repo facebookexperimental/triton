@@ -503,6 +503,12 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value responseAddr, Value mbar) -> void {
              self.create<ttng::AsyncCLCTryCancelOp>(mbar, responseAddr);
            })
+      // clc_query: Extract tile ID from CLC response.
+      //
+      // Returns the tile ID decoded from the CLC response buffer.
+      // In multi-CTA mode, callers should offset by cluster_cta_rank() to get
+      // unique tile assignments (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
+      // Returns -1 if CLC response indicates no work available.
       .def("clc_query",
            [](TritonOpBuilder &self, Value responseAddr) -> Value {
              return self.create<ttng::CLCQueryCancelOp>(responseAddr);
