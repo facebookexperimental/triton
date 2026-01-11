@@ -1581,9 +1581,9 @@ def test_async_dot_scaled_2cta(device):
         tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
 
         # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
-        cta_bar = tlx.remote_view(cta_bars[0], 0)
-        tlx.barrier_arrive(cta_bar, 1)
-        tlx.barrier_wait(cta_bar, phase=0, pred=pred_cta0)
+        # "Arrive Remote, Wait Local" pattern: all CTAs signal CTA 0's barrier, only CTA 0 waits
+        tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
         c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
 
