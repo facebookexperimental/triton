@@ -1,9 +1,9 @@
-from typing import Optional
 import triton.language.core as tl
 
 from . import types as tlx
 from .mem_ops import local_view
 from .barrier import alloc_barriers, barrier_expect_bytes, barrier_wait, barrier_arrive
+from .utility import cluster_cta_rank
 
 # Blackwell-only
 
@@ -50,12 +50,15 @@ def _clc_query(
     """
     Extract tile ID from CLC response.
 
-    Returns the tile ID decoded from the CLC response buffer, or -1 if no work
-    is available. In multi-CTA mode, callers should offset by cluster_cta_rank()
-    to get unique tile assignments (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
+    Returns the tile ID decoded from the CLC response buffer, automatically
+    offset by cluster_cta_rank() so each CTA gets a unique tile assignment
+    (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.). Returns -1 if no work available.
+
+    Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the offset
+    is a no-op. This allows the same code path for both single and multi-CTA modes.
     """
     assert isinstance(clc_response_addr, tlx.clc_response)
-    x = _semantic.builder.clc_query(clc_response_addr.handle, )
+    x = _semantic.builder.clc_query(clc_response_addr.handle)
     return _semantic.tensor(x, tl.int32)
 
 
@@ -69,19 +72,25 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 
 @tl.builtin
-def clc_producer(context, k, p_producer, multi_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
+def clc_producer(context, k, p_producer, multi_ctas: bool = False, _semantic=None):
     """
     Issue a CLC try_cancel request from the first CTA in the cluster.
 
     Multi-CTA Synchronization ("Arrive Remote, Wait Local"):
     ---------------------------------------------------------
-    - WAIT: Only CTA 0 waits on its LOCAL bar_empty (predicated by pred_cta0).
+    - WAIT: Only CTA 0 waits on its LOCAL bar_empty.
             Other CTAs skip the wait since they will signal CTA 0's barrier.
-    - EXPECT: Only CTA 0 sets barrier_expect_bytes (predicated by pred_cta0).
+    - EXPECT: Only CTA 0 sets barrier_expect_bytes.
     - ISSUE: CLC try_cancel is issued; hardware multicasts response to all CTAs.
 
     Key constraint: barrier_wait must use LOCAL mbarrier only (per NVIDIA spec).
     Remote signaling is done via barrier_arrive with remote_cta_rank parameter.
+
+    Args:
+        context: CLC pipeline context created by clc_create_context
+        k: Stage index
+        p_producer: Phase for producer
+        multi_ctas: If True, compute pred_cta0 internally from cluster_cta_rank()
 
     PTX instruction generated:
         clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
@@ -90,10 +99,14 @@ def clc_producer(context, k, p_producer, multi_ctas: bool = False, pred_cta0: Op
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
+    # Compute pred_cta0 internally for multi-CTA mode
     if multi_ctas:
-        assert pred_cta0 is not None, "pred_cta0 must be provided when multi_ctas is True"
+        cta_rank = cluster_cta_rank(_semantic=_semantic)
+        zero = _semantic.builder.get_int32(0)
+        pred_cta0_handle = _semantic.builder.create_icmpEQ(cta_rank.handle, zero)
+        pred_cta0 = tl.tensor(pred_cta0_handle, tl.int1)
     else:
-        assert pred_cta0 is None, "pred_cta0 must be None when multi_ctas is False"
+        pred_cta0 = None
 
     # Only CTA 0 waits on its LOCAL bar_empty (arrive remote, wait local)
     barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
@@ -110,7 +123,7 @@ def clc_producer(context, k, p_producer, multi_ctas: bool = False, pred_cta0: Op
 
 
 @tl.builtin
-def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, pred_cta0: Optional[bool] = None, _semantic=None):
+def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, _semantic=None):
     """
     Decode the tile ID from a CLC response and signal completion.
 
@@ -118,9 +131,15 @@ def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, pred_cta0: Op
     ---------------------------------------------------------
     - WAIT: Only CTA 0 waits on its LOCAL bar_full (predicated by pred_cta0).
             CLC multicasts response to all CTAs, but only CTA 0 needs to wait.
-    - QUERY: Extract tile_id from response. Caller should offset by cluster_cta_rank().
+    - QUERY: Extract tile_id from response. Automatically offset by cluster_cta_rank().
     - SIGNAL: All CTAs signal CTA 0's bar_empty via remote_cta_rank=0.
               This is valid because we can arrive at remote mbar, but not wait on it.
+
+    Args:
+        context: CLC pipeline context created by clc_create_context
+        k: Stage index
+        p_consumer: Phase for consumer
+        multi_ctas: If True, compute pred_cta0 internally and use remote signaling
 
     Returns the tile ID if successful, otherwise -1.
 
@@ -132,15 +151,19 @@ def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, pred_cta0: Op
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
+    # Compute pred_cta0 internally for multi-CTA mode
     if multi_ctas:
-        assert pred_cta0 is not None, "pred_cta0 must be provided when multi_ctas is True"
+        cta_rank = cluster_cta_rank(_semantic=_semantic)
+        zero = _semantic.builder.get_int32(0)
+        pred_cta0_handle = _semantic.builder.create_icmpEQ(cta_rank.handle, zero)
+        pred_cta0 = tl.tensor(pred_cta0_handle, tl.int1)
     else:
-        assert pred_cta0 is None, "pred_cta0 must be None when multi_ctas is False"
+        pred_cta0 = None
 
     # Only CTA 0 waits on its LOCAL bar_full
     barrier_wait(bar_full, p_consumer, pred_cta0, _semantic=_semantic)
 
-    # Extract tile_id (caller should offset by cluster_cta_rank() in multi-CTA mode)
+    # Extract tile_id (automatically offset by cluster_cta_rank())
     stolen_tile_id = _clc_query(response, _semantic=_semantic)
 
     # Signal completion: all CTAs signal CTA 0's bar_empty

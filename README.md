@@ -283,7 +283,7 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
     - `num_stages`: Number of pipeline stages for double/multi-buffering
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, k, phase, multi_ctas=False, pred_cta0=None)`
+- `tlx.clc_producer(context, k, phase, multi_ctas=False)`
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
@@ -291,10 +291,9 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
     - `context`: CLC pipeline context from `clc_create_context`
     - `k`: Pipeline stage index (for multi-buffering)
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
-    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs)
-    - `pred_cta0`: Predicate indicating if current CTA is CTA 0 (required when `multi_ctas=True`)
+    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False, pred_cta0=None)`
+- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False)`
 
     Decode the tile ID from a CLC response and signal completion.
 
@@ -302,10 +301,9 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
     - `context`: CLC pipeline context from `clc_create_context`
     - `k`: Pipeline stage index
     - `phase`: Current barrier phase
-    - `multi_ctas`: Set to `True` for 2-CTA mode
-    - `pred_cta0`: Predicate indicating if current CTA is CTA 0 (required when `multi_ctas=True`)
+    - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
 
-    **Returns:** The tile ID, or -1 if no work available. In multi-CTA mode, callers should offset by `cluster_cta_rank()`.
+    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available.
 
 #### How CLC Works
 
