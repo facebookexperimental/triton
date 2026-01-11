@@ -356,12 +356,6 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
     # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
     clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
 
-    # Predicate for CTA 0 (only needed for multi-CTA mode)
-    if PAIR_CTA:
-        pred_cta0 = tlx.cluster_cta_rank() == 0
-    else:
-        pred_cta0 = None
-
     with tlx.async_tasks():
         with tlx.async_task("default"):  # Epilogue consumer
             clc_phase_producer = 1
@@ -370,17 +364,35 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
 
             while tile_id != -1:
                 # Producer: acquire next tile
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, PAIR_CTA, pred_cta0)
+                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, PAIR_CTA, pred_cta0)
-                # Offset by CTA rank in multi-CTA mode
-                if PAIR_CTA and tile_id != -1:
-                    tile_id += tlx.cluster_cta_rank()
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+
 ```
 
 Examples: how mbarriers are communicated in warp specialization
