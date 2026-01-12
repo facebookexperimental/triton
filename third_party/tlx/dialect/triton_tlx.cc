@@ -389,7 +389,8 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
               Value bScale, tt::ScaleDotElemType aType,
               tt::ScaleDotElemType bType, std::optional<Value> useD,
-              std::optional<Value> pred, std::vector<Value> mBarriers) -> void {
+              std::optional<Value> pred, bool twoCTAs,
+              std::vector<Value> mBarriers) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
@@ -401,7 +402,7 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::TCGen5MMAScaledOp>(
                  tokType, a, b, d, Value(), aScale, bScale, aType, bType,
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred*/,
+                 pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
                  ValueRange(mBarriers), ValueRange(barrierPreds),
                  !mBarriers.empty() /* is_async */);
            })
@@ -502,9 +503,28 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value responseAddr, Value mbar) -> void {
              self.create<ttng::AsyncCLCTryCancelOp>(mbar, responseAddr);
            })
+      // clc_query: Extract tile ID from CLC response.
+      //
+      // Returns the tile ID decoded from the CLC response buffer, offset by
+      // cluster_cta_rank() so each CTA gets a unique tile assignment
+      // (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
+      // Returns -1 if no work available.
+      //
+      // Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the
+      // offset is a no-op. This allows the same code path for both cases.
       .def("clc_query",
            [](TritonOpBuilder &self, Value responseAddr) -> Value {
-             return self.create<ttng::AsyncCLCQueryCancelOp>(responseAddr);
+             Value tileId = self.create<ttng::CLCQueryCancelOp>(responseAddr);
+             // Always offset by cluster_cta_rank() - for single CTA, rank=0
+             Value ctaRank = self.create<triton::nvgpu::ClusterCTAIdOp>(
+                 self.getBuilder().getI32Type());
+             Value negOne = self.create<mlir::arith::ConstantIntOp>(-1, 32);
+             Value isNegOne = self.create<mlir::arith::CmpIOp>(
+                 mlir::arith::CmpIPredicate::eq, tileId, negOne);
+             Value offset = self.create<mlir::arith::AddIOp>(tileId, ctaRank);
+             tileId =
+                 self.create<mlir::arith::SelectOp>(isNegOne, tileId, offset);
+             return tileId;
            })
       .def("create_async_TMA_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,

@@ -155,6 +155,7 @@ def async_dot_scaled(
     | tl.tensor = None,  # For blackwell, compute D = A @ B + D instead of D = A @ B. If None, default to True.
     pred=None,
     mBarriers: list[tlx.mbarrier] = [],
+    two_ctas: bool = False,
     out_dtype=tl.float32,
     _semantic=None,
 ) -> tl.tensor:
@@ -205,6 +206,10 @@ def async_dot_scaled(
     mBarriers : list[tlx.mbarrier]
         Optional mbarriers used to coordinate producer/consumer warp-groups
         when `async_dot_scaled` participates in a pipelined MMA schedule.
+
+    two_ctas : bool
+        If True, the op will execute a matmul across two contiguous CTAs,
+        reading data distributed across the two CTAs. Default is False.
 
     out_dtype : tl.dtype
         Output accumulation type before final store (default: fp32).
@@ -271,6 +276,7 @@ def async_dot_scaled(
         B_type,
         use_acc_handle,
         pred,
+        two_ctas,
         bar_handles,
     )
     return tl.tensor(output, tl.void)

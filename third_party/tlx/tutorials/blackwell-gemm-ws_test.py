@@ -24,7 +24,6 @@ def get_cuda_autotune_config():
                 "NUM_TMEM_BUFFERS": t,
                 "EPILOGUE_SUBTILE": subtile,
                 "PAIR_CTA": pairCTA,
-                "PERSISTENT": persistent,
             },
             num_warps=4,
             num_stages=1,
@@ -34,11 +33,10 @@ def get_cuda_autotune_config():
         for BM in [128]
         for BN in [128, 256, 512]
         for BK in [64, 128]
-        for s in [2, 3, 4, 5, 6, 7]
+        for s in [2, 3, 4, 5, 6]
         for t in [2, 3]
         for subtile in [1, 2, 4, 8]
         for pairCTA in [True, False]
-        for persistent in [True, False]
     ]
 
 
@@ -70,6 +68,9 @@ def preprocess_configs(configs, named_args, **kwargs):
     MAX_SHARED_MEMORY = 232 * 1024  # bytes (232KB)
     MAX_TENSOR_MEMORY = 256 * 1024  # bytes (256KB TMEM per SM)
 
+    MBARRIER_SIZE = 8  # bytes
+    CLC_RESPONSE_SIZE = 16  # bytes
+
     pruned_configs = []
     for conf in configs:
         M = named_args["M"]
@@ -80,13 +81,6 @@ def preprocess_configs(configs, named_args, **kwargs):
         NUM_SMEM_BUFFERS = conf.kwargs["NUM_SMEM_BUFFERS"]
         NUM_TMEM_BUFFERS = conf.kwargs["NUM_TMEM_BUFFERS"]
         PAIR_CTA = conf.kwargs["PAIR_CTA"]
-        PERSISTENT = conf.kwargs["PERSISTENT"]
-
-        # Non-persistent mode only processes a single tile and doesn't benefit from pipelining
-        # so we force single TMEM buffer and disable PAIR_CTA optimizations
-        if not PERSISTENT:
-            NUM_TMEM_BUFFERS = 1
-            conf.kwargs["NUM_TMEM_BUFFERS"] = 1
 
         num_tiles_m = math.ceil(M / BLOCK_M)
         num_tiles_n = math.ceil(N / BLOCK_N)
@@ -109,13 +103,15 @@ def preprocess_configs(configs, named_args, **kwargs):
         # from TMEM to shared memory before TMA store to global memory
         EPILOGUE_SUBTILE = conf.kwargs["EPILOGUE_SUBTILE"]
         smem_epilog = BLOCK_M * (BLOCK_N // EPILOGUE_SUBTILE) * 2
-        smem_barriers = NUM_SMEM_BUFFERS * 2
+        smem_barriers = NUM_SMEM_BUFFERS * MBARRIER_SIZE
         if PAIR_CTA:
-            smem_barriers += NUM_SMEM_BUFFERS * 64  # cta_bars
+            smem_barriers += NUM_SMEM_BUFFERS * MBARRIER_SIZE  # cta_bars
         # tmem_full_bars
         smem_barriers += NUM_TMEM_BUFFERS
 
-        total_smem = smem_a + smem_b + smem_epilog + smem_barriers
+        smem_clc = CLC_RESPONSE_SIZE + MBARRIER_SIZE * 2
+
+        total_smem = smem_a + smem_b + smem_epilog + smem_barriers + smem_clc
         # Prune configs that exceed memory limits
         if total_smem > MAX_SHARED_MEMORY:
             continue
@@ -123,14 +119,9 @@ def preprocess_configs(configs, named_args, **kwargs):
         # Estimate Tensor Memory (TMEM) Usage
         # tmem_buffers: BLOCK_M x BLOCK_N x float32 x NUM_TMEM_BUFFERS
         # TMEM stores the accumulation buffers for MMA operations
-        # Non-persistent mode only needs 1 TMEM buffer (processes single tile)
-        # Persistent mode uses NUM_TMEM_BUFFERS to overlap MMA and epilogue
+        # use NUM_TMEM_BUFFERS to overlap MMA and epilogue
         total_tmem = BLOCK_M * BLOCK_N * 4 * NUM_TMEM_BUFFERS
         if total_tmem > MAX_TENSOR_MEMORY:
-            continue
-
-        # TODO: add back configs that triggers compiler bug
-        if BLOCK_N == 512 and not PERSISTENT:
             continue
 
         pruned_configs.append(conf)
@@ -172,7 +163,6 @@ def _process_tile_epilogue_inner(
     tmem_empty_bars,
     cur_tmem_buf,
     tmem_read_phase,
-    PERSISTENT,
 ):
     """Process epilogue for a single tile."""
     pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
@@ -194,9 +184,8 @@ def _process_tile_epilogue_inner(
         c = result.to(tl.float16)
         c_desc.store([offs_am, offs_bn + slice_id * slice_size], c)
 
-    # Signal MMA consumer if in persistent mode
-    if PERSISTENT:
-        tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
+    # Signal MMA consumer
+    tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
 
 
 @triton.jit
@@ -220,15 +209,13 @@ def _process_tile_mma_inner(
     PAIR_CTA,
     cta_bars,
     pred_cta0,
-    PERSISTENT,
 ):
     """Process MMA for a single tile. Returns updated smem_accum_cnt."""
     pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
 
-    if PERSISTENT:
-        # wait epilogue consumer to be done with the buffer before reusing it
-        # Note: we start with phase 1 since epilogue starts with phase 0
-        tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase ^ 1)
+    # wait epilogue consumer to be done with the buffer before reusing it
+    # Note: we start with phase 1 since epilogue starts with phase 0
+    tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase ^ 1)
 
     # now iterate along K to compute result for the block
     for k in range(0, k_tiles):
@@ -238,9 +225,8 @@ def _process_tile_mma_inner(
         tlx.barrier_wait(smem_full_bars[buf], phase)
         # CTA0 waits for CTA0 and CTA1 to finish loading A and B before issuing dot op
         if PAIR_CTA:
-            cta_bar = tlx.remote_view(cta_bars[buf], 0)
-            tlx.barrier_arrive(cta_bar, 1)
-            tlx.barrier_wait(cta_bar, phase=phase, pred=pred_cta0)
+            tlx.barrier_arrive(cta_bars[buf], arrive_count=1, remote_cta_rank=0)
+            tlx.barrier_wait(cta_bars[buf], phase=phase, pred=pred_cta0)
 
         # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
         tlx.async_dot(
@@ -330,8 +316,6 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                                    NUM_TMEM_BUFFERS: tl.constexpr,  #
                                    EPILOGUE_SUBTILE: tl.constexpr,  #
                                    PAIR_CTA: tl.constexpr,  #
-                                   PERSISTENT: tl.constexpr,  #
-                                   NUM_SMS: tl.constexpr,  #
                                    ):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
@@ -340,8 +324,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
         buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // 2), tl.float16, NUM_SMEM_BUFFERS)
     else:
         buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
-    # Non-persistent mode: 1 TMEM buffer (processes single tile)
-    # Persistent mode: NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
+    # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
     tmem_buffers = tlx.local_alloc(
         (BLOCK_SIZE_M, BLOCK_SIZE_N),
         tl.float32,
@@ -363,46 +346,29 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     # allocate barriers
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    # Non-persistent mode: 1 TMEM barrier (processes single tile)
-    # Persistent mode: NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
+    # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-    if PERSISTENT:
-        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-    else:
-        tmem_empty_bars = None
+    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+
+    # Dynamic tiling setup
+    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
             start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = _compute_grid_info(
                 M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
 
-            if PERSISTENT:
+            tmem_accum_cnt = 0
+            tile_id = start_pid
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 # Persistent mode: process multiple tiles
-                tmem_accum_cnt = 0
-                for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                    cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                    _process_tile_epilogue_inner(
-                        tile_id,
-                        num_pid_in_group,
-                        num_pid_m,
-                        GROUP_SIZE_M,
-                        BLOCK_SIZE_M,
-                        BLOCK_SIZE_N,
-                        EPILOGUE_SUBTILE,
-                        c_desc,
-                        tmem_buffers,
-                        tmem_full_bars,
-                        tmem_empty_bars,
-                        cur_tmem_buf,
-                        tmem_read_phase,
-                        PERSISTENT,
-                    )
-                    tmem_accum_cnt += 1
-            else:
-                # Non-persistent mode: process single tile
-                tile_id = start_pid
-                cur_tmem_buf = 0
-                tmem_read_phase = 0
+
+                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                clc_phase_producer ^= 1
+
+                cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                 _process_tile_epilogue_inner(
                     tile_id,
                     num_pid_in_group,
@@ -417,50 +383,25 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     tmem_empty_bars,
                     cur_tmem_buf,
                     tmem_read_phase,
-                    PERSISTENT,
                 )
+                tmem_accum_cnt += 1
+
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = _compute_grid_info(
                 M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
 
-            if PERSISTENT:
-                # Persistent mode: process multiple tiles
-                tmem_accum_cnt = 0
-                smem_accum_cnt = 0
+            tmem_accum_cnt = 0
+            smem_accum_cnt = 0
 
-                for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                    cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                    smem_accum_cnt = _process_tile_mma_inner(
-                        tile_id,
-                        num_pid_in_group,
-                        num_pid_m,
-                        GROUP_SIZE_M,
-                        k_tiles,
-                        NUM_SMEM_BUFFERS,
-                        buffers_A,
-                        buffers_B,
-                        tmem_buffers,
-                        smem_full_bars,
-                        smem_empty_bars,
-                        tmem_full_bars,
-                        cur_tmem_buf,
-                        tmem_empty_bars,
-                        tmem_write_phase,
-                        smem_accum_cnt,
-                        PAIR_CTA,
-                        cta_bars,
-                        pred_cta0,
-                        PERSISTENT,
-                    )
-                    tmem_accum_cnt += 1
-            else:
-                # Non-persistent mode: process single tile
-                tile_id = start_pid
-                smem_accum_cnt = 0
-                cur_tmem_buf = 0
-                tmem_write_phase = 0  # Not used in non-persistent mode
-                _process_tile_mma_inner(
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
+
+                cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                smem_accum_cnt = _process_tile_mma_inner(
                     tile_id,
                     num_pid_in_group,
                     num_pid_m,
@@ -480,42 +421,22 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     PAIR_CTA,
                     cta_bars,
                     pred_cta0,
-                    PERSISTENT,
                 )
+                tmem_accum_cnt += 1
+
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = _compute_grid_info(
                 M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
 
-            if PERSISTENT:
+            smem_accum_cnt = 0
+            tile_id = start_pid
+            clc_phase_consumer = 0
+            while tile_id != -1:
                 # Persistent mode: process multiple tiles
-                smem_accum_cnt = 0
-                for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                    smem_accum_cnt = _process_tile_producer_inner(
-                        tile_id,
-                        num_pid_in_group,
-                        num_pid_m,
-                        GROUP_SIZE_M,
-                        BLOCK_SIZE_M,
-                        BLOCK_SIZE_N,
-                        BLOCK_SIZE_K,
-                        k_tiles,
-                        NUM_SMEM_BUFFERS,
-                        a_desc,
-                        b_desc,
-                        buffers_A,
-                        buffers_B,
-                        smem_full_bars,
-                        smem_empty_bars,
-                        smem_accum_cnt,
-                        PAIR_CTA,
-                        cluster_cta_rank,
-                    )
-            else:
-                # Non-persistent mode: process single tile
-                tile_id = start_pid
-                smem_accum_cnt = 0
-                _process_tile_producer_inner(
+                smem_accum_cnt = _process_tile_producer_inner(
                     tile_id,
                     num_pid_in_group,
                     num_pid_m,
@@ -535,6 +456,8 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     PAIR_CTA,
                     cluster_cta_rank,
                 )
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
 
 
 def matmul(a, b):
@@ -552,17 +475,10 @@ def matmul(a, b):
     b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-    # Grid function that adapts based on PERSISTENT parameter from autotune
-    # For persistent mode: launch fewer CTAs (min of NUM_SMS or total tiles)
-    # For non-persistent mode: launch one CTA per tile
+    # We don't cap grid size by NUM_SMS here because we use CLC by default
     def grid(META):
         total_tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        if META.get("PERSISTENT", False):
-            return (min(NUM_SMS, total_tiles), )
-        else:
-            return (total_tiles, )
+        return (total_tiles, )
 
     matmul_kernel_tma_ws_blackwell[grid](
         a_desc,
@@ -571,7 +487,6 @@ def matmul(a, b):
         M,
         N,
         K,
-        NUM_SMS=NUM_SMS,
     )
     return c
 
@@ -599,12 +514,12 @@ ref_lib = "cuBLAS"
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-        x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
+        x_vals=[8192],  # Different possible values for `x_name`
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=[ref_lib.lower(), "triton_persistent"],  # Label name for the lines
-        line_names=[ref_lib, "Triton (persisent)"],  # Line styles
+        line_vals=[ref_lib.lower(), "triton"],  # Label name for the lines
+        line_names=[ref_lib, "Triton"],  # Line styles
         styles=[("green", "-"), ("blue", "-")],
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance-" + ("fp16"),  # Name for the plot, used also as a file name for saving the plot.
@@ -617,7 +532,7 @@ def benchmark(M, N, K, provider):
     if provider == ref_lib.lower():
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
                                                      rep=2000)
-    if provider == "triton_persistent":
+    if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=2000, rep=2000)
 
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)

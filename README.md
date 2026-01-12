@@ -265,6 +265,136 @@ Examples
 
   Signal a barrier of an expected number of bytes to be copied.
 
+- `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)`
+
+    Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
+
+### Cluster Launch Control (CLC)
+
+CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dynamic persistent kernel** execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.
+
+#### CLC API
+
+- `context = tlx.clc_create_context(num_stages, num_consumers)`
+
+    Create a CLC pipeline context with the specified number of stages and expected consumer count.
+
+    **Parameters:**
+    - `num_stages`: Number of pipeline stages for double/multi-buffering
+    - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
+
+- `tlx.clc_producer(context, k, phase, multi_ctas=False)`
+
+    Issue a CLC try_cancel request to acquire a new tile ID.
+
+    **Parameters:**
+    - `context`: CLC pipeline context from `clc_create_context`
+    - `k`: Pipeline stage index (for multi-buffering)
+    - `phase`: Current barrier phase (0 or 1, alternates each iteration)
+    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
+
+- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False)`
+
+    Decode the tile ID from a CLC response and signal completion.
+
+    **Parameters:**
+    - `context`: CLC pipeline context from `clc_create_context`
+    - `k`: Pipeline stage index
+    - `phase`: Current barrier phase
+    - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+
+    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available.
+
+#### How CLC Works
+
+CLC uses hardware-assisted work stealing via the PTX instruction:
+```
+clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
+```
+
+The `.multicast::cluster::all` qualifier means the response is **asynchronously written to all CTAs** in the cluster. This enables efficient multi-CTA execution where all CTAs in a cluster receive the same base tile ID.
+
+#### CLC Synchronization Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLC Producer (clc_producer)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. WAIT:   barrier_wait(bar_empty)      ← Wait for consumers   │
+│  2. EXPECT: barrier_expect_bytes(bar_full, 16)                  │
+│  3. ISSUE:  clc_issue(response, bar_full) ← Hardware request    │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+                    [Hardware processes CLC]
+                    [Multicasts response to all CTAs]
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLC Consumer (clc_consumer)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. WAIT:   barrier_wait(bar_full)       ← Wait for response    │
+│  2. QUERY:  tile_id = clc_query(response) ← Extract tile ID     │
+│  3. SIGNAL: barrier_arrive(bar_empty)    ← Release producer     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Multi-CTA Mode (2-CTA Clusters)
+
+In multi-CTA mode (`multi_ctas=True`), multiple CTAs in a cluster work together on adjacent tiles. The key constraint is: **you can arrive at a remote mbarrier, but you cannot wait on a remote mbarrier** (per NVIDIA specification).
+
+##### Key Principle: "Arrive Remote, Wait Local"
+
+| Operation | Local mbarrier | Remote mbarrier |
+|-----------|----------------|-----------------|
+| `barrier_wait` | ✅ Allowed | ❌ Undefined behavior |
+| `barrier_arrive` | ✅ Allowed | ✅ Allowed (via `remote_cta_rank`) |
+
+##### Example: Multi-CTA GEMM with CLC
+
+```python
+@triton.jit
+def matmul_kernel(..., PAIR_CTA: tl.constexpr):
+    # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
+    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):  # Epilogue consumer
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # Producer: acquire next tile
+                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                clc_phase_producer ^= 1
+
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+
+```
+
 Examples: how mbarriers are communicated in warp specialization
 ```
     phase = 0

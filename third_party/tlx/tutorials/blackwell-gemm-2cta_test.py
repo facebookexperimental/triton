@@ -60,8 +60,7 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
 
     # 2cta specific
     bar_cta = tlx.alloc_barriers(1, arrive_count=2)  # CTA0 waits for CTA1's data before mma
-    bar_tmp = tlx.local_view(bar_cta, 0)
-    bar_cta0 = tlx.remote_view(bar_tmp, 0)  # map to bar living in CTA0
+    bar_cta0 = tlx.local_view(bar_cta, 0)
 
     buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
     acc_tmem = tlx.local_view(buffers, 0)
@@ -86,7 +85,7 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
         tlx.barrier_wait(bar_b, phase)
 
         # CTA0 needs to know CTA1 is done loading data before issuing MMA
-        tlx.barrier_arrive(bar_cta0, 1)
+        tlx.barrier_arrive(bar_cta0, 1, remote_cta_rank=0)
         tlx.barrier_wait(bar_cta0, phase=k % 2, pred=pred_cta0)
 
         # 2cta specific
