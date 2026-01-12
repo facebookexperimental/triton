@@ -498,9 +498,8 @@ def grouped_matmul_tlx_kernel(
                             tlx.barrier_wait(smem_full_bars[smem_buf], smem_phase)
                             # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
                             if NUM_CTAS == 2:
-                                cta_bar = tlx.remote_view(cta_bars[smem_buf], 0)
-                                tlx.barrier_arrive(cta_bar, 1)
-                                tlx.barrier_wait(cta_bar, phase=smem_phase, pred=pred_cta0)
+                                tlx.barrier_arrive(cta_bars[smem_buf], 1, remote_cta_rank=0)
+                                tlx.barrier_wait(cta_bars[smem_buf], phase=smem_phase, pred=pred_cta0)
 
                             tlx.async_dot(
                                 buffers_A[smem_buf],
