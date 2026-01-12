@@ -8,6 +8,12 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_blackwell
 
+from tlx_kernel_utils import (
+    compute_tile_position,
+    init_tmem_accumulator,
+    flip_phase_on_boundary,
+)
+
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
@@ -43,11 +49,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m, pid_n = compute_tile_position(pid, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
 
     # Initialize TMA descriptors
     desc_a = tl.make_tensor_descriptor(
@@ -86,12 +88,8 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
         tlx.async_descriptor_load(desc_a, a, [pid_m * BLOCK_SIZE_M, i * BLOCK_SIZE_K], load_bar)
         tlx.async_descriptor_load(desc_b, b, [i * BLOCK_SIZE_K, pid_n * BLOCK_SIZE_N], load_bar)
 
-    # main K loop
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # init accumulator to 0 (in TMEM)
-    buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
-    acc_tmem = tlx.local_view(buffers, 0)
-    tlx.local_store(acc_tmem, accumulator)
+    # main K loop - init accumulator to 0 (in TMEM)
+    acc_tmem = init_tmem_accumulator(BLOCK_SIZE_M, BLOCK_SIZE_N)
 
     num_iter = tl.cdiv(K, BLOCK_SIZE_K)
     for k in range(0, num_iter):
@@ -130,7 +128,7 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
             tlx.async_descriptor_load(desc_a, a_next, [pid_m * BLOCK_SIZE_M, i * BLOCK_SIZE_K], next_load_bar)
             tlx.async_descriptor_load(desc_b, b_next, [i * BLOCK_SIZE_K, pid_n * BLOCK_SIZE_N], next_load_bar)
 
-        phase = phase if (buf < NUM_STAGES - 1) else phase ^ 1
+        phase = flip_phase_on_boundary(phase, buf, NUM_STAGES)
 
     # wait for last mma to complete
     i = num_iter - 1
