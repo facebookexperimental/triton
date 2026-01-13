@@ -12,8 +12,24 @@ C++ changes require recompilation to take effect. Python-only changes do not.
 pre-commit run --all
 ```
 
-# CRITICAL: Always run denoise script when measuring performance:
-Run `third_party/tlx/denoise.sh python third_party/tlx/tutorials/<KERNEL.py>`
+# Testing Workflow
+
+## Correctness First
+Always run correctness tests first:
+```bash
+pytest third_party/tlx/tutorials/<KERNEL.py>
+```
+
+## Performance Testing
+Do NOT run performance tests (denoise script) unless explicitly requested.
+When measuring performance:
+1. Check GPU occupancy: `nvidia-smi`
+2. Pick the least occupied GPU (lowest memory usage)
+3. Set CUDA_VISIBLE_DEVICES to that GPU
+4. Run the denoise script:
+```bash
+CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/<KERNEL.py>
+```
 
 # CRITICAL: Run killgpu.sh
 Run `third_party/tlx/killgpu.sh` to kill if any test runs a few minutes
