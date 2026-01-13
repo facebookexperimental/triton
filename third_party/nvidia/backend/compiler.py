@@ -131,7 +131,7 @@ class CUDAOptions:
     extern_libs: dict = None
     debug: bool = False
     backend_name: str = 'cuda'
-    sanitize_overflow: bool = True
+    sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
 
