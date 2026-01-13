@@ -36,7 +36,7 @@ class HIPOptions:
     extern_libs: dict = None
     cluster_dims: tuple = (1, 1, 1)
     debug: bool = False
-    sanitize_overflow: bool = True
+    sanitize_overflow: bool = False
     arch: str = None
     # We have native support for OCP fp8 variants since CDNA4/RDNA4. For earlier generations,
     # we software emulate the support for them.

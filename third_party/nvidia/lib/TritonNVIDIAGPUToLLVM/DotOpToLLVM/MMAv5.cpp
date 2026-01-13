@@ -652,8 +652,9 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
     Value scaleB = tb.add(
         baseScaleB, tb.i32_val((n + wordIdx * numRepN) * numColPerScaleBlockB));
     Value instDescriptor = createScaleInstDescriptor(
-        rewriter, op, desc.mmaSizeM, desc.mmaSizeN, desc.transA, desc.transB,
-        subWordIdx, subWordIdx, mxfpInstKind);
+        rewriter, op, op.getTwoCtas() ? desc.mmaSizeM * 2 : desc.mmaSizeM,
+        desc.mmaSizeN, desc.transA, desc.transB, subWordIdx, subWordIdx,
+        mxfpInstKind);
     createScaledGen5MMA(rewriter, loc, op, a, b, accAddress, scaleA, scaleB,
                         pred, instDescriptor, useInitAcc, desc.aInTmem,
                         mxfpInstKind, op.getTwoCtas());
@@ -663,7 +664,7 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
                  adaptor.getBarrierPreds(), op.getTwoCtas(),
-                 /*tlxPairedMMA*/ false, opKindIsMXFP4, dot);
+                 tlx::tlxEnablePairedMMA(op), opKindIsMXFP4, dot);
 }
 
 //===----------------------------------------------------------------------===//
