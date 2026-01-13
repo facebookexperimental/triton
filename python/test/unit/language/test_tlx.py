@@ -1494,6 +1494,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
 def test_async_dot_scaled_2cta(device):
     """
     Test 2-CTA scaled MMA generates tcgen05.mma.cta_group::2 instruction.
+    Also verifies numerical correctness against reference implementation.
     """
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
@@ -1535,9 +1536,13 @@ def test_async_dot_scaled_2cta(device):
             block_shape=[BLOCK_M, BLOCK_K],
         )
 
-        desc_b = tl.make_tensor_descriptor(b_ptr, shape=[K, N], strides=[stride_bk, stride_bn],
-                                           block_shape=[BLOCK_K, BLOCK_N // 2],  # difference from 1cta
-                                           )
+        # difference from 1cta: B is split across 2 CTAs
+        desc_b = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[K, N],
+            strides=[stride_bk, stride_bn],
+            block_shape=[BLOCK_K, BLOCK_N // 2],
+        )
 
         desc_a_scale = tl.make_tensor_descriptor(
             a_scale_ptr,
@@ -1546,18 +1551,20 @@ def test_async_dot_scaled_2cta(device):
             block_shape=[BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
         )
 
-        desc_b_scale = tl.make_tensor_descriptor(b_scale_ptr, shape=[N // 128, K // 32 // 4, 2, 2 * 128],
-                                                 strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
-                                                 block_shape=[BLOCK_N // 2 // 128, BLOCK_K // 32 // 4, 2,
-                                                              2 * 128],  # difference from 1cta: B scale is half
-                                                 )
+        # B scale is NOT split across CTAs - full scale needed for MMA
+        desc_b_scale = tl.make_tensor_descriptor(
+            b_scale_ptr,
+            shape=[N // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
 
         # async load a and b into SMEM
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
         b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float8e4nv, tl.constexpr(1))  # difference from 1cta
         a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
-        b_scale_tile = tlx.local_alloc((BLOCK_N // 2 // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8,
-                                       tl.constexpr(1))  # difference from 1cta: B scale is half
+        # B scale tile is NOT halved - full scale for MMA
+        b_scale_tile = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
 
         bars = tlx.alloc_barriers(tl.constexpr(4))
         bar_a = tlx.local_view(bars, 0)
@@ -1565,15 +1572,16 @@ def test_async_dot_scaled_2cta(device):
         bar_a_scale = tlx.local_view(bars, 2)
         bar_b_scale = tlx.local_view(bars, 3)
         tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K * 1)  # fp8
-        tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 1)  # difference from 1cta
+        tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 1)  # difference from 1cta: B is half
         tlx.barrier_expect_bytes(bar_a_scale, BLOCK_M // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)
-        tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N // 2 // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)
+        tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)  # full B scale
 
-        # difference from 1cta: size and offsets
+        # difference from 1cta: A offset by CTA rank, B offset by CTA rank
         tlx.async_descriptor_load(desc_a, a_tile[0], [cluster_cta_rank * BLOCK_M, 0], bar_a)
         tlx.async_descriptor_load(desc_b, b_tile[0], [0, cluster_cta_rank * BLOCK_N // 2], bar_b)
-        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [0, 0, 0, 0], bar_a_scale)
-        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0], bar_b_scale)
+        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [cluster_cta_rank * BLOCK_M // 128, 0, 0, 0],
+                                  bar_a_scale)
+        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0], bar_b_scale)  # full B scale
 
         tlx.barrier_wait(bar_a, tl.constexpr(0))
         tlx.barrier_wait(bar_b, tl.constexpr(0))
@@ -1587,7 +1595,12 @@ def test_async_dot_scaled_2cta(device):
 
         c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
 
+        # Allocate barrier for MMA completion
+        mma_done_bars = tlx.alloc_barriers(tl.constexpr(1))
+        mma_done_bar = tlx.local_view(mma_done_bars, 0)
+
         # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
+        # Pass mma_done_bar directly to async_dot_scaled for MMA completion signaling
         tlx.async_dot_scaled(
             a_tile[0],
             b_tile[0],
@@ -1598,7 +1611,12 @@ def test_async_dot_scaled_2cta(device):
             B_format,
             use_acc=False,
             two_ctas=True,
+            mBarriers=[mma_done_bar],
         )
+
+        # Wait for MMA completion
+        tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+
         result = tlx.local_load(c_tile[0])
 
         c = result.to(tl.float16)
@@ -1609,7 +1627,7 @@ def test_async_dot_scaled_2cta(device):
 
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
-    # Use N=256 so that BLOCK_N//2=128 (required for b_scale shape to be valid: 128//128=1)
+    # M=256 so BLOCK_M=128 per CTA, N=256 so BLOCK_N=256 total (128 per CTA for B data)
     M, N, K = (256, 256, 128)
 
     DTYPE_MAP = {
@@ -1626,11 +1644,11 @@ def test_async_dot_scaled_2cta(device):
 
     a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
     b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
-    a_scale = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
-    b_scale = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+    a_scale_4d = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
+    b_scale_4d = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
 
-    BLOCK_M = M // 2
-    BLOCK_N = N
+    BLOCK_M = M // 2  # 128 per CTA
+    BLOCK_N = N  # 256 total, 128 per CTA for B data
     BLOCK_K = K
     kern_kwargs = {
         "BLOCK_M": BLOCK_M,
@@ -1647,8 +1665,8 @@ def test_async_dot_scaled_2cta(device):
         b,
         b.stride(0),
         b.stride(1),
-        a_scale,
-        b_scale,
+        a_scale_4d,
+        b_scale_4d,
         c,
         c.stride(0),
         c.stride(1),
@@ -1675,6 +1693,26 @@ def test_async_dot_scaled_2cta(device):
         f"Expected tcgen05.mma.cta_group::2 for 2-CTA scaled MMA, but found: "
         f"cta_group::1 count={ptx.count('tcgen05.mma.cta_group::1')}, "
         f"cta_group::2 count={ptx.count('tcgen05.mma.cta_group::2')}")
+
+    # Numeric verification: compute reference and compare
+    def fp8e8m0_to_float32(scale):
+        """Convert FP8 E8M0 scale values to float32."""
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    # Compute reference: D = (A * A_scale) @ (B * B_scale)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
+    # Repeat each scale value 32 times along K dimension
+    a_scale_f32 = a_scale_f32.repeat_interleave(32, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(32, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+
+    atol = 1e-2 * math.sqrt(K / 32)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
 
 
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])
