@@ -32,3 +32,14 @@ add_triton_ut(
     TritonGPUTransforms
     TritonNvidiaGPUTransforms
 )
+
+add_triton_ut(
+  NAME NumericalInvarianceTest
+  SRCS NumericalInvarianceTest.cpp
+  LIBS
+    MLIRParser
+    TritonIR
+    TritonGPUIR
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+)

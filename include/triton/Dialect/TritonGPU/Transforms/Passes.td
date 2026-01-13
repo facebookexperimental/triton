@@ -384,4 +384,36 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUPrintNumericalInvariance: Pass<"tritongpu-print-numerical-invariance", "mlir::ModuleOp"> {
+  let summary = "Print numerical invariance fingerprint for regression detection";
+
+  let description = [{
+    Computes and prints a numerical invariance fingerprint for the TTGIR module.
+    Two TTGIRs that are numerically equivalent (same computation graph, types,
+    layouts) will produce the same fingerprint, even if they differ in SSA names,
+    function names, or other cosmetic properties. This is useful for detecting
+    numerical regressions across compiler changes.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+}
+
+def TritonGPUDumpNumericalInvariance: Pass<"tritongpu-dump-numerical-invariance", "mlir::ModuleOp"> {
+  let summary = "Dump numerical invariance fingerprint to a file";
+
+  let description = [{
+    Computes a numerical invariance fingerprint for the TTGIR module and dumps
+    it to the specified output file. This allows comparison of fingerprints
+    across different compiler runs to detect numerical regressions.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"outputPath", "output-path",
+           "std::string", /*default*/"\"\"",
+           "Path to the output file for dumping the numerical invariance">
+  ];
+}
+
 #endif
