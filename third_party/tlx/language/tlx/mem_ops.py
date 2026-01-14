@@ -541,13 +541,14 @@ def async_descriptor_load(
     pred: tl.tensor = None,
     cache_modifier: str = "",
     eviction_policy: str = "",
-    multicast_targets: tl.tensor = None,
+    multicast_targets: list[tl.tensor] = [],
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
+    multicast_targets = _semantic._convert_to_ir_values(multicast_targets, require_i64=False)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
@@ -555,11 +556,8 @@ def async_descriptor_load(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
-    multicast_targets_handle = None
-    if multicast_targets is not None:
-        multicast_targets_handle = multicast_targets.handle
     _semantic.builder.create_async_TMA_load(
-        multicast_targets_handle,
+        multicast_targets,
         desc.handle,
         offsets,
         barrier.handle,

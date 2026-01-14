@@ -2382,13 +2382,13 @@ def test_descriptor_load_multicast(device):
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
         if should_initiate_load:
-            # calculate target CTA mask, given CTA layout
+            # given CTA layout
             # [ 0, 2 ]
             # [ 1, 3 ]
-            # for CTA 0: we want it to multicast to CTA 0 and 2, so mask will be 0x0101
-            # for CTA 3: we want it to multicast to CTA 1 and 3, so mask will be 0x1010
-            target_cta_mask = (1 << cta_id_m) | (1 << (cta_id_m + CLUSTER_SIZE_M))
-            tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, multicast_targets=target_cta_mask)
+            # for CTA 0: we want it to multicast to CTA 0 and 2
+            # for CTA 3: we want it to multicast to CTA 1 and 3
+            tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
+                                      multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
         tlx.barrier_wait(bar=bar, phase=0)
         tlx.fence_async_shared()
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
