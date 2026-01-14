@@ -378,16 +378,6 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
     oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($barrier)) `->` qualified(type($result))
   }];
-
-  let builders = [
-    OpBuilder<(ins "Value":$desc, "ValueRange":$coord, "Value":$barrier,
-                   "Value":$result, "Value":$pred),
-    [{
-      build($_builder, $_state, Type(), /*multicastTargets*/ Value(), desc, coord,
-            barrier, result, pred, /*cache=*/triton::CacheModifier::NONE, /*evict=*/triton::EvictionPolicy::NORMAL,
-            /*isVolatile=*/false);
-    }]>
-  ];
 }
 
 def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
