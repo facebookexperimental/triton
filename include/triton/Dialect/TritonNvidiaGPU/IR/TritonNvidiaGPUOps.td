@@ -374,7 +374,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
   );
 
   let assemblyFormat = [{
-    ($multicastTargets^ `,`)? $desc `[` $coord `]` $result `,` $barrier `,` $pred
+    $desc `[` $coord `]` $result `,` $barrier `,` $pred (`,` $multicastTargets^)?
     oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($barrier)) `->` qualified(type($result))
   }];
