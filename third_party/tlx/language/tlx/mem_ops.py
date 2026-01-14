@@ -541,6 +541,7 @@ def async_descriptor_load(
     pred: tl.tensor = None,
     cache_modifier: str = "",
     eviction_policy: str = "",
+    multicastTargets: tl.tensor = None,
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
@@ -554,7 +555,11 @@ def async_descriptor_load(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
+    multicastTargets_handle = None
+    if multicastTargets is not None:
+        multicastTargets_handle = multicastTargets.handle
     _semantic.builder.create_async_TMA_load(
+        multicastTargets_handle,
         desc.handle,
         offsets,
         barrier.handle,

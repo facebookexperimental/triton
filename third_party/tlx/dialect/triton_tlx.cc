@@ -527,11 +527,13 @@ void init_triton_tlx_ir(py::module &&m) {
              return tileId;
            })
       .def("create_async_TMA_load",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
-              Value mbarrier, Value pred, Value result,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> void {
+           [](TritonOpBuilder &self, std::optional<Value> multicastTargets,
+              Value desc, std::vector<Value> &coord, Value mbarrier, Value pred,
+              Value result, CacheModifier cacheModifier,
+              EvictionPolicy evictionPolicy, bool isVolatile) -> void {
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
+                 multicastTargets.has_value() ? multicastTargets.value()
+                                              : Value(),
                  desc, coord, mbarrier, result, pred, cacheModifier,
                  evictionPolicy, isVolatile);
            })

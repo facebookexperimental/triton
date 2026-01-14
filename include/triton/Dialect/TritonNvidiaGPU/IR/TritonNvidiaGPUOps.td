@@ -348,7 +348,7 @@ def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
   let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $ctaId)";
 }
 
-def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {
+def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [AttrSizedOperandSegments]> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -356,11 +356,13 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local">
     asynchronously.  This is analogue to tt.load except the data are copied to
     local memory pointed by the memory descriptor instead of a distributed
     tensor. The data copied depends on the global memory descriptor pointed to
-    by `desc`.
+    by `desc`. If `multicastTargets` is provided, it represents a bitmask specifying the
+    destination CTA indices in a cluster for TMA multicast.
   }];
 
   let hasVerifier = 1;
   let arguments = (ins
+    Optional<I32>: $multicastTargets,
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$coord,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
@@ -372,10 +374,20 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local">
   );
 
   let assemblyFormat = [{
-    $desc `[` $coord `]` $result `,` $barrier `,` $pred
+    ($multicastTargets^ `,`)? $desc `[` $coord `]` $result `,` $barrier `,` $pred
     oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($barrier)) `->` qualified(type($result))
   }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$desc, "ValueRange":$coord, "Value":$barrier,
+                   "Value":$result, "Value":$pred),
+    [{
+      build($_builder, $_state, Type(), /*multicastTargets*/ Value(), desc, coord,
+            barrier, result, pred, /*cache=*/triton::CacheModifier::NONE, /*evict=*/triton::EvictionPolicy::NORMAL,
+            /*isVolatile=*/false);
+    }]>
+  ];
 }
 
 def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
