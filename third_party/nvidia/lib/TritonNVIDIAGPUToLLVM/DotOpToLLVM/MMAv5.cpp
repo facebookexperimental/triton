@@ -398,8 +398,9 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
       rewriter.create<ttng::ClusterWaitOp>(loc);
     }
 
-    Value clusterId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
-    Value cluster0 = tb.icmp_eq(clusterId, tb.i32_val(0));
+    Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    leftClusterId = tb.and_(leftClusterId, tb.i32_val(1));
+    Value cluster0 = tb.icmp_eq(leftClusterId, tb.i32_val(0));
     pred = tb.and_(pred, cluster0);
   }
   pred = tb.and_(pred, isWarp0);
