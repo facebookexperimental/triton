@@ -527,13 +527,29 @@ void init_triton_tlx_ir(py::module &&m) {
              return tileId;
            })
       .def("create_async_TMA_load",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
-              Value mbarrier, Value pred, Value result,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> void {
+           [](TritonOpBuilder &self, std::vector<Value> &multicastTargets,
+              Value desc, std::vector<Value> &coord, Value mbarrier, Value pred,
+              Value result, CacheModifier cacheModifier,
+              EvictionPolicy evictionPolicy, bool isVolatile) -> void {
+             Value multicastTargetBitMask;
+             if (multicastTargets.empty()) {
+               multicastTargetBitMask = Value();
+             } else {
+               auto one = self.create<arith::ConstantIntOp>(
+                   self.getBuilder().getI32Type(), 1);
+               multicastTargetBitMask = self.create<arith::ConstantIntOp>(
+                   self.getBuilder().getI32Type(), 0);
+               for (auto ctaIdx : multicastTargets) {
+                 // activate the bit corresponding to the ctaIdx (e.g. last bit
+                 // for idx 0, second last bit for idx 1, etc.)
+                 multicastTargetBitMask = self.create<arith::OrIOp>(
+                     multicastTargetBitMask,
+                     self.create<arith::ShLIOp>(one, ctaIdx));
+               }
+             }
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
-                 desc, coord, mbarrier, result, pred, cacheModifier,
-                 evictionPolicy, isVolatile);
+                 multicastTargetBitMask, desc, coord, mbarrier, result, pred,
+                 cacheModifier, evictionPolicy, isVolatile);
            })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,

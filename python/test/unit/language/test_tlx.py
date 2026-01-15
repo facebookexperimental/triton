@@ -2338,6 +2338,96 @@ def test_descriptor_load(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_descriptor_load_multicast(device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        CLUSTER_SIZE_M: tl.constexpr = 2
+        cta_id = tlx.cluster_cta_rank()
+        cta_id_m = cta_id % CLUSTER_SIZE_M
+        cta_id_n = cta_id // CLUSTER_SIZE_M
+
+        # have one CTA from each cluster row to initiate the TMA
+        should_initiate_load = cta_id_m == cta_id_n
+
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+        if should_initiate_load:
+            # given CTA layout
+            # [ 0, 2 ]
+            # [ 1, 3 ]
+            # for CTA 0: we want it to multicast to CTA 0 and 2
+            # for CTA 3: we want it to multicast to CTA 1 and 3
+            tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
+                                      multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.rand((M, N), dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (2, 2)
+
+    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                          ctas_per_cga=(2, 2, 1))
+
+    assert kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    # x:
+    # [ x0 | x2]
+    # [ x1 | x3]
+    # y:
+    # [ y0 | y2]
+    # [ y1 | y3]
+    # we copied x0 to y0 and y2, x3 to y1 and y3. x1 and x2 are not copied.
+    x0 = x[:64, :64]
+    x3 = x[64:128, 64:128]
+
+    y0 = y[:64, :64]
+    y3 = y[64:128, 64:128]
+    y1 = y[64:128, :64]
+    y2 = y[:64, 64:128]
+
+    torch.testing.assert_close(x0, y0)
+    torch.testing.assert_close(x0, y2)
+    torch.testing.assert_close(x3, y1)
+    torch.testing.assert_close(x3, y3)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_local_gather(device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
