@@ -1147,3 +1147,24 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     tt.return
   }
 }
+
+
+// -----
+// Test that local_load with BlockedEncodingAttr result infers vectorized smem layout.
+// The blocked encoding with order [1, 0] and sizePerThread [1, 8] has 8 contiguous elements
+// in dim 1, so vec=8. With shape 128x64 and 16-bit elements, compute bank-conflict-free swizzling.
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+// CHECK-DAG: #[[$SHARED:.*]] = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 2, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @local_load_blocked_encoding
+  tt.func public @local_load_blocked_encoding(%arg0: tensor<128x64xf16, #blocked>) -> tensor<128x64xf16, #blocked> {
+    // CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #[[$SHARED]], #smem, mutable>
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    ttg.local_store %arg0, %0 : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    // CHECK: ttg.local_load %{{.*}} : !ttg.memdesc<128x64xf16, #[[$SHARED]], #smem, mutable> -> tensor<128x64xf16, #blocked>
+    %2 = ttg.local_load %0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+    tt.return %2 : tensor<128x64xf16, #blocked>
+  }
+}
