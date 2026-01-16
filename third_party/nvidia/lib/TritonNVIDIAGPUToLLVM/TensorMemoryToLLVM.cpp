@@ -898,7 +898,7 @@ static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
     Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
         loc, rewriter.getI32Type());
     // mask the least bit
-    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(-2));
+    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
     // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +
     // 1))"
     Value mask = b.shl(b.i32_val(3), leaderCTARank);
