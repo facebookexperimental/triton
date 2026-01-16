@@ -4,7 +4,7 @@ from . import types as tlx
 from .utility import cuda_parse_arch
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     rank = len(x.shape)
     layout = tlx.nv_mma_shared_layout_encoding(
@@ -14,7 +14,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
         numCTAsPerCGA=[1] * rank,
         numCTASplit=[1] * rank,
         numCTAOrder=[1] * rank,
-        fp4Padded=False,
+        fp4Padded=fp4Padded,
         swizzled=swizzled,
     )
 
@@ -234,8 +234,11 @@ def async_dot_scaled(
     assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
 
     # Require the shared memory layout for A and B
-    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder)
-    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder)
+    # For fp4 (e2m1) format, we need fp4Padded=True for correct swizzling
+    A_fp4Padded = A_format == "e2m1"
+    B_fp4Padded = B_format == "e2m1"
+    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
 
     # Handle input formats
     supported_formats = {"e2m1", "e4m3", "e5m2"}

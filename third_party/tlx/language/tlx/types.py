@@ -168,7 +168,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
     """
 
     @classmethod
-    def make_default(cls, shape, elemType):
+    def make_default(cls, shape, elemType, fp4Padded=False):
         rank = len(shape)
         return cls(
             shape=shape,
@@ -177,7 +177,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             numCTAsPerCGA=[1] * rank,
             numCTASplit=[1] * rank,
             numCTAOrder=[1] * rank,
-            fp4Padded=False,
+            fp4Padded=fp4Padded,
             swizzled=True,
         )
 
