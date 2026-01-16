@@ -107,6 +107,8 @@ void init_triton_proton(py::module &&m) {
                      proton::gpu::createAllocateProtonGlobalScratchBufferPass);
   ADD_PASS_WRAPPER_0("add_schedule_buffer_store",
                      proton::gpu::createScheduleBufferStorePass);
+  ADD_PASS_WRAPPER_0("add_mpp_store_barrier_info",
+                     proton::gpu::createMppStoreBarrierInfoPass);
   ADD_PASS_WRAPPER_0("add_sched_barriers",
                      proton::gpu::createAddSchedBarriersPass);
 }

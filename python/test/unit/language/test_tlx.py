@@ -81,13 +81,13 @@ def test_async_tasks(BLOCK_SIZE, device):
     )
     ttgir = kernel.asm["ttgir"]
     # print(ttgir)
-    pattern_ws = (r'ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 120, 100, 100>}')
+    pattern_ws = r"ttg.warp_specialize(.*) attributes {requestedRegisters = array<i32: 120, 100, 100>}"
     assert re.search(pattern_ws, ttgir, flags=re.DOTALL)
-    pattern_p0 = (r'partition0\([^\n]*\)\s+num_warps\(4\)')
+    pattern_p0 = r"partition0\([^\n]*\)\s+num_warps\(4\)"
     assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
-    pattern_p1 = (r'partition1\([^\n]*\)\s+num_warps\(1\)')
+    pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(1\)"
     assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
-    pattern_p2 = (r'partition2\([^\n]*\)\s+num_warps\(1\)')
+    pattern_p2 = r"partition2\([^\n]*\)\s+num_warps\(1\)"
     assert re.search(pattern_p2, ttgir, flags=re.DOTALL)
 
     # Check that the replica_id is correctly passed to non-default regions
@@ -103,7 +103,7 @@ def test_async_tasks(BLOCK_SIZE, device):
     #   %13 = arith.addf %9, %cst
     #   %14 = arith.subf %12, %cst
     #   ...}
-    pattern_cst = (r'= arith.constant dense\<.*\>')
+    pattern_cst = r"= arith.constant dense\<.*\>"
     found = re.findall(pattern_cst, ttgir)
     assert len(found) == 4, "Expected 4 cst by calling `tlx.async_task_replica_id()` in all regions"
     assert found[0] != found[1], "Two matches MUST be different"
@@ -544,12 +544,12 @@ def test_thread_id(device):
         if tid == 0:
             tl.store(output_ptr + offsets, value, mask=mask)
 
-    output = torch.zeros(32, dtype=torch.int32, device='cuda')
+    output = torch.zeros(32, dtype=torch.int32, device="cuda")
     n_elements = output.numel()
     value = 42
     store_from_thread_0_kernel[(1, )](output, value, n_elements, 0, 32, num_warps=1)
     torch.cuda.synchronize()
-    expected_output = torch.zeros(32, dtype=torch.int32, device='cuda')
+    expected_output = torch.zeros(32, dtype=torch.int32, device="cuda")
     expected_output[0] = value
     torch.testing.assert_close(output, expected_output)
 
@@ -791,8 +791,20 @@ def test_local_reinterpret(device):
 def test_async_dot(device):
 
     @triton.jit
-    def wgmma_kernel_A_smem(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def wgmma_kernel_A_smem(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -819,8 +831,20 @@ def test_async_dot(device):
         tl.store(c_ptrs, c)
 
     @triton.jit
-    def wgmma_kernel_A_reg(X, stride_xm, stride_xk, Y, stride_yk, stride_yn, Z, stride_zm, stride_zn,
-                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def wgmma_kernel_A_reg(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
         off_m = tl.arange(0, BLOCK_M)
         off_n = tl.arange(0, BLOCK_N)
         off_k = tl.arange(0, BLOCK_K)
@@ -851,7 +875,7 @@ def test_async_dot(device):
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
     # test smem
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
     kernel = wgmma_kernel_A_smem[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                          z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
@@ -860,7 +884,7 @@ def test_async_dot(device):
     torch.testing.assert_close(z, z_ref)
 
     # test reg
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
     kernel = wgmma_kernel_A_reg[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                         z.stride(1), **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
@@ -875,8 +899,21 @@ def test_async_dot_blackwell(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -922,7 +959,7 @@ def test_async_dot_blackwell(device):
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
     kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                        z.stride(1), **kern_kwargs)
 
@@ -948,9 +985,22 @@ def test_async_dot_blackwell_not_use_d(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
-                          c_ptr2, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                          OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr1,
+        stride_cm,
+        stride_cn,
+        c_ptr2,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
         pid = tl.program_id(axis=0)
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
@@ -996,7 +1046,7 @@ def test_async_dot_blackwell_not_use_d(device):
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
     z2 = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
     kernel = tcgen5_dot_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
                                        z1.stride(1), z2, **kern_kwargs)
     ttgir = kernel.asm["ttgir"]
@@ -1029,10 +1079,25 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                  OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                                  A_TMEM: tl.constexpr):
+    def tcgen5_dot_kernel2cta_tma(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        A_TMEM: tl.constexpr,
+    ):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
@@ -1069,9 +1134,8 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
         tlx.barrier_wait(bar_b, tl.constexpr(0))
 
         # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
-        cta_bar = tlx.remote_view(cta_bars[0], 0)
-        tlx.barrier_arrive(cta_bar, 1)
-        tlx.barrier_wait(cta_bar, phase=0, pred=pred_cta0)
+        tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
+        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
         buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         acc_tmem = tlx.local_view(buffers, 0)
@@ -1104,17 +1168,34 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
     BLOCK_N = N
     BLOCK_K = K
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'A_TMEM': A_TMEM
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "OUT_DTYPE": tl.float32,
+        "M": M,
+        "N": N,
+        "K": K,
+        "A_TMEM": A_TMEM,
     }
-    kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
-                                                                     y.stride(1), z, z.stride(0), z.stride(1),
-                                                                     **kern_kwargs)
+    kernel = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        ctas_per_cga=(2, 1, 1),  # TLX way: explicitly set cluster dims
+        **kern_kwargs,
+    )
 
     # verify kernel launch cluster
-    assert kernel.metadata.cluster_dims == (
-        2, 1, 1), f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}"
-    assert kernel.metadata.num_ctas == 1, f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}"
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("nvgpu.cluster_id") == 1
@@ -1130,6 +1211,140 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
     torch.testing.assert_close(z, ref_out)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell")
+def test_cluster_dims(device):
+
+    @triton.jit
+    def test_kernel():
+        pid = tl.program_id(axis=0)
+        if pid == 0:
+            return
+
+    k = kernel = test_kernel[(2, )](ctas_per_cga=(2, 1, 1))
+    assert kernel.metadata.cluster_dims == (2, 1, 1)
+    assert ('"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32'
+            in k.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for DSM")
+def test_remote_shmem_store(device):
+
+    @triton.jit
+    def remote_shmem_store_kernel(
+        x,
+        y,
+    ):
+        local_buff = tlx.local_alloc((1, ), tl.float32, 2)
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        remote_store_view = tlx.local_view(local_buff, cluster_cta_rank ^ 1)
+        offset = tl.arange(0, 1) + cluster_cta_rank
+        value = tl.load(x + offset) + (cluster_cta_rank + 1) * 100
+
+        tlx.remote_shmem_store(
+            dst=remote_store_view,
+            src=value,
+            remote_cta_rank=cluster_cta_rank ^ 1,
+        )
+        tlx.cluster_barrier()
+        local_load_view = tlx.local_view(local_buff, cluster_cta_rank)
+        remote_value = tlx.local_load(local_load_view)
+        tl.store(y + offset, remote_value)
+
+    x = torch.empty((2, ), device=device, dtype=torch.float32)
+    x[0] = 42.0
+    x[1] = 43.0
+    y = torch.empty((2, ), device=device, dtype=torch.float32)
+    remote_shmem_store_kernel[(2, )](x, y, ctas_per_cga=(2, 1, 1))
+    assert y[1] == 142.0 and y[0] == 243.0
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("num_ctas", [1, 2])
+def test_async_remote_shmem_store(num_ctas, device):
+    """Test that remote_shmem_store correctly aggregates 2D data across multiple CTAs."""
+
+    @triton.jit
+    def remote_store_sum_kernel(
+        input_ptr,
+        output_ptr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        NUM_CTAS: tl.constexpr,
+    ):
+        # Configure the number of CTAs participating in reduction
+        BLOCK_N: tl.constexpr = triton.cdiv(N, NUM_CTAS)
+
+        # Allocate NUM_CTAS buffers in shared memory, each with shape (BLOCK_M,)
+        # to hold a 1D vector of float32 values
+        local_buffs = tlx.local_alloc((BLOCK_M, ), tl.float32, NUM_CTAS)
+
+        # Allocate barriers for synchronization across CTAs
+        # Each non-zero CTA will use a barrier to signal when its data is written
+        barriers = tlx.alloc_barriers(num_barriers=NUM_CTAS)
+
+        # CTA 0 expects to receive (NUM_CTAS - 1) tiles from other CTAs
+        # Each tile is BLOCK_M * sizeof(float32) bytes
+        for i in tl.static_range(1, NUM_CTAS):
+            tlx.barrier_expect_bytes(barriers[i], BLOCK_M * tlx.size_of(tl.float32))
+
+        # Synchronize all CTAs before starting computation
+        tlx.cluster_barrier()
+
+        # Get the rank of this CTA within the cluster
+        cta_rank = tlx.cluster_cta_rank()
+
+        # Each CTA processes its portion of the input data (2D tile)
+        # Layout: each CTA gets a different BLOCK_N columns
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = cta_rank * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        # Load 2D tile: (BLOCK_M, BLOCK_N)
+        offsets = offs_m[:, None] * N + offs_n[None, :]
+        data = tl.load(input_ptr + offsets)
+
+        # Compute sum over this tile along N dimension, resulting in shape [BLOCK_M]
+        local_sum = tl.sum(data, axis=1)
+
+        # Non-zero CTAs: send their 2D tile to CTA 0's shared memory asynchronously
+        if cta_rank != 0:
+            tlx.async_remote_shmem_store(dst=local_buffs[cta_rank],  # Destination buffer in CTA 0's shared memory
+                                         src=local_sum,  # Source 2D tensor from this CTA
+                                         remote_cta_rank=0,  # Target CTA is CTA 0
+                                         barrier=barriers[cta_rank],  # Signal barrier when write completes
+                                         )
+
+        # CTA 0: aggregate all tiles and write final result
+        if cta_rank == 0:
+            # Start with CTA 0's own local sum
+            final_sum = local_sum
+
+            # Wait for each non-zero CTA to write its data, then accumulate
+            for i in tl.static_range(1, NUM_CTAS):
+                tlx.barrier_wait(barriers[i], phase=0)  # Wait for CTA i's data
+                final_sum += tlx.local_load(local_buffs[i])  # Accumulate CTA i's sum
+
+            # Write the final aggregated sum to output
+            offs_m = tl.arange(0, BLOCK_M)
+            tl.store(output_ptr + offs_m, final_sum)
+
+    torch.manual_seed(0)
+    M = 64
+    N = 256
+    input_tensor = torch.randn((M, N), dtype=torch.float32, device=device)
+    output = torch.zeros(M, dtype=torch.float32, device=device)
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), META["NUM_CTAS"])
+
+    kernel = remote_store_sum_kernel[grid](input_tensor, output, M=M, N=N, BLOCK_M=64, NUM_CTAS=num_ctas, num_warps=1,
+                                           ctas_per_cga=(1, num_ctas, 1))
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttg.async_remote_shmem_store") == 1
+
+    expected = torch.sum(input_tensor, dim=1)
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma_ws(device):
     """
@@ -1142,9 +1357,24 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def tcgen5_dot_kernel2cta_tma_ws(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm,
-                                     stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                     OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    def tcgen5_dot_kernel2cta_tma_ws(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+    ):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
         pred_cta0 = cluster_cta_rank == 0
@@ -1187,9 +1417,8 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
                 tlx.barrier_wait(smem_full_bars[0], phase=0)
 
                 # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
-                cta_bar = tlx.remote_view(cta_bars[0], 0)
-                tlx.barrier_arrive(cta_bar, 1)
-                tlx.barrier_wait(cta_bar, phase=0, pred=pred_cta0)
+                tlx.barrier_arrive(cta_bars[0], arrive_count=1, remote_cta_rank=0)
+                tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
 
                 # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
                 tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[], two_ctas=True, out_dtype=OUT_DTYPE)
@@ -1214,16 +1443,33 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     BLOCK_N = N
     BLOCK_K = K
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "OUT_DTYPE": tl.float32,
+        "M": M,
+        "N": N,
+        "K": K,
     }
-    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](x, x.stride(0), x.stride(1), y, y.stride(0),
-                                                                        y.stride(1), z, z.stride(0), z.stride(1),
-                                                                        **kern_kwargs)
+    kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        ctas_per_cga=(2, 1, 1),
+        **kern_kwargs,
+    )
 
     # verify kernel launch cluster
-    assert kernel.metadata.cluster_dims == (
-        2, 1, 1), f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}"
-    assert kernel.metadata.num_ctas == 1, f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}"
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("nvgpu.cluster_id") == 1
@@ -1242,6 +1488,231 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
 
     ref_out = torch.matmul(x, y)
     torch.testing.assert_close(z, ref_out)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_scaled_2cta(device):
+    """
+    Test 2-CTA scaled MMA generates tcgen05.mma.cta_group::2 instruction.
+    Also verifies numerical correctness against reference implementation.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def tcgen5_dot_scaled_2cta_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        a_scale_ptr,
+        b_scale_ptr,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+    ):
+        # difference from 1cta
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        pred_cta0 = cluster_cta_rank == 0
+        cta_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)  # CTA0 waits for signals from both CTAs
+
+        desc_a = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+
+        # difference from 1cta: B is split across 2 CTAs
+        desc_b = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[K, N],
+            strides=[stride_bk, stride_bn],
+            block_shape=[BLOCK_K, BLOCK_N // 2],
+        )
+
+        desc_a_scale = tl.make_tensor_descriptor(
+            a_scale_ptr,
+            shape=[M // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        # B scale is NOT split across CTAs - full scale needed for MMA
+        desc_b_scale = tl.make_tensor_descriptor(
+            b_scale_ptr,
+            shape=[N // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        # async load a and b into SMEM
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float8e4nv, tl.constexpr(1))  # difference from 1cta
+        a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
+        # B scale tile is NOT halved - full scale for MMA
+        b_scale_tile = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
+
+        bars = tlx.alloc_barriers(tl.constexpr(4))
+        bar_a = tlx.local_view(bars, 0)
+        bar_b = tlx.local_view(bars, 1)
+        bar_a_scale = tlx.local_view(bars, 2)
+        bar_b_scale = tlx.local_view(bars, 3)
+        tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K * 1)  # fp8
+        tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 1)  # difference from 1cta: B is half
+        tlx.barrier_expect_bytes(bar_a_scale, BLOCK_M // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)
+        tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)  # full B scale
+
+        # difference from 1cta: A offset by CTA rank, B offset by CTA rank
+        tlx.async_descriptor_load(desc_a, a_tile[0], [cluster_cta_rank * BLOCK_M, 0], bar_a)
+        tlx.async_descriptor_load(desc_b, b_tile[0], [0, cluster_cta_rank * BLOCK_N // 2], bar_b)
+        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [cluster_cta_rank * BLOCK_M // 128, 0, 0, 0],
+                                  bar_a_scale)
+        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0], bar_b_scale)  # full B scale
+
+        tlx.barrier_wait(bar_a, tl.constexpr(0))
+        tlx.barrier_wait(bar_b, tl.constexpr(0))
+        tlx.barrier_wait(bar_a_scale, tl.constexpr(0))
+        tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
+
+        # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
+        # "Arrive Remote, Wait Local" pattern: all CTAs signal CTA 0's barrier, only CTA 0 waits
+        tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        # Allocate barrier for MMA completion
+        mma_done_bars = tlx.alloc_barriers(tl.constexpr(1))
+        mma_done_bar = tlx.local_view(mma_done_bars, 0)
+
+        # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
+        # Pass mma_done_bar directly to async_dot_scaled for MMA completion signaling
+        tlx.async_dot_scaled(
+            a_tile[0],
+            b_tile[0],
+            c_tile[0],
+            a_scale_tile[0],
+            A_format,
+            b_scale_tile[0],
+            B_format,
+            use_acc=False,
+            two_ctas=True,
+            mBarriers=[mma_done_bar],
+        )
+
+        # Wait for MMA completion
+        tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+
+        result = tlx.local_load(c_tile[0])
+
+        c = result.to(tl.float16)
+        offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    triton.set_allocator(alloc_fn)
+    torch.manual_seed(0)
+    # M=256 so BLOCK_M=128 per CTA, N=256 so BLOCK_N=256 total (128 per CTA for B data)
+    M, N, K = (256, 256, 128)
+
+    DTYPE_MAP = {
+        "e5m2": torch.float8_e5m2,
+        "e4m3": torch.float8_e4m3fn,
+    }
+
+    A_DATA_TYPE = "e4m3"
+    B_DATA_TYPE = "e4m3"
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(DTYPE_MAP[A_DATA_TYPE]).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
+    a_scale_4d = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
+    b_scale_4d = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+
+    BLOCK_M = M // 2  # 128 per CTA
+    BLOCK_N = N  # 256 total, 128 per CTA for B data
+    BLOCK_K = K
+    kern_kwargs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "M": M,
+        "N": N,
+        "K": K,
+    }
+    kernel = tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
+        a,
+        a.stride(0),
+        a.stride(1),
+        b,
+        b.stride(0),
+        b.stride(1),
+        a_scale_4d,
+        b_scale_4d,
+        c,
+        c.stride(0),
+        c.stride(1),
+        A_DATA_TYPE,
+        B_DATA_TYPE,
+        ctas_per_cga=(2, 1, 1),  # TLX way: explicitly set cluster dims
+        **kern_kwargs,
+    )
+
+    # verify kernel launch cluster
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("ttng.map_to_remote_buffer") == 1
+    assert ttgir.count("ttng.tc_gen5_mma_scaled") >= 1
+
+    ptx = kernel.asm["ptx"]
+    # The key assertion: with two_ctas=True, should generate cta_group::2 for scaled MMA
+    assert ptx.count("tcgen05.mma.cta_group::2") > 0, (
+        f"Expected tcgen05.mma.cta_group::2 for 2-CTA scaled MMA, but found: "
+        f"cta_group::1 count={ptx.count('tcgen05.mma.cta_group::1')}, "
+        f"cta_group::2 count={ptx.count('tcgen05.mma.cta_group::2')}")
+
+    # Numeric verification: compute reference and compare
+    def fp8e8m0_to_float32(scale):
+        """Convert FP8 E8M0 scale values to float32."""
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    # Compute reference: D = (A * A_scale) @ (B * B_scale)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
+    # Repeat each scale value 32 times along K dimension
+    a_scale_f32 = a_scale_f32.repeat_interleave(32, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(32, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+
+    atol = 1e-2 * math.sqrt(K / 32)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
 
 
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])
@@ -1363,9 +1834,22 @@ def test_tcgen05_commit(device):
     """
 
     @triton.jit
-    def tcgen5_commit_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr1, stride_cm, stride_cn,
-                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                             OUT_DTYPE: tl.constexpr, NUM_DOT: tl.constexpr):
+    def tcgen5_commit_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr1,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        NUM_DOT: tl.constexpr,
+    ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -1413,16 +1897,27 @@ def test_tcgen05_commit(device):
     x = torch.randn((M, K), device=device, dtype=torch.float16)
     y = torch.randn((K, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
 
     num_dot = 4
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
-    kernel = tcgen5_commit_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
-                                          z1.stride(1), NUM_DOT=num_dot, **kern_kwargs)
+    kernel = tcgen5_commit_kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z1,
+        z1.stride(0),
+        z1.stride(1),
+        NUM_DOT=num_dot,
+        **kern_kwargs,
+    )
     ptx = kernel.asm["ptx"]
     assert ptx.count("tcgen05.mma") == 4 * num_dot  # loop unrolled so 4 mma ops per dot
-    assert ptx.count(
-        "tcgen05.commit") == 1 + num_dot  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
+    assert (ptx.count("tcgen05.commit") == 1 + num_dot
+            )  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
     assert ptx.count("mbarrier.try_wait") == 2  # one for first sync dot, one for final wait
     ref_out = torch.zeros_like(z1)
     for _ in range(num_dot):
@@ -1431,12 +1926,23 @@ def test_tcgen05_commit(device):
 
     num_dot = 3
     z1 = torch.zeros((M, N), device=device, dtype=torch.float16)
-    kernel = tcgen5_commit_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z1, z1.stride(0),
-                                          z1.stride(1), NUM_DOT=num_dot, **kern_kwargs)
+    kernel = tcgen5_commit_kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z1,
+        z1.stride(0),
+        z1.stride(1),
+        NUM_DOT=num_dot,
+        **kern_kwargs,
+    )
     ptx = kernel.asm["ptx"]
     assert ptx.count("tcgen05.mma") == 4 * num_dot  # loop unrolled so 4 mma ops per dot
-    assert ptx.count(
-        "tcgen05.commit") == 1 + num_dot  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
+    assert (ptx.count("tcgen05.commit") == 1 + num_dot
+            )  # one for each dot (loop unrolled), then one dedicated barrier for all mma ops
     assert ptx.count("mbarrier.try_wait") == 2  # one for first sync dot, one for final wait
     ref_out = torch.zeros_like(z1)
     for _ in range(num_dot):
@@ -1451,9 +1957,21 @@ def test_async_dot_blackwell_tmem_A(device):
     """
 
     @triton.jit
-    def tcgen5_dot_kernel_tmem_A(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                                 OUT_DTYPE: tl.constexpr):
+    def tcgen5_dot_kernel_tmem_A(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -1500,7 +2018,7 @@ def test_async_dot_blackwell_tmem_A(device):
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N, 'OUT_DTYPE': tl.float32}
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
     kernel = tcgen5_dot_kernel_tmem_A[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z, z.stride(0),
                                               z.stride(1), **kern_kwargs)
 
@@ -1592,7 +2110,6 @@ def tlx_square_ws(
     phase = 0
     with tlx.async_tasks():
         with tlx.async_task("default"):
-
             tlx.barrier_wait(bar=b1, phase=phase ^ 1)
 
             # Placeholder block to do something
@@ -1600,7 +2117,6 @@ def tlx_square_ws(
             tlx.barrier_arrive(bar=b0)  # Release
 
         with tlx.async_task(num_warps=4):
-
             tlx.barrier_wait(bar=b0, phase=phase)  # Wait
 
             # Some arith ops TODO. add WS
@@ -1614,7 +2130,6 @@ def tlx_square_ws(
 
 
 def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
-
     # prepare inputs
     torch.manual_seed(0)
     size = 98432
@@ -1643,12 +2158,12 @@ def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
     if is_hip():
-        assert (ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase")
-                                                              == 3) and (ttgir.count("amdgpu.arrive_barrier")
-                                                                         == 3), f"TTGIR {ttgir}"
+        assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
+                and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
     else:
-        assert (ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3) and (
-            ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 3), f"TTGIR {ttgir}"
+        assert ((ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3)
+                and (ttgir.count("ttng.barrier_expect") == 0)
+                and (ttgir.count("ttng.arrive_barrier") == 3)), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -1658,10 +2173,9 @@ def test_wait_arrive_ws(BLOCK_SIZE, device):
 
     # ASSERT in ttgir
     ttgir = kernel.asm["ttgir"]
-    assert (ttgir.count("ttng.init_barrier")
-            == 2) and (ttgir.count("ttng.wait_barrier") == 2) and (ttgir.count("ttng.barrier_expect") == 0) and (
-                ttgir.count("ttng.arrive_barrier")
-                == 2) and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1), f"TTGIR {ttgir}"
+    assert ((ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2)
+            and (ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 2)
+            and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1)), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -1669,6 +2183,11 @@ def test_barrier_live_range(device):
 
     @triton.jit
     def bar_live_kernel():
+        # an intentional early return here to check that we're considering dominance when inserting inval bar ops
+        pid = tl.program_id(axis=0)
+        if pid == 258:
+            return
+
         # use bars1 after bars2/3 init
         bars1 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
 
@@ -1819,6 +2338,96 @@ def test_descriptor_load(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_descriptor_load_multicast(device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        CLUSTER_SIZE_M: tl.constexpr = 2
+        cta_id = tlx.cluster_cta_rank()
+        cta_id_m = cta_id % CLUSTER_SIZE_M
+        cta_id_n = cta_id // CLUSTER_SIZE_M
+
+        # have one CTA from each cluster row to initiate the TMA
+        should_initiate_load = cta_id_m == cta_id_n
+
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+        if should_initiate_load:
+            # given CTA layout
+            # [ 0, 2 ]
+            # [ 1, 3 ]
+            # for CTA 0: we want it to multicast to CTA 0 and 2
+            # for CTA 3: we want it to multicast to CTA 1 and 3
+            tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
+                                      multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.rand((M, N), dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (2, 2)
+
+    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                          ctas_per_cga=(2, 2, 1))
+
+    assert kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    # x:
+    # [ x0 | x2]
+    # [ x1 | x3]
+    # y:
+    # [ y0 | y2]
+    # [ y1 | y3]
+    # we copied x0 to y0 and y2, x3 to y1 and y3. x1 and x2 are not copied.
+    x0 = x[:64, :64]
+    x3 = x[64:128, 64:128]
+
+    y0 = y[:64, :64]
+    y3 = y[64:128, 64:128]
+    y1 = y[64:128, :64]
+    y2 = y[:64, 64:128]
+
+    torch.testing.assert_close(x0, y0)
+    torch.testing.assert_close(x0, y2)
+    torch.testing.assert_close(x3, y1)
+    torch.testing.assert_close(x3, y3)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_local_gather(device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
@@ -1901,7 +2510,7 @@ def test_loop_carry_var_check(device):
     with pytest.raises(triton.CompilationError) as e:
         loop_carry_shadow[grid]()
     list_msg = traceback.format_exception(e.type, e.value, e.tb, chain=True)
-    assert "Please make sure that the type stays consistent" in '\n'.join(list_msg)
+    assert "Please make sure that the type stays consistent" in "\n".join(list_msg)
 
 
 @triton.jit
@@ -1913,7 +2522,6 @@ def _global_tmem_func(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
-
     offs_m = tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_N)
     x_ptr_offsets = x_ptr + (offs_m[:, None] * stride_m + offs_n[None, :] * stride_n)
@@ -1977,6 +2585,34 @@ def test_inline_tmem(BLOCK_SIZE, device):
     assert kerenl_info.asm["ttir"].count("store") == 1
 
 
+def test_size_of(device):
+
+    @triton.jit
+    def size_of_kernel(output_ptr):
+        # Test size_of for various dtypes
+        size_fp32 = tlx.size_of(tl.float32)
+        size_fp16 = tlx.size_of(tl.float16)
+        size_int32 = tlx.size_of(tl.int32)
+        size_int8 = tlx.size_of(tl.int8)
+        size_int64 = tlx.size_of(tl.int64)
+
+        # Store results
+        tl.store(output_ptr + 0, size_fp32)
+        tl.store(output_ptr + 1, size_fp16)
+        tl.store(output_ptr + 2, size_int32)
+        tl.store(output_ptr + 3, size_int8)
+        tl.store(output_ptr + 4, size_int64)
+
+    # Expected sizes in bytes
+    expected_sizes = torch.tensor([4, 2, 4, 1, 8], dtype=torch.int32, device=device)
+    output = torch.zeros(5, dtype=torch.int32, device=device)
+
+    grid = lambda meta: (1, )
+    size_of_kernel[grid](output)
+
+    torch.testing.assert_close(output, expected_sizes)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dots_blackwell_tmem(device):
     """
@@ -1984,8 +2620,23 @@ def test_async_dots_blackwell_tmem(device):
     """
 
     @triton.jit
-    def tcgen5_fa_kernel(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn, d_ptr,
-                         stride_dm, stride_dn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def tcgen5_fa_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        d_ptr,
+        stride_dm,
+        stride_dn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
         a_tiles = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
         b_tiles = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
         c_tiles = tlx.local_alloc((BLOCK_N, BLOCK_N), tl.float16, tl.constexpr(1), reuse=a_tiles)
@@ -2062,9 +2713,23 @@ def test_async_dots_blackwell_tmem(device):
     c = torch.ones((N, N), device=device, dtype=torch.float16)
     d = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    kern_kwargs = {'BLOCK_M': M, 'BLOCK_K': K, 'BLOCK_N': N}
-    kernel = tcgen5_fa_kernel[(1, 1)](a, a.stride(0), a.stride(1), b, b.stride(0), b.stride(1), c, c.stride(0),
-                                      c.stride(1), d, d.stride(0), d.stride(1), **kern_kwargs, num_warps=4)
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N}
+    kernel = tcgen5_fa_kernel[(1, 1)](
+        a,
+        a.stride(0),
+        a.stride(1),
+        b,
+        b.stride(0),
+        b.stride(1),
+        c,
+        c.stride(0),
+        c.stride(1),
+        d,
+        d.stride(0),
+        d.stride(1),
+        **kern_kwargs,
+        num_warps=4,
+    )
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.tmem_alloc") == 2
@@ -2129,11 +2794,11 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
     ptx = kernel.asm["ptx"]
 
-    assert re.search((r'clusterlaunchcontrol.try_cancel'), ptx, flags=re.DOTALL)
-    assert re.search((r'clusterlaunchcontrol.query_cancel.is_canceled.pred.b128'), ptx, flags=re.DOTALL)
-    assert re.search((r'clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128'), ptx, flags=re.DOTALL)
+    assert re.search((r"clusterlaunchcontrol.try_cancel"), ptx, flags=re.DOTALL)
+    assert re.search((r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128"), ptx, flags=re.DOTALL)
+    assert re.search((r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128"), ptx, flags=re.DOTALL)
 
-    assert (torch.count_nonzero(output) == size)
+    assert torch.count_nonzero(output) == size
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -2151,7 +2816,8 @@ def test_async_tasks_region_error(device):
     with pytest.raises(triton.CompilationError) as e:
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
-    assert "ZeroDivisionError('division by zero')" in exc_msg, '\n\nExpected ZeroDivisionError but got: \n\n' + exc_msg + '\n\n'
+    assert "ZeroDivisionError('division by zero')" in exc_msg, ("\n\nExpected ZeroDivisionError but got: \n\n" +
+                                                                exc_msg + "\n\n")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -2191,8 +2857,137 @@ def test_local_index(BLOCK_SIZE, device):
     n_elements = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     local_index[grid](x, output, n_elements, BLOCK_SIZE)
-    y = torch.tensor([10., 10., 10., 10.], device='cuda:0')
+    y = torch.tensor([10.0, 10.0, 10.0, 10.0], device="cuda:0")
     torch.testing.assert_close(y, output)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_scaled_mxfp4(device):
+    """
+    Test D = (A * A_scale) * (B * B_scale) with mxfp4 (e2m1) format for both A and B.
+
+    For mxfp4 format:
+    - Two fp4 (e2m1) elements are packed into a single uint8
+    - A has logical shape (M, K), packed along K to get physical shape (M, K//2)
+    - B is stored in transposed layout (N, K), packed along K to get (N, K//2)
+    - B is transposed in SMEM before being passed to MMA to get (K//2, N)
+
+    Scale layout uses 4D TMA descriptor [rep_m, rep_k, 2, 256] with uint8 elements,
+    matching the working fp8 test pattern.
+    """
+    from triton.tools.mxfp import MXFP4Tensor
+
+    VEC_SIZE = 32  # mxfp4 uses 32 elements per scale factor
+
+    @triton.jit
+    def tcgen5_dot_scaled_mxfp4_kernel(
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # Allocate SMEM buffers
+        # A: (M, K//2) - packed along K
+        # B: (N, K//2) - stored in transposed layout, packed along K
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K // 2), tl.uint8, tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_N, BLOCK_K // 2), tl.uint8, tl.constexpr(1))
+        a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
+
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        LD_SIZE: tl.constexpr = BLOCK_M * BLOCK_K // 2 + BLOCK_N * BLOCK_K // 2 + (BLOCK_M + BLOCK_N) * BLOCK_K // 32
+        tlx.barrier_expect_bytes(load_bar[0], LD_SIZE)
+        tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        # Transpose B from (N, K//2) to (K//2, N) for MMA
+        b_tile_T = tlx.local_trans(b_tile[0])
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.async_dot_scaled(a_tile[0], b_tile_T, c_tile[0], a_scale_tile[0], "e2m1", b_scale_tile[0], "e2m1",
+                             use_acc=False)
+
+        result = tlx.local_load(c_tile[0])
+        c = result.to(tlx.dtype_of(c_desc))
+        c_desc.store([0, 0], c)
+
+    torch.manual_seed(0)
+    M, N, K = (128, 128, 128)
+    BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
+
+    # Create mxfp4 tensors and pack them
+    # A has logical shape (M, K), packed along K to get physical shape (M, K//2)
+    a_mxfp4 = MXFP4Tensor(size=(M, K), device=device).random()
+    a = a_mxfp4.to_packed_tensor(dim=1)  # Pack along K dimension -> (M, K//2)
+    a_ref = a_mxfp4.to(torch.float32)
+
+    # B is stored in transposed layout (N, K), packed along K to get (N, K//2)
+    # This matches the hardware expectation for mxfp4
+    b_mxfp4 = MXFP4Tensor(size=(N, K), device=device).random()
+    b = b_mxfp4.to_packed_tensor(dim=1)  # Pack along K dimension -> (N, K//2)
+    b_ref = b_mxfp4.to(torch.float32).T  # Transpose for reference matmul -> (K, N)
+
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    # TMA descriptors for packed mxfp4 data
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K // 2])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_N, BLOCK_K // 2])  # B stored as (N, K//2)
+    c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
+
+    # Create E8M0 scale tensors using same pattern as working fp8 test:
+    # Start with 2D shape (M, K//32), reshape to 4D (M//128, K//32//4, 2, 256)
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+
+    # Reshape to 4D format for TMA: [rep_m, rep_k, 2, 256]
+    a_scale_4d = a_scale.reshape(M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_4d = b_scale.reshape(N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+
+    a_scale_block_shape = [BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_4d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_4d, block_shape=b_scale_block_shape)
+
+    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N}
+    kernel = tcgen5_dot_scaled_mxfp4_kernel[(1, 1)](
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        **kern_kwargs,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_global_to_local") == 4
+    assert ttgir.count("ttng.tc_gen5_mma_scaled") == 1
+
+    # Converts E8M0 format scale values to float32 by bit-shifting the exponent bits
+    # into the correct position for IEEE 754 float32 representation
+    def fp8e8m0_to_float32(scale):
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    # Compute reference: reshape 4D scale back to 2D, then convert to float32
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_4d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_4d.reshape(N, K // VEC_SIZE))
+    # Repeat each scale value VEC_SIZE times along dim 1
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a_ref * a_scale_f32, b_ref * b_scale_f32).to(torch.float16)
+
+    atol = 1e-2 * math.sqrt(K / 32)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -2347,8 +3142,14 @@ def test_stoch_round_partial_pack(dst_dtype, device):
         a = torch.randn([SIZE], dtype=torch.float32, device=device)
         b = torch.empty([SIZE], dtype=torch.float32, device=device).to(dst_dtype_torch)
         grid = lambda meta: (1, )
-        stoch_round_partial_kernel[grid](a, b, BLOCK_SIZE=SIZE, BLOCK_SIZE_ROUNDED=SIZE_ROUNDED,
-                                         QUARTER_SIZE_ROUNDED=QUARTER_SIZE_ROUNDED, num_warps=1)
+        stoch_round_partial_kernel[grid](
+            a,
+            b,
+            BLOCK_SIZE=SIZE,
+            BLOCK_SIZE_ROUNDED=SIZE_ROUNDED,
+            QUARTER_SIZE_ROUNDED=QUARTER_SIZE_ROUNDED,
+            num_warps=1,
+        )
 
         # Verify no NaN/Inf
         b_back = b.float()
@@ -2423,13 +3224,13 @@ def test_stoch_round_entropy_quality(device):
 
     # Results should be different for at least some values
     different_count = (b1.float() != b2.float()).sum().item()
-    assert different_count > SIZE * 0.1, (f"Different seeds should produce different results, "
-                                          f"but only {different_count}/{SIZE} values differ")
+    assert different_count > SIZE * 0.1, (
+        f"Different seeds should produce different results, but only {different_count}/{SIZE} values differ")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_make_tensor_descriptor(device):
-    """Test global_alloc and make_tensor_descriptor together with TMA operations."""
+    """Test allocate_tensor_descriptor and make_tensor_descriptor together with TMA operations."""
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
@@ -2438,20 +3239,20 @@ def test_make_tensor_descriptor(device):
 
     @triton.jit
     def kernel(input_ptr, output_ptr, SIZE, BLOCK_SIZE: tl.constexpr):
-        # Allocate descriptor in global scratch memory using global_alloc
-        desc_ptr = tlx.global_alloc(nbytes=256, alignment=128)
+        # Allocate descriptor in global scratch memory using allocate_tensor_descriptor
+        desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
 
         # Create tensor descriptor using the global scratch pointer
-        desc_in = tlx.make_tensor_descriptor(
-            desc_ptr=desc_ptr,
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
             base=input_ptr,
             shape=[SIZE],
             strides=[tl.constexpr(1)],
             block_shape=[BLOCK_SIZE],
         )
 
-        desc_out = tlx.make_tensor_descriptor(
-            desc_ptr=desc_ptr + 128,
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptrs[1],
             base=output_ptr,
             shape=[SIZE],
             strides=[tl.constexpr(1)],
@@ -2463,6 +3264,17 @@ def test_make_tensor_descriptor(device):
         offset = pid * BLOCK_SIZE
 
         # Load and store using standard descriptors
+        # Reinterpret pointers as tensor descriptors
+        desc_in = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptrs[0],
+            block_shape=[BLOCK_SIZE],
+            dtype=tlx.dtype_of(input_ptr),
+        )
+        desc_out = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptrs[1],
+            block_shape=[BLOCK_SIZE],
+            dtype=tlx.dtype_of(output_ptr),
+        )
         x = desc_in.load([offset])
         desc_out.store([offset], x)
 
@@ -2479,6 +3291,339 @@ def test_make_tensor_descriptor(device):
     ttgir = compiled_kernel.asm["ttgir"]
     assert ttgir.count("ttg.global_scratch_alloc") == 1, "Expected 1 global_scratch_alloc operation"
     assert ttgir.count("ttng.tensormap_create") == 2, "Expected 2 tensormap_create operations"
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 2, "Expected 2 reinterpret_tensor_descriptor operations"
 
     # Verify the data was copied correctly through TMA operations
     torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_buffer_indexing_in_function_call(device):
+    """Test that buffer indexing with [] syntax works correctly in function calls"""
+
+    @triton.jit
+    def helper_function(buffers, idx, data):
+        """Helper function that receives buffers and performs indexing inside"""
+        tlx.local_store(buffers[idx], data)  # Indexing happens inside the helper
+        result = tlx.local_load(buffers[idx])  # Indexing again
+        return result
+
+    @triton.jit
+    def kernel_with_indexing(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        # Allocate buffer with multiple stages
+        buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, num=tl.constexpr(4))
+
+        # Load data
+        x = tl.load(x_ptr + offsets, mask=mask)
+
+        # Pass buffers to helper function which performs ALL indexing
+        result = helper_function(buffers, 0, x)
+
+        # Store result
+        tl.store(y_ptr + offsets, result, mask=mask)
+
+    torch.manual_seed(0)
+    size = 1024
+    x = torch.rand(size, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(size, BLOCK_SIZE), )
+    kernel_with_indexing[grid](x, y, size, BLOCK_SIZE)
+
+    # Verify correctness
+    assert torch.allclose(y, x), "Buffer indexing in function call failed"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_async_tasks_warp_group_start_ids(BLOCK_SIZE, device):
+    """Test that warp_group_start_id is correctly passed to warp_specialize op."""
+
+    @triton.jit
+    def warp_specialized_kernel_with_start_ids(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                output = x + y
+                tl.store(z_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                tl.store(z_ptr + offsets, x, mask=mask)
+            with tlx.async_task(num_warps=1, warp_group_start_id=8):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                y = tl.load(y_ptr + offsets, mask=mask)
+                tl.store(z_ptr + offsets, y, mask=mask)
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = warp_specialized_kernel_with_start_ids[grid](
+        x,
+        y,
+        output,
+        n_elements,
+        BLOCK_SIZE,
+        num_warps=4,
+    )
+    ttgir = kernel.asm["ttgir"]
+
+    # Verify that warpGroupStartIds attribute is present in the IR with the correct values
+    pattern_ws = r"ttg.warp_specialize.*warpGroupStartIds = array<i32: 4, 6, 8>"
+    assert re.search(pattern_ws, ttgir,
+                     flags=re.DOTALL), (f"Expected warpGroupStartIds = array<i32: 4, 6, 8> in ttgir, got:\n{ttgir}")
+
+    # Verify partition structure
+    # Task 1 has replicate=2 with num_warps=2, so partition0 and partition1 both have 2 warps
+    # Task 2 has replicate=1 with num_warps=1, so partition2 has 1 warp
+    pattern_p0 = r"partition0\([^\n]*\)\s+num_warps\(2\)"
+    assert re.search(pattern_p0, ttgir, flags=re.DOTALL)
+    pattern_p1 = r"partition1\([^\n]*\)\s+num_warps\(2\)"
+    assert re.search(pattern_p1, ttgir, flags=re.DOTALL)
+    pattern_p2 = r"partition2\([^\n]*\)\s+num_warps\(1\)"
+    assert re.search(pattern_p2, ttgir, flags=re.DOTALL)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for cluster support")
+def test_ctas_per_cga(device):
+    """Test launching kernels with 2x1x1 ctas_per_cga (CUDA cluster dimensions) in autotune config."""
+
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {"BLOCK_SIZE": 64},
+                num_warps=4,
+            ),
+        ],
+        key=["n_elements"],
+    )
+    @triton.jit
+    def simple_kernel_clustered(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tl.store(x_ptr + offsets, offsets, mask=mask)
+
+    x = torch.zeros(256, dtype=torch.float32, device=device)
+    num_blocks = triton.cdiv(256, 64)
+
+    # Launch with autotuned config containing ctas_per_cga=(2,1,1)
+    kernel = simple_kernel_clustered[(num_blocks, )](x, 256, ctas_per_cga=(2, 1, 1))
+
+    # verify kernel launch cluster
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+    assert kernel.metadata.num_ctas == 1, (
+        f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell for TMEM")
+def test_dummy_layout_function_inlining(device):
+    """Test that dummy layouts are correctly resolved when helper functions are inlined into async tasks.
+
+    This test verifies that:
+    1. Helper functions with TMA+TMEM operations get properly inlined into async task regions
+    2. The dummy layout resolution uses the correct num_warps from the async task context
+       (not the global num_warps)
+    3. TMA load/store and TMEM operations work correctly when in separate helper functions
+       with different warp counts than the async task
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def load_helper(desc, smem_buffer, tmem_buffer, offset_m, offset_n, bar, tmem_full_bar):
+        """Helper function: TMA load from global to SMEM, then store to TMEM."""
+        tlx.async_descriptor_load(desc, smem_buffer, [offset_m, offset_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        # Load from SMEM to registers, then store to TMEM
+        reg_data = tlx.local_load(smem_buffer)
+        tlx.local_store(tmem_buffer, reg_data)
+        # Signal that TMEM is ready
+        tlx.barrier_arrive(tmem_full_bar)
+
+    @triton.jit
+    def store_helper(desc, smem_buffer, tmem_buffer, offset_m, offset_n, tmem_full_bar):
+        """Helper function: Load from TMEM, then TMA store to global."""
+        # Wait for TMEM to be ready
+        tlx.barrier_wait(tmem_full_bar, phase=0)
+        # Load from TMEM to registers, then store to SMEM
+        reg_data = tlx.local_load(tmem_buffer)
+        tlx.local_store(smem_buffer, reg_data)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc, smem_buffer, [offset_m, offset_n])
+        tlx.async_descriptor_store_wait(0)
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+
+        # SMEM buffer for TMA operations
+        smem_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1))
+        smem_buffer = tlx.local_view(smem_buffers, 0)
+
+        # TMEM buffer for intermediate storage
+        tmem_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1), tlx.storage_kind.tmem)
+        tmem_buffer = tlx.local_view(tmem_buffers, 0)
+
+        # Barrier for TMA load completion
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_M * BLOCK_N * 2)
+
+        # Barrier for TMEM write completion (producer-consumer sync between async tasks)
+        tmem_full_bars = tlx.alloc_barriers(tl.constexpr(1))
+        tmem_full_bar = tlx.local_view(tmem_full_bars, 0)
+
+        off_m = pid_m * BLOCK_M
+        off_n = pid_n * BLOCK_N
+
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                # Load from TMA + store to TMEM
+                load_helper(desc_in, smem_buffer, tmem_buffer, off_m, off_n, bar, tmem_full_bar)
+            with tlx.async_task(num_warps=8):
+                # Load from TMEM + store to TMA
+                store_helper(desc_out, smem_buffer, tmem_buffer, off_m, off_n, tmem_full_bar)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_M, BLOCK_N = 64, 64
+    x = torch.randn((M, N), dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    compiled_kernel = kernel[grid](x, y, M, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4)
+
+    ttgir = compiled_kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_global_to_local") == 1
+    assert ttgir.count("ttng.async_tma_copy_local_to_global") == 1
+    assert ttgir.count("ttng.tmem_alloc") == 1
+    assert ttgir.count("ttng.tmem_store") == 1
+    assert ttgir.count("ttng.tmem_load") == 1
+
+    assert torch.equal(x, y), "Data copy through TMA+TMEM should be exact"
+
+
+@pytest.mark.parametrize("BLOCK_SIZE", [64])
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_tensor_descriptor_ws_capture(BLOCK_SIZE, device):
+    """Test that tensor descriptor parameters are properly captured in WS regions when used in inlined functions."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def load_helper(desc, offset):
+        """Helper function that uses descriptor - will be inlined."""
+        return desc.load([offset])
+
+    @triton.jit
+    def store_helper(desc, offset, data):
+        """Helper function that stores using descriptor - will be inlined."""
+        desc.store([offset], data)
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr, SIZE, BLOCK_SIZE: tl.constexpr):
+        # Create tensor descriptors
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[SIZE],
+            strides=[tl.constexpr(1)],
+            block_shape=[BLOCK_SIZE],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[SIZE],
+            strides=[tl.constexpr(1)],
+            block_shape=[BLOCK_SIZE],
+        )
+
+        pid = tl.program_id(0)
+        offset = pid * BLOCK_SIZE
+
+        # Use tensor descriptor in WS regions with inlined function
+        # The descriptor and its expanded parameters should be properly captured in non-default region
+        with tlx.async_tasks(warp_specialize=True):
+            with tlx.async_task("default"):
+                # Default task does some trivial work
+                dummy = pid + 1
+                dummy = dummy * 2
+            with tlx.async_task(num_warps=4):
+                # Call helper functions that will be inlined in non-default region
+                # The descriptor and its expanded parameters need to be captured from outer scope
+                x = load_helper(desc_in, offset)
+                store_helper(desc_out, offset, x)
+
+    triton.set_allocator(alloc_fn)
+    SIZE = 256
+    input_data = torch.arange(SIZE, dtype=torch.float32, device=device)
+    output_data = torch.zeros(SIZE, dtype=torch.float32, device=device)
+
+    grid = lambda meta: (triton.cdiv(SIZE, BLOCK_SIZE), )
+    kernel[grid](input_data, output_data, SIZE, BLOCK_SIZE)
+    assert torch.allclose(output_data, input_data), "Tensor descriptor capture in WS region failed"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_wait_no_remote_view(device):
+    """Test that barrier_wait does not allow remote_view of mbarrier."""
+
+    @triton.jit
+    def barrier_wait_remote_view_kernel():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        # Get remote view of the barrier
+        remote_bar = tlx.remote_view(bar, 0)
+        # This should raise an assertion error because barrier_wait does not support remote_view
+        tlx.barrier_wait(remote_bar, phase=0)
+
+    grid = lambda meta: (1, )
+    with pytest.raises(triton.CompilationError) as e:
+        barrier_wait_remote_view_kernel[grid](ctas_per_cga=(2, 1, 1))
+    exc_msg = str(e.value)
+    assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"

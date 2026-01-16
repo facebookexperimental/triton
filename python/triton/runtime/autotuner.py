@@ -333,11 +333,30 @@ class Config:
     :ivar pre_hook: a function that will be called before the kernel is called. Parameters of this
                     function are args.
     :ivar ir_override: filename of a user-defined IR (*.{ttgir|llir|ptx|amdgcn}).
+    :ivar ctas_per_cga: number of CTAs per Cooperative Grid Array (cluster) for CUDA Thread Block Clusters. SM90+ only.
+        Unlike cluster_dims which spawns new CTAs, ctas_per_cga regroups existing grid CTAs into clusters.
+        This matches CUDA's cuLaunchKernelEx CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION semantics.
+    :type ctas_per_cga: tuple[int, int, int]
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None,
-                 minRegAutoWS=None, maxRegAutoWS=None, pingpongAutoWS=None, num_buffers_warp_spec=0,
-                 num_consumer_groups=0, reg_dec_producer=0, reg_inc_consumer=0):
+    def __init__(
+        self,
+        kwargs,
+        num_warps=4,
+        num_stages=3,
+        num_ctas=1,
+        maxnreg=None,
+        pre_hook=None,
+        ir_override=None,
+        minRegAutoWS=None,
+        maxRegAutoWS=None,
+        pingpongAutoWS=None,
+        num_buffers_warp_spec=0,
+        num_consumer_groups=0,
+        reg_dec_producer=0,
+        reg_inc_consumer=0,
+        ctas_per_cga=None,
+    ):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
@@ -348,6 +367,7 @@ class Config:
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
+        self.ctas_per_cga = ctas_per_cga
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -360,10 +380,12 @@ class Config:
         self.minRegAutoWS = state.get("minRegAutoWS", None)
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
+        self.ctas_per_cga = state.get("ctas_per_cga", None)
 
     def all_kwargs(self):
         return {
-            **self.kwargs, **{
+            **self.kwargs,
+            **{
                 k: v
                 for (k, v) in (
                     ("num_warps", self.num_warps),
@@ -374,8 +396,9 @@ class Config:
                     ("minRegAutoWS", self.minRegAutoWS),
                     ("maxRegAutoWS", self.maxRegAutoWS),
                     ("pingpongAutoWS", self.pingpongAutoWS),
+                    ("ctas_per_cga", self.ctas_per_cga),
                 ) if v is not None
-            }
+            },
         }
 
     def __str__(self):
@@ -389,6 +412,7 @@ class Config:
         res.append(f"minRegAutoWS: {self.minRegAutoWS}")
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
+        res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         return ", ".join(res)
 
     def __hash__(self):

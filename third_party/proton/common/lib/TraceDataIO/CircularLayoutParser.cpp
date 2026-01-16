@@ -128,7 +128,9 @@ void CircularLayoutParser::parseSegment(
 
           if (activeProfileEvent.first->cycle >
               activeProfileEvent.second->cycle) {
-            throw ClockOverflowException("Clock overflow");
+            if (!std::getenv("PROTON_ENABLE_MPP_STORE_BARRIER_INFO_PASS")) {
+              throw ClockOverflowException("Clock overflow");
+            }
           }
           trace.profileEvents.push_back(activeProfileEvent);
         } else {

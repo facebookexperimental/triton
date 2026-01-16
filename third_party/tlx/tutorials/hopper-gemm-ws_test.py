@@ -119,7 +119,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
                 full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
                 tlx.barrier_wait(bar=empty_a_1st, phase=p)  # EmptyBar A1 wait
-                tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * 2)
+                tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
                 data_a_1st = tlx.local_view(a, buf)  # smem data
                 tlx.async_descriptor_load(a_desc, data_a_1st, [offset_am, offset_k], full_a_1st)
 
@@ -127,7 +127,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 empty_b = tlx.local_view(bars_empty_b, buf)
                 full_b = tlx.local_view(bars_full_b, buf)
                 tlx.barrier_wait(bar=empty_b, phase=p)
-                tlx.barrier_expect_bytes(full_b, BN * BK * 2)
+                tlx.barrier_expect_bytes(full_b, BN * BK * tlx.size_of(tlx.dtype_of(a_desc)))
                 data_b = tlx.local_view(b, buf)
                 tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full_b)
 
@@ -135,7 +135,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
                 full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
                 tlx.barrier_wait(bar=empty_a_2nd, phase=p)
-                tlx.barrier_expect_bytes(bar=full_a_2nd, size=BLOCK_M_SPLIT * BK * 2)
+                tlx.barrier_expect_bytes(bar=full_a_2nd, size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
                 data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)  # smem data
                 tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
 

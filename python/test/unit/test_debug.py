@@ -143,3 +143,70 @@ def test_sanitize_int_sub_overflow(x, y, x_dtype, y_dtype, debug, should_overflo
         tl.store(Z, tl.load(X) - tl.load(Y))
 
     _test_overflow(x, y, x_dtype, y_dtype, should_overflow, debug, _kernel_sub, lambda x, y: x - y, device)
+
+
+# TRITON_SANITIZE_OVERFLOW environment variable tests
+
+
+@pytest.mark.forked
+def test_sanitize_overflow_env_enables_overflow_check(monkeypatch, device):
+    """Test that TRITON_SANITIZE_OVERFLOW=1 enables overflow checking without TRITON_DEBUG."""
+    monkeypatch.setenv("TRITON_SANITIZE_OVERFLOW", "1")
+    monkeypatch.setenv("TRITON_DEBUG", "0")
+    triton.knobs.refresh_knobs()
+
+    @triton.jit
+    def _kernel_add(X, Y, Z):
+        tl.store(Z, tl.load(X) + tl.load(Y))
+
+    x = torch.tensor([2**31 - 1], dtype=torch.int32, device=device)
+    y = torch.tensor([1], dtype=torch.int32, device=device)
+    z = torch.empty_like(x)
+
+    # INT32_MAX + 1 should overflow
+    with pytest.raises(RuntimeError) as exc_info:
+        _kernel_add[(1, )](x, y, z)
+        getattr(torch, device).synchronize()
+    assert "device-side assert" in str(exc_info.value)
+
+
+@pytest.mark.forked
+def test_sanitize_overflow_env_disabled_no_overflow_check(monkeypatch, device):
+    """Test that TRITON_SANITIZE_OVERFLOW=0 and TRITON_DEBUG=0 disables overflow checking."""
+    monkeypatch.setenv("TRITON_SANITIZE_OVERFLOW", "0")
+    monkeypatch.setenv("TRITON_DEBUG", "0")
+    triton.knobs.refresh_knobs()
+
+    @triton.jit
+    def _kernel_add(X, Y, Z):
+        tl.store(Z, tl.load(X) + tl.load(Y))
+
+    x = torch.tensor([2**31 - 1], dtype=torch.int32, device=device)
+    y = torch.tensor([1], dtype=torch.int32, device=device)
+    z = torch.empty_like(x)
+
+    # INT32_MAX + 1 would overflow, but checking is disabled so no error
+    _kernel_add[(1, )](x, y, z)
+    getattr(torch, device).synchronize()
+
+
+@pytest.mark.forked
+def test_debug_env_enables_sanitize_overflow(monkeypatch, device):
+    """Test that TRITON_DEBUG=1 also enables sanitize_overflow."""
+    monkeypatch.setenv("TRITON_SANITIZE_OVERFLOW", "0")
+    monkeypatch.setenv("TRITON_DEBUG", "1")
+    triton.knobs.refresh_knobs()
+
+    @triton.jit
+    def _kernel_add(X, Y, Z):
+        tl.store(Z, tl.load(X) + tl.load(Y))
+
+    x = torch.tensor([2**31 - 1], dtype=torch.int32, device=device)
+    y = torch.tensor([1], dtype=torch.int32, device=device)
+    z = torch.empty_like(x)
+
+    # TRITON_DEBUG=1 should enable sanitize_overflow even if TRITON_SANITIZE_OVERFLOW=0
+    with pytest.raises(RuntimeError) as exc_info:
+        _kernel_add[(1, )](x, y, z)
+        getattr(torch, device).synchronize()
+    assert "device-side assert" in str(exc_info.value)

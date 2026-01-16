@@ -243,7 +243,8 @@ void createTMAAsyncLoad(scf::ForOp forOp, tt::DescriptorLoadOp loadOp,
             loadOp.getDesc().getType().getBlockType().getEncoding(),
             loadOp.getIndices());
         builder.create<ttng::AsyncTMACopyGlobalToLocalOp>(
-            loadOp.getLoc(), tmaPtr, indices, barrier, view, pred);
+            loadOp.getLoc(), /*multicastTargets*/ Value(), tmaPtr, indices,
+            barrier, view, pred);
       });
 }
 

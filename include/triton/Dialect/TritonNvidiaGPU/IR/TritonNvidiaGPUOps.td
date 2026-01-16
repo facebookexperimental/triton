@@ -329,7 +329,7 @@ def TTNG_AsyncCLCTryCancelOp : TTNG_Op<"async_clc_try_cancel", []> {
   let assemblyFormat = "$mbarAlloc`,` $clcResAlloc attr-dict `:` type(operands)";
 }
 
-def TTNG_AsyncCLCQueryCancelOp : TTNG_Op<"async_clc_query_cancel", []> {
+def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
   let summary = "Extract CTA ID from CLC response";
 
   let description = [{
@@ -348,7 +348,7 @@ def TTNG_AsyncCLCQueryCancelOp : TTNG_Op<"async_clc_query_cancel", []> {
   let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $ctaId)";
 }
 
-def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {
+def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [AttrSizedOperandSegments]> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -356,11 +356,13 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local">
     asynchronously.  This is analogue to tt.load except the data are copied to
     local memory pointed by the memory descriptor instead of a distributed
     tensor. The data copied depends on the global memory descriptor pointed to
-    by `desc`.
+    by `desc`. If `multicastTargets` is provided, it represents a bitmask specifying the
+    destination CTA indices in a cluster for TMA multicast.
   }];
 
   let hasVerifier = 1;
   let arguments = (ins
+    Optional<I32>: $multicastTargets,
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$coord,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
@@ -372,7 +374,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local">
   );
 
   let assemblyFormat = [{
-    $desc `[` $coord `]` $result `,` $barrier `,` $pred
+    $desc `[` $coord `]` $result `,` $barrier `,` $pred (`,` $multicastTargets^)?
     oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($barrier)) `->` qualified(type($result))
   }];
@@ -572,7 +574,8 @@ def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
     I1:$pred,
     Variadic<TTG_MemDescType>:$barriers,
     Variadic<I1>:$barrier_preds,
-    UnitAttr:$is_async
+    UnitAttr:$is_async,
+    UnitAttr:$two_ctas
   );
   let results = (outs Optional<TTG_AsyncToken>:$token);
 
@@ -591,6 +594,7 @@ def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
       "::mlir::Value":$b_scale, "::mlir::triton::ScaleDotElemType":$a_type,
       "::mlir::triton::ScaleDotElemType":$b_type,
       "::mlir::Value":$useD, "::mlir::Value":$pred,
+      CArg<"bool", "false">:$two_ctas,
       CArg<"::mlir::ValueRange", "{}">:$barriers,
       CArg<"::mlir::ValueRange", "{}">:$barrier_preds,
       CArg<"bool", "false">:$is_async)>

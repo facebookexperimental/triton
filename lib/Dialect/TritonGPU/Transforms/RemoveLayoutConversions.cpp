@@ -265,6 +265,9 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
 bool isLayoutAnchor(Operation *op) {
   if (isa<LoadOp, StoreOp>(op))
     return isExpensiveLoadOrStore(op);
+  // local_load is expensive as it reads from shared memory with specific layout
+  if (isa<triton::gpu::LocalLoadOp>(op))
+    return isExpensiveLocalLoad(op);
   if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
           AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op))
     return true;
@@ -846,6 +849,8 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
 bool canBeRemat(Operation *op) {
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
+  if (isa<triton::gpu::LocalLoadOp>(op))
+    return !isExpensiveLocalLoad(op);
   if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op))
     return false;
   if (auto gather = dyn_cast<GatherOp>(op))

@@ -7,6 +7,7 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/NVPTXAddrSpace.h"
 
 using namespace mlir;
 
@@ -154,7 +155,12 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
 
 static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
                   Value pred) {
-  return rewriter.create<NVVM::MapaOp>(loc, ptr.getType(), ptr, ctaid);
+  auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
+  assert(ptrTy.getAddressSpace() == llvm::NVPTXAS::ADDRESS_SPACE_SHARED &&
+         "Invalid src llvm addr space for mapa");
+  MLIRContext *ctx = rewriter.getContext();
+  auto dsmPtrTy = ptr_ty(ctx, llvm::NVPTXAS::ADDRESS_SPACE_SHARED_CLUSTER);
+  return rewriter.create<NVVM::MapaOp>(loc, dsmPtrTy, ptr, ctaid);
 }
 
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
@@ -179,8 +185,8 @@ static bool isConstantTruePred(Value pred) {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val,
-                              Value pred) const {
+                              std::optional<Value> ctaId, Value val, Value pred,
+                              std::optional<Value> barrierPtr) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -188,7 +194,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   if (!isa<VectorType>(val.getType())) {
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, {val}, rewriter),
-                 pred);
+                 pred, barrierPtr);
     return;
   }
 
@@ -206,7 +212,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       v = b.zext(int_ty(8), b.bitcast(v, int_ty(elemBitwidth)));
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
-                 pred);
+                 pred, barrierPtr);
     return;
   }
 
@@ -216,7 +222,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       v = b.bitcast(v, int_ty(elemBitwidth));
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
-                 pred);
+                 pred, barrierPtr);
     return;
   }
 
@@ -237,7 +243,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       newVals.push_back(b.bitcast(v, i32_ty));
     }
     storeDShared(rewriter, loc, ptr, ctaId,
-                 packLLVector(loc, newVals, rewriter), pred);
+                 packLLVector(loc, newVals, rewriter), pred, barrierPtr);
     return;
   }
 
@@ -254,7 +260,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
       storeDShared(
           rewriter, loc, newPtr, ctaId,
           packLLVector(loc, ArrayRef(vals).slice(i * maxVec, maxVec), rewriter),
-          pred);
+          pred, barrierPtr);
     }
     return;
   }
@@ -270,15 +276,25 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
   }
 
+  // Map barrier to remote address space if needed
+  Value mappedBarrier;
+  if (barrierPtr.has_value()) {
+    assert(ctaId.has_value() && "barrier without ctaId");
+    mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), *ctaId, pred);
+  }
+
   PTXBuilder builder;
   auto st = builder.create<>("st")
-                ->o("shared::cta", ctaId.has_value())
+                ->o("async", barrierPtr.has_value())
+                .o("shared::cluster", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
-                .v(vec, /*predicate=*/vec > 1)
-                .b(elemBitwidth);
+                .o("mbarrier::complete_tx::bytes", barrierPtr.has_value());
+
+  st.v(vec, /*predicate=*/vec > 1).b(elemBitwidth);
+
   auto *ptrOpr = builder.newAddrOperand(ptr, "r");
 
-  if (isConstantTruePred(pred)) {
+  if (isConstantTruePred(pred) && !barrierPtr) {
     b.store(val, ptr, /*align=*/vec * elemBitwidth / 8);
   } else {
     PTXBuilder::Operand *valOpr;
@@ -292,7 +308,13 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     } else {
       valOpr = builder.newOperand(val, constraint);
     }
-    st(ptrOpr, valOpr).predicate(pred, "b");
+    // Build the store instruction with optional barrier operand
+    if (barrierPtr.has_value()) {
+      auto *barrierOpr = builder.newAddrOperand(mappedBarrier, "r");
+      st(ptrOpr, valOpr, barrierOpr).predicate(pred, "b");
+    } else {
+      st(ptrOpr, valOpr).predicate(pred, "b");
+    }
     builder.launch(rewriter, loc, void_ty(ctx));
   }
 }
