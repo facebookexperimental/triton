@@ -8,6 +8,17 @@ import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
 
+from tlx_kernel_utils import (
+    compute_tile_position,
+    compute_grid_info,
+    compute_tile_offsets,
+    flip_phase_on_boundary,
+    async_load_ab_tiles,
+    async_mma_with_barrier,
+    epilogue_store_half_half,
+    epilogue_store_full,
+)
+
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
@@ -49,14 +60,7 @@ def matmul_tma_set_block_size_hook(nargs):
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
 
 
-@triton.jit
-def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
-    group_id = tile_id // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (tile_id % group_size_m)
-    pid_n = (tile_id % num_pid_in_group) // group_size_m
-    return pid_m, pid_n
+# Use compute_tile_position from tlx_kernel_utils instead of local _compute_pid
 
 
 @triton.autotune(
@@ -89,13 +93,10 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
-            # common code duplicated for each region to avoid SMEM overhead
-            start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
+            # Use compute_grid_info from tlx_kernel_utils
+            start_pid, num_pid_m, num_pid_n, num_pid_in_group, _, k_tiles = compute_grid_info(
+                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+            )
 
             tmem_read_phase = 0
             cur_tmem_buf = 0
@@ -112,35 +113,22 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # tl.device_print("Default WG Processing CtaID", tile_id)
                 # producer
                 tlx.clc_producer(clc_context, clc_buf, clc_phase_producer)
-                # clc_phase_producer ^= 1
-                clc_phase_producer = clc_phase_producer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_phase_producer = flip_phase_on_boundary(clc_phase_producer, clc_buf, NUM_CLC_STAGES)
 
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
+                pid_m, pid_n = compute_tile_position(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_am, offs_bn = compute_tile_offsets(pid_m, pid_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
                 tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
-                # flip phase at the end of a round of using TMEM barriers
-                tmem_read_phase = tmem_read_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
+                tmem_read_phase = flip_phase_on_boundary(tmem_read_phase, cur_tmem_buf, NUM_TMEM_BUFFERS)
 
                 # load the result from TMEM to registers
                 acc_tmem = tmem_buffers[cur_tmem_buf]
 
                 if EPILOGUE_SUBTILE:
                     # We load/store the result half by half to reduce SMEM pressure
-                    acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice1)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn], c)
-
-                    acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice2)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
+                    epilogue_store_half_half(acc_tmem, c_desc, offs_am, offs_bn, BLOCK_SIZE_N)
                 else:
-                    result = tlx.local_load(acc_tmem)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn], c)
+                    epilogue_store_full(acc_tmem, c_desc, offs_am, offs_bn)
 
                 # done storing this buffer, signal MMA consumer to resume writing to it
                 tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
@@ -148,8 +136,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
                 tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase_consumer)
-                # clc_phase_consumer ^= 1
-                clc_phase_consumer = clc_phase_consumer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_phase_consumer = flip_phase_on_boundary(clc_phase_consumer, clc_buf, NUM_CLC_STAGES)
                 clc_buf += 1
 
                 # Debug-only: verifying that CLC steals workloads successfully
@@ -157,12 +144,10 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # tl.device_print("Extracted CtaID", tile_id)
 
         with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
-            # common code duplicated for each region to avoid SMEM overhead
-            start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            # Use compute_grid_info from tlx_kernel_utils
+            start_pid, num_pid_m, num_pid_n, num_pid_in_group, _, k_tiles = compute_grid_info(
+                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+            )
             # end of common code
 
             dot_phase = 0  # the current phase of dot op
@@ -175,14 +160,12 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
             clc_buf = 0
             while tile_id != -1:
                 clc_buf = clc_buf % NUM_CLC_STAGES
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
+                pid_m, pid_n = compute_tile_position(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_am, offs_bn = compute_tile_offsets(pid_m, pid_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
                 # wait epilogue consumer to be done with the buffer before reusing it
                 tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
-                # flip phase at the end of a round of using TMEM barriers
-                tmem_write_phase = tmem_write_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
+                tmem_write_phase = flip_phase_on_boundary(tmem_write_phase, cur_tmem_buf, NUM_TMEM_BUFFERS)
 
                 # now iterate along K to compute result for the block
                 for k in range(0, k_tiles):
@@ -191,10 +174,14 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     # wait for current phase(round) of load for this buf
                     tlx.barrier_wait(smem_full_bars[buf], dot_phase)
                     # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,
-                                  mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
-                    # flip phase at the end of a round
-                    dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
+                    async_mma_with_barrier(
+                        buffers_A[buf],
+                        buffers_B[buf],
+                        tmem_buffers[cur_tmem_buf],
+                        use_acc=k > 0,
+                        done_barrier=smem_empty_bars[buf],
+                    )
+                    dot_phase = flip_phase_on_boundary(dot_phase, buf, NUM_SMEM_BUFFERS)
 
                 # wait for last mma to complete
                 last_buf = (processed_k_iters + k_tiles - 1) % NUM_SMEM_BUFFERS
@@ -209,18 +196,14 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
                 tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
-                # clc_phase ^= 1
-                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_phase = flip_phase_on_boundary(clc_phase, clc_buf, NUM_CLC_STAGES)
                 clc_buf += 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
-            # common code duplicated for each region to avoid SMEM overhead
-            start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
+            # Use compute_grid_info from tlx_kernel_utils
+            start_pid, num_pid_m, num_pid_n, num_pid_in_group, _, k_tiles = compute_grid_info(
+                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+            )
 
             load_phase = 0  # the current phase of TMA load
             # we virtually "flatten" the two layer loop as if we're performing tma loads on
@@ -232,9 +215,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
             clc_buf = 0
             while tile_id != -1:
                 clc_buf = clc_buf % NUM_CLC_STAGES
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
+                pid_m, pid_n = compute_tile_position(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_am, offs_bn = compute_tile_offsets(pid_m, pid_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
                 for k in range(0, k_tiles):
                     # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
@@ -243,16 +225,23 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
                     # buffer is now ready to be used again
                     offs_k = k * BLOCK_SIZE_K
-                    tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                             2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
-                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
-                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
-                    # flip phase at the end of a round
-                    load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
+                    async_load_ab_tiles(
+                        a_desc,
+                        b_desc,
+                        buffers_A[buf],
+                        buffers_B[buf],
+                        offs_am,
+                        offs_k,
+                        offs_bn,
+                        smem_full_bars[buf],
+                        BLOCK_SIZE_M,
+                        BLOCK_SIZE_N,
+                        BLOCK_SIZE_K,
+                    )
+                    load_phase = flip_phase_on_boundary(load_phase, buf, NUM_SMEM_BUFFERS)
                 processed_k_iters += k_tiles
                 tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
-                # clc_phase ^= 1
-                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                clc_phase = flip_phase_on_boundary(clc_phase, clc_buf, NUM_CLC_STAGES)
                 clc_buf += 1
 
 

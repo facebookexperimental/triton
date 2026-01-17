@@ -9,6 +9,18 @@ import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton._internal_testing import is_blackwell
 
+from tlx_kernel_utils import (
+    compute_tile_position,
+    compute_grid_info,
+    get_buffer_index_and_phase,
+    compute_tile_offsets,
+    compute_tile_offsets_2cta,
+    epilogue_store_subtiled,
+    async_load_ab_tiles,
+    async_load_ab_tiles_2cta,
+    async_mma_with_barrier,
+)
+
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
@@ -53,14 +65,7 @@ def matmul_tma_set_block_size_hook(nargs):
     nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
 
 
-@triton.jit
-def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
-    group_id = tile_id // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (tile_id % group_size_m)
-    pid_n = (tile_id % num_pid_in_group) // group_size_m
-    return pid_m, pid_n
+# Use compute_tile_position from tlx_kernel_utils instead of local _compute_pid
 
 
 def preprocess_configs(configs, named_args, **kwargs):
@@ -129,23 +134,7 @@ def preprocess_configs(configs, named_args, **kwargs):
     return pruned_configs
 
 
-@triton.jit
-def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
-    bufIdx = accum_cnt % NUM_BUFFERS_KV
-    phase = (accum_cnt // NUM_BUFFERS_KV) & 1
-    return bufIdx, phase
-
-
-@triton.jit
-def _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M):
-    """Compute common grid information used across async tasks."""
-    start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    num_tiles = num_pid_m * num_pid_n
-    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    return start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles
+# Use get_buffer_index_and_phase and compute_grid_info from tlx_kernel_utils
 
 
 @triton.jit
@@ -153,10 +142,10 @@ def _process_tile_epilogue_inner(
     tile_id,
     num_pid_in_group,
     num_pid_m,
-    GROUP_SIZE_M,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    EPILOGUE_SUBTILE,
+    GROUP_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
     c_desc,
     tmem_buffers,
     tmem_full_bars,
@@ -165,24 +154,14 @@ def _process_tile_epilogue_inner(
     tmem_read_phase,
 ):
     """Process epilogue for a single tile."""
-    pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-    offs_am = pid_m * BLOCK_SIZE_M
-    offs_bn = pid_n * BLOCK_SIZE_N
+    pid_m, pid_n = compute_tile_position(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+    offs_am, offs_bn = compute_tile_offsets(pid_m, pid_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
     tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
 
-    # load the result from TMEM to registers
+    # load the result from TMEM to registers and store via subtiling
     acc_tmem = tmem_buffers[cur_tmem_buf]
-    slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
-    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-        acc_tmem_subslice = tlx.local_slice(
-            acc_tmem,
-            [0, slice_id * slice_size],
-            [BLOCK_SIZE_M, slice_size],
-        )
-        result = tlx.local_load(acc_tmem_subslice)
-        c = result.to(tl.float16)
-        c_desc.store([offs_am, offs_bn + slice_id * slice_size], c)
+    epilogue_store_subtiled(acc_tmem, c_desc, offs_am, offs_bn, BLOCK_SIZE_M, BLOCK_SIZE_N, EPILOGUE_SUBTILE)
 
     # Signal MMA consumer
     tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
@@ -193,9 +172,9 @@ def _process_tile_mma_inner(
     tile_id,
     num_pid_in_group,
     num_pid_m,
-    GROUP_SIZE_M,
+    GROUP_SIZE_M: tl.constexpr,
     k_tiles,
-    NUM_SMEM_BUFFERS,
+    NUM_SMEM_BUFFERS: tl.constexpr,
     buffers_A,
     buffers_B,
     tmem_buffers,
@@ -206,12 +185,12 @@ def _process_tile_mma_inner(
     tmem_empty_bars,
     tmem_write_phase,
     smem_accum_cnt,
-    PAIR_CTA,
+    PAIR_CTA: tl.constexpr,
     cta_bars,
     pred_cta0,
 ):
     """Process MMA for a single tile. Returns updated smem_accum_cnt."""
-    pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+    pid_m, pid_n = compute_tile_position(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
 
     # wait epilogue consumer to be done with the buffer before reusing it
     # Note: we start with phase 1 since epilogue starts with phase 0
@@ -219,7 +198,7 @@ def _process_tile_mma_inner(
 
     # now iterate along K to compute result for the block
     for k in range(0, k_tiles):
-        buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+        buf, phase = get_buffer_index_and_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
 
         # wait for current phase(round) of load for this buf
         tlx.barrier_wait(smem_full_bars[buf], phase)
@@ -229,19 +208,18 @@ def _process_tile_mma_inner(
             tlx.barrier_wait(cta_bars[buf], phase=phase, pred=pred_cta0)
 
         # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-        tlx.async_dot(
+        async_mma_with_barrier(
             buffers_A[buf],
             buffers_B[buf],
             tmem_buffers[cur_tmem_buf],
             use_acc=k > 0,
-            mBarriers=[smem_empty_bars[buf]],
+            done_barrier=smem_empty_bars[buf],
             two_ctas=PAIR_CTA,
-            out_dtype=tl.float32,
         )
         smem_accum_cnt += 1
 
     # Wait for last MMA to complete before signaling epilogue
-    last_buf, last_phase = _get_bufidx_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
+    last_buf, last_phase = get_buffer_index_and_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
     tlx.barrier_wait(smem_empty_bars[last_buf], last_phase)
 
     # Done filling this buffer, signal epilogue consumer
@@ -255,12 +233,12 @@ def _process_tile_producer_inner(
     tile_id,
     num_pid_in_group,
     num_pid_m,
-    GROUP_SIZE_M,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    BLOCK_SIZE_K,
+    GROUP_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
     k_tiles,
-    NUM_SMEM_BUFFERS,
+    NUM_SMEM_BUFFERS: tl.constexpr,
     a_desc,
     b_desc,
     buffers_A,
@@ -268,36 +246,51 @@ def _process_tile_producer_inner(
     smem_full_bars,
     smem_empty_bars,
     smem_accum_cnt,
-    PAIR_CTA,
+    PAIR_CTA: tl.constexpr,
     cluster_cta_rank,
 ):
     """Process TMA loads for a single tile. Returns updated smem_accum_cnt."""
-    pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-    offs_am = pid_m * BLOCK_SIZE_M
+    pid_m, pid_n = compute_tile_position(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
     # split B into two parts so each CTA has different offset
     if PAIR_CTA:
-        offs_bn = pid_n * BLOCK_SIZE_N + cluster_cta_rank * (BLOCK_SIZE_N // 2)
+        offs_am, offs_bn = compute_tile_offsets_2cta(pid_m, pid_n, cluster_cta_rank, BLOCK_SIZE_M, BLOCK_SIZE_N)
     else:
-        offs_bn = pid_n * BLOCK_SIZE_N
+        offs_am, offs_bn = compute_tile_offsets(pid_m, pid_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
     for k in range(0, k_tiles):
-        buf, load_phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+        buf, load_phase = get_buffer_index_and_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
         # wait for previous phase(round) of dot for this buf
         tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
         # buffer is now ready to be used again
         offs_k = k * BLOCK_SIZE_K
         if PAIR_CTA:
-            tlx.barrier_expect_bytes(
+            async_load_ab_tiles_2cta(
+                a_desc,
+                b_desc,
+                buffers_A[buf],
+                buffers_B[buf],
+                offs_am,
+                offs_k,
+                offs_bn,
                 smem_full_bars[buf],
-                2 * (BLOCK_SIZE_M + BLOCK_SIZE_N // 2) * BLOCK_SIZE_K,
-            )  # float16
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+            )
         else:
-            tlx.barrier_expect_bytes(
+            async_load_ab_tiles(
+                a_desc,
+                b_desc,
+                buffers_A[buf],
+                buffers_B[buf],
+                offs_am,
+                offs_k,
+                offs_bn,
                 smem_full_bars[buf],
-                2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K,
-            )  # float16
-        tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
-        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+            )
         smem_accum_cnt += 1
 
     return smem_accum_cnt
@@ -355,8 +348,9 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
-            start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = _compute_grid_info(
-                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
+            start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = compute_grid_info(
+                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+            )
 
             tmem_accum_cnt = 0
             tile_id = start_pid
@@ -368,7 +362,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
-                cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                cur_tmem_buf, tmem_read_phase = get_buffer_index_and_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                 _process_tile_epilogue_inner(
                     tile_id,
                     num_pid_in_group,
@@ -390,8 +384,9 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
-            start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = _compute_grid_info(
-                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
+            start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = compute_grid_info(
+                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+            )
 
             tmem_accum_cnt = 0
             smem_accum_cnt = 0
@@ -399,8 +394,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-
-                cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                cur_tmem_buf, tmem_write_phase = get_buffer_index_and_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                 smem_accum_cnt = _process_tile_mma_inner(
                     tile_id,
                     num_pid_in_group,
@@ -428,8 +422,9 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
-            start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = _compute_grid_info(
-                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
+            start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_tiles, k_tiles = compute_grid_info(
+                M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+            )
 
             smem_accum_cnt = 0
             tile_id = start_pid

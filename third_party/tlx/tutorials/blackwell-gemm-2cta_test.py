@@ -8,6 +8,12 @@ from triton._internal_testing import is_blackwell
 
 from typing import Optional
 
+from tlx_kernel_utils import (
+    init_tmem_accumulator,
+    load_and_convert_accumulator,
+    async_mma_accumulate,
+)
+
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
@@ -62,11 +68,8 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
     bar_cta = tlx.alloc_barriers(1, arrive_count=2)  # CTA0 waits for CTA1's data before mma
     bar_leader_cta = tlx.local_view(bar_cta, 0)
 
-    buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
-    acc_tmem = tlx.local_view(buffers, 0)
-
-    acc_init = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    tlx.local_store(acc_tmem, acc_init)
+    # Initialize TMEM accumulator to 0
+    acc_tmem = init_tmem_accumulator(BLOCK_M, BLOCK_N)
 
     dot_bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
 
@@ -89,15 +92,12 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
         tlx.barrier_wait(bar_leader_cta, phase=k % 2, pred=pred_leader_cta)
 
         # 2cta specific
-        tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=True, mBarriers=[dot_bars[0]], two_ctas=True,
-                      out_dtype=OUT_DTYPE)
+        async_mma_accumulate(a_smem, b_smem, acc_tmem, dot_bars[0], two_ctas=True)
 
         tlx.barrier_wait(dot_bars[0], phase)
         phase = phase ^ 1
 
-    result = tlx.local_load(acc_tmem)
-
-    c = result.to(tl.float16)
+    c = load_and_convert_accumulator(acc_tmem)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c)
 
