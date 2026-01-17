@@ -233,13 +233,6 @@ def async_dot_scaled(
     assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
     assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
 
-    # Require the shared memory layout for A and B
-    # For fp4 (e2m1) format, we need fp4Padded=True for correct swizzling
-    A_fp4Padded = A_format == "e2m1"
-    B_fp4Padded = B_format == "e2m1"
-    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
-    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
-
     # Handle input formats
     supported_formats = {"e2m1", "e4m3", "e5m2"}
     A_format = tl._unwrap_if_constexpr(A_format)
@@ -248,6 +241,21 @@ def async_dot_scaled(
     assert B_format in supported_formats, f"Unsupported B_format: {B_format}"
     A_type = _semantic._str_to_fp_type(A_format)
     B_type = _semantic._str_to_fp_type(B_format)
+
+    # Require the shared memory layout for A and B
+    # For fp4 (e2m1) format with mixed precision, we need fp4Padded=True for correct swizzling
+    # This follows the same logic as Triton's AccelerateMatmul.cpp:
+    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-packing-formats-mxf8f6f4-smem
+    is_A_fp4 = A_format == "e2m1"
+    is_B_fp4 = B_format == "e2m1"
+    is_mixed_precision = A_format != B_format
+    # fp4Padded is needed when:
+    # 1. The operand is FP4 and it's mixed precision (the other operand is not FP4)
+    # Note: When both operands are FP4 (not mixed precision), they use packed format
+    A_fp4Padded = is_A_fp4 and is_mixed_precision
+    B_fp4Padded = is_B_fp4 and is_mixed_precision
+    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
 
     # Require the shared memory layout for A_scale and B_scale
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"
