@@ -22,6 +22,7 @@
  */
 
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TargetInfo.h"
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -31,6 +32,8 @@
 #include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "Utility.h"
+
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -156,15 +159,15 @@ struct WaitBarrierOpConversion
       : ConvertOpToLLVMPattern(typeConverter, benefit),
         targetInfo(&targetInfo) {}
 
-  static int64_t getTimeoutNs() {
+  static std::optional<int64_t> getTimeoutNs() {
     std::string envVal = tools::getStrEnv("TRITON_MBAR_WAIT_TIMEOUT_SEC");
     if (envVal.empty())
-      return -1;
+      return std::nullopt;
     // Env var is in seconds, convert to nanoseconds
     char *end;
     double seconds = std::strtod(envVal.c_str(), &end);
     if (end == envVal.c_str() || seconds < 0)
-      return -1;
+      return std::nullopt;
     return static_cast<int64_t>(seconds * 1e9);
   }
 
@@ -179,8 +182,9 @@ struct WaitBarrierOpConversion
     bool predicated =
         adaptor.getPred() && !matchPattern(op.getPred(), m_NonZero());
 
-    int64_t timeoutNs = getTimeoutNs();
-    bool useTimeout = (timeoutNs >= 0);
+    std::optional<int64_t> timeoutNs = getTimeoutNs();
+    bool useTimeout =
+        timeoutNs.has_value() && targetInfo->getComputeCapability() >= 90;
 
     std::string ptx;
     if (targetInfo->getComputeCapability() < 90) {
@@ -207,11 +211,10 @@ struct WaitBarrierOpConversion
 }
 )";
       }
-      // No timeout support for older GPUs
-      useTimeout = false;
     } else {
       if (useTimeout) {
-        std::string timeoutStr = std::to_string(timeoutNs);
+        // Timeout path: trap on timeout
+        std::string timeoutStr = std::to_string(*timeoutNs);
         if (!predicated) {
           ptx = R"(
 {
@@ -252,6 +255,7 @@ struct WaitBarrierOpConversion
 )";
         }
       } else {
+        // No timeout
         if (!predicated) {
           ptx = R"(
 {
@@ -285,8 +289,66 @@ struct WaitBarrierOpConversion
       operands.push_back(ptxBuilder.newOperand(adaptor.getPred(), "b"));
 
     waitLoop(operands, /*onlyAttachMLIRArgs=*/true);
+
+    // If timeout is enabled, print debug info BEFORE executing the wait loop.
+    // This way, if the kernel traps due to timeout, the last printed message
+    // identifies which barrier caused the timeout.
+    // Only print from thread 0 in each block to avoid flooding the output.
+    if (useTimeout) {
+      // Guard: only thread 0 prints
+      Value tid = getThreadId(rewriter, loc);
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      Value isThread0 = b.icmp_eq(tid, b.i32_val(0));
+
+      // Create blocks for conditional printf
+      Block *currentBlock = rewriter.getInsertionBlock();
+      auto insertPt = rewriter.getInsertionPoint();
+      Block *continueBlock = currentBlock->splitBlock(insertPt);
+      Block *printfBlock = rewriter.createBlock(
+          currentBlock->getParent(), Region::iterator(continueBlock));
+
+      // Conditional branch: if thread0, print; else skip
+      rewriter.setInsertionPointToEnd(currentBlock);
+      rewriter.create<LLVM::CondBrOp>(loc, isThread0, printfBlock,
+                                      continueBlock);
+
+      // Printf block
+      rewriter.setInsertionPointToStart(printfBlock);
+
+      // Get block IDs for debug output
+      Value blockIdX = rewriter.create<NVVM::BlockIdXOp>(loc, i32_ty);
+      Value blockIdY = rewriter.create<NVVM::BlockIdYOp>(loc, i32_ty);
+      Value blockIdZ = rewriter.create<NVVM::BlockIdZOp>(loc, i32_ty);
+
+      // Convert barrier address (ptr) to i64 for printing
+      Value barAddrInt =
+          rewriter.create<LLVM::PtrToIntOp>(loc, i64_ty, smemObj.getBase());
+
+      // Convert phase to i32 for printing (if it's not already)
+      Value phase = adaptor.getPhase();
+      if (phase.getType() != i32_ty) {
+        phase = rewriter.create<LLVM::ZExtOp>(loc, i32_ty, phase);
+      }
+
+      // Print debug info identifying this barrier wait
+      targetInfo->printf(
+          rewriter,
+          "MBAR_WAIT: addr=0x%llx phase=%d block=(%d,%d,%d) timeout_sec=%lld",
+          {barAddrInt, phase, blockIdX, blockIdY, blockIdZ,
+           rewriter.create<LLVM::ConstantOp>(
+               loc, i64_ty,
+               rewriter.getI64IntegerAttr(*timeoutNs / 1000000000LL))},
+          {/*isSigned=*/false, true, true, true, true, true});
+
+      // Branch to continue
+      rewriter.create<LLVM::BrOp>(loc, continueBlock);
+
+      // Continue in continueBlock
+      rewriter.setInsertionPointToStart(continueBlock);
+    }
+
     auto voidTy = void_ty(op->getContext());
-    ptxBuilder.launch(rewriter, op->getLoc(), voidTy);
+    ptxBuilder.launch(rewriter, loc, voidTy);
 
     rewriter.eraseOp(op);
     return success();
