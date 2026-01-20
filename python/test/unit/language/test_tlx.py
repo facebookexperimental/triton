@@ -3654,3 +3654,30 @@ def test_barrier_wait_timeout(device):
             del os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"]
         else:
             os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"] = old_val
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_wait_timeout_missing_bytes(device):
+    """Test that barrier_wait times out when expected bytes never arrive."""
+
+    @triton.jit
+    def deadlock_kernel_missing_bytes():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        # Expect 1024 bytes but never send them
+        tlx.barrier_expect_bytes(bar, 1024)
+        tlx.barrier_wait(bar, phase=0)  # Deadlock - bytes never arrive
+
+    timeout_sec = "1"  # 1 second
+    old_val = os.environ.get("TRITON_MBAR_WAIT_TIMEOUT_SEC")
+    os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"] = timeout_sec
+    try:
+        with pytest.raises(Exception) as exc_info:
+            deadlock_kernel_missing_bytes[(1, )]()
+            torch.cuda.synchronize()
+        assert "launch failure" in str(exc_info.value).lower(), f"Expected launch failure error, got: {exc_info.value}"
+    finally:
+        if old_val is None:
+            del os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"]
+        else:
+            os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"] = old_val
