@@ -361,8 +361,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                                                     buffer, bufferIdx, true);
     // FIXME: translateTMAIndices
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
-        loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
-        pipelineBuffer, pred);
+        loc, /*multicastTargets*/ Value(), tmaLoad.getDesc(),
+        tmaLoad.getIndices(), prodBarrier, pipelineBuffer, pred);
   }
 
   // Create a wait_barrier before the first consumer.

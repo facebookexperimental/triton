@@ -1391,7 +1391,11 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           ptxBuilderTMA.newOperand(adaptor.getDesc(), "l")};
       std::string tmaInst =
           "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
-          "d.shared::cluster.global.mbarrier::complete_tx::bytes [$1], [$2, {";
+          "d.shared::cluster.global.mbarrier::complete_tx::bytes";
+      auto multicastMask = op.getMulticastTargets();
+      if (multicastMask != nullptr)
+        tmaInst += ".multicast::cluster";
+      tmaInst += " [$1], [$2, {";
 
       auto offsets = applyLinearLayout(loc, rewriter, msgToOffset,
                                        {{kMsg, copyIdxVal}, {kBlock, ctaId}});
@@ -1407,7 +1411,12 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       }
       operands.push_back(
           ptxBuilderTMA.newOperand(barrierMemObj.getBase(), "r"));
-      tmaInst += "}], [$" + std::to_string(operandIdx++) + "];";
+      tmaInst += "}], [$" + std::to_string(operandIdx++) + "]";
+      if (multicastMask != nullptr) {
+        operands.push_back(ptxBuilderTMA.newOperand(multicastMask, "h"));
+        tmaInst += ", $" + std::to_string(operandIdx++);
+      }
+      tmaInst += ";";
 
       auto &tma = *ptxBuilderTMA.create<>(tmaInst);
       tma(operands, /*onlyAttachMLIRArgs=*/true);

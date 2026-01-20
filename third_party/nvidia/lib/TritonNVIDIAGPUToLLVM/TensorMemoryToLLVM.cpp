@@ -893,7 +893,16 @@ static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
   if (tlxTwoCTAs) {
     // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
     // be broadcasted into CTAid 0 and 1
-    auto *ctaMask = ptxBuilder.newOperand(b.int_val(16, 0x3), "h");
+    // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
+    // where x is even
+    Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
+        loc, rewriter.getI32Type());
+    // mask the least bit
+    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
+    // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +
+    // 1))"
+    Value mask = b.shl(b.i32_val(3), leaderCTARank);
+    auto *ctaMask = ptxBuilder.newOperand(mask, "h");
     ptxOperands.push_back(ctaMask);
     opcode = "@$0 "
              "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
