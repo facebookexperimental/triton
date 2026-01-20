@@ -28,6 +28,7 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "Utility.h"
 
@@ -155,6 +156,18 @@ struct WaitBarrierOpConversion
       : ConvertOpToLLVMPattern(typeConverter, benefit),
         targetInfo(&targetInfo) {}
 
+  static int64_t getTimeoutNs() {
+    std::string envVal = tools::getStrEnv("TRITON_MBAR_WAIT_TIMEOUT_SEC");
+    if (envVal.empty())
+      return -1;
+    // Env var is in seconds, convert to nanoseconds
+    char *end;
+    double seconds = std::strtod(envVal.c_str(), &end);
+    if (end == envVal.c_str() || seconds < 0)
+      return -1;
+    return static_cast<int64_t>(seconds * 1e9);
+  }
+
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::WaitBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -165,6 +178,10 @@ struct WaitBarrierOpConversion
     auto loc = op.getLoc();
     bool predicated =
         adaptor.getPred() && !matchPattern(op.getPred(), m_NonZero());
+
+    int64_t timeoutNs = getTimeoutNs();
+    bool useTimeout = (timeoutNs >= 0);
+
     std::string ptx;
     if (targetInfo->getComputeCapability() < 90) {
       if (!predicated) {
@@ -190,9 +207,53 @@ struct WaitBarrierOpConversion
 }
 )";
       }
+      // No timeout support for older GPUs
+      useTimeout = false;
     } else {
-      if (!predicated) {
-        ptx = R"(
+      if (useTimeout) {
+        std::string timeoutStr = std::to_string(timeoutNs);
+        if (!predicated) {
+          ptx = R"(
+{
+	.reg .pred complete, timedOut;
+	.reg .u64 startTime, currentTime, elapsed;
+	mov.u64 startTime, %globaltimer;
+	waitLoop:
+	mbarrier.try_wait.parity.shared.b64 complete, [$0], $1;
+	@complete bra.uni done;
+	mov.u64 currentTime, %globaltimer;
+	sub.u64 elapsed, currentTime, startTime;
+	setp.ge.u64 timedOut, elapsed, )" +
+                timeoutStr + R"(;
+	@timedOut trap;
+	bra.uni waitLoop;
+	done:
+}
+)";
+        } else {
+          ptx = R"(
+{
+	@!$2 bra.uni skipWait;
+	.reg .pred complete, timedOut;
+	.reg .u64 startTime, currentTime, elapsed;
+	mov.u64 startTime, %globaltimer;
+	waitLoop:
+	mbarrier.try_wait.parity.shared.b64 complete, [$0], $1;
+	@complete bra.uni done;
+	mov.u64 currentTime, %globaltimer;
+	sub.u64 elapsed, currentTime, startTime;
+	setp.ge.u64 timedOut, elapsed, )" +
+                timeoutStr + R"(;
+	@timedOut trap;
+	bra.uni waitLoop;
+	done:
+	skipWait:
+}
+)";
+        }
+      } else {
+        if (!predicated) {
+          ptx = R"(
 {
 	.reg .pred complete;
 	waitLoop:
@@ -200,8 +261,8 @@ struct WaitBarrierOpConversion
 	@!complete bra.uni waitLoop;
 }
 )";
-      } else {
-        ptx = R"(
+        } else {
+          ptx = R"(
 {
 	@!$2 bra.uni skipWait;
 	.reg .pred complete;
@@ -211,11 +272,13 @@ struct WaitBarrierOpConversion
 	skipWait:
 }
 )";
+        }
       }
     }
+
     ::mlir::triton::PTXBuilder ptxBuilder;
     auto &waitLoop = *ptxBuilder.create<>(ptx);
-    SmallVector<::mlir::triton::PTXBuilder::Operand *, 3> operands = {
+    SmallVector<::mlir::triton::PTXBuilder::Operand *, 4> operands = {
         ptxBuilder.newOperand(smemObj.getBase(), "r"),
         ptxBuilder.newOperand(adaptor.getPhase(), "r")};
     if (predicated)
@@ -224,6 +287,7 @@ struct WaitBarrierOpConversion
     waitLoop(operands, /*onlyAttachMLIRArgs=*/true);
     auto voidTy = void_ty(op->getContext());
     ptxBuilder.launch(rewriter, op->getLoc(), voidTy);
+
     rewriter.eraseOp(op);
     return success();
   }
