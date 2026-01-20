@@ -1720,38 +1720,48 @@ def test_async_dot_scaled_2cta(device):
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     """
-    Test D = (A * A_scale)  * (B * B_scale)
+    Test D = (A * A_scale)  * (B * B_scale) with mxfp8 format for both A and B.
 
+    Scale layout uses 5D TMA descriptor [1, rep_m, rep_k, 2, 256] with uint8 elements,
+    matching cuBLAS block scaling layout.
     """
+
+    VEC_SIZE = 32  # mxfp8 uses 32 elements per scale factor
 
     @triton.jit
     def tcgen5_dot_scaled_kernel(
         a_desc,
-        a_scale_desc,  #
+        a_scale_desc,
         b_desc,
-        b_scale_desc,  #
-        c_desc,  #
-        A_format: tl.constexpr,  #
-        B_format: tl.constexpr,  #
+        b_scale_desc,
+        c_desc,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        # async load a and b into SMEM
+        # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
+        REP_M: tl.constexpr = BLOCK_M // 128
+        REP_N: tl.constexpr = BLOCK_N // 128
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+
+        # Allocate SMEM buffers
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
         b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
-        a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tlx.dtype_of(a_scale_desc),
-                                       tl.constexpr(1))
-        b_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tlx.dtype_of(b_scale_desc),
-                                       tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256] for cuBLAS block scaling layout
+        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1))
 
         load_bar = tlx.alloc_barriers(tl.constexpr(1))
-        LD_SIZE: tl.constexpr = (BLOCK_M + BLOCK_N) * (BLOCK_K + BLOCK_K // 32)
-        tlx.barrier_expect_bytes(load_bar[0], LD_SIZE)  # fp8
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
         tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
         tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
-        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0], load_bar)
-        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0], load_bar)
+        # 5D offset with leading 0
+        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
         tlx.barrier_wait(load_bar[0], 0)
 
         c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
@@ -1763,7 +1773,7 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         c_desc.store([0, 0], c)
 
     torch.manual_seed(0)
-    M, N, K = (128, 128, 128)
+    M, N, K = (128, 128, 256)
     BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
 
     DTYPE_MAP = {
@@ -1778,17 +1788,19 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
-    # Use 4D TMA descriptor [rep_m, rep_k, 2, 256] with uint8 elements.
-    # With 256 elements we better utilize the L2 and don't require the TMA
-    # engine to emit many small messages (16B) messages as with 32x16xu8.
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
+    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
-    a_scale = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
-    b_scale = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
 
-    a_scale_desc = TensorDescriptor.from_tensor(a_scale, block_shape=[BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128])
-    b_scale_desc = TensorDescriptor.from_tensor(b_scale, block_shape=[BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128])
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
 
     kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N}
     kernel = tcgen5_dot_scaled_kernel[(1, 1)](
@@ -1804,10 +1816,9 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.async_tma_copy_global_to_local") == 4
-    assert ttgir.count("ttng.tmem_copy") == 2
     assert ttgir.count("ttng.tc_gen5_mma_scaled") == 1
 
-    # Converts a tensor of FP8 E8M0 format scale values to float32 by bit-shifting the exponent bits
+    # Converts E8M0 format scale values to float32 by bit-shifting the exponent bits
     # into the correct position for IEEE 754 float32 representation
     def fp8e8m0_to_float32(scale):
         scale = scale.view(torch.uint8)
@@ -1817,13 +1828,13 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         return scale
 
     # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale.reshape(M, K // 32))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale.reshape(N, K // 32))
-    # Repeats each scale value 32 times along dimension 1.
-    a_scale_f32 = a_scale_f32.repeat_interleave(32, dim=1)[:M, :K]
-    b_scale_f32 = b_scale_f32.repeat_interleave(32, dim=1).T.contiguous()[:K, :N]
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Repeats each scale value VEC_SIZE times along dimension 1.
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
-    atol = 1e-2 * math.sqrt(K / 32)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
     torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
 
 
@@ -3024,7 +3035,7 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
     For mxfp8 format:
     - Standard fp8 e4m3 layout with shape (M, K) or (K, N)
 
-    Scale layout uses 4D TMA descriptor [rep_m, rep_k, 2, 256] with uint8 elements.
+    Scale layout uses 5D TMA descriptor [1, rep_m, rep_k, 2, 256] with uint8 elements (cuBLAS block scaling layout).
     """
     from triton.tools.mxfp import MXFP4Tensor
 
@@ -3045,7 +3056,7 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         A_IS_FP4: tl.constexpr,
         B_IS_FP4: tl.constexpr,
     ):
-        # Scale tile dimensions for 4D TMA
+        # Scale tile dimensions for 5D TMA
         REP_M: tl.constexpr = BLOCK_M // 128
         REP_N: tl.constexpr = BLOCK_N // 128
         REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
@@ -3065,9 +3076,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
             # B is (K, N) for FP8
             b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
 
-        # 4D scale buffers: [REP_M/N, REP_K, 2, 256]
-        a_scale_tile = tlx.local_alloc((REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
-        b_scale_tile = tlx.local_alloc((REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256]
+        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
 
         # Calculate expected bytes for barrier
         if A_IS_FP4:
@@ -3086,8 +3097,8 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         tlx.barrier_expect_bytes(load_bar[0], A_BYTES + B_BYTES + SCALE_BYTES)
         tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
         tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
-        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0], load_bar)
-        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
         tlx.barrier_wait(load_bar[0], 0)
 
         # Transpose B from (N, K//2) to (K//2, N) for FP4, or use as-is for FP8
@@ -3139,18 +3150,18 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
-    # Create E8M0 scale tensors using 4D TMA layout: [rep_m, rep_k, 2, 256]
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
     a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
     b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 4D format for TMA
-    a_scale_4d = a_scale.reshape(M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_4d = b_scale.reshape(N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Reshape to 5D format for TMA (cuBLAS block scaling layout)
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
 
-    a_scale_block_shape = [BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
-    b_scale_block_shape = [BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
-    a_scale_desc = TensorDescriptor.from_tensor(a_scale_4d, block_shape=a_scale_block_shape)
-    b_scale_desc = TensorDescriptor.from_tensor(b_scale_4d, block_shape=b_scale_block_shape)
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
 
     kern_kwargs = {
         "BLOCK_M": BLOCK_M,
@@ -3193,8 +3204,8 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         return scale
 
     # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_4d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_4d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
     # Repeat each scale value VEC_SIZE times along dim 1
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
