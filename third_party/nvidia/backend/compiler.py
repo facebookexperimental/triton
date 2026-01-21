@@ -115,8 +115,9 @@ class CUDAOptions:
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
+    ctas_per_cga: Optional[tuple] = None  # Alias for cluster_dims with CUDA semantics
     ptx_version: int = None
-    ptx_options: str = None
+    ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
@@ -130,7 +131,7 @@ class CUDAOptions:
     extern_libs: dict = None
     debug: bool = False
     backend_name: str = 'cuda'
-    sanitize_overflow: bool = True
+    sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
 
@@ -143,6 +144,19 @@ class CUDAOptions:
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
             "num_warps must be a power of 2"
+
+        # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
+        # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
+        # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
+        # the multiplicative semantics of num_ctas.
+        if self.ctas_per_cga is not None:
+            # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
+            assert self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga, (
+                f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
+                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+
+            object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
+            object.__setattr__(self, "num_ctas", 1)
 
     def hash(self):
         hash_dict = dict(self.__dict__)
@@ -235,6 +249,8 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
         tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         passes.common.add_inliner(pm)
+        # Only determine layouts after inlining is finished.
+        tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         passes.ttir.add_rewrite_tensor_pointer(pm)
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -266,6 +282,19 @@ class CUDABackend(BaseBackend):
             cluster_info.clusterDimX = opt.cluster_dims[0]
             cluster_info.clusterDimY = opt.cluster_dims[1]
             cluster_info.clusterDimZ = opt.cluster_dims[2]
+            # Set cluster_info attributes on the module
+            mod.set_attr(
+                "ttg.cluster-dim-x",
+                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimX),
+            )
+            mod.set_attr(
+                "ttg.cluster-dim-y",
+                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimY),
+            )
+            mod.set_attr(
+                "ttg.cluster-dim-z",
+                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimZ),
+            )
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)
@@ -344,14 +373,10 @@ class CUDABackend(BaseBackend):
 
         pm.run(mod)
 
-        tlx_enable_paired_cta_mma = mod.get_bool_attr("tlx.enable_paired_cta_mma") or False
-        metadata["tlx_enable_paired_cta_mma"] = tlx_enable_paired_cta_mma
-        if tlx_enable_paired_cta_mma:
-            assert cluster_info.clusterDimX == 1 and cluster_info.clusterDimY == 1 and cluster_info.clusterDimZ == 1, \
-                f"Unexpected cluster dims before TLX override:({cluster_info.clusterDimX}, {cluster_info.clusterDimY}, {cluster_info.clusterDimZ})"
-            metadata["cluster_dims"] = (2, 1, 1)
-        else:
-            metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        # Track whether ctas_per_cga was explicitly set to distinguish between
+        # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
+        metadata["ctas_per_cga"] = opt.ctas_per_cga
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
@@ -402,13 +427,34 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
+
         passes.convert.add_nvvm_to_llvm(pm)
-        if not knobs.compilation.disable_line_info:
+        if not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables:
             passes.llvmir.add_di_scope(pm)
+
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
         pm.run(mod)
+
+        if knobs.compilation.dump_ir_extract_di_local_variables:
+            # comments below on why separate it
+            if not knobs.compilation.disable_line_info:
+                pm = ir.pass_manager(mod.context)
+                pm.enable_debug()
+                passes.llvmir.add_di_scope(pm)
+                pm.run(mod)
+
+            # insert dbg intrinsic with several DI Attribute including source
+            # var name and type info note: unknown reason for now, but this
+            # pass and add_di_scope has to be run separately, otherwise if we
+            # put them into previous pipline, it trigger a segmentfault without
+            # any error message; could be due to a bug in mlir or pybind11
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            passes.llvmir.add_di_local_variable(pm)
+            pm.run(mod)
+
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
@@ -461,8 +507,11 @@ class CUDABackend(BaseBackend):
         ptx_version = f'{ptx_version//10}.{ptx_version%10}'
         ret = re.sub(r'\.version \d+\.\d+', f'.version {ptx_version}', ret, flags=re.MULTILINE)
         ret = re.sub(r'\.target sm_\d+', f'.target sm_{capability}', ret, flags=re.MULTILINE)
-        # Remove the debug flag that prevents ptxas from optimizing the code
-        ret = re.sub(r",\s*debug|debug,\s*", "", ret)
+        if not knobs.compilation.dump_ir_extract_di_local_variables:
+            # Remove the debug flag that prevents ptxas from optimizing the code
+            # Note: if this flag is removed, the source var name and type info will be lost when ptx was compiled into cubin
+            #           and we may not be able to see them in cuda-gdb
+            ret = re.sub(r",\s*debug|debug,\s*", "", ret)
         if knobs.nvidia.dump_nvptx:
             print("// -----// NVPTX Dump //----- //")
             print(ret)

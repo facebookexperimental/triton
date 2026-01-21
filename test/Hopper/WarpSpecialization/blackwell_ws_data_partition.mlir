@@ -37,11 +37,11 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
     %cst_2 = arith.constant dense<0.127517432> : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
     %cst_3 = arith.constant dense<0.000000e+00> : tensor<256x128xf32, #blocked>
     // CHECK-COUNT-8: tt.make_tensor_descriptor
-    %q_desc = tt.make_tensor_descriptor %q, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : <bf16>, <tensor<1x256x128xbf16, #shared>>
-    %k_desc = tt.make_tensor_descriptor %k, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : <bf16>, <tensor<1x128x128xbf16, #shared>>
-    %v_desc = tt.make_tensor_descriptor %v, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : <bf16>, <tensor<1x128x128xbf16, #shared>>
-    %lse_desc_4 = tt.make_tensor_descriptor %lse, [%c128_i32, %c8192_i32], [%lse_desc, %c1_i64] : <f32>, <tensor<1x256xf32, #shared1>>
-    %o_desc = tt.make_tensor_descriptor %o, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : <bf16>, <tensor<1x256x128xbf16, #shared>>
+    %q_desc = tt.make_tensor_descriptor %q, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x256x128xbf16, #shared>>
+    %k_desc = tt.make_tensor_descriptor %k, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x128x128xbf16, #shared>>
+    %v_desc = tt.make_tensor_descriptor %v, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x128x128xbf16, #shared>>
+    %lse_desc_4 = tt.make_tensor_descriptor %lse, [%c128_i32, %c8192_i32], [%lse_desc, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<tensor<1x256xf32, #shared1>>
+    %o_desc = tt.make_tensor_descriptor %o, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x256x128xbf16, #shared>>
     %0 = tt.get_program_id x : i32
     scf.for %virtual_pid = %0 to %total_pids step %c148_i32  : i32 {
       %pid_0 = arith.remsi %virtual_pid, %c32_i32 : i32

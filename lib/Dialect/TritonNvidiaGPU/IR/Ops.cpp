@@ -25,6 +25,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -538,9 +539,14 @@ bool TCGen5MMAScaledOp::verifyOutputDims() {
   if (this->getBType() == ScaleDotElemType::E2M1 && transB)
     bNdim *= 2;
 
-  if (aMdim != oMdim || bNdim != oNdim)
+  if (aMdim != oMdim)
     return false;
-  return true;
+
+  // For 2-CTA TLX mode, output N should be 2 * B's N dimension
+  if (getTwoCtas()) {
+    return oNdim == bNdim || oNdim == 2 * bNdim;
+  }
+  return bNdim == oNdim;
 }
 
 Value TCGen5MMAScaledOp::useAccumulator() { return getUseD(); }
@@ -609,8 +615,9 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
                               Type token, Value a, Value b, Value d,
                               Value accDep, Value aScale, Value bScale,
                               ScaleDotElemType aType, ScaleDotElemType bType,
-                              Value useD, Value pred, ValueRange barriers,
-                              ValueRange barrierPreds, bool isAsync) {
+                              Value useD, Value pred, bool twoCTAs,
+                              ValueRange barriers, ValueRange barrierPreds,
+                              bool isAsync) {
   MLIRContext *ctx = builder.getContext();
   if (!barriers.empty()) {
     isAsync = true;
@@ -618,7 +625,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, token, a, b, d, accDep, aScale, bScale,
         ScaleDotElemTypeAttr::get(ctx, aType),
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
-        barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr());
+        barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
+        twoCTAs ? builder.getUnitAttr() : UnitAttr());
 }
 
 bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
@@ -629,6 +637,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
   if (type.getEncoding()) {
+    // Skip verification for placeholder layouts - they will be resolved later
+    if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
+      return success();
     auto enc = dyn_cast<DistributedEncodingTrait>(type.getEncoding());
     if (!enc) {
       return op->emitOpError(regName)

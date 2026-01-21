@@ -47,10 +47,10 @@
 // CHECK:           %[[VAL_32:.*]] = arith.remsi %[[VAL_20]], %[[VAL_25]] : i32
 // CHECK:           %[[VAL_33:.*]] = arith.divsi %[[VAL_32]], %[[VAL_29]] : i32
 // CHECK:           %[[VAL_34:.*]] = arith.extsi %[[VAL_5]] : i32 to i64
-// CHECK:           %[[VAL_35:.*]] = tt.make_tensor_descriptor %[[VAL_0]], {{\[}}%[[VAL_3]], %[[VAL_5]]], {{\[}}%[[VAL_34]], %[[VAL_14]]] : <f16>, <tensor<128x64xf16, #[[$ATTR_2]]>>
-// CHECK:           %[[VAL_36:.*]] = tt.make_tensor_descriptor %[[VAL_1]], {{\[}}%[[VAL_4]], %[[VAL_5]]], {{\[}}%[[VAL_34]], %[[VAL_14]]] : <f16>, <tensor<256x64xf16, #[[$ATTR_2]]>>
+// CHECK:           %[[VAL_35:.*]] = tt.make_tensor_descriptor %[[VAL_0]], {{\[}}%[[VAL_3]], %[[VAL_5]]], {{\[}}%[[VAL_34]], %[[VAL_14]]] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #[[$ATTR_2]]>>
+// CHECK:           %[[VAL_36:.*]] = tt.make_tensor_descriptor %[[VAL_1]], {{\[}}%[[VAL_4]], %[[VAL_5]]], {{\[}}%[[VAL_34]], %[[VAL_14]]] : !tt.ptr<f16>, !tt.tensordesc<tensor<256x64xf16, #[[$ATTR_2]]>>
 // CHECK:           %[[VAL_37:.*]] = arith.extsi %[[VAL_4]] : i32 to i64
-// CHECK:           %[[VAL_38:.*]] = tt.make_tensor_descriptor %[[VAL_2]], {{\[}}%[[VAL_3]], %[[VAL_4]]], {{\[}}%[[VAL_37]], %[[VAL_14]]] : <f16>, <tensor<128x256xf16, #[[$ATTR_2]]>>
+// CHECK:           %[[VAL_38:.*]] = tt.make_tensor_descriptor %[[VAL_2]], {{\[}}%[[VAL_3]], %[[VAL_4]]], {{\[}}%[[VAL_37]], %[[VAL_14]]] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x256xf16, #[[$ATTR_2]]>>
 // CHECK:           %[[VAL_39:.*]] = arith.muli %[[VAL_31]], %[[VAL_10]] : i32
 // CHECK:           %[[VAL_40:.*]] = arith.muli %[[VAL_33]], %[[VAL_11]] : i32
 // CHECK:           %[[VAL_41:.*]] = arith.addi %[[VAL_5]], %[[VAL_18]] : i32
@@ -148,10 +148,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %12 = arith.remsi %0, %5 : i32
     %13 = arith.divsi %12, %9 : i32
     %14 = arith.extsi %arg5 : i32 to i64
-    %15 = tt.make_tensor_descriptor %arg0, [%arg3, %arg5], [%14, %c1_i64] : <f16>, <tensor<128x64xf16, #shared>>
-    %16 = tt.make_tensor_descriptor %arg1, [%arg4, %arg5], [%14, %c1_i64] : <f16>, <tensor<256x64xf16, #shared>>
+    %15 = tt.make_tensor_descriptor %arg0, [%arg3, %arg5], [%14, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #shared>>
+    %16 = tt.make_tensor_descriptor %arg1, [%arg4, %arg5], [%14, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<256x64xf16, #shared>>
     %17 = arith.extsi %arg4 : i32 to i64
-    %18 = tt.make_tensor_descriptor %arg2, [%arg3, %arg4], [%17, %c1_i64] : <f16>, <tensor<128x256xf16, #shared>>
+    %18 = tt.make_tensor_descriptor %arg2, [%arg3, %arg4], [%17, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x256xf16, #shared>>
     %19 = arith.muli %11, %c128_i32 : i32
     %20 = arith.muli %13, %c256_i32 : i32
     %21 = arith.addi %arg5, %c63_i32 : i32

@@ -52,12 +52,74 @@ def visit_withAsyncTask(self, node):
     self.visit_compound_statement(node.body)
 
 
+def _validate_warp_group_start_ids(
+    start_ids: List[int],
+    num_warps: List[int],
+    task_replicates: List[int],
+    default_num_warps: int,
+) -> None:
+    """Validate that warp group start IDs are valid and non-overlapping across different tasks.
+
+    Args:
+        start_ids: List of warp group start IDs for each task (before replica expansion).
+        num_warps: List of number of warps for each task (before replica expansion).
+        task_replicates: List of replica counts for each task.
+        default_num_warps: Number of warps used by the default region (starts at warp 0).
+
+    Raises:
+        AssertionError: If validation fails.
+    """
+    assert len(start_ids) == len(num_warps) == len(task_replicates), (
+        f"start_ids length ({len(start_ids)}), num_warps length ({len(num_warps)}), "
+        f"and task_replicates length ({len(task_replicates)}) must all match")
+
+    # Check that all start IDs are non-negative
+    for i, start_id in enumerate(start_ids):
+        assert start_id >= 0, f"warp_group_start_id[{i}] = {start_id} must be non-negative"
+
+    # Check for overlapping warp ranges between different tasks
+    # Build list of (start, end) ranges for each task, considering replicas
+    # Each task uses num_warps * replicate warps starting at start_id
+    ranges = [(start_ids[i], start_ids[i] + num_warps[i] * task_replicates[i]) for i in range(len(start_ids))]
+
+    # Default region uses warps [0, default_num_warps)
+    default_range = (0, default_num_warps)
+
+    # Check that no non-default task overlaps with the default region
+    for i, (start_i, end_i) in enumerate(ranges):
+        # Two ranges [a, b) and [c, d) overlap if a < d and c < b
+        if start_i < default_range[1] and default_range[0] < end_i:
+            assert False, (f"Overlapping warp ranges: task {i} uses warps [{start_i}, {end_i}) "
+                           f"which overlaps with default region warps [{default_range[0]}, {default_range[1]})")
+
+    # Check all pairs of non-default tasks for overlap
+    for i in range(len(ranges)):
+        for j in range(i + 1, len(ranges)):
+            start_i, end_i = ranges[i]
+            start_j, end_j = ranges[j]
+            # Two ranges [a, b) and [c, d) overlap if a < d and c < b
+            if start_i < end_j and start_j < end_i:
+                assert False, (f"Overlapping warp ranges: task {i} uses warps [{start_i}, {end_i}) "
+                               f"and task {j} uses warps [{start_j}, {end_j})")
+
+
 @tlx_enter_sub_region()
 def visit_withAsyncTasks(self, node):
-    from triton.compiler.code_generator import (enter_sub_region, _is_list_like, _is_constexpr)
+    from triton.compiler.code_generator import enter_sub_region, _is_list_like, _is_constexpr
+
     with enter_sub_region(self) as sr:
         liveins, _ = sr
         ip, last_loc = self._get_insertion_point_and_loc()
+
+        def _flatten_value_handles(val):
+            handles = []
+            # Prefer the generic flatten hook to support multi-result values (e.g. tensor descriptors)
+            if hasattr(val, "_flatten_ir"):
+                val._flatten_ir(handles)
+            else:
+                handles.append(val.handle)
+            return handles
+
         stmts = node.body
         # Ensure that stmts is iterable
         if not _is_list_like(stmts):
@@ -70,6 +132,12 @@ def visit_withAsyncTasks(self, node):
             taskNumWarps = []
             taskNumRegs = []
             taskReplica = []
+            taskWarpGroupStartIds = []
+
+            # Per-task data for validation (before replica expansion)
+            perTaskNumWarps = []
+            perTaskStartIds = []
+            perTaskReplicates = []
 
             global region_replica_id_stack
             region_replica_id_stack.append(-1)  # dummy placeholder
@@ -87,24 +155,50 @@ def visit_withAsyncTasks(self, node):
                         taskNumWarps.extend([self.builder.options.num_warps] * (task.replicate - 1))
                         if task.num_regs:
                             taskNumRegs.extend([task.num_regs] * (task.replicate - 1))
+                        if task.warp_group_start_id is not None:
+                            taskWarpGroupStartIds.extend([task.warp_group_start_id] * (task.replicate - 1))
                 else:
                     taskReplica.append(task.replicate)
                     taskNumWarps.extend([task.num_warps] * task.replicate)
                     if task.num_regs:
                         taskNumRegs.extend([task.num_regs] * task.replicate)
+                    if task.warp_group_start_id is not None:
+                        # Each replica gets its own start ID, incrementing by num_warps
+                        for r in range(task.replicate):
+                            taskWarpGroupStartIds.append(task.warp_group_start_id + r * task.num_warps)
+                        # Collect per-task data for validation
+                        perTaskNumWarps.append(task.num_warps)
+                        perTaskStartIds.append(task.warp_group_start_id)
+                        perTaskReplicates.append(task.replicate)
 
             region_replica_id_stack.pop()  # revert adding dummy placeholder
 
         assert num_default == 1, "Default task must be one and only one"
         block.erase()
 
-        assert len(taskNumRegs) in [0,
-                                    len(taskNumWarps)], "Registers are set for either ALL or NONE of non-default tasks"
+        assert len(taskNumRegs) in [0, len(taskNumWarps)
+                                    ], ("Registers are set for either ALL or NONE of non-default tasks")
+        assert len(taskWarpGroupStartIds) in [
+            0, len(taskNumWarps)
+        ], ("warp_group_start_id must be set for either ALL or NONE of non-default tasks")
+
+        # Validate warp_group_start_ids
+        if len(perTaskStartIds) > 0:
+            _validate_warp_group_start_ids(
+                perTaskStartIds,
+                perTaskNumWarps,
+                perTaskReplicates,
+                self.builder.options.num_warps,
+            )
 
         # Create tasks body block
         self._set_insertion_point_and_loc(ip, last_loc)
-        ws_op = self.builder.create_warp_specialize_op(taskNumWarps, taskNumRegs if len(taskNumRegs) > 0 else None,
-                                                       sum(taskReplica))
+        ws_op = self.builder.create_warp_specialize_op(
+            taskNumWarps,
+            taskNumRegs if len(taskNumRegs) > 0 else None,
+            sum(taskReplica),
+            taskWarpGroupStartIds if len(taskWarpGroupStartIds) > 0 else None,
+        )
 
         # dry visit async task body to calculate captures
         index = 0
@@ -132,9 +226,11 @@ def visit_withAsyncTasks(self, node):
             if getattr(val, "__triton_aggregate__", False):
                 for field in val.type.fields:
                     v = getattr(val, field[0])
-                    ws_op.append_operand(v.handle)
+                    for h in _flatten_value_handles(v):
+                        ws_op.append_operand(h)
             else:
-                ws_op.append_operand(val.handle)
+                for h in _flatten_value_handles(val):
+                    ws_op.append_operand(h)
 
         # real codegen
         index = 0
@@ -171,11 +267,13 @@ def visit_withAsyncTasks(self, node):
                     if getattr(val, "__triton_aggregate__", False):
                         for field in val.type.fields:
                             v = getattr(val, field[0])
-                            arg = task_body.add_argument(v.handle.get_type())
-                            block.replace_use_in_block_with(v.handle, arg)
+                            for h in _flatten_value_handles(v):
+                                arg = task_body.add_argument(h.get_type())
+                                block.replace_use_in_block_with(h, arg)
                     else:
-                        arg = task_body.add_argument(val.handle.get_type())
-                        block.replace_use_in_block_with(val.handle, arg)
+                        for h in _flatten_value_handles(val):
+                            arg = task_body.add_argument(h.get_type())
+                            block.replace_use_in_block_with(h, arg)
 
                 self.builder.create_warp_return_op()
                 region_replica_id_stack.pop()

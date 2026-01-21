@@ -735,18 +735,33 @@ class CudaLauncher(object):
             libraries=libraries,
         )
 
-        self.tlx_enable_paired_cta_mma = getattr(metadata, "tlx_enable_paired_cta_mma", False)
-        if self.tlx_enable_paired_cta_mma:
+        # Distinguish between Triton's way and TLX's way by checking if ctas_per_cga
+        # was explicitly set:
+        # - Triton's way: Uses num_ctas > 1 with cluster_dims = (1,1,1). Grid is multiplied
+        #   by num_ctas to get total CTAs.
+        # - TLX's way (CUDA native): Uses ctas_per_cga to set non-trivial cluster_dims.
+        #   Grid equals total CTAs, and ctas_per_cga regroups them into clusters.
+        # When ctas_per_cga is set, num_ctas must be 1 to prevent multiplicative behavior.
+        if getattr(metadata, "ctas_per_cga", None) is not None:
+            # TLX/CUDA way: ctas_per_cga defines cluster shape, num_ctas must be 1
+            assert tuple(metadata.ctas_per_cga) == tuple(metadata.cluster_dims), (
+                f"ctas_per_cga ({metadata.ctas_per_cga}) must equal cluster_dims ({metadata.cluster_dims})")
             self.num_ctas = 1
+            # When using ctas_per_cga, always enable cluster launch.
+            # Use True since the C code checks "launch_cluster != 0".
+            self.launch_cluster = True
         else:
+            # Triton's way: use num_ctas for multiplicative cluster semantics.
+            # Note: cluster launch is enabled by "num_ctas != 1" in the C code,
+            # so launch_cluster can be False here.
             self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
+            self.launch_cluster = metadata.launch_cluster
         self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
         self.profile_scratch_align = metadata.profile_scratch_align
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
-        self.launch_cluster = metadata.launch_cluster or self.tlx_enable_paired_cta_mma
         self.launch_pdl = metadata.launch_pdl
 
     def __call__(self, gridX, gridY, gridZ, stream, function, *args):

@@ -107,6 +107,20 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
            })
+      .def("create_remote_store",
+           [](TritonOpBuilder &self, Value &dst, Value &regValues,
+              Value remoteCTARank) -> void {
+             auto bufferType = cast<ttg::MemDescType>(dst.getType());
+             auto remote_store = self.create<ttg::RemoteShmemStoreOp>(
+                 regValues, dst, remoteCTARank);
+           })
+      .def("create_async_remote_store",
+           [](TritonOpBuilder &self, Value &dst, Value &regValues,
+              Value remoteCTARank, Value barrier) -> void {
+             auto bufferType = cast<ttg::MemDescType>(dst.getType());
+             auto remote_store = self.create<ttg::AsyncRemoteShmemStoreOp>(
+                 regValues, dst, remoteCTARank, barrier);
+           })
       .def("make_swizzled_shared_encoding_attr",
            [](TritonOpBuilder &self, unsigned vectorSize, unsigned perPhase,
               unsigned maxPhase, std::vector<unsigned> order,
@@ -189,41 +203,11 @@ void init_triton_tlx_ir(py::module &&m) {
              return ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
                                                      eltType);
            })
-      .def("make_default_tmem_compatible_tensor_layout_encoding",
+      .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type elementType, int moduleNumWarps, int threadsPerWarp,
-              int numCTAs) {
-             // Include various assert to vet the input to make sure they're
-             // valid for MMAv5. See also lib/Analysis/Utiity.cpp:supportMMA
-             assert(shape.size() == 2 &&
-                    "Only supporting 2D tensors for TMEM layout.");
-             assert((!elementType.isInteger()) &&
-                    "Integer type not supported.");
-
-             Block *parentBlock = self.getBuilder().getInsertionBlock();
-             int numWarps =
-                 ttg::maybeLookupNumWarps(parentBlock).value_or(moduleNumWarps);
-             assert((numWarps == 4 || numWarps == 8) &&
-                    "Currently only support numWarps 4 or 8 for TMEM load and "
-                    "store.");
-
-             ttg::BlockedEncodingAttr defaultBlockedEncoding =
-                 ttg::getDefaultBlockedEncoding(self.getContext(), shape,
-                                                numWarps, threadsPerWarp,
-                                                numCTAs);
-             auto oldType = RankedTensorType::get(shape, elementType,
-                                                  defaultBlockedEncoding);
-             auto oldTypeShapePerCTA = ttg::getShapePerCTA(oldType);
-             auto rank = oldTypeShapePerCTA.size();
-             assert((oldTypeShapePerCTA[rank - 2] % 64 == 0 &&
-                     ((oldTypeShapePerCTA[rank - 1] % 8 == 0) ||
-                      oldTypeShapePerCTA[rank - 1] == 1)) &&
-                    "Shape unsupported by TMEM ops.");
-
-             Attribute newDistributedEncoding =
-                 nvidia_gpu::getTmemCompatibleLayout(shape[0], shape[1],
-                                                     oldType, numWarps);
-             return newDistributedEncoding;
+              Type elementType, bool tmemCompatible) -> Attribute {
+             return tlx::DummyRegisterLayoutAttr::get(
+                 self.getContext(), shape, elementType, tmemCompatible);
            })
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self) -> void {
@@ -334,6 +318,11 @@ void init_triton_tlx_ir(py::module &&m) {
               Value pred) -> void {
              self.create<ttng::BarrierExpectOp>(mbarrerLoc, expectBytes, pred);
            })
+      .def("create_cluster_barrier",
+           [](TritonOpBuilder &self) -> void {
+             self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
+             self.create<triton::nvidia_gpu::ClusterWaitOp>();
+           })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,
@@ -400,7 +389,8 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
               Value bScale, tt::ScaleDotElemType aType,
               tt::ScaleDotElemType bType, std::optional<Value> useD,
-              std::optional<Value> pred, std::vector<Value> mBarriers) -> void {
+              std::optional<Value> pred, bool twoCTAs,
+              std::vector<Value> mBarriers) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
@@ -412,13 +402,13 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::TCGen5MMAScaledOp>(
                  tokType, a, b, d, Value(), aScale, bScale, aType, bType,
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred*/,
+                 pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
                  ValueRange(mBarriers), ValueRange(barrierPreds),
                  !mBarriers.empty() /* is_async */);
            })
       .def("create_tcgen05_commit",
-           [](TritonOpBuilder &self, Value &barrier) -> void {
-             self.create<ttng::TCGen5CommitOp>(barrier);
+           [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
+             self.create<ttng::TCGen5CommitOp>(barrier, pred);
            })
       .def("create_async_commit_group",
            [](TritonOpBuilder &self,
@@ -513,18 +503,53 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value responseAddr, Value mbar) -> void {
              self.create<ttng::AsyncCLCTryCancelOp>(mbar, responseAddr);
            })
+      // clc_query: Extract tile ID from CLC response.
+      //
+      // Returns the tile ID decoded from the CLC response buffer, offset by
+      // cluster_cta_rank() so each CTA gets a unique tile assignment
+      // (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
+      // Returns -1 if no work available.
+      //
+      // Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the
+      // offset is a no-op. This allows the same code path for both cases.
       .def("clc_query",
            [](TritonOpBuilder &self, Value responseAddr) -> Value {
-             return self.create<ttng::AsyncCLCQueryCancelOp>(responseAddr);
+             Value tileId = self.create<ttng::CLCQueryCancelOp>(responseAddr);
+             // Always offset by cluster_cta_rank() - for single CTA, rank=0
+             Value ctaRank = self.create<triton::nvgpu::ClusterCTAIdOp>(
+                 self.getBuilder().getI32Type());
+             Value negOne = self.create<mlir::arith::ConstantIntOp>(-1, 32);
+             Value isNegOne = self.create<mlir::arith::CmpIOp>(
+                 mlir::arith::CmpIPredicate::eq, tileId, negOne);
+             Value offset = self.create<mlir::arith::AddIOp>(tileId, ctaRank);
+             tileId =
+                 self.create<mlir::arith::SelectOp>(isNegOne, tileId, offset);
+             return tileId;
            })
       .def("create_async_TMA_load",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
-              Value mbarrier, Value pred, Value result,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> void {
+           [](TritonOpBuilder &self, std::vector<Value> &multicastTargets,
+              Value desc, std::vector<Value> &coord, Value mbarrier, Value pred,
+              Value result, CacheModifier cacheModifier,
+              EvictionPolicy evictionPolicy, bool isVolatile) -> void {
+             Value multicastTargetBitMask;
+             if (multicastTargets.empty()) {
+               multicastTargetBitMask = Value();
+             } else {
+               auto one = self.create<arith::ConstantIntOp>(
+                   self.getBuilder().getI32Type(), 1);
+               multicastTargetBitMask = self.create<arith::ConstantIntOp>(
+                   self.getBuilder().getI32Type(), 0);
+               for (auto ctaIdx : multicastTargets) {
+                 // activate the bit corresponding to the ctaIdx (e.g. last bit
+                 // for idx 0, second last bit for idx 1, etc.)
+                 multicastTargetBitMask = self.create<arith::OrIOp>(
+                     multicastTargetBitMask,
+                     self.create<arith::ShLIOp>(one, ctaIdx));
+               }
+             }
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
-                 desc, coord, mbarrier, result, pred, cacheModifier,
-                 evictionPolicy, isVolatile);
+                 multicastTargetBitMask, desc, coord, mbarrier, result, pred,
+                 cacheModifier, evictionPolicy, isVolatile);
            })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
@@ -543,12 +568,15 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
               std::optional<std::vector<int>> requestedRegisters,
-              int numPartitionRegions) -> ttg::WarpSpecializeOp {
+              int numPartitionRegions,
+              std::optional<std::vector<int>> warpGroupStartIds)
+               -> ttg::WarpSpecializeOp {
              ArrayRef<Type> dummyTypes;
              auto wsOp = self.create<ttg::WarpSpecializeOp>(
                  dummyTypes, partitionNumWarps, numPartitionRegions);
 
              wsOp.setRequestedRegisters(requestedRegisters);
+             wsOp.setWarpGroupStartIds(warpGroupStartIds);
 
              return wsOp;
            })
@@ -619,6 +647,24 @@ void init_triton_tlx_ir(py::module &&m) {
              Value remoteBuf = self.create<ttng::MapToRemoteBufferOp>(
                  newBufferType, src, clusterCTARank);
              return remoteBuf;
+           })
+      .def("create_global_scratch_alloc",
+           [](TritonOpBuilder &self, int nbytes, int alignment) -> Value {
+             auto context = self.getBuilder().getContext();
+             auto ptrType = triton::PointerType::get(
+                 self.getBuilder().getI8Type(), /*addressSpace=*/1);
+             return self.create<ttg::GlobalScratchAllocOp>(ptrType, nbytes,
+                                                           alignment);
+           })
+      // Make a tensor descriptor with optional desc_ptr
+      .def("create_make_tensor_descriptor",
+           [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
+              std::vector<Value> &strides, Value &descPtr,
+              std::vector<int32_t> &tensorShape, bool isSignedInteger,
+              tt::PaddingOption paddingOption) -> Value {
+             return self.create<tt::MakeTensorDescOp>(
+                 base, shape, strides, descPtr, tensorShape, isSignedInteger,
+                 paddingOption);
            });
 }
 
@@ -628,6 +674,8 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXInsertRequireLayout);
   ADD_PASS_WRAPPER_0("add_tlx_rewrite_local_alias",
                      tlx::createTLXRewriteLocalAlias);
+  ADD_PASS_WRAPPER_0("add_tlx_resolve_placeholder_layouts",
+                     tlx::createTLXResolvePlaceholderLayouts);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
                             std::string, int32_t, int32_t, int32_t);
 }

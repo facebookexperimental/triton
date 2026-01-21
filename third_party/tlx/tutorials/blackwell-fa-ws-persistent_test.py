@@ -297,8 +297,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # Use l[1]/l[1+HEAD_DIM] and m[2][2 + HEAD_DIM]
                     # to disambigulate from alpha[0]/alpha[HEAD_DIM]
                     l = tlx.local_load(l_tiles[cid * HEAD_DIM + 1])
-                    tlx.barrier_arrive(qk_empties[cid])
                     m = tlx.local_load(m_tiles[cid * HEAD_DIM + 2])
+                    tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
                     offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
                     m_ptrs = M + off_hz * N_CTX + offs_m

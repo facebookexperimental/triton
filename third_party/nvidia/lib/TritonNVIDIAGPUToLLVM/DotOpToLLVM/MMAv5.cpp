@@ -265,17 +265,20 @@ static void createScaledGen5MMA(ConversionPatternRewriter &rewriter,
                                 MemDescOperand a, Value b, MemDescOperand d,
                                 Value scaleA, Value scaleB, Value pred,
                                 Value instDescriptor, Value useInitAcc,
-                                bool aInTmem, mxfpKind mxfpInstKind) {
+                                bool aInTmem, mxfpKind mxfpInstKind,
+                                bool twoCTAs) {
   PTXBuilder ptxBuilder;
+  std::string ctaGroup = std::to_string(twoCTAs ? 2 : 1);
   std::string opcode;
   if (mxfpInstKind == mxfpKind::mxf8f6f4) {
-    opcode =
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X";
+    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
+             ".kind::mxf8f6f4.block_scale.scale_vec::1X";
   } else if (mxfpInstKind == mxfpKind::mxf4) {
-    opcode = "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X";
+    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
+             ".kind::mxf4.block_scale.scale_vec::2X";
   } else if (mxfpInstKind == mxfpKind::mxf4nvf4) {
-    opcode =
-        "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X";
+    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
+             ".kind::mxf4nvf4.block_scale.scale_vec::4X";
   } else {
     assert(0 && "Unsupported mxfp kind.");
   }
@@ -307,7 +310,16 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
   if (twoCTAs) {
     // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
     // be broadcasted into CTAid 0 and 1
-    auto *ctaMask = ptxBuilder.newOperand(b.int_val(16, 0x3), "h");
+    // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
+    // where x is even
+    Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
+        loc, rewriter.getI32Type());
+    // mask the least bit
+    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
+    // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +
+    // 1))"
+    Value mask = b.shl(b.i32_val(3), leaderCTARank);
+    auto *ctaMask = ptxBuilder.newOperand(mask, "h");
     ptxOperands.push_back(ctaMask);
     opcode = "@$0 "
              "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
@@ -395,8 +407,9 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
       rewriter.create<ttng::ClusterWaitOp>(loc);
     }
 
-    Value clusterId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
-    Value cluster0 = tb.icmp_eq(clusterId, tb.i32_val(0));
+    Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    leftClusterId = tb.and_(leftClusterId, tb.i32_val(1));
+    Value cluster0 = tb.icmp_eq(leftClusterId, tb.i32_val(0));
     pred = tb.and_(pred, cluster0);
   }
   pred = tb.and_(pred, isWarp0);
@@ -649,18 +662,19 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
     Value scaleB = tb.add(
         baseScaleB, tb.i32_val((n + wordIdx * numRepN) * numColPerScaleBlockB));
     Value instDescriptor = createScaleInstDescriptor(
-        rewriter, op, desc.mmaSizeM, desc.mmaSizeN, desc.transA, desc.transB,
-        subWordIdx, subWordIdx, mxfpInstKind);
+        rewriter, op, op.getTwoCtas() ? desc.mmaSizeM * 2 : desc.mmaSizeM,
+        desc.mmaSizeN, desc.transA, desc.transB, subWordIdx, subWordIdx,
+        mxfpInstKind);
     createScaledGen5MMA(rewriter, loc, op, a, b, accAddress, scaleA, scaleB,
                         pred, instDescriptor, useInitAcc, desc.aInTmem,
-                        mxfpInstKind);
+                        mxfpInstKind, op.getTwoCtas());
   };
 
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), /*twoCTAs=*/false,
-                 /*tlxPairedMMA*/ false, opKindIsMXFP4, dot);
+                 adaptor.getBarrierPreds(), op.getTwoCtas(),
+                 tlx::tlxEnablePairedMMA(op), opKindIsMXFP4, dot);
 }
 
 //===----------------------------------------------------------------------===//

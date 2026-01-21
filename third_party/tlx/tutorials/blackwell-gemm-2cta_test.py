@@ -26,10 +26,10 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
 
     # assuming CTA pairs along M dim
     cluster_cta_rank = tlx.cluster_cta_rank()  # 2cta specific
-    pred_cta0 = cluster_cta_rank == 0
+    pred_leader_cta = cluster_cta_rank % 2 == 0
 
     offs_am = pid_m * BLOCK_M
-    offs_bn = pid_n * BLOCK_N + cluster_cta_rank * (BLOCK_N // 2)  # 2cta specific
+    offs_bn = pid_n * BLOCK_N + (cluster_cta_rank % 2) * (BLOCK_N // 2)  # 2cta specific
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -60,8 +60,7 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
 
     # 2cta specific
     bar_cta = tlx.alloc_barriers(1, arrive_count=2)  # CTA0 waits for CTA1's data before mma
-    bar_tmp = tlx.local_view(bar_cta, 0)
-    bar_cta0 = tlx.remote_view(bar_tmp, 0)  # map to bar living in CTA0
+    bar_leader_cta = tlx.local_view(bar_cta, 0)
 
     buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
     acc_tmem = tlx.local_view(buffers, 0)
@@ -86,8 +85,8 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
         tlx.barrier_wait(bar_b, phase)
 
         # CTA0 needs to know CTA1 is done loading data before issuing MMA
-        tlx.barrier_arrive(bar_cta0, 1)
-        tlx.barrier_wait(bar_cta0, phase=k % 2, pred=pred_cta0)
+        tlx.barrier_arrive(bar_leader_cta, 1, remote_cta_rank=cluster_cta_rank & ~1)
+        tlx.barrier_wait(bar_leader_cta, phase=k % 2, pred=pred_leader_cta)
 
         # 2cta specific
         tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=True, mBarriers=[dot_bars[0]], two_ctas=True,
@@ -119,7 +118,7 @@ def matmul(a, b):
 
     kern_kwargs = {
         'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'num_stages': 0
+        'num_stages': 0, 'ctas_per_cga': (4, 2, 1)
     }
     _ = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](a, a.stride(0), a.stride(1), b, b.stride(0),
                                                                 b.stride(1), c, c.stride(0), c.stride(1), **kern_kwargs)

@@ -28,9 +28,15 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Allocate `NUM_BUFFERS` of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.
 
-- `buffer = tlx.local_view(buffers, buffer_idx)`
 
-    Return a subview of the buffer indexed by `buffer_idx` from `buffers`.
+- `buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)`
+
+    Alias this allocation to an existing `buffered_tensor` so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.
+
+
+- `buffer = tlx.local_view(buffers, buffer_idx)` or `buffer = buffers[buffer_idx]`
+
+    Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
 - `distributed_tensor = tlx.local_load(buffer, optional_token)`
@@ -57,6 +63,24 @@ While this approach places more responsibility on the user, it reduces the compi
   Return a remote view of the `buffer` living in another CTA in the same cluster with ID `remote_cta_rank`. NOTE: for
   now we only support barrier as `buffer`, not general SMEM.
 
+- `tlx.remote_shmem_store(dst, src, remote_cta_rank)`
+
+  Store a distributed tensor into a buffer in the remote shared memory of a cluster (synchronous).
+
+  **Parameters:**
+  - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
+  - `src`: The source distributed tensor to store
+  - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
+
+  **Example:**
+  ```python
+  # Allocate shared memory buffer
+  buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+
+  # Store to remote CTA's shared memory (synchronous)
+  tlx.remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1)
+  ```
+
 ### Async memory access
 
 
@@ -69,6 +93,113 @@ While this approach places more responsibility on the user, it reduces the compi
 
    Store a chunk of data from local memory into global memory buffer. The global address, strides, and buffer size are defined by the memory descriptor.
 
+
+- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)`
+
+   Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.
+
+   **Parameters:**
+   - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
+   - `src`: The source distributed tensor to store
+   - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
+   - `barrier`: mbarrier to signal when the store completes
+
+   **Example:**
+   ```python
+   # Allocate shared memory buffer and barrier
+   buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+
+   # Store to remote CTA's shared memory
+   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
+   ```
+
+- `desc_ptrs = tlx.allocate_tensor_descriptor(num)`
+
+   Allocates global memory for tensor descriptor storage with built-in parameters (nbytes=128, alignment=128 per descriptor).
+   Returns a `tensor_descriptor_ptr` with 128-byte stride semantics that supports indexing.
+
+   **Parameters:**
+   - `num`: Number of tensor descriptors to allocate (must be a constexpr)
+
+   **Returns:**
+   - A `tensor_descriptor_ptr` where indexing (e.g., `desc_ptrs[0]`, `desc_ptrs[1]`) advances by 128 bytes per index
+
+   **Example:**
+   ```python
+   # Allocate storage for 4 tensor descriptors
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=4)
+
+   # Access individual descriptors using indexing
+   desc_ptr_0 = desc_ptrs[0]  # First descriptor
+   desc_ptr_1 = desc_ptrs[1]  # Second descriptor (128 bytes offset)
+   ```
+
+- `tlx.make_tensor_descriptor(desc_ptr, base, shape, strides, block_shape, padding_option)`
+
+   Create a TMA (Tensor Memory Accelerator) descriptor for efficient asynchronous data movement on Hopper and Blackwell GPUs.
+
+   **Parameters:**
+   - `desc_ptr` (optional): Tensor descriptor pointer from `allocate_tensor_descriptor()`. Pass `None` for automatic allocation.
+   - `base`: Base pointer to the tensor in global memory
+   - `shape`: List of tensor dimensions (dynamic, runtime values)
+   - `strides`: List of tensor strides (dynamic, runtime values)
+   - `block_shape`: Shape of the block to be loaded/stored (compile-time constants)
+   - `padding_option`: Padding option for out-of-bounds accesses (default: "zero")
+
+   **Example:**
+   ```python
+   # Create a 2D tensor descriptor with automatic scratch allocation
+   desc = tlx.make_tensor_descriptor(
+       desc_ptr=None,  # Compiler allocates scratch memory automatically
+       base=tensor_ptr,
+       shape=[M, N],
+       strides=[N, tl.constexpr(1)],
+       block_shape=[64, 64],
+   )
+
+   # Or with explicit descriptor allocation for advanced use cases (e.g., pipelining)
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+
+   # Create descriptor at index 0
+   tlx.make_tensor_descriptor(
+       desc_ptr=desc_ptrs[0],
+       base=tensor_ptr,
+       shape=[M, N],
+       strides=[N, tl.constexpr(1)],
+       block_shape=[64, 64],
+   )
+
+   # Reinterpret the descriptor for TMA operations
+   desc = tlx.reinterpret_tensor_descriptor(
+       desc_ptr=desc_ptrs[0],
+       block_shape=[64, 64],
+       dtype=tl.float16,
+   )
+
+   # Use with async TMA operations
+   tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)
+   ```
+
+- `desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)`
+
+   Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.
+
+   **Parameters:**
+   - `desc_ptr`: A `tensor_descriptor_ptr` pointing to the TMA descriptor (from `allocate_tensor_descriptor`)
+   - `block_shape`: Shape of the block to be loaded/stored (compile-time constants)
+   - `dtype`: Data type of the tensor elements
+
+   **Example:**
+   ```python
+   # Allocate and create descriptor
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+   tlx.make_tensor_descriptor(desc_ptr=desc_ptrs[0], base=a_ptr, shape=[M, K], strides=[K, 1], block_shape=[128, 64])
+
+   # Reinterpret for use with TMA
+   a_desc = tlx.reinterpret_tensor_descriptor(desc_ptr=desc_ptrs[0], block_shape=[128, 64], dtype=tl.float16)
+   tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
+   ```
 
 - `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)`
 
@@ -92,17 +223,72 @@ While this approach places more responsibility on the user, it reduces the compi
 - `acc = tlx.async_dot(a[i], b[i], acc)`
 - `acc = tlx.async_dot(a_reg, b[i], acc)`
 - `acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)`
-- `acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], b_scale[i])`
+- `acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], a_format, b_scale[i], b_format, use_acc, two_ctas, mBarriers)`
+
+    **Parameters:**
+    - `a[i]`: A tile in shared memory (FP8 format)
+    - `b[i]`: B tile in shared memory (FP8 format)
+    - `acc[i]`: Accumulator tile in tensor memory (TMEM)
+    - `a_scale[i]`: Per-block scaling factors for A (E8M0 format in SMEM)
+    - `a_format`: FP8 format string for A: `"e4m3"`, `"e5m2"`, or `"e2m1"`
+    - `b_scale[i]`: Per-block scaling factors for B (E8M0 format in SMEM)
+    - `b_format`: FP8 format string for B: `"e4m3"`, `"e5m2"`, or `"e2m1"`
+    - `use_acc`: If `True`, compute D = A@B + D; if `False`, compute D = A@B
+    - `two_ctas`: If `True`, enables 2-CTA collective MMA (generates `tcgen05.mma.cta_group::2`)
+    - `mBarriers`: Optional list of mbarriers for MMA completion signaling
+
+    **2-CTA Scaled MMA:** When `two_ctas=True`, the scaled MMA operates across two CTAs in a cluster. Key considerations:
+    - **B data is split**: Each CTA loads half of B (`BLOCK_N // 2`)
+    - **B scale is NOT split**: Both CTAs need the full B scale for correct MMA computation
+    - **CTA synchronization**: Use "Arrive Remote, Wait Local" pattern before MMA
+    - **MMA predication**: Compiler auto-generates predicate so only CTA 0 issues the MMA
+
+    **Example: 2-CTA Scaled MMA**
+    ```python
+    # B data split across CTAs, but B scale is full
+    desc_b = tl.make_tensor_descriptor(b_ptr, ..., block_shape=[BLOCK_K, BLOCK_N // 2])
+    desc_b_scale = tl.make_tensor_descriptor(b_scale_ptr, ..., block_shape=[BLOCK_N // 128, ...])  # Full scale
+
+    # Load B with CTA offset, B scale without offset
+    tlx.async_descriptor_load(desc_b, b_tile[0], [0, cluster_cta_rank * BLOCK_N // 2], bar_b)
+    tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0], bar_b_scale)  # Full B scale
+
+    # CTA sync: "Arrive Remote, Wait Local"
+    tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+    tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
+
+    # 2-CTA scaled MMA with mBarriers for completion tracking
+    tlx.async_dot_scaled(
+        a_tile[0], b_tile[0], c_tile[0],
+        a_scale_tile[0], "e4m3",
+        b_scale_tile[0], "e4m3",
+        use_acc=False,
+        two_ctas=True,
+        mBarriers=[mma_done_bar],
+    )
+    tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+    ```
+
+    **Alternative: Using tcgen05_commit for MMA completion**
+    ```python
+    # Issue MMA without mBarriers
+    tlx.async_dot_scaled(..., two_ctas=True)
+
+    # Use tcgen05_commit to track all prior MMA ops
+    tlx.tcgen05_commit(mma_done_bar, two_ctas=True)
+    tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+    ```
+
 - `acc = tlx.async_dot_wait(pendings, acc)`
 
     Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.
 
-Examples
-```
+    Example:
+    ```python
     acc = tlx.async_dot(a_smem, b_smem)
     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
     tl.store(C_ptrs, acc)
-```
+    ```
 
 ### Barrier operations
 
@@ -133,6 +319,136 @@ Examples
 - `tlx.barrier_expect_bytes(bar, bytes)`
 
   Signal a barrier of an expected number of bytes to be copied.
+
+- `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)`
+
+    Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
+
+### Cluster Launch Control (CLC)
+
+CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dynamic persistent kernel** execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.
+
+#### CLC API
+
+- `context = tlx.clc_create_context(num_stages, num_consumers)`
+
+    Create a CLC pipeline context with the specified number of stages and expected consumer count.
+
+    **Parameters:**
+    - `num_stages`: Number of pipeline stages for double/multi-buffering
+    - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
+
+- `tlx.clc_producer(context, k, phase, multi_ctas=False)`
+
+    Issue a CLC try_cancel request to acquire a new tile ID.
+
+    **Parameters:**
+    - `context`: CLC pipeline context from `clc_create_context`
+    - `k`: Pipeline stage index (for multi-buffering)
+    - `phase`: Current barrier phase (0 or 1, alternates each iteration)
+    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
+
+- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False)`
+
+    Decode the tile ID from a CLC response and signal completion.
+
+    **Parameters:**
+    - `context`: CLC pipeline context from `clc_create_context`
+    - `k`: Pipeline stage index
+    - `phase`: Current barrier phase
+    - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+
+    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available.
+
+#### How CLC Works
+
+CLC uses hardware-assisted work stealing via the PTX instruction:
+```
+clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
+```
+
+The `.multicast::cluster::all` qualifier means the response is **asynchronously written to all CTAs** in the cluster. This enables efficient multi-CTA execution where all CTAs in a cluster receive the same base tile ID.
+
+#### CLC Synchronization Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLC Producer (clc_producer)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. WAIT:   barrier_wait(bar_empty)      ← Wait for consumers   │
+│  2. EXPECT: barrier_expect_bytes(bar_full, 16)                  │
+│  3. ISSUE:  clc_issue(response, bar_full) ← Hardware request    │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+                    [Hardware processes CLC]
+                    [Multicasts response to all CTAs]
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLC Consumer (clc_consumer)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. WAIT:   barrier_wait(bar_full)       ← Wait for response    │
+│  2. QUERY:  tile_id = clc_query(response) ← Extract tile ID     │
+│  3. SIGNAL: barrier_arrive(bar_empty)    ← Release producer     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Multi-CTA Mode (2-CTA Clusters)
+
+In multi-CTA mode (`multi_ctas=True`), multiple CTAs in a cluster work together on adjacent tiles. The key constraint is: **you can arrive at a remote mbarrier, but you cannot wait on a remote mbarrier** (per NVIDIA specification).
+
+##### Key Principle: "Arrive Remote, Wait Local"
+
+| Operation | Local mbarrier | Remote mbarrier |
+|-----------|----------------|-----------------|
+| `barrier_wait` | ✅ Allowed | ❌ Undefined behavior |
+| `barrier_arrive` | ✅ Allowed | ✅ Allowed (via `remote_cta_rank`) |
+
+##### Example: Multi-CTA GEMM with CLC
+
+```python
+@triton.jit
+def matmul_kernel(..., PAIR_CTA: tl.constexpr):
+    # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
+    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):  # Epilogue consumer
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # Producer: acquire next tile
+                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                clc_phase_producer ^= 1
+
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+
+```
 
 Examples: how mbarriers are communicated in warp specialization
 ```
@@ -167,16 +483,108 @@ Examples: how mbarriers are communicated in warp specialization
 
 ```
     with tlx.async_tasks
-        with tlx.asycn_task(default)
+        with tlx.async_task("default")
             ...
-        with tlx.asycn_task(num_warps = 4)
+        with tlx.async_task(num_warps=4)
             ...
 ```
-`tlx.async_tasks` opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block..
+`tlx.async_tasks` opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block.
 
-`tlx.async_task(default)` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks. .
+`tlx.async_task("default")` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.
 
-`tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task..
+`tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
+
+#### async_task Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `"default"` | First positional argument to mark this as the default/trunk task |
+| `num_warps` | Number of warps to reserve for this task |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning) |
+| `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
+| `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
+
+#### Explicit Warp Assignment with warp_group_start_id
+
+By default, the compiler automatically assigns warp IDs to each task. However, you can use `warp_group_start_id` to explicitly specify which warps each task should use. This is useful for:
+- Fine-grained control over warp-to-task mapping
+- Ensuring specific hardware resource allocation
+- Advanced optimization scenarios
+
+**Example:**
+```python
+with tlx.async_tasks():
+    with tlx.async_task("default"):  # Uses warps 0-3 (from num_warps=4 kernel param)
+        # Producer task
+        ...
+    with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
+        # Two replicas, each using 2 warps
+        # Replica 0: warps 4-5
+        # Replica 1: warps 6-7
+        ...
+    with tlx.async_task(num_warps=1, warp_group_start_id=8):
+        # Consumer task using warp 8
+        ...
+```
+
+**Validation Rules:**
+- Warp ranges must not overlap between tasks
+- Non-default tasks must not overlap with the default region (warps 0 to kernel's `num_warps`)
+- When using `warp_group_start_id`, it must be specified for ALL non-default tasks or NONE
+
+### CUDA Thread Block Clustering
+
+TLX supports CUDA Thread Block Clustering (available on SM90+ Hopper/Blackwell GPUs) through the `ctas_per_cga` parameter. This provides explicit control over cluster dimensions for multi-CTA cooperative kernels.
+
+#### Usage
+
+Pass `ctas_per_cga` as a tuple when launching a kernel:
+
+```python
+kernel[(grid_x, grid_y)](
+    ...,
+    ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster of CTAs
+    **kwargs
+)
+```
+
+#### Using ctas_per_cga with Autotune
+
+You can specify `ctas_per_cga` in `triton.Config` for autotuning:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128},
+            num_warps=4,
+            ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64},
+            num_warps=4,
+            ctas_per_cga=(1, 1, 1),  # No clustering
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def matmul_kernel(...):
+    ...
+```
+
+
+#### TLX vs Triton Semantics
+
+TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
+
+| Aspect | Triton's way (`num_ctas`) | TLX way (`ctas_per_cga`) |
+|--------|---------------------------|--------------------------|
+| Grid interpretation | Grid × cluster_dims = total CTAs | Grid = total CTAs |
+| Cluster definition | Multiplicative | Regrouping |
+| `num_ctas` value | `product(cluster_dims)` | Always 1 |
+| `launch_cluster` | Can be False (enabled by `num_ctas != 1`) | Always True |
+
 
 ### Other operations
 
@@ -187,6 +595,24 @@ Examples: how mbarriers are communicated in warp specialization
 - `tlx.thread_id(axis)`
 
     Returns the id of the current thread instance along the given `axis`.
+
+- `tlx.dtype_of(v)`
+
+    Returns the dtype of a tensor or tensor descriptor.
+
+- `tlx.size_of(dtype)`
+
+    Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.
+
+    Example:
+    ```python
+    # Instead of hardcoding size values
+    tlx.barrier_expect_bytes(barrier, 2 * BLOCK_M * BLOCK_K)  # Assumes float16
+
+    # Use size_of for dtype-aware computation
+    tlx.barrier_expect_bytes(barrier,
+                           tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)
+    ```
 
 - `tlx.clock64()`
 
@@ -238,259 +664,22 @@ Examples: how mbarriers are communicated in warp specialization
 ### GEMM kernels
 [Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-pipelined_test.py)
 
-[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-pipelined.py)
+[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-pipelined_test.py)
 
 [Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-ws_test.py)
 
-[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-ws.py)
+[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-ws_test.py)
+
+[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell-grouped-gemm_test.py)
 
 ### Attention kernels
 
-[Warp-specialized FA fwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws_test.py)
-
-[Warp-specialized pipelined FA fwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws-pipelined_test.py)
-
-[Warp-specialized FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws_test.py)
-
-[Warp-Specialized computation-pipelined FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined_test.py)
+[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws-pipelined-persistent_test.py)
 
 [Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py)
 
-[Warp-Specialized computation-pipelined pingpong HSTU fwd on Hopper](https://github.com/meta-recsys/generative-recommenders/blob/bcb3aeea0f7b48faa9ea8d0d0337a055897618ec/generative_recommenders/ops/triton/triton_hstu_attention.py#L1262)
 
 
-
-
-### Pipelined GEMM on NVIDIA Hopper
-
-```
-@triton.jit
-def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,  #
-                                   stride_bk, stride_bn,  #
-                                   stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                                   BLOCK_SIZE_K: tl.constexpr,  #
-                                   GROUP_SIZE_M: tl.constexpr,  #
-                                   NUM_STAGES: tl.constexpr  #
-                                   ):
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # offset computation
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # allocate NUM_STAGES buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_STAGES)
-
-    # prefetch (pipelining) for NUM_STAGES - 1 buffers
-    for i in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
-        token_a = tlx.async_load(a_ptrs, buffers_A[i], mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
-        token_b = tlx.async_load(b_ptrs, buffers_B[i], mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        tlx.async_load_commit_group([token_a, token_b])
-
-    # main K loop
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # Disable auto-pipelining with num_stages=0
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=0):
-        # identify the buffer index for the current iteration
-        buf = k % NUM_STAGES
-
-        # wait for buffers to be ready
-        tlx.async_load_wait_group(NUM_STAGES - 2)
-
-        # do the mma
-        acc = tlx.async_dot(buffers_A[buf], buffers_B[buf], acc)
-
-        # prefetch for i-th iteration, i.e, NUM_STAGES - 1 ahead
-        i = k + NUM_STAGES - 1
-        # wait for the previous MMA using this buffer to complete
-        acc = tlx.async_dot_wait(NUM_STAGES - 1, acc)
-        # prefetch
-        token_a = tlx.async_load(a_ptrs, buffers_A[i % NUM_STAGES], mask=offs_k[None, :] < K - i * BLOCK_SIZE_K)
-        token_b = tlx.async_load(b_ptrs, buffers_B[i % NUM_STAGES], mask=offs_k[:, None] < K - i * BLOCK_SIZE_K)
-        tlx.async_load_commit_group([token_a, token_b])
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    # wait for last mma to complete
-    acc = tlx.async_dot_wait(0, acc)
-    c = acc.to(tlx.dtype_of(c_ptr))
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-```
-
-
-### Warp-Specialized GEMM on NVIDIA Blackwell
-
-```
-@triton.jit
-def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
-                                   BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-                                   GROUP_SIZE_M: tl.constexpr,  #
-                                   NUM_SMEM_BUFFERS: tl.constexpr,  #
-                                   NUM_TMEM_BUFFERS: tl.constexpr,  #
-                                   NUM_SMS: tl.constexpr,  #
-                                   EPILOGUE_SUBTILE: tl.constexpr,  #
-                                   ):
-    # allocate NUM_SMEM_BUFFERS buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
-    # use multiple TMEM buffers to overlap MMA and epilogue
-    tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
-
-    # allocate barriers
-    smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-
-    with tlx.async_tasks():
-        with tlx.async_task("default"):  # producer, TMA load
-            # common code duplicated for each region to avoid SMEM overhead
-            start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            num_tiles = num_pid_m * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
-
-            load_phase = 0  # the current phase of TMA load
-            # we virtually "flatten" the two layer loop as if we're performing tma loads on
-            # one big list of data
-            processed_k_iters = 0
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
-
-                for k in range(0, k_tiles):
-                    # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
-                    buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
-                    # wait for previous phase(round) of dot for this buf
-                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
-                    # buffer is now ready to be used again
-                    offs_k = k * BLOCK_SIZE_K
-                    tlx.barrier_expect_bytes(smem_full_bars[buf],
-                                             2 * (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K)  # float16
-                    tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], smem_full_bars[buf])
-                    tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], smem_full_bars[buf])
-                    # flip phase at the end of a round
-                    load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
-                processed_k_iters += k_tiles
-        with tlx.async_task(num_warps=1, num_regs=232):  # MMA consumer
-            # common code duplicated for each region to avoid SMEM overhead
-            start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            num_tiles = num_pid_m * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
-
-            dot_phase = 0  # the current phase of dot op
-            tmem_write_phase = 1  # sync between epilogue consumer and MMA consumer
-            cur_tmem_buf = 0
-
-            processed_k_iters = 0
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
-
-                # wait epilogue consumer to be done with the buffer before reusing it
-                tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
-                # flip phase at the end of a round of using TMEM barriers
-                tmem_write_phase = tmem_write_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
-
-                # now iterate along K to compute result for the block
-                for k in range(0, k_tiles):
-                    # processed_k_iters + k means we use the immediate next buffer slot of tile_id x when we start tile_id x+1
-                    buf = (processed_k_iters + k) % NUM_SMEM_BUFFERS
-                    # wait for current phase(round) of load for this buf
-                    tlx.barrier_wait(smem_full_bars[buf], dot_phase)
-                    # buffer is now ready with loaded data, tlx.async_dot will signal `mBarrier` when done
-                    tlx.async_dot(buffers_A[buf], buffers_B[buf], tmem_buffers[cur_tmem_buf], use_acc=k > 0,
-                                  mBarriers=[smem_empty_bars[buf]], out_dtype=tl.float32)
-                    # flip phase at the end of a round
-                    dot_phase = dot_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
-
-                # wait for last mma to complete
-                last_buf = (processed_k_iters + k_tiles - 1) % NUM_SMEM_BUFFERS
-                # in case phase was flipped, we should use the phase value when dot op was issued
-                last_dot_phase = dot_phase ^ (last_buf == NUM_SMEM_BUFFERS - 1)
-                tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
-
-                # done filling this buffer, signal epilogue consumer
-                tlx.barrier_arrive(tmem_full_bars[cur_tmem_buf], 1)
-
-                # possibly enter next iteration (next tile) without waiting for epilogue
-                cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
-                processed_k_iters += k_tiles
-
-        with tlx.async_task(num_warps=4, num_regs=232):  # epilogue consumer
-            # common code duplicated for each region to avoid SMEM overhead
-            start_pid = tl.program_id(axis=0)
-            num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-            num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            num_tiles = num_pid_m * num_pid_n
-            k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-            # end of common code
-
-            tmem_read_phase = 0
-            cur_tmem_buf = 0
-
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-                offs_am = pid_m * BLOCK_SIZE_M
-                offs_bn = pid_n * BLOCK_SIZE_N
-
-                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
-                # flip phase at the end of a round of using TMEM barriers
-                tmem_read_phase = tmem_read_phase ^ (cur_tmem_buf == NUM_TMEM_BUFFERS - 1)
-
-                # load the result from TMEM to registers
-                acc_tmem = tmem_buffers[cur_tmem_buf]
-
-                if EPILOGUE_SUBTILE:
-                    # We load/store the result half by half to reduce SMEM pressure
-                    acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice1)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn], c)
-
-                    acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice2)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
-                else:
-                    result = tlx.local_load(acc_tmem)
-                    c = result.to(tl.float16)
-                    c_desc.store([offs_am, offs_bn], c)
-
-                # done storing this buffer, signal MMA consumer to resume writing to it
-                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
-
-                cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
-```
 
 ## Build and install TLX from source
 

@@ -1,4 +1,5 @@
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
@@ -91,52 +92,63 @@ public:
                                 "auto insert InvalBarrierOp.";
     }
 
-    // Find all barrier init ops in the module
-    std::vector<Value> barriers;
-    mod.walk(
-        [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
+    SetVector<triton::FuncOp> funcOps;
+    mod.walk([&](triton::FuncOp op) { funcOps.insert(op); });
+    for (auto funcOp : funcOps) {
+      DominanceInfo domInfo(funcOp);
 
-    // Find the entry funcOp
-    triton::FuncOp funcOp = nullptr;
-    mod.walk([&](triton::FuncOp op) {
-      if (triton::isKernel(op)) {
-        funcOp = op;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-
-    // todo: consider removing all the inval op that's located right before
-    // return in a later pass to save a few cycles.
-    // Insert InvalBarrierOp before returnOp of
-    // entry funcOp
-    funcOp.walk([&](triton::ReturnOp op) {
-      OpBuilder builder(op); // Insert *before* returnOp
-      Location loc = op.getLoc();
-      for (auto barrier : barriers) {
-        builder.create<ttng::InvalBarrierOp>(loc, barrier);
-      }
-    });
+      // Find all barrier init ops in the func
+      std::vector<Value> barriers;
+      funcOp.walk(
+          [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
+      // todo: consider removing all the inval op that's located right before
+      // return in a later pass to save a few cycles.
+      // Insert InvalBarrierOp before returnOp of
+      // entry funcOp
+      funcOp.walk([&](triton::ReturnOp op) {
+        OpBuilder builder(op); // Insert *before* returnOp
+        Location loc = op.getLoc();
+        for (auto barrier : barriers) {
+          if (domInfo.properlyDominates(barrier, op)) {
+            builder.create<ttng::InvalBarrierOp>(loc, barrier);
+          }
+        }
+      });
+    }
 
     return success();
+  }
+
+  bool isAMD() const {
+    // target is set up as f"hip:{options.arch}"
+    return (target.getValue().find("hip:") == 0);
   }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    auto hasTLXTwoCTAs = mod.walk([&](ttng::TCGen5MMAOp tcgen05MMAOp) {
-                              if (tcgen05MMAOp.getTwoCtas()) {
-                                return WalkResult::interrupt();
-                              }
-                              return WalkResult::advance();
-                            })
-                             .wasInterrupted();
+    auto hasTLXTwoCTAs =
+        mod.walk([&](Operation *op) {
+             if (auto tcgen05MMAOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+               if (tcgen05MMAOp.getTwoCtas()) {
+                 return WalkResult::interrupt();
+               }
+             } else if (auto tcgen05MMAScaledOp =
+                            dyn_cast<ttng::TCGen5MMAScaledOp>(op)) {
+               if (tcgen05MMAScaledOp.getTwoCtas()) {
+                 return WalkResult::interrupt();
+               }
+             }
+             return WalkResult::advance();
+           })
+            .wasInterrupted();
 
     if (failed(verifyModule(mod, hasTLXTwoCTAs))) {
       return signalPassFailure();
     }
 
-    if (failed(insertInvalBarrier(mod))) {
+    // InvalBarrierOp insertion is not needed for AMD
+    if (!isAMD() && failed(insertInvalBarrier(mod))) {
       return signalPassFailure();
     }
 

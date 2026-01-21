@@ -4,7 +4,7 @@ from . import types as tlx
 from .utility import cuda_parse_arch
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     rank = len(x.shape)
     layout = tlx.nv_mma_shared_layout_encoding(
@@ -14,7 +14,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
         numCTAsPerCGA=[1] * rank,
         numCTASplit=[1] * rank,
         numCTAOrder=[1] * rank,
-        fp4Padded=False,
+        fp4Padded=fp4Padded,
         swizzled=swizzled,
     )
 
@@ -155,6 +155,7 @@ def async_dot_scaled(
     | tl.tensor = None,  # For blackwell, compute D = A @ B + D instead of D = A @ B. If None, default to True.
     pred=None,
     mBarriers: list[tlx.mbarrier] = [],
+    two_ctas: bool = False,
     out_dtype=tl.float32,
     _semantic=None,
 ) -> tl.tensor:
@@ -206,6 +207,10 @@ def async_dot_scaled(
         Optional mbarriers used to coordinate producer/consumer warp-groups
         when `async_dot_scaled` participates in a pipelined MMA schedule.
 
+    two_ctas : bool
+        If True, the op will execute a matmul across two contiguous CTAs,
+        reading data distributed across the two CTAs. Default is False.
+
     out_dtype : tl.dtype
         Output accumulation type before final store (default: fp32).
 
@@ -228,10 +233,6 @@ def async_dot_scaled(
     assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
     assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
 
-    # Require the shared memory layout for A and B
-    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder)
-    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder)
-
     # Handle input formats
     supported_formats = {"e2m1", "e4m3", "e5m2"}
     A_format = tl._unwrap_if_constexpr(A_format)
@@ -240,6 +241,21 @@ def async_dot_scaled(
     assert B_format in supported_formats, f"Unsupported B_format: {B_format}"
     A_type = _semantic._str_to_fp_type(A_format)
     B_type = _semantic._str_to_fp_type(B_format)
+
+    # Require the shared memory layout for A and B
+    # For fp4 (e2m1) format with mixed precision, we need fp4Padded=True for correct swizzling
+    # This follows the same logic as Triton's AccelerateMatmul.cpp:
+    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-packing-formats-mxf8f6f4-smem
+    is_A_fp4 = A_format == "e2m1"
+    is_B_fp4 = B_format == "e2m1"
+    is_mixed_precision = A_format != B_format
+    # fp4Padded is needed when:
+    # 1. The operand is FP4 and it's mixed precision (the other operand is not FP4)
+    # Note: When both operands are FP4 (not mixed precision), they use packed format
+    A_fp4Padded = is_A_fp4 and is_mixed_precision
+    B_fp4Padded = is_B_fp4 and is_mixed_precision
+    A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
 
     # Require the shared memory layout for A_scale and B_scale
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"
@@ -271,6 +287,7 @@ def async_dot_scaled(
         B_type,
         use_acc_handle,
         pred,
+        two_ctas,
         bar_handles,
     )
     return tl.tensor(output, tl.void)
@@ -294,10 +311,18 @@ def async_dot_wait(
 @tl.builtin
 def tcgen05_commit(
     mBarrier: tlx.mbarrier,
+    two_ctas: bool = False,
     _semantic=None,
 ) -> tl.tensor:
     """
     Make the mbarrier track the completion of all prior asynchronous tcgen5 operations.
     NOTE: DO NOT use the same mBarrier passed to async_dot. This op needs a separate dedicated mBarrier.
     """
-    return tl.tensor(_semantic.builder.create_tcgen05_commit(mBarrier.handle), tl.void)
+    if not two_ctas:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        # cluster_cta_rank() % 2 == 0
+        cta_rank = _semantic.builder.create_cluster_cta_rank()
+        mod_result = _semantic.builder.create_urem(cta_rank, _semantic.builder.get_int32(2))
+        pred_handle = _semantic.builder.create_icmpEQ(mod_result, _semantic.builder.get_int32(0))
+    return tl.tensor(_semantic.builder.create_tcgen05_commit(mBarrier.handle, pred_handle), tl.void)

@@ -354,6 +354,7 @@ class cache_knobs(base_knobs):
 class compilation_knobs(base_knobs):
     override: env_bool = env_bool("TRITON_KERNEL_OVERRIDE")
     dump_ir: env_bool = env_bool("TRITON_KERNEL_DUMP")
+    dump_ir_extract_di_local_variables: env_bool = env_bool("LLVM_EXTRACT_DI_LOCAL_VARIABLES")
     store_binary_only: env_bool = env_bool("TRITON_STORE_BINARY_ONLY")
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")
     # TODO: Use enum to constrain / 'typecheck' the values
@@ -456,6 +457,8 @@ class runtime_knobs(base_knobs):
     # debug is on critical path for kernel launches
     # avoid repeated reads from env-var by calling get directly
     debug: bool = env_bool("TRITON_DEBUG").get()
+    # sanitize_overflow enables overflow checking for integer operations
+    sanitize_overflow: bool = env_bool("TRITON_SANITIZE_OVERFLOW").get()
     override_arch: env_opt_str = env_opt_str("TRITON_OVERRIDE_ARCH")
 
     launch_enter_hook: HookChain[LaunchHook] = HookChain()
@@ -482,6 +485,7 @@ class nvidia_knobs(base_knobs):
 
     dump_nvptx: env_bool = env_bool("NVPTX_ENABLE_DUMP")
     disable_ptxas_opt: env_bool = env_bool("DISABLE_PTXAS_OPT")
+    ptxas_options: env_opt_str = env_opt_str("PTXAS_OPTIONS")
     mock_ptx_version: env_opt_str = env_opt_str("TRITON_MOCK_PTX_VERSION")
     dump_ptxas_log: env_bool = env_bool("TRITON_DUMP_PTXAS_LOG")
 
@@ -527,3 +531,4 @@ proton = proton_knobs()
 
 def refresh_knobs():
     runtime.debug = env_bool("TRITON_DEBUG").get()
+    runtime.sanitize_overflow = env_bool("TRITON_SANITIZE_OVERFLOW").get()

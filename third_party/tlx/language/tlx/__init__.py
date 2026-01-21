@@ -1,55 +1,74 @@
+from . import compiler
 from .async_task_utils import async_task, async_tasks
-from .types import (
-    layout_encoding,
-    shared_layout_encoding,
-    swizzled_shared_layout_encoding,
-    tensor_memory_layout_encoding,
-    nv_mma_shared_layout_encoding,
-    storage_kind,
-    buffered_tensor,
-    buffered_tensor_type,
-    mbarrier,
-    mbarrier_type,
-    clc_response,
-    clc_response_type,
-    CLCPipelineContext,
-    async_token,
-)
-from .mem_ops import (local_alloc, local_view, remote_view, local_slice, subslice, async_load, async_load_commit_group,
-                      async_load_wait_group, local_load, local_store, local_trans, local_reinterpret,
-                      async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, fence_async_shared)
 from .barrier import (
     alloc_barriers,
+    barrier_arrive,
     barrier_expect_bytes,
     barrier_wait,
-    barrier_arrive,
-    named_barrier_wait,
+    cluster_barrier,
     named_barrier_arrive,
-)
-from .mma_ops import (
-    async_dot,
-    async_dot_scaled,
-    async_dot_wait,
-    tcgen05_commit,
-)
-from .utility import (
-    cluster_cta_rank,
-    thread_id,
-    async_task_replica_id,
-    dtype_of,
-    clock64,
-    stoch_round,
+    named_barrier_wait,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
     _clc_issue,
     _clc_query,
-    clc_producer,
     clc_consumer,
     clc_create_context,
+    clc_producer,
 )
-
-from . import compiler
+from .mem_ops import (
+    allocate_tensor_descriptor,
+    async_descriptor_load,
+    async_descriptor_store,
+    async_descriptor_store_wait,
+    async_load,
+    async_load_commit_group,
+    async_load_wait_group,
+    fence_async_shared,
+    local_alloc,
+    local_load,
+    local_reinterpret,
+    local_slice,
+    local_store,
+    local_trans,
+    local_view,
+    make_tensor_descriptor,
+    reinterpret_tensor_descriptor,
+    remote_shmem_store,
+    async_remote_shmem_store,
+    remote_view,
+    subslice,
+)
+from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
+from .types import (
+    async_token,
+    buffered_tensor,
+    buffered_tensor_type,
+    clc_response,
+    clc_response_type,
+    CLCPipelineContext,
+    DummyRegisterLayoutEncoding,
+    layout_encoding,
+    mbarrier,
+    mbarrier_type,
+    nv_mma_shared_layout_encoding,
+    shared_layout_encoding,
+    storage_kind,
+    swizzled_shared_layout_encoding,
+    tensor_descriptor_ptr,
+    tensor_descriptor_ptr_type,
+    tensor_memory_layout_encoding,
+)
+from .utility import (
+    async_task_replica_id,
+    clock64,
+    cluster_cta_rank,
+    dtype_of,
+    size_of,
+    stoch_round,
+    thread_id,
+)
 
 __all__ = [
     # async_tasks
@@ -70,6 +89,8 @@ __all__ = [
     "clc_response_type",
     "CLCPipeliner",
     "async_token",
+    "tensor_descriptor_ptr",
+    "tensor_descriptor_ptr_type",
     # mem_ops
     "local_alloc",
     "local_view",
@@ -83,11 +104,17 @@ __all__ = [
     "local_store",
     "local_trans",
     "local_reinterpret",
+    "allocate_tensor_descriptor",
     "async_descriptor_load",
     "async_descriptor_store",
     "async_descriptor_store_wait",
     "fence_async_shared",
+    "make_tensor_descriptor",
+    "reinterpret_tensor_descriptor",
+    "remote_shmem_store",
+    "async_remote_shmem_store",
     # barriers
+    "cluster_barrier",
     "alloc_barriers",
     "barrier_expect_bytes",
     "barrier_wait",
@@ -104,6 +131,7 @@ __all__ = [
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    "size_of",
     "clock64",
     "stoch_round",
     # dynamic launcher ops
@@ -114,4 +142,5 @@ __all__ = [
     "clc_producer",
     "clc_consumer",
     "CLCPipelineContext",
+    "DummyRegisterLayoutEncoding",
 ]

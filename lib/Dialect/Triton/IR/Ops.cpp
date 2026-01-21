@@ -1149,7 +1149,153 @@ void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
   auto descTy =
       TensorDescType::get(builder.getContext(), blockTy, isSignedInteger);
   auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
-  return build(builder, state, descTy, base, shape, strides, paddingAttr);
+  return build(builder, state, descTy, base, shape, strides,
+               /*descPtr=*/Value(), paddingAttr);
+}
+
+void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
+                             Value base, ValueRange shape, ValueRange strides,
+                             Value descPtr, ArrayRef<int32_t> blockShape,
+                             bool isSignedInteger,
+                             triton::PaddingOption padding) {
+  auto ptrTy = dyn_cast<triton::PointerType>(base.getType());
+  if (!ptrTy) {
+    llvm::report_fatal_error("Expected pointer type");
+  }
+  auto elemTy = ptrTy.getPointeeType();
+  SmallVector<int64_t> blockShape64(blockShape);
+  auto blockTy = RankedTensorType::get(blockShape64, elemTy);
+  auto descTy =
+      TensorDescType::get(builder.getContext(), blockTy, isSignedInteger);
+  auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
+  return build(builder, state, descTy, base, shape, strides, descPtr,
+               paddingAttr);
+}
+
+ParseResult MakeTensorDescOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  // Parse: $base `,` `[` $shape `]` `,` `[` $strides `]`
+  //        (`,` `descPtr` `=` $descPtr `:` type($descPtr))?
+  //        attr-dict `:` type($base) `,` type($result)
+
+  OpAsmParser::UnresolvedOperand base;
+  SmallVector<OpAsmParser::UnresolvedOperand> shape;
+  SmallVector<OpAsmParser::UnresolvedOperand> strides;
+  Type baseType, resultType;
+
+  // Parse base operand
+  if (parser.parseOperand(base) || parser.parseComma())
+    return failure();
+
+  // Parse shape: `[` $shape `]`
+  if (parser.parseLSquare() ||
+      parser.parseOperandList(shape, OpAsmParser::Delimiter::None) ||
+      parser.parseRSquare() || parser.parseComma())
+    return failure();
+
+  // Parse strides: `[` $strides `]`
+  if (parser.parseLSquare() ||
+      parser.parseOperandList(strides, OpAsmParser::Delimiter::None) ||
+      parser.parseRSquare())
+    return failure();
+
+  // Optional descPtr
+  OpAsmParser::UnresolvedOperand descPtr;
+  Type descPtrType;
+  bool hasDescPtr = false;
+
+  if (succeeded(parser.parseOptionalComma())) {
+    if (succeeded(parser.parseOptionalKeyword("descPtr"))) {
+      if (parser.parseEqual() || parser.parseOperand(descPtr) ||
+          parser.parseColon() || parser.parseType(descPtrType))
+        return failure();
+      hasDescPtr = true;
+    } else {
+      // If we see a comma but not "descPtr", it's an error
+      return parser.emitError(parser.getCurrentLocation(),
+                              "expected 'descPtr' keyword");
+    }
+  }
+
+  // Attr-dict
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse `:` type($base) `,` type($result)
+  if (parser.parseColon() || parser.parseType(baseType) ||
+      parser.parseComma() || parser.parseType(resultType))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperand(base, baseType, result.operands))
+    return failure();
+
+  // Shape operands are I32
+  auto i32Type = parser.getBuilder().getI32Type();
+  if (parser.resolveOperands(shape, i32Type, result.operands))
+    return failure();
+
+  // Strides operands are I64
+  auto i64Type = parser.getBuilder().getI64Type();
+  if (parser.resolveOperands(strides, i64Type, result.operands))
+    return failure();
+
+  // Resolve optional descPtr
+  if (hasDescPtr) {
+    if (parser.resolveOperand(descPtr, descPtrType, result.operands))
+      return failure();
+  }
+
+  // Tell MLIR how many operands belong to each segment:
+  // [ base, shape..., strides..., descPtr? ]
+  SmallVector<int32_t, 4> segmentSizes;
+  segmentSizes.push_back(1);                  // base
+  segmentSizes.push_back(shape.size());       // shape (Variadic<I32>)
+  segmentSizes.push_back(strides.size());     // strides (Variadic<I64>)
+  segmentSizes.push_back(hasDescPtr ? 1 : 0); // descPtr (Optional<TT_Ptr>)
+
+  auto &builder = parser.getBuilder();
+  result.addAttribute("operand_segment_sizes",
+                      builder.getDenseI32ArrayAttr(segmentSizes));
+
+  // Result type
+  result.addTypes(resultType);
+
+  return success();
+}
+
+void MakeTensorDescOp::print(OpAsmPrinter &p) {
+  // Print: $base `,` `[` $shape `]` `,` `[` $strides `]`
+  //        (`,` `descPtr` `=` $descPtr `:` type($descPtr))?
+  //        attr-dict `:` type($base) `,` type($result)
+
+  p << " " << getBase() << ", [" << getShape() << "], [" << getStrides() << "]";
+
+  // Print descPtr if present
+  if (getDescPtr()) {
+    p << ", descPtr = " << getDescPtr() << " : " << getDescPtr().getType();
+  }
+
+  // Print attributes (excluding any that were explicitly handled)
+  SmallVector<StringRef> elidedAttrs;
+  elidedAttrs.push_back("operandSegmentSizes");
+  // Elide padding if it's the default value
+  if (getPadding() == triton::PaddingOption::PAD_ZERO) {
+    elidedAttrs.push_back("padding");
+  }
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+
+  p << " : " << getBase().getType() << ", " << getType();
+}
+
+void MakeTensorDescOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // If descPtr operand is present, this operation writes to global memory
+  if (getDescPtr()) {
+    effects.emplace_back(MemoryEffects::Write::get(), GlobalMemory::get());
+  }
+  // Otherwise, the operation is pure (no effects)
 }
 
 // The following ops, including `call`, `func`, and `return` are copied and

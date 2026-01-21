@@ -1,6 +1,5 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -15,7 +14,6 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/StrUtil.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -243,7 +241,8 @@ void createTMAAsyncLoad(scf::ForOp forOp, tt::DescriptorLoadOp loadOp,
             loadOp.getDesc().getType().getBlockType().getEncoding(),
             loadOp.getIndices());
         builder.create<ttng::AsyncTMACopyGlobalToLocalOp>(
-            loadOp.getLoc(), tmaPtr, indices, barrier, view, pred);
+            loadOp.getLoc(), /*multicastTargets*/ Value(), tmaPtr, indices,
+            barrier, view, pred);
       });
 }
 
@@ -682,80 +681,46 @@ Operation *hoistBufferOutOfLoop(scf::ForOp forOp, Operation *op,
 
 void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
                              ttng::MMAv5OpInterface mma, int mmaSelfLatency,
-                             ttng::TMEMAllocOp alloc, int phaseArgIdx,
+                             Value alloc, int phaseArgIdx,
                              int barrierIdxArgIdx) {
   auto isLoadToBePipelined = [&](Operation *op) {
     return schedule[mma].first > schedule[op].first;
   };
 
-  std::optional<Operation *> latestSyncPoint;
-  for (auto user : alloc->getUsers()) {
+  llvm::SmallDenseSet<Operation *> syncCandidates;
+
+  for (auto user : alloc.getUsers()) {
     if (auto load = dyn_cast<ttng::TMEMLoadOp>(user)) {
       if (load->getBlock() != mma->getBlock()) {
         continue;
       }
-      if (!latestSyncPoint || schedule.isOpBefore(load, *latestSyncPoint)) {
-        latestSyncPoint = load;
-      }
+      syncCandidates.insert(load);
     }
   }
 
   ttng::MMAv5PipelineableOperandsHelper mmaPipeHelper(mma, forOp,
                                                       isLoadToBePipelined);
 
-  SmallVector<Operation *> updatedDefs;
   for (auto def : mmaPipeHelper.unpipelineableOperandDefs) {
     auto newStore = hoistBufferOutOfLoop(forOp, def, schedule);
-    if (newStore) {
-      updatedDefs.push_back(newStore);
-    } else {
-      updatedDefs.push_back(def);
-    }
-  }
-
-  // Note: We cannot depend on schedule.isOpBefore here because the relevant
-  // stage depends on the location relative to the MMA. For example, imagine
-  // the following setup:
-  // load {cluster: 1, stage: 0}
-  // mma {cluster: 1, stage: 0}
-  // tmem_load {cluster: 0, stage: 1}
-  //
-  // If we just check which occurs first in the schedule, we will insert the
-  // barrier before the load in the loop. However, this will actually happen
-  // after the tmem_load, which is not what we want. To handle this, we need
-  // to account for any operation that occurs before the mma needs its location
-  // evaluated with {stage + 1}.
-  //
-  auto isEarlierBarrierLocation = [&](Operation *newOp, Operation *oldOp) {
-    auto [aStage, aCluster] = schedule[newOp];
-    auto [bStage, bCluster] = schedule[oldOp];
-    // We care about the first location after the MMA, not the first location
-    // in the IR.
-    if (schedule.isOpBefore(newOp, mma)) {
-      aStage += 1;
-    }
-    if (schedule.isOpBefore(oldOp, mma)) {
-      bStage += 1;
-    }
-    if (aStage != bStage) {
-      return aStage < bStage;
-    }
-    if (aCluster != bCluster) {
-      return schedule.clusters.isBefore(aCluster, bCluster);
-    }
-    return newOp->isBeforeInBlock(oldOp);
-  };
-
-  if (!mmaPipeHelper.isPipelineable &&
-      mmaPipeHelper.isOperandsStateDetermined) {
-    // If the operands are not pipelineable, we need to insert a sync point
-    // before the earliest operand load
-    for (auto def : updatedDefs) {
-      if (!latestSyncPoint || isEarlierBarrierLocation(def, *latestSyncPoint)) {
-        latestSyncPoint = def;
+    // If the operands are not pipelineable, we need to consider the stores as
+    // well.
+    if (!mmaPipeHelper.isPipelineable &&
+        mmaPipeHelper.isOperandsStateDetermined) {
+      if (newStore) {
+        syncCandidates.insert(newStore);
+      } else {
+        syncCandidates.insert(def);
       }
     }
   }
+
+  // Find the first sync candidate that appears after the MMA
+  // in the linearized schedule. This is either the first op to appear
+  // after the MMA or the first op
+  auto linearizedSchedule = schedule.linearized(forOp, mma);
+  std::optional<Operation *> latestSyncPoint = linearizedSchedule.findNext(
+      [&](Operation *op) { return syncCandidates.contains(op); });
 
   int mainWaitStage = schedule[mma].first + mmaSelfLatency;
   CoarseSchedule::Cluster mainWaitCluster = schedule[mma].second;
@@ -779,8 +744,7 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value phase = forOp.getRegionIterArg(phaseArgIdx);
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
   Value barrierIdx;
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
-  if (!metaWS || numStages > 1) {
+  if (numStages > 1) {
     barrierIdx = forOp.getRegionIterArg(barrierIdxArgIdx);
   } else {
     barrierIdx = zero;
@@ -789,10 +753,8 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   Value numStagesVal =
       builder.create<arith::ConstantIntOp>(forOp.getLoc(), numStages, 32);
 
-  Value barrierSlice = barrierAlloc;
-  if (metaWS || numStages > 1)
-    barrierSlice =
-        triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+  Value barrierSlice =
+      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
   mma.addCompletionBarrier(barrierSlice, vTrue);
   mma.setIsAsync(true);
 
@@ -812,7 +774,7 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   builder.create<ttng::WaitBarrierOp>(barrierSlice, phase, waitBuffers);
 
   // Add waits before loads in conditional blocks
-  for (auto user : alloc->getUsers()) {
+  for (auto user : alloc.getUsers()) {
     if (auto load = dyn_cast<ttng::TMEMLoadOp>(user)) {
       if (load->getBlock() == mma->getBlock()) {
         continue;

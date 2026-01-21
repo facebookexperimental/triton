@@ -20,9 +20,10 @@ public:
   void barrier(Location loc, RewriterBase &rewriter,
                bool isWarpSync = false) const override;
 
-  void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    std::optional<Value> ctaId, Value val,
-                    Value pred) const override;
+  void
+  storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
+               std::optional<Value> ctaId, Value val, Value pred,
+               std::optional<Value> barrierPtr = std::nullopt) const override;
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     std::optional<Value> ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
