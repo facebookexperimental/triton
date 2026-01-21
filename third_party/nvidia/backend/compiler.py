@@ -301,6 +301,7 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_annotate_pid_address_patterns(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)

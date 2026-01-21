@@ -384,4 +384,24 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUAnnotatePidAddressPatterns: Pass<"tritongpu-annotate-pid-address-patterns", "mlir::ModuleOp"> {
+  let summary = "Annotate load/store ops with program_id address patterns";
+
+  let description = [{
+    This pass uses ProgramIdAddressAnalysis to annotate load/store operations
+    with their access patterns relative to program_id. The annotations include:
+    - triton.pid_address_pattern: The pattern type (constant, pid_affine, etc.)
+    - triton.pid_axes: Which program_id axes affect the address
+    - triton.pid_strides: The stride for each axis
+    - triton.is_coalesced: Whether the access pattern is coalesced
+    - triton.block_size: The block size if known
+
+    This information can be used by downstream passes for memory coalescing
+    optimization, vectorization decisions, and out-of-bounds checking hints.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 #endif
