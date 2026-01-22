@@ -245,6 +245,12 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttir(mod, metadata, opt, capability):
+        # Collect CUDA-specific warnings for Python emission
+        cuda_warnings = mod.get_cuda_warnings(capability)
+        for warning_msg in cuda_warnings:
+            import warnings
+            warnings.warn(warning_msg, stacklevel=2)
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
