@@ -260,7 +260,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
     minRegAutoWS = attr.getInt();
   }
-  int maxRegAutoWS = 88; // default value
+  int maxRegAutoWS = 88; // default value (used to be 168)
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName)) {
     maxRegAutoWS = attr.getInt();
   }

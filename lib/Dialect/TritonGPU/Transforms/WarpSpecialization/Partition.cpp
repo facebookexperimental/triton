@@ -87,6 +87,8 @@ FailureOr<WarpSchedule> WarpSchedule::deserialize(scf::ForOp loop) {
 void WarpSchedule::serialize(scf::ForOp loop) const {
   SmallVector<Attribute> stages;
   Builder b(loop.getContext());
+
+  // Serialize partition attributes for operations inside the loop.
   loop.walk([&](Operation *op) {
     if (Partition *partition = opToPartition.lookup(op)) {
       if (partition == getRootPartition())
@@ -95,6 +97,24 @@ void WarpSchedule::serialize(scf::ForOp loop) const {
                   b.getI32IntegerAttr(partition->getIndex()));
     }
   });
+
+  // Serialize partition attributes for post-loop operations -
+  // operations scheduled in partitions but outside the loop body.
+  // Walk the parent op to find post-loop operations that are still in the IR
+  // fix: some operations in opToPartition are erased by inserAref pass in NVWS.
+  if (Operation *parent = loop->getParentOp()) {
+    parent->walk([&](Operation *op) {
+      // Skip operations inside the loop (already handled above)
+      if (loop->isAncestor(op))
+        return;
+      Partition *partition = opToPartition.lookup(op);
+      if (!partition || partition == getRootPartition())
+        return;
+      op->setAttr(kPartitionAttrName,
+                  b.getI32IntegerAttr(partition->getIndex()));
+    });
+  }
+
   for (Partition &partition : getPartitions())
     stages.push_back(b.getI32IntegerAttr(partition.getStage()));
   loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
@@ -164,6 +184,18 @@ void WarpSchedule::iterateOutputs(
   for (Operation *op : partition->getOps()) {
     for (OpOperand &use : op->getUses()) {
       Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+
+      // Handle post-loop operations.
+      if (!owner) {
+        // The user is outside the loop, so it's a post-loop operation.
+        // Use the operation directly.
+        owner = use.getOwner();
+        if (getPartition(owner) != partition) {
+          callback(owner, use);
+        }
+        continue;
+      }
+
       if (isa<scf::YieldOp>(owner)) {
         // This value is used in a subsequent iteration.
         callback(owner, use);
@@ -195,6 +227,14 @@ void WarpSchedule::iterateUses(
   while (!uses.empty()) {
     auto [output, use, distance] = uses.pop_back_val();
     Operation *owner = loop.getBody()->findAncestorOpInBlock(*use->getOwner());
+
+    // Handle post-loop operations.
+    if (!owner) {
+      // The user is outside the loop, so it's a post-loop operation.
+      callback(output, *use, distance);
+      continue;
+    }
+
     if (!isa<scf::YieldOp>(owner)) {
       callback(output, *use, distance);
       continue;

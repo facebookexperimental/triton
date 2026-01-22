@@ -435,7 +435,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (int i = 0; i < maxPossibleDistance; i++) {
+  for (int i = 0; i <= maxPossibleDistance; i++) {
     if (maxClusterPerDistance[i] == -1) {
       maxClusterPerDistance[i] = numDots + offset++;
     }
@@ -523,7 +523,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - (stage + minDistance);
+      auto dist = maxDistance - stage;
       clusterIdx = maxClusterPerDistance[dist];
     }
     minIndex = std::min(minIndex, clusterIdx);
@@ -542,7 +542,7 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     if (mappedClusterIdx != clusterMap.end()) {
       clusterIdx = mappedClusterIdx->second;
     } else {
-      auto dist = maxDistance - (stage + minDistance);
+      auto dist = maxDistance - stage;
       clusterIdx = maxClusterPerDistance[dist];
     }
     schedule.insert(op, stage, clusters[clusterIdx - minIndex]);
