@@ -1742,9 +1742,9 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         BLOCK_K: tl.constexpr,
     ):
         # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
-        REP_M: tl.constexpr = BLOCK_M // 128
-        REP_N: tl.constexpr = BLOCK_N // 128
-        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
 
         # Allocate SMEM buffers
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
@@ -2902,9 +2902,9 @@ def test_async_dot_scaled_mxfp4(device):
         BLOCK_K: tl.constexpr,
     ):
         # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
-        REP_M: tl.constexpr = BLOCK_M // 128
-        REP_N: tl.constexpr = BLOCK_N // 128
-        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
 
         # Allocate SMEM buffers
         # A: (M, K//2) - packed along K
@@ -3057,9 +3057,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         B_IS_FP4: tl.constexpr,
     ):
         # Scale tile dimensions for 5D TMA
-        REP_M: tl.constexpr = BLOCK_M // 128
-        REP_N: tl.constexpr = BLOCK_N // 128
-        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
 
         # Allocate SMEM buffers
         # For FP4: packed along K, so (M, K//2) or (N, K//2)
