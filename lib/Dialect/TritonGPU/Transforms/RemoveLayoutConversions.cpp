@@ -433,6 +433,23 @@ void LayoutPropagation::propagateLayout() {
   }
 }
 
+// Compute a score for a layout to guide conflict resolution.
+// Currently based on sizePerThread (vectorization), but can be extended
+// with other heuristics. Higher score is preferred.
+// Returns 0 for non-blocked encodings.
+static int64_t getLayoutScore(Attribute encoding) {
+  auto blocked = dyn_cast<BlockedEncodingAttr>(encoding);
+  if (!blocked)
+    return 0;
+  auto sizePerThread = blocked.getSizePerThread();
+  // Compute product of sizePerThread values as the vectorization score.
+  int64_t score = 1;
+  for (auto size : sizePerThread) {
+    score *= size;
+  }
+  return score;
+}
+
 void LayoutPropagation::resolveConflicts() {
   for (auto &it : layouts) {
     Operation *op = it.first.getDefiningOp();
@@ -444,11 +461,26 @@ void LayoutPropagation::resolveConflicts() {
     Attribute encoding = *info.encodings.begin();
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
+    // Pick the layout with maximum score.
+    // This prefers layouts with larger sizePerThread values (e.g., TMEM's
+    // [1, 128] over SMEM's [1, 8]) for better memory access patterns.
+    int64_t bestScore = getLayoutScore(encoding);
     for (Attribute e : info.encodings) {
-      if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
-          (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
+      int64_t score = getLayoutScore(e);
+      if (score > bestScore) {
+        bestScore = score;
         encoding = e;
-        break;
+      }
+    }
+    // If no blocked layout with vectorization found, fall back to the original
+    // heuristic (prefer blocked for load/store, MMA for compute).
+    if (bestScore == 0) {
+      for (Attribute e : info.encodings) {
+        if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
+            (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
+          encoding = e;
+          break;
+        }
       }
     }
     info.encodings.clear();

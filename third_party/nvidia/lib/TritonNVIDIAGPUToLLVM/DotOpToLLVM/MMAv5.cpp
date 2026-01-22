@@ -310,7 +310,16 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
   if (twoCTAs) {
     // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
     // be broadcasted into CTAid 0 and 1
-    auto *ctaMask = ptxBuilder.newOperand(b.int_val(16, 0x3), "h");
+    // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
+    // where x is even
+    Value clusterCTARank = rewriter.create<triton::nvgpu::ClusterCTAIdOp>(
+        loc, rewriter.getI32Type());
+    // mask the least bit
+    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
+    // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +
+    // 1))"
+    Value mask = b.shl(b.i32_val(3), leaderCTARank);
+    auto *ctaMask = ptxBuilder.newOperand(mask, "h");
     ptxOperands.push_back(ctaMask);
     opcode = "@$0 "
              "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
@@ -398,8 +407,9 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
       rewriter.create<ttng::ClusterWaitOp>(loc);
     }
 
-    Value clusterId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
-    Value cluster0 = tb.icmp_eq(clusterId, tb.i32_val(0));
+    Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    leftClusterId = tb.and_(leftClusterId, tb.i32_val(1));
+    Value cluster0 = tb.icmp_eq(leftClusterId, tb.i32_val(0));
     pred = tb.and_(pred, cluster0);
   }
   pred = tb.and_(pred, isWarp0);
