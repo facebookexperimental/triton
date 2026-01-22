@@ -279,6 +279,71 @@ While this approach places more responsibility on the user, it reduces the compi
     tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
     ```
 
+    **TMEM-backed MX Scales:**
+
+    For scaled MMA operations on Blackwell GPUs, scales can be stored in Tensor Memory (TMEM) for efficient access. TLX provides automatic layout resolution for TMEM scale buffers.
+
+    *Allocating TMEM Scale Buffers:*
+
+    ```python
+    # Allocate TMEM buffers for scales (layout is automatically resolved)
+    a_scale_tmem = tlx.local_alloc((128, 8), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+    b_scale_tmem = tlx.local_alloc((256, 4), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+    ```
+
+    *Copying Scales from SMEM to TMEM:*
+
+    Use `tlx.tmem_copy` to efficiently transfer scale data from shared memory to tensor memory:
+
+    ```python
+    # Copy scales from SMEM to TMEM (asynchronous, uses tcgen05.cp instruction)
+    tlx.tmem_copy(a_scale_smem, a_scale_tmem)
+    tlx.tmem_copy(b_scale_smem, b_scale_tmem)
+    ```
+
+    *Using TMEM Scales with Scaled MMA:*
+
+    ```python
+    # TMEM scales are automatically detected and used with the correct layout
+    tlx.async_dot_scaled(
+        a_smem, b_smem, acc_tmem,
+        A_scale=a_scale_tmem, A_format="e4m3",
+        B_scale=b_scale_tmem, B_format="e4m3",
+        use_acc=True,
+        mBarriers=[mma_bar],
+    )
+    ```
+
+    *Complete Example: TMEM-backed Scaled GEMM:*
+
+    ```python
+    @triton.jit
+    def scaled_gemm_kernel(...):
+        # Allocate TMEM for accumulator and scales
+        acc = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, num=1, storage=tlx.storage_kind.tmem)
+        a_scale_tmem = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+
+        # Load scales from global memory to SMEM
+        tlx.async_descriptor_load(a_scale_desc, a_scale_smem, [...], barrier=bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_smem, [...], barrier=bar)
+        tlx.barrier_wait(bar, phase)
+
+        # Copy scales from SMEM to TMEM
+        tlx.tmem_copy(a_scale_smem[0], a_scale_tmem[0])
+        tlx.tmem_copy(b_scale_smem[0], b_scale_tmem[0])
+
+        # Perform scaled MMA with TMEM scales
+        tlx.async_dot_scaled(
+            a_smem[0], b_smem[0], acc[0],
+            A_scale=a_scale_tmem[0], A_format="e4m3",
+            B_scale=b_scale_tmem[0], B_format="e4m3",
+            use_acc=False,
+        )
+    ```
+
+    **Note:** Multibuffering is automatically cancelled for scale buffers since TMEM scales don't support multibuffering. 3D allocations (1×M×K) are automatically flattened to 2D (M×K).
+
 - `acc = tlx.async_dot_wait(pendings, acc)`
 
     Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.

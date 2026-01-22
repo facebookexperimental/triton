@@ -81,14 +81,21 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.swizzled,
                 )
         else:
-            layout = tlx.tensor_memory_layout_encoding.make_default(shape)
-            layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
-                layout.blockM,
-                layout.blockN,
-                layout.unpacked,
-                layout.CTASplitM,
-                layout.CTASplitN,
-            )
+            # For 8-bit element types (uint8/int8), use a dummy TMEM layout that will
+            # be resolved during layout propagation. This is used for scales in
+            # scaled MMA operations where the final layout depends on usage context.
+            if dtype == tl.uint8 or dtype == tl.int8:
+                layout = None  # Will be resolved by layout propagation
+                layout_handle = _semantic.builder.make_dummy_tmem_layout_attr()
+            else:
+                layout = tlx.tensor_memory_layout_encoding.make_default(shape)
+                layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
+                    layout.blockM,
+                    layout.blockN,
+                    layout.unpacked,
+                    layout.CTASplitM,
+                    layout.CTASplitN,
+                )
     else:
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
@@ -481,6 +488,35 @@ def local_store(
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
+
+
+@tl.builtin
+def tmem_copy(
+    src: tlx.buffered_tensor,
+    dst: tlx.buffered_tensor,
+    _semantic=None,
+) -> None:
+    """
+    Start an asynchronous copy from shared memory to tensor memory.
+
+    This maps directly to NVIDIA Blackwell's tcgen05.cp instruction,
+    enabling efficient data movement from SMEM to TMEM without going
+    through registers.
+
+    Args:
+        src: Source buffer in shared memory (SMEM).
+        dst: Destination buffer in tensor memory (TMEM).
+
+    Note:
+        The current semantics of the instruction are not well defined and
+        the API may change in the future. Use at your own risk.
+    """
+    assert isinstance(src, tlx.buffered_tensor), "source must be a buffered tensor"
+    assert isinstance(dst, tlx.buffered_tensor), "destination must be a buffered tensor"
+    assert src.type.storage == tlx.storage_kind.smem, "source must be in shared memory"
+    assert dst.type.storage == tlx.storage_kind.tmem, "destination must be in tensor memory"
+    _assert_blackwell_for_tmem(_semantic.builder.options.arch)
+    _semantic.builder.create_tmem_copy(src.handle, dst.handle)
 
 
 @tl.builtin

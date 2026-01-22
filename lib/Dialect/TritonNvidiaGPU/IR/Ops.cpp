@@ -693,8 +693,10 @@ LogicalResult TMEMLoadOp::verify() {
 
 // -- TMEMAllocOp --
 LogicalResult TMEMAllocOp::verify() {
-  if (!isa<TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr>(
-          getType().getEncoding()))
+  // Accept TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr,
+  // or DummyTMEMLayoutAttr (placeholder for deferred layout resolution)
+  if (!isa<TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr,
+           triton::tlx::DummyTMEMLayoutAttr>(getType().getEncoding()))
     return emitOpError("should use tensor memory encoding");
   if (getSrc() &&
       failed(verifyTMEMOperand(*this, getSrc().getType(), getType(), "source")))
@@ -741,7 +743,10 @@ LogicalResult TMEMCopyOp::verify() {
   }
   if (sharedEnc.getTransposed() || sharedEnc.getFp4Padded())
     return emitOpError("The source should not be transposed or passed");
-  if (isa<TensorMemoryScalesEncodingAttr>(getDst().getType().getEncoding())) {
+  if (isa<triton::tlx::DummyTMEMLayoutAttr>(getDst().getType().getEncoding())) {
+    return success();
+  } else if (isa<TensorMemoryScalesEncodingAttr>(
+                 getDst().getType().getEncoding())) {
     if (sharedEnc.getSwizzlingByteWidth() != 0) {
       return emitOpError("The source should not be swizzled for now");
     }

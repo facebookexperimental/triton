@@ -39,6 +39,7 @@ from .mem_ops import (
     async_remote_shmem_store,
     remote_view,
     subslice,
+    tmem_copy,
 )
 from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
 from .types import (
