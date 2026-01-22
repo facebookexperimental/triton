@@ -22,11 +22,26 @@ class DriverConfig:
             self._default = _create_driver()
         return self._default
 
+    # Facebook begin
+    # add setter and deleter for active property
+    # to unblock internal use case of setting patch
+    # with patch("xxx.triton.runtime.driver.active")
+    # otherwise we can revert https://github.com/triton-lang/triton/pull/7770
     @property
     def active(self) -> DriverBase:
         if self._active is None:
             self._active = self.default
         return self._active
+
+    @active.setter
+    def active(self, value: DriverBase) -> None:
+        self._active = value
+
+    @active.deleter
+    def active(self) -> None:
+        self._active = None
+
+    # Facebook end
 
     def set_active(self, driver: DriverBase) -> None:
         self._active = driver
