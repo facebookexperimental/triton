@@ -90,4 +90,38 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   }];
 }
 
+def CudaWarnings : Pass<"test-cuda-warnings", "mlir::ModuleOp"> {
+  let summary = "Emit warnings for performance-impacting patterns on CUDA targets";
+  let description = [{
+    This pass is intended for testing purposes only. Python code should instead call
+    into the `mlir::triton::collectCudaWarnings` API instead to get warnings visible
+    in Python.
+
+    This pass analyzes TTIR for patterns that may cause performance issues
+    on specific CUDA GPU architectures. Currently detects:
+
+    - FP64 (double-precision) math operations on GB300 (SM103): GB300 has
+      significantly reduced FP64 throughput (1/64th of FP32). The pass warns
+      when operations like arith.addf, arith.mulf, tt.dot, math.exp, etc.
+      operate on f64 types.
+
+    The pass emits MLIR warnings that surface to the user during compilation.
+    It does NOT warn on data movement operations like load/store.
+
+    The pass uses the compute capability to determine which warnings to emit.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::math::MathDialect"
+  ];
+
+  let options = [
+    Option<"computeCapability", "compute-capability",
+           "int32_t", /*default*/"0",
+           "Target GPU compute capability">
+  ];
+}
+
 #endif

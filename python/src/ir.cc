@@ -32,6 +32,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -687,6 +688,16 @@ void init_triton_ir(py::module &&m) {
              return py::int_(ret.getInt());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+      .def("get_cuda_warnings",
+           [](ModuleOp &self, int32_t computeCapability) -> py::list {
+             py::list result;
+             auto warnings =
+                 mlir::triton::collectCudaWarnings(self, computeCapability);
+             for (const auto &warning : warnings) {
+               result.append(py::str(warning));
+             }
+             return result;
+           })
       .def("create_location_snapshot",
            [](ModuleOp &self, const std::string &fileName) -> void {
              auto printingFlags = getOpPrintingFlags();
