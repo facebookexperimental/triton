@@ -1941,27 +1941,34 @@ print(N_HEADS)
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
-    configs.append(
-        triton.testing.Benchmark(
-            x_names=["N_CTX"],
-            x_vals=[2**i for i in range(10, 15)],
-            line_arg="provider",
-            line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-            line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
-            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-            ylabel="TFLOPS",
-            plot_name=f"fused-attention-ws-pipelined-persistent-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
-            args={
-                "H": N_HEADS,
-                "BATCH": BATCH,
-                "HEAD_DIM": HEAD_DIM,
-                "mode": mode,
-            },
-        ))
+    for causal in [False, True]:
+        for BWD_BLOCK_M1 in [64, 128]:
+            for GROUP_SIZE_M in [8]:
+                configs.append(
+                    triton.testing.Benchmark(
+                        x_names=["N_CTX"],
+                        x_vals=[2**i for i in range(10, 15)],
+                        line_arg="provider",
+                        line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+                        line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
+                        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+                        ylabel="TFLOPS",
+                        plot_name=f"fused-attention-ws-pipelined-persistent-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+                        args={
+                            "H": N_HEADS,
+                            "BATCH": BATCH,
+                            "HEAD_DIM": HEAD_DIM,
+                            "mode": mode,
+                            "causal": causal,
+                            "BWD_BLOCK_M1": BWD_BLOCK_M1,
+                            "GROUP_SIZE_M": GROUP_SIZE_M,
+                        },
+                    ))
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE, dtype=torch.float16):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, causal, BWD_BLOCK_M1, GROUP_SIZE_M, device=DEVICE,
+                          dtype=torch.float16):
     assert mode in ["fwd", "bwd"]
     assert dtype in [torch.float16, torch.bfloat16, torch.float8_e5m2]
     if "triton" in provider:
@@ -1973,7 +1980,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
             k = k.to(dtype)
             v = v.to(dtype)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, sm_scale)
+        fn = lambda: attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
