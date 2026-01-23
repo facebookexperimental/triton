@@ -1839,6 +1839,144 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_scaled_tmem_scales(device):
+    """
+    Test D = (A * A_scale) * (B * B_scale) with mxfp8 format and TMEM scales.
+
+    This test verifies that scales can be stored in tensor memory (TMEM) instead
+    of shared memory (SMEM). The scales are first loaded to SMEM via TMA, then
+    copied to TMEM for use in the scaled MMA operation.
+    """
+
+    VEC_SIZE = 32  # mxfp8 uses 32 elements per scale factor
+
+    @triton.jit
+    def tcgen5_dot_scaled_tmem_scales_kernel(
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
+        REP_M: tl.constexpr = BLOCK_M // 128
+        REP_N: tl.constexpr = BLOCK_N // 128
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+
+        # Allocate SMEM buffers for A, B, and scales
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
+        # 5D scale buffers in SMEM: [1, REP_M/N, REP_K, 2, 256]
+        a_scale_smem = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1))
+        b_scale_smem = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1))
+
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
+        tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
+        # Load scales to SMEM via TMA
+        tlx.async_descriptor_load(a_scale_desc, a_scale_smem[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_smem[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        # Allocate TMEM for scales and accumulator
+        # Scale shape in TMEM: flatten 5D to 2D for TMEM storage
+        SCALE_K: tl.constexpr = BLOCK_K // 32
+        SCALE_N: tl.constexpr = BLOCK_N // 32
+        a_scale_tmem = tlx.local_alloc((BLOCK_M, SCALE_K), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_K, SCALE_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        # Copy scales from SMEM to TMEM directly using tmem_copy
+        tlx.tmem_copy(a_scale_smem[0], a_scale_tmem[0])
+        tlx.tmem_copy(b_scale_smem[0], b_scale_tmem[0])
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        # Use TMEM scales in async_dot_scaled
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tmem[0], A_format, b_scale_tmem[0], B_format,
+                             use_acc=False)
+
+        result = tlx.local_load(c_tile[0])
+        c = result.to(tlx.dtype_of(c_desc))
+        c_desc.store([0, 0], c)
+
+    torch.manual_seed(0)
+    M, N, K = (128, 128, 256)
+    BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
+
+    A_DATA_TYPE = "e4m3"
+    B_DATA_TYPE = "e4m3"
+
+    DTYPE_MAP = {
+        "e5m2": torch.float8_e5m2,
+        "e4m3": torch.float8_e4m3fn,
+    }
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(DTYPE_MAP[A_DATA_TYPE]).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
+    c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
+
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+
+    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
+
+    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N}
+    kernel = tcgen5_dot_scaled_tmem_scales_kernel[(1, 1)](
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        A_DATA_TYPE,
+        B_DATA_TYPE,
+        **kern_kwargs,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_global_to_local") == 4
+    assert ttgir.count("ttng.tc_gen5_mma_scaled") == 1
+    # Verify TMEM scales encoding is used
+    assert "tensor_memory_scales_encoding" in ttgir
+    # Verify tmem_copy is used for SMEM->TMEM transfer
+    assert ttgir.count("ttng.tmem_copy") == 2
+
+    # Converts E8M0 format scale values to float32
+    def fp8e8m0_to_float32(scale):
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    # Compute reference
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_tcgen05_commit(device):
     """
     Test tcgen05.commit tracking multiple tcgen05 ops

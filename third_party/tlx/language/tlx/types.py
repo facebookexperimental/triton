@@ -140,6 +140,31 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         )
 
 
+class tensor_memory_scales_layout_encoding:
+    """
+    Tensor memory scales layout encoding for Blackwell.
+    Used for scales in scaled MMA operations.
+    """
+
+    def __init__(
+        self,
+        CTASplitM: int = 1,
+        CTASplitN: int = 1,
+    ):
+        self.CTASplitM = CTASplitM
+        self.CTASplitN = CTASplitN
+
+    @classmethod
+    def make_default(cls):
+        return cls(CTASplitM=1, CTASplitN=1)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_tensor_memory_scales_encoding_attr(
+            self.CTASplitM,
+            self.CTASplitN,
+        )
+
+
 class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def __init__(

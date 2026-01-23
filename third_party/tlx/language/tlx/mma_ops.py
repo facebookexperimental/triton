@@ -53,6 +53,17 @@ def require_tmem_layout_unpacked(src: tlx.buffered_tensor, unpacked: bool, _buil
     return src.handle
 
 
+def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
+    """
+    Require tensor memory scales layout for a TMEM tensor.
+    """
+    assert isinstance(
+        src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem, ("input must be a TMEM tensor")
+    layout = tlx.tensor_memory_scales_layout_encoding.make_default()
+    layout_handle = layout.to_ir(_builder)
+    return _builder.create_require_layout(src.handle, layout_handle)
+
+
 # async dot signature needs to be close to tl.dot as much as possible
 @tl.builtin
 def async_dot(
@@ -183,7 +194,8 @@ def async_dot_scaled(
 
     A_scale : tlx.buffered_tensor
         Per-tile or per-subgroup scaling factors for operand A. Typically encoded
-        as FP8 (E8M0) and stored in SMEM or TMEM.
+        as FP8 (E8M0) and stored in SMEM or TMEM. The storage type is automatically
+        detected from the tensor's storage attribute.
 
     A_format : str
         FP8 format string for operand A (e.g., "e4m3", "e5m2"). Determines how
@@ -257,14 +269,21 @@ def async_dot_scaled(
     A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
     B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
 
-    # Require the shared memory layout for A_scale and B_scale
+    # Handle scale tensors - can be in SMEM or TMEM (auto-detected from storage type)
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"
-    assert A_scale.type.storage == tlx.storage_kind.smem, "A_scale must be a shared memory tensor"
     assert isinstance(B_scale, tlx.buffered_tensor), "B_scale must be a buffered tensor"
-    assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be a shared memory tensor"
 
-    A_scale_handle = require_nv_mma_shared_layout(A_scale, False, _semantic.builder)
-    B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)
+    if A_scale.type.storage == tlx.storage_kind.tmem:
+        A_scale_handle = require_tmem_scales_layout(A_scale, _semantic.builder)
+    else:
+        assert A_scale.type.storage == tlx.storage_kind.smem, "A_scale must be in SMEM or TMEM"
+        A_scale_handle = require_nv_mma_shared_layout(A_scale, False, _semantic.builder)
+
+    if B_scale.type.storage == tlx.storage_kind.tmem:
+        B_scale_handle = require_tmem_scales_layout(B_scale, _semantic.builder)
+    else:
+        assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be in SMEM or TMEM"
+        B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)
 
     # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
     acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)

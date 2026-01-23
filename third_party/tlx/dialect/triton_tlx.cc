@@ -107,6 +107,10 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
            })
+      .def("create_tmem_copy",
+           [](TritonOpBuilder &self, Value src, Value dst) {
+             self.create<ttng::TMEMCopyOp>(src, dst, /*barrier=*/Value());
+           })
       .def("create_remote_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues,
               Value remoteCTARank) -> void {
@@ -142,6 +146,13 @@ void init_triton_tlx_ir(py::module &&m) {
              auto context = self.getBuilder().getContext();
              return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
                  context, blockM, blockN, unpacked, CTASplitM, CTASplitN));
+           })
+      .def("make_tensor_memory_scales_encoding_attr",
+           [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {
+             auto context = self.getBuilder().getContext();
+             return mlir::cast<Attribute>(
+                 ttng::TensorMemoryScalesEncodingAttr::get(context, CTASplitM,
+                                                           CTASplitN));
            })
       .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -208,6 +219,10 @@ void init_triton_tlx_ir(py::module &&m) {
               Type elementType, bool tmemCompatible) -> Attribute {
              return tlx::DummyRegisterLayoutAttr::get(
                  self.getContext(), shape, elementType, tmemCompatible);
+           })
+      .def("make_dummy_tmem_layout_attr",
+           [](TritonOpBuilder &self) -> Attribute {
+             return tlx::DummyTMEMLayoutAttr::get(self.getContext());
            })
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self) -> void {

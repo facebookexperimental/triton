@@ -43,4 +43,24 @@ def TLX_DummyRegisterLayoutAttr : TLX_Attr<"DummyRegisterLayout", []> {
   let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `,` $tmemCompatible `>`";
 }
 
+def TLX_DummyTMEMLayoutAttr : TLX_Attr<"DummyTMEMLayout", []> {
+  let mnemonic = "dummy_tmem_layout";
+  let summary = "Placeholder layout for TMEM tensors to be resolved during layout propagation";
+
+  let description = [{
+    This attribute represents a placeholder layout for tensors in Tensor Memory (TMEM).
+    It is used when we don't know the final TMEM layout at allocation time.
+
+    During layout propagation, this will be resolved to a concrete TMEM layout:
+    - TensorMemoryEncodingAttr (for regular TMEM data)
+    - TensorMemoryScalesEncodingAttr (for scales in scaled MMA operations)
+
+    The resolution depends on how the TMEM buffer is used (e.g., as scales in tmem_copy).
+  }];
+
+  let parameters = (ins);
+
+  let assemblyFormat = "";
+}
+
 #endif // TLX_ATTRDEFS

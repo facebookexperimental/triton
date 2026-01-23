@@ -66,6 +66,70 @@ public:
   using impl::TlxPropagateLayoutBase<
       TlxPropagateLayoutPass>::TlxPropagateLayoutBase;
 
+  // Cancel multibuffering for TMEM allocations that will have scales encoding.
+  // Scales don't support multibuffering, so 3D shapes (1xMxK) must be flattened
+  // to 2D (MxK). This should be called before layout propagation so that the
+  // types are already flattened when layouts are applied.
+  void cancelMultibufferingForScales(triton::FuncOp funcOp,
+                                     DataFlowSolver &solver) {
+    DenseMap<Value, ttg::MemDescType> allocsToFlatten;
+
+    // First pass: Collect TMEMAllocOps that will have scales encoding
+    // (determined by dataflow analysis) and need multibuffering cancelled
+    funcOp.walk([&](ttng::TMEMAllocOp allocOp) {
+      auto origType = allocOp.getType();
+      auto shape = origType.getShape();
+      if (shape.size() != 3 || shape[0] != 1)
+        return WalkResult::advance();
+
+      // Check if this alloc will receive scales encoding via layout
+      // propagation
+      auto *lattice =
+          solver.lookupState<LayoutEncodingLattice>(allocOp.getResult());
+      if (!lattice || lattice->getValue().isUninitialized())
+        return WalkResult::advance();
+
+      auto encoding = lattice->getValue().getLayoutEncoding();
+      if (!isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+        return WalkResult::advance();
+
+      // This is a 3D alloc with scales encoding - needs flattening
+      // Cancel multibuffering: flatten 1xMxK to MxK
+      SmallVector<int64_t> newShape{shape[1], shape[2]};
+      auto newType = ttg::MemDescType::get(
+          newShape, origType.getElementType(), origType.getEncoding(),
+          origType.getMemorySpace(), origType.getMutableMemory());
+      allocsToFlatten[allocOp.getResult()] = newType;
+      return WalkResult::advance();
+    });
+
+    // Second pass: Update memdesc_index ops that index into flattened allocs
+    // These ops should be replaced with the alloc directly since we're
+    // canceling multibuffering
+    SmallVector<ttg::MemDescIndexOp> indexOpsToRemove;
+    for (auto &[allocValue, newType] : allocsToFlatten) {
+      for (auto &use : allocValue.getUses()) {
+        if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(use.getOwner())) {
+          // The index op is accessing the buffering dimension which we're
+          // removing. Replace all uses of the index op with the flattened
+          // alloc.
+          indexOp.getResult().replaceAllUsesWith(allocValue);
+          indexOpsToRemove.push_back(indexOp);
+        }
+      }
+    }
+
+    // Erase the index ops
+    for (auto indexOp : indexOpsToRemove) {
+      indexOp.erase();
+    }
+
+    // Third pass: Update the alloc types
+    for (auto &[allocValue, newType] : allocsToFlatten) {
+      allocValue.setType(newType);
+    }
+  }
+
   void runOnFuncOp(triton::FuncOp funcOp) {
     // We can terminate early if we don't have a layout constraint.
     WalkResult walkResult = funcOp.walk([&](mlir::Operation *op) {
@@ -88,6 +152,10 @@ public:
     solver.load<LayoutForwardPropagation>();
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
+
+    // Cancel multibuffering for scales allocations before applying layouts.
+    // This flattens 3D (1xMxK) to 2D (MxK) and removes memdesc_index ops.
+    cancelMultibufferingForScales(funcOp, solver);
 
     auto getNewMemDescType = [&](ttg::MemDescType origType,
                                  Attribute encoding) {
@@ -139,6 +207,21 @@ public:
       }
       return WalkResult::advance();
     });
+
+    // Verify that no DummyTMEMLayoutAttr remains after layout propagation
+    bool hasDummyLayout = false;
+    funcOp.walk([&](ttng::TMEMAllocOp allocOp) {
+      auto encoding = allocOp.getType().getEncoding();
+      if (isa_and_nonnull<DummyTMEMLayoutAttr>(encoding)) {
+        allocOp.emitError(
+            "DummyTMEMLayoutAttr was not resolved during layout propagation");
+        hasDummyLayout = true;
+      }
+      return WalkResult::advance();
+    });
+    if (hasDummyLayout)
+      return signalPassFailure();
+
     return;
   }
 
