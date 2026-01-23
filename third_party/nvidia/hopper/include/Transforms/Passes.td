@@ -54,7 +54,13 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
   let options = [
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
-           "number of buffering for warp specialization">
+           "number of buffering for warp specialization">,
+    Option<"readDecisionFile", "read-decision-file",
+           "std::string", /*default*/"\"\"",
+           "path to JSON file containing buffer decisions to apply">,
+    Option<"writeDecisionFile", "write-decision-file",
+           "std::string", /*default*/"\"\"",
+           "path to JSON file to write buffer decisions to">
   ];
 }
 
