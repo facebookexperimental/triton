@@ -1,4 +1,3 @@
-from typing import Optional
 import pytest
 import torch
 import triton
@@ -1968,7 +1967,8 @@ for mode in ["fwd", "bwd"]:
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, causal, BWD_BLOCK_M1, GROUP_SIZE_M, device=DEVICE, dtype=torch.float16):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, causal, BWD_BLOCK_M1, GROUP_SIZE_M, device=DEVICE,
+                          dtype=torch.float16):
     assert mode in ["fwd", "bwd"]
     assert dtype in [torch.float16, torch.bfloat16, torch.float8_e5m2]
     if "triton" in provider:
