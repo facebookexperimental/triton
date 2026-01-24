@@ -384,4 +384,27 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonPrintBarrierAnalysis: Pass<"triton-print-barrier-analysis", "mlir::ModuleOp"> {
+  let summary = "Print barrier execution order analysis";
+
+  let description = [{
+    This pass analyzes barrier operations (mbarrier and named barriers) in TTGIR
+    to understand execution order and producer/consumer relationships between
+    warp groups.
+
+    The analysis:
+    1. Collects all barrier operations (init, arrive, wait, expect)
+    2. Groups them by warp group (async task)
+    3. Identifies producer/consumer dependencies
+    4. Detects potential issues (missing arrive/wait, deadlock risks)
+    5. Generates execution trace visualization
+
+    Output includes:
+    - Barrier operations grouped by warp group
+    - Dependency graph (arrive->wait, expect->wait, init->use)
+    - Cross-warp-group synchronization points
+    - ASCII execution trace visualization
+  }];
+}
+
 #endif

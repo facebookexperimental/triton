@@ -1,6 +1,7 @@
 add_triton_library(TritonAnalysis
   AxisInfo.cpp
   Allocation.cpp
+  BarrierAnalysis.cpp
   Membar.cpp
   Alias.cpp
   Utility.cpp
