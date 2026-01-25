@@ -675,9 +675,30 @@ static void setTmemChannelAttr(Operation *op, int channelId,
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
-static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
-                           ttng::TCGen5MMAOp mmaOp,
-                           SmallVector<std::unique_ptr<Channel>> &channels) {
+/// Handle TMEM used as operand D (accumulator) of an MMA operation.
+///
+/// This function creates producer-consumer channels for a TMEM allocation that
+/// is used as the accumulator (operand D) of a TCGen5MMA operation. The
+/// accumulator follows a read-modify-write pattern where:
+///   1. A producer writes to the TMEM (either a tmem_store or an MMA)
+///   2. The MMA reads the accumulator, performs computation, and writes back
+///
+/// The function handles several cases for finding the initial producer:
+///   - TMEMStoreOp outside the loop: Initialization before the loop starts
+///   - MMA with use_acc=false: The MMA overwrites (doesn't accumulate), so it
+///     becomes the first producer without needing a prior value
+///   - TMEMStoreOp inside the loop: Re-initialization within the loop
+///
+/// For each producer-consumer pair, a TmemDataChannelPost is created to track
+/// the data dependency for warp specialization scheduling.
+///
+/// @param tmemAllocOp The TMEM allocation used as operand D
+/// @param mmaOp The MMA operation that uses this TMEM as its accumulator
+/// @param channels Output vector to collect the created channels
+/// @return success() if channels were created successfully, failure() otherwise
+static LogicalResult
+handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
+               SmallVector<std::unique_ptr<Channel>> &channels) {
   SmallVector<Operation *> consumers;
   SmallVector<Operation *> producers;
   // Go through ops in the body to figure out producer/consumer of the tmem.
@@ -688,9 +709,26 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
     users.insert(user);
   }
   auto forOp = mmaOp->getParentOfType<scf::ForOp>();
+  if (!forOp) {
+    return mmaOp.emitError(
+        "handleOperandD: MMA operation is not inside a scf.for loop");
+  }
   Operation *currentProd = nullptr;
   auto ctx = forOp.getContext();
   SmallVector<int> channelsToBeUpdate;
+
+  // Check for producers outside the loop body (e.g., tmem_store before the
+  // loop that initializes the accumulator). These producers dominate the loop.
+  for (auto user : tmemAllocOp.getResult().getUsers()) {
+    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+      // Check if this store is outside the loop (not nested under forOp)
+      if (!forOp->isProperAncestor(storeOp)) {
+        currentProd = storeOp;
+        handledUsers.insert(storeOp);
+      }
+    }
+  }
+
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!users.count(&op))
       continue;
@@ -698,12 +736,51 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
     if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(&op)) {
       if (&op == mmaOp.getOperation()) {
         // This uses and defines D. Will be both producer and consumer.
-        assert(currentProd != nullptr);
+        // If useAcc is false, the MMA doesn't read the accumulator - it
+        // overwrites it completely. In this case, the MMA is the first
+        // producer and doesn't need a prior producer.
+        if (currentProd == nullptr) {
+          Value useAccFlag = mmaOpT.useAccumulator();
+          bool useAccIsFalse = false;
+          if (useAccFlag) {
+            if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
+              if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue())) {
+                useAccIsFalse = !boolAttr.getValue();
+              } else if (auto intAttr =
+                             dyn_cast<IntegerAttr>(constOp.getValue())) {
+                useAccIsFalse = intAttr.getInt() == 0;
+              }
+            }
+          }
+          if (useAccIsFalse) {
+            // MMA with use_acc=false is the first producer
+            currentProd = &op;
+            continue;
+          }
+        }
+        if (currentProd == nullptr) {
+          mmaOp.emitError(
+              "handleOperandD: no producer found for MMA operand D. "
+              "Expected a tmem_store before the loop or use_acc=false.");
+          return failure();
+        }
         // Start a channel from currentProd to op
         auto producerTaskIds = getAsyncTaskIds(currentProd);
         auto consumerIds = getAsyncTaskIds(&op);
-        assert(producerTaskIds.size() == 1);
-        auto producerTaskId = producerTaskIds.front();
+        // Producer outside the loop may have multiple task IDs. Pick one that
+        // matches a consumer task ID, or fall back to the first producer task
+        // ID.
+        int producerTaskId = producerTaskIds.front();
+        if (producerTaskIds.size() > 1) {
+          for (auto pId : producerTaskIds) {
+            for (auto cId : consumerIds) {
+              if (pId == cId) {
+                producerTaskId = pId;
+                break;
+              }
+            }
+          }
+        }
         auto channelID = channels.size();
         channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
@@ -713,12 +790,25 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         setTmemChannelAttr(&op, channelID, "tmem.end");
         currentProd = &op;
       } else {
-        assert(mmaOpT.getD() != tmemAllocOp.getResult());
+        if (mmaOpT.getD() == tmemAllocOp.getResult()) {
+          mmaOp.emitError(
+              "handleOperandD: unexpected MMA using same TMEM as operand D");
+          return failure();
+        }
         // This uses tmem. mark as tmem.end = channel_id
-        assert(currentProd != nullptr);
+        if (currentProd == nullptr) {
+          mmaOpT.emitError(
+              "handleOperandD: no producer found for MMA consumer");
+          return failure();
+        }
         // Start a channel from currentProd to op
         auto producerTaskIds = getAsyncTaskIds(currentProd);
-        assert(producerTaskIds.size() == 1);
+        if (producerTaskIds.size() != 1) {
+          mmaOpT.emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
         auto producerTaskId = producerTaskIds.front();
         auto channelID = channels.size();
         auto consumerIds = getAsyncTaskIds(&op);
@@ -735,7 +825,12 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
       if (currentProd) {
         // Start a channel from currentProd to op
         auto producerTaskIds = getAsyncTaskIds(currentProd);
-        assert(producerTaskIds.size() == 1);
+        if (producerTaskIds.size() != 1) {
+          loadOp.emitError("handleOperandD: expected exactly one producer task "
+                           "ID for TMEMLoad, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
         auto producerTaskId = producerTaskIds.front();
         auto channelID = channels.size();
         auto consumerIds = getAsyncTaskIds(&op);
@@ -756,12 +851,18 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         setTmemChannelAttr(&op, channelID, "tmem.end");
       }
     } else {
-      assert(0);
+      // Unexpected operation type using the TMEM
+      return op.emitError(
+          "handleOperandD: unexpected operation type using TMEM");
     }
   }
   // Update channel's producer here.
   for (auto idx : channelsToBeUpdate) {
-    assert(currentProd); // assuming ForOp runs at least one iteration.
+    if (!currentProd) {
+      // This can happen if ForOp never produces - should not occur in valid IR
+      return mmaOp.emitError(
+          "handleOperandD: no producer found for deferred channel update");
+    }
     channels[idx]->relation.first = getAsyncTaskIds(currentProd).front();
     setTmemChannelAttr(currentProd, channels[idx]->uniqID, "tmem.start");
   }
@@ -771,10 +872,17 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
       continue;
     // only handle tmem_load. FIXME: check if it is after the ForOp
     if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(user)) {
-      assert(currentProd);
+      if (!currentProd) {
+        return loadOp.emitError(
+            "handleOperandD: no producer found for TMEMLoad outside loop");
+      }
       // Start a channel from currentProd to user
       auto producerTaskIds = getAsyncTaskIds(currentProd);
-      assert(producerTaskIds.size() == 1);
+      if (producerTaskIds.size() != 1) {
+        return loadOp.emitError("handleOperandD: expected exactly one producer "
+                                "task ID, got ")
+               << producerTaskIds.size();
+      }
       auto producerTaskId = producerTaskIds.front();
       auto channelID = channels.size();
       auto consumerIds = getAsyncTaskIds(user);
@@ -786,6 +894,7 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
       setTmemChannelAttr(user, channelID, "tmem.end");
     }
   }
+  return success();
 }
 
 static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
@@ -831,7 +940,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     if (isOperandD) {
       // Create a list of virtual channels for this case. Each virtual channel
       // has a single producer.
-      handleOperandD(tmemAllocOp, mmaOp, channels);
+      if (failed(handleOperandD(tmemAllocOp, mmaOp, channels))) {
+        // Error already emitted by handleOperandD
+        return;
+      }
       return;
     }
 

@@ -24,6 +24,9 @@ namespace mlir {
 
 using OperationListT = std::vector<Operation *>;
 
+/// Check if a ForOp is an innermost loop (contains no nested ForOps).
+/// @param forOp The loop operation to check
+/// @return true if the loop has no nested ForOp, false otherwise
 static bool isInnermostLoop(scf::ForOp forOp) {
   for (Operation &nestedOp : forOp.getBody()->getOperations()) {
     if (isa<scf::ForOp>(nestedOp)) {
@@ -33,6 +36,10 @@ static bool isInnermostLoop(scf::ForOp forOp) {
   return true;
 }
 
+/// Find the channel associated with a given allocation operation.
+/// @param op The operation to find a channel for (typically an allocation op)
+/// @param channels The list of channels to search through
+/// @return Pointer to the matching Channel, or nullptr if not found
 static Channel *findChannelForOp(Operation *op,
                                  SmallVector<Channel *> &channels) {
   Channel *TheCh = nullptr;
@@ -46,28 +53,43 @@ static Channel *findChannelForOp(Operation *op,
   return TheCh;
 }
 
+/// Find the channel associated with a value's defining allocation operation.
+/// Convenience wrapper around findChannelForOp.
+/// @param value The value whose defining operation to find a channel for
+/// @param channels The list of channels to search through
+/// @return Pointer to the matching Channel, or nullptr if not found
 static Channel *findChannelForAlloc(Value value,
                                     SmallVector<Channel *> &channels) {
   return findChannelForOp(value.getDefiningOp(), channels);
 }
 
-static void getAllAcutalUsersForChannel(Channel *TheCh,
-                                        DenseSet<Operation *> &users,
-                                        Operation *alloc = nullptr) {
+/// Collect all actual users (consumers) of a channel.
+/// For a channel, this includes the source operation and the actual consumers
+/// derived from the destination operations.
+/// @param TheCh The channel to get users for (may be nullptr)
+/// @param users Output set to collect all user operations
+/// @param alloc Optional allocation operation for validation
+/// @return success() if users were collected, failure() if validation failed
+static LogicalResult getAllAcutalUsersForChannel(Channel *TheCh,
+                                                 DenseSet<Operation *> &users,
+                                                 Operation *alloc = nullptr) {
   // Skip null channels
   if (!TheCh) {
     // Allocations inside loops should have associated channels
     // For outside loop ops, channels are not created when there is
     // no valid producer or outside loop op has no task IDs (e.g., store)
-    assert((!alloc || !alloc->getParentOfType<scf::ForOp>()) &&
-           "Expected channel for allocation inside loop");
-    return;
+    if (alloc && alloc->getParentOfType<scf::ForOp>()) {
+      return alloc->emitError(
+          "getAllAcutalUsersForChannel: expected channel for allocation "
+          "inside loop");
+    }
+    return success();
   }
   Operation *src = TheCh->getSrcOp();
   // Skip channels without valid source operations (e.g., allocations outside
   // loops)
   if (!src)
-    return;
+    return success();
   SmallVector<Operation *> dsts;
   TheCh->getDstOps(dsts);
   users.insert(src);
@@ -76,17 +98,37 @@ static void getAllAcutalUsersForChannel(Channel *TheCh,
     for (auto *tOp : actual)
       users.insert(tOp);
   }
+  return success();
 }
 
-static void updateLiveOpsInOneBlock(Channel *TheCh, OperationListT &liveOps) {
-  assert(TheCh->channelKind == DataChannelKind::TMEMPost ||
-         TheCh->channelKind == DataChannelKind::SMEMPost);
+/// Collect live operations for a channel within a single basic block.
+/// Records all operations from the source operation to the last destination
+/// operation (inclusive). Assumes source and destinations are in the same
+/// block.
+/// @param TheCh The channel (must be TMEMPost or SMEMPost kind)
+/// @param liveOps Output vector to collect the live operations
+/// @return success() if channel is valid, failure() otherwise
+static LogicalResult updateLiveOpsInOneBlock(Channel *TheCh,
+                                             OperationListT &liveOps) {
+  if (!TheCh) {
+    return failure();
+  }
+  if (TheCh->channelKind != DataChannelKind::TMEMPost &&
+      TheCh->channelKind != DataChannelKind::SMEMPost) {
+    return failure();
+  }
   Operation *src = TheCh->getSrcOp();
+  if (!src) {
+    return success();
+  }
   SmallVector<Operation *> dsts;
   TheCh->getDstOps(dsts);
   Operation *lastDst = TheCh->getDstOpLast();
   // Assuming they are in the same block, insert ops from src to dsts.
   auto *block = src->getBlock();
+  if (!block) {
+    return success();
+  }
   bool foundStart = false;
   for (auto &op : block->getOperations()) {
     if (&op == src) {
@@ -100,9 +142,16 @@ static void updateLiveOpsInOneBlock(Channel *TheCh, OperationListT &liveOps) {
       break;
     }
   }
+  return success();
 }
 
-// Lift up scope of b till it contains a.
+/// Find the lowest common ancestor scope that contains both operations.
+/// Walks up the parent hierarchy of operation 'a' to collect all ancestor
+/// scopes, then walks up 'b' until it finds a matching scope.
+/// @param a The first operation to find common scope for
+/// @param b The second operation to lift until it reaches the common scope
+/// @return The common ancestor Operation, or nullptr if no common scope found
+///         (other than FuncOp which is not returned)
 static Operation *getLiftedScope(Operation *a, Operation *b) {
   DenseSet<Operation *> parentScopes;
   Operation *op = a;
@@ -119,13 +168,18 @@ static Operation *getLiftedScope(Operation *a, Operation *b) {
   return nullptr;
 }
 
-// Return a list of users under the same scope, original users
-// will be lifted up.
-static void getUserScopes(DenseSet<Operation *> &users,
-                          DenseSet<Operation *> &userScopes) {
+/// Normalize a set of user operations to be at the same scope level.
+/// Takes a set of user operations that may be at different nesting levels
+/// and lifts them to be direct children of their lowest common ancestor scope.
+/// This ensures all operations can be compared in program order within a block.
+/// @param users Input set of user operations to normalize
+/// @param userScopes Output set of operations lifted to the same scope level
+/// @return success() if normalization succeeded, failure() otherwise
+static LogicalResult getUserScopes(DenseSet<Operation *> &users,
+                                   DenseSet<Operation *> &userScopes) {
   // Skip if users is empty (e.g., channels without valid operations)
   if (users.empty())
-    return;
+    return success();
 
   bool first = true;
   for (auto user : users) {
@@ -150,7 +204,9 @@ static void getUserScopes(DenseSet<Operation *> &users,
         // find the parent scope that include both scope and user
         auto *parentScope = getLiftedScope(scope, user);
         userScopes.clear();
-        assert(parentScope);
+        if (!parentScope) {
+          return failure();
+        }
         Operation *op = user;
         Operation *liftedUser = nullptr;
         while (!isa<triton::FuncOp>(op)) {
@@ -160,7 +216,9 @@ static void getUserScopes(DenseSet<Operation *> &users,
           }
           op = op->getParentOp();
         }
-        assert(liftedUser);
+        if (!liftedUser) {
+          return failure();
+        }
         userScopes.insert(liftedUser);
         op = scope;
         Operation *liftedScope = nullptr;
@@ -171,24 +229,39 @@ static void getUserScopes(DenseSet<Operation *> &users,
           }
           op = op->getParentOp();
         }
-        assert(liftedScope);
+        if (!liftedScope) {
+          return failure();
+        }
         userScopes.insert(liftedScope);
       }
     }
     first = false;
   }
+  return success();
 }
 
-static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
-                                      OperationListT &liveOps) {
+/// Collect all live operations between the first and last user operations.
+/// First normalizes users to the same scope level, then walks through all
+/// operations (including nested ones) between the first and last user in
+/// program order.
+/// @param users Set of user operations to find live range for
+/// @param liveOps Output vector to collect all live operations
+/// @return success() if live ops were collected, failure() otherwise
+static LogicalResult updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
+                                               OperationListT &liveOps) {
   DenseSet<Operation *> userScopes;
-  getUserScopes(users, userScopes);
+  if (failed(getUserScopes(users, userScopes))) {
+    return failure();
+  }
   // Return early if no user scopes (e.g., when users is empty)
   if (userScopes.empty())
-    return;
+    return success();
   // Find the block that contains all users
   bool foundStart = false;
   auto *scope = *(userScopes.begin());
+  if (!scope || !scope->getBlock()) {
+    return success();
+  }
   Operation *lastDst = nullptr;
   for (auto &op : scope->getBlock()->getOperations()) {
     if (userScopes.count(&op)) {
@@ -206,10 +279,16 @@ static void updateLiveOpsAcrossScopes(DenseSet<Operation *> &users,
       break;
     }
   }
+  return success();
 }
 
 namespace triton {
-// A simplified version of AllocationAnalysis.
+
+/// Memory planner for shared memory (SMEM) allocations in warp-specialized
+/// kernels. Analyzes liveness of SMEM buffers based on channel producer/
+/// consumer relationships and assigns buffer IDs and copy counts for
+/// multi-buffering optimization. Buffers used in innermost loops with 2D+
+/// shapes are candidates for multi-buffering with the specified numBuffers.
 class MemoryPlanner {
 public:
   MemoryPlanner(Operation *operation, Allocation *allocation,
@@ -267,12 +346,16 @@ private:
   OperationListT livenessForSmemChannel(Value value) {
     // Find the channel for value in channels.
     Operation *alloc = value.getDefiningOp();
-    ChannelPost *TheCh =
-        static_cast<ChannelPost *>(findChannelForAlloc(value, *channels));
+    Channel *ch = findChannelForAlloc(value, *channels);
+    // Check if channel is an SMEMPost channel
+    ChannelPost *TheCh = nullptr;
+    if (ch && ch->channelKind == DataChannelKind::SMEMPost) {
+      TheCh = static_cast<ChannelPost *>(ch);
+    }
     std::vector<Operation *> liveOps;
     DenseSet<Operation *> users;
-    getAllAcutalUsersForChannel(TheCh, users, alloc);
-    updateLiveOpsAcrossScopes(users, liveOps);
+    (void)getAllAcutalUsersForChannel(TheCh, users, alloc);
+    (void)updateLiveOpsAcrossScopes(users, liveOps);
     return liveOps;
   }
 
@@ -335,10 +418,14 @@ public:
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
     auto usedInnermostLoop = [&](Operation *alloc) -> bool {
-      ChannelPost *TheCh =
-          static_cast<ChannelPost *>(findChannelForOp(alloc, *channels));
+      Channel *ch = findChannelForOp(alloc, *channels);
+      // Check if channel is an SMEMPost channel
+      ChannelPost *TheCh = nullptr;
+      if (ch && ch->channelKind == DataChannelKind::SMEMPost) {
+        TheCh = static_cast<ChannelPost *>(ch);
+      }
       DenseSet<Operation *> users;
-      getAllAcutalUsersForChannel(TheCh, users, alloc);
+      (void)getAllAcutalUsersForChannel(TheCh, users, alloc);
       // If no users found (e.g., for allocations outside loops), not in
       // innermost loop
       if (users.empty())
@@ -423,34 +510,70 @@ public:
 };
 } // namespace triton
 
-static void getAllTmemUsers(ttng::TmemDataChannelPost *TheCh,
-                            DenseSet<Operation *> &users) {
-  ttng::TMEMAllocOp tmemAllocOp = cast<ttng::TMEMAllocOp>(TheCh->getAllocOp());
+/// Collect all users of a TMEM allocation from its channel.
+/// For operand D allocations (accumulator), collects all direct users.
+/// For other allocations, delegates to getAllAcutalUsersForChannel.
+/// @param TheCh The TMEM data channel post to get users for
+/// @param users Output set to collect all user operations
+/// @return success() if users were collected, failure() if TheCh is null
+static LogicalResult getAllTmemUsers(ttng::TmemDataChannelPost *TheCh,
+                                     DenseSet<Operation *> &users) {
+  if (!TheCh) {
+    return failure();
+  }
+  auto *allocOp = TheCh->getAllocOp();
+  if (!allocOp) {
+    return failure();
+  }
+  auto tmemAllocOp = llvm::dyn_cast<ttng::TMEMAllocOp>(allocOp);
+  if (!tmemAllocOp) {
+    return failure();
+  }
   if (TheCh->isOperandD) {
     for (auto user : tmemAllocOp.getResult().getUsers()) {
       users.insert(user);
     }
   } else {
-    getAllAcutalUsersForChannel(TheCh, users);
+    if (failed(getAllAcutalUsersForChannel(TheCh, users))) {
+      return failure();
+    }
   }
+  return success();
 }
 
-// Return the list of operations where value is live.
+/// Compute the list of operations where a TMEM value is live.
+/// Uses the channel's producer/consumer information to determine the live
+/// range, which spans from the first user to the last user in program order.
+/// @param value The TMEM allocation value to compute liveness for
+/// @param channels The list of channels to search for the allocation's channel
+/// @return Vector of operations where the value is live (empty on failure)
 OperationListT livenessForTmemChannel(Value value,
                                       SmallVector<Channel *> &channels) {
-  // Find the channel for value in channels.
-  ttng::TmemDataChannelPost *TheCh = static_cast<ttng::TmemDataChannelPost *>(
-      findChannelForAlloc(value, channels));
   std::vector<Operation *> liveOps;
+  // Find the channel for value in channels.
+  Channel *ch = findChannelForAlloc(value, channels);
+  if (!ch || ch->channelKind != DataChannelKind::TMEMPost) {
+    return liveOps;
+  }
+  ttng::TmemDataChannelPost *TheCh =
+      static_cast<ttng::TmemDataChannelPost *>(ch);
   DenseSet<Operation *> users;
-  getAllTmemUsers(TheCh, users);
-  updateLiveOpsAcrossScopes(users, liveOps);
+  if (failed(getAllTmemUsers(TheCh, users))) {
+    return liveOps;
+  }
+  (void)updateLiveOpsAcrossScopes(users, liveOps);
 
   return liveOps;
 }
 
 namespace triton {
-// A simplified version of AllocationAnalysis.
+
+/// Memory planner for tensor memory (TMEM) allocations in warp-specialized
+/// kernels. Handles allocation of TMEM buffers used for Blackwell TCGen5MMA
+/// operations. Computes liveness intervals based on channel relationships
+/// and performs memory reuse optimization by allowing non-interfering buffers
+/// to share TMEM space. Prioritizes operand D (accumulator) allocations and
+/// larger buffers when assigning memory locations.
 class MemoryPlannerTmem {
 public:
   MemoryPlannerTmem(Operation *operation, Allocation *allocation,
@@ -501,11 +624,16 @@ private:
   Interval<int> getIntervalForCtrlOp(Operation *ctrlOp,
                                      DenseMap<Operation *, int> &operationId) {
     // get the operationId of the first instruction
-    auto forOp = cast<scf::ForOp>(ctrlOp);
+    auto forOp = dyn_cast<scf::ForOp>(ctrlOp);
+    if (!forOp) {
+      // Return empty interval if not a ForOp
+      return Interval(0, 0);
+    }
     for (Operation &op : forOp.getBody()->without_terminator()) {
       return Interval(operationId[&op], operationId[ctrlOp]);
     }
-    llvm_unreachable("getIntervalForCtrlOp");
+    // Empty loop body - return interval at ctrlOp
+    return Interval(operationId[ctrlOp], operationId[ctrlOp]);
   }
 
   // Return number of outer loops.
@@ -520,7 +648,7 @@ private:
   }
 
 public:
-  void run(unsigned bufferId) {
+  LogicalResult run(unsigned bufferId) {
     Operation *parentOp = operation;
     SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
     DenseMap<Operation *, int> operationId;
@@ -546,9 +674,11 @@ public:
                              << liveInterval.end());
       LDBG("tmem allocSize: " << allocSize.numCols << " " << allocSize.numRows);
 
-      ttng::TmemDataChannelPost *TheCh =
-          static_cast<ttng::TmemDataChannelPost *>(
-              findChannelForAlloc(alloc, *channels));
+      ttng::TmemDataChannelPost *TheCh = nullptr;
+      Channel *chBase = findChannelForAlloc(alloc, *channels);
+      if (chBase && chBase->channelKind == DataChannelKind::TMEMPost) {
+        TheCh = static_cast<ttng::TmemDataChannelPost *>(chBase);
+      }
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
@@ -558,16 +688,31 @@ public:
     // Sort allocs according to isOperandD, size, live interval.
     // This can be adjusted later on.
     sort(allocs, [&](ttng::TMEMAllocOp a, ttng::TMEMAllocOp b) {
-      ttng::TmemDataChannelPost *aCh = static_cast<ttng::TmemDataChannelPost *>(
-          findChannelForAlloc(a, *channels));
-      ttng::TmemDataChannelPost *bCh = static_cast<ttng::TmemDataChannelPost *>(
-          findChannelForAlloc(b, *channels));
+      Channel *aChBase = findChannelForAlloc(a, *channels);
+      Channel *bChBase = findChannelForAlloc(b, *channels);
+      ttng::TmemDataChannelPost *aCh = nullptr;
+      ttng::TmemDataChannelPost *bCh = nullptr;
+      if (aChBase && aChBase->channelKind == DataChannelKind::TMEMPost) {
+        aCh = static_cast<ttng::TmemDataChannelPost *>(aChBase);
+      }
+      if (bChBase && bChBase->channelKind == DataChannelKind::TMEMPost) {
+        bCh = static_cast<ttng::TmemDataChannelPost *>(bChBase);
+      }
+      // Handle null channels - put them at the end
+      if (!aCh && !bCh)
+        return false;
+      if (!aCh)
+        return false;
+      if (!bCh)
+        return true;
       if (aCh->isOperandD && !bCh->isOperandD)
         return true;
       if (bCh->isOperandD && !aCh->isOperandD)
         return false;
       auto iter1 = allocToSize.find(a.getOperation());
       auto iter2 = allocToSize.find(b.getOperation());
+      if (iter1 == allocToSize.end() || iter2 == allocToSize.end())
+        return false;
       if (iter1->second.numRows == iter2->second.numRows &&
           iter1->second.numCols == iter2->second.numCols) {
         // check live interval length and offset.
@@ -585,13 +730,16 @@ public:
           return true;
         if (intv1.start() > intv2.start())
           return false;
-        assert(false);
+        // Equal intervals - maintain stable sort
+        return false;
       }
       if (iter1->second.numRows == iter2->second.numRows)
         return iter1->second.numCols > iter2->second.numCols;
       if (iter1->second.numCols == iter2->second.numCols)
         return iter1->second.numRows > iter2->second.numRows;
-      assert(false);
+      // Default comparison by total size
+      return (iter1->second.numRows * iter1->second.numCols) >
+             (iter2->second.numRows * iter2->second.numCols);
     });
     Allocation allocation;
     SmallVector<BufferT *> buffers;
@@ -655,23 +803,32 @@ public:
            << ctrlInt.end());
       for (auto t : allocsForThisLoop)
         LLVM_DEBUG(t.getOperation()->dump());
-      bufferId = allocateTMemAllocs(
+      auto result = allocateTMemAllocs(
           allocsForThisLoop, buffers, // allocToIntervals,
           /*allocToSize,*/ allocToChannel, operationId, ctrlOp, bufferId);
+      if (failed(result))
+        return failure();
+      bufferId = *result;
       ++ctrlIdx;
     }
     SmallVector<triton::nvidia_gpu::TMEMAllocOp> lastAllocs;
     for (auto alloc : allocs) {
-      assert(handledAllocs.count(alloc));
+      if (!handledAllocs.count(alloc)) {
+        LDBG("Warning: allocation not handled in any innermost loop");
+      }
     }
     if (!lastAllocs.empty()) {
-      bufferId = allocateTMemAllocs(lastAllocs, buffers, // allocToIntervals,
-                                    /*allocToSize,*/ allocToChannel,
-                                    operationId, nullptr, bufferId);
+      auto result = allocateTMemAllocs(lastAllocs, buffers, // allocToIntervals,
+                                       /*allocToSize,*/ allocToChannel,
+                                       operationId, nullptr, bufferId);
+      if (failed(result))
+        return failure();
+      bufferId = *result;
     }
+    return success();
   }
 
-  unsigned allocateTMemAllocs(
+  FailureOr<unsigned> allocateTMemAllocs(
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
       SmallVector<BufferT *> &buffers,
       DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
@@ -699,12 +856,19 @@ public:
       return false;
     };
     auto getCombinedTasks = [&](BufferT *alloc) -> SmallVector<AsyncTaskId> {
-      ttng::TmemDataChannelPost *TheCh =
-          static_cast<ttng::TmemDataChannelPost *>(
-              findChannelForOp(alloc->owner, *channels));
-      DenseSet<Operation *> users;
-      getAllTmemUsers(TheCh, users);
+      Channel *chBase = findChannelForOp(alloc->owner, *channels);
+      ttng::TmemDataChannelPost *TheCh = nullptr;
+      if (chBase && chBase->channelKind == DataChannelKind::TMEMPost) {
+        TheCh = static_cast<ttng::TmemDataChannelPost *>(chBase);
+      }
       SmallVector<AsyncTaskId> combinedTasks;
+      if (!TheCh) {
+        return combinedTasks;
+      }
+      DenseSet<Operation *> users;
+      if (failed(getAllTmemUsers(TheCh, users))) {
+        return combinedTasks;
+      }
       DenseSet<AsyncTaskId> combinedSet;
       for (auto *user : users) {
         auto asyncTasksVec = getAsyncTaskIds(user);
@@ -976,7 +1140,10 @@ public:
       if (allInterfere(candBuf)) {
         LDBG("\nallInterfere");
         bool hasSpace = allocateNewSpace(candBuf, true);
-        assert(hasSpace && "no new space for tmem alloc");
+        if (!hasSpace) {
+          return alloc.emitError("can't find tmem space: no new space for "
+                                 "tmem alloc when all buffers interfere");
+        }
       } else {
         auto *reuseBuf = findReuseChannel(candBuf, 2 /*partitionCondition*/,
                                           1 /*depChainCondition*/);
@@ -996,7 +1163,8 @@ public:
           if (allocateNewSpace(candBuf, false))
             allocateNewSpace(candBuf, true);
           else {
-            assert(false && "can't find tmem space");
+            return alloc.emitError(
+                "can't find tmem space: failed to allocate new space");
           }
         }
       }
@@ -1017,7 +1185,7 @@ public:
 };
 } // namespace triton
 
-void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
+LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -1027,7 +1195,7 @@ void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
     channels.push_back(c.get());
   }
   if (channels.empty()) {
-    return;
+    return success();
   }
   for (auto *ch : channels) {
     LLVM_DEBUG({
@@ -1053,9 +1221,11 @@ void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
   {
     Allocation allocation;
     triton::MemoryPlannerTmem planner(funcOp, &allocation, &channels);
-    planner.run(bufferId);
+    if (failed(planner.run(bufferId)))
+      return failure();
   }
   // allocateTMem(funcOp, channels, bufferId);
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSMEMORYPLANNER
@@ -1068,8 +1238,10 @@ public:
       NVGPUTestWSMemoryPlannerPass>::NVGPUTestWSMemoryPlannerBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    if (numBuffers >= 1)
-      doMemoryPlanner(funcOp, numBuffers);
+    if (numBuffers >= 1) {
+      if (failed(doMemoryPlanner(funcOp, numBuffers)))
+        signalPassFailure();
+    }
   }
 
   void runOnOperation() override {
