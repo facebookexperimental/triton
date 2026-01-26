@@ -281,6 +281,148 @@ class storage_kind(enum.Enum):
     smemCluster = "smemCluster"
 
 
+class storage_alias_spec(tl.base_value):
+    """
+    Definition of a storage alias specification.
+
+    This class represents ownership of an underlying memory buffer that can be
+    shared by multiple `local_alloc` calls. It can be either unsized or sized:
+
+    - **Unsized (default)**: The compiler sets the buffer size to accommodate
+      the largest allocation that references it.
+    - **Sized**: The user specifies an explicit size, and the compiler verifies
+      all referencing allocations fit within it.
+
+    All attributes are immutable after construction.
+
+    Attributes:
+        storage: The storage kind (smem or tmem) for this buffer.
+        buffer_size_bytes: Optional explicit size in bytes. Must be a compile-time
+            constant if provided. Immutable after construction.
+
+    Note:
+        smemCluster storage is not supported yet for storage alias specifications.
+
+    Example:
+        # Create an unsized storage alias spec (size determined by largest user)
+        alias_spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+        # Create a sized storage alias spec with explicit padding
+        alias_spec = tlx.storage_alias_spec(
+            buffer_size_bytes=16384,
+            storage=tlx.storage_kind.tmem
+        )
+    """
+
+    def __init__(
+        self,
+        handle,
+        storage: storage_kind,
+        buffer_size_bytes: Optional[int] = None,
+    ):
+        """
+        Initialize a shared buffer definition.
+
+        This constructor is internal. Use tlx.storage_alias_spec() builtin instead.
+
+        Args:
+            handle: The IR handle for this storage alias specification.
+            storage: The storage kind for this buffer. Must be smem or tmem.
+                smemCluster is not supported.
+            buffer_size_bytes: Optional explicit size in bytes. If provided,
+                the compiler will verify that all referencing allocations fit
+                within this size. This value is immutable after construction.
+
+        Raises:
+            ValueError: If storage is smemCluster (not supported).
+        """
+        super().__init__()
+        if storage == storage_kind.smemCluster:
+            raise ValueError("smemCluster storage is not supported for storage_alias_spec")
+        self._handle = handle
+        self._storage = storage
+        self._buffer_size_bytes = buffer_size_bytes
+        self.type = storage_alias_spec_type(storage, buffer_size_bytes)
+
+    @property
+    def handle(self):
+        """The IR handle (read-only)."""
+        return self._handle
+
+    @property
+    def storage(self) -> storage_kind:
+        """The storage kind for this buffer (read-only)."""
+        return self._storage
+
+    @property
+    def buffer_size_bytes(self) -> Optional[int]:
+        """The explicit buffer size in bytes, or None if unsized (read-only)."""
+        return self._buffer_size_bytes
+
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self._handle)
+
+    def __repr__(self):
+        size_str = f", size={self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        return f"storage_alias_spec(storage={self._storage.value}{size_str})"
+
+
+class storage_alias_spec_type(tl.base_type):
+    """
+    Type for storage alias specifications.
+
+    This type represents the MLIR StorageAliasSpecType and carries
+    storage kind and optional explicit size information.
+    """
+
+    def __init__(
+        self,
+        storage: storage_kind,
+        buffer_size_bytes: Optional[int] = None,
+    ):
+        self._storage = storage
+        self._buffer_size_bytes = buffer_size_bytes
+
+    @property
+    def storage(self) -> storage_kind:
+        """The storage kind (read-only)."""
+        return self._storage
+
+    @property
+    def buffer_size_bytes(self) -> Optional[int]:
+        """The explicit buffer size in bytes, or None (read-only)."""
+        return self._buffer_size_bytes
+
+    def __eq__(self, other):
+        return (isinstance(other, storage_alias_spec_type) and self._storage == other._storage
+                and self._buffer_size_bytes == other._buffer_size_bytes)
+
+    def __repr__(self) -> str:
+        size_str = f", size={self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        return f"storage_alias_spec_type(storage={self._storage.value}{size_str})"
+
+    def mangle(self) -> str:
+        size_part = f"_{self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        return f"storage_alias_spec_{self._storage.value}{size_part}"
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(self.to_ir(builder))
+
+    def to_ir(self, builder: ir.builder):
+        return builder.get_storage_alias_spec_type(
+            self._storage.value,
+            self._buffer_size_bytes,
+        )
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple["storage_alias_spec", int]:
+        value = storage_alias_spec(
+            handles[cursor],
+            self._storage,
+            self._buffer_size_bytes,
+        )
+        return value, cursor + 1
+
+
 class buffered_tensor(tl.base_value):
     """
     A symbolic type representing a tensor allocated in a manually managed buffer
