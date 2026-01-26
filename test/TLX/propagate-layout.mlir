@@ -1,5 +1,44 @@
 // RUN: triton-opt -split-input-file --tlx-propagate-layout %s| FileCheck %s
 
+// -----
+
+// Test that TMEMCopyOp propagates unswizzled layout constraint to the source
+// shared memory when the destination lattice has TensorMemoryScalesEncodingAttr.
+
+#shared_swizzled = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1, 1, 1, 1], CTASplitNum = [1, 1, 1, 1, 1], CTAOrder = [4, 3, 2, 1, 0]}>
+// CHECK-DAG: #[[$SHARED_UNSWIZZLED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0,
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#scales_encoding = #ttng.tensor_memory_scales_encoding<>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_copy_propagates_unswizzled_layout
+  tt.func public @tmem_copy_propagates_unswizzled_layout() {
+    %c0_i32 = arith.constant 0 : i32
+
+    // CHECK: ttg.local_alloc : () -> !ttg.memdesc<2x1x1x2x2x256xi8, #[[$SHARED_UNSWIZZLED]], #smem, mutable>
+    %scale_smem = ttg.local_alloc : () -> !ttg.memdesc<2x1x1x2x2x256xi8, #shared_swizzled, #smem, mutable>
+    %scale_smem_indexed = ttg.memdesc_index %scale_smem[%c0_i32] : !ttg.memdesc<2x1x1x2x2x256xi8, #shared_swizzled, #smem, mutable> -> !ttg.memdesc<1x1x2x2x256xi8, #shared_swizzled, #smem, mutable>
+
+    // Allocate TMEM for scales with dummy layout
+    %scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+    %scale_tmem_indexed = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<1x128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    // The tmem_copy destination has DummyTMEMLayoutAttr, but require_layout propagates
+    // TensorMemoryScalesEncodingAttr to the lattice, which should then propagate
+    // an unswizzled NVMMASharedEncodingAttr to the source shared memory.
+    ttng.tmem_copy %scale_smem_indexed, %scale_tmem_indexed : !ttg.memdesc<1x1x2x2x256xi8, #shared_swizzled, #smem, mutable>, !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    // Require scales layout for use - this propagates TensorMemoryScalesEncodingAttr to the lattice
+    %scale_req = tlx.require_layout %scale_tmem_indexed : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable>
+
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 8], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
