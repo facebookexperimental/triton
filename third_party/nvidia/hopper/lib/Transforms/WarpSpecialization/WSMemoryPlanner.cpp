@@ -185,50 +185,6 @@ static LogicalResult getAllAcutalUsersForChannel(Channel *TheCh,
   return success();
 }
 
-/// Collect live operations for a channel within a single basic block.
-/// Records all operations from the source operation to the last destination
-/// operation (inclusive). Assumes source and destinations are in the same
-/// block.
-/// @param TheCh The channel (must be TMEMPost or SMEMPost kind)
-/// @param liveOps Output vector to collect the live operations
-/// @return success() if channel is valid, failure() otherwise
-static LogicalResult updateLiveOpsInOneBlock(Channel *TheCh,
-                                             OperationListT &liveOps) {
-  if (!TheCh) {
-    return failure();
-  }
-  if (TheCh->channelKind != DataChannelKind::TMEMPost &&
-      TheCh->channelKind != DataChannelKind::SMEMPost) {
-    return failure();
-  }
-  Operation *src = TheCh->getSrcOp();
-  if (!src) {
-    return success();
-  }
-  SmallVector<Operation *> dsts;
-  TheCh->getDstOps(dsts);
-  Operation *lastDst = TheCh->getDstOpLast();
-  // Assuming they are in the same block, insert ops from src to dsts.
-  auto *block = src->getBlock();
-  if (!block) {
-    return success();
-  }
-  bool foundStart = false;
-  for (auto &op : block->getOperations()) {
-    if (&op == src) {
-      foundStart = true;
-      liveOps.push_back(&op);
-      continue;
-    }
-    if (foundStart)
-      liveOps.push_back(&op);
-    if (&op == lastDst) {
-      break;
-    }
-  }
-  return success();
-}
-
 /// Find the lowest common ancestor scope that contains both operations.
 /// Walks up the parent hierarchy of operation 'a' to collect all ancestor
 /// scopes, then walks up 'b' until it finds a matching scope.
