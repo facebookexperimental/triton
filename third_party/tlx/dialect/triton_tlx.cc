@@ -499,6 +499,40 @@ void init_triton_tlx_ir(py::module &&m) {
              else
                return self.create<ttg::LocalAllocOp>(memDesc);
            })
+      .def("create_storage_alias_spec",
+           [](TritonOpBuilder &self, const std::string &storage,
+              std::optional<int64_t> bufferSizeBytes) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+
+             // Parse storage kind (smemCluster is not allowed)
+             tlx::StorageKind storageKind;
+             if (storage == "smem") {
+               storageKind = tlx::StorageKind::smem;
+             } else if (storage == "tmem") {
+               storageKind = tlx::StorageKind::tmem;
+             } else if (storage == "smemCluster") {
+               throw std::invalid_argument("smemCluster storage is not "
+                                           "supported for storage_alias_spec");
+             } else {
+               throw std::invalid_argument("Unknown storage type: " + storage);
+             }
+
+             // Create the result type
+             auto resultType = tlx::StorageAliasSpecType::get(
+                 context, storageKind, bufferSizeBytes);
+
+             // Create the attributes
+             auto storageAttr = tlx::StorageKindAttr::get(context, storageKind);
+             mlir::IntegerAttr bufferSizeAttr = nullptr;
+             if (bufferSizeBytes) {
+               bufferSizeAttr =
+                   self.getBuilder().getI64IntegerAttr(*bufferSizeBytes);
+             }
+
+             // Create the operation
+             return self.create<tlx::StorageAliasSpecOp>(
+                 resultType, storageAttr, bufferSizeAttr);
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {

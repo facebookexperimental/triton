@@ -17,6 +17,13 @@ def TLX_Dialect : Dialect {
   ];
 
   let useDefaultAttributePrinterParser = 1;
+  let useDefaultTypePrinterParser = 1;
+
+  let extraClassDeclaration = [{
+    void registerTypes();
+  }];
 }
+
+include "TLXTypes.td"
 
 #endif
