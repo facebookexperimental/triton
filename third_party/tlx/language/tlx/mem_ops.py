@@ -484,6 +484,14 @@ def async_load(
     """
     Loads buffer from global to local memory asynchronously.
     """
+    # Unwrap constexpr and convert to tensor (same as tl.load)
+    mask = tl._unwrap_if_constexpr(mask)
+    other = tl._unwrap_if_constexpr(other)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+    if other is not None:
+        other = _semantic.to_tensor(other)
+
     if src.type.is_ptr() and src.type.element_ty.is_block():
         # Load by a block pointer: `pointer_type<block_type<>>`
         # unsupported for now
