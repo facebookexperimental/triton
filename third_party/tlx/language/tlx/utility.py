@@ -69,6 +69,7 @@ def size_of(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
     """
     Returns the size of a given dtype.
     """
+    dtype = tl._unwrap_if_constexpr(dtype)
     assert isinstance(dtype, tl.dtype), f"size_of expects a dtype, but got {type(dtype)}"
     return tl.constexpr(dtype.primitive_bitwidth // 8)
 
