@@ -641,13 +641,22 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   }
 
+  // Run dead code elimination before manually erasing operations.
+  IRRewriter rewriter(context);
+  (void)runRegionDCE(rewriter, funcOp->getRegions());
+
+  // Recover wsOp after DCE as it may have been modified.
+  ttg::WarpSpecializeOp newWsOp;
+  funcOp.walk([&](ttg::WarpSpecializeOp op) { newWsOp = op; });
+  assert(newWsOp && "WarpSpecializeOp should still exist after DCE");
+
   LLVM_DEBUG({
     LDBG("\n\nWith task Id checks");
     funcOp.dump();
   });
 
   SmallVector<Operation *> toErase;
-  wsOp.walk([&](Operation *op) {
+  newWsOp.walk([&](Operation *op) {
     unsigned numUsers = std::distance(op->user_begin(), op->user_end());
     bool isYield = isa<scf::YieldOp>(op);
     bool isAdd = isa<arith::AddIOp>(op);
@@ -663,8 +672,17 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   // Remove original operations that have been cloned in reverse order.
+  // First, filter opList to only include operations that are still alive
+  // (DCE may have erased some of them).
+  DenseSet<Operation *> aliveOps;
+  funcOp.walk([&](Operation *op) { aliveOps.insert(op); });
+
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
     Operation *op = *it;
+    // Skip operations that have already been erased by DCE.
+    if (!aliveOps.contains(op))
+      continue;
+
     LLVM_DEBUG({
       LDBG("erasing op ");
       op->dump();
