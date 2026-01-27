@@ -48,6 +48,17 @@ public:
       : relation(producer, consumers), op(op), operandIdx(operandIdx),
         _numBuffers(numBuffers), uniqID(ID), channelKind(channelKind) {}
 
+  // Returns true if the producer and all consumers have the same task ID,
+  // meaning no cross-warp synchronization is needed.
+  bool hasSameProducerConsumerTaskId() const {
+    int producerId = relation.first;
+    for (int consumerId : relation.second) {
+      if (consumerId != producerId)
+        return false;
+    }
+    return true;
+  }
+
   bool operator==(const Channel &c) {
     return relation == c.relation && operandIdx == c.operandIdx && op == c.op;
   }
