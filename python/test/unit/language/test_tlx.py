@@ -3990,3 +3990,56 @@ def test_barrier_wait_no_remote_view(device):
         barrier_wait_remote_view_kernel[grid](ctas_per_cga=(2, 1, 1))
     exc_msg = str(e.value)
     assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"
+
+
+@triton.jit
+def _test_get_fp8_format_name_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+    EXPECTED: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    if result == EXPECTED:
+        tl.store(output_ptr, 1)
+    else:
+        tl.store(output_ptr, 0)
+
+
+@triton.jit
+def _test_get_fp8_format_name_unsupported_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    tl.store(output_ptr, result == "e5m2")
+
+
+@pytest.mark.parametrize(
+    "dtype,expected",
+    [
+        (tl.float8e5, "e5m2"),
+        (tl.float8e4nv, "e4m3"),
+    ],
+)
+def test_get_fp8_format_name(dtype, expected, device):
+    """Test that FP8 dtypes return correct format strings."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    _test_get_fp8_format_name_kernel[(1, )](output, DTYPE=dtype, EXPECTED=expected)
+    assert output.item() == 1
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        tl.float32,
+        tl.float16,
+        tl.int32,
+    ],
+)
+def test_get_fp8_format_name_unsupported_dtype_raises_error(dtype, device):
+    """Test that non-FP8 dtypes raise a CompilationError during compilation."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    with pytest.raises(triton.CompilationError) as exc_info:
+        _test_get_fp8_format_name_unsupported_kernel[(1, )](output, DTYPE=dtype)
+    # Check that the underlying cause mentions the supported types
+    assert "only supports tl.float8e5" in str(exc_info.value.__cause__)
