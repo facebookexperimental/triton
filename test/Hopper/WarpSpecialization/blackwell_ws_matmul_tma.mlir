@@ -161,8 +161,6 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK: ttg.warp_specialize
 // Default group: MMA operations with tmem_store
 // CHECK: default
-// The tmem_store should inherit the partition from its source value
-// CHECK: ttng.tmem_store
 // CHECK: ttng.tc_gen5_mma
 // Group 0: Descriptor load operations (producer)
 // CHECK: partition0
@@ -170,6 +168,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK: ttng.async_tma_copy_global_to_local
 // Group 1: Epilogue operations (includes accumulator init - partition 3)
 // CHECK: partition1
+// The tmem_store should inherit the partition from its source value
+// CHECK: ttng.tmem_store
 // CHECK: ttng.tmem_load
 // CHECK: tt.descriptor_store
 
