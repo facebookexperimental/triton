@@ -795,21 +795,13 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         // Start a channel from currentProd to op
         auto producerTaskIds = getAsyncTaskIds(currentProd);
         auto consumerIds = getAsyncTaskIds(&op);
-        // Producer outside the loop may have multiple task IDs. Pick one that
-        // matches a consumer task ID, or fall back to the first producer task
-        // ID.
-        int producerTaskId = producerTaskIds.front();
-        if (producerTaskIds.size() > 1) {
-          for (auto pId : producerTaskIds) {
-            for (auto cId : consumerIds) {
-              if (pId == cId) {
-                producerTaskId = pId;
-                break;
-              }
-            }
-          }
-          setAsyncTaskIds(currentProd, {producerTaskId});
+        if (producerTaskIds.size() != 1) {
+          mmaOp.emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
+              << producerTaskIds.size();
+          return failure();
         }
+        int producerTaskId = producerTaskIds.front();
         auto channel = createTmemDataChannelPost(
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
             true /*isOperandD*/, true, channels.size());
