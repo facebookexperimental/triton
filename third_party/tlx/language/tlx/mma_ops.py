@@ -130,6 +130,7 @@ def async_dot(
         # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
         acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
         handles = [t.handle for t in mBarriers]
+        is_async = force_async or len(handles) > 0
         use_acc_handle = None
         if use_acc is not None:
             assert isinstance(use_acc, tl.tensor) or isinstance(
@@ -139,7 +140,7 @@ def async_dot(
             else:
                 use_acc_handle = _semantic.builder.get_int1(use_acc.value)
         output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
-                                                     handles, force_async)
+                                                     handles, is_async)
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
@@ -290,6 +291,7 @@ def async_dot_scaled(
     # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
     acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
     bar_handles = [t.handle for t in mBarriers]
+    is_async = force_async or len(bar_handles) > 0
     use_acc_handle = None
     if use_acc is not None:
         assert isinstance(use_acc, tl.tensor) or isinstance(
@@ -310,7 +312,7 @@ def async_dot_scaled(
         pred,
         two_ctas,
         bar_handles,
-        force_async,
+        is_async,
     )
     return tl.tensor(output, tl.void)
 
