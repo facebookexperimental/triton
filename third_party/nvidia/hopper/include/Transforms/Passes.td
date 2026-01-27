@@ -18,7 +18,7 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
                            "mlir::triton::nvws::NVWSDialect"];
   let options = [
     Option<"numStages", "num-stages",
-           "int32_t", /*default*/"0",
+           "int32_t", /*default*/"3",
            "number of buffers for warp specialization">,
     Option<"capability", "capability",
            "int32_t", /*default*/"10",
