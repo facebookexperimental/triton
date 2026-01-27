@@ -2762,6 +2762,34 @@ def test_size_of(device):
     torch.testing.assert_close(output, expected_sizes)
 
 
+def test_size_of_constexpr(device):
+
+    @triton.jit
+    def size_of_constexpr_kernel(output_ptr, DTYPE: tl.constexpr):
+        # Test size_of with constexpr dtype argument
+        size = tlx.size_of(DTYPE)
+        tl.store(output_ptr, size)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Test with float32 (4 bytes)
+    grid = lambda meta: (1, )
+    size_of_constexpr_kernel[grid](output, tl.float32)
+    assert output.item() == 4, f"Expected 4 for float32, got {output.item()}"
+
+    # Test with float16 (2 bytes)
+    size_of_constexpr_kernel[grid](output, tl.float16)
+    assert output.item() == 2, f"Expected 2 for float16, got {output.item()}"
+
+    # Test with int8 (1 byte)
+    size_of_constexpr_kernel[grid](output, tl.int8)
+    assert output.item() == 1, f"Expected 1 for int8, got {output.item()}"
+
+    # Test with int64 (8 bytes)
+    size_of_constexpr_kernel[grid](output, tl.int64)
+    assert output.item() == 8, f"Expected 8 for int64, got {output.item()}"
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dots_blackwell_tmem(device):
     """
