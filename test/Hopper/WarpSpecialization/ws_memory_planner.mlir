@@ -1,5 +1,4 @@
 // RUN: not triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner=num-buffers=3 2>&1 | FileCheck %s
-// XFAIL: *
 
 // Test case: Attention backward pass with TMEM allocations and tc_gen5_mma operations.
 // This IR has already been processed by the memory planner (after doBufferAllocation).

@@ -672,16 +672,19 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   // Remove original operations that have been cloned in reverse order.
-  // First, filter opList to only include operations that are still alive
-  // (DCE may have erased some of them).
-  DenseSet<Operation *> aliveOps;
-  funcOp.walk([&](Operation *op) { aliveOps.insert(op); });
+  // Recompute opList after DCE as some operations may have been erased.
+  opList.clear();
+  for (auto &block : funcOp.getBody().getBlocks()) {
+    for (Operation &op : block.getOperations()) {
+      auto taskIds = getAsyncTaskIds(&op);
+      if (!taskIds.empty())
+        opList.push_back(&op);
+    }
+  }
+  opList = topologicalSort(opList);
 
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
     Operation *op = *it;
-    // Skip operations that have already been erased by DCE.
-    if (!aliveOps.contains(op))
-      continue;
 
     LLVM_DEBUG({
       LDBG("erasing op ");
