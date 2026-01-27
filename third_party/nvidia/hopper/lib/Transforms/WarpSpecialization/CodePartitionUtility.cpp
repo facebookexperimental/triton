@@ -808,6 +808,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
               }
             }
           }
+          setAsyncTaskIds(currentProd, {producerTaskId});
         }
         auto channel = createTmemDataChannelPost(
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
@@ -818,8 +819,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           // Mark producer and consumer.
           setTmemChannelAttr(currentProd, channelID, "tmem.start");
           setTmemChannelAttr(&op, channelID, "tmem.end");
+          currentProd = &op;
         }
-        currentProd = &op;
       } else {
         if (mmaOpT.getD() == tmemAllocOp.getResult()) {
           mmaOp.emitError(
