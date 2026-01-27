@@ -819,124 +819,122 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           setTmemChannelAttr(currentProd, channelID, "tmem.start");
           setTmemChannelAttr(&op, channelID, "tmem.end");
         }
+        currentProd = &op;
+      } else {
+        if (mmaOpT.getD() == tmemAllocOp.getResult()) {
+          mmaOp.emitError(
+              "handleOperandD: unexpected MMA using same TMEM as operand D");
+          return failure();
+        }
+        // This uses tmem. mark as tmem.end = channel_id
+        if (currentProd == nullptr) {
+          mmaOpT.emitError(
+              "handleOperandD: no producer found for MMA consumer");
+          return failure();
+        }
+        // Start a channel from currentProd to op
+        auto producerTaskIds = getAsyncTaskIds(currentProd);
+        if (producerTaskIds.size() != 1) {
+          mmaOpT.emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
+        auto producerTaskId = producerTaskIds.front();
+        auto consumerIds = getAsyncTaskIds(&op);
+        auto channel = createTmemDataChannelPost(
+            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+            true /*isOperandD*/, true, channels.size());
+        if (channel) {
+          auto channelID = channels.size();
+          channels.push_back(std::move(channel));
+          // Mark producer and consumer.
+          setTmemChannelAttr(currentProd, channelID, "tmem.start");
+          setTmemChannelAttr(&op, channelID, "tmem.end");
+        }
       }
-      currentProd = &op;
-    } else {
-      if (mmaOpT.getD() == tmemAllocOp.getResult()) {
-        mmaOp.emitError(
-            "handleOperandD: unexpected MMA using same TMEM as operand D");
-        return failure();
-      }
-      // This uses tmem. mark as tmem.end = channel_id
-      if (currentProd == nullptr) {
-        mmaOpT.emitError("handleOperandD: no producer found for MMA consumer");
-        return failure();
-      }
-      // Start a channel from currentProd to op
-      auto producerTaskIds = getAsyncTaskIds(currentProd);
-      if (producerTaskIds.size() != 1) {
-        mmaOpT.emitError(
-            "handleOperandD: expected exactly one producer task ID, got ")
-            << producerTaskIds.size();
-        return failure();
-      }
-      auto producerTaskId = producerTaskIds.front();
-      auto consumerIds = getAsyncTaskIds(&op);
-      auto channel = createTmemDataChannelPost(
-          producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-          true /*isOperandD*/, true, channels.size());
-      if (channel) {
+    } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(&op)) {
+      currentProd = &op; // mark as tmem.start = channel_id
+    } else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(&op)) {
+      if (currentProd) {
+        // Start a channel from currentProd to op
+        auto producerTaskIds = getAsyncTaskIds(currentProd);
+        if (producerTaskIds.size() != 1) {
+          loadOp.emitError("handleOperandD: expected exactly one producer task "
+                           "ID for TMEMLoad, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
+        auto producerTaskId = producerTaskIds.front();
+        auto consumerIds = getAsyncTaskIds(&op);
+        auto channel = createTmemDataChannelPost(
+            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+            true /*isOperandD*/, true, channels.size());
+        if (channel) {
+          auto channelID = channels.size();
+          channels.push_back(std::move(channel));
+          // Mark producer and consumer.
+          setTmemChannelAttr(currentProd, channelID, "tmem.start");
+          setTmemChannelAttr(&op, channelID, "tmem.end");
+        }
+      } else {
+        channelsToBeUpdate.push_back(channels.size());
         auto channelID = channels.size();
-        channels.push_back(std::move(channel));
+        auto consumerIds = getAsyncTaskIds(&op);
+        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+            -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
+            true, channels.size()));
         // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
         setTmemChannelAttr(&op, channelID, "tmem.end");
       }
-    }
-  }
-  else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(&op)) {
-    currentProd = &op; // mark as tmem.start = channel_id
-  }
-  else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(&op)) {
-    if (currentProd) {
-      // Start a channel from currentProd to op
-      auto producerTaskIds = getAsyncTaskIds(currentProd);
-      if (producerTaskIds.size() != 1) {
-        loadOp.emitError("handleOperandD: expected exactly one producer task "
-                         "ID for TMEMLoad, got ")
-            << producerTaskIds.size();
-        return failure();
-      }
-      auto producerTaskId = producerTaskIds.front();
-      auto consumerIds = getAsyncTaskIds(&op);
-      auto channel = createTmemDataChannelPost(
-          producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-          true /*isOperandD*/, true, channels.size());
-      if (channel) {
-        auto channelID = channels.size();
-        channels.push_back(std::move(channel));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
-      }
     } else {
-      channelsToBeUpdate.push_back(channels.size());
-      auto channelID = channels.size();
-      auto consumerIds = getAsyncTaskIds(&op);
-      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-          -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
-          true, channels.size()));
-      // Mark producer and consumer.
-      setTmemChannelAttr(&op, channelID, "tmem.end");
+      // Unexpected operation type using the TMEM
+      return op.emitError(
+          "handleOperandD: unexpected operation type using TMEM");
     }
   }
-  else {
-    // Unexpected operation type using the TMEM
-    return op.emitError("handleOperandD: unexpected operation type using TMEM");
-  }
-}
-// Update channel's producer here.
-for (auto idx : channelsToBeUpdate) {
-  if (!currentProd) {
-    // This can happen if ForOp never produces - should not occur in valid IR
-    return mmaOp.emitError(
-        "handleOperandD: no producer found for deferred channel update");
-  }
-  channels[idx]->relation.first = getAsyncTaskIds(currentProd).front();
-  setTmemChannelAttr(currentProd, channels[idx]->uniqID, "tmem.start");
-}
-// For consumers outside of ForOp.
-for (auto *user : users) {
-  if (handledUsers.count(user))
-    continue;
-  // only handle tmem_load. FIXME: check if it is after the ForOp
-  if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(user)) {
+  // Update channel's producer here.
+  for (auto idx : channelsToBeUpdate) {
     if (!currentProd) {
-      return loadOp.emitError(
-          "handleOperandD: no producer found for TMEMLoad outside loop");
+      // This can happen if ForOp never produces - should not occur in valid IR
+      return mmaOp.emitError(
+          "handleOperandD: no producer found for deferred channel update");
     }
-    // Start a channel from currentProd to user
-    auto producerTaskIds = getAsyncTaskIds(currentProd);
-    if (producerTaskIds.size() != 1) {
-      return loadOp.emitError("handleOperandD: expected exactly one producer "
-                              "task ID, got ")
-             << producerTaskIds.size();
-    }
-    auto producerTaskId = producerTaskIds.front();
-    auto consumerIds = getAsyncTaskIds(user);
-    auto channel = createTmemDataChannelPost(
-        producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-        true /*isOperandD*/, true, channels.size());
-    if (channel) {
-      auto channelID = channels.size();
-      channels.push_back(std::move(channel));
-      // Mark producer and consumer.
-      setTmemChannelAttr(currentProd, channelID, "tmem.start");
-      setTmemChannelAttr(user, channelID, "tmem.end");
+    channels[idx]->relation.first = getAsyncTaskIds(currentProd).front();
+    setTmemChannelAttr(currentProd, channels[idx]->uniqID, "tmem.start");
+  }
+  // For consumers outside of ForOp.
+  for (auto *user : users) {
+    if (handledUsers.count(user))
+      continue;
+    // only handle tmem_load. FIXME: check if it is after the ForOp
+    if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(user)) {
+      if (!currentProd) {
+        return loadOp.emitError(
+            "handleOperandD: no producer found for TMEMLoad outside loop");
+      }
+      // Start a channel from currentProd to user
+      auto producerTaskIds = getAsyncTaskIds(currentProd);
+      if (producerTaskIds.size() != 1) {
+        return loadOp.emitError("handleOperandD: expected exactly one producer "
+                                "task ID, got ")
+               << producerTaskIds.size();
+      }
+      auto producerTaskId = producerTaskIds.front();
+      auto consumerIds = getAsyncTaskIds(user);
+      auto channel = createTmemDataChannelPost(
+          producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+          true /*isOperandD*/, true, channels.size());
+      if (channel) {
+        auto channelID = channels.size();
+        channels.push_back(std::move(channel));
+        // Mark producer and consumer.
+        setTmemChannelAttr(currentProd, channelID, "tmem.start");
+        setTmemChannelAttr(user, channelID, "tmem.end");
+      }
     }
   }
-}
-return success();
+  return success();
 }
 
 static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
