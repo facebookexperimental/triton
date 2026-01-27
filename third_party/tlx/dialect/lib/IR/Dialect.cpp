@@ -6,6 +6,7 @@
 // clang-format off
 #include "IR/Dialect.h"
 #include "IR/Dialect.cpp.inc"
+#include "IR/TLXTypesEnums.cpp.inc"
 // clang-format on
 
 using namespace mlir;
@@ -16,6 +17,8 @@ void mlir::triton::tlx::TLXDialect::initialize() {
 #define GET_ATTRDEF_LIST
 #include "IR/TLXAttrDefs.cpp.inc"
       >();
+
+  registerTypes();
 
   addOperations<
 #define GET_OP_LIST

@@ -8,10 +8,11 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 #include "tlx/dialect/include/IR/Dialect.h.inc"
-#include "tlx/dialect/include/IR/OpsEnums.h.inc"
 #include "tlx/dialect/include/IR/Traits.h"
 #define GET_ATTRDEF_CLASSES
 #include "tlx/dialect/include/IR/TLXAttrDefs.h.inc"
+
+#include "tlx/dialect/include/IR/Types.h"
 
 #define GET_OP_CLASSES
 #include "tlx/dialect/include/IR/Ops.h.inc"

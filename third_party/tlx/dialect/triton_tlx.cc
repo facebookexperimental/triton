@@ -389,7 +389,7 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &d, std::optional<Value> useD,
               std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers) -> void {
+              std::vector<Value> mBarriers, bool forceAsync) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
@@ -398,14 +398,14 @@ void init_triton_tlx_ir(py::module &&m) {
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
                  ValueRange(mBarriers), ValueRange(barrierPreds),
-                 !mBarriers.empty() /* is_async */);
+                 forceAsync || !mBarriers.empty() /* is_async */);
            })
       .def("create_tcgen5_dot_scaled",
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
               Value bScale, tt::ScaleDotElemType aType,
               tt::ScaleDotElemType bType, std::optional<Value> useD,
               std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers) -> void {
+              std::vector<Value> mBarriers, bool forceAsync) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
@@ -419,7 +419,7 @@ void init_triton_tlx_ir(py::module &&m) {
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
                  ValueRange(mBarriers), ValueRange(barrierPreds),
-                 !mBarriers.empty() /* is_async */);
+                 forceAsync || !mBarriers.empty() /* is_async */);
            })
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
@@ -498,6 +498,40 @@ void init_triton_tlx_ir(py::module &&m) {
                return self.create<tlx::LocalAliasOp>(memDesc, *alias);
              else
                return self.create<ttg::LocalAllocOp>(memDesc);
+           })
+      .def("create_storage_alias_spec",
+           [](TritonOpBuilder &self, const std::string &storage,
+              std::optional<int64_t> bufferSizeBytes) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+
+             // Parse storage kind (smemCluster is not allowed)
+             tlx::StorageKind storageKind;
+             if (storage == "smem") {
+               storageKind = tlx::StorageKind::smem;
+             } else if (storage == "tmem") {
+               storageKind = tlx::StorageKind::tmem;
+             } else if (storage == "smemCluster") {
+               throw std::invalid_argument("smemCluster storage is not "
+                                           "supported for storage_alias_spec");
+             } else {
+               throw std::invalid_argument("Unknown storage type: " + storage);
+             }
+
+             // Create the result type
+             auto resultType = tlx::StorageAliasSpecType::get(
+                 context, storageKind, bufferSizeBytes);
+
+             // Create the attributes
+             auto storageAttr = tlx::StorageKindAttr::get(context, storageKind);
+             mlir::IntegerAttr bufferSizeAttr = nullptr;
+             if (bufferSizeBytes) {
+               bufferSizeAttr =
+                   self.getBuilder().getI64IntegerAttr(*bufferSizeBytes);
+             }
+
+             // Create the operation
+             return self.create<tlx::StorageAliasSpecOp>(
+                 resultType, storageAttr, bufferSizeAttr);
            })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,

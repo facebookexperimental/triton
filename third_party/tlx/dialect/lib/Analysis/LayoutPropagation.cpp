@@ -186,6 +186,41 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     return success();
   }
 
+  // Handle TMEMCopyOp: when destination has TensorMemoryScalesEncodingAttr,
+  // the source shared memory must be unswizzled. Propagate this constraint.
+  if (auto tmemCopyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {
+    // Check the lattice encoding for the destination. The lattice may have
+    // TensorMemoryScalesEncodingAttr propagated from downstream operations
+    // (e.g., RequireLayoutOp). If the IR already has the encoding, the source
+    // should already be correctly set up.
+    auto dstLattice = operands[1];
+    auto dstLatticeEncoding = dstLattice->getValue();
+    if (!dstLatticeEncoding.isUninitialized() &&
+        isa<ttng::TensorMemoryScalesEncodingAttr>(
+            dstLatticeEncoding.getLayoutEncoding())) {
+      // Source must be unswizzled for scales copy.
+      // Create an unswizzled encoding requirement for the source.
+      auto srcType = cast<ttg::MemDescType>(tmemCopyOp.getSrc().getType());
+      auto ctx = srcType.getContext();
+
+      // Build unswizzled NVMMASharedEncodingAttr with default CTA layout
+      auto ctaLayout = ttg::CTALayoutAttr::getDefault(ctx, srcType.getRank());
+      auto unswizzledEncoding = ttg::NVMMASharedEncodingAttr::get(
+          ctx,
+          /*swizzlingByteWidth=*/0,
+          /*transposed=*/false,
+          srcType.getElementType().getIntOrFloatBitWidth(),
+          /*fp4Padded=*/false, ctaLayout);
+      const auto unswizzledLayoutEncoding = LayoutEncoding(unswizzledEncoding);
+      auto operandLattice = operands[0];
+      ChangeResult changed = operandLattice->meet(unswizzledLayoutEncoding);
+      propagateIfChanged(operandLattice, changed);
+      visitWarpSpecRegionArgs(op, tmemCopyOp.getSrc(),
+                              unswizzledLayoutEncoding);
+      return success();
+    }
+  }
+
   // Propagate from results to the operands
   for (const auto resultLattice : results) {
     for (auto [i, operandLattice] : llvm::enumerate(operands)) {

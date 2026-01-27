@@ -687,6 +687,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         kv_slice,
                         acc_tiles[0],
                         use_acc=slice_id > 0,
+                        force_async=True,
                     )
 
                 acc1_init = False
@@ -764,6 +765,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                             kv_slice,
                             acc_tiles[0],
                             use_acc=True,
+                            force_async=True,
                         )
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])

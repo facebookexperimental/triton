@@ -14,6 +14,92 @@ def _assert_blackwell_for_tmem(arch):
     assert capability >= 100, "tmem is only available on Blackwell"
 
 
+@tl.builtin
+def storage_alias_spec(
+    storage: tlx.storage_kind = tlx.storage_kind.smem,
+    buffer_size_bytes: Optional[tl.constexpr] = None,
+    _semantic=None,
+) -> tlx.storage_alias_spec:
+    """
+    Create a storage alias specification.
+
+    This function creates a storage alias specification that can be referenced by
+    multiple `local_alloc` calls via the `reuse` parameter. Unlike directly
+    passing a `buffered_tensor` to `reuse`, using a `storage_alias_spec` makes
+    all referencing allocations equal peers with no primary owner.
+
+    The storage alias spec can be either unsized or sized:
+
+    - **Unsized (default)**: The compiler sets the buffer size to accommodate
+      the largest allocation that references it.
+    - **Sized**: The user specifies an explicit size, and the compiler verifies
+      all referencing allocations fit within this size.
+
+    All attributes of the returned object are immutable after construction.
+
+    Args:
+        storage: The storage kind for this buffer. Must be `smem` or `tmem`.
+            All `local_alloc` calls that reference this `storage_alias_spec`
+            must use the same storage kind. `smemCluster` is not supported.
+        buffer_size_bytes: Optional explicit size in bytes. If provided, must
+            be a compile-time constant (`tl.constexpr`). The compiler will
+            verify that all referencing allocations fit within this size.
+            This value is immutable after construction.
+        _semantic: Internal parameter for Triton semantics.
+
+    Returns:
+        A `storage_alias_spec` object that can be passed to `local_alloc` via
+        the `reuse` parameter.
+
+    Raises:
+        ValueError: If storage is not a valid `storage_kind`.
+        ValueError: If storage is `smemCluster` (not supported).
+        ValueError: If buffer_size_bytes is not a compile-time constant.
+        ValueError: If buffer_size_bytes is not positive.
+
+    Example:
+        # Create an unsized storage alias spec (size determined by largest user)
+        alias_spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+        # Create a sized storage alias spec with explicit size
+        alias_spec = tlx.storage_alias_spec(
+            storage=tlx.storage_kind.tmem,
+            buffer_size_bytes=16384,
+        )
+
+        # Use with local_alloc (Phase 2 - not yet implemented)
+        # buf_a = tlx.local_alloc(..., reuse=alias_spec)
+        # buf_b = tlx.local_alloc(..., reuse=alias_spec)
+    """
+    # Validate storage kind
+    if not isinstance(storage, tlx.storage_kind):
+        raise ValueError(f"storage must be a tlx.storage_kind, got {type(storage)}")
+
+    # smemCluster is not supported
+    if storage == tlx.storage_kind.smemCluster:
+        raise ValueError("smemCluster storage is not supported for storage_alias_spec")
+
+    # Validate and unwrap buffer_size_bytes if provided
+    unwrapped_size = None
+    if buffer_size_bytes is not None:
+        unwrapped_size = tl._unwrap_if_constexpr(buffer_size_bytes)
+        if unwrapped_size <= 0:
+            raise ValueError(f"buffer_size_bytes must be positive, got {unwrapped_size}")
+
+    # Create IR operation
+    handle = _semantic.builder.create_storage_alias_spec(
+        storage.value,
+        unwrapped_size,
+    )
+
+    # Return wrapper object (immutable)
+    return tlx.storage_alias_spec(
+        handle=handle,
+        storage=storage,
+        buffer_size_bytes=unwrapped_size,
+    )
+
+
 def _create_tmem_compatible_tensor_layout_encoding(
     builder,
     tensor: tlx.buffered_tensor,
@@ -398,6 +484,14 @@ def async_load(
     """
     Loads buffer from global to local memory asynchronously.
     """
+    # Unwrap constexpr and convert to tensor (same as tl.load)
+    mask = tl._unwrap_if_constexpr(mask)
+    other = tl._unwrap_if_constexpr(other)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+    if other is not None:
+        other = _semantic.to_tensor(other)
+
     if src.type.is_ptr() and src.type.element_ty.is_block():
         # Load by a block pointer: `pointer_type<block_type<>>`
         # unsupported for now
