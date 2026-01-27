@@ -725,6 +725,8 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXRewriteLocalAlias);
   ADD_PASS_WRAPPER_0("add_tlx_resolve_placeholder_layouts",
                      tlx::createTLXResolvePlaceholderLayouts);
+  ADD_PASS_WRAPPER_0("add_tlx_print_ttgir_to_tlx",
+                     tlx::createTLXPrintTTGIRToTLX);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
                             std::string, int32_t, int32_t, int32_t);
 }
