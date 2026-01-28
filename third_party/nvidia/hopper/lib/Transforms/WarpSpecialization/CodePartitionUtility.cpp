@@ -18,19 +18,12 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-// Helper function to create TmemDataChannelPost. Returns nullptr if the
-// producer matches all consumer task IDs (no cross-warp synchronization
-// needed).
-static std::unique_ptr<ttng::TmemDataChannelPost>
-createTmemDataChannelPost(int producer, SmallVector<int> &consumers,
-                          Operation *allocOp, bool isOperandD,
-                          bool isOperandDNoAcc, unsigned uniqID) {
-  bool allMatch = llvm::all_of(
+// Helper function to check if a channel is needed between producer and
+// consumers. Returns false if the producer task ID matches all consumer task
+// IDs (no cross-warp synchronization needed).
+static bool needsChannel(int producer, const SmallVector<int> &consumers) {
+  return !llvm::all_of(
       consumers, [producer](int consumerId) { return consumerId == producer; });
-  if (allMatch)
-    return nullptr;
-  return std::make_unique<ttng::TmemDataChannelPost>(
-      producer, consumers, allocOp, isOperandD, isOperandDNoAcc, uniqID);
 }
 
 // Check to see if op is enclosed under ifOp.
@@ -691,6 +684,29 @@ static void setTmemChannelAttr(Operation *op, int channelId,
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
+// Helper function to create channels from multiple producers to a single
+// consumer. Creates one channel per producer in the currentProds vector.
+// @param currentProds Vector of producer operations
+// @param producerTaskId Task ID of the producers (must all be the same)
+// @param consumerIds Consumer task IDs
+// @param allocOp The TMEM allocation operation
+// @param consumerOp The consumer operation
+// @param channels Output vector to add created channels to
+static void
+createChannelsForProducers(SmallVector<Operation *> &currentProds,
+                           int producerTaskId, SmallVector<int> &consumerIds,
+                           Operation *allocOp, Operation *consumerOp,
+                           SmallVector<std::unique_ptr<Channel>> &channels) {
+  for (auto *prod : currentProds) {
+    auto channelID = channels.size();
+    channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+        producerTaskId, consumerIds, allocOp, true /*isOperandD*/, true,
+        channelID));
+    setTmemChannelAttr(prod, channelID, "tmem.start");
+    setTmemChannelAttr(consumerOp, channelID, "tmem.end");
+  }
+}
+
 /// Handle TMEM used as operand D (accumulator) of an MMA operation.
 ///
 /// This function creates producer-consumer channels for a TMEM allocation that
@@ -807,29 +823,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           return failure();
         }
         int producerTaskId = producerTaskIds.front();
-        auto channel = createTmemDataChannelPost(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, true, channels.size());
-        if (channel) {
-          // Use the existing channel for the first producer, create new
-          // channels for subsequent producers
-          for (size_t i = 0; i < currentProds.size(); ++i) {
-            auto *prod = currentProds[i];
-            if (i == 0) {
-              auto channelID = channels.size();
-              channels.push_back(std::move(channel));
-              setTmemChannelAttr(prod, channelID, "tmem.start");
-              setTmemChannelAttr(&op, channelID, "tmem.end");
-            } else {
-              auto channelID = channels.size();
-              auto prodChannel = createTmemDataChannelPost(
-                  producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-                  true /*isOperandD*/, true, channelID);
-              channels.push_back(std::move(prodChannel));
-              setTmemChannelAttr(prod, channelID, "tmem.start");
-              setTmemChannelAttr(&op, channelID, "tmem.end");
-            }
-          }
+        if (needsChannel(producerTaskId, consumerIds)) {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), &op, channels);
           currentProds.clear();
           currentProds.push_back(&op);
         } else {
@@ -858,29 +854,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         }
         auto producerTaskId = producerTaskIds.front();
         auto consumerIds = getAsyncTaskIds(&op);
-        auto channel = createTmemDataChannelPost(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, true, channels.size());
-        if (channel) {
-          // Use the existing channel for the first producer, create new
-          // channels for subsequent producers
-          for (size_t i = 0; i < currentProds.size(); ++i) {
-            auto *prod = currentProds[i];
-            if (i == 0) {
-              auto channelID = channels.size();
-              channels.push_back(std::move(channel));
-              setTmemChannelAttr(prod, channelID, "tmem.start");
-              setTmemChannelAttr(&op, channelID, "tmem.end");
-            } else {
-              auto channelID = channels.size();
-              auto prodChannel = createTmemDataChannelPost(
-                  producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-                  true /*isOperandD*/, true, channelID);
-              channels.push_back(std::move(prodChannel));
-              setTmemChannelAttr(prod, channelID, "tmem.start");
-              setTmemChannelAttr(&op, channelID, "tmem.end");
-            }
-          }
+        if (needsChannel(producerTaskId, consumerIds)) {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), &op, channels);
         } else {
           // Channel skipped - append to producers vector
           currentProds.push_back(&op);
@@ -901,29 +877,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         }
         auto producerTaskId = producerTaskIds.front();
         auto consumerIds = getAsyncTaskIds(&op);
-        auto channel = createTmemDataChannelPost(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, true, channels.size());
-        if (channel) {
-          // Use the existing channel for the first producer, create new
-          // channels for subsequent producers
-          for (size_t i = 0; i < currentProds.size(); ++i) {
-            auto *prod = currentProds[i];
-            if (i == 0) {
-              auto channelID = channels.size();
-              channels.push_back(std::move(channel));
-              setTmemChannelAttr(prod, channelID, "tmem.start");
-              setTmemChannelAttr(&op, channelID, "tmem.end");
-            } else {
-              auto channelID = channels.size();
-              auto prodChannel = createTmemDataChannelPost(
-                  producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-                  true /*isOperandD*/, true, channelID);
-              channels.push_back(std::move(prodChannel));
-              setTmemChannelAttr(prod, channelID, "tmem.start");
-              setTmemChannelAttr(&op, channelID, "tmem.end");
-            }
-          }
+        if (needsChannel(producerTaskId, consumerIds)) {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), &op, channels);
         } else {
           // Channel skipped - append to producers vector
           currentProds.push_back(&op);
@@ -976,29 +932,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
       }
       auto producerTaskId = producerTaskIds.front();
       auto consumerIds = getAsyncTaskIds(user);
-      auto channel = createTmemDataChannelPost(
-          producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-          true /*isOperandD*/, true, channels.size());
-      if (channel) {
-        // Use the existing channel for the first producer, create new
-        // channels for subsequent producers
-        for (size_t i = 0; i < currentProds.size(); ++i) {
-          auto *prod = currentProds[i];
-          if (i == 0) {
-            auto channelID = channels.size();
-            channels.push_back(std::move(channel));
-            setTmemChannelAttr(prod, channelID, "tmem.start");
-            setTmemChannelAttr(user, channelID, "tmem.end");
-          } else {
-            auto channelID = channels.size();
-            auto prodChannel = createTmemDataChannelPost(
-                producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-                true /*isOperandD*/, true, channelID);
-            channels.push_back(std::move(prodChannel));
-            setTmemChannelAttr(prod, channelID, "tmem.start");
-            setTmemChannelAttr(user, channelID, "tmem.end");
-          }
-        }
+      if (needsChannel(producerTaskId, consumerIds)) {
+        createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                   tmemAllocOp.getOperation(), user, channels);
       } else {
         // Channel skipped - append to producers vector
         currentProds.push_back(user);
@@ -1102,11 +1038,11 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   consumerTaskIds.erase(iter, consumerTaskIds.end());
 
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
-    auto channel = createTmemDataChannelPost(producerTaskIds.front(),
-                                             consumerTaskIds, allocOp, false,
-                                             isOperandDNoAcc, channels.size());
-    if (channel)
-      channels.push_back(std::move(channel));
+    if (needsChannel(producerTaskId, consumerTaskIds)) {
+      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+          producerTaskId, consumerTaskIds, allocOp, false, isOperandDNoAcc,
+          channels.size()));
+    }
   } else
     channels.push_back(std::make_unique<ChannelPost>(
         producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
