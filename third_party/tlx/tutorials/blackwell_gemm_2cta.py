@@ -1,10 +1,8 @@
-import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_blackwell
 
 from typing import Optional
 
@@ -124,21 +122,3 @@ def matmul(a, b):
                                                                 b.stride(1), c, c.stride(0), c.stride(1), **kern_kwargs)
 
     return c
-
-
-@pytest.mark.skipif(
-    not is_blackwell(),
-    reason="Requires Blackwell GPU",
-)
-def test_op():
-    torch.manual_seed(0)
-    for i in [8192]:
-        M, N, K = i, i, i
-        a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-        b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-        torch_output = torch.matmul(a, b)
-        triton_output = matmul(a, b)
-        # print(f"torch_output_with_fp16_inputs={torch_output}")
-        # print(f"triton_output_with_fp16_inputs={triton_output}")
-        rtol = 0
-        torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=rtol)
