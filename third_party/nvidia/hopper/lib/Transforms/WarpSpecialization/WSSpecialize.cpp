@@ -641,13 +641,22 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   }
 
+  // Run dead code elimination before manually erasing operations.
+  IRRewriter rewriter(context);
+  (void)runRegionDCE(rewriter, funcOp->getRegions());
+
+  // Recover wsOp after DCE as it may have been modified.
+  ttg::WarpSpecializeOp newWsOp;
+  funcOp.walk([&](ttg::WarpSpecializeOp op) { newWsOp = op; });
+  assert(newWsOp && "WarpSpecializeOp should still exist after DCE");
+
   LLVM_DEBUG({
     LDBG("\n\nWith task Id checks");
     funcOp.dump();
   });
 
   SmallVector<Operation *> toErase;
-  wsOp.walk([&](Operation *op) {
+  newWsOp.walk([&](Operation *op) {
     unsigned numUsers = std::distance(op->user_begin(), op->user_end());
     bool isYield = isa<scf::YieldOp>(op);
     bool isAdd = isa<arith::AddIOp>(op);
@@ -663,8 +672,20 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   // Remove original operations that have been cloned in reverse order.
+  // Recompute opList after DCE as some operations may have been erased.
+  opList.clear();
+  for (auto &block : funcOp.getBody().getBlocks()) {
+    for (Operation &op : block.getOperations()) {
+      auto taskIds = getAsyncTaskIds(&op);
+      if (!taskIds.empty())
+        opList.push_back(&op);
+    }
+  }
+  opList = topologicalSort(opList);
+
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
     Operation *op = *it;
+
     LLVM_DEBUG({
       LDBG("erasing op ");
       op->dump();

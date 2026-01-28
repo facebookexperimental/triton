@@ -743,6 +743,19 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           Value useAccFlag = mmaOpT.useAccumulator();
           bool useAccIsFalse = false;
           if (useAccFlag) {
+            // If useAccFlag is a block argument of the loop, trace it back
+            // to its init value. Even if useAccFlag may be true, we don't
+            // need a producer if useAcc = False for the first iteration.
+            if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
+              if (blockArg.getOwner() == forOp.getBody()) {
+                // Block arg 0 is the induction variable, so iter args start
+                // at index 1.
+                unsigned argNum = blockArg.getArgNumber();
+                if (argNum > 0) {
+                  useAccFlag = forOp.getInitArgs()[argNum - 1];
+                }
+              }
+            }
             if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
               if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue())) {
                 useAccIsFalse = !boolAttr.getValue();

@@ -179,6 +179,7 @@ public:
   }
 
   void runOnOperation() override {
+    assert(numStages >= 1 && "numStages must be at least 1");
     getOperation()->walk(
         [&](triton::FuncOp funcOp) { runOnFuncOp(funcOp, numStages); });
 
