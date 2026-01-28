@@ -1,7 +1,6 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -10,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -28,7 +28,8 @@ static OpPrintingFlags getWSPrintingFlags() {
 
 // Helper to dump module with appropriate printing flags
 static void dumpModuleIR(StringRef label, ModuleOp moduleOp) {
-  llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: " << label << "\n";
+  llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: " << label
+               << "\n";
   moduleOp.print(llvm::dbgs(), getWSPrintingFlags());
   llvm::dbgs() << "\n\n\n";
 }
