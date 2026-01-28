@@ -74,6 +74,8 @@ from .utility import (
     stoch_round,
     thread_id,
 )
+from .warp_ops import (
+    vote_ballot_sync, )
 
 __all__ = [
     # async_tasks
@@ -152,4 +154,6 @@ __all__ = [
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
+    # warp_ops
+    "vote_ballot_sync",
 ]

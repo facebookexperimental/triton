@@ -412,6 +412,27 @@ struct CLCQueryCancelOpConversion
     return success();
   }
 };
+
+struct VoteBallotSyncOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::VoteBallotSyncOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::VoteBallotSyncOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::VoteBallotSyncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+
+    // Use the NVVM dialect's VoteSyncOp which lowers to:
+    // vote.sync.ballot.b32 dest, predicate, membermask;
+    Value result = rewriter.create<NVVM::VoteSyncOp>(
+        loc, rewriter.getI32Type(), adaptor.getMask(), adaptor.getPred(),
+        NVVM::VoteSyncKind::ballot);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
 } // namespace
 
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
@@ -427,4 +448,5 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);
   patterns.add<AsyncCLCTryCancelOpConversion>(typeConverter, benefit);
   patterns.add<CLCQueryCancelOpConversion>(typeConverter, benefit);
+  patterns.add<VoteBallotSyncOpConversion>(typeConverter, benefit);
 }

@@ -348,6 +348,34 @@ def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
   let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $ctaId)";
 }
 
+def TTNG_VoteBallotSyncOp : TTNG_Op<"vote_ballot_sync", [Pure]> {
+  let summary = "Warp-level vote ballot synchronization";
+
+  let description = [{
+    Performs a warp-level vote ballot operation that collects a predicate from
+    each thread in the warp and returns a 32-bit mask where each bit represents
+    the predicate value from the corresponding lane.
+
+    The `mask` operand specifies which threads participate in the vote. Threads
+    with their corresponding bit set in the mask must execute the instruction
+    with the same mask value.
+
+    This lowers to PTX instruction:
+    vote.sync.ballot.b32 dest, predicate, membermask;
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
+  }];
+
+  let arguments = (ins
+    I32:$mask,
+    I1:$pred
+  );
+
+  let results = (outs I32:$result);
+
+  let assemblyFormat = "$mask `,` $pred attr-dict";
+}
+
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [AttrSizedOperandSegments]> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 

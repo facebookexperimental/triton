@@ -573,6 +573,11 @@ void init_triton_tlx_ir(py::module &&m) {
                  self.create<mlir::arith::SelectOp>(isNegOne, tileId, offset);
              return tileId;
            })
+      .def("vote_ballot_sync",
+           [](TritonOpBuilder &self, Value mask, Value pred) -> Value {
+             return self.create<ttng::VoteBallotSyncOp>(
+                 self.getBuilder().getI32Type(), mask, pred);
+           })
       .def("create_async_TMA_load",
            [](TritonOpBuilder &self, std::vector<Value> &multicastTargets,
               Value desc, std::vector<Value> &coord, Value mbarrier, Value pred,
