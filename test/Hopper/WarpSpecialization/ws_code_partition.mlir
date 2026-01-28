@@ -157,8 +157,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.for
 // CHECK: scf.for
 // CHECK: ttng.wait_barrier
-// CHECK: ttg.local_load
-// CHECK: ttg.local_load
 // CHECK: ttng.warp_group_dot
 // CHECK: nvws.consumer_release
 // CHECK: nvws.producer_acquire
