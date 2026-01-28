@@ -389,7 +389,7 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &d, std::optional<Value> useD,
               std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers, bool forceAsync) -> void {
+              std::vector<Value> mBarriers, bool isAsync) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
@@ -397,15 +397,14 @@ void init_triton_tlx_ir(py::module &&m) {
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred */, twoCTAs,
-                 ValueRange(mBarriers), ValueRange(barrierPreds),
-                 forceAsync || !mBarriers.empty() /* is_async */);
+                 ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
            })
       .def("create_tcgen5_dot_scaled",
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
               Value bScale, tt::ScaleDotElemType aType,
               tt::ScaleDotElemType bType, std::optional<Value> useD,
               std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers, bool forceAsync) -> void {
+              std::vector<Value> mBarriers, bool isAsync) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
@@ -418,8 +417,7 @@ void init_triton_tlx_ir(py::module &&m) {
                  tokType, a, b, d, Value(), aScale, bScale, aType, bType,
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
-                 ValueRange(mBarriers), ValueRange(barrierPreds),
-                 forceAsync || !mBarriers.empty() /* is_async */);
+                 ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
            })
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
@@ -725,6 +723,8 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXRewriteLocalAlias);
   ADD_PASS_WRAPPER_0("add_tlx_resolve_placeholder_layouts",
                      tlx::createTLXResolvePlaceholderLayouts);
+  ADD_PASS_WRAPPER_0("add_tlx_print_ttgir_to_tlx",
+                     tlx::createTLXPrintTTGIRToTLX);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
                             std::string, int32_t, int32_t, int32_t);
 }

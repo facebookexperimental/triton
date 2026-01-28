@@ -422,6 +422,9 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
+        # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
+        if knobs.nvidia.dump_ttgir_to_tlx:
+            tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)

@@ -24,6 +24,90 @@ namespace mlir {
 
 using OperationListT = std::vector<Operation *>;
 
+//===----------------------------------------------------------------------===//
+// MemoryPlannerBase - Abstract base class for memory planners
+//===----------------------------------------------------------------------===//
+
+/// Abstract base class for memory planners in warp-specialized kernels.
+/// Provides common functionality for both SMEM and TMEM memory planning,
+/// including operation ID mapping, channel lookup, and liveness computation.
+/// Subclasses implement memory-type-specific allocation strategies.
+class MemoryPlannerBase {
+public:
+  MemoryPlannerBase(Operation *operation, Allocation *allocation,
+                    SmallVector<Channel *> *channels)
+      : operation(operation), allocation(allocation), channels(channels) {}
+
+  virtual ~MemoryPlannerBase() = default;
+
+  /// Run the memory planner with the given number of buffers.
+  /// @param numBuffers Number of buffers for multi-buffering (SMEM) or
+  ///                   starting buffer ID (TMEM)
+  /// @return LogicalResult indicating success or failure.
+  virtual LogicalResult run(unsigned numBuffers) = 0;
+
+protected:
+  Operation *operation;
+  Allocation *allocation;
+  SmallVector<Channel *> *channels;
+  DenseMap<Operation *, size_t> operationId;
+
+  /// Build the operation ID map by walking the operation tree.
+  /// Assigns monotonically increasing IDs to operations in post-order.
+  void buildOperationIdMap() {
+    operation->walk<WalkOrder::PostOrder>([&](Operation *op) {
+      LLVM_DEBUG(
+          op->setAttr("operation_id",
+                      IntegerAttr::get(IntegerType::get(op->getContext(), 32),
+                                       operationId.size())));
+      operationId[op] = operationId.size();
+    });
+  }
+
+  /// Get the channel kind this planner handles.
+  /// @return DataChannelKind::SMEMPost or DataChannelKind::TMEMPost
+  virtual DataChannelKind getChannelKind() const = 0;
+
+  /// Compute the liveness interval for a value.
+  /// @param value The allocation value to compute liveness for
+  /// @return Interval representing the live range in operation IDs
+  virtual Interval<size_t> computeLivenessInterval(Value value) = 0;
+
+  /// Compute the interval for the liveness operations.
+  /// @param liveOps The vector of live operations
+  /// @return Interval representing the live range in operation IDs
+  Interval<size_t> computeIntervalFromOps(const OperationListT &liveOps) {
+    if (liveOps.empty()) {
+      return Interval<size_t>(0, 0);
+    }
+    auto minId = std::numeric_limits<size_t>::max();
+    auto maxId = std::numeric_limits<size_t>::min();
+    for (Operation *liveOp : liveOps) {
+      if (operationId[liveOp] < minId) {
+        minId = operationId[liveOp];
+      }
+      if ((operationId[liveOp] + 1) > maxId) {
+        maxId = operationId[liveOp] + 1;
+      }
+    }
+    return Interval(minId, maxId);
+  }
+
+  /// Get the interval for a control operation (ForOp).
+  /// @param ctrlOp The control operation (typically a scf::ForOp)
+  /// @return Interval from first instruction to the control op
+  Interval<size_t> getIntervalForCtrlOp(Operation *ctrlOp) {
+    auto forOp = dyn_cast<scf::ForOp>(ctrlOp);
+    if (!forOp) {
+      return Interval<size_t>(0, 0);
+    }
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      return Interval(operationId[&op], operationId[ctrlOp]);
+    }
+    return Interval(operationId[ctrlOp], operationId[ctrlOp]);
+  }
+};
+
 /// Check if a ForOp is an innermost loop (contains no nested ForOps).
 /// @param forOp The loop operation to check
 /// @return true if the loop has no nested ForOp, false otherwise
@@ -97,50 +181,6 @@ static LogicalResult getAllAcutalUsersForChannel(Channel *TheCh,
     auto actual = getActualConsumers(op);
     for (auto *tOp : actual)
       users.insert(tOp);
-  }
-  return success();
-}
-
-/// Collect live operations for a channel within a single basic block.
-/// Records all operations from the source operation to the last destination
-/// operation (inclusive). Assumes source and destinations are in the same
-/// block.
-/// @param TheCh The channel (must be TMEMPost or SMEMPost kind)
-/// @param liveOps Output vector to collect the live operations
-/// @return success() if channel is valid, failure() otherwise
-static LogicalResult updateLiveOpsInOneBlock(Channel *TheCh,
-                                             OperationListT &liveOps) {
-  if (!TheCh) {
-    return failure();
-  }
-  if (TheCh->channelKind != DataChannelKind::TMEMPost &&
-      TheCh->channelKind != DataChannelKind::SMEMPost) {
-    return failure();
-  }
-  Operation *src = TheCh->getSrcOp();
-  if (!src) {
-    return success();
-  }
-  SmallVector<Operation *> dsts;
-  TheCh->getDstOps(dsts);
-  Operation *lastDst = TheCh->getDstOpLast();
-  // Assuming they are in the same block, insert ops from src to dsts.
-  auto *block = src->getBlock();
-  if (!block) {
-    return success();
-  }
-  bool foundStart = false;
-  for (auto &op : block->getOperations()) {
-    if (&op == src) {
-      foundStart = true;
-      liveOps.push_back(&op);
-      continue;
-    }
-    if (foundStart)
-      liveOps.push_back(&op);
-    if (&op == lastDst) {
-      break;
-    }
   }
   return success();
 }
@@ -289,19 +329,48 @@ namespace triton {
 /// consumer relationships and assigns buffer IDs and copy counts for
 /// multi-buffering optimization. Buffers used in innermost loops with 2D+
 /// shapes are candidates for multi-buffering with the specified numBuffers.
-class MemoryPlanner {
+class MemoryPlanner : public MemoryPlannerBase {
 public:
   MemoryPlanner(Operation *operation, Allocation *allocation,
                 SmallVector<Channel *> *channels)
-      : operation(operation), allocation(allocation), channels(channels) {}
+      : MemoryPlannerBase(operation, allocation, channels), lastBufferId(0) {}
+
+  /// Get the next available buffer ID after running the planner.
+  unsigned getLastBufferId() const { return lastBufferId; }
+
+protected:
+  DataChannelKind getChannelKind() const override {
+    return DataChannelKind::SMEMPost;
+  }
+
+  Interval<size_t> computeLivenessInterval(Value value) override {
+    auto liveOps = livenessForSmemChannel(value);
+    if (liveOps.empty()) {
+      return Interval<size_t>(0, 0);
+    }
+    return computeIntervalFromOps(liveOps);
+  }
 
 private:
-  using BufferT = Allocation::BufferT;
-  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<size_t>>;
-  Operation *operation;
-  Allocation *allocation;
-  SmallVector<Channel *> *channels;
-  BufferRangeMapT bufferRange;
+  bool usersInInnermostLoop(Operation *alloc) {
+    Channel *ch = findChannelForOp(alloc, *channels);
+    if (!ch || ch->channelKind != getChannelKind()) {
+      return false;
+    }
+    DenseSet<Operation *> users;
+    (void)getAllAcutalUsersForChannel(ch, users, alloc);
+    if (users.empty())
+      return false;
+    auto *first = *(users.begin());
+    for (auto *user : users) {
+      if (user->getBlock() != first->getBlock())
+        return false;
+    }
+    auto parentLoop = first->getParentOfType<scf::ForOp>();
+    if (!parentLoop)
+      return false;
+    return isInnermostLoop(parentLoop);
+  }
 
   void getExplicitValueSize(Operation *op) {
     auto alloc = dyn_cast<ttg::LocalAllocOp>(op);
@@ -325,7 +394,6 @@ private:
   }
 
   void getValuesAndSizes() {
-    // Get the alloc values
     operation->walk<WalkOrder::PreOrder>(
         [&](Operation *op) { getExplicitValueSize(op); });
   }
@@ -344,10 +412,8 @@ private:
   }
 
   OperationListT livenessForSmemChannel(Value value) {
-    // Find the channel for value in channels.
     Operation *alloc = value.getDefiningOp();
     Channel *ch = findChannelForAlloc(value, *channels);
-    // Check if channel is an SMEMPost channel
     ChannelPost *TheCh = nullptr;
     if (ch && ch->channelKind == DataChannelKind::SMEMPost) {
       TheCh = static_cast<ChannelPost *>(ch);
@@ -360,16 +426,8 @@ private:
   }
 
   void resolveLiveness() {
-    DenseMap<Operation *, size_t> operationId;
-    operation->walk<WalkOrder::PostOrder>([&](Operation *op) {
-      LLVM_DEBUG(
-          op->setAttr("operation_id",
-                      IntegerAttr::get(IntegerType::get(op->getContext(), 32),
-                                       operationId.size())));
-      operationId[op] = operationId.size();
-    });
+    buildOperationIdMap();
 
-    // Analyze liveness of explicit buffers
     Liveness liveness(operation);
     auto getValueLivenessRange = [&](Value value) {
       Operation *defOp = value.getDefiningOp();
@@ -379,9 +437,6 @@ private:
       });
       auto liveOperations = livenessForSmemChannel(value);
 
-      // If no live operations found (e.g., for allocations outside loops
-      // without valid channels), return an empty interval at the beginning.
-      // This allocation won't interfere with any operations.
       if (liveOperations.empty()) {
         return Interval<size_t>(0, 0);
       }
@@ -410,40 +465,12 @@ private:
   }
 
 public:
-  unsigned run(unsigned numBuffers) {
+  LogicalResult run(unsigned numBuffers) override {
     getValuesAndSizes();
     resolveLiveness();
-    // Try to set buffer.copy, buffer.id, heuristics: for channels in innermost
-    // loop, set to maxStage Make sure the configuration will fit in SMEM.
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
-    auto usedInnermostLoop = [&](Operation *alloc) -> bool {
-      Channel *ch = findChannelForOp(alloc, *channels);
-      // Check if channel is an SMEMPost channel
-      ChannelPost *TheCh = nullptr;
-      if (ch && ch->channelKind == DataChannelKind::SMEMPost) {
-        TheCh = static_cast<ChannelPost *>(ch);
-      }
-      DenseSet<Operation *> users;
-      (void)getAllAcutalUsersForChannel(TheCh, users, alloc);
-      // If no users found (e.g., for allocations outside loops), not in
-      // innermost loop
-      if (users.empty())
-        return false;
-      // All users are in the same block and in the innermost loop.
-      auto *first = *(users.begin());
-      for (auto *user : users) {
-        if (user->getBlock() != first->getBlock())
-          return false;
-      }
-      auto parentLoop = first->getParentOfType<scf::ForOp>();
-      // If users are outside loops, they're not in the innermost loop
-      if (!parentLoop)
-        return false;
-      return isInnermostLoop(parentLoop);
-    };
-    // Keep track of unique element types. We don't support casting between
-    // different element types.
+
     DenseMap<int, Type> idTypes;
     for (auto bufferIter : bufferRange) {
       Operation *owner = bufferIter.first->owner;
@@ -451,14 +478,12 @@ public:
       auto aType = sAlloc.getType();
       auto allocDescType = cast<triton::gpu::MemDescType>(aType);
       auto elemType = aType.getElementType();
-      // FIXME: reuse for buffers in inner most loop, set copy to numBuffers,
-      // when the shape is 2D.
       unsigned numD = 0;
       for (int shape : allocDescType.getShape()) {
         if (shape > 1)
           ++numD;
       }
-      if (usedInnermostLoop(owner) && numD >= 2) {
+      if (usersInInnermostLoop(owner) && numD >= 2) {
         if (bufferIdInnermost < 0) {
           bufferIdInnermost = bufferId;
           ++bufferId;
@@ -475,7 +500,6 @@ public:
             "buffer.id",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
                              bufferIdInnermost));
-        // FIXME: heuristics
         owner->setAttr(
             "buffer.copy",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
@@ -488,15 +512,16 @@ public:
             "buffer.id",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
                              bufferId));
-        // FIXME: heuristics
         owner->setAttr(
             "buffer.copy",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32), 1));
         ++bufferId;
       }
     }
-    return bufferId;
+    lastBufferId = bufferId;
+    return success();
   }
+
   void dumpBuffers() const {
     LDBG("Dump bufferRange: id size offset ---------");
     for (auto bufferIter : bufferRange) {
@@ -507,6 +532,13 @@ public:
       bufferIter.first->owner->dump();
     }
   }
+
+private:
+  using BufferT = Allocation::BufferT;
+  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<size_t>>;
+
+  BufferRangeMapT bufferRange;
+  unsigned lastBufferId;
 };
 } // namespace triton
 
@@ -574,69 +606,61 @@ namespace triton {
 /// and performs memory reuse optimization by allowing non-interfering buffers
 /// to share TMEM space. Prioritizes operand D (accumulator) allocations and
 /// larger buffers when assigning memory locations.
-class MemoryPlannerTmem {
+class MemoryPlannerTmem : public MemoryPlannerBase {
 public:
   MemoryPlannerTmem(Operation *operation, Allocation *allocation,
                     SmallVector<Channel *> *channels)
-      : operation(operation), allocation(allocation), channels(channels) {}
+      : MemoryPlannerBase(operation, allocation, channels) {}
+
+protected:
+  DataChannelKind getChannelKind() const override {
+    return DataChannelKind::TMEMPost;
+  }
+
+  Interval<size_t> computeLivenessInterval(Value value) override {
+    auto liveOps = livenessForTmemChannel(value, *channels);
+    if (liveOps.empty()) {
+      return Interval<size_t>(0, 0);
+    }
+    return computeIntervalFromOps(liveOps);
+  }
 
 private:
   using BufferT = Allocation::BufferT;
-  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<int>>;
+  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<size_t>>;
   using GraphT = DenseMap<BufferT *, DenseSet<BufferT *>>;
-  Operation *operation;
-  Allocation *allocation;
-  SmallVector<Channel *> *channels;
+
   BufferRangeMapT bufferRange;
 
-  // Copied from TensorMemoryAllocation.cpp
-  Interval<int> getLiveIntervals(Value value, Liveness &liveness,
-                                 DenseMap<Operation *, int> &operationId,
-                                 SmallVector<Channel *> &channels) {
-    auto liveOperations = livenessForTmemChannel(value, channels);
-    // Merge the alloc liverange with the liverange of any subview of the
-    // allocation.
+  Interval<size_t> getLiveIntervals(Value value, Liveness &liveness,
+                                    DenseMap<Operation *, size_t> &opId,
+                                    SmallVector<Channel *> &chans) {
+    auto liveOperations = livenessForTmemChannel(value, chans);
     SmallVector<Operation *> users(value.getUsers());
     while (!users.empty()) {
       Operation *user = users.pop_back_val();
       if (!isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp>(user))
         continue;
-      auto usersLivness = livenessForTmemChannel(user->getResult(0), channels);
+      auto usersLivness = livenessForTmemChannel(user->getResult(0), chans);
       liveOperations.insert(liveOperations.end(), usersLivness.begin(),
                             usersLivness.end());
       users.append(user->getResult(0).getUsers().begin(),
                    user->getResult(0).getUsers().end());
     }
-    auto minId = std::numeric_limits<int>::max();
-    auto maxId = std::numeric_limits<int>::min();
+    auto minId = std::numeric_limits<size_t>::max();
+    auto maxId = std::numeric_limits<size_t>::min();
     std::for_each(liveOperations.begin(), liveOperations.end(),
                   [&](Operation *liveOp) {
-                    if (operationId[liveOp] < minId) {
-                      minId = operationId[liveOp];
+                    if (opId[liveOp] < minId) {
+                      minId = opId[liveOp];
                     }
-                    if ((operationId[liveOp] + 1) > maxId) {
-                      maxId = operationId[liveOp] + 1;
+                    if ((opId[liveOp] + 1) > maxId) {
+                      maxId = opId[liveOp] + 1;
                     }
                   });
     return Interval(minId, maxId);
   }
 
-  Interval<int> getIntervalForCtrlOp(Operation *ctrlOp,
-                                     DenseMap<Operation *, int> &operationId) {
-    // get the operationId of the first instruction
-    auto forOp = dyn_cast<scf::ForOp>(ctrlOp);
-    if (!forOp) {
-      // Return empty interval if not a ForOp
-      return Interval(0, 0);
-    }
-    for (Operation &op : forOp.getBody()->without_terminator()) {
-      return Interval(operationId[&op], operationId[ctrlOp]);
-    }
-    // Empty loop body - return interval at ctrlOp
-    return Interval(operationId[ctrlOp], operationId[ctrlOp]);
-  }
-
-  // Return number of outer loops.
   unsigned getLoopDepth(Operation *op) {
     unsigned depth = 0;
     auto pOp = op->getParentOfType<scf::ForOp>();
@@ -651,21 +675,19 @@ public:
   LogicalResult run(unsigned bufferId) {
     Operation *parentOp = operation;
     SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
-    DenseMap<Operation *, int> operationId;
-    // Only consider allocs for channels.
-    parentOp->walk<WalkOrder::PostOrder>([&](Operation *op) {
-      operationId[op] = operationId.size();
+    buildOperationIdMap();
+    parentOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
       if (auto alloc = dyn_cast<triton::nvidia_gpu::TMEMAllocOp>(op)) {
         allocs.push_back(alloc);
       }
     });
     Liveness liveness(parentOp);
-    DenseMap<Operation *, Interval<int>> allocToIntervals;
+    DenseMap<Operation *, Interval<size_t>> allocToIntervals;
     DenseMap<Operation *, ttng::TMemAllocation> allocToSize;
     DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       ttng::TMEMAllocOp alloc = *it;
-      Interval<int> liveInterval =
+      Interval<size_t> liveInterval =
           getLiveIntervals(alloc, liveness, operationId, *channels);
       auto memDescType = alloc.getType();
       ttng::TMemAllocation allocSize = ttng::getTmemAllocSizes(memDescType);
@@ -787,7 +809,7 @@ public:
     for (auto *ctrlOp : innermostLoops) {
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocsForThisLoop;
       unsigned allocIdx = 0;
-      auto ctrlInt = getIntervalForCtrlOp(ctrlOp, operationId);
+      auto ctrlInt = getIntervalForCtrlOp(ctrlOp);
       for (auto alloc : allocs) {
         auto allocInt = bufferRange.lookup(buffers[allocIdx]);
         ++allocIdx;
@@ -832,7 +854,7 @@ public:
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
       SmallVector<BufferT *> &buffers,
       DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
-      DenseMap<Operation *, int> &operationId, Operation *ctrlOp,
+      DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
       unsigned bufferId) {
     auto alongDependencyChain = [&](Operation *src, Operation *dst,
                                     unsigned depChainCondition) -> bool {
@@ -848,7 +870,7 @@ public:
     auto sameLoop = [&](BufferT *alloc) -> bool {
       // cand belongs to ctrlOp.
       if (ctrlOp) {
-        auto ctrlInt = getIntervalForCtrlOp(ctrlOp, operationId);
+        auto ctrlInt = getIntervalForCtrlOp(ctrlOp);
         // If alloc also belongs to ctrlOp, return true.
         return bufferRange[alloc].intersects(ctrlInt);
       }
@@ -1123,7 +1145,7 @@ public:
     //   if belongs to the same loop and along the dependency chain
     //   or belongs to different loops and have the same partitions
     //   if there is enough space, allocate new space otherwise, reuse space
-    DenseMap<Operation *, Interval<int>> bufferSet;
+    DenseMap<Operation *, Interval<size_t>> bufferSet;
     Operation *candidateAlloc = nullptr;
     SmallVector<Operation *> allocOrder;
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
@@ -1215,7 +1237,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
   // otherwise, the liveness can't overlap.
   Allocation allocation;
   triton::MemoryPlanner planner(funcOp, &allocation, &channels);
-  unsigned bufferId = planner.run(numBuffers);
+  if (failed(planner.run(numBuffers)))
+    return failure();
+  unsigned bufferId = planner.getLastBufferId();
   LLVM_DEBUG(funcOp.dump());
   LLVM_DEBUG(planner.dumpBuffers());
   {

@@ -2762,6 +2762,34 @@ def test_size_of(device):
     torch.testing.assert_close(output, expected_sizes)
 
 
+def test_size_of_constexpr(device):
+
+    @triton.jit
+    def size_of_constexpr_kernel(output_ptr, DTYPE: tl.constexpr):
+        # Test size_of with constexpr dtype argument
+        size = tlx.size_of(DTYPE)
+        tl.store(output_ptr, size)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Test with float32 (4 bytes)
+    grid = lambda meta: (1, )
+    size_of_constexpr_kernel[grid](output, tl.float32)
+    assert output.item() == 4, f"Expected 4 for float32, got {output.item()}"
+
+    # Test with float16 (2 bytes)
+    size_of_constexpr_kernel[grid](output, tl.float16)
+    assert output.item() == 2, f"Expected 2 for float16, got {output.item()}"
+
+    # Test with int8 (1 byte)
+    size_of_constexpr_kernel[grid](output, tl.int8)
+    assert output.item() == 1, f"Expected 1 for int8, got {output.item()}"
+
+    # Test with int64 (8 bytes)
+    size_of_constexpr_kernel[grid](output, tl.int64)
+    assert output.item() == 8, f"Expected 8 for int64, got {output.item()}"
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dots_blackwell_tmem(device):
     """
@@ -3990,3 +4018,56 @@ def test_barrier_wait_no_remote_view(device):
         barrier_wait_remote_view_kernel[grid](ctas_per_cga=(2, 1, 1))
     exc_msg = str(e.value)
     assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"
+
+
+@triton.jit
+def _test_get_fp8_format_name_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+    EXPECTED: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    if result == EXPECTED:
+        tl.store(output_ptr, 1)
+    else:
+        tl.store(output_ptr, 0)
+
+
+@triton.jit
+def _test_get_fp8_format_name_unsupported_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    tl.store(output_ptr, result == "e5m2")
+
+
+@pytest.mark.parametrize(
+    "dtype,expected",
+    [
+        (tl.float8e5, "e5m2"),
+        (tl.float8e4nv, "e4m3"),
+    ],
+)
+def test_get_fp8_format_name(dtype, expected, device):
+    """Test that FP8 dtypes return correct format strings."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    _test_get_fp8_format_name_kernel[(1, )](output, DTYPE=dtype, EXPECTED=expected)
+    assert output.item() == 1
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        tl.float32,
+        tl.float16,
+        tl.int32,
+    ],
+)
+def test_get_fp8_format_name_unsupported_dtype_raises_error(dtype, device):
+    """Test that non-FP8 dtypes raise a CompilationError during compilation."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    with pytest.raises(triton.CompilationError) as exc_info:
+        _test_get_fp8_format_name_unsupported_kernel[(1, )](output, DTYPE=dtype)
+    # Check that the underlying cause mentions the supported types
+    assert "only supports tl.float8e5" in str(exc_info.value.__cause__)
