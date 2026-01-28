@@ -341,7 +341,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,
-              std::optional<Value> alias) -> mlir::Value {
+              std::optional<Value> alias,
+              std::optional<Value> storageAlias) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttng::TensorMemorySpaceAttr::get(context);
              auto memDesc =
@@ -349,6 +350,9 @@ void init_triton_tlx_ir(py::module &&m) {
                                        memorySpace, /*mutableMemory=*/true);
              if (alias)
                return self.create<tlx::LocalAliasOp>(memDesc, *alias);
+             else if (storageAlias)
+               return self.create<tlx::StorageAliasLocalAllocOp>(
+                   memDesc, *storageAlias);
              else
                return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
            })
@@ -486,7 +490,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_local_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,
-              std::optional<Value> alias) -> mlir::Value {
+              std::optional<Value> alias,
+              std::optional<Value> storageAlias) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto memDesc =
@@ -494,6 +499,9 @@ void init_triton_tlx_ir(py::module &&m) {
                                        memorySpace, /*mutableMemory=*/true);
              if (alias)
                return self.create<tlx::LocalAliasOp>(memDesc, *alias);
+             else if (storageAlias)
+               return self.create<tlx::StorageAliasLocalAllocOp>(
+                   memDesc, *storageAlias);
              else
                return self.create<ttg::LocalAllocOp>(memDesc);
            })
@@ -725,6 +733,8 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXResolvePlaceholderLayouts);
   ADD_PASS_WRAPPER_0("add_tlx_print_ttgir_to_tlx",
                      tlx::createTLXPrintTTGIRToTLX);
+  ADD_PASS_WRAPPER_0("add_tlx_storage_alias_lowering",
+                     tlx::createTLXStorageAliasLowering);
   ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
                             std::string, int32_t, int32_t, int32_t);
 }

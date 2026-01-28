@@ -109,4 +109,70 @@ def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
   ];
 }
 
+def TLXStorageAliasSizeDefinition : Pass<"tlx-storage-alias-size-definition", "mlir::ModuleOp"> {
+  let summary = "Compute or validate storage alias sizes";
+
+  let description = [{
+    For each storage_alias_spec, this pass computes the required buffer size
+    as the maximum of all referencing storage_alias_local_alloc operations.
+
+    If the storage_alias_spec has an explicit buffer_size_bytes:
+    - Validates that the size is sufficient for all referencing allocations
+    - Emits an error if the size is too small
+
+    If the storage_alias_spec has no explicit size:
+    - Computes the size as the maximum of all referencing allocations
+    - Updates the storage_alias_spec with the computed size
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TLXStorageAliasAllocation : Pass<"tlx-storage-alias-allocation", "mlir::ModuleOp"> {
+  let summary = "Materialize storage alias allocations";
+
+  let description = [{
+    This pass eliminates storage_alias_spec operations by materializing actual
+    memory allocations and updates all referencing storage_alias_local_alloc
+    operations to use local_alias with the allocated buffer.
+
+    This pass must run after TLXStorageAliasSizeDefinition to ensure that
+    all storage alias specifications have their sizes set.
+
+    The pass performs the following transformations:
+    1. Creates a LocalAllocOp/TMEMAllocOp for each storage_alias_spec
+    2. Replaces storage_alias_local_alloc with local_alias referencing the allocation
+    3. Erases the original storage_alias_spec operations
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower storage alias operations (combined size definition and allocation)";
+
+  let description = [{
+    This pass combines TLXStorageAliasSizeDefinition and TLXStorageAliasAllocation
+    into a single pass for convenience. It performs all storage alias lowering
+    in one step:
+
+    1. Computes or validates storage alias sizes (TLXStorageAliasSizeDefinition)
+    2. Materializes storage alias allocations (TLXStorageAliasAllocation)
+
+    The individual passes (TLXStorageAliasSizeDefinition and TLXStorageAliasAllocation)
+    remain available for testing and debugging purposes.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 #endif // TRITON_TLX_PASSES

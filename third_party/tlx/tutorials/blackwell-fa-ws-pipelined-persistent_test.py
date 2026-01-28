@@ -351,6 +351,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
                  GROUP_SIZE_N: tl.constexpr,  #
+                 USE_STORAGE_ALIAS_SPEC: tl.constexpr,  #
                  ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -398,48 +399,95 @@ def _attn_fwd_ws(sm_scale, M,  #
     o_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    # allocate TMEM buffers and barriers
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
-    # Shared buffer for QK, P and Alpha, l, and m.
-    # A single QK buffer is split evenly:
-    #   - First half  : stores P
-    #   - Second half  : stores Alpha, l, and m
-    #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
-    #     P:                                                |  BLK_M/2 * BLOCK_N * fp16 |
-    #  Alpha : |BLK_M/2*1*fp32|
-    #     l :                 |BLK_M/2*1*fp32|
-    #     m :                                |BLK_M/2*1*fp32|
-    # When working with smaller dtypes (e.g. FP8), we pad the original data to match the original
-    # boundaries and prevent overlap.
-    NUM_P_BUFFERS: tl.constexpr = NUM_MMA_GROUPS * NUM_MMA_SLICES * 2 * P_PADDING
-    p_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
-        tlx.dtype_of(desc_v),
-        NUM_P_BUFFERS,
-        tlx.storage_kind.tmem,
-        reuse=qk_tiles,
-    )
-    alpha_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-        reuse=qk_tiles,
-    )
-    l_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-        reuse=qk_tiles,
-    )
-    m_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-        reuse=qk_tiles,
-    )
+
+    # Conditionally use storage_alias_spec or qk_tiles for reuse
+    if USE_STORAGE_ALIAS_SPEC:
+        qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+        # allocate TMEM buffers and barriers
+        qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem, reuse=qk_storage_alias)
+        # Shared buffer for QK, P and Alpha, l, and m.
+        # A single QK buffer is split evenly:
+        #   - First half  : stores P
+        #   - Second half  : stores Alpha, l, and m
+        #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
+        #     P:                                                |  BLK_M/2 * BLOCK_N * fp16 |
+        #  Alpha : |BLK_M/2*1*fp32|
+        #     l :                 |BLK_M/2*1*fp32|
+        #     m :                                |BLK_M/2*1*fp32|
+        # When working with smaller dtypes (e.g. FP8), we pad the original data to match the original
+        # boundaries and prevent overlap.
+        NUM_P_BUFFERS: tl.constexpr = NUM_MMA_GROUPS * NUM_MMA_SLICES * 2 * P_PADDING
+        p_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
+            tlx.dtype_of(desc_v),
+            NUM_P_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        alpha_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        l_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        m_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+    else:
+        # allocate TMEM buffers and barriers
+        qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
+        # Shared buffer for QK, P and Alpha, l, and m.
+        # A single QK buffer is split evenly:
+        #   - First half  : stores P
+        #   - Second half  : stores Alpha, l, and m
+        #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
+        #     P:                                                |  BLK_M/2 * BLOCK_N * fp16 |
+        #  Alpha : |BLK_M/2*1*fp32|
+        #     l :                 |BLK_M/2*1*fp32|
+        #     m :                                |BLK_M/2*1*fp32|
+        # When working with smaller dtypes (e.g. FP8), we pad the original data to match the original
+        # boundaries and prevent overlap.
+        NUM_P_BUFFERS: tl.constexpr = NUM_MMA_GROUPS * NUM_MMA_SLICES * 2 * P_PADDING
+        p_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
+            tlx.dtype_of(desc_v),
+            NUM_P_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_tiles,
+        )
+        alpha_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_tiles,
+        )
+        l_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_tiles,
+        )
+        m_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_tiles,
+        )
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
@@ -1649,7 +1697,9 @@ def _attn_bwd_ws(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M):
+    def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M, USE_STORAGE_ALIAS_SPEC):
+        # Note: USE_STORAGE_ALIAS_SPEC is added solely for testing purposes. When the API is fully
+        # implemented we will unify to a single implementation.
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -1724,6 +1774,7 @@ class _attention(torch.autograd.Function):
             # Useful for resetting autotuning.
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
+            USE_STORAGE_ALIAS_SPEC=USE_STORAGE_ALIAS_SPEC,  #
             **extra_kern_args,
         )
 
@@ -1861,6 +1912,7 @@ attention = _attention.apply
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
 @pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("USE_STORAGE_ALIAS_SPEC", [False, True])
 def test_op(
     Z,
     H,
@@ -1872,6 +1924,7 @@ def test_op(
     BLOCK_M1,
     GROUP_SIZE_M,
     dtype,
+    USE_STORAGE_ALIAS_SPEC,
 ):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
@@ -1900,7 +1953,7 @@ def test_op(
         q = q.to(dtype)
         k = k.to(dtype)
         v = v.to(dtype)
-    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).to(dtype)
+    tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M, USE_STORAGE_ALIAS_SPEC).to(dtype)
     if mode == "fwd":
         tri_out = tri_out.to(ref_dtype)
         # Largest atol measured for FP8 fwd was ~0.15. Seems like 0.4%

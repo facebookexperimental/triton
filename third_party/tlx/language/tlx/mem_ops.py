@@ -113,12 +113,28 @@ def local_alloc(
     dtype: tl.dtype,
     num: tl.constexpr,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
-    reuse: Optional[tlx.buffered_tensor] = None,
+    reuse: Optional[tlx.buffered_tensor | tlx.storage_alias_spec] = None,
     layout: Optional[tlx.shared_layout_encoding] = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
     Allocates buffer in shared memory and return a view of the buffer.
+
+    Args:
+        shape: Shape of each buffer (excluding the num dimension).
+        dtype: Data type of the buffer elements.
+        num: Number of buffers to allocate (compile-time constant).
+        storage: Storage kind (smem or tmem).
+        reuse: Optional buffer reuse specification:
+            - buffered_tensor: Reuse an existing buffer's memory (legacy).
+            - storage_alias_spec: Reference a storage alias specification.
+        layout: Optional memory layout encoding.
+
+    Returns:
+        A buffered_tensor representing the allocated buffers.
+
+    Raises:
+        ValueError: If reuse storage kind doesn't match the specified storage.
     """
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
@@ -186,19 +202,36 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
     alias_handle = None
+    shared_buffer_handle = None
     if reuse:
-        # reuse tensor has to be a buffered tensor
-        if not isinstance(reuse, tlx.buffered_tensor):
-            raise ValueError("reuse tensor has to be a buffered tensor")
-        # verify that the reuse tensor has the same storage
-        if reuse.type.storage != storage:
-            raise ValueError("reuse tensor has different storage")
-        alias_handle = reuse.handle
+        if isinstance(reuse, tlx.buffered_tensor):
+            # Legacy behavior: reuse an existing buffer's memory
+            # verify that the reuse tensor has the same storage
+            if reuse.type.storage != storage:
+                raise ValueError("reuse tensor has different storage")
+            alias_handle = reuse.handle
+        elif isinstance(reuse, tlx.storage_alias_spec):
+            # New behavior: reference a storage alias specification
+            if reuse.storage != storage:
+                raise ValueError(
+                    f"storage_alias_spec storage ({reuse.storage.value}) "
+                    f"doesn't match local_alloc storage ({storage.value})"
+                )
+            shared_buffer_handle = reuse.handle
+        else:
+            raise ValueError(
+                f"reuse must be a buffered_tensor or storage_alias_spec, "
+                f"got {type(reuse)}"
+            )
 
     if storage == tlx.storage_kind.smem:
-        tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle, alias_handle)
+        tensor_handle = _semantic.builder.create_local_alloc(
+            full_shape, elem_type, layout_handle, alias_handle, shared_buffer_handle
+        )
     else:
-        tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle)
+        tensor_handle = _semantic.builder.create_tmem_alloc(
+            full_shape, elem_type, layout_handle, alias_handle, shared_buffer_handle
+        )
 
     return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
