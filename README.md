@@ -729,21 +729,21 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
-[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-pipelined_test.py)
+[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_pipelined_test.py)
 
-[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-pipelined_test.py)
+[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_pipelined_test.py)
 
-[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-ws_test.py)
+[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_ws_test.py)
 
-[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-ws_test.py)
+[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws_test.py)
 
-[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell-grouped-gemm_test.py)
+[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell_grouped_gemm_test.py)
 
 ### Attention kernels
 
-[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws-pipelined-persistent_test.py)
+[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell_fa_ws_pipelined_persistent_test.py)
 
-[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py)
+[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py)
 
 
 
@@ -760,7 +760,7 @@ pip install -e .
 
 Run the tutorials after the build finishes, e.g,
 ```
-python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py
+python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py
 ```
 
 ## More reading materials
