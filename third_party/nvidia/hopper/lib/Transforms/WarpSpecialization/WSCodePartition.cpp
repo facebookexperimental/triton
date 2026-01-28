@@ -745,7 +745,7 @@ getTaskTopRegion(triton::FuncOp funcOp,
 }
 
 // Create an allocation to hold the mbarriers.
-static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
+static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance, StringRef debugName = "") {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -763,8 +763,14 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   Type singleBarrierMemDescType = ttg::MemDescType::get(
       {1}, builder.getI64Type(), barrierEncoding,
       barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
+  // If debugName is provided, wrap the location with NameLoc so that
+  // the SSA value will be named when printNameLocAsPrefix is enabled.
+  Location allocLoc = loc;
+  if (!debugName.empty()) {
+    allocLoc = NameLoc::get(builder.getStringAttr(debugName), loc);
+  }
   Value barrierAlloc = builder.create<mlir::triton::gpu::LocalAllocOp>(
-      loc, barrierMemDescType, Value());
+      allocLoc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
     Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
     Value barrierView = builder.create<ttg::MemDescIndexOp>(
@@ -854,13 +860,13 @@ void createToken(
     }
     if (hasTMAProducer) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), "tma_producer");
     }
     // Pattern matching for tmem_store --> getD --> tmem_load (gen5 is the
     // actual producer) or gen5 --> tmem_load
     if (ProducerIsGen5(producerOp))
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), "tcgen5_producer");
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
@@ -918,7 +924,7 @@ void createToken(
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(), "tcgen5_consumer");
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
@@ -1244,13 +1250,13 @@ void createTokenPost(
     }
     if (hasTMAProducer) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), "tma_producer");
     }
     // If channel is from a gen5, pre-allocate gen5 barrier.
     bool hasProdBar = false;
     if (isa<ttng::TCGen5MMAOp>(producerOp)) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), "tcgen5_producer");
       hasProdBar = true;
     }
     // Check if this channel needs token-based synchronization.
@@ -1339,7 +1345,7 @@ void createTokenPost(
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(), "tcgen5_consumer");
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
       }
     }
