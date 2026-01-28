@@ -9,12 +9,30 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir {
+
+// Helper to get OpPrintingFlags with NameLoc prefix enabled via env var
+static OpPrintingFlags getWSPrintingFlags() {
+  OpPrintingFlags flags;
+  if (triton::tools::getBoolEnv("TRITON_USE_NAMELOC_PREFIX")) {
+    flags.printNameLocAsPrefix(true);
+  }
+  return flags;
+}
+
+// Helper to dump module with appropriate printing flags
+static void dumpModuleIR(StringRef label, ModuleOp moduleOp) {
+  llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: " << label
+               << "\n";
+  moduleOp.print(llvm::dbgs(), getWSPrintingFlags());
+  llvm::dbgs() << "\n\n\n";
+}
 
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
@@ -86,26 +104,20 @@ public:
         // Partition key ops into multiple async tasks.
         doTaskPartition(funcOp, numWarpGroups);
         if (dumpIntermediateSteps) {
-          llvm::dbgs()
-              << "// -----// WarpSpec internal IR Dump After: doTaskPartition\n"
-              << moduleOp << "\n\n\n";
+          dumpModuleIR("doTaskPartition", moduleOp);
         }
         // Propagate taskId.
         int retCode = doTaskIdPropagate(funcOp);
         if (retCode == -1)
           continue;
         if (dumpIntermediateSteps) {
-          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskIdPropagate\n"
-                       << moduleOp << "\n\n\n";
+          dumpModuleIR("doTaskIdPropagate", moduleOp);
         }
 
         // Partition ops into parallel sub ops.
         if (doDataPartition(funcOp, numWarpGroups - 1)) {
           if (dumpIntermediateSteps) {
-            llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                            "doDataPartition\n"
-                         << moduleOp << "\n\n\n";
+            dumpModuleIR("doDataPartition", moduleOp);
           }
           success = true;
           break;
@@ -119,9 +131,7 @@ public:
       if (retCode == -1)
         signalPassFailure();
       if (dumpIntermediateSteps) {
-        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doTaskIdPropagate\n"
-                     << moduleOp << "\n\n\n";
+        dumpModuleIR("doTaskIdPropagate", moduleOp);
       }
     }
 
@@ -129,52 +139,38 @@ public:
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
     if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n"
-          << moduleOp << "\n\n\n";
+      dumpModuleIR("doBufferAllocation", moduleOp);
     }
 
     doMemoryPlanner(funcOp, numStages);
     if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"
-          << moduleOp << "\n\n\n";
+      dumpModuleIR("doMemoryPlanner", moduleOp);
     }
 
     doCodePartitionPost(funcOp, numStages);
     if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n"
-          << moduleOp << "\n\n\n";
+      dumpModuleIR("doCodePartition", moduleOp);
     }
 
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
-        llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n"
-            << moduleOp << "\n\n\n";
+        dumpModuleIR("doPingPongSync", moduleOp);
       }
     }
 
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n"
-          << moduleOp << "\n\n\n";
+      dumpModuleIR("doTokenLowering", moduleOp);
     }
 
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
     if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedulePreprocessing\n"
-                   << moduleOp << "\n\n\n";
+      dumpModuleIR("doLoopSchedulePreprocessing", moduleOp);
     }
     triton::gpu::scheduleLoops(moduleOp, defaultNumStages, true);
     if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedule\n"
-                   << moduleOp << "\n\n\n";
+      dumpModuleIR("doLoopSchedule", moduleOp);
     }
   }
 

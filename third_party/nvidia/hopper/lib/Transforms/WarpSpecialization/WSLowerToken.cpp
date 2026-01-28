@@ -210,6 +210,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       // We need bufferFullArray and bufferEmptyArray.
       if (auto op = dyn_cast<ttnvws::ProducerAcquireOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
+        bufferEmpty.setLoc(NameLoc::get(
+            builder.getStringAttr("producer_acquire"), bufferEmpty.getLoc()));
         auto pOp = user->getParentOp();
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
@@ -218,6 +220,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         return true;
       } else if (auto op = dyn_cast<ttnvws::ProducerCommitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
+        bufferFull.setLoc(NameLoc::get(builder.getStringAttr("producer_commit"),
+                                       bufferFull.getLoc()));
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processProducerCommitOp(builder, op, bufferFull, loadType,
@@ -226,6 +230,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
+        bufferFull.setLoc(NameLoc::get(builder.getStringAttr("consumer_wait"),
+                                       bufferFull.getLoc()));
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerWaitOp(builder, op, bufferFull);
@@ -233,6 +239,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerReleaseOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
+        bufferEmpty.setLoc(NameLoc::get(
+            builder.getStringAttr("consumer_release"), bufferEmpty.getLoc()));
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
