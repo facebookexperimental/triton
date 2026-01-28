@@ -4,6 +4,7 @@ add_triton_library(TritonTLXTransforms
   InsertRequireLayout.cpp
   RewriteLocalAlias.cpp
   ResolvePlaceholderLayouts.cpp
+  PrintTTGIRToTLX.cpp
 
   DEPENDS
   TritonTLXTransformsIncGen

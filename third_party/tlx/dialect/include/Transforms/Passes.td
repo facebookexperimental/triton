@@ -86,4 +86,27 @@ def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir
   ];
 }
 
+def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
+  let summary = "Print TTGIR operations with their TLX equivalents";
+
+  let description = [{
+    This pass walks through the TTGIR module and prints annotations showing
+    the mapping from TTGIR operations back to their TLX API equivalents.
+    This is useful for understanding the correspondence between the high-level
+    TLX Python API and the low-level TTGIR operations.
+
+    Example mappings:
+    - ttng::InitBarrierOp -> tlx.alloc_barriers
+    - ttng::WaitBarrierOp -> tlx.barrier_wait
+    - ttng::WarpGroupDotOp -> tlx.async_dot (Hopper)
+    - ttng::TCGen5MMAOp -> tlx.async_dot (Blackwell)
+    - ttg::LocalAllocOp -> tlx.local_alloc (smem)
+    - ttng::TMEMAllocOp -> tlx.local_alloc (tmem)
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 #endif // TRITON_TLX_PASSES
