@@ -672,7 +672,7 @@ private:
   }
 
 public:
-  LogicalResult run(unsigned bufferId) {
+  LogicalResult run(unsigned bufferId) override {
     Operation *parentOp = operation;
     SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
     buildOperationIdMap();
