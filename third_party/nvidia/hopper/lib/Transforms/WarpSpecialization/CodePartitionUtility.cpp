@@ -729,7 +729,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
     return mmaOp.emitError(
         "handleOperandD: MMA operation is not inside a scf.for loop");
   }
-  Operation *currentProd = nullptr;
+  // Track multiple producers when channels are skipped (same task IDs).
+  // All producers in the vector must share the exact same task IDs.
+  SmallVector<Operation *> currentProds;
   auto ctx = forOp.getContext();
   SmallVector<int> channelsToBeUpdate;
 
@@ -739,7 +741,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
     if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
       // Check if this store is outside the loop (not nested under forOp)
       if (!forOp->isProperAncestor(storeOp)) {
-        currentProd = storeOp;
+        currentProds.clear();
+        currentProds.push_back(storeOp);
         handledUsers.insert(storeOp);
       }
     }
@@ -755,7 +758,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         // If useAcc is false, the MMA doesn't read the accumulator - it
         // overwrites it completely. In this case, the MMA is the first
         // producer and doesn't need a prior producer.
-        if (currentProd == nullptr) {
+        if (currentProds.empty()) {
           Value useAccFlag = mmaOpT.useAccumulator();
           bool useAccIsFalse = false;
           if (useAccFlag) {
@@ -783,18 +786,19 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           }
           if (useAccIsFalse) {
             // MMA with use_acc=false is the first producer
-            currentProd = &op;
+            currentProds.clear();
+            currentProds.push_back(&op);
             continue;
           }
         }
-        if (currentProd == nullptr) {
+        if (currentProds.empty()) {
           mmaOp.emitError(
               "handleOperandD: no producer found for MMA operand D. "
               "Expected a tmem_store before the loop or use_acc=false.");
           return failure();
         }
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
+        // Start a channel from currentProds to op
+        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
         if (producerTaskIds.size() != 1) {
           mmaOp.emitError(
@@ -807,12 +811,30 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
             true /*isOperandD*/, true, channels.size());
         if (channel) {
-          auto channelID = channels.size();
-          channels.push_back(std::move(channel));
-          // Mark producer and consumer.
-          setTmemChannelAttr(currentProd, channelID, "tmem.start");
-          setTmemChannelAttr(&op, channelID, "tmem.end");
-          currentProd = &op;
+          // Use the existing channel for the first producer, create new
+          // channels for subsequent producers
+          for (size_t i = 0; i < currentProds.size(); ++i) {
+            auto *prod = currentProds[i];
+            if (i == 0) {
+              auto channelID = channels.size();
+              channels.push_back(std::move(channel));
+              setTmemChannelAttr(prod, channelID, "tmem.start");
+              setTmemChannelAttr(&op, channelID, "tmem.end");
+            } else {
+              auto channelID = channels.size();
+              auto prodChannel = createTmemDataChannelPost(
+                  producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+                  true /*isOperandD*/, true, channelID);
+              channels.push_back(std::move(prodChannel));
+              setTmemChannelAttr(prod, channelID, "tmem.start");
+              setTmemChannelAttr(&op, channelID, "tmem.end");
+            }
+          }
+          currentProds.clear();
+          currentProds.push_back(&op);
+        } else {
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
         }
       } else {
         if (mmaOpT.getD() == tmemAllocOp.getResult()) {
@@ -821,13 +843,13 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           return failure();
         }
         // This uses tmem. mark as tmem.end = channel_id
-        if (currentProd == nullptr) {
+        if (currentProds.empty()) {
           mmaOpT.emitError(
               "handleOperandD: no producer found for MMA consumer");
           return failure();
         }
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
+        // Start a channel from currentProds to op
+        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         if (producerTaskIds.size() != 1) {
           mmaOpT.emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
@@ -840,19 +862,37 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
             true /*isOperandD*/, true, channels.size());
         if (channel) {
-          auto channelID = channels.size();
-          channels.push_back(std::move(channel));
-          // Mark producer and consumer.
-          setTmemChannelAttr(currentProd, channelID, "tmem.start");
-          setTmemChannelAttr(&op, channelID, "tmem.end");
+          // Use the existing channel for the first producer, create new
+          // channels for subsequent producers
+          for (size_t i = 0; i < currentProds.size(); ++i) {
+            auto *prod = currentProds[i];
+            if (i == 0) {
+              auto channelID = channels.size();
+              channels.push_back(std::move(channel));
+              setTmemChannelAttr(prod, channelID, "tmem.start");
+              setTmemChannelAttr(&op, channelID, "tmem.end");
+            } else {
+              auto channelID = channels.size();
+              auto prodChannel = createTmemDataChannelPost(
+                  producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+                  true /*isOperandD*/, true, channelID);
+              channels.push_back(std::move(prodChannel));
+              setTmemChannelAttr(prod, channelID, "tmem.start");
+              setTmemChannelAttr(&op, channelID, "tmem.end");
+            }
+          }
+        } else {
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
         }
       }
     } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(&op)) {
-      currentProd = &op; // mark as tmem.start = channel_id
+      currentProds.clear();
+      currentProds.push_back(&op); // mark as tmem.start = channel_id
     } else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(&op)) {
-      if (currentProd) {
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
+      if (!currentProds.empty()) {
+        // Start a channel from currentProds to op
+        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         if (producerTaskIds.size() != 1) {
           loadOp.emitError("handleOperandD: expected exactly one producer task "
                            "ID for TMEMLoad, got ")
@@ -865,11 +905,28 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
             producerTaskId, consumerIds, tmemAllocOp.getOperation(),
             true /*isOperandD*/, true, channels.size());
         if (channel) {
-          auto channelID = channels.size();
-          channels.push_back(std::move(channel));
-          // Mark producer and consumer.
-          setTmemChannelAttr(currentProd, channelID, "tmem.start");
-          setTmemChannelAttr(&op, channelID, "tmem.end");
+          // Use the existing channel for the first producer, create new
+          // channels for subsequent producers
+          for (size_t i = 0; i < currentProds.size(); ++i) {
+            auto *prod = currentProds[i];
+            if (i == 0) {
+              auto channelID = channels.size();
+              channels.push_back(std::move(channel));
+              setTmemChannelAttr(prod, channelID, "tmem.start");
+              setTmemChannelAttr(&op, channelID, "tmem.end");
+            } else {
+              auto channelID = channels.size();
+              auto prodChannel = createTmemDataChannelPost(
+                  producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+                  true /*isOperandD*/, true, channelID);
+              channels.push_back(std::move(prodChannel));
+              setTmemChannelAttr(prod, channelID, "tmem.start");
+              setTmemChannelAttr(&op, channelID, "tmem.end");
+            }
+          }
+        } else {
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
         }
       } else {
         channelsToBeUpdate.push_back(channels.size());
@@ -889,13 +946,16 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   }
   // Update channel's producer here.
   for (auto idx : channelsToBeUpdate) {
-    if (!currentProd) {
+    if (currentProds.empty()) {
       // This can happen if ForOp never produces - should not occur in valid IR
       return mmaOp.emitError(
           "handleOperandD: no producer found for deferred channel update");
     }
-    channels[idx]->relation.first = getAsyncTaskIds(currentProd).front();
-    setTmemChannelAttr(currentProd, channels[idx]->uniqID, "tmem.start");
+    // For deferred channels, we only have one channel per consumer, so use
+    // the last producer in the vector (which should be the most recent).
+    auto *lastProd = currentProds.back();
+    channels[idx]->relation.first = getAsyncTaskIds(lastProd).front();
+    setTmemChannelAttr(lastProd, channels[idx]->uniqID, "tmem.start");
   }
   // For consumers outside of ForOp.
   for (auto *user : users) {
@@ -903,12 +963,12 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
       continue;
     // only handle tmem_load. FIXME: check if it is after the ForOp
     if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(user)) {
-      if (!currentProd) {
+      if (currentProds.empty()) {
         return loadOp.emitError(
             "handleOperandD: no producer found for TMEMLoad outside loop");
       }
-      // Start a channel from currentProd to user
-      auto producerTaskIds = getAsyncTaskIds(currentProd);
+      // Start a channel from currentProds to user
+      auto producerTaskIds = getAsyncTaskIds(currentProds.front());
       if (producerTaskIds.size() != 1) {
         return loadOp.emitError("handleOperandD: expected exactly one producer "
                                 "task ID, got ")
@@ -920,11 +980,28 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           producerTaskId, consumerIds, tmemAllocOp.getOperation(),
           true /*isOperandD*/, true, channels.size());
       if (channel) {
-        auto channelID = channels.size();
-        channels.push_back(std::move(channel));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(user, channelID, "tmem.end");
+        // Use the existing channel for the first producer, create new
+        // channels for subsequent producers
+        for (size_t i = 0; i < currentProds.size(); ++i) {
+          auto *prod = currentProds[i];
+          if (i == 0) {
+            auto channelID = channels.size();
+            channels.push_back(std::move(channel));
+            setTmemChannelAttr(prod, channelID, "tmem.start");
+            setTmemChannelAttr(user, channelID, "tmem.end");
+          } else {
+            auto channelID = channels.size();
+            auto prodChannel = createTmemDataChannelPost(
+                producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+                true /*isOperandD*/, true, channelID);
+            channels.push_back(std::move(prodChannel));
+            setTmemChannelAttr(prod, channelID, "tmem.start");
+            setTmemChannelAttr(user, channelID, "tmem.end");
+          }
+        }
+      } else {
+        // Channel skipped - append to producers vector
+        currentProds.push_back(user);
       }
     }
   }
