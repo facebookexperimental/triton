@@ -3688,6 +3688,212 @@ def test_make_tensor_descriptor(device):
     torch.testing.assert_close(x, y)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_make_tensor_descriptor_mxfp8(device):
+    """Test that encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp with MXFP8 scales.
+
+    When make_tensor_descriptor writes to a descPtr and reinterpret_tensor_descriptor
+    reads from the same descPtr, the shared memory encoding from the TMA operation
+    should propagate back to the make_tensor_descriptor operation.
+
+    This test uses MXFP8 with 5D TMA scales to verify the encoding propagation in a realistic
+    scaled GEMM scenario.
+    """
+
+    VEC_SIZE = 32  # mxfp8 uses 32 elements per scale factor
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def mxfp8_scaled_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        a_scale_ptr,
+        b_scale_ptr,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+    ):
+        # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
+
+        # Allocate separate descriptor pointers for each descriptor
+        desc_ptr_a = tlx.allocate_tensor_descriptor(num=1)
+        desc_ptr_b = tlx.allocate_tensor_descriptor(num=1)
+        desc_ptr_a_scale = tlx.allocate_tensor_descriptor(num=1)
+        desc_ptr_b_scale = tlx.allocate_tensor_descriptor(num=1)
+
+        # Create tensor descriptors and write to allocated pointers
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_a[0],
+            base=a_ptr,
+            shape=[M, K],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_b[0],
+            base=b_ptr,
+            shape=[K, N],
+            strides=[stride_bk, stride_bn],
+            block_shape=[BLOCK_K, BLOCK_N],
+        )
+
+        # 5D scale descriptors: [1, rep_m/n, rep_k, 2, 256] for cuBLAS block scaling layout
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_a_scale[0],
+            base=a_scale_ptr,
+            shape=[1, M // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[M // 128 * K // 32 // 4 * 2 * 2 * 128, K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_b_scale[0],
+            base=b_scale_ptr,
+            shape=[1, N // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[N // 128 * K // 32 // 4 * 2 * 2 * 128, K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        # Reinterpret the pointers as tensor descriptors
+        desc_a = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_a[0],
+            block_shape=[BLOCK_M, BLOCK_K],
+            dtype=tl.float8e4nv,
+        )
+        desc_b = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_b[0],
+            block_shape=[BLOCK_K, BLOCK_N],
+            dtype=tl.float8e4nv,
+        )
+        # 5D reinterpret for scales
+        desc_a_scale = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_a_scale[0],
+            block_shape=[1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+            dtype=tl.uint8,
+        )
+        desc_b_scale = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_b_scale[0],
+            block_shape=[1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+            dtype=tl.uint8,
+        )
+
+        # Allocate SMEM buffers
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float8e4nv, tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256] for cuBLAS block scaling layout
+        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
+
+        # Use reinterpreted descriptors for async loads
+        tlx.async_descriptor_load(desc_a, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(desc_b, b_tile[0], [0, 0], load_bar)
+        # 5D offset with leading 0
+        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tile[0], A_format, b_scale_tile[0], B_format,
+                             use_acc=False)
+
+        result = tlx.local_load(c_tile[0])
+        c = result.to(tl.float16)
+
+        # Store result
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        tl.store(c_ptrs, c)
+
+    triton.set_allocator(alloc_fn)
+    torch.manual_seed(0)
+    M, N, K = (128, 128, 256)
+    BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
+    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+
+    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+
+    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N, "M": M, "N": N, "K": K}
+    kernel = mxfp8_scaled_kernel[(1, 1)](
+        a,
+        a.stride(0),
+        a.stride(1),
+        b,
+        b.stride(0),
+        b.stride(1),
+        a_scale_5d,
+        b_scale_5d,
+        c,
+        c.stride(0),
+        c.stride(1),
+        "e4m3",
+        "e4m3",
+        **kern_kwargs,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+
+    # Verify that tensormap_create and reinterpret_tensor_descriptor operations are present
+    assert ttgir.count("ttng.tensormap_create") == 4, f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}"
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 4, f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+
+    # Verify encoding propagation: tensormap_create should have shared memory encoding
+    # The encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp
+    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, \
+        "Expected shared memory encoding in ttgir"
+
+    # Compute reference
+    def fp8e8m0_to_float32(scale):
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=1e-2)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_buffer_indexing_in_function_call(device):
     """Test that buffer indexing with [] syntax works correctly in function calls"""
