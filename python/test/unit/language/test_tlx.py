@@ -3869,8 +3869,11 @@ def test_make_tensor_descriptor_mxfp8(device):
     ttgir = kernel.asm["ttgir"]
 
     # Verify that tensormap_create and reinterpret_tensor_descriptor operations are present
-    assert ttgir.count("ttng.tensormap_create") == 4, f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}"
-    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 4, f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    assert ttgir.count("ttng.tensormap_create"
+                       ) == 4, f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}"
+    assert ttgir.count(
+        "ttng.reinterpret_tensor_descriptor"
+    ) == 4, f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
 
     # Verify encoding propagation: tensormap_create should have shared memory encoding
     # The encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp

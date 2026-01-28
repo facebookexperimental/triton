@@ -505,15 +505,14 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
       continue;
     auto blockTy = desc.getType().getBlockType();
     // Strip encoding from blockTy for lookup
-    auto keyTy = RankedTensorType::get(blockTy.getShape(),
-                                       blockTy.getElementType());
+    auto keyTy =
+        RankedTensorType::get(blockTy.getShape(), blockTy.getElementType());
     auto it = blockTypeToEncoding.find(keyTy);
     if (it == blockTypeToEncoding.end()) {
       blockTypeToEncoding[keyTy] = einfo->desiredEncoding;
     } else {
       // Prefer smaller swizzle width
-      auto existing =
-          dyn_cast<ttg::NVMMASharedEncodingAttr>(it->second);
+      auto existing = dyn_cast<ttg::NVMMASharedEncodingAttr>(it->second);
       auto candidate =
           dyn_cast<ttg::NVMMASharedEncodingAttr>(einfo->desiredEncoding);
       if (existing && candidate &&
