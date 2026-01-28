@@ -99,13 +99,15 @@ static Operation *getCommonScope(Operation *a, Operation *b) {
     parentScopes.insert(op);
     op = op->getParentOp();
   }
+  // Worst case the function should enclose both A and B.
+  parentScopes.insert(op);
   op = b;
   while (!isa<triton::FuncOp>(op)) {
     if (parentScopes.count(op))
       return op;
     op = op->getParentOp();
   }
-  return nullptr;
+  return parentScopes.count(op) ? op : nullptr;
 }
 
 // Return the lifted "op" that is directly under scope.
@@ -128,7 +130,6 @@ bool appearsBefore(Operation *A, Operation *B) {
     auto *outScope = getCommonScope(A, B);
     return appearsBefore(getLiftedOp(A, outScope), getLiftedOp(B, outScope));
   }
-  assert(A->getBlock() == B->getBlock());
   auto block = A->getBlock();
   for (auto &op : block->getOperations()) {
     if (&op == A) {

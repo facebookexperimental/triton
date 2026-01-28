@@ -1,3 +1,4 @@
+#include "CodePartitionUtility.h"
 #include "TaskIdPropagation.h"
 #include "Utility.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
@@ -99,23 +100,34 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
       if (forOp->isProperAncestor(storeOp))
         continue;
 
-      // Verify there is no other user at the same fixed offset (besides MMA)
-      // or that other users share the same task_id.
+      // Verify that the current MMA is the earliest user in program order,
+      // or that any earlier user has the same async task IDs.
+      // Track the earliest user with matching task IDs.
+      Operation *taskIdSource = mmaOp;
       bool validUser = true;
       for (auto otherUser : tmemAllocOp.getResult().getUsers()) {
-        if (otherUser == storeOp)
+        if (otherUser == storeOp || otherUser == mmaOp)
           continue;
-        if (auto otherMma = dyn_cast<ttng::TCGen5MMAOp>(otherUser)) {
-          auto otherTaskIds = getAsyncTaskIds(otherMma);
-          if (!otherTaskIds.empty() && otherTaskIds != mmaTaskIds) {
-            LDBG("Other MMA has different task_id, skipping");
+        // Check if otherUser appears before mmaOp in program order
+        if (appearsBefore(otherUser, mmaOp)) {
+          // Earlier user must have the same task IDs
+          auto otherTaskIds = getAsyncTaskIds(otherUser);
+          if (otherTaskIds.empty() || otherTaskIds != mmaTaskIds) {
+            LDBG(
+                "Earlier user has different task_id, skipping: " << *otherUser);
             validUser = false;
             break;
+          } else {
+            // Update to use the earliest matching user
+            taskIdSource = otherUser;
           }
         }
       }
       if (!validUser)
         continue;
+
+      // Get the task IDs from the earliest matching user
+      auto taskIdsToPropagate = getAsyncTaskIds(taskIdSource);
 
       // Step 4: Check if the TMEMStoreOp already has a task_id
       auto storeTaskIds = getAsyncTaskIds(storeOp);
@@ -132,9 +144,10 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
         LDBG("Found async_id from source: assigning to TMEMStoreOp");
         setAsyncTaskIds(storeOp, srcAsyncId);
       } else {
-        // Step 6: If no async_id found, assign the async_id from the MMA
-        LDBG("No async_id from source, using MMA task_id");
-        setAsyncTaskIds(storeOp, mmaTaskIds);
+        // Step 6: If no async_id found, assign the async_id from the earliest
+        // matching user
+        LDBG("No async_id from source, using task_id from earliest user");
+        setAsyncTaskIds(storeOp, taskIdsToPropagate);
       }
     }
   });
