@@ -100,14 +100,8 @@ public:
       if (isa<math::ExpOp, math::Exp2Op>(op)) {
         LDBG("Encounter a " << op->getName() << " op on Blackwell.");
         Type resultType = op->getResult(0).getType();
-        int64_t rank = -1;
-        if (auto tensorTy = dyn_cast<RankedTensorType>(resultType)) {
-          rank = tensorTy.getRank();
-          LDBG("RankedTensorType, rank is " << rank);
-        }
-        if (rank > 1)
-          return true;
-        return false;
+        if (auto tensorTy = dyn_cast<RankedTensorType>(resultType))
+          return tensorTy.getRank() > 1;
       }
       break;
     default:
