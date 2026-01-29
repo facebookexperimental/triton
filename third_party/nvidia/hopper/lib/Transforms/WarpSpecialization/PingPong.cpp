@@ -33,6 +33,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <unordered_set>
@@ -211,6 +212,137 @@ void getNestedFor(Region *partition,
       loopDepthMap[tDepth].push_back(subOp);
     }
   });
+}
+
+
+/// Determine which partition arrives first using the linearized schedule.
+/// Uses CoarseSchedule to find the operation that executes first in the
+/// linearized schedule order, then returns that operation's partition ID.
+///
+/// @param forOp The for loop containing the operations
+/// @param keyOps The candidate operations (one from each partition)
+/// @return partition ID that arrives first, or -1 if cannot determine
+int arrivesFirstWithLinearizedSchedule(scf::ForOp forOp,
+                                       llvm::ArrayRef<Operation *> keyOps) {
+  // Deserialize the CoarseSchedule from IR attributes
+  triton::CoarseSchedule schedule;
+  if (failed(schedule.deSerialize(forOp))) {
+    LDBG("Failed to deserialize CoarseSchedule");
+    return -1;
+  }
+
+  // Collect one representative op per partition that is in the schedule
+  llvm::DenseMap<int, Operation *> partitionToOp;
+  for (Operation *op : keyOps) {
+    int partitionId = getSingleTaskId(op);
+    if (partitionId == -1)
+      continue;
+    if (schedule.count(op) == 0) {
+      LDBG("Op not in schedule: " << op->getName());
+      continue;
+    }
+    if (partitionToOp.count(partitionId) == 0) {
+      partitionToOp[partitionId] = op;
+    }
+  }
+
+  // Get the two candidate ops
+  SmallVector<Operation *, 2> candidateOps;
+  SmallVector<int, 2> partitionIds;
+  for (auto &[partitionId, op] : partitionToOp) {
+    candidateOps.push_back(op);
+    partitionIds.push_back(partitionId);
+  }
+
+  Operation *op1 = candidateOps[0];
+  Operation *op2 = candidateOps[1];
+  int partition1 = partitionIds[0];
+  int partition2 = partitionIds[1];
+
+  // Use CoarseSchedule to determine which op comes first
+  if (schedule.isOpBefore(op1, op2)) {
+    LDBG("Linearized schedule: partition " << partition1 << " arrives first");
+    return partition1;
+  } else {
+    LDBG("Linearized schedule: partition " << partition2 << " arrives first");
+    return partition2;
+  }
+}
+
+/// Check if pingpong pass should bail out due to non-alternating schedule.
+/// Uses findNext to verify that candidate operations alternate in the
+/// linearized schedule. If the same op is found twice in sequence, the
+/// scheduling is not alternating and pingpong should abort.
+///
+/// @param forOp The for loop containing the operations
+/// @param keyOps The candidate operations (one from each partition)
+/// @return true if should bail out (not alternating), false if safe to proceed
+bool shouldBailOutDueToNonAlternating(scf::ForOp forOp,
+                                      llvm::ArrayRef<Operation *> keyOps) {
+  // Deserialize the CoarseSchedule from IR attributes
+  triton::CoarseSchedule schedule;
+  if (failed(schedule.deSerialize(forOp))) {
+    LDBG("No CoarseSchedule available - cannot verify alternation");
+    // If no schedule exists, we can't verify - don't bail out, let other
+    // heuristics handle it
+    return false;
+  }
+
+  // Collect one representative op per partition that is in the schedule
+  llvm::DenseMap<int, Operation *> partitionToOp;
+  for (Operation *op : keyOps) {
+    int partitionId = getSingleTaskId(op);
+    if (partitionId == -1)
+      continue;
+    if (schedule.count(op) == 0)
+      continue;
+    if (partitionToOp.count(partitionId) == 0) {
+      partitionToOp[partitionId] = op;
+    }
+  }
+
+  // Get the two candidate ops
+  SmallVector<Operation *, 2> candidateOps;
+  for (auto &[partitionId, op] : partitionToOp) {
+    candidateOps.push_back(op);
+  }
+
+  Operation *op1 = candidateOps[0];
+  Operation *op2 = candidateOps[1];
+
+  // Determine which op comes first
+  Operation *firstOp = schedule.isOpBefore(op1, op2) ? op1 : op2;
+  Operation *secondOp = (firstOp == op1) ? op2 : op1;
+
+  // Use linearized iterator with findNext to verify alternation
+  // Start from firstOp and find the next candidate op
+  auto linearizedSchedule = schedule.linearized(forOp, firstOp);
+
+  auto isCandidate = [&](Operation *op) { return op == op1 || op == op2; };
+
+  std::optional<Operation *> nextCandidate =
+      linearizedSchedule.findNext(isCandidate);
+
+  if (!nextCandidate) {
+    LDBG("Could not find next candidate in linearized schedule");
+    // Can't verify - don't bail out
+    return false;
+  }
+
+  // Check if same op found twice in sequence
+  if (*nextCandidate == firstOp) {
+    LDBG("BAIL OUT: Schedule is not alternating - " << firstOp->getName()
+                                                    << " found twice");
+    return true; // Should bail out!
+  }
+
+  if (*nextCandidate != secondOp) {
+    LDBG("BAIL OUT: Unexpected op in schedule");
+    return true; // Should bail out!
+  }
+
+  LDBG("Alternation verified: ops alternate correctly");
+  return false; // Safe to proceed
 }
 
 /// Returns true if both operations are in the same block with no intervening
@@ -484,9 +616,35 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       continue;
     }
 
-    // Find which partition arrives first
-    int arrivesFirstPartitionId = arrivesFirst(keyOps);
-    LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
+    // Try to find the innermost ForOp containing the key ops
+    scf::ForOp innermostForOp = nullptr;
+    if (!keyOps.empty()) {
+      innermostForOp = keyOps[0]->getParentOfType<scf::ForOp>();
+    }
+
+    // Check if pingpong should bail out due to non-alternating schedule.
+    if (innermostForOp &&
+        shouldBailOutDueToNonAlternating(innermostForOp, keyOps)) {
+      LDBG("SKIPPING pingpong region " << pingpongId
+                                       << " - schedule is not alternating");
+      continue;
+    }
+
+    // Determine which partition arrives first using linearized schedule.
+    int arrivesFirstPartitionId = -1;
+    if (innermostForOp) {
+      arrivesFirstPartitionId =
+          arrivesFirstWithLinearizedSchedule(innermostForOp, keyOps);
+    }
+
+    // Fall back to static stage/cluster analysis if linearized schedule
+    // didn't work
+    if (arrivesFirstPartitionId == -1) {
+      LDBG("Falling back to static stage/cluster analysis");
+      arrivesFirstPartitionId = arrivesFirst(keyOps);
+    }
+
+    LDBG("Ping partition (arrives first): " << arrivesFirstPartitionId);
 
     int numberOfThreads = 0;
     for (auto [partitionId, startOp] : startOps) {
