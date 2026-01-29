@@ -91,6 +91,7 @@ case $user_choice in
     c)
         echo "Verifying correctness of TLX tutorial kernels"
         pytest third_party/tlx/tutorials/*.py
+        pytest third_party/tlx/tutorials/correctness_test.py
         ;;
     p)
         echo "Measuring performance of TLX tutorial kernels"
@@ -98,6 +99,7 @@ case $user_choice in
             echo "Running $k"
             third_party/tlx/denoise.sh python $k
         done
+        third_party/tlx/denoise.sh third_party/tlx/tutorials/blackwell_gemm_perf_test.py
         ;;
     n)
         break
