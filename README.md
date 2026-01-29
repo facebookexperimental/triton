@@ -729,21 +729,25 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
-[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-pipelined_test.py)
+[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_pipelined_test.py)
 
-[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-pipelined_test.py)
+[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_ws_test.py)
 
-[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-ws_test.py)
+[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws.py)
 
-[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-ws_test.py)
+[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell_grouped_gemm_test.py)
 
-[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell-grouped-gemm_test.py)
+[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_pipelined.py)
+
+[CLC GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_clc.py)
+
+[2-CTA GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_2cta.py)
 
 ### Attention kernels
 
-[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws-pipelined-persistent_test.py)
+[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell_fa_ws_pipelined_persistent_test.py)
 
-[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py)
+[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py)
 
 
 
@@ -760,7 +764,19 @@ pip install -e .
 
 Run the tutorials after the build finishes, e.g,
 ```
-python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py
+python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py
+```
+
+To run Blackwell GEMM tutorial kernels, you can use the following command:
+
+Correctness test:
+```
+[TLX_GEMM_VERSION={ws|clc|pipelined|2cta}] pytest third_party/tlx/tutorials/correctness_test.py
+```
+
+Performance test:
+```
+third_party/tlx/denoise.sh third_party/tlx/tutorials/blackwell_gemm_perf_test.py [--version {ws|clc|pipelined|2cta}]
 ```
 
 ## More reading materials
