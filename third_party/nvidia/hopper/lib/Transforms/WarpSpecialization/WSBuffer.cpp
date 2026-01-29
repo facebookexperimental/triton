@@ -506,7 +506,8 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   // Step 2: Add accumCnts to yieldOp.
   auto yieldOp = llvm::cast<scf::YieldOp>(body->getTerminator());
   builder.setInsertionPoint(yieldOp);
-  unsigned tSize = body->getNumArguments();
+  // For loop body args may count variables used in the start, end, and step.
+  unsigned tSize = forOp.getInitArgs().size() + numAccumCnts;
   // Pass argument value as yield. This will be fixed in the caller.
   for (unsigned i = 0; i < numAccumCnts; i++)
     yieldOp->insertOperands(yieldOp.getNumOperands(),
@@ -751,7 +752,8 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
 
   // Update yieldOp.
   Operation *yieldOp = newForOp.getBody()->getTerminator();
-  unsigned tSize = newForOp.getBody()->getArguments().size();
+  // For loop body args may count variables used in the start, end, and step.
+  unsigned tSize = newForOp.getInitArgs().size();
   auto numAccumCnts = initialAccums.size();
   if (numAccumCnts == 0)
     return newForOp;

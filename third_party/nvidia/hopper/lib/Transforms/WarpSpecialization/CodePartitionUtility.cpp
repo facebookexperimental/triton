@@ -570,7 +570,8 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 
   auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
-  unsigned tSize = parentForOp.getBody()->getArguments().size();
+  // For loop body args may count variables used in the start, end, and step.
+  unsigned tSize = parentForOp.getInitArgs().size();
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
   unsigned accumArgId = getAccumArgIdx(parentForOp, pOp, regionsWithChannels,
                                        config, reuseGroupIdx);

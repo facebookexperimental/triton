@@ -27,6 +27,7 @@ if [ -z "$CMAKE_ARGS" ]; then
               -DCMAKE_EXPORT_COMPILE_COMMANDS=1
               -DLLVM_ENABLE_PROJECTS="$LLVM_PROJECTS"
               -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_PATH"
+              -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
               -B"$LLVM_BUILD_PATH" "$LLVM_PROJECT_PATH/llvm"
         )
     else
