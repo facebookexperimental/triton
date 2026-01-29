@@ -96,8 +96,8 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
       if (!storeOp)
         continue;
 
-      // Check if this store is outside the loop
-      if (forOp->isProperAncestor(storeOp))
+      // Check if this store is outside and before the loop
+      if (forOp->isProperAncestor(storeOp) || !appearsBefore(storeOp, forOp))
         continue;
 
       // Verify that the current MMA is the earliest user in program order,
@@ -126,9 +126,6 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
       if (!validUser)
         continue;
 
-      // Get the task IDs from the earliest matching user
-      auto taskIdsToPropagate = getAsyncTaskIds(taskIdSource);
-
       // Step 4: Check if the TMEMStoreOp already has a task_id
       auto storeTaskIds = getAsyncTaskIds(storeOp);
       if (!storeTaskIds.empty()) {
@@ -147,6 +144,8 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
         // Step 6: If no async_id found, assign the async_id from the earliest
         // matching user
         LDBG("No async_id from source, using task_id from earliest user");
+        // Get the task IDs from the earliest matching user
+        auto taskIdsToPropagate = getAsyncTaskIds(taskIdSource);
         setAsyncTaskIds(storeOp, taskIdsToPropagate);
       }
     }
