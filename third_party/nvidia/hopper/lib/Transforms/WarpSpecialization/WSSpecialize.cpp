@@ -320,21 +320,8 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   // Create YieldOp for newForOp.
   auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   SmallVector<Value> newYieldOperands;
-  for (unsigned i = 0; i < usedArgs.size(); ++i) {
-    // Yield op may be missing if the for loop is eliminated from the region
-    // entirely. In that case, reuse the init arg passed to the new ForOp.
-    Value yieldOperand = yieldOp.getOperand(usedArgs[i]);
-    Value mappedValue = mapping.lookupOrNull(yieldOperand);
-    if (mappedValue) {
-      newYieldOperands.push_back(mappedValue);
-    } else {
-      // Operand not found in mapping, reuse the corresponding init arg.
-      // This can occur when the accumulator arg is updating a phase inside
-      // the inner for loop but that loop has been eliminated from the current
-      // partition.
-      newYieldOperands.push_back(newForOp.getInitArgs()[i]);
-    }
-  }
+  for (unsigned i : usedArgs)
+    newYieldOperands.push_back(mapping.lookup(yieldOp.getOperand(i)));
 
   bool createNewYield = true;
   if (newForOp.getBody()->mightHaveTerminator()) {
@@ -654,9 +641,13 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   }
 
-  // Run dead code elimination before manually erasing operations.
+  // Run dead code elimination on all nested regions recursively.
   IRRewriter rewriter(context);
-  (void)runRegionDCE(rewriter, funcOp->getRegions());
+  funcOp.walk([&](Operation *op) {
+    if (op->getNumRegions() > 0) {
+      (void)runRegionDCE(rewriter, op->getRegions());
+    }
+  });
 
   // Recover wsOp after DCE as it may have been modified.
   ttg::WarpSpecializeOp newWsOp;

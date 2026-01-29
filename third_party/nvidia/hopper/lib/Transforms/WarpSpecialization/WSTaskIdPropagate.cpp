@@ -226,6 +226,18 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // We do this in a separate walk to avoid having a parent operation treated
   // like an anchor op and skipped by the first walk.
   funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
+
+  // Mark ForOps (but not their bodies) as used by all partitions.
+  // This ensures the for loop structure is cloned into every partition,
+  // even if no operations inside the body belong to that partition.
+  // The body filtering is handled by SpecializeForOp.
+  funcOp.walk([&](scf::ForOp forOp) {
+    // Only process top-level ForOps in the function body
+    if (forOp->getParentOfType<scf::ForOp>())
+      return;
+    setAsyncTaskIds(forOp, allTasks);
+  });
+
   return 0;
 }
 
