@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -18,7 +19,9 @@ namespace mlir {
 
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
-void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers);
+LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
+                              StringRef readDecisionFile = "",
+                              StringRef writeDecisionFile = "");
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
@@ -134,7 +137,10 @@ public:
           << moduleOp << "\n\n\n";
     }
 
-    doMemoryPlanner(funcOp, numStages);
+    if (failed(doMemoryPlanner(funcOp, numStages))) {
+      signalPassFailure();
+      return;
+    }
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"

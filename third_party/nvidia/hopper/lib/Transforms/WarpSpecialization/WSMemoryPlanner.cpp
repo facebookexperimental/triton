@@ -12,6 +12,11 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
+#include <fstream>
+#include <sstream>
 
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -1207,7 +1212,253 @@ public:
 };
 } // namespace triton
 
-LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
+//===----------------------------------------------------------------------===//
+// Buffer Decision Serialization/Deserialization
+//===----------------------------------------------------------------------===//
+
+struct BufferDecision {
+  unsigned channelId;
+  unsigned bufferId;
+  unsigned bufferCopy;
+  unsigned bufferOffset;
+
+  bool operator==(const BufferDecision &other) const {
+    return channelId == other.channelId && bufferId == other.bufferId &&
+           bufferCopy == other.bufferCopy && bufferOffset == other.bufferOffset;
+  }
+
+  bool operator!=(const BufferDecision &other) const {
+    return !(*this == other);
+  }
+};
+
+struct BufferDecisionList {
+  SmallVector<BufferDecision> decisions;
+
+  bool operator==(const BufferDecisionList &other) const {
+    if (decisions.size() != other.decisions.size())
+      return false;
+    for (size_t i = 0; i < decisions.size(); ++i) {
+      if (decisions[i] != other.decisions[i])
+        return false;
+    }
+    return true;
+  }
+
+  bool operator!=(const BufferDecisionList &other) const {
+    return !(*this == other);
+  }
+};
+
+static void sortChannelsByProgramOrder(SmallVector<Channel *> &channels) {
+  llvm::sort(channels, [](Channel *a, Channel *b) {
+    Operation *allocA = a->getAllocOp();
+    Operation *allocB = b->getAllocOp();
+    if (!allocA || !allocB)
+      return a->uniqID < b->uniqID;
+    return allocA->isBeforeInBlock(allocB) ||
+           (allocA->getBlock() != allocB->getBlock() && a->uniqID < b->uniqID);
+  });
+}
+
+static BufferDecision extractBufferDecision(Channel *ch) {
+  BufferDecision decision;
+  decision.channelId = ch->uniqID;
+  decision.bufferId = 0;
+  decision.bufferCopy = 1;
+  decision.bufferOffset = 0;
+
+  Operation *allocOp = ch->getAllocOp();
+  if (!allocOp)
+    return decision;
+
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.id"))
+    decision.bufferId = attr.getInt();
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
+    decision.bufferCopy = attr.getInt();
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+    decision.bufferOffset = attr.getInt();
+
+  return decision;
+}
+
+static void applyBufferDecision(Channel *ch, const BufferDecision &decision) {
+  Operation *allocOp = ch->getAllocOp();
+  if (!allocOp)
+    return;
+
+  auto ctx = allocOp->getContext();
+  auto i32Type = IntegerType::get(ctx, 32);
+
+  allocOp->setAttr("buffer.id", IntegerAttr::get(i32Type, decision.bufferId));
+  allocOp->setAttr("buffer.copy",
+                   IntegerAttr::get(i32Type, decision.bufferCopy));
+  allocOp->setAttr("buffer.offset",
+                   IntegerAttr::get(i32Type, decision.bufferOffset));
+}
+
+BufferDecisionList serializeBufferDecisions(SmallVector<Channel *> &channels) {
+  SmallVector<Channel *> sortedChannels(channels.begin(), channels.end());
+  sortChannelsByProgramOrder(sortedChannels);
+
+  BufferDecisionList result;
+  for (Channel *ch : sortedChannels) {
+    result.decisions.push_back(extractBufferDecision(ch));
+  }
+  return result;
+}
+
+LogicalResult deserializeBufferDecisions(SmallVector<Channel *> &channels,
+                                         const BufferDecisionList &decisions) {
+  SmallVector<Channel *> sortedChannels(channels.begin(), channels.end());
+  sortChannelsByProgramOrder(sortedChannels);
+
+  if (sortedChannels.size() != decisions.decisions.size()) {
+    LDBG("deserialize failed: channel count mismatch ("
+         << sortedChannels.size() << " vs " << decisions.decisions.size()
+         << ")");
+    return failure();
+  }
+
+  for (size_t i = 0; i < sortedChannels.size(); ++i) {
+    Channel *ch = sortedChannels[i];
+    const BufferDecision &decision = decisions.decisions[i];
+
+    if (ch->uniqID != decision.channelId) {
+      LDBG("deserialize failed: channel id mismatch at index "
+           << i << " (" << ch->uniqID << " vs " << decision.channelId << ")");
+      return failure();
+    }
+
+    applyBufferDecision(ch, decision);
+  }
+  return success();
+}
+
+std::string serializeBufferDecisionsToString(const BufferDecisionList &list) {
+  llvm::json::Array decisionsArray;
+  for (const auto &decision : list.decisions) {
+    llvm::json::Object obj;
+    obj["channelId"] = static_cast<int64_t>(decision.channelId);
+    obj["bufferId"] = static_cast<int64_t>(decision.bufferId);
+    obj["bufferCopy"] = static_cast<int64_t>(decision.bufferCopy);
+    obj["bufferOffset"] = static_cast<int64_t>(decision.bufferOffset);
+    decisionsArray.push_back(std::move(obj));
+  }
+
+  llvm::json::Object root;
+  root["version"] = 1;
+  root["decisions"] = std::move(decisionsArray);
+
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  os << llvm::json::Value(std::move(root));
+  return result;
+}
+
+std::optional<BufferDecisionList>
+deserializeBufferDecisionsFromString(StringRef jsonStr) {
+  auto parsed = llvm::json::parse(jsonStr);
+  if (!parsed) {
+    LDBG("JSON parse error: " << llvm::toString(parsed.takeError()));
+    return std::nullopt;
+  }
+
+  auto *root = parsed->getAsObject();
+  if (!root) {
+    LDBG("JSON root is not an object");
+    return std::nullopt;
+  }
+
+  auto version = root->getInteger("version");
+  if (!version || *version != 1) {
+    LDBG("Unsupported version: " << (version ? *version : -1));
+    return std::nullopt;
+  }
+
+  auto *decisionsArray = root->getArray("decisions");
+  if (!decisionsArray) {
+    LDBG("Missing 'decisions' array");
+    return std::nullopt;
+  }
+
+  BufferDecisionList result;
+  for (const auto &item : *decisionsArray) {
+    auto *obj = item.getAsObject();
+    if (!obj) {
+      LDBG("Decision item is not an object");
+      return std::nullopt;
+    }
+
+    BufferDecision decision;
+    auto channelId = obj->getInteger("channelId");
+    auto bufferId = obj->getInteger("bufferId");
+    auto bufferCopy = obj->getInteger("bufferCopy");
+    auto bufferOffset = obj->getInteger("bufferOffset");
+
+    if (!channelId || !bufferId || !bufferCopy || !bufferOffset) {
+      LDBG("Missing required field in decision");
+      return std::nullopt;
+    }
+
+    decision.channelId = static_cast<unsigned>(*channelId);
+    decision.bufferId = static_cast<unsigned>(*bufferId);
+    decision.bufferCopy = static_cast<unsigned>(*bufferCopy);
+    decision.bufferOffset = static_cast<unsigned>(*bufferOffset);
+    result.decisions.push_back(decision);
+  }
+
+  return result;
+}
+
+//===----------------------------------------------------------------------===//
+
+LogicalResult writeDecisionsToFile(SmallVector<Channel *> &channels,
+                                   StringRef filePath) {
+  BufferDecisionList decisions = serializeBufferDecisions(channels);
+  std::string json = serializeBufferDecisionsToString(decisions);
+
+  std::error_code ec;
+  llvm::raw_fd_ostream os(filePath, ec);
+  if (ec) {
+    LDBG("Failed to open file for writing: " << filePath << " - "
+                                             << ec.message());
+    return failure();
+  }
+
+  os << json;
+  LDBG("Wrote buffer decisions to: " << filePath);
+  return success();
+}
+
+LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
+                                    StringRef filePath) {
+  auto bufferOrErr = llvm::MemoryBuffer::getFile(filePath);
+  if (!bufferOrErr) {
+    LDBG("Failed to open file for reading: "
+         << filePath << " - " << bufferOrErr.getError().message());
+    return failure();
+  }
+
+  StringRef content = (*bufferOrErr)->getBuffer();
+  auto decisions = deserializeBufferDecisionsFromString(content);
+  if (!decisions) {
+    LDBG("Failed to parse decisions from file: " << filePath);
+    return failure();
+  }
+
+  if (failed(deserializeBufferDecisions(channels, *decisions))) {
+    LDBG("Failed to apply decisions from file: " << filePath);
+    return failure();
+  }
+
+  LDBG("Applied buffer decisions from: " << filePath);
+  return success();
+}
+
+LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
+                              StringRef readDecisionFile = "",
+                              StringRef writeDecisionFile = "") {
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -1232,6 +1483,17 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
                                << TheCh->isOperandDNoAcc);
     }
   }
+
+  // If a read decision file is provided, apply decisions from file instead of
+  // running the planner.
+  if (!readDecisionFile.empty()) {
+    if (failed(readDecisionsFromFile(channels, readDecisionFile))) {
+      return failure();
+    }
+    LDBG("Skipping memory planner - using decisions from file");
+    return success();
+  }
+
   // Step 2: figure out smem/tmem sizes and liveness.
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
   // otherwise, the liveness can't overlap.
@@ -1248,6 +1510,14 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers) {
     if (failed(planner.run(bufferId)))
       return failure();
   }
+
+  // If a write decision file is provided, serialize decisions to file.
+  if (!writeDecisionFile.empty()) {
+    if (failed(writeDecisionsToFile(channels, writeDecisionFile))) {
+      return failure();
+    }
+  }
+
   // allocateTMem(funcOp, channels, bufferId);
   return success();
 }
@@ -1262,8 +1532,9 @@ public:
       NVGPUTestWSMemoryPlannerPass>::NVGPUTestWSMemoryPlannerBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    if (numBuffers >= 1) {
-      if (failed(doMemoryPlanner(funcOp, numBuffers)))
+    if (numBuffers >= 1 || !readDecisionFile.empty()) {
+      if (failed(doMemoryPlanner(funcOp, numBuffers, readDecisionFile,
+                                 writeDecisionFile)))
         signalPassFailure();
     }
   }
