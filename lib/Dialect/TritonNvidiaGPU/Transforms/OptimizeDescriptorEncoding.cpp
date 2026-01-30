@@ -1,3 +1,4 @@
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Pass/PassManager.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -290,7 +291,92 @@ TensorDescType getTensorDescTypeWithEncoding(Operation *op,
   return TensorDescType::get(existingTy.getContext(), blockTy);
 }
 
-void assignMemoryLayouts(FuncOp &func) {
+//===----------------------------------------------------------------------===//
+// Helper to find base pointer from GlobalScratchAllocOp
+//===----------------------------------------------------------------------===//
+
+// Returns the base pointer (GlobalScratchAllocOp result) if ptr originates from
+// exactly one GlobalScratchAllocOp. Returns nullopt otherwise.
+std::optional<Value> getBaseScratchPointer(Value ptr) {
+  if (!ptr)
+    return std::nullopt;
+
+  SetVector<Operation *> backwardSlice;
+  BackwardSliceOptions options;
+  options.omitBlockArguments = true;
+  (void)getBackwardSlice(ptr, &backwardSlice, options);
+
+  if (auto defOp = ptr.getDefiningOp())
+    backwardSlice.insert(defOp);
+
+  // Find GlobalScratchAllocOp in the backward slice - there should be exactly
+  // one
+  Value basePtr;
+  for (auto *op : backwardSlice) {
+    if (auto scratchAlloc = dyn_cast<ttg::GlobalScratchAllocOp>(op)) {
+      if (basePtr) {
+        // Multiple GlobalScratchAllocOps found - not supported
+        llvm::report_fatal_error(
+            "Multiple GlobalScratchAllocOps found in backward slice");
+      }
+      basePtr = scratchAlloc.getResult();
+    }
+  }
+  return basePtr ? std::optional<Value>(basePtr) : std::nullopt;
+}
+
+// Propagate encoding from ReinterpretTensorDescOp back to MakeTensorDescOp.
+// Returns failure if conflicting encodings are detected for the same base ptr.
+LogicalResult propagateEncodingFromReinterpretToMakeDesc(
+    ttng::ReinterpretTensorDescOp reinterpretOp,
+    TypedValue<TensorDescType> desc,
+    llvm::DenseMap<Value, SmallVector<TypedValue<TensorDescType>>>
+        &ptrToMakeDescResults,
+    llvm::DenseMap<Value, Attribute> &basePtrToEncoding,
+    llvm::MapVector<TypedValue<TensorDescType>, const EncodingInfo *>
+        &valueToEncodingInfo,
+    std::function<void(ArrayRef<Value>, EncodingInfo)> updateEncoding) {
+  auto rawDescPtr = reinterpretOp.getRawDesc();
+  auto basePtr = getBaseScratchPointer(rawDescPtr);
+  if (!basePtr)
+    return success();
+
+  auto it = ptrToMakeDescResults.find(*basePtr);
+  if (it == ptrToMakeDescResults.end())
+    return success();
+
+  auto reinterpretIt = valueToEncodingInfo.find(desc);
+  if (reinterpretIt == valueToEncodingInfo.end())
+    return success();
+
+  Attribute currentEncoding = reinterpretIt->second->desiredEncoding;
+
+  // Check for conflicting encodings to the same base pointer
+  auto encIt = basePtrToEncoding.find(*basePtr);
+  if (encIt != basePtrToEncoding.end()) {
+    if (encIt->second != currentEncoding) {
+      reinterpretOp.emitError(
+          "conflicting encodings for descriptors sharing the same "
+          "base pointer from global_scratch_alloc");
+      return failure();
+    }
+  } else {
+    basePtrToEncoding[*basePtr] = currentEncoding;
+  }
+
+  EncodingInfo propagatedInfo{currentEncoding, reinterpretIt->second->ctaLayout,
+                              reinterpretIt->second->shape, false};
+  for (auto makeDescResult : it->second)
+    updateEncoding({makeDescResult}, propagatedInfo);
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Main encoding assignment logic
+//===----------------------------------------------------------------------===//
+
+LogicalResult assignMemoryLayouts(FuncOp &func) {
   std::unordered_set<EncodingInfo> encodings;
   llvm::MapVector<TypedValue<TensorDescType>, const EncodingInfo *>
       valueToEncodingInfo;
@@ -332,7 +418,7 @@ void assignMemoryLayouts(FuncOp &func) {
                      EncodingInfo{info->desiredSharedEncoding, info->ctaLayout,
                                   info->shape});
     } else {
-      bool forcedToDefault = isa<CallOp, ReturnOp, ReinterpretTensorDescOp>(op);
+      bool forcedToDefault = isa<CallOp, ReturnOp>(op);
       auto einfo =
           internEncoding(encodings, EncodingInfo{{}, {}, {}, forcedToDefault});
 
@@ -349,6 +435,20 @@ void assignMemoryLayouts(FuncOp &func) {
       for (auto arg : op->getOperands())
         if (auto desc = dyn_cast<TypedValue<TensorDescType>>(arg))
           setEncoding(desc);
+    }
+  });
+
+  // Build a map from base pointer values to MakeTensorDescOp results.
+  // This allows us to propagate encoding from ReinterpretTensorDescOp back to
+  // MakeTensorDescOp when they share the same base pointer.
+  llvm::DenseMap<Value, SmallVector<TypedValue<TensorDescType>>>
+      ptrToMakeDescResults;
+  llvm::DenseMap<Value, Attribute> basePtrToEncoding;
+
+  func.walk([&](MakeTensorDescOp op) {
+    if (auto descPtr = op.getDescPtr()) {
+      if (auto basePtr = getBaseScratchPointer(descPtr))
+        ptrToMakeDescResults[*basePtr].push_back(op.getResult());
     }
   });
 
@@ -378,6 +478,12 @@ void assignMemoryLayouts(FuncOp &func) {
       if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(definingOp)) {
         auto vals = getTiedArgs(definingOp, opResult.getResultNumber());
         updateEncoding(vals, EncodingInfo{});
+      } else if (auto reinterpretOp =
+                     dyn_cast<ttng::ReinterpretTensorDescOp>(definingOp)) {
+        if (failed(propagateEncodingFromReinterpretToMakeDesc(
+                reinterpretOp, desc, ptrToMakeDescResults, basePtrToEncoding,
+                valueToEncodingInfo, updateEncoding)))
+          return failure();
       }
     } else if (auto blockArg = dyn_cast<BlockArgument>(desc)) {
       auto parentOp = blockArg.getOwner()->getParentOp();
@@ -390,7 +496,32 @@ void assignMemoryLayouts(FuncOp &func) {
     }
   }
 
-  // 3. Transfer propagated encodings into the graph
+  // 3. Build a map from block type to best encoding (prefer smaller swizzle)
+  // This allows MakeTensorDescOp to inherit encoding from matching
+  // ReinterpretTensorDescOp
+  llvm::DenseMap<RankedTensorType, Attribute> blockTypeToEncoding;
+  for (auto &[desc, einfo] : valueToEncodingInfo) {
+    if (!einfo->desiredEncoding)
+      continue;
+    auto blockTy = desc.getType().getBlockType();
+    // Strip encoding from blockTy for lookup
+    auto keyTy =
+        RankedTensorType::get(blockTy.getShape(), blockTy.getElementType());
+    auto it = blockTypeToEncoding.find(keyTy);
+    if (it == blockTypeToEncoding.end()) {
+      blockTypeToEncoding[keyTy] = einfo->desiredEncoding;
+    } else {
+      // Prefer smaller swizzle width
+      auto existing = dyn_cast<ttg::NVMMASharedEncodingAttr>(it->second);
+      auto candidate =
+          dyn_cast<ttg::NVMMASharedEncodingAttr>(einfo->desiredEncoding);
+      if (existing && candidate &&
+          candidate.getSwizzlingByteWidth() < existing.getSwizzlingByteWidth())
+        blockTypeToEncoding[keyTy] = einfo->desiredEncoding;
+    }
+  }
+
+  // 4. Transfer propagated encodings into the graph
   auto ctx = func.getContext();
   for (auto &[desc, einfo] : valueToEncodingInfo) {
     auto existingTy = desc.getType().getBlockType();
@@ -400,8 +531,17 @@ void assignMemoryLayouts(FuncOp &func) {
     } else if (einfo->forcedToDefault) {
       newEncoding = getFallbackSharedEncoding(existingTy, {}, {});
     } else {
-      newEncoding =
-          getFallbackSharedEncoding(existingTy, einfo->ctaLayout, einfo->shape);
+      // Try to find encoding from a matching block type (e.g., from
+      // ReinterpretTensorDescOp that reads the same descriptor)
+      auto keyTy = RankedTensorType::get(existingTy.getShape(),
+                                         existingTy.getElementType());
+      auto it = blockTypeToEncoding.find(keyTy);
+      if (it != blockTypeToEncoding.end()) {
+        newEncoding = it->second;
+      } else {
+        newEncoding = getFallbackSharedEncoding(existingTy, einfo->ctaLayout,
+                                                einfo->shape);
+      }
     }
     desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(), existingTy,
                                                newEncoding));
@@ -417,14 +557,17 @@ void assignMemoryLayouts(FuncOp &func) {
     }
   }
   func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));
+  return success();
 }
 
-void assignMemoryLayouts(ModuleOp &mod) {
+LogicalResult assignMemoryLayouts(ModuleOp &mod) {
   for (auto &op : *mod.getBody()) {
     if (auto func = dyn_cast<FuncOp>(&op)) {
-      assignMemoryLayouts(func);
+      if (failed(assignMemoryLayouts(func)))
+        return failure();
     }
   }
+  return success();
 }
 
 } // anonymous namespace
@@ -440,7 +583,8 @@ public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
-    assignMemoryLayouts(m);
+    if (failed(assignMemoryLayouts(m)))
+      signalPassFailure();
   }
 };
 
