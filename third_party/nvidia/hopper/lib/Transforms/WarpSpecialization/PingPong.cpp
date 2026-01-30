@@ -410,7 +410,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     // Walk through the region to find operations that have pingpong_id
     // attribute
     region->walk<WalkOrder::PreOrder>([&](Operation *op) {
-      // Check if this is a warp_group_dot operation
       if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
         int pingpongId = pingpongIdAttr.getInt();
         LDBG("Found op " << op->getName().getStringRef() << " with pingpong id "
@@ -657,9 +656,6 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
 
   // Assign pingpong region IDs to groups
   for (auto &group : expensiveOps) {
-    if (group.size() < 2)
-      continue;
-
     // Count the number of distinct partitions in the group
     llvm::SmallDenseSet<int, 4> partitionIds;
     for (auto *op : group) {
