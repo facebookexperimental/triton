@@ -298,7 +298,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
       return curOp;
     }
     // If we've reached the stop op, there's no memory effect between them
-    if (stopOp && curOp == stopOp) {
+    if (curOp == stopOp) {
       return nullptr;
     }
     // Check if we've hit a control flow boundary
