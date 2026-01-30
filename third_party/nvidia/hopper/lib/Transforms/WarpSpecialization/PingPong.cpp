@@ -501,12 +501,11 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   }
 
   // Step 3: Insert pingpong barriers to the IR
-  for (auto &[pingpongId, keyOps] : crManager.pingpongIdToKeyOps) {
+  for (auto &[pingpongId, pingBoundOps] :
+       crManager.pingpongIdToPingBoundaryOps) {
     if (!crManager.hasPingPongBoundary(pingpongId))
       continue;
-    SmallVector<Operation *> pingBoundOps =
-        crManager.pingpongIdToPingBoundaryOps[pingpongId];
-    SmallVector<Operation *> pongBoundOps =
+    const SmallVector<Operation *> &pongBoundOps =
         crManager.pingpongIdToPongBoundaryOps[pingpongId];
 
     if (crManager.pingpongIdToBarrierId.count(pingpongId) == 0) {
@@ -515,8 +514,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       continue;
     }
 
-    unsigned pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
-    unsigned pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
+    auto [pingBarrierId, pongBarrierId] =
+        crManager.pingpongIdToBarrierId[pingpongId];
 
     int numThreads = crManager.pingpongIdToThreadNum[pingpongId];
 
