@@ -1,12 +1,19 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
+from typing import Optional
+
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def alloc_fn(size: int, align: int, stream: Optional[int]):
+    assert align == 128
+    assert stream == 0
+    return torch.empty(size, dtype=torch.int8, device=DEVICE)
 
 
 def get_cuda_autotune_config():
@@ -23,7 +30,6 @@ def get_cuda_autotune_config():
             },
             num_warps=4,
             num_stages=1,
-            pre_hook=matmul_tma_set_block_size_hook,
         )
         for BM in [128]
         for BN in [128, 256]
@@ -32,19 +38,6 @@ def get_cuda_autotune_config():
         for t in [2, 3]
         for subtile in [True]
     ]
-
-
-def matmul_tma_set_block_size_hook(nargs):
-    BLOCK_M = nargs["BLOCK_SIZE_M"]
-    BLOCK_N = nargs["BLOCK_SIZE_N"]
-    BLOCK_K = nargs["BLOCK_SIZE_K"]
-    nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
-    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N]
-    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
-    if EPILOGUE_SUBTILE:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-    else:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
 
 
 @triton.jit
@@ -62,8 +55,9 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     key=["M", "N", "K"],
 )
 @triton.jit
-def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M: tl.constexpr,
-                                       BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
+def matmul_kernel_tma_ws_blackwell_clc(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn,
+                                       stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                       BLOCK_SIZE_K: tl.constexpr,  #
                                        GROUP_SIZE_M: tl.constexpr,  #
                                        NUM_SMEM_BUFFERS: tl.constexpr,  #
                                        NUM_TMEM_BUFFERS: tl.constexpr,  #
@@ -71,6 +65,33 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                                        NUM_CLC_STAGES: tl.constexpr,  #
                                        EPILOGUE_SUBTILE: tl.constexpr,  #
                                        ):
+    # Initialize TMA descriptors
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, K],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[K, N],
+        strides=[stride_bk, stride_bn],
+        block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+    )
+    if EPILOGUE_SUBTILE:
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            shape=[M, N],
+            strides=[stride_cm, stride_cn],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // 2],
+        )
+    else:
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            shape=[M, N],
+            strides=[stride_cm, stride_cn],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
     buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
@@ -263,19 +284,19 @@ def matmul(a, b):
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
-    # A dummy block value that will be overwritten when we have the real block size
-    dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
-    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
-    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    # Initialize TMA descriptor storage allocator
+    triton.set_allocator(alloc_fn)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     # Persistent kernel to have thread block resident in SM as long as possible
     grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
     matmul_kernel_tma_ws_blackwell_clc[grid](
-        a_desc, b_desc, c_desc,  #
+        a, b, c,  #
         M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
         NUM_SMS=NUM_SMS,  #
         NUM_CLC_STAGES=1,  #
     )
