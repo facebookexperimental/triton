@@ -575,8 +575,23 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("vote_ballot_sync",
            [](TritonOpBuilder &self, Value mask, Value pred) -> Value {
-             return self.create<ttng::VoteBallotSyncOp>(
-                 self.getBuilder().getI32Type(), mask, pred);
+             auto &builder = self.getBuilder();
+             Type predType = pred.getType();
+
+             // Determine result type based on predicate type
+             Type resultType;
+             if (auto tensorType = dyn_cast<RankedTensorType>(predType)) {
+               // For tensor input, return tensor of i32 with same
+               // shape/encoding
+               resultType = RankedTensorType::get(tensorType.getShape(),
+                                                  builder.getI32Type(),
+                                                  tensorType.getEncoding());
+             } else {
+               // Scalar input -> scalar i32 result
+               resultType = builder.getI32Type();
+             }
+
+             return self.create<ttng::VoteBallotSyncOp>(resultType, mask, pred);
            })
       .def("create_async_TMA_load",
            [](TritonOpBuilder &self, std::vector<Value> &multicastTargets,

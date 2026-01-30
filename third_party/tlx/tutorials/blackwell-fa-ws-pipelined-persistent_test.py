@@ -631,25 +631,35 @@ def _attn_fwd_ws(sm_scale, M,  #
                         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
                         alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
                         tlx.barrier_arrive(alpha_empties[cid])
-                        # Perform warp-level ballot vote
+                        # Perform warp-level ballot vote to check if any thread needs rescaling
                         # 0xFFFFFFFF means all 32 threads in the warp participate
-                        should_rescale = True
                         if RESCALE_OPT:
                             pred = alpha_1 < 1.0
+                            # ballot_result is a tensor with the same shape as pred
+                            # All elements contain the same warp-level ballot value
+                            # Non-zero means at least one thread has alpha_1 < 1.0
                             ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
                             should_rescale = ballot_result != 0
-                        if should_rescale:
-                            # correction_rescale in FA4, break into 8 fragments, unroll by 2
-                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                subslice = tlx.subslice(
-                                    acc_tiles[cid],
-                                    HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                    HEAD_DIM // NUM_MMA_SLICES,
-                                )
-                                acc = tlx.local_load(subslice)
-                                # acc = acc * alpha_1
+                        else:
+                            # Always rescale when optimization is disabled
+                            should_rescale = tl.full(alpha_1.shape, True, tl.int1)
+
+                        # correction_rescale in FA4, break into 8 fragments, unroll by 2
+                        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                            subslice = tlx.subslice(
+                                acc_tiles[cid],
+                                HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                                HEAD_DIM // NUM_MMA_SLICES,
+                            )
+                            acc = tlx.local_load(subslice)
+                            # Use tl.where to conditionally apply rescaling
+                            # acc = acc * alpha_1 where should_rescale, else acc unchanged
+                            if RESCALE_OPT:
+                                scaled_acc = _mul_f32x2(acc, alpha_1)
+                                acc = tl.where(should_rescale, scaled_acc, acc)
+                            else:
                                 acc = _mul_f32x2(acc, alpha_1)
-                                tlx.local_store(subslice, acc)
+                            tlx.local_store(subslice, acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
@@ -665,7 +675,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
@@ -892,7 +902,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         )
                         p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                         use_acc = acc1_init if slice_id == 0 else True
-                        mBarriers = ([kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                        mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -950,7 +960,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
                     p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                     use_acc = acc1_init if slice_id == 0 else True
-                    mBarriers = ([acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                    mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
                     tlx.async_dot(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -2040,9 +2050,9 @@ def test_op(
     dtype,
 ):
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
     sm_scale = 0.5
     # reference implementation
     if dtype == torch.float8_e5m2:
@@ -2108,9 +2118,9 @@ BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
 print(N_HEADS)
 # vary seq length for fixed head and batch=4
 configs = []
-for mode in ["fwd"]:  #, "bwd"]:
-    for causal in [False]:  #, True]:
-        for BWD_BLOCK_M1 in [64]:  #, 128]:
+for mode in ["fwd"]:  # , "bwd"]:
+    for causal in [False]:  # , True]:
+        for BWD_BLOCK_M1 in [64]:  # , 128]:
             for GROUP_SIZE_M in [8]:
                 configs.append(
                     triton.testing.Benchmark(
