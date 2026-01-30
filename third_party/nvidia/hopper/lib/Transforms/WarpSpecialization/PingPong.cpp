@@ -148,14 +148,14 @@ public:
     for (const auto &entry : pingpongIdToPingBoundaryOps) {
       LDBG("pingpongId: " << entry.first);
       for (const auto &op : entry.second) {
-        LDBG("  ping boundary op: " << op->getName().getStringRef());
+        LDBG("  ping boundary op: " << op->getName());
       }
     }
     LDBG("pingpongIdToPongBoundaryOps");
     for (const auto &entry : pingpongIdToPongBoundaryOps) {
       LDBG("pingpongId: " << entry.first);
       for (const auto &op : entry.second) {
-        LDBG("  pong boundary op: " << op->getName().getStringRef());
+        LDBG("  pong boundary op: " << op->getName());
       }
     }
   }
@@ -219,7 +219,7 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
 void dumpMemoryEffects(Operation *op) {
   auto memInterface = dyn_cast<MemoryEffectOpInterface>(op);
   if (!memInterface) {
-    LDBG("  Op '" << op->getName().getStringRef()
+    LDBG("  Op '" << op->getName()
                   << "' does not implement MemoryEffectOpInterface");
     return;
   }
@@ -228,7 +228,7 @@ void dumpMemoryEffects(Operation *op) {
   memInterface.getEffects(effects);
 
   if (effects.empty()) {
-    LDBG("  Op '" << op->getName().getStringRef() << "' has no memory effects");
+    LDBG("  Op '" << op->getName() << "' has no memory effects");
     return;
   }
 
@@ -246,8 +246,8 @@ void dumpMemoryEffects(Operation *op) {
       effectType = "Unknown";
 
     llvm::StringRef resourceName = effect.getResource()->getName();
-    LDBG("  Op '" << op->getName().getStringRef() << "' has effect: "
-                  << effectType << " on resource: " << resourceName);
+    LDBG("  Op '" << op->getName() << "' has effect: " << effectType
+                  << " on resource: " << resourceName);
   }
 }
 
@@ -269,6 +269,10 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
   // Set the end op of this pingpong region to be the first op with memory side
   // effect after this critical op
   while (curOp) {
+    if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(curOp)) {
+      LDBG("Found control flow op " << curOp->getName());
+      return nullptr;
+    }
     if (!isMemoryEffectFree(curOp)) {
       LDBG("Found op with memory effects:");
       dumpMemoryEffects(curOp);
@@ -282,7 +286,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
     // Set end op to the end of the control flow equivalent region
     Operation *nextOp = curOp->getNextNode();
     if (!nextOp || !areControlFlowEquivalent(curOp, nextOp))
-      break;
+      return nullptr;
     curOp = nextOp;
   }
   return nullptr;
@@ -412,7 +416,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     region->walk<WalkOrder::PreOrder>([&](Operation *op) {
       if (auto pingpongIdAttr = op->getAttrOfType<IntegerAttr>("pingpong_id")) {
         int pingpongId = pingpongIdAttr.getInt();
-        LDBG("Found op " << op->getName().getStringRef() << " with pingpong id "
+        LDBG("Found op " << op->getName() << " with pingpong id "
                          << pingpongId);
         // Prepare CriticalRegionManager for this pingpong region
         crManager.pingpongIdToKeyOps[pingpongId].push_back(op);
@@ -646,14 +650,14 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       }
       foundGroup = matchType;
       if (foundGroup) {
-        LDBG("Insert to ref op group " << group[0]->getName().getStringRef());
+        LDBG("Insert to ref op group " << group[0]->getName());
         group.push_back(op);
         break;
       }
     }
 
     if (!foundGroup) {
-      LDBG("Create new group for op " << op->getName().getStringRef());
+      LDBG("Create new group for op " << op->getName());
       expensiveOps.push_back({op});
     }
   });
@@ -679,8 +683,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       op->setAttr(
           "pingpong_id",
           IntegerAttr::get(IntegerType::get(op->getContext(), 32), pingpongID));
-      LDBG("Assign pingpong_id " << pingpongID << " to op '"
-                                 << op->getName().getStringRef()
+      LDBG("Assign pingpong_id " << pingpongID << " to op '" << op->getName()
                                  << "' with task_id " << getSingleTaskId(op));
     }
     pingpongID++;
