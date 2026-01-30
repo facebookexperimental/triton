@@ -238,7 +238,6 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // We do this in a separate walk to avoid having a parent operation treated
   // like an anchor op and skipped by the first walk.
   funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
-
   return 0;
 }
 

@@ -632,7 +632,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   }
 
-  // Run dead code elimination on all nested regions recursively.
+  // Run dead code elimination before manually erasing operations.
   IRRewriter rewriter(context);
   (void)runRegionDCE(rewriter, funcOp->getRegions());
 
