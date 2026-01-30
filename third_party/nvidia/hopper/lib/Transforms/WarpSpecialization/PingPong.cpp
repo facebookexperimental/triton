@@ -59,10 +59,10 @@ private:
 
 public:
   /// Current barrier ID to assign (range [MIN_BARRIER_ID, MAX_BARRIER_ID])
-  int barrierId;
+  unsigned barrierId = MIN_BARRIER_ID;
 
   /// Map from pingpong region id to its barrier ID
-  llvm::DenseMap<int, std::pair<int, int>> pingpongIdToBarrierId;
+  llvm::DenseMap<int, std::pair<unsigned, unsigned>> pingpongIdToBarrierId;
 
   /// Map from pingpong region id to its critical operations
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToKeyOps;
@@ -75,10 +75,7 @@ public:
   /// Map from pingpong region id to the participating thread number
   llvm::DenseMap<int, int> pingpongIdToThreadNum;
 
-  CriticalRegionManager() {
-    // Initialize barrier ID to be MIN_BARRIER_ID
-    barrierId = MIN_BARRIER_ID;
-  }
+  CriticalRegionManager() = default;
 
   /// Check if an operation is registered as an expensive operation for the
   /// given compute capability. Only considers ops with 2D+ shaped operands.
@@ -122,8 +119,8 @@ public:
     }
 
     // Assign barrier ID to the pingpong region
-    int barrierId = this->barrierId;
-    int barrierId_1 = this->barrierId + 1;
+    unsigned barrierId = this->barrierId;
+    unsigned barrierId_1 = this->barrierId + 1;
 
     // Check if we would exceed the maximum barrier ID
     if (barrierId > MAX_BARRIER_ID || barrierId_1 > MAX_BARRIER_ID) {
@@ -522,8 +519,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     SmallVector<Operation *> pongBoundOps =
         crManager.pingpongIdToPongBoundaryOps[pingpongId];
 
-    int pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
-    int pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
+    unsigned pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
+    unsigned pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
 
     if (pingBarrierId == -1 || pongBarrierId == -1) {
       LDBG("Named barriers have run out for the pingpong region " << pingpongId
