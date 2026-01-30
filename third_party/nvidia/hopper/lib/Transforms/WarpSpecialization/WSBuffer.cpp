@@ -780,6 +780,8 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   // Handle the loop body. This order should align with the preorder that is
   // used for accumCnts.
   SmallVector<Operation *> dummy;
+  // Track seen ops for the reuse group section.
+  DenseSet<Operation *> seenOps;
   for (auto *op : opList) {
     if (!enclosingAChannel(op, regionsWithChannels))
       continue;
@@ -804,6 +806,10 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       LLVM_DEBUG(yieldOp->dump());
       ++accumArgId;
     }
+    // Insert ops for control flow to ensure they aren't also processed
+    // in the reuse group section.
+    if (tCnts > 0)
+      seenOps.insert(op);
   }
 
   // Handle reuse groups.
@@ -816,6 +822,9 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (chList.empty())
       continue;
     Operation *lastCh = chList.back();
+    // Check if we have already accounted for this accumulator via nesting.
+    if (seenOps.contains(lastCh))
+      continue;
     auto forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
                                           config, idx, false);
     Value arg = newForOp.getBody()->getArgument(accumArgId);
