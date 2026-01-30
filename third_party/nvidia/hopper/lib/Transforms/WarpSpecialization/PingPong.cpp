@@ -101,8 +101,6 @@ public:
           return tensorTy.getRank() > 1;
       }
       break;
-    default:
-      break;
     }
     return false;
   }
@@ -123,8 +121,7 @@ public:
     unsigned barrierId_1 = this->barrierId + 1;
 
     // Check if we would exceed the maximum barrier ID
-    if (barrierId > MAX_BARRIER_ID || barrierId_1 > MAX_BARRIER_ID) {
-      pingpongIdToBarrierId[pingpongId] = {-1, -1};
+    if (this->barrierId + 1 > MAX_BARRIER_ID) {
       LDBG("Barrier IDs exhausted, assigning {-1, -1} to pingpong region '"
            << pingpongId << "'.");
       return;
@@ -137,16 +134,6 @@ public:
 
     // Increment the barrier ID counter
     this->barrierId = barrierId + 2;
-  }
-
-  bool hasPingBoundary(int pingpongRegionId) const {
-    return (pingpongIdToPingBoundaryOps.count(pingpongRegionId) > 0) &&
-           (pingpongIdToPingBoundaryOps.at(pingpongRegionId).size() == 2);
-  }
-
-  bool hasPongBoundary(int pingpongRegionId) const {
-    return (pingpongIdToPongBoundaryOps.count(pingpongRegionId) > 0) &&
-           (pingpongIdToPongBoundaryOps.at(pingpongRegionId).size() == 2);
   }
 
   bool hasPingPongBoundary(int pingpongRegionId) const {
@@ -207,8 +194,7 @@ void getNestedFor(Region *partition,
 /// Returns true if both operations are in the same block with no intervening
 /// control flow operations. False otherwise.
 bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
-  if (!op1 || !op2)
-    return false;
+  assert(op1 && op2 && "Both input ops of areControlFlowEquivalent must be non-null.");
 
   if (op1->getBlock() != op2->getBlock())
     return false;
@@ -263,12 +249,6 @@ void dumpMemoryEffects(Operation *op) {
     LDBG("  Op '" << op->getName().getStringRef() << "' has effect: "
                   << effectType << " on resource: " << resourceName);
   }
-}
-
-/// Find the start boundary op for the critical region.
-Operation *findStartOp(CriticalRegionManager &crManager, Operation *keyOp) {
-  // Set the start op of this pingpong region to be the critical op
-  return keyOp;
 }
 
 /// Find the end boundary op for the critical region.
@@ -457,7 +437,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       if (partitionId != -1) {
-        Operation *startOp = findStartOp(crManager, keyOp);
+        Operation *startOp = keyOp;
         Operation *endOp = findEndOp(crManager, keyOp, nullptr);
         startOps[partitionId].push_back(startOp);
         endOps[partitionId].push_back(endOp);
@@ -519,14 +499,14 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     SmallVector<Operation *> pongBoundOps =
         crManager.pingpongIdToPongBoundaryOps[pingpongId];
 
-    unsigned pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
-    unsigned pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
-
-    if (pingBarrierId == -1 || pongBarrierId == -1) {
+    if (crManager.pingpongIdToBarrierId.count(pingpongId) == 0) {
       LDBG("Named barriers have run out for the pingpong region " << pingpongId
                                                                   << ".");
       continue;
     }
+
+    unsigned pingBarrierId = crManager.pingpongIdToBarrierId[pingpongId].first;
+    unsigned pongBarrierId = crManager.pingpongIdToBarrierId[pingpongId].second;
 
     int numThreads = crManager.pingpongIdToThreadNum[pingpongId];
 
