@@ -858,7 +858,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                      tmemAllocOp.getOperation(), &op, channels);
         } else {
-          assert(false && "Unexpected Producer Found");
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
         }
       }
     } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(&op)) {
@@ -880,7 +881,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
           createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                      tmemAllocOp.getOperation(), &op, channels);
         } else {
-          assert(false && "Unexpected Producer Found");
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
         }
       } else {
         channelsToBeUpdate.push_back(channels.size());
