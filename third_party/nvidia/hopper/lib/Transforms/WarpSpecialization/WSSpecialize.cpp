@@ -253,15 +253,6 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            AsyncTaskId asyncTaskId) {
   // Create newForOp for each task Id.
   auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
-  // This is for the epilogue partition.
-  const unsigned EpiloguePartition = 3;
-  if (asyncTaskId == EpiloguePartition) { // HACK tracked in T238592410
-    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
-    if (!parentForOp) {
-      usedArgs.pop_back();
-      LDBG("SpecializeForOp hack to remove last argIdx");
-    }
-  }
 
   // Prepare newLoopArgs.
   SmallVector<Value> newLoopArgs;
@@ -643,11 +634,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   // Run dead code elimination on all nested regions recursively.
   IRRewriter rewriter(context);
-  funcOp.walk([&](Operation *op) {
-    if (op->getNumRegions() > 0) {
-      (void)runRegionDCE(rewriter, op->getRegions());
-    }
-  });
+  (void)runRegionDCE(rewriter, funcOp->getRegions());
 
   // Recover wsOp after DCE as it may have been modified.
   ttg::WarpSpecializeOp newWsOp;

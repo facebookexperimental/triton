@@ -187,6 +187,18 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // assume this is for the inputs and can state this as needed.
   funcOp.walk([&](LLVM::AssumeOp op) { setAsyncTaskIds(op, allTasks); });
 
+  // Mark all forOps with all async tasks. We assume DCE can
+  // prune any unused loops. Also propagate to loop bounds (start, stop, step).
+  funcOp.walk([&](scf::ForOp op) {
+    setAsyncTaskIds(op, allTasks);
+    if (auto *defOp = op.getLowerBound().getDefiningOp())
+      addAsyncTaskIds(defOp, allTasks);
+    if (auto *defOp = op.getUpperBound().getDefiningOp())
+      addAsyncTaskIds(defOp, allTasks);
+    if (auto *defOp = op.getStep().getDefiningOp())
+      addAsyncTaskIds(defOp, allTasks);
+  });
+
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
   DataFlowSolver solver;
