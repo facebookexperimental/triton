@@ -122,8 +122,7 @@ public:
 
     // Check if we would exceed the maximum barrier ID
     if (this->barrierId + 1 > MAX_BARRIER_ID) {
-      LDBG("Barrier IDs exhausted, assigning {-1, -1} to pingpong region '"
-           << pingpongId << "'.");
+      LDBG("Barrier IDs exhausted for pingpong region '" << pingpongId << "'.");
       return;
     }
 
@@ -194,7 +193,8 @@ void getNestedFor(Region *partition,
 /// Returns true if both operations are in the same block with no intervening
 /// control flow operations. False otherwise.
 bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
-  assert(op1 && op2 && "Both input ops of areControlFlowEquivalent must be non-null.");
+  assert(op1 && op2 &&
+         "Both input ops of areControlFlowEquivalent must be non-null.");
 
   if (op1->getBlock() != op2->getBlock())
     return false;
@@ -282,7 +282,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
     // Set end op to the end of the control flow equivalent region
     Operation *nextOp = curOp->getNextNode();
     if (!nextOp || !areControlFlowEquivalent(curOp, nextOp))
-      return curOp;
+      break;
     curOp = nextOp;
   }
   return nullptr;
@@ -433,11 +433,16 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     llvm::DenseMap<int, int> numWarps;
 
     // Find the start and end ops for each key operation in the pingpong region
+    bool foundNullEndOp = false;
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       if (partitionId != -1) {
         Operation *startOp = keyOp;
         Operation *endOp = findEndOp(crManager, keyOp, nullptr);
+        if (!endOp) {
+          foundNullEndOp = true;
+          break;
+        }
         startOps[partitionId].push_back(startOp);
         endOps[partitionId].push_back(endOp);
         // Look up the number of warps for each partition
@@ -448,6 +453,8 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
         }
       }
     }
+    if (foundNullEndOp)
+      continue;
 
     if (startOps.size() != 2 || endOps.size() != 2 || numWarps.size() != 2) {
       LDBG("pingpong ops are not in two partitions");
