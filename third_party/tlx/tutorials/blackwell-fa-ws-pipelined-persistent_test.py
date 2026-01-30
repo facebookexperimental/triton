@@ -18,15 +18,12 @@ def to_mxfp8(
         torch.bfloat16,
         torch.float,
     ), f"{data_hp.dtype} is not supported yet"
-    assert (
-        data_hp.shape[-1] % block_size == 0
-    ), f"the last dimension of shape {data_hp.shape} must be divisible by block_size {block_size}"
+    assert data_hp.shape[-1] % block_size == 0, (
+        f"the last dimension of shape {data_hp.shape} must be divisible by block_size {block_size}")
     assert data_hp.is_contiguous(), "unsupported"
 
     orig_shape = data_hp.shape
-    data_hp = data_hp.reshape(
-        *orig_shape[:-1], orig_shape[-1] // block_size, block_size
-    )
+    data_hp = data_hp.reshape(*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
 
     max_abs = torch.amax(torch.abs(data_hp), -1).unsqueeze(-1)
 
@@ -48,14 +45,11 @@ def to_mxfp8(
             torch.isnan(descale),
             0xFF,  # Handle biased exponent for nan
             # NOTE: descale < (torch.finfo(torch.float32).smallest_normal / 2) is handled through clamping
-            (
-                torch.clamp(
-                    torch.ceil(torch.log2(descale)),
-                    min=-E8M0_EXPONENT_BIAS,
-                    max=E8M0_EXPONENT_BIAS,
-                )
-                + E8M0_EXPONENT_BIAS
-            ).to(torch.uint8),
+            (torch.clamp(
+                torch.ceil(torch.log2(descale)),
+                min=-E8M0_EXPONENT_BIAS,
+                max=E8M0_EXPONENT_BIAS,
+            ) + E8M0_EXPONENT_BIAS).to(torch.uint8),
         )
 
         descale_fp = torch.where(
@@ -147,9 +141,7 @@ def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
     Returns:
         Rearranged tensor in block-scaled swizzle format [padded_M, padded_K/32]
     """
-    assert scale_tensor.element_size() == 1, (
-        "Expected element size to be 1 byte (8 bits)"
-    )
+    assert scale_tensor.element_size() == 1, "Expected element size to be 1 byte (8 bits)"
 
     rows, cols = scale_tensor.shape
 
@@ -192,6 +184,7 @@ def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+
 def _mxf8_host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
@@ -210,7 +203,6 @@ def _mxf8_host_descriptor_pre_hook(nargs):
     nargs["desc_q_scale"].block_shape = [1, REP_M, REP_HEAD, 2, 256]
     nargs["desc_k_scale"].block_shape = [1, REP_N, REP_HEAD, 2, 256]
     nargs["desc_v_scale"].block_shape = [1, REP_N, REP_HEAD, 2, 256]
-
 
 
 def _host_descriptor_pre_hook(nargs):
@@ -770,7 +762,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
@@ -992,7 +984,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         )
                         p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                         use_acc = acc1_init if slice_id == 0 else True
-                        mBarriers = ([kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                        mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -1050,7 +1042,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
                     p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                     use_acc = acc1_init if slice_id == 0 else True
-                    mBarriers = ([acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                    mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
                     tlx.async_dot(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -1178,20 +1170,18 @@ def _attn_fwd_ws(sm_scale, M,  #
 )
 @triton.jit
 def _attn_fwd_mxf8_ws(sm_scale, M,  #
-                 Z, H, desc_q, desc_k, desc_v, desc_o,
-                 desc_q_scale, desc_k_scale, desc_v_scale,
-                 N_CTX,  #
-                 HEAD_DIM: tl.constexpr,  #
-                 BLOCK_M: tl.constexpr,  #
-                 BLOCK_N: tl.constexpr,  #
-                 STAGE: tl.constexpr,  #
-                 NUM_BUFFERS_Q: tl.constexpr,  #
-                 NUM_BUFFERS_KV: tl.constexpr,  #
-                 NUM_BUFFERS_QK: tl.constexpr,  #
-                 NUM_MMA_GROUPS: tl.constexpr,  #
-                 NUM_MMA_SLICES: tl.constexpr,  #
-                 GROUP_SIZE_N: tl.constexpr,  #
-                 ):
+                      Z, H, desc_q, desc_k, desc_v, desc_o, desc_q_scale, desc_k_scale, desc_v_scale, N_CTX,  #
+                      HEAD_DIM: tl.constexpr,  #
+                      BLOCK_M: tl.constexpr,  #
+                      BLOCK_N: tl.constexpr,  #
+                      STAGE: tl.constexpr,  #
+                      NUM_BUFFERS_Q: tl.constexpr,  #
+                      NUM_BUFFERS_KV: tl.constexpr,  #
+                      NUM_BUFFERS_QK: tl.constexpr,  #
+                      NUM_MMA_GROUPS: tl.constexpr,  #
+                      NUM_MMA_SLICES: tl.constexpr,  #
+                      GROUP_SIZE_N: tl.constexpr,  #
+                      ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -1388,7 +1378,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
@@ -1560,7 +1550,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     k_scale_tiles[k_bufIdx],
                     K_FP8_FORMAT,
                     use_acc=False,
-                    mBarriers=[qk_fulls[1], kv_empties[k_bufIdx], q_scale_empties[q_bufIdx], q_scale_empties[q_bufIdx + NUM_BUFFERS_Q], k_scale_empties[k_bufIdx]],
+                    mBarriers=[
+                        qk_fulls[1],
+                        kv_empties[k_bufIdx],
+                        q_scale_empties[q_bufIdx],
+                        q_scale_empties[q_bufIdx + NUM_BUFFERS_Q],
+                        k_scale_empties[k_bufIdx],
+                    ],
                 )
 
                 _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
@@ -1636,10 +1632,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                         use_acc = acc1_init if slice_id == 0 else True
                         # V scale for v_bufIdx_prev was already loaded
-                        mBarriers_scaled = (
-                            [kv_empties[v_bufIdx_prev], v_scale_empties[v_bufIdx_prev]]
-                            if slice_id == NUM_MMA_SLICES - 1 else []
-                        )
+                        mBarriers_scaled = ([kv_empties[v_bufIdx_prev], v_scale_empties[v_bufIdx_prev]]
+                                            if slice_id == NUM_MMA_SLICES - 1 else [])
                         tlx.async_dot_scaled(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -1712,10 +1706,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                     use_acc = acc1_init if slice_id == 0 else True
                     # V scale already waited above, add v_scale_empties to mBarriers for last slice
-                    mBarriers_scaled = (
-                        [acc_empties[1], kv_empties[v_bufIdx], v_scale_empties[v_bufIdx]]
-                        if slice_id == NUM_MMA_SLICES - 1 else []
-                    )
+                    mBarriers_scaled = ([acc_empties[1], kv_empties[v_bufIdx], v_scale_empties[v_bufIdx]]
+                                        if slice_id == NUM_MMA_SLICES - 1 else [])
                     tlx.async_dot_scaled(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -1774,7 +1766,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_expect_bytes(q_scale_fulls[q_bufIdx], Q_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, m_offset, head_offset, 0, 0]
                 # off_hz is the combined batch*H + head index
-                tlx.async_descriptor_load(desc_q_scale, q_scale_tiles[q_bufIdx], [off_hz, q_scale_m_offset, head_scale_offset, 0, 0], q_scale_fulls[q_bufIdx])
+                tlx.async_descriptor_load(
+                    desc_q_scale,
+                    q_scale_tiles[q_bufIdx],
+                    [off_hz, q_scale_m_offset, head_scale_offset, 0, 0],
+                    q_scale_fulls[q_bufIdx],
+                )
 
                 # loop over loading k, v
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
@@ -1795,7 +1792,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 k_scale_tile = tlx.local_view(k_scale_tiles, k_bufIdx)
                 tlx.barrier_expect_bytes(k_scale_full, K_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
-                tlx.async_descriptor_load(desc_k_scale, k_scale_tile, [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0], k_scale_full)
+                tlx.async_descriptor_load(desc_k_scale, k_scale_tile,
+                                          [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0], k_scale_full)
 
                 # load q1
                 q_bufIdx += NUM_BUFFERS_Q
@@ -1810,7 +1808,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # 5D TMA offset: [batch_head, m_offset, head_offset, 0, 0]
                 # For q1, compute offset based on relative row position within this batch-head
                 q1_scale_m_offset = (start_m * BLOCK_M + BLOCK_M_SPLIT) // 128
-                tlx.async_descriptor_load(desc_q_scale, q_scale_tiles[q_bufIdx], [off_hz, q1_scale_m_offset, head_scale_offset, 0, 0], q_scale_fulls[q_bufIdx])
+                tlx.async_descriptor_load(
+                    desc_q_scale,
+                    q_scale_tiles[q_bufIdx],
+                    [off_hz, q1_scale_m_offset, head_scale_offset, 0, 0],
+                    q_scale_fulls[q_bufIdx],
+                )
 
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                 # wait for the V buffer to be released by the consumer
@@ -1829,7 +1832,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 v_scale_tile = tlx.local_view(v_scale_tiles, v_bufIdx)
                 tlx.barrier_expect_bytes(v_scale_full, V_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
-                tlx.async_descriptor_load(desc_v_scale, v_scale_tile, [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0], v_scale_full)
+                tlx.async_descriptor_load(desc_v_scale, v_scale_tile,
+                                          [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0], v_scale_full)
 
                 kv_offset_y += BLOCK_N
                 accum_cnt_kv += 2
@@ -1855,7 +1859,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # Compute offset based on relative position within this batch-head's N range
                     # kv_offset_y is absolute, so we use (kv_offset_y - off_hz * N_CTX) to get relative N
                     curr_kv_scale_n_offset = (kv_offset_y - off_hz * N_CTX) // 128
-                    tlx.async_descriptor_load(desc_k_scale, k_scale_tile, [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0], k_scale_full)
+                    tlx.async_descriptor_load(
+                        desc_k_scale,
+                        k_scale_tile,
+                        [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0],
+                        k_scale_full,
+                    )
 
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     # wait for the V buffer to be released by the consumer
@@ -1875,7 +1884,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.barrier_expect_bytes(v_scale_full, V_SCALE_BYTES)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                     # Compute offset based on relative position within this batch-head's N range
-                    tlx.async_descriptor_load(desc_v_scale, v_scale_tile, [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0], v_scale_full)
+                    tlx.async_descriptor_load(
+                        desc_v_scale,
+                        v_scale_tile,
+                        [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0],
+                        v_scale_full,
+                    )
 
                     kv_offset_y += BLOCK_N
                     accum_cnt_kv += 2
@@ -2713,7 +2727,8 @@ class _attention(torch.autograd.Function):
         USE_MXFP8 = q_scale is not None or k_scale is not None or v_scale is not None
 
         if USE_MXFP8:
-            assert k_scale is not None and v_scale is not None and q_scale is not None, "All scales must be provided for MXFP8"
+            assert k_scale is not None and v_scale is not None and q_scale is not None, (
+                "All scales must be provided for MXFP8")
             dummy_q_scale_block_shape = [1, 1, 1, 1, 1]
             # q_scale from to_mxfp8: [B, H, M, HEAD_DIM/32]
             B, H, M, num_scales_k = q_scale.shape
