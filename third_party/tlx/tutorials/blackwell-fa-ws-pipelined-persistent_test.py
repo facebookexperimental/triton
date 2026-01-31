@@ -2686,7 +2686,7 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
         extra_kern_args = {}
 
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        m_tensor = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
         y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
@@ -2800,7 +2800,7 @@ class _attention(torch.autograd.Function):
         if USE_MXFP8:
             _attn_fwd_mxf8_ws[grid](
                 sm_scale,
-                M,  #
+                m_tensor,  #
                 q.shape[0],
                 q.shape[1],  #
                 desc_q,
@@ -2818,7 +2818,7 @@ class _attention(torch.autograd.Function):
         else:
             _attn_fwd_ws[grid](
                 sm_scale,
-                M,  #
+                m_tensor,  #
                 q.shape[0],
                 q.shape[1],  #
                 desc_q,
