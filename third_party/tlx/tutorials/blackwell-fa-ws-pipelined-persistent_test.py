@@ -292,7 +292,7 @@ mxfp8_configs = [
             "NUM_BUFFERS_KV": 3,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
+            "NUM_MMA_SLICES": 1,
             "GROUP_SIZE_N": 1,
         },
         num_stages=0,
@@ -307,7 +307,7 @@ mxfp8_configs = [
             "NUM_BUFFERS_KV": 3,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
+            "NUM_MMA_SLICES": 1,
             "GROUP_SIZE_N": 4,
         },
         num_stages=0,
@@ -322,7 +322,7 @@ mxfp8_configs = [
             "NUM_BUFFERS_KV": 6,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
+            "NUM_MMA_SLICES": 1,
             "GROUP_SIZE_N": 1,
         },
         num_stages=0,
@@ -337,7 +337,7 @@ mxfp8_configs = [
             "NUM_BUFFERS_KV": 6,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
+            "NUM_MMA_SLICES": 1,
             "GROUP_SIZE_N": 4,
         },
         num_stages=0,
@@ -1185,6 +1185,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
+    tl.static_assert(NUM_MMA_SLICES == 1)
 
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
 
@@ -1246,35 +1247,27 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # 5D scale buffers: [1, REP_M/N, REP_HEAD, 2, 256]
     # For FP8, scales are stored in TMEM
     # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q buffers for q_scale
-    q_scale_tiles = tlx.local_alloc((NUM_MMA_GROUPS * NUM_BUFFERS_Q, REP_M, REP_HEAD, 2, 256), tl.uint8, 1)
-    # Explicitly allocate 1 k_scale buffer (k_bufIdx is always 0 since accum_cnt_kv increments by 2)
-    k_scale_tiles_0 = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, 1)
-
-    v_scale_tiles_1 = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, 1)
+    q_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_BUFFERS_Q)
+    kv_scale_tiles = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
     # p_scale is constant 1/256 = 2^-8 for MXFP8 (softmax output is in [0,1] scaled by 256)
     # Allocate same shape as q_scale since P has same M dimension as Q
     p_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, 1)
-
-    # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q barriers for q_scale
-    q_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
-    q_scale_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
-    # Explicitly allocate 1 k_scale barrier set (k_bufIdx is always 0)
-    k_scale_fulls_0 = tlx.alloc_barriers(num_barriers=1)
-    k_scale_empties_0 = tlx.alloc_barriers(num_barriers=1)
-    # Explicitly allocate 1 v_scale barrier set (v_bufIdx is always 1)
-    v_scale_fulls_1 = tlx.alloc_barriers(num_barriers=1)
-    v_scale_empties_1 = tlx.alloc_barriers(num_barriers=1)
-
-    # Calculate scale bytes for barrier expect
-    Q_SCALE_BYTES: tl.constexpr = REP_M * REP_HEAD * 2 * 256
-    K_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
-    V_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
-
     # Fill p_scale_tiles with constant 0x77 (e8m0 encoding of 2^-8 = 1/256)
     # e8m0 format: stored byte = exponent + 127 (IEEE bias), so 2^-8 => -8 + 127 = 119 = 0x77
     P_SCALE_E8M0: tl.constexpr = 119  # 0x77 = 2^-8 in e8m0 format
     p_scale_const = tl.full((1, REP_M, REP_HEAD, 2, 256), P_SCALE_E8M0, dtype=tl.uint8)
     tlx.local_store(p_scale_tiles[0], p_scale_const)
+
+    q_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
+    q_scale_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
+    # Explicitly allocate 1 k_scale barrier set (k_bufIdx is always 0)
+    kv_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    kv_scale_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+
+    # Calculate scale bytes for barrier expect
+    Q_SCALE_BYTES: tl.constexpr = REP_M * REP_HEAD * 2 * 256
+    K_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
+    V_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
 
     # allocate TMEM buffers and barriers
     qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
@@ -1531,14 +1524,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Use q_scale buffer index 0 for group 0 (q0)
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
                 # k_bufIdx is always 0 (accum_cnt_kv % 2 where accum_cnt_kv increments by 2)
-                tlx.barrier_wait(k_scale_fulls_0[0], k_phase)
+                tlx.barrier_wait(kv_scale_empties[k_bufIdx], k_phase)
                 tlx.async_dot_scaled(
                     q_tiles[0],
                     k_tile,
                     qk_tiles[0],
                     q_scale_tiles[0],
                     Q_FP8_FORMAT,
-                    k_scale_tiles_0[0],
+                    kv_scale_tiles[k_bufIdx],
                     K_FP8_FORMAT,
                     use_acc=False,
                     mBarriers=[qk_fulls[0]],
@@ -1556,13 +1549,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     qk_tiles[1],
                     q_scale_tiles[1],
                     Q_FP8_FORMAT,
-                    k_scale_tiles_0[0],
+                    kv_scale_tiles[k_bufIdx],
                     K_FP8_FORMAT,
                     use_acc=False,
                     mBarriers=[
                         qk_fulls[1],
                         kv_empties[k_bufIdx],
-                        k_scale_empties_0[0],
+                        kv_scale_empties[k_bufIdx],
                     ],
                 )
 
@@ -1574,7 +1567,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
                 # Wait for V scale before the loop
                 # v_bufIdx is always 1 since (accum_cnt_kv + 1) % 2 = 1
-                tlx.barrier_wait(v_scale_fulls_1[0], v_phase)
+                tlx.barrier_wait(kv_scale_fulls[0], v_phase)
                 # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
                 # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
@@ -1591,7 +1584,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         acc_tiles[0],
                         p_scale_tiles[0],
                         P_FP8_FORMAT,
-                        v_scale_tiles_1[0],
+                        # TODO: Determine how to handle NUM_MMA_SLICES here.
+                        kv_scale_tiles[v_bufIdx],
                         V_FP8_FORMAT,
                         use_acc=slice_id > 0,
                         force_async=True,
@@ -1616,14 +1610,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     # Wait for K scale to be loaded by the load group
                     # k_bufIdx is always 0 (accum_cnt_kv % 2 where accum_cnt_kv increments by 2)
-                    tlx.barrier_wait(k_scale_fulls_0[0], k_phase)
+                    tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
                     tlx.async_dot_scaled(
                         q_tiles[0],
                         k_tile,
                         qk_tiles[0],
                         q_scale_tiles[0],
                         Q_FP8_FORMAT,
-                        k_scale_tiles_0[0],
+                        kv_scale_tiles[k_bufIdx],
                         K_FP8_FORMAT,
                         use_acc=False,
                         mBarriers=[qk_fulls[0]],
@@ -1642,7 +1636,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         use_acc = acc1_init if slice_id == 0 else True
                         # V scale for v_bufIdx_prev was already loaded
                         # v_bufIdx_prev is always 1, use explicit buffer
-                        mBarriers_scaled = ([kv_empties[v_bufIdx_prev], v_scale_empties_1[0]]
+                        mBarriers_scaled = ([kv_empties[v_bufIdx_prev], kv_scale_empties[v_bufIdx_prev]]
                                             if slice_id == NUM_MMA_SLICES - 1 else [])
                         tlx.async_dot_scaled(
                             p_tiles[p_bufIdx],
@@ -1650,7 +1644,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                             acc_tiles[1],
                             p_scale_tiles[0],
                             P_FP8_FORMAT,
-                            v_scale_tiles_1[0],
+                            # TODO: Determine how to handle NUM_MMA_SLICES here.
+                            kv_scale_tiles[v_bufIdx_prev],
                             V_FP8_FORMAT,
                             use_acc=use_acc,
                             mBarriers=mBarriers_scaled,
@@ -1665,10 +1660,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         qk_tiles[1],
                         q_scale_tiles[1],
                         Q_FP8_FORMAT,
-                        k_scale_tiles_0[0],
+                        kv_scale_tiles[k_bufIdx],
                         K_FP8_FORMAT,
                         use_acc=False,
-                        mBarriers=[qk_fulls[1], kv_empties[k_bufIdx], k_scale_empties_0[0]],
+                        mBarriers=[qk_fulls[1], kv_empties[k_bufIdx], kv_scale_empties[k_bufIdx]],
                     )
 
                     # -- compute p0 @ v ----
@@ -1678,7 +1673,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.barrier_wait(acc_fulls[0], qk_phase)
                     # Wait for V scale before the loop
                     # v_bufIdx is always 1, use explicit buffer
-                    tlx.barrier_wait(v_scale_fulls_1[0], v_phase)
+                    tlx.barrier_wait(kv_scale_fulls[v_bufIdx], v_phase)
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
                         # Use p[1] for cid=0, and p[3] for cid=1
@@ -1694,7 +1689,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                             acc_tiles[0],
                             p_scale_tiles[0],
                             P_FP8_FORMAT,
-                            v_scale_tiles_1[0],
+                            # TODO: Determine how to handle NUM_MMA_SLICES here.
+                            kv_scale_tiles[v_bufIdx],
                             V_FP8_FORMAT,
                             use_acc=True,
                             force_async=True,
@@ -1720,7 +1716,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     use_acc = acc1_init if slice_id == 0 else True
                     # V scale already waited above, add v_scale_empties to mBarriers for last slice
                     # v_bufIdx is always 1, use explicit buffer
-                    mBarriers_scaled = ([acc_empties[1], kv_empties[v_bufIdx], v_scale_empties_1[0]]
+                    mBarriers_scaled = ([acc_empties[1], kv_empties[v_bufIdx], kv_scale_empties[v_bufIdx]]
                                         if slice_id == NUM_MMA_SLICES - 1 else [])
                     tlx.async_dot_scaled(
                         p_tiles[p_bufIdx],
@@ -1728,7 +1724,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         acc_tiles[1],
                         p_scale_tiles[0],
                         P_FP8_FORMAT,
-                        v_scale_tiles_1[0],
+                        # TODO: Determine how to handle NUM_MMA_SLICES here.
+                        kv_scale_tiles[v_bufIdx],
                         V_FP8_FORMAT,
                         use_acc=use_acc,
                         mBarriers=mBarriers_scaled,
@@ -1801,14 +1798,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
 
                 # Load K scale - k_bufIdx is always 0, use explicit buffer 0
-                tlx.barrier_wait(k_scale_empties_0[0], k_phase ^ 1)
-                tlx.barrier_expect_bytes(k_scale_fulls_0[0], K_SCALE_BYTES)
+                tlx.barrier_wait(kv_scale_empties[k_bufIdx], k_phase ^ 1)
+                tlx.barrier_expect_bytes(kv_scale_fulls[k_bufIdx], K_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                 tlx.async_descriptor_load(
                     desc_k_scale,
-                    k_scale_tiles_0[0],
+                    kv_scale_tiles[k_bufIdx],
                     [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0],
-                    k_scale_fulls_0[0],
+                    kv_scale_fulls[k_bufIdx],
                 )
 
                 # load q1
@@ -1841,14 +1838,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
 
                 # Load V scale - v_bufIdx is always 1, use explicit buffer
-                tlx.barrier_wait(v_scale_empties_1[0], v_phase ^ 1)
-                tlx.barrier_expect_bytes(v_scale_fulls_1[0], V_SCALE_BYTES)
+                tlx.barrier_wait(kv_scale_empties[0], v_phase ^ 1)
+                tlx.barrier_expect_bytes(kv_scale_fulls[0], V_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                 tlx.async_descriptor_load(
                     desc_v_scale,
-                    v_scale_tiles_1[0],
+                    kv_scale_tiles[v_bufIdx],
                     [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0],
-                    v_scale_fulls_1[0],
+                    kv_scale_fulls[0],
                 )
 
                 kv_offset_y += BLOCK_N
@@ -1866,17 +1863,17 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
 
                     # Load K scale - k_bufIdx is always 0, use explicit buffer 0
-                    tlx.barrier_wait(k_scale_empties_0[0], k_phase ^ 1)
-                    tlx.barrier_expect_bytes(k_scale_fulls_0[0], K_SCALE_BYTES)
+                    tlx.barrier_wait(kv_scale_empties[k_bufIdx], k_phase ^ 1)
+                    tlx.barrier_expect_bytes(kv_scale_fulls[k_bufIdx], K_SCALE_BYTES)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                     # Compute offset based on relative position within this batch-head's N range
                     # kv_offset_y is absolute, so we use (kv_offset_y - off_hz * N_CTX) to get relative N
                     curr_kv_scale_n_offset = (kv_offset_y - off_hz * N_CTX) // 128
                     tlx.async_descriptor_load(
                         desc_k_scale,
-                        k_scale_tiles_0[0],
+                        kv_scale_tiles[k_bufIdx],
                         [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0],
-                        k_scale_fulls_0[0],
+                        kv_scale_fulls[k_bufIdx],
                     )
 
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
@@ -1890,15 +1887,15 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
 
                     # Load V scale - v_bufIdx is always 1, use explicit buffer
-                    tlx.barrier_wait(v_scale_empties_1[0], v_phase ^ 1)
-                    tlx.barrier_expect_bytes(v_scale_fulls_1[0], V_SCALE_BYTES)
+                    tlx.barrier_wait(kv_scale_empties[v_bufIdx], v_phase ^ 1)
+                    tlx.barrier_expect_bytes(kv_scale_fulls[v_bufIdx], V_SCALE_BYTES)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                     # Compute offset based on relative position within this batch-head's N range
                     tlx.async_descriptor_load(
                         desc_v_scale,
-                        v_scale_tiles_1[0],
+                        kv_scale_tiles[v_bufIdx],
                         [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0],
-                        v_scale_fulls_1[0],
+                        kv_scale_fulls[v_bufIdx],
                     )
 
                     kv_offset_y += BLOCK_N
