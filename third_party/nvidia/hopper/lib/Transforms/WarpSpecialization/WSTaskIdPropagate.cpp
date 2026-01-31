@@ -100,31 +100,23 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
       if (forOp->isProperAncestor(storeOp) || !appearsBefore(storeOp, forOp))
         continue;
 
-      // Verify that the current MMA is the earliest user in program order,
-      // or that any earlier user has the same async task IDs.
-      // Track the earliest user with matching task IDs.
-      Operation *taskIdSource = mmaOp;
-      bool validUser = true;
+      // Find the earliest user with an async task ID to use as the source.
+      Operation *taskIdSource = nullptr;
       for (auto otherUser : tmemAllocOp.getResult().getUsers()) {
-        if (otherUser == storeOp || otherUser == mmaOp)
+        if (otherUser == storeOp)
           continue;
-        // Check if otherUser appears before mmaOp in program order
-        if (appearsBefore(otherUser, mmaOp)) {
-          // Earlier user must have the same task IDs
-          auto otherTaskIds = getAsyncTaskIds(otherUser);
-          if (otherTaskIds.empty() || otherTaskIds != mmaTaskIds) {
-            LDBG(
-                "Earlier user has different task_id, skipping: " << *otherUser);
-            validUser = false;
-            break;
-          } else {
-            // Update to use the earliest matching user
-            taskIdSource = otherUser;
-          }
+        auto otherTaskIds = getAsyncTaskIds(otherUser);
+        if (otherTaskIds.empty())
+          continue;
+        // Check if this user is earlier than the current taskIdSource
+        if (!taskIdSource || appearsBefore(otherUser, taskIdSource)) {
+          taskIdSource = otherUser;
         }
       }
-      if (!validUser)
+      if (!taskIdSource) {
+        LDBG("No user with async task ID found, skipping");
         continue;
+      }
 
       // Step 4: Check if the TMEMStoreOp already has a task_id
       auto storeTaskIds = getAsyncTaskIds(storeOp);
