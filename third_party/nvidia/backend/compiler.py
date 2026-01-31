@@ -255,6 +255,9 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
         tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         passes.common.add_inliner(pm)
+        # Handle storage lowering. In the future this may need
+        # dummy layouts
+        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         # Only determine layouts after inlining is finished.
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         passes.ttir.add_rewrite_tensor_pointer(pm)

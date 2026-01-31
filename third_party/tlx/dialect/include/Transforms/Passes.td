@@ -109,4 +109,26 @@ def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
   ];
 }
 
+def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower storage alias operations";
+
+  let description = [{
+    This pass lowers storage alias operations by:
+
+    1. Computing or validating storage alias sizes - For each storage_alias_spec,
+       computes the required buffer size as the maximum of all referencing
+       storage_alias_local_alloc operations. If an explicit size is provided,
+       validates it is sufficient.
+
+    2. Materializing storage alias allocations - Creates LocalAllocOp/TMEMAllocOp
+       for each storage_alias_spec and replaces storage_alias_local_alloc with
+       local_alias referencing the allocation.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 #endif // TRITON_TLX_PASSES
