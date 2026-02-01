@@ -1838,8 +1838,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
 
                 # Load V scale - v_bufIdx is always 1, use explicit buffer
-                tlx.barrier_wait(kv_scale_empties[0], v_phase ^ 1)
-                tlx.barrier_expect_bytes(kv_scale_fulls[0], V_SCALE_BYTES)
+                tlx.barrier_wait(kv_scale_empties[v_bufIdx], v_phase ^ 1)
+                tlx.barrier_expect_bytes(kv_scale_fulls[v_bufIdx], V_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                 tlx.async_descriptor_load(
                     desc_v_scale,
