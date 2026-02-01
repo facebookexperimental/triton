@@ -1567,7 +1567,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
                 # Wait for V scale before the loop
                 # v_bufIdx is always 1 since (accum_cnt_kv + 1) % 2 = 1
-                tlx.barrier_wait(kv_scale_fulls[0], v_phase)
+                tlx.barrier_wait(kv_scale_fulls[v_bufIdx], v_phase)
                 # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
                 # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
