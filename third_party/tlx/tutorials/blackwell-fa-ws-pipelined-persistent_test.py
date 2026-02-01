@@ -1764,7 +1764,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 kv_scale_n_offset = lo // 128
                 # Head scale offset: dim 2 is HEAD_DIM position divided by 128
                 # For HEAD_DIM <= 128, this is always 0. For HEAD_DIM > 128, would need per-head-block handling.
-                head_scale_offset: tl.constexpr = HEAD_DIM // 128  # HEAD_DIM offset within the head dimension
+                head_scale_offset: tl.constexpr = (HEAD_DIM - 1) // 128  # HEAD_DIM offset within the head dimension
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
