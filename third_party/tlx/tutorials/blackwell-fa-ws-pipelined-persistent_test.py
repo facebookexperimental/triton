@@ -1845,7 +1845,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     desc_v_scale,
                     kv_scale_tiles[v_bufIdx],
                     [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0],
-                    kv_scale_fulls[0],
+                    kv_scale_fulls[v_bufIdx],
                 )
 
                 kv_offset_y += BLOCK_N
