@@ -1524,7 +1524,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Use q_scale buffer index 0 for group 0 (q0)
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
                 # k_bufIdx is always 0 (accum_cnt_kv % 2 where accum_cnt_kv increments by 2)
-                tlx.barrier_wait(kv_scale_empties[k_bufIdx], k_phase)
+                tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
                 tlx.async_dot_scaled(
                     q_tiles[0],
                     k_tile,
