@@ -2831,7 +2831,7 @@ class _attention(torch.autograd.Function):
                 **extra_kern_args,
             )
 
-        ctx.save_for_backward(q, k, v, o, M)
+        ctx.save_for_backward(q, k, v, o, m_tensor)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
