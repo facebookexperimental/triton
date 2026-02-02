@@ -144,20 +144,19 @@ def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
     assert scale_tensor.element_size() == 1, "Expected element size to be 1 byte (8 bits)"
 
     rows, cols = scale_tensor.shape
+    BLOCK_ROWS, BLOCK_COLS = 128, 4
 
     # Calculate blocks needed
-    n_row_blocks = triton.cdiv(rows, 128)
-    n_col_blocks = triton.cdiv(cols, 4)
-    padded_rows = n_row_blocks * 128
-    padded_cols = n_col_blocks * 4
+    n_row_blocks = triton.cdiv(rows, BLOCK_ROWS)
+    n_col_blocks = triton.cdiv(cols, BLOCK_COLS)
+    padded_rows = n_row_blocks * BLOCK_ROWS
+    padded_cols = n_col_blocks * BLOCK_COLS
 
     out = scale_tensor.new_empty((padded_rows, padded_cols))
 
     # Input stride (for row-major format)
     input_row_stride = scale_tensor.stride()[0]
     input_col_stride = scale_tensor.stride()[1]
-
-    BLOCK_ROWS, BLOCK_COLS = 128, 4
 
     # Output block stride for the rearranged format
     output_block_stride = BLOCK_ROWS * BLOCK_COLS * (padded_cols // BLOCK_COLS)
