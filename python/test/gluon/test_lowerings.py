@@ -22,7 +22,7 @@ def _is_layout_applicable(layout) -> bool:
             return False
         return True
     elif is_hip():
-        if layout in ["padded_shared_layout_single_interval", "padded_shared_layout_multi_interval"]:
+        if isinstance(layout, ttgl.PaddedSharedLayout):
             return True
         # TODO: Add other amd layouts
         return isinstance(layout, ttgl.amd.AMDMFMALayout)

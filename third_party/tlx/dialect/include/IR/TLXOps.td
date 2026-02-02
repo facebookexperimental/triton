@@ -50,7 +50,8 @@ def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", [Pure]> {
 
   let arguments = (ins
     TLX_StorageKindAttr:$storage,
-    OptionalAttr<I64Attr>:$buffer_size_bytes
+    OptionalAttr<I64Attr>:$buffer_size_bytes,
+    OptionalAttr<DenseI64ArrayAttr>:$buffer_shape
   );
 
   let results = (outs TLX_StorageAliasSpecType:$result);
@@ -60,6 +61,49 @@ def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", [Pure]> {
     `storage` `=` $storage
     (`,` `size` `=` $buffer_size_bytes^)?
     attr-dict `:` qualified(type($result))
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Storage Alias Local Alloc Operation
+//===----------------------------------------------------------------------===//
+
+def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
+                                          [Pure]> {
+  let summary = "Allocate local memory referencing a storage alias specification";
+
+  let description = [{
+    Allocates local memory (shared memory or tensor memory) that references
+    a storage alias specification. Multiple allocations can reference the same
+    storage alias specification, and the compiler will:
+    1. Compute the required buffer size (or validate the explicit size)
+    2. Assign offsets to each allocation
+    3. Materialize the actual memory allocation
+
+    This operation is produced by the Python frontend when `local_alloc` is
+    called with a `storage_alias_spec` in the `reuse` parameter.
+
+    After the StorageAliasAllocationPass runs, this operation is replaced with
+    a LocalAliasOp (or MemDescSubviewOp for non-zero offsets) pointing to a
+    standard LocalAllocOp/TMEMAllocOp.
+
+    Example:
+    ```mlir
+    %alias = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %buf = tlx.storage_alias_local_alloc %alias : !tlx.storage_alias_spec<smem>
+           -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    ```
+  }];
+
+  let arguments = (ins TLX_StorageAliasSpecType:$storage_alias);
+
+  let results = (outs TTG_MemDescType:$result);
+
+  let assemblyFormat = [{
+    $storage_alias attr-dict `:`
+    qualified(type($storage_alias)) `->` qualified(type($result))
   }];
 
   let hasVerifier = 1;
