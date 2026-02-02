@@ -1757,15 +1757,20 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Scale tensor is 5D: [B*H, N//128, HEAD_DIM//128, 2, 256] for K/V
                 # TMA offset: [batch_head, row_block, head_block, 0, 0]
                 # Q scale offset: dim 1 is M position divided by 128-row granularity
-                # But we need the offset relative to the start of this batch-head's M block
-                # start_m is the M block index within this batch-head
-                q_scale_m_offset = start_m * BLOCK_M // 128
+                # start_m is the M block index, each block has BLOCK_M rows
+                q_scale_m_offset_q0 = start_m * BLOCK_M // 128
+                # Q1 is at offset BLOCK_M_SPLIT within the BLOCK_M chunk
+                q_scale_m_offset_q1 = (start_m * BLOCK_M + BLOCK_M_SPLIT) // 128
                 # K/V scale offset: dim 1 is N position divided by 128-row granularity
                 # lo is the starting N position within this batch-head
                 kv_scale_n_offset = lo // 128
                 # Head scale offset: dim 2 is HEAD_DIM position divided by 128
                 # For HEAD_DIM <= 128, this is always 0. For HEAD_DIM > 128, would need per-head-block handling.
                 head_scale_offset: tl.constexpr = (HEAD_DIM - 1) // 128  # HEAD_DIM offset within the head dimension
+
+                # Compute base offset for this batch-head (needed for inner loop kv_scale computation)
+                # offset_y = off_z * (N_CTX * H) + off_h * N_CTX = qo_offset_y - start_m * BLOCK_M
+                base_offset_y = qo_offset_y - start_m * BLOCK_M
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
@@ -1782,7 +1787,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(
                     desc_q_scale,
                     q_scale_tiles[0],
-                    [off_hz, q_scale_m_offset, head_scale_offset, 0, 0],
+                    [off_hz, q_scale_m_offset_q0, head_scale_offset, 0, 0],
                     q_scale_fulls[0],
                 )
 
@@ -1811,7 +1816,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # load q1
                 q_bufIdx += NUM_BUFFERS_Q
-                q_scale_m_offset += NUM_BUFFERS_Q
 
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
@@ -1824,7 +1828,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(
                     desc_q_scale,
                     q_scale_tiles[1],
-                    [off_hz, q_scale_m_offset, head_scale_offset, 0, 0],
+                    [off_hz, q_scale_m_offset_q1, head_scale_offset, 0, 0],
                     q_scale_fulls[1],
                 )
 
@@ -1868,8 +1872,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.barrier_expect_bytes(kv_scale_fulls[k_bufIdx], K_SCALE_BYTES)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                     # Compute offset based on relative position within this batch-head's N range
-                    # kv_offset_y is absolute, so we use (kv_offset_y - off_hz * N_CTX) to get relative N
-                    curr_kv_scale_n_offset = (kv_offset_y - off_hz * N_CTX) // 128
+                    # kv_offset_y is absolute, base_offset_y is the start of this batch-head
+                    curr_kv_scale_n_offset = (kv_offset_y - base_offset_y) // 128
                     tlx.async_descriptor_load(
                         desc_k_scale,
                         kv_scale_tiles[k_bufIdx],
