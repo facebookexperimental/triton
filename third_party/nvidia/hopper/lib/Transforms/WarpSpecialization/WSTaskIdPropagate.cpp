@@ -101,9 +101,9 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
         continue;
 
       // Find the earliest user with an async task ID to use as the source.
-      Operation *taskIdSource = nullptr;
+      Operation *taskIdSource = mmaOp;
       for (auto otherUser : tmemAllocOp.getResult().getUsers()) {
-        if (otherUser == storeOp)
+        if (otherUser == storeOp || otherUser == taskIdSource)
           continue;
         auto otherTaskIds = getAsyncTaskIds(otherUser);
         if (otherTaskIds.empty())
@@ -112,10 +112,6 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
         if (!taskIdSource || appearsBefore(otherUser, taskIdSource)) {
           taskIdSource = otherUser;
         }
-      }
-      if (!taskIdSource) {
-        LDBG("No user with async task ID found, skipping");
-        continue;
       }
 
       // Step 4: Check if the TMEMStoreOp already has a task_id
