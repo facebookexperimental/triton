@@ -1775,8 +1775,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Q0 is first half, Q1 is second half
                 q_scale_m_offset_q0 = start_m * 2 * REP_M
                 q_scale_m_offset_q1 = (start_m * 2 * REP_M) + REP_M
-                # K/V scale offset: Based on REP_N
-                # TODO: FIXME
+                # K/V scale offset: compute which BLOCK_N-sized data block we're in,
+                # then convert to scale chunk offset (REP_N chunks per data block)
                 kv_scale_n_offset = (lo // BLOCK_N) * REP_N
 
                 # load q0
