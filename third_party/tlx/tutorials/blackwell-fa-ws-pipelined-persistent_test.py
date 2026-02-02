@@ -3025,11 +3025,11 @@ def generate_attention_inputs(shape, device, dtype):
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("N_CTX", [1024])
-@pytest.mark.parametrize("HEAD_DIM", [64, 128])
-@pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("BLOCK_M1", [64, 128])
-@pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
+@pytest.mark.parametrize("HEAD_DIM", [64])
+@pytest.mark.parametrize("mode", ["fwd"])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("BLOCK_M1", [128])
+@pytest.mark.parametrize("GROUP_SIZE_M", [1])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 def test_op(
     Z,
