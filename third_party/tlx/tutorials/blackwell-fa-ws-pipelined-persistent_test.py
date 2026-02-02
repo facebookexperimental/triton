@@ -98,13 +98,17 @@ def triton_scale_swizzle(
     start_row = pid_row * BLOCK_ROWS
     start_col = pid_col * BLOCK_COLS
     global_rows = start_row + rows
-    global_cols = start_col + cols
+    # Replicate columns instead of zero-padding: wrap column indices to valid range
+    # This ensures that when scale_cols < BLOCK_COLS (e.g., HEAD_DIM=64 gives 2 cols),
+    # we replicate the valid columns to fill the 4-column block that hardware expects.
+    # E.g., for 2 cols: [col0, col1, col0, col1] instead of [col0, col1, 0, 0]
+    global_cols = start_col + (cols % scale_cols)
 
-    mask = (global_rows < scale_rows) & (global_cols < scale_cols)
+    row_mask = global_rows < scale_rows
 
     input_scales = tl.load(
         scale_ptr + global_rows * input_row_stride + global_cols * input_col_stride,
-        mask=mask,
+        mask=row_mask,
         other=0.0,
     )
 
