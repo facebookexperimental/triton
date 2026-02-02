@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-taskid-propagate="num-warp-groups=3" --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
 // CHECK-LABEL: _attn_fwd_persist
 // CHECK: ttg.warp_specialize
 // CHECK: default
