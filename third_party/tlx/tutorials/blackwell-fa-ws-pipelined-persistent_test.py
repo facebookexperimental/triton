@@ -1776,8 +1776,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 q_scale_m_offset_q0 = start_m * 2 * REP_M
                 q_scale_m_offset_q1 = (start_m * 2 * REP_M) + REP_M
                 # K/V scale offset: Based on REP_N
-                # Note: off_hz handles batch/head in the 5D TMA, so kv_scale_n_offset
-                # should be the scale chunk index (0 to scale_n_chunks-1), not the data offset
+                # TODO: FIXME
                 kv_scale_n_offset = (lo // BLOCK_N) * REP_N
 
                 # load q0
