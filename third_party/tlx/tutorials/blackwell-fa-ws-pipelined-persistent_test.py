@@ -1757,9 +1757,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Scale tensor is 5D: [B*H, M//128, HEAD_DIM//128, 2, 256] for Q
                 # Scale tensor is 5D: [B*H, N//128, HEAD_DIM//128, 2, 256] for K/V
                 # TMA offset: [batch_head, row_block, head_block, 0, 0]
-                # Q scale offset: Based on REP_M
-                q_scale_m_offset_q0 = start_m * REP_M
-                q_scale_m_offset_q1 = q_scale_m_offset_q0 + REP_M
+                # Q scale offset: start_m covers 256 rows (2 scale blocks of 128 each)
+                # Q0 is first half, Q1 is second half
+                q_scale_m_offset_q0 = start_m * 2 * REP_M
+                q_scale_m_offset_q1 = (start_m * 2 * REP_M) + REP_M
                 # K/V scale offset: Based on REP_N
                 kv_scale_n_offset = kv_offset_y
 
@@ -1895,6 +1896,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     )
 
                     kv_offset_y += BLOCK_N
+                    kv_scale_n_offset += REP_N
                     accum_cnt_kv += 2
 
                 tile_idx += num_progs
@@ -2774,6 +2776,27 @@ class _attention(torch.autograd.Function):
             scale_k_chunks = v_scale_swizzled.shape[2] // 4
             v_scale_5d = v_scale_swizzled.reshape(B * H, scale_n_chunks, scale_k_chunks, 2, 256)
             desc_v_scale = TensorDescriptor.from_tensor(v_scale_5d, block_shape=dummy_v_scale_block_shape)
+
+            # DEBUG: Print scale tensor shapes and key parameters
+            print("\n=== DEBUG: Scale Tensor Info ===")
+            print(f"B={B}, H={H}, N_CTX={q.shape[2]}, HEAD_DIM={HEAD_DIM_K}")
+            print(f"q_scale input shape: {q_scale.shape} (should be [B, H, M, HEAD_DIM/32])")
+            print(f"  -> HEAD_DIM/32 = {HEAD_DIM_K}/32 = {HEAD_DIM_K // 32}")
+            print(f"q_scale_flat shape before swizzle: [{B*H}, {q.shape[2]}, {q_scale.shape[-1]}]")
+            print(f"q_scale_swizzled shape: {q_scale_swizzled.shape}")
+            print(f"  -> Expected cols after padding to 4: {triton.cdiv(q_scale.shape[-1], 4) * 4}")
+            print(f"q_scale_5d shape: {q_scale_5d.shape}")
+            print(f"scale_m_chunks={scale_m_chunks}, scale_k_chunks={scale_k_chunks}")
+
+            # Check the actual non-zero pattern in swizzled tensor
+            print("\n--- Swizzle Pattern Analysis ---")
+            print("q_scale_swizzled[0, :4, :] (first 4 rows, all cols):")
+            print(q_scale_swizzled[0, :4, :])
+            print("\nq_scale_swizzled non-zero count per column:")
+            for col in range(q_scale_swizzled.shape[2]):
+                nz = (q_scale_swizzled[0, :, col] != 0).sum().item()
+                print(f"  col {col}: {nz} non-zero values")
+            print("=== END DEBUG ===\n")
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
