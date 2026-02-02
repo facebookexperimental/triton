@@ -351,7 +351,7 @@ mxfp8_configs = [
 def prune_configs_by_hdim(configs, named_args, **kwargs):
     HEAD_DIM = kwargs["HEAD_DIM"]
     STAGE = kwargs["STAGE"]
-    target_kv_buffers = 6 if HEAD_DIM == 64 else 1
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
     target_group_size_n = 4 if STAGE == 3 else 1
     return [
         conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
@@ -362,7 +362,7 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
 def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
     HEAD_DIM = kwargs["HEAD_DIM"]
     STAGE = kwargs["STAGE"]
-    target_kv_buffers = 6 if HEAD_DIM == 64 else 1
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
     target_group_size_n = 4 if STAGE == 3 else 1
     return [
         conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
