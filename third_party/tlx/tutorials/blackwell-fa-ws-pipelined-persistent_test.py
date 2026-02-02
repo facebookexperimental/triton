@@ -197,8 +197,9 @@ def _mxf8_host_descriptor_pre_hook(nargs):
     nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
+    VEC_SIZE = 32
     REP_M = math.ceil(BLOCK_M_SPLIT / 128)
-    REP_N = math.ceil(BLOCK_N / 128)
+    REP_N = math.ceil(math.ceil(BLOCK_N / VEC_SIZE), 4)
     REP_HEAD = math.ceil(HEAD_DIM / 128)
     nargs["desc_q_scale"].block_shape = [1, REP_M, REP_HEAD, 2, 256]
     nargs["desc_k_scale"].block_shape = [1, REP_N, REP_HEAD, 2, 256]
