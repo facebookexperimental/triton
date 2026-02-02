@@ -1760,16 +1760,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Q scale offset: Based on REP_M
                 q_scale_m_offset_q0 = start_m * REP_M
                 q_scale_m_offset_q1 = q_scale_m_offset_q0 + REP_M
-                # K/V scale offset: dim 1 is N position divided by 128-row granularity
-                # lo is the starting N position within this batch-head
-                kv_scale_n_offset = lo // 128
-                # Head scale offset: dim 2 is HEAD_DIM position divided by 128
-                # For HEAD_DIM <= 128, this is always 0. For HEAD_DIM > 128, would need per-head-block handling.
-                head_scale_offset: tl.constexpr = (HEAD_DIM - 1) // 128  # HEAD_DIM offset within the head dimension
-
-                # Compute base offset for this batch-head (needed for inner loop kv_scale computation)
-                # offset_y = off_z * (N_CTX * H) + off_h * N_CTX = qo_offset_y - start_m * BLOCK_M
-                base_offset_y = qo_offset_y - start_m * BLOCK_M
+                # K/V scale offset: Based on REP_N
+                kv_scale_n_offset = kv_offset_y
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
@@ -1786,7 +1778,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(
                     desc_q_scale,
                     q_scale_tiles[0],
-                    [off_hz, q_scale_m_offset_q0, head_scale_offset, 0, 0],
+                    [off_hz, q_scale_m_offset_q0, 0, 0, 0],
                     q_scale_fulls[0],
                 )
 
@@ -1809,7 +1801,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(
                     desc_k_scale,
                     kv_scale_tiles[k_bufIdx],
-                    [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0],
+                    [off_hz, kv_scale_n_offset, 0, 0, 0],
                     kv_scale_fulls[k_bufIdx],
                 )
 
@@ -1827,7 +1819,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(
                     desc_q_scale,
                     q_scale_tiles[1],
-                    [off_hz, q_scale_m_offset_q1, head_scale_offset, 0, 0],
+                    [off_hz, q_scale_m_offset_q1, 0, 0, 0],
                     q_scale_fulls[1],
                 )
 
@@ -1848,11 +1840,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(
                     desc_v_scale,
                     kv_scale_tiles[v_bufIdx],
-                    [off_hz, kv_scale_n_offset, head_scale_offset, 0, 0],
+                    [off_hz, kv_scale_n_offset, 0, 0, 0],
                     kv_scale_fulls[v_bufIdx],
                 )
 
                 kv_offset_y += BLOCK_N
+                kv_scale_n_offset += REP_N
                 accum_cnt_kv += 2
 
                 for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
@@ -1872,11 +1865,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                     # Compute offset based on relative position within this batch-head's N range
                     # kv_offset_y is absolute, base_offset_y is the start of this batch-head
-                    curr_kv_scale_n_offset = (kv_offset_y - base_offset_y) // 128
                     tlx.async_descriptor_load(
                         desc_k_scale,
                         kv_scale_tiles[k_bufIdx],
-                        [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0],
+                        [off_hz, kv_scale_n_offset, 0, 0, 0],
                         kv_scale_fulls[k_bufIdx],
                     )
 
@@ -1898,7 +1890,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.async_descriptor_load(
                         desc_v_scale,
                         kv_scale_tiles[v_bufIdx],
-                        [off_hz, curr_kv_scale_n_offset, head_scale_offset, 0, 0],
+                        [off_hz, kv_scale_n_offset, 0, 0, 0],
                         kv_scale_fulls[v_bufIdx],
                     )
 
