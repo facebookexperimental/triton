@@ -351,7 +351,18 @@ mxfp8_configs = [
 def prune_configs_by_hdim(configs, named_args, **kwargs):
     HEAD_DIM = kwargs["HEAD_DIM"]
     STAGE = kwargs["STAGE"]
-    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 1
+    target_group_size_n = 4 if STAGE == 3 else 1
+    return [
+        conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
+        and conf.kwargs.get("GROUP_SIZE_N", 0) == target_group_size_n
+    ]
+
+
+def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
+    HEAD_DIM = kwargs["HEAD_DIM"]
+    STAGE = kwargs["STAGE"]
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 1
     target_group_size_n = 4 if STAGE == 3 else 1
     return [
         conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
@@ -1167,7 +1178,7 @@ def _attn_fwd_ws(sm_scale, M,  #
 @triton.autotune(
     configs=mxfp8_configs,
     key=["N_CTX", "HEAD_DIM", "STAGE"],
-    prune_configs_by={"early_config_prune": prune_configs_by_hdim},
+    prune_configs_by={"early_config_prune": prune_configs_by_hdim_mxfp8},
 )
 @triton.jit
 def _attn_fwd_mxf8_ws(sm_scale, M,  #
@@ -1762,7 +1773,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 q_scale_m_offset_q0 = start_m * 2 * REP_M
                 q_scale_m_offset_q1 = (start_m * 2 * REP_M) + REP_M
                 # K/V scale offset: Based on REP_N
-                kv_scale_n_offset = kv_offset_y
+                # Note: off_hz handles batch/head in the 5D TMA, so kv_scale_n_offset
+                # should be the scale chunk index (0 to scale_n_chunks-1), not the data offset
+                kv_scale_n_offset = (lo // BLOCK_N) * REP_N
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
@@ -2782,7 +2795,7 @@ class _attention(torch.autograd.Function):
             print(f"B={B}, H={H}, N_CTX={q.shape[2]}, HEAD_DIM={HEAD_DIM_K}")
             print(f"q_scale input shape: {q_scale.shape} (should be [B, H, M, HEAD_DIM/32])")
             print(f"  -> HEAD_DIM/32 = {HEAD_DIM_K}/32 = {HEAD_DIM_K // 32}")
-            print(f"q_scale_flat shape before swizzle: [{B*H}, {q.shape[2]}, {q_scale.shape[-1]}]")
+            print(f"q_scale_flat shape before swizzle: [{B * H}, {q.shape[2]}, {q_scale.shape[-1]}]")
             print(f"q_scale_swizzled shape: {q_scale_swizzled.shape}")
             print(f"  -> Expected cols after padding to 4: {triton.cdiv(q_scale.shape[-1], 4) * 4}")
             print(f"q_scale_5d shape: {q_scale_5d.shape}")
