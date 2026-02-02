@@ -289,7 +289,7 @@ mxfp8_configs = [
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_KV": 1,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 1,
@@ -304,7 +304,7 @@ mxfp8_configs = [
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_KV": 1,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 1,
@@ -361,7 +361,7 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
 def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
     HEAD_DIM = kwargs["HEAD_DIM"]
     STAGE = kwargs["STAGE"]
-    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 1
     target_group_size_n = 4 if STAGE == 3 else 1
     return [
         conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
@@ -3014,7 +3014,7 @@ def generate_attention_inputs(shape, device, dtype):
     """
     # Generate bf16 reference tensors first
 
-    if dtype == torch.float8_e5m2:
+    if dtype == torch.float8_e4m3fn:
         orig_dtype = torch.bfloat16
     else:
         orig_dtype = dtype
@@ -3023,7 +3023,7 @@ def generate_attention_inputs(shape, device, dtype):
     k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
 
-    if dtype == torch.float8_e5m2:
+    if dtype == torch.float8_e4m3fn:
         # Convert bf16 reference tensors to MXFP8
         q_scale, q_data = to_mxfp8(q_ref)
         k_scale, k_data = to_mxfp8(k_ref)
@@ -3049,7 +3049,7 @@ def generate_attention_inputs(shape, device, dtype):
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
 @pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 def test_op(
     Z,
     H,
@@ -3073,7 +3073,7 @@ def test_op(
     sm_scale = 0.5
     # reference implementation using bf16 reference tensors
     ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=causal)
-    if mode == "bwd" and dtype == torch.float8_e5m2:
+    if mode == "bwd" and dtype == torch.float8_e4m3fn:
         pytest.skip("FP8 bwd not supported yet")
     if mode == "bwd":
         dout = torch.randn_like(q)
@@ -3151,7 +3151,7 @@ for mode in ["fwd", "bwd"]:
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, causal, BWD_BLOCK_M1, GROUP_SIZE_M, device=DEVICE,
                           dtype=torch.float16):
     assert mode in ["fwd", "bwd"]
-    assert dtype in [torch.float16, torch.bfloat16, torch.float8_e5m2]
+    assert dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
     if "triton" in provider:
         shape = (BATCH, H, N_CTX, HEAD_DIM)
 
