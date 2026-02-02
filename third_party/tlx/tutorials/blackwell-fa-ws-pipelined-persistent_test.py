@@ -1202,7 +1202,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # Using ceiling division for block sizes that may not fully use the hardware
     REP_M: tl.constexpr = triton.cdiv(BLOCK_M_SPLIT, 128)
     REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
-    REP_HEAD: tl.constexpr = triton.cdiv(HEAD_DIM, 128)
+    VEC_SIZE: tl.constexpr = 32
+    REP_HEAD: tl.constexpr = triton.cdiv(triton.cdiv(HEAD_DIM, VEC_SIZE), 4)
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
@@ -1756,11 +1757,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Scale tensor is 5D: [B*H, M//128, HEAD_DIM//128, 2, 256] for Q
                 # Scale tensor is 5D: [B*H, N//128, HEAD_DIM//128, 2, 256] for K/V
                 # TMA offset: [batch_head, row_block, head_block, 0, 0]
-                # Q scale offset: dim 1 is M position divided by 128-row granularity
-                # start_m is the M block index, each block has BLOCK_M rows
-                q_scale_m_offset_q0 = start_m * BLOCK_M // 128
-                # Q1 is at offset BLOCK_M_SPLIT within the BLOCK_M chunk
-                q_scale_m_offset_q1 = (start_m * BLOCK_M + BLOCK_M_SPLIT) // 128
+                # Q scale offset: Based on REP_M
+                q_scale_m_offset_q0 = start_m * REP_M
+                q_scale_m_offset_q1 = q_scale_m_offset_q0 + REP_M
                 # K/V scale offset: dim 1 is N position divided by 128-row granularity
                 # lo is the starting N position within this batch-head
                 kv_scale_n_offset = lo // 128
