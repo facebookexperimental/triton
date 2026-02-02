@@ -199,7 +199,7 @@ def _mxf8_host_descriptor_pre_hook(nargs):
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
     VEC_SIZE = 32
     REP_M = math.ceil(BLOCK_M_SPLIT / 128)
-    REP_N = math.ceil(math.ceil(BLOCK_N / VEC_SIZE), 4)
+    REP_N = math.ceil(math.ceil(BLOCK_N / VEC_SIZE) / 4)
     REP_HEAD = math.ceil(HEAD_DIM / 128)
     nargs["desc_q_scale"].block_shape = [1, REP_M, REP_HEAD, 2, 256]
     nargs["desc_k_scale"].block_shape = [1, REP_N, REP_HEAD, 2, 256]
@@ -1811,6 +1811,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # load q1
                 q_bufIdx += NUM_BUFFERS_Q
+                q_scale_m_offset += NUM_BUFFERS_Q
+
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                 qo_offset_y_split = qo_offset_y + BLOCK_M_SPLIT
@@ -1819,8 +1821,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Load Q scale for q1 - use q_scale buffer index 1 for group 1
                 tlx.barrier_wait(q_scale_empties[1], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_scale_fulls[1], Q_SCALE_BYTES)
-                # Q scale offset is same as q0 for group 1 (same M block)
-                # The two groups share the same Q tile but need separate buffers
                 tlx.async_descriptor_load(
                     desc_q_scale,
                     q_scale_tiles[1],
