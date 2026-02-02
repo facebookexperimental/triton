@@ -1268,9 +1268,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # p_scale is constant 1/256 = 2^-8 for MXFP8 (softmax output is in [0,1] scaled by 256)
     # Allocate same shape as q_scale since P has same M dimension as Q
     p_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, 1)
-    # Fill p_scale_tiles with constant 0x77 (e8m0 encoding of 2^-8 = 1/256)
-    # e8m0 format: stored byte = exponent + 127 (IEEE bias), so 2^-8 => -8 + 127 = 119 = 0x77
-    P_SCALE_E8M0: tl.constexpr = 119  # 0x77 = 2^-8 in e8m0 format
+    # TODO: FIXME/Understand P's value
+    P_SCALE_E8M0: tl.constexpr = 127
     p_scale_const = tl.full((1, REP_M, REP_HEAD, 2, 256), P_SCALE_E8M0, dtype=tl.uint8)
     tlx.local_store(p_scale_tiles[0], p_scale_const)
 
@@ -2791,27 +2790,6 @@ class _attention(torch.autograd.Function):
             scale_k_chunks = v_scale_swizzled.shape[2] // 4
             v_scale_5d = v_scale_swizzled.reshape(B * H, scale_n_chunks, scale_k_chunks, 2, 256)
             desc_v_scale = TensorDescriptor.from_tensor(v_scale_5d, block_shape=dummy_v_scale_block_shape)
-
-            # DEBUG: Print scale tensor shapes and key parameters
-            print("\n=== DEBUG: Scale Tensor Info ===")
-            print(f"B={B}, H={H}, N_CTX={q.shape[2]}, HEAD_DIM={HEAD_DIM_K}")
-            print(f"q_scale input shape: {q_scale.shape} (should be [B, H, M, HEAD_DIM/32])")
-            print(f"  -> HEAD_DIM/32 = {HEAD_DIM_K}/32 = {HEAD_DIM_K // 32}")
-            print(f"q_scale_flat shape before swizzle: [{B * H}, {q.shape[2]}, {q_scale.shape[-1]}]")
-            print(f"q_scale_swizzled shape: {q_scale_swizzled.shape}")
-            print(f"  -> Expected cols after padding to 4: {triton.cdiv(q_scale.shape[-1], 4) * 4}")
-            print(f"q_scale_5d shape: {q_scale_5d.shape}")
-            print(f"scale_m_chunks={scale_m_chunks}, scale_k_chunks={scale_k_chunks}")
-
-            # Check the actual non-zero pattern in swizzled tensor
-            print("\n--- Swizzle Pattern Analysis ---")
-            print("q_scale_swizzled[0, :4, :] (first 4 rows, all cols):")
-            print(q_scale_swizzled[0, :4, :])
-            print("\nq_scale_swizzled non-zero count per column:")
-            for col in range(q_scale_swizzled.shape[2]):
-                nz = (q_scale_swizzled[0, :, col] != 0).sum().item()
-                print(f"  col {col}: {nz} non-zero values")
-            print("=== END DEBUG ===\n")
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
