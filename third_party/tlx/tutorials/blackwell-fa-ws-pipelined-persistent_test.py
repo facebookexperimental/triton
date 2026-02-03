@@ -1303,12 +1303,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
                                reuse=qk_storage_alias)
     NUM_P_BUFFERS: tl.constexpr = NUM_MMA_GROUPS * NUM_MMA_SLICES * 2 * P_PADDING
+    # Note: P is not shared because of scaled_dot requirements.
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
         tlx.dtype_of(desc_v),
         NUM_P_BUFFERS,
-        tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
     )
     alpha_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
