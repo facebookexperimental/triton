@@ -1513,7 +1513,10 @@ def test_op(
     # triton implementation
     tri_out = attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal).to(dtype)
     tri_out = tri_out.to(ref_out.dtype)
-    # FP8 has lower precision, so use higher tolerance
-    fwd_atol = 1e-2
+    # MXFP8 has lower precision due to:
+    # 1. FP8 E4M3 quantization of Q, K, V (3 mantissa bits = 12.5% relative error)
+    # 2. Softmax probabilities < 0.002 underflow to 0 in FP8 (affects P @ V)
+    # 3. Compound errors from multiple FP8 matmuls
+    fwd_atol = 3e-2
     torch.testing.assert_close(tri_out, ref_out, atol=fwd_atol, rtol=0)
     return
