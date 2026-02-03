@@ -334,7 +334,7 @@ def _softmax_inner_loop(
 
 @triton.autotune(
     configs=configs,
-    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"],
+    key=["N_CTX", "HEAD_DIM", "STAGE"],
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
@@ -343,7 +343,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                  HEAD_DIM: tl.constexpr,  #
                  BLOCK_M: tl.constexpr,  #
                  BLOCK_N: tl.constexpr,  #
-                 FP8_OUTPUT: tl.constexpr,  #
                  STAGE: tl.constexpr,  #
                  NUM_BUFFERS_Q: tl.constexpr,  #
                  NUM_BUFFERS_KV: tl.constexpr,  #
@@ -1723,8 +1722,6 @@ class _attention(torch.autograd.Function):
             desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
-            # Useful for resetting autotuning.
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             **extra_kern_args,
         )
@@ -1862,7 +1859,7 @@ attention = _attention.apply
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("BLOCK_M1", [64, 128])
 @pytest.mark.parametrize("GROUP_SIZE_M", [1, 2, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_op(
     Z,
     H,
@@ -1881,16 +1878,11 @@ def test_op(
     v = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
     sm_scale = 0.5
     # reference implementation
-    if dtype == torch.float8_e5m2:
-        ref_dtype = torch.float32
-    else:
-        ref_dtype = dtype
+    ref_dtype = dtype
     q = q.to(ref_dtype)
     k = k.to(ref_dtype)
     v = v.to(ref_dtype)
     ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
-    if mode == "bwd" and dtype == torch.float8_e5m2:
-        pytest.skip("FP8 bwd not supported yet")
     if mode == "bwd":
         dout = torch.randn_like(q)
         ref_out.backward(dout)
@@ -1898,17 +1890,10 @@ def test_op(
         ref_dk, k.grad = k.grad.clone(), None
         ref_dq, q.grad = q.grad.clone(), None
     # triton implementation
-    if mode == "fwd" and dtype == torch.float8_e5m2:
-        q = q.to(dtype)
-        k = k.to(dtype)
-        v = v.to(dtype)
     tri_out = attention(q, k, v, sm_scale, causal, BLOCK_M1, GROUP_SIZE_M).to(dtype)
     if mode == "fwd":
         tri_out = tri_out.to(ref_dtype)
-        # Largest atol measured for FP8 fwd was ~0.15. Seems like 0.4%
-        # of values fall outside the 16-bit range.
-        atol = 2e-1 if dtype == torch.float8_e5m2 else 1e-2
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
+        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
         return
 
     tri_out.backward(dout)
@@ -1974,15 +1959,11 @@ for mode in ["fwd", "bwd"]:
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, causal, BWD_BLOCK_M1, GROUP_SIZE_M, device=DEVICE,
                           dtype=torch.float16):
     assert mode in ["fwd", "bwd"]
-    assert dtype in [torch.float16, torch.bfloat16, torch.float8_e5m2]
+    assert dtype in [torch.float16, torch.bfloat16]
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=device).to(dtype).requires_grad_()
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=device).to(dtype).requires_grad_()
         v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=device).to(dtype).requires_grad_()
-        if mode == "fwd" and dtype == torch.float8_e5m2:
-            q = q.to(dtype)
-            k = k.to(dtype)
-            v = v.to(dtype)
         sm_scale = 1.3
         fn = lambda: attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M)
         if mode == "bwd":
