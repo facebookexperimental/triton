@@ -183,21 +183,15 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.swizzled,
                 )
         else:
-            # For 8-bit element types (uint8/int8), use a dummy TMEM layout that will
-            # be resolved during layout propagation. This is used for scales in
-            # scaled MMA operations where the final layout depends on usage context.
-            if dtype == tl.uint8 or dtype == tl.int8:
-                layout = None  # Will be resolved by layout propagation
-                layout_handle = _semantic.builder.make_dummy_tmem_layout_attr()
+            # For sub-16-bit element types (uint8, int8, fp8, etc.), use a dummy TMEM
+            # layout that will be resolved during layout propagation. This is used for
+            # scales in scaled MMA operations where the final layout depends on usage context.
+            if dtype.primitive_bitwidth < 16:
+                layout = tlx.DummyTMEMLayoutEncoding()
+                layout_handle = layout.to_ir(_semantic.builder)
             else:
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
-                layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
-                    layout.blockM,
-                    layout.blockN,
-                    layout.unpacked,
-                    layout.CTASplitM,
-                    layout.CTASplitN,
-                )
+                layout_handle = layout.to_ir(_semantic.builder)
     else:
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 

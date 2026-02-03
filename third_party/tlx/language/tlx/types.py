@@ -275,6 +275,29 @@ class DummyRegisterLayoutEncoding(layout_encoding):
         return hash((tuple(self.shape), self.element_type, self.tmem_compatible))
 
 
+class DummyTMEMLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for TMEM tensors that will be resolved during layout propagation.
+    Used for sub-16-bit element types where the final layout depends on usage context
+    (e.g., as scales in scaled MMA operations).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_tmem_layout_attr()
+
+    def __repr__(self):
+        return "DummyTMEMLayoutEncoding<>"
+
+    def __eq__(self, other):
+        return isinstance(other, DummyTMEMLayoutEncoding)
+
+    def __hash__(self):
+        return hash(self.__class__.__name__)
+
+
 class storage_kind(enum.Enum):
     smem = "smem"
     tmem = "tmem"
