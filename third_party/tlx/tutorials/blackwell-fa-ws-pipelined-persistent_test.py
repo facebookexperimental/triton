@@ -1266,11 +1266,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q buffers for q_scale
     q_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_tiles = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
-    # p_scale is constant 1/256 = 2^-8 for MXFP8 (softmax output is in [0,1] scaled by 256)
+    # p_scale is 1.0 (E8M0 bias is 127) since softmax output P is in [0,1] without prescaling
     # Allocate same shape as q_scale since P has same M dimension as Q
     p_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, 1)
-    # TODO: FIXME/Understand P's value
-    P_SCALE_E8M0: tl.constexpr = 119
+    # E8M0 scale = 2^(value - 127), so 127 means scale = 1.0
+    P_SCALE_E8M0: tl.constexpr = 127
     p_scale_const = tl.full((1, REP_M, REP_HEAD, 2, 256), P_SCALE_E8M0, dtype=tl.uint8)
     tlx.local_store(p_scale_tiles[0], p_scale_const)
 
@@ -3015,10 +3015,13 @@ def generate_attention_inputs(shape, device, dtype):
         k_scale, k_data = to_mxfp8(k_ref)
 
         # For V, we need scales along the N dimension (reduction dim in P @ V)
-        # V shape: [B, H, N, HEAD_DIM], transpose to [B, H, HEAD_DIM, N]
-        v_scale, v_data = to_mxfp8(v_ref)
-        v_scale = v_scale.transpose(-2, -1).contiguous()
-        # v_scale: [B, H, HEAD_DIM, N//32] - scales along N (correct for P @ V)
+        # V shape: [B, H, N, HEAD_DIM]
+        # to_mxfp8 scales along the last dimension, so we transpose before quantization
+        # to get scales along N instead of HEAD_DIM
+        v_transposed = v_ref.transpose(-2, -1).contiguous()  # [B, H, HEAD_DIM, N]
+        v_scale, v_data_transposed = to_mxfp8(v_transposed)  # v_scale: [B, H, HEAD_DIM, N//32]
+        v_data = v_data_transposed.transpose(-2, -1).contiguous()  # [B, H, N, HEAD_DIM]
+        # v_scale shape: [B, H, HEAD_DIM, N//32] - scales along N (correct for P @ V)
 
         return (q_data, q_scale, q_ref), (k_data, k_scale, k_ref), (v_data, v_scale, v_ref)
     else:

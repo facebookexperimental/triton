@@ -2553,8 +2553,8 @@ def test_descriptor_load_multicast(device):
     kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
                                           ctas_per_cga=(2, 2, 1))
 
-    assert kernel.asm["ptx"].count(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    assert (kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1)
     # x:
     # [ x0 | x2]
     # [ x1 | x3]
@@ -3869,16 +3869,15 @@ def test_make_tensor_descriptor_mxfp8(device):
     ttgir = kernel.asm["ttgir"]
 
     # Verify that tensormap_create and reinterpret_tensor_descriptor operations are present
-    assert ttgir.count("ttng.tensormap_create"
-                       ) == 4, f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}"
-    assert ttgir.count(
-        "ttng.reinterpret_tensor_descriptor"
-    ) == 4, f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    assert ttgir.count("ttng.tensormap_create") == 4, (
+        f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}")
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 4, (
+        f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    )
 
     # Verify encoding propagation: tensormap_create should have shared memory encoding
     # The encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp
-    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, \
-        "Expected shared memory encoding in ttgir"
+    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, "Expected shared memory encoding in ttgir"
 
     # Compute reference
     def fp8e8m0_to_float32(scale):
