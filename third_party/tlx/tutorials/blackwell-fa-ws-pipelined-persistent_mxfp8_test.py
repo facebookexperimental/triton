@@ -503,7 +503,7 @@ def _softmax_inner_loop(
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             p_bufIdx = slice_id + cid * NUM_MMA_SLICES
             p_i = tl.math.exp2(qks[slice_id])
-            # tlx.barrier_wait(tlx.local_view(p_empties, p_bufIdx), qk_phase ^ 1)
+            tlx.barrier_wait(tlx.local_view(p_empties, p_bufIdx), qk_phase ^ 1)
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
             tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
             ps = ps + (p_i, )
@@ -915,13 +915,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Use p[slice_id] for cid=0, and
                 # p[NUM_MMA_SLICES + slice_id] for cid=1
                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                    tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
+                    p_bufIdx = slice_id
+                    tlx.barrier_wait(p_fulls[slice_id], qk_phase)
                     kv_slice = tlx.local_slice(
                         kv_tiles[v_bufIdx],
                         [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                         [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                     )
-                    p_bufIdx = slice_id
                     tlx.async_dot_scaled(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -932,7 +932,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         kv_scale_tiles[v_bufIdx],
                         V_FP8_FORMAT,
                         use_acc=slice_id > 0,
-                        force_async=True,
+                        mBarriers=[p_empties[p_bufIdx]],
                     )
 
                 acc1_init = False
@@ -980,8 +980,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         use_acc = acc1_init if slice_id == 0 else True
                         # V scale for v_bufIdx_prev was already loaded
                         # v_bufIdx_prev is always 1, use explicit buffer
-                        mBarriers_scaled = ([kv_empties[v_bufIdx_prev], kv_scale_empties[v_bufIdx_prev]]
-                                            if slice_id == NUM_MMA_SLICES - 1 else [])
+                        mBarriers_scaled = ([
+                            kv_empties[v_bufIdx_prev], kv_scale_empties[v_bufIdx_prev], p_empties[p_bufIdx]
+                        ] if slice_id == NUM_MMA_SLICES - 1 else [p_empties[p_bufIdx]])
                         tlx.async_dot_scaled(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -1036,7 +1037,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                             kv_scale_tiles[v_bufIdx],
                             V_FP8_FORMAT,
                             use_acc=True,
-                            force_async=True,
+                            mBarriers=[p_empties[p_bufIdx]],
                         )
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
@@ -1044,8 +1045,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
-                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                    tlx.tcgen05_commit(p_empties[slice_id])
 
                 # -- compute p1 @ v ----
                 tlx.barrier_wait(acc_fulls[1], qk_phase)
@@ -1063,7 +1062,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # v_bufIdx is always 1, use explicit buffer
                     mBarriers_scaled = ([
                         acc_empties[1], kv_empties[v_bufIdx], kv_scale_empties[v_bufIdx], p_empties[p_bufIdx]
-                    ] if slice_id == NUM_MMA_SLICES - 1 else [])
+                    ] if slice_id == NUM_MMA_SLICES - 1 else [p_empties[p_bufIdx]])
                     tlx.async_dot_scaled(
                         p_tiles[p_bufIdx],
                         kv_slice,
