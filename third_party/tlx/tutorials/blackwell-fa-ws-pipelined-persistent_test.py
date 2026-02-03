@@ -1288,8 +1288,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     K_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
     V_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
 
-    # Define the buffer for sharing. Offsets are currently manually specified
-    # via buffer count.
     qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     # Shared buffer for QK, P and Alpha, l, and m.
     # A single QK buffer is split evenly:
