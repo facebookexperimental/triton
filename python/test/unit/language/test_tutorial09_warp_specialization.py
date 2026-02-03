@@ -109,16 +109,14 @@ def matmul_kernel_tma_persistent_ws(
 
     # Always use warp_specialize=True with configurable flatten
     for tile_id in tl.range(
-        start_pid,
-        num_tiles,
-        NUM_SMS,
-        flatten=FLATTEN,
-        warp_specialize=True,
-        disallow_acc_multi_buffer=True,
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=True,
+            disallow_acc_multi_buffer=True,
     ):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -130,9 +128,7 @@ def matmul_kernel_tma_persistent_ws(
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
@@ -204,16 +200,14 @@ def matmul_kernel_descriptor_persistent_ws(
 
     # Always use warp_specialize=True with configurable flatten
     for tile_id in tl.range(
-        start_pid,
-        num_tiles,
-        NUM_SMS,
-        flatten=FLATTEN,
-        warp_specialize=True,
-        disallow_acc_multi_buffer=True,
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=FLATTEN,
+            warp_specialize=True,
+            disallow_acc_multi_buffer=True,
     ):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -225,9 +219,7 @@ def matmul_kernel_descriptor_persistent_ws(
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
@@ -247,29 +239,19 @@ def matmul_kernel_descriptor_persistent_ws(
 # ============================================================================
 # Test 1: matmul_kernel_tma warp specialization (K-loop based)
 # ============================================================================
-@pytest.mark.parametrize(
-    "M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)]
-)
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
 @pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_tutorial09_matmul_tma_warp_specialize(
-    M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps
-):
+def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages,
+                                               num_warps):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and num_stages == 3 and num_warps == 8:
-        pytest.skip(
-            "Out of resources: shared memory and tensor memory exceeded for BLOCK_SIZE_N=256, num_stages=3, num_warps=8"
-        )
-    # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_warps == 4:
-        pytest.skip(
-            "Out of resources: shared memory and tensor memory exceeded for BLOCK_SIZE_N=256, BLOCK_SIZE_K == 128, num_warps=8"
-        )
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -294,9 +276,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
         b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
         c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
 
-        grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
 
         kernel = matmul_kernel_tma_ws[grid](
             a_desc,
@@ -328,9 +308,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 # Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop based)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
-@pytest.mark.parametrize(
-    "M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)]
-)
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -353,17 +331,11 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
     # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and num_stages == 3:
-        pytest.skip(
-            "Out of resources: tensor memory exceeded for BLOCK_SIZE_N=256, num_stages=3"
-        )
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if not FLATTEN and num_warps == 4:
-        pytest.skip("Fails in AutoWS. TODO: Support")
-
-    # EPILOGUE_SUBTILE only works with flatten=True
-    if not FLATTEN and EPILOGUE_SUBTILE:
-        pytest.skip("EPILOGUE_SUBTILE only works with flatten=True")
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and not EPILOGUE_SUBTILE:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -394,13 +366,10 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             [BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if EPILOGUE_SUBTILE else BLOCK_SIZE_N],
         )
 
-        grid = lambda META: (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            ),
-        )
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
 
         kernel = matmul_kernel_tma_persistent_ws[grid](
             a_desc,
@@ -435,9 +404,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 # Test 3: matmul_kernel_descriptor_persistent warp specialization (device-side TMA)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
-@pytest.mark.parametrize(
-    "M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)]
-)
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -460,17 +427,11 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
     # Skip configurations that exceed hardware resource limits
-    if BLOCK_SIZE_N == 256 and num_stages == 3:
-        pytest.skip(
-            "Out of resources: tensor memory exceeded for BLOCK_SIZE_N=256, num_stages=3"
-        )
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if not FLATTEN and num_warps == 4:
-        pytest.skip("Fails in AutoWS. TODO: Support")
-
-    # EPILOGUE_SUBTILE only works with flatten=True
-    if not FLATTEN and EPILOGUE_SUBTILE:
-        pytest.skip("EPILOGUE_SUBTILE only works with flatten=True")
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and not EPILOGUE_SUBTILE:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -492,13 +453,10 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
 
         triton.set_allocator(alloc_fn)
 
-        grid = lambda META: (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            ),
-        )
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
 
         kernel = matmul_kernel_descriptor_persistent_ws[grid](
             A,
