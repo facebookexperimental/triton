@@ -2877,7 +2877,7 @@ void insertAsyncComm(
         // Even when A is nested inside B we still need to place
         // the acquire right before the head producer to avoid
         // reordering the barriers incorrectly. This acquire will
-        // be idemponent in the loop becasue we don't flip the phase.
+        // be idemponent in the loop because we don't flip the phase.
         auto producerAcquirePoint =
             getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
         builder.setAsynTaskIdsFromArray(masterChannel->relation.first);

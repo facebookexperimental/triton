@@ -673,8 +673,9 @@ def _attn_fwd_ws(sm_scale, M,  #
     o_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    # allocate TMEM buffers and barriers
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
+    # Define the buffer for sharing. Offsets are currently manually specified
+    # via buffer count.
+    qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     # Shared buffer for QK, P and Alpha, l, and m.
     # A single QK buffer is split evenly:
     #   - First half  : stores P
@@ -686,34 +687,36 @@ def _attn_fwd_ws(sm_scale, M,  #
     #     m :                                |BLK_M/2*1*fp32|
     # When working with smaller dtypes (e.g. FP8), we pad the original data to match the original
     # boundaries and prevent overlap.
+    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
+                               reuse=qk_storage_alias)
     NUM_P_BUFFERS: tl.constexpr = NUM_MMA_GROUPS * NUM_MMA_SLICES * 2 * P_PADDING
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
         tlx.dtype_of(desc_v),
         NUM_P_BUFFERS,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
     alpha_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
         BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
     l_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
         BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
     m_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
         BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
@@ -1285,8 +1288,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     K_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
     V_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
 
-    # allocate TMEM buffers and barriers
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
+    # Define the buffer for sharing. Offsets are currently manually specified
+    # via buffer count.
+    qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     # Shared buffer for QK, P and Alpha, l, and m.
     # A single QK buffer is split evenly:
     #   - First half  : stores P
@@ -1298,37 +1302,36 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     #     m :                                |BLK_M/2*1*fp32|
     # When working with smaller dtypes (e.g. FP8), we pad the original data to match the original
     # boundaries and prevent overlap.
-    # For FP8 (USE_SCALE_MMA), p_tiles are in SMEM (not reused), and scales are in TMEM.
-    # For non-FP8, p_tiles reuse qk_tiles from TMEM.
+    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
+                               reuse=qk_storage_alias)
     NUM_P_BUFFERS: tl.constexpr = NUM_MMA_GROUPS * NUM_MMA_SLICES * 2 * P_PADDING
-    # For FP8: p_tiles in SMEM (not reused from qk_tiles)
-    # TODO: Validate
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
-        p_dtype,
+        tlx.dtype_of(desc_v),
         NUM_P_BUFFERS,
+        tlx.storage_kind.tmem,
+        reuse=qk_storage_alias,
     )
-
     alpha_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
         BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
     l_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
         BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
     m_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
         BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_storage_alias,
     )
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
@@ -2689,7 +2692,6 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M):
-        # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V

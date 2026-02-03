@@ -9,6 +9,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #define GET_OP_CLASSES
 #include "IR/Ops.cpp.inc"
@@ -45,6 +47,35 @@ LogicalResult StorageAliasSpecOp::verify() {
     int64_t size = sizeAttr.getInt();
     if (size <= 0) {
       return emitOpError("buffer_size_bytes must be positive, got ") << size;
+    }
+  }
+
+  return success();
+}
+
+//-- StorageAliasLocalAllocOp --
+
+LogicalResult StorageAliasLocalAllocOp::verify() {
+  // Verify that the storage alias and result have compatible storage kinds
+  auto storageAliasType =
+      cast<StorageAliasSpecType>(getStorageAlias().getType());
+  auto storageAliasStorage = storageAliasType.getStorage();
+
+  auto resultType = cast<triton::gpu::MemDescType>(getResult().getType());
+  auto resultMemorySpace = resultType.getMemorySpace();
+
+  // Check consistency between storage alias storage and result memory space
+  if (storageAliasStorage == StorageKind::smem) {
+    if (!isa<triton::gpu::SharedMemorySpaceAttr>(resultMemorySpace)) {
+      return emitOpError(
+          "storage_alias_spec has smem storage but result is not in shared "
+          "memory");
+    }
+  } else if (storageAliasStorage == StorageKind::tmem) {
+    if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(resultMemorySpace)) {
+      return emitOpError(
+          "storage_alias_spec has tmem storage but result is not in tensor "
+          "memory");
     }
   }
 
