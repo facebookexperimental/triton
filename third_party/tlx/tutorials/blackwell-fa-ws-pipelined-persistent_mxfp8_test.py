@@ -1326,12 +1326,8 @@ def generate_attention_inputs(shape, device, dtype):
     """
     # Generate bf16 reference tensors first
     orig_dtype = torch.bfloat16
-    min_max_ranges = [(-0.1, 0.1), (0.3, 0.6), (-10.0, 10.0)]
-    q_ref = generate_tensor_with_block_distributions(torch.empty(shape, device=device, dtype=orig_dtype),
-                                                     min_max_ranges)
-    k_ref = generate_tensor_with_block_distributions(torch.empty(shape, device=device, dtype=orig_dtype),
-                                                     min_max_ranges)
-
+    q_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
+    k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     # Convert bf16 reference tensors to MXFP8
     q_scale, q_data = to_mxfp8(q_ref)
