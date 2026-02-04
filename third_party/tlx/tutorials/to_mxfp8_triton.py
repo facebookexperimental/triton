@@ -82,6 +82,49 @@ def to_mxfp8(
     return scale_e8m0_biased, data_lp
 
 
+# =============================================================================
+# Shared swizzle function for 5D scale layout
+# =============================================================================
+
+
+@triton.jit
+def swizzle_scales_block(
+    scale_input,  # [BLOCK_ROWS, BLOCK_COLS] tensor (already loaded)
+    scale_output,  # Output pointer
+    output_offset,  # Offset in output buffer for this block
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """
+    Swizzle a block of scales to 5D format and store to output.
+
+    The swizzling follows NVIDIA's block scaling factors layout:
+    - 128 rows are grouped into 4 sub-blocks of 32 rows
+    - Swizzle formula: dest_idx = (r % 32) * 16 + (r // 32) * 4 + c
+
+    Args:
+        scale_input: Loaded scale tensor [BLOCK_ROWS, BLOCK_COLS]
+        scale_output: Output buffer pointer
+        output_offset: Offset in output buffer for this block
+        BLOCK_ROWS: Number of rows (typically 128)
+        BLOCK_COLS: Number of columns (typically 4)
+    """
+    rows = tl.arange(0, BLOCK_ROWS)[:, None]
+    cols = tl.arange(0, BLOCK_COLS)[None, :]
+
+    r_div_32 = rows // 32
+    r_mod_32 = rows % 32
+
+    # Swizzle formula: maps 2D (r, c) to flat index in 512-byte block
+    dest_indices = r_mod_32 * 16 + r_div_32 * 4 + cols
+
+    # Flatten and store
+    dest_indices_flat = tl.reshape(dest_indices, (BLOCK_ROWS * BLOCK_COLS, ))
+    scales_flat = tl.reshape(scale_input, (BLOCK_ROWS * BLOCK_COLS, ))
+
+    tl.store(scale_output + output_offset + dest_indices_flat, scales_flat)
+
+
 # Triton kernel for scale swizzling from torchao
 # https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/kernels.py
 @triton.jit
@@ -120,24 +163,12 @@ def triton_scale_swizzle(
         other=0.0,
     )
 
-    r_div_32 = rows // 32
-    r_mod_32 = rows % 32
-
-    # Rearrange to (32, 4, 4) then to final (32, 16) coordinates
-    dest_indices = r_mod_32 * 16 + r_div_32 * 4 + cols
-
-    # Flatten
-    dest_indices_flat = tl.reshape(dest_indices, (BLOCK_ROWS * BLOCK_COLS))
-    scales_flat = tl.reshape(input_scales, (BLOCK_ROWS * BLOCK_COLS))
-
-    # Calculate block offset using provided output block stride
+    # Calculate block offset for output
     LOCAL_NUMEL = BLOCK_ROWS * BLOCK_COLS
     block_offset = pid_col * LOCAL_NUMEL + (pid_row * output_block_stride)
 
-    tl.store(
-        output_ptr + block_offset + dest_indices_flat,
-        scales_flat,
-    )
+    # Use shared swizzle function
+    swizzle_scales_block(input_scales, output_ptr, block_offset, BLOCK_ROWS, BLOCK_COLS)
 
 
 def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -273,51 +304,6 @@ def _compute_scale_and_quantize(data_block,  # [BLOCK_M, BLOCK_K] float32 input
 
 
 @triton.jit
-def _swizzle_scales_for_tmem(
-    scale_input,  # [BLOCK_M, NUM_SCALES] uint8 scales
-    scale_output,  # Pre-allocated output buffer, flattened (1, REP_M, REP_N, 2, 256)
-    BLOCK_M: tl.constexpr,
-    NUM_SCALES: tl.constexpr,
-):
-    """
-    Swizzle scales from row-major [BLOCK_M, NUM_SCALES] to TMEM format (1, REP_M, REP_N, 2, 256).
-
-    The TMEM format is (1, REP_M, REP_N, 2, 256) where:
-    - REP_M = ceil(BLOCK_M / 128)
-    - REP_N = ceil(NUM_SCALES / 4)
-
-    The swizzling follows NVIDIA's block scaling factors layout:
-    - 128 rows are grouped into blocks
-    - Within each 128-row block, rows are interleaved with columns
-
-    For a 128x4 scale tensor:
-    - Input indices: row r (0-127), col c (0-3)
-    - Output flat index: (r % 32) * 16 + (r // 32) * 4 + c
-    - This flat index maps to 5D as: (0, 0, 0, flat_idx // 256, flat_idx % 256)
-
-    Args:
-        scale_input: Input scales tensor [BLOCK_M, NUM_SCALES]
-        scale_output: Pre-allocated output buffer pointer (flattened view of (1, REP_M, REP_N, 2, 256))
-        BLOCK_M: Number of rows (must be 128 for now)
-        NUM_SCALES: Number of scale columns (must be 4 for now)
-    """
-    # Compute swizzle destination indices
-    rows = tl.arange(0, BLOCK_M)[:, None]  # [BLOCK_M, 1]
-    cols = tl.arange(0, NUM_SCALES)[None, :]  # [1, NUM_SCALES]
-
-    # Swizzle formula: maps 2D (r, c) to flat index in 512-byte block
-    r_div_32 = rows // 32
-    r_mod_32 = rows % 32
-    dest_idx = r_mod_32 * 16 + r_div_32 * 4 + cols  # [BLOCK_M, NUM_SCALES]
-
-    # Flatten and store
-    dest_idx_flat = tl.reshape(dest_idx, [BLOCK_M * NUM_SCALES])
-    scale_flat = tl.reshape(scale_input, [BLOCK_M * NUM_SCALES])
-
-    tl.store(scale_output + dest_idx_flat, scale_flat)
-
-
-@triton.jit
 def to_mxfp8_jit(data,  # [BLOCK_M, BLOCK_K] float32 input tensor
                  BLOCK_SIZE: tl.constexpr = 32,  # MX block size
                  ):
@@ -390,24 +376,8 @@ def to_mxfp8_with_swizzled_scale(
     # Step 1: Compute scales and quantized data
     scale_e8m0, data_fp8 = _compute_scale_and_quantize(data, VEC_SIZE)
 
-    # Step 2: Swizzle scales for TMEM
-    # scale_e8m0 shape: [128, 4]
-    # Need to produce (1, 1, 1, 2, 256) = 512 bytes
-
-    # Swizzle pattern for 128x4 -> 512 flat
-    rows = tl.arange(0, BLOCK_M)[:, None]  # [128, 1]
-    cols = tl.arange(0, NUM_SCALES)[None, :]  # [1, 4]
-
-    r_div_32 = rows // 32
-    r_mod_32 = rows % 32
-
-    # Destination index: r_mod_32 * 16 + r_div_32 * 4 + cols
-    dest_idx = r_mod_32 * 16 + r_div_32 * 4 + cols  # [128, 4]
-    dest_idx_flat = tl.reshape(dest_idx, [BLOCK_M * NUM_SCALES])
-    scale_flat = tl.reshape(scale_e8m0, [BLOCK_M * NUM_SCALES])
-
-    # Store swizzled scales
-    tl.store(scale_out + dest_idx_flat, scale_flat)
+    # Step 2: Swizzle scales for TMEM using shared function
+    swizzle_scales_block(scale_e8m0, scale_out, 0, BLOCK_M, NUM_SCALES)
 
     return data_fp8
 
@@ -415,51 +385,6 @@ def to_mxfp8_with_swizzled_scale(
 # =============================================================================
 # Test and verification code
 # =============================================================================
-
-
-def reference_to_mxfp8_pytorch(data_hp: torch.Tensor, block_size: int = 32):
-    """
-    Reference PyTorch implementation of to_mxfp8 for verification.
-    Extracted from torchao.
-    """
-    assert data_hp.dtype in (torch.bfloat16, torch.float32)
-    assert data_hp.shape[-1] % block_size == 0
-
-    orig_shape = data_hp.shape
-    data_hp = data_hp.reshape(*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
-
-    max_abs = torch.amax(torch.abs(data_hp), -1).unsqueeze(-1)
-    data_hp = data_hp.to(torch.float32)
-    max_abs = max_abs.to(torch.float32)
-
-    F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    E8M0_EXPONENT_BIAS = 127
-
-    descale = max_abs / F8E4M3_MAX
-
-    exponent = torch.where(
-        torch.isnan(descale),
-        0xFF,
-        (torch.clamp(
-            torch.ceil(torch.log2(descale)),
-            min=-E8M0_EXPONENT_BIAS,
-            max=E8M0_EXPONENT_BIAS,
-        ) + E8M0_EXPONENT_BIAS).to(torch.uint8),
-    )
-
-    descale_fp = torch.where(
-        exponent == 0,
-        1.0,
-        torch.exp2(E8M0_EXPONENT_BIAS - exponent.to(torch.float32)),
-    )
-
-    data_lp = torch.clamp(data_hp * descale_fp, min=-F8E4M3_MAX, max=F8E4M3_MAX)
-    data_lp = data_lp.to(torch.float8_e4m3fn)
-    data_lp = data_lp.reshape(orig_shape)
-
-    scale_e8m0 = exponent.squeeze(-1)
-
-    return scale_e8m0.view(torch.float8_e8m0fnu), data_lp
 
 
 def swizzle_scales_pytorch(scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -568,7 +493,7 @@ def _test_swizzle_scales_kernel(
     BLOCK_M: tl.constexpr,
     NUM_SCALES: tl.constexpr,
 ):
-    """Test kernel that applies _swizzle_scales_for_tmem."""
+    """Test kernel that applies swizzle_scales_block."""
     # Load input scales [BLOCK_M, NUM_SCALES]
     row_idx = tl.arange(0, BLOCK_M)[:, None]
     col_idx = tl.arange(0, NUM_SCALES)[None, :]
@@ -576,8 +501,8 @@ def _test_swizzle_scales_kernel(
 
     scale_input = tl.load(scale_in_ptr + in_offsets)
 
-    # Call the function being tested - it writes to the output buffer
-    _swizzle_scales_for_tmem(scale_input, scale_out_ptr, BLOCK_M, NUM_SCALES)
+    # Call the function being tested - it writes to the output buffer with offset 0
+    swizzle_scales_block(scale_input, scale_out_ptr, 0, BLOCK_M, NUM_SCALES)
 
 
 def test_to_mxfp8_host():
@@ -790,8 +715,8 @@ def test_to_mxfp8_roundtrip():
     return passed
 
 
-def test_swizzle_scales_for_tmem():
-    """Test _swizzle_scales_for_tmem against PyTorch reference.
+def test_swizzle_scales_block():
+    """Test swizzle_scales_block against PyTorch reference.
 
     Verifies that the swizzled output has the correct (1, REP_M, REP_N, 2, 256) layout
     with proper values at each position.
@@ -904,8 +829,8 @@ def test_to_mxfp8():
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    # Get PyTorch reference
-    scale_ref, data_fp8_ref = reference_to_mxfp8_pytorch(data, BLOCK_SIZE)
+    # Get PyTorch reference using to_mxfp8
+    scale_ref, data_fp8_ref = to_mxfp8(data, BLOCK_SIZE)
     scale_ref = scale_ref.view(torch.uint8)
 
     # Compare scales
@@ -963,8 +888,8 @@ def test_to_mxfp8_swizzled():
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    # Get PyTorch reference
-    scale_ref, data_fp8_ref = reference_to_mxfp8_pytorch(data, BLOCK_SIZE)
+    # Get PyTorch reference using to_mxfp8
+    scale_ref, data_fp8_ref = to_mxfp8(data, BLOCK_SIZE)
     scale_ref_uint8 = scale_ref.view(torch.uint8)
 
     # Swizzle reference scales
@@ -1010,9 +935,9 @@ if __name__ == "__main__":
     print(f"Test passed: {result_roundtrip}\n")
 
     print("=" * 60)
-    print("Testing _swizzle_scales_for_tmem...")
+    print("Testing swizzle_scales_block...")
     print("=" * 60)
-    result0 = test_swizzle_scales_for_tmem()
+    result0 = test_swizzle_scales_block()
     print(f"Test passed: {result0}\n")
 
     print("=" * 60)
@@ -1036,6 +961,6 @@ if __name__ == "__main__":
         print(f"  to_mxfp8_host: {result_host}")
         print(f"  triton_mx_block_rearrange: {result_rearrange}")
         print(f"  to_mxfp8_roundtrip: {result_roundtrip}")
-        print(f"  _swizzle_scales_for_tmem: {result0}")
+        print(f"  swizzle_scales_block: {result0}")
         print(f"  to_mxfp8 in-kernel: {result1}")
         print(f"  to_mxfp8 in-kernel swizzled: {result2}")
