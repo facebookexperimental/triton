@@ -2932,7 +2932,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         # CLC Init
         clc_phase_producer = 1
         clc_phase_consumer = 0
-        clc_context = tlx.clc_create_context()
+        clc_context = tlx.clc_create_context(1)
 
         while tile_id != -1:
             # CLC producer

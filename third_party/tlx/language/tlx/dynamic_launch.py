@@ -63,7 +63,7 @@ def _clc_query(
 
 
 @tl.builtin
-def clc_create_context(num_stages: tl.tensor = 1, num_consumers=1, _semantic=None) -> tlx.CLCPipelineContext:
+def clc_create_context(num_consumers, num_stages: tl.tensor = 1, _semantic=None) -> tlx.CLCPipelineContext:
     if not isinstance(num_stages, tl.constexpr):
         num_stages = tl.constexpr(num_stages)
     if not isinstance(num_consumers, tl.constexpr):
@@ -76,7 +76,7 @@ def clc_create_context(num_stages: tl.tensor = 1, num_consumers=1, _semantic=Non
 
 
 @tl.builtin
-def clc_producer(context, k=0, p_producer=None, multi_ctas: bool = False, _semantic=None):
+def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _semantic=None):
     """
     Issue a CLC try_cancel request from the first CTA in the cluster.
 
@@ -127,7 +127,7 @@ def clc_producer(context, k=0, p_producer=None, multi_ctas: bool = False, _seman
 
 
 @tl.builtin
-def clc_consumer(context, k=0, p_consumer=None, multi_ctas: bool = False, _semantic=None):
+def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _semantic=None):
     """
     Decode the tile ID from a CLC response and signal completion.
 
