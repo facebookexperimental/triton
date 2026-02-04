@@ -83,7 +83,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
-    clc_context = tlx.clc_create_context(NUM_CLC_STAGES, 3)
+    clc_context = tlx.clc_create_context(NUM_CLC_STAGES, num_consumers=3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -109,7 +109,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # if tlx.thread_id(axis=0) == 0:
                 # tl.device_print("Default WG Processing CtaID", tile_id)
                 # producer
-                tlx.clc_producer(clc_context, clc_buf, clc_phase_producer)
+                tlx.clc_producer(clc_context, k=clc_buf, p_producer=clc_phase_producer)
                 # clc_phase_producer ^= 1
                 clc_phase_producer = clc_phase_producer ^ (clc_buf == (NUM_CLC_STAGES - 1))
 
@@ -145,7 +145,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
-                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, k=clc_buf, p_consumer=clc_phase_consumer)
                 # clc_phase_consumer ^= 1
                 clc_phase_consumer = clc_phase_consumer ^ (clc_buf == (NUM_CLC_STAGES - 1))
                 clc_buf += 1
@@ -206,7 +206,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                tile_id = tlx.clc_consumer(clc_context, k=clc_buf, p_consumer=clc_phase)
                 # clc_phase ^= 1
                 clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
                 clc_buf += 1
@@ -248,7 +248,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
+                tile_id = tlx.clc_consumer(clc_context, k=clc_buf, p_consumer=clc_phase)
                 # clc_phase ^= 1
                 clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
                 clc_buf += 1
