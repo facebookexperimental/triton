@@ -11,6 +11,192 @@ import torch
 import triton
 import triton.language as tl
 
+# =============================================================================
+# PyTorch host-side MXFP8 conversion functions
+# (Extracted from blackwell-fa-ws-pipelined-persistent_mxfp8_test.py)
+# =============================================================================
+
+
+# This function is extracted from https://github.com/pytorch/ao/blob/v0.12.0/torchao/prototype/mx_formats/mx_tensor.py#L142
+def to_mxfp8(
+    data_hp: torch.Tensor,
+    block_size: int = 32,
+):
+    assert data_hp.dtype in (
+        torch.bfloat16,
+        torch.float,
+    ), f"{data_hp.dtype} is not supported yet"
+    assert data_hp.shape[-1] % block_size == 0, (
+        f"the last dimension of shape {data_hp.shape} must be divisible by block_size {block_size}")
+    assert data_hp.is_contiguous(), "unsupported"
+
+    orig_shape = data_hp.shape
+    data_hp = data_hp.reshape(*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
+
+    max_abs = torch.amax(torch.abs(data_hp), -1).unsqueeze(-1)
+
+    data_hp = data_hp.to(torch.float32)
+    max_abs = max_abs.to(torch.float32)
+
+    F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    max_pos = F8E4M3_MAX
+
+    # RCEIL
+    def _to_mx_rceil(
+        data_hp: torch.Tensor,
+        max_abs: torch.Tensor,
+        max_pos: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        E8M0_EXPONENT_BIAS = 127
+        descale = max_abs / max_pos
+        exponent = torch.where(
+            torch.isnan(descale),
+            0xFF,  # Handle biased exponent for nan
+            # NOTE: descale < (torch.finfo(torch.float32).smallest_normal / 2) is handled through clamping
+            (torch.clamp(
+                torch.ceil(torch.log2(descale)),
+                min=-E8M0_EXPONENT_BIAS,
+                max=E8M0_EXPONENT_BIAS,
+            ) + E8M0_EXPONENT_BIAS).to(torch.uint8),
+        )
+
+        descale_fp = torch.where(
+            exponent == 0,
+            1.0,
+            torch.exp2(E8M0_EXPONENT_BIAS - exponent.to(torch.float32)),
+        )
+
+        # scale and saturated cast the data elements to max of target dtype
+        data_lp = torch.clamp(data_hp * descale_fp, min=-1 * max_pos, max=max_pos)
+        return exponent, data_lp
+
+    scale_e8m0_biased, data_lp = _to_mx_rceil(data_hp, max_abs, max_pos)
+
+    # cast to target dtype
+    data_lp = data_lp.to(torch.float8_e4m3fn)
+    # need to reshape at the end to help inductor fuse things
+    data_lp = data_lp.reshape(orig_shape)
+
+    scale_e8m0_biased = scale_e8m0_biased.view(torch.float8_e8m0fnu)
+    scale_e8m0_biased = scale_e8m0_biased.squeeze(-1)
+    return scale_e8m0_biased, data_lp
+
+
+# Triton kernel for scale swizzling from torchao
+# https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/kernels.py
+@triton.jit
+def triton_scale_swizzle(
+    scale_ptr,
+    scale_rows,
+    scale_cols,
+    output_ptr,
+    input_row_stride,
+    input_col_stride,
+    output_block_stride,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+
+    rows = tl.arange(0, BLOCK_ROWS)[:, None]
+    cols = tl.arange(0, BLOCK_COLS)[None, :]
+
+    # Calculate starting row and column for this tile
+    start_row = pid_row * BLOCK_ROWS
+    start_col = pid_col * BLOCK_COLS
+    global_rows = start_row + rows
+    # Replicate columns instead of zero-padding: wrap column indices to valid range
+    # This ensures that when scale_cols < BLOCK_COLS (e.g., HEAD_DIM=64 gives 2 cols),
+    # we replicate the valid columns to fill the 4-column block that hardware expects.
+    # E.g., for 2 cols: [col0, col1, col0, col1] instead of [col0, col1, 0, 0]
+    global_cols = start_col + (cols % scale_cols)
+
+    row_mask = global_rows < scale_rows
+
+    input_scales = tl.load(
+        scale_ptr + global_rows * input_row_stride + global_cols * input_col_stride,
+        mask=row_mask,
+        other=0.0,
+    )
+
+    r_div_32 = rows // 32
+    r_mod_32 = rows % 32
+
+    # Rearrange to (32, 4, 4) then to final (32, 16) coordinates
+    dest_indices = r_mod_32 * 16 + r_div_32 * 4 + cols
+
+    # Flatten
+    dest_indices_flat = tl.reshape(dest_indices, (BLOCK_ROWS * BLOCK_COLS))
+    scales_flat = tl.reshape(input_scales, (BLOCK_ROWS * BLOCK_COLS))
+
+    # Calculate block offset using provided output block stride
+    LOCAL_NUMEL = BLOCK_ROWS * BLOCK_COLS
+    block_offset = pid_col * LOCAL_NUMEL + (pid_row * output_block_stride)
+
+    tl.store(
+        output_ptr + block_offset + dest_indices_flat,
+        scales_flat,
+    )
+
+
+def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Rearranges an E8M0 tensor scale to block-scaled swizzle format.
+
+    This format is suitable for Tmem as described in NVIDIA documentation:
+    https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
+
+    Args:
+        scale_tensor: Input tensor in row-major format with 8-bit elements [M, K/32]
+
+    Returns:
+        Rearranged tensor in block-scaled swizzle format [padded_M, padded_K/32]
+    """
+    assert scale_tensor.element_size() == 1, "Expected element size to be 1 byte (8 bits)"
+
+    rows, cols = scale_tensor.shape
+    BLOCK_ROWS, BLOCK_COLS = 128, 4
+
+    # Calculate blocks needed
+    n_row_blocks = triton.cdiv(rows, BLOCK_ROWS)
+    n_col_blocks = triton.cdiv(cols, BLOCK_COLS)
+    padded_rows = n_row_blocks * BLOCK_ROWS
+    padded_cols = n_col_blocks * BLOCK_COLS
+
+    out = scale_tensor.new_empty((padded_rows, padded_cols))
+
+    # Input stride (for row-major format)
+    input_row_stride = scale_tensor.stride()[0]
+    input_col_stride = scale_tensor.stride()[1]
+
+    # Output block stride for the rearranged format
+    output_block_stride = BLOCK_ROWS * BLOCK_COLS * (padded_cols // BLOCK_COLS)
+
+    grid = lambda META: (
+        triton.cdiv(padded_rows, BLOCK_ROWS),
+        triton.cdiv(padded_cols, BLOCK_COLS),
+    )
+
+    triton_scale_swizzle[grid](
+        scale_tensor.view(torch.uint8),
+        rows,
+        cols,
+        out.view(torch.uint8),
+        input_row_stride,
+        input_col_stride,
+        output_block_stride,
+        BLOCK_ROWS=BLOCK_ROWS,
+        BLOCK_COLS=BLOCK_COLS,
+    )
+
+    return out
+
+
+# =============================================================================
+# Triton in-kernel MXFP8 conversion functions
+# =============================================================================
+
 
 @triton.jit
 def _compute_scale_and_quantize(data_block,  # [BLOCK_M, BLOCK_K] float32 input
@@ -132,9 +318,9 @@ def _swizzle_scales_for_tmem(
 
 
 @triton.jit
-def to_mxfp8(data,  # [BLOCK_M, BLOCK_K] float32 input tensor
-             BLOCK_SIZE: tl.constexpr = 32,  # MX block size
-             ):
+def to_mxfp8_jit(data,  # [BLOCK_M, BLOCK_K] float32 input tensor
+                 BLOCK_SIZE: tl.constexpr = 32,  # MX block size
+                 ):
     """
     Convert a float32 tensor to MXFP8 format inside a Triton kernel.
 
@@ -337,7 +523,7 @@ def _test_to_mxfp8_kernel(
     data = tl.load(data_ptr + offsets)
 
     # Convert to MXFP8
-    data_fp8, scale_e8m0 = to_mxfp8(data, BLOCK_SIZE)
+    data_fp8, scale_e8m0 = to_mxfp8_jit(data, BLOCK_SIZE)
 
     # Store FP8 data
     tl.store(data_fp8_ptr + offsets, data_fp8)
@@ -392,6 +578,216 @@ def _test_swizzle_scales_kernel(
 
     # Call the function being tested - it writes to the output buffer
     _swizzle_scales_for_tmem(scale_input, scale_out_ptr, BLOCK_M, NUM_SCALES)
+
+
+def test_to_mxfp8_host():
+    """Test the PyTorch host-side to_mxfp8 function."""
+    torch.manual_seed(42)
+
+    device = torch.device("cuda")
+
+    # Test with different shapes
+    test_cases = [
+        (128, 128),
+        (256, 128),
+        (128, 256),
+        (64, 64),
+    ]
+
+    all_passed = True
+    for M, K in test_cases:
+        print(f"  Testing shape ({M}, {K})...")
+
+        # Test with float32
+        data_f32 = torch.randn(M, K, dtype=torch.float32, device=device)
+        scale_f32, data_fp8_f32 = to_mxfp8(data_f32)
+
+        # Verify shapes
+        expected_scale_shape = (M, K // 32)
+        expected_data_shape = (M, K)
+
+        if scale_f32.shape != expected_scale_shape:
+            print(f"    FAIL: scale shape {scale_f32.shape} != expected {expected_scale_shape}")
+            all_passed = False
+        if data_fp8_f32.shape != expected_data_shape:
+            print(f"    FAIL: data shape {data_fp8_f32.shape} != expected {expected_data_shape}")
+            all_passed = False
+
+        # Verify dtypes
+        if scale_f32.dtype != torch.float8_e8m0fnu:
+            print(f"    FAIL: scale dtype {scale_f32.dtype} != torch.float8_e8m0fnu")
+            all_passed = False
+        if data_fp8_f32.dtype != torch.float8_e4m3fn:
+            print(f"    FAIL: data dtype {data_fp8_f32.dtype} != torch.float8_e4m3fn")
+            all_passed = False
+
+        # Test with bfloat16
+        data_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+        scale_bf16, data_fp8_bf16 = to_mxfp8(data_bf16)
+
+        if scale_bf16.shape != expected_scale_shape:
+            print(f"    FAIL: bf16 scale shape {scale_bf16.shape} != expected {expected_scale_shape}")
+            all_passed = False
+        if data_fp8_bf16.shape != expected_data_shape:
+            print(f"    FAIL: bf16 data shape {data_fp8_bf16.shape} != expected {expected_data_shape}")
+            all_passed = False
+
+        print(f"    Shape ({M}, {K}) passed")
+
+    # Test that quantized values are in valid FP8 range
+    data = torch.randn(128, 128, dtype=torch.float32, device=device) * 1000  # Large values
+    scale, data_fp8 = to_mxfp8(data)
+    max_fp8 = torch.finfo(torch.float8_e4m3fn).max
+    if data_fp8.float().abs().max() > max_fp8:
+        print(f"  FAIL: FP8 values exceed max {max_fp8}")
+        all_passed = False
+
+    print(f"to_mxfp8 host test: {'PASSED' if all_passed else 'FAILED'}")
+    return all_passed
+
+
+def test_triton_mx_block_rearrange():
+    """Test the triton_mx_block_rearrange function."""
+    torch.manual_seed(42)
+
+    device = torch.device("cuda")
+
+    # Test with different shapes
+    test_cases = [(128, 4),  # Standard case for 128x128 input
+                  (256, 4),  # Larger M
+                  (128, 8),  # Larger K (256 input)
+                  (256, 8),  # Both larger
+                  ]
+
+    all_passed = True
+    for rows, cols in test_cases:
+        print(f"  Testing scale shape ({rows}, {cols})...")
+
+        # Create random scale data with unique values for easier tracking
+        scale_input = torch.randint(0, 255, (rows, cols), dtype=torch.uint8, device=device)
+
+        # Run the swizzle
+        scale_output = triton_mx_block_rearrange(scale_input.view(torch.float8_e8m0fnu))
+
+        # Verify output shape
+        BLOCK_ROWS, BLOCK_COLS = 128, 4
+        n_row_blocks = triton.cdiv(rows, BLOCK_ROWS)
+        n_col_blocks = triton.cdiv(cols, BLOCK_COLS)
+        expected_rows = n_row_blocks * BLOCK_ROWS
+        expected_cols = n_col_blocks * BLOCK_COLS
+
+        if scale_output.shape != (expected_rows, expected_cols):
+            print(f"    FAIL: output shape {scale_output.shape} != expected ({expected_rows}, {expected_cols})")
+            all_passed = False
+            continue
+
+        # Verify the swizzle pattern by checking values at known positions
+        scale_out_uint8 = scale_output.view(torch.uint8)
+        spot_check_passed = True
+        mismatches = []
+
+        # Check a subset of positions to verify the swizzle formula
+        check_rows = [0, 1, 31, 32, 33, 63, 64, 95, 96, 127]
+        check_rows = [r for r in check_rows if r < rows]
+
+        for r in check_rows:
+            for c in range(min(cols, BLOCK_COLS)):
+                # Compute expected destination using swizzle formula
+                r_div_32 = r // 32
+                r_mod_32 = r % 32
+                dest_idx = r_mod_32 * 16 + r_div_32 * 4 + c
+
+                # The output is flattened row-major in blocks
+                # For the first block (rows 0-127, cols 0-3):
+                out_row = dest_idx // expected_cols
+                out_col = dest_idx % expected_cols
+
+                original_val = scale_input[r, c].item()
+
+                if out_row < expected_rows and out_col < expected_cols:
+                    swizzled_val = scale_out_uint8[out_row, out_col].item()
+
+                    if original_val != swizzled_val:
+                        mismatches.append((r, c, original_val, swizzled_val, dest_idx))
+                        spot_check_passed = False
+
+        if not spot_check_passed:
+            print(f"    FAIL: {len(mismatches)} spot check mismatches")
+            for r, c, orig, swiz, dest in mismatches[:5]:
+                print(f"      input[{r},{c}]={orig} != output[dest={dest}]={swiz}")
+            all_passed = False
+        else:
+            print(f"    Spot checks passed for ({rows}, {cols})")
+
+        # Output may have padding/replication, so just check input values exist
+        output_flat = scale_out_uint8.view(-1)
+        for val in scale_input.unique():
+            val_item = val.item()
+            input_count = (scale_input == val_item).sum().item()
+            output_count = (output_flat == val_item).sum().item()
+            # Output count should be >= input count (may have replication)
+            if output_count < input_count:
+                print(f"    FAIL: value {val_item} appears {input_count}x in input but only {output_count}x in output")
+                all_passed = False
+
+    # Test with actual to_mxfp8 output
+    print("  Testing with to_mxfp8 output...")
+    data = torch.randn(128, 128, dtype=torch.float32, device=device)
+    scale, _ = to_mxfp8(data)
+    swizzled = triton_mx_block_rearrange(scale)
+
+    if swizzled.shape != (128, 4):
+        print(f"    FAIL: swizzled shape {swizzled.shape} != expected (128, 4)")
+        all_passed = False
+    else:
+        print("    to_mxfp8 integration passed")
+
+    print(f"triton_mx_block_rearrange test: {'PASSED' if all_passed else 'FAILED'}")
+    return all_passed
+
+
+def test_to_mxfp8_roundtrip():
+    """Test that to_mxfp8 + dequantization approximately recovers original values."""
+    torch.manual_seed(42)
+
+    device = torch.device("cuda")
+
+    # Create test data with values in a reasonable range
+    data = torch.randn(128, 128, dtype=torch.float32, device=device)
+
+    # Quantize
+    scale, data_fp8 = to_mxfp8(data)
+
+    # Dequantize manually
+    scale_uint8 = scale.view(torch.uint8)
+    E8M0_EXPONENT_BIAS = 127
+
+    # Expand scale to match data shape
+    scale_expanded = scale_uint8.unsqueeze(-1).expand(-1, -1, 32)
+    scale_flat = scale_expanded.reshape(128, 128).float()
+
+    # Compute actual scale values: 2^(exponent - 127)
+    scale_values = torch.where(scale_flat == 0, torch.ones_like(scale_flat),
+                               torch.exp2(scale_flat - E8M0_EXPONENT_BIAS))
+
+    # Dequantize: fp8_value * scale
+    dequantized = data_fp8.float() * scale_values
+
+    # Check relative error (should be within FP8 precision)
+    # FP8 E4M3 has ~12.5% relative error for normalized values
+    relative_error = (dequantized - data).abs() / (data.abs() + 1e-6)
+    max_rel_error = relative_error.max().item()
+    mean_rel_error = relative_error.mean().item()
+
+    print(f"  Max relative error: {max_rel_error:.4f}")
+    print(f"  Mean relative error: {mean_rel_error:.4f}")
+
+    # FP8 E4M3 can have up to ~12.5% relative error, plus quantization noise
+    # Allow up to 50% for edge cases
+    passed = max_rel_error < 0.5 and mean_rel_error < 0.15
+
+    print(f"to_mxfp8 roundtrip test: {'PASSED' if passed else 'FAILED'}")
+    return passed
 
 
 def test_swizzle_scales_for_tmem():
@@ -595,19 +991,51 @@ def test_to_mxfp8_swizzled():
 
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("Testing PyTorch host-side to_mxfp8...")
+    print("=" * 60)
+    result_host = test_to_mxfp8_host()
+    print(f"Test passed: {result_host}\n")
+
+    print("=" * 60)
+    print("Testing triton_mx_block_rearrange...")
+    print("=" * 60)
+    result_rearrange = test_triton_mx_block_rearrange()
+    print(f"Test passed: {result_rearrange}\n")
+
+    print("=" * 60)
+    print("Testing to_mxfp8 roundtrip (quantize + dequantize)...")
+    print("=" * 60)
+    result_roundtrip = test_to_mxfp8_roundtrip()
+    print(f"Test passed: {result_roundtrip}\n")
+
+    print("=" * 60)
     print("Testing _swizzle_scales_for_tmem...")
+    print("=" * 60)
     result0 = test_swizzle_scales_for_tmem()
-    print(f"Test 0 passed: {result0}\n")
+    print(f"Test passed: {result0}\n")
 
-    print("Testing to_mxfp8 (non-swizzled scales)...")
+    print("=" * 60)
+    print("Testing to_mxfp8 in-kernel (non-swizzled scales)...")
+    print("=" * 60)
     result1 = test_to_mxfp8()
-    print(f"Test 1 passed: {result1}\n")
+    print(f"Test passed: {result1}\n")
 
-    print("Testing to_mxfp8 with swizzled scales...")
+    print("=" * 60)
+    print("Testing to_mxfp8 in-kernel with swizzled scales...")
+    print("=" * 60)
     result2 = test_to_mxfp8_swizzled()
-    print(f"Test 2 passed: {result2}\n")
+    print(f"Test passed: {result2}\n")
 
-    if result0 and result1 and result2:
-        print("All tests passed!")
+    print("=" * 60)
+    all_passed = all([result_host, result_rearrange, result_roundtrip, result0, result1, result2])
+    if all_passed:
+        print("ALL TESTS PASSED!")
     else:
-        print("Some tests failed!")
+        print("SOME TESTS FAILED!")
+        print(f"  to_mxfp8_host: {result_host}")
+        print(f"  triton_mx_block_rearrange: {result_rearrange}")
+        print(f"  to_mxfp8_roundtrip: {result_roundtrip}")
+        print(f"  _swizzle_scales_for_tmem: {result0}")
+        print(f"  to_mxfp8 in-kernel: {result1}")
+        print(f"  to_mxfp8 in-kernel swizzled: {result2}")
