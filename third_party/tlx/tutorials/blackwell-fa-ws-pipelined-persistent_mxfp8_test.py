@@ -574,13 +574,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q buffers for q_scale
     q_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_tiles = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
-    # p_scale is 1.0 (E8M0 bias is 127) since softmax output P is in [0,1] without prescaling
-    # Allocate same shape as q_scale since P has same M dimension as Q
-    p_scale_tiles = tlx.local_alloc((1, REP_M, REP_N, 2, 256), tl.uint8, 1)
-    # E8M0 scale = 2^(value - 127), so 127 means scale = 1.0
-    P_SCALE_E8M0: tl.constexpr = 127
-    p_scale_const = tl.full((1, REP_M, REP_N, 2, 256), P_SCALE_E8M0, dtype=tl.uint8)
-    tlx.local_store(p_scale_tiles[0], p_scale_const)
+    p_scale_tiles = tlx.local_alloc((1, REP_M, REP_N, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_MMA_SLICES)
 
     q_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     q_scale_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
@@ -903,7 +897,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         p_tiles[p_bufIdx],
                         kv_slice,
                         acc_tiles[0],
-                        p_scale_tiles[0],
+                        p_scale_tiles[p_bufIdx],
                         P_FP8_FORMAT,
                         # TODO: Determine how to handle NUM_MMA_SLICES here.
                         kv_scale_tiles[v_bufIdx],
@@ -964,7 +958,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                             p_tiles[p_bufIdx],
                             kv_slice,
                             acc_tiles[1],
-                            p_scale_tiles[0],
+                            p_scale_tiles[p_bufIdx],
                             P_FP8_FORMAT,
                             # TODO: Determine how to handle NUM_MMA_SLICES here.
                             kv_scale_tiles[v_bufIdx_prev],
@@ -1008,7 +1002,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                             p_tiles[p_bufIdx],
                             kv_slice,
                             acc_tiles[0],
-                            p_scale_tiles[0],
+                            p_scale_tiles[p_bufIdx],
                             P_FP8_FORMAT,
                             # TODO: Determine how to handle NUM_MMA_SLICES here.
                             kv_scale_tiles[v_bufIdx],
@@ -1044,7 +1038,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         p_tiles[p_bufIdx],
                         kv_slice,
                         acc_tiles[1],
-                        p_scale_tiles[0],
+                        p_scale_tiles[p_bufIdx],
                         P_FP8_FORMAT,
                         # TODO: Determine how to handle NUM_MMA_SLICES here.
                         kv_scale_tiles[v_bufIdx],
@@ -1397,6 +1391,72 @@ class _attention(torch.autograd.Function):
 attention = _attention.apply
 
 
+def generate_tensor_with_block_distributions(
+    reference_tensor: torch.Tensor,
+    min_max_ranges: list[tuple[float, float]],
+    block_size: int = 32,
+    num_pregenerated_blocks: int = 100,
+) -> torch.Tensor:
+    """
+    Generate a tensor with the same shape as reference_tensor but with different
+    distributions for different blocks. Fully vectorized - no Python loops.
+
+    Parameters:
+    -----------
+    reference_tensor : torch.Tensor
+        The reference tensor whose shape, dtype, device, and properties to copy.
+    min_max_ranges : list[tuple[float, float]]
+        List of [min, max] value ranges. Each block will be assigned a range
+        cyclically from this list.
+    block_size : int
+        The size of each block (default: 32 for MXFP8).
+    num_pregenerated_blocks : int
+        Number of random blocks to pre-generate for each range (default: 100).
+
+    Returns:
+    --------
+    torch.Tensor
+        A new tensor with the same shape as reference_tensor but with varying
+        distributions across blocks.
+    """
+    device = reference_tensor.device
+    dtype = reference_tensor.dtype
+    requires_grad = reference_tensor.requires_grad
+    shape = reference_tensor.shape
+
+    total_elements = reference_tensor.numel()
+    num_blocks = (total_elements + block_size - 1) // block_size
+    num_ranges = len(min_max_ranges)
+
+    # Pre-generate random blocks for all ranges at once
+    # Shape: [num_ranges, num_pregenerated_blocks, block_size]
+    all_blocks = []
+    for min_val, max_val in min_max_ranges:
+        blocks = (torch.rand(num_pregenerated_blocks, block_size, device=device, dtype=dtype) * (max_val - min_val) +
+                  min_val)
+        all_blocks.append(blocks)
+    all_blocks = torch.stack(all_blocks)  # [num_ranges, num_pregenerated, block_size]
+
+    # Generate random indices on GPU (not CPU!)
+    range_indices = torch.randint(0, num_ranges, (num_blocks, ), device=device)
+    block_indices = torch.randint(0, num_pregenerated_blocks, (num_blocks, ), device=device)
+
+    # Use advanced indexing to select all blocks at once - NO PYTHON LOOP!
+    selected_blocks = all_blocks[range_indices, block_indices]  # [num_blocks, block_size]
+
+    # Flatten and take only the elements we need
+    generated_tensor = selected_blocks.flatten()[:total_elements]
+
+    # Reshape to original shape
+    generated_tensor = generated_tensor.view(shape).contiguous()
+
+    # Set requires_grad if needed
+    if requires_grad:
+        generated_tensor.requires_grad_(True)
+
+    return generated_tensor
+
+
 def generate_mxfp8_tensors(shape, device):
     """Generate MXFP8 quantized tensors for Q, K, V.
 
@@ -1429,8 +1489,12 @@ def generate_attention_inputs(shape, device, dtype):
     """
     # Generate bf16 reference tensors first
     orig_dtype = torch.bfloat16
-    q_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
-    k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
+    min_max_ranges = [(-0.1, 0.1), (0.3, 0.6), (-10.0, 10.0)]
+    q_ref = generate_tensor_with_block_distributions(torch.empty(shape, device=device, dtype=orig_dtype),
+                                                     min_max_ranges)
+    k_ref = generate_tensor_with_block_distributions(torch.empty(shape, device=device, dtype=orig_dtype),
+                                                     min_max_ranges)
+
     v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     # Convert bf16 reference tensors to MXFP8
     q_scale, q_data = to_mxfp8(q_ref)
@@ -1474,8 +1538,8 @@ def test_op(
     if HEAD_DIM == 128:
         pytest.skip("FP8 with HEAD_DIM=128 not supported yet")
 
-    if causal:
-        pytest.skip("Causal not supported yet")
+    # if causal:
+    #     pytest.skip("Causal not supported yet")
 
     # Generate attention inputs (returns (data, scale, ref) tuples, scale is None for non-FP8)
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = generate_attention_inputs(shape, DEVICE, dtype)
@@ -1494,6 +1558,6 @@ def test_op(
     # 1. FP8 E4M3 quantization of Q, K, V (3 mantissa bits = 12.5% relative error)
     # 2. Softmax probabilities < 0.002 underflow to 0 in FP8 (affects P @ V)
     # 3. Compound errors from multiple FP8 matmuls
-    fwd_atol = 3e-2
+    fwd_atol = 1e-2
     torch.testing.assert_close(tri_out, ref_out, atol=fwd_atol, rtol=0)
     return
