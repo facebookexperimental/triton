@@ -260,7 +260,6 @@ def _softmax_inner_loop(
     p_fulls,
     p_tiles,
     p_scale_tiles,
-    p_scale_tmp_ptr,
     alpha_empties,
     alpha_fulls,
     alpha_tiles,
@@ -314,7 +313,6 @@ def _softmax_inner_loop(
                 p_i,
                 tlx.local_view(p_tiles, p_bufIdx),
                 tlx.local_view(p_scale_tiles, p_bufIdx),
-                p_scale_tmp_ptr + cid * 512,
                 VEC_SIZE,
             )
             tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
@@ -336,8 +334,7 @@ def _softmax_inner_loop(
 )
 @triton.jit
 def _attn_fwd_mxf8_ws(sm_scale, M,  #
-                      Z, H, desc_q, desc_k, desc_v, desc_o, desc_q_scale, desc_k_scale, desc_v_scale, p_scale_tmp_ptr,
-                      N_CTX,  #
+                      Z, H, desc_q, desc_k, desc_v, desc_o, desc_q_scale, desc_k_scale, desc_v_scale, N_CTX,  #
                       HEAD_DIM: tl.constexpr,  #
                       BLOCK_M: tl.constexpr,  #
                       BLOCK_N: tl.constexpr,  #
@@ -586,7 +583,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         p_fulls,
                         p_tiles,
                         p_scale_tiles,
-                        p_scale_tmp_ptr,
                         alpha_empties,
                         alpha_fulls,
                         alpha_tiles,
@@ -616,7 +612,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         p_fulls,
                         p_tiles,
                         p_scale_tiles,
-                        p_scale_tmp_ptr,
                         alpha_empties,
                         alpha_fulls,
                         alpha_tiles,
@@ -1103,8 +1098,6 @@ class _attention(torch.autograd.Function):
         m_tensor = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
-        p_scale_temp = torch.empty((2, 512), dtype=torch.int8, device=q.device)
-
         dummy_block = [1, 1]
         desc_q = TensorDescriptor(
             q,
@@ -1219,7 +1212,6 @@ class _attention(torch.autograd.Function):
             desc_q_scale,
             desc_k_scale,
             desc_v_scale,  #
-            p_scale_temp,
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
