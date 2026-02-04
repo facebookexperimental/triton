@@ -2633,8 +2633,8 @@ def test_descriptor_load_multicast(device):
     kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
                                           ctas_per_cga=(2, 2, 1))
 
-    assert kernel.asm["ptx"].count(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    assert (kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1)
     # x:
     # [ x0 | x2]
     # [ x1 | x3]
@@ -4550,3 +4550,63 @@ class TestLocalAllocWithStorageAliasSpec:
         # We can't fully test the error without a kernel context, but we can
         # verify the storage_alias_spec's storage property is accessible
         assert buf.storage == tlx.storage_kind.smem
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_vote_ballot_sync(device):
+    """Test vote_ballot_sync TLX operation for warp-level voting."""
+
+    @triton.jit
+    def vote_ballot_kernel(
+        output_ptr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Each thread's lane ID (use x-axis thread ID)
+        tid = tlx.thread_id(0)
+
+        # Create a predicate: lanes 0-15 vote True, lanes 16-31 vote False
+        pred = tid < 16
+
+        # Perform warp-level ballot vote
+        # 0xFFFFFFFF means all 32 threads in the warp participate
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+
+        # Store the ballot result from thread 0 only
+        if tid == 0:
+            tl.store(output_ptr, ballot_result)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Run the kernel with 1 warp
+    vote_ballot_kernel[(1, )](output, BLOCK_SIZE=32, num_warps=1)
+    torch.cuda.synchronize()
+
+    # Expected ballot result: threads 0-15 have pred=True, threads 16-31 have pred=False
+    # So ballot should be 0x0000FFFF (lower 16 bits set)
+    expected_ballot = 0x0000FFFF
+    assert output.item() == expected_ballot, f"Expected {hex(expected_ballot)}, got {hex(output.item())}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_vote_ballot_sync_ir_emission(device):
+    """Test that vote_ballot_sync generates the correct IR."""
+
+    @triton.jit
+    def vote_ballot_ir_kernel(output_ptr, ):
+        tid = tlx.thread_id(0)
+        pred = tid < 16  # First 16 threads True
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+        if tid == 0:
+            tl.store(output_ptr, ballot_result)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    kernel = vote_ballot_ir_kernel[(1, )](output, num_warps=1)
+
+    # Verify the TTGIR contains the vote_ballot_sync op
+    ttgir = kernel.asm["ttgir"]
+    assert "vote_ballot_sync" in ttgir, "Expected vote_ballot_sync in TTGIR"
+
+    # Verify the LLVM IR contains the NVVM vote instruction
+    llir = kernel.asm["llir"]
+    assert "nvvm.vote.ballot.sync" in llir or "vote.sync.ballot" in llir, (
+        "Expected nvvm.vote.ballot.sync or vote.sync.ballot in LLVM IR")
