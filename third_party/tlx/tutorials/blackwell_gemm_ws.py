@@ -350,7 +350,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     # Dynamic tiling setup
-    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+    clc_context = tlx.clc_create_context(num_consumers=6 if PAIR_CTA else 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -364,7 +364,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             while tile_id != -1:
                 # Persistent mode: process multiple tiles
 
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
                 cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
@@ -385,7 +385,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 )
                 tmem_accum_cnt += 1
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
@@ -423,7 +423,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 )
                 tmem_accum_cnt += 1
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
@@ -455,7 +455,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     PAIR_CTA,
                     cluster_cta_rank,
                 )
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
 
