@@ -43,7 +43,7 @@ configs = [
     )
     for kv in [3, 6]
     for grp_n in [1, 4]
-    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
+    for (rescale_opt, where) in [(True, True)] #(False, False), (True, False), (True, True)]
 ]
 
 

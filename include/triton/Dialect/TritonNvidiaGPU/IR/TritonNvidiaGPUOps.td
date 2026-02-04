@@ -34,6 +34,7 @@ include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
+include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
@@ -930,6 +931,72 @@ def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   let arguments = (ins TT_PtrType:$desc_ptr);
   let assemblyFormat = [{
     $desc_ptr attr-dict `:` qualified(type($desc_ptr))
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// IfFromWhereOp - Conditional execution with tensor condition
+//===----------------------------------------------------------------------===//
+
+def TTNG_IfFromWhereYieldOp : TTNG_Op<"if_from_where_yield", [
+  Pure, Terminator, HasParent<"IfFromWhereOp">,
+  DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>
+]> {
+  let summary = "yield from the body region of `ttng.if_from_where`";
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = "($values^)? attr-dict (`:` type($values)^)?";
+}
+
+def TTNG_IfFromWhereOp : TTNG_Op<"if_from_where", [
+  RecursiveMemoryEffects, SingleBlockImplicitTerminator<"IfFromWhereYieldOp">,
+  DeclareOpInterfaceMethods<RegionBranchOpInterface>
+]> {
+  let summary = "Conditional execution guarded by a warp-uniform tensor condition";
+
+  let description = [{
+    The `ttng.if_from_where` operation represents a conditional execution block
+    where the condition is a tensor (typically derived from vote_ballot_sync).
+
+    Unlike scf.if which requires a scalar i1 condition, this op accepts a tensor
+    condition where all elements have the same value (warp-uniform). When lowered
+    to LLVM, element 0 is extracted as the scalar branch condition.
+
+    This op is designed to optimize patterns like:
+      acc = local_load(subslice)
+      scaled_acc = computation(acc, alpha)
+      acc = tl.where(should_rescale, scaled_acc, acc)
+      local_store(subslice, acc)
+
+    When should_rescale is false (all elements), the entire body is skipped.
+
+    The body region contains operations to execute when condition is true.
+    The op yields values that are used when condition is true, otherwise
+    the original values (passed as operands) are used.
+
+    Example:
+    ```mlir
+    %result = ttng.if_from_where %cond, %original {
+      %computed = ... compute new value ...
+      ttng.if_from_where_yield %computed
+    } : tensor<128xi1>, tensor<128xf32> -> tensor<128xf32>
+    ```
+  }];
+
+  let arguments = (ins
+    TT_BoolTensor:$condition,
+    Variadic<AnyType>:$elseValues
+  );
+
+  let results = (outs Variadic<AnyType>:$results);
+
+  let regions = (region SizedRegion<1>:$thenRegion);
+
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+
+  let extraClassDeclaration = [{
+    /// Get the body of the then region
+    Block *thenBlock() { return &getThenRegion().front(); }
   }];
 }
 

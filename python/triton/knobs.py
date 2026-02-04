@@ -493,6 +493,7 @@ class nvidia_knobs(base_knobs):
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
+    enable_select_to_branch: env_bool = env_bool("TRITON_ENABLE_SELECT_TO_BRANCH")
 
 
 class amd_knobs(base_knobs):

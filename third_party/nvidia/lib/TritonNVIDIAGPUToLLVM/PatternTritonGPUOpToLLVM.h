@@ -83,6 +83,10 @@ void populateTensorMemoryOpToLLVMPattern(LLVMTypeConverter &typeConverter,
 void populateTensorMemorySubviewOpToLLVMPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit);
+
+void populateIfFromWhereOpToLLVMPattern(LLVMTypeConverter &typeConverter,
+                                        RewritePatternSet &patterns,
+                                        PatternBenefit benefit);
 } // namespace NVIDIA
 } // namespace triton
 } // namespace mlir

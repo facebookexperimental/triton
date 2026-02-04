@@ -174,4 +174,39 @@ def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-to
   }];
 }
 
+def TritonNvidiaGPUSelectToBranchPass : Pass<"triton-nvidia-gpu-select-to-branch", "mlir::ModuleOp"> {
+  let summary = "Convert warp-uniform select to branching";
+
+  let description = [{
+    The `triton-nvidia-gpu-select-to-branch` pass identifies sequences of
+    tmem_load -> computation -> arith.select (with ballot condition) -> tmem_store
+    and wraps them in ttng.if_from_where for conditional execution.
+
+    This optimization benefits patterns where the condition is warp-uniform
+    (derived from vote_ballot_sync), allowing the entire load/compute/store
+    sequence to be skipped when the condition is false.
+
+    SAFETY INVARIANT:
+    This optimization is safe because the pattern matching GUARANTEES that:
+      1. falseVal comes from a TMEMLoadOp
+      2. The load and store operate on the SAME memory descriptor
+
+    Therefore, when the condition is false:
+      result = select(false, trueVal, load(mem)) = load(mem)
+      store(mem, result) = store(mem, load(mem))  // NO-OP!
+
+    Since storing the same value back is a no-op, skipping the entire block
+    when the condition is false produces identical memory state.
+
+    This invariant makes the optimization safe for BOTH forward and backward
+    kernels, as long as the backward kernel follows the same pattern where
+    the false-value is the loaded value from the same memory location.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 #endif
