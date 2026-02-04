@@ -722,6 +722,14 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
     ```
 
+- `tlx.vote_ballot_sync(mask, pred)`
+
+    Collects a predicate from each thread in the warp and returns a 32-bit
+    mask where each bit represents the predicate value from the corresponding
+    lane. Only threads specified by `mask` participate in the vote.
+    ```
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+    ```
 
 ## Kernels Implemented with TLX
 
