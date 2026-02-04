@@ -702,6 +702,8 @@ def async_descriptor_load(
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), \
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
