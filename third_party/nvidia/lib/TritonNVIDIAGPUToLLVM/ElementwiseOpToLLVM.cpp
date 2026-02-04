@@ -7,6 +7,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 using namespace mlir::triton::gpu;
 
@@ -927,6 +928,242 @@ struct OpToExternCallConversion
 private:
   StringRef funcName;
 };
+
+/// Check if a value is warp-uniform (same across all threads in a warp).
+/// This is true for:
+/// 1. Results of vote_ballot_sync (all threads get the same 32-bit mask)
+/// 2. Values derived from uniform values via compare/and/or/xor operations
+/// 3. Scalar constants
+/// 4. Splat tensors derived from uniform scalars
+static bool isWarpUniform(Value val, int depth = 0) {
+  // Limit recursion depth to avoid infinite loops
+  if (depth > 10)
+    return false;
+
+  Operation *defOp = val.getDefiningOp();
+  if (!defOp)
+    return false; // Block arguments need additional analysis
+
+  // vote_ballot_sync result is warp-uniform - all threads get the same result
+  // This works for both scalar and tensor results (tensor is a splat of the
+  // uniform scalar)
+  if (isa<triton::nvidia_gpu::VoteBallotSyncOp>(defOp))
+    return true;
+
+  // Constants are uniform (both scalar and splat constants)
+  if (isa<arith::ConstantOp, LLVM::ConstantOp>(defOp))
+    return true;
+
+  // Splat of a uniform value is uniform
+  if (auto splatOp = dyn_cast<triton::SplatOp>(defOp))
+    return isWarpUniform(splatOp.getSrc(), depth + 1);
+
+  // Broadcast of a uniform value is uniform
+  if (auto broadcastOp = dyn_cast<triton::BroadcastOp>(defOp))
+    return isWarpUniform(broadcastOp.getSrc(), depth + 1);
+
+  // Integer comparison of uniform values is uniform
+  if (auto cmpOp = dyn_cast<arith::CmpIOp>(defOp)) {
+    return isWarpUniform(cmpOp.getLhs(), depth + 1) &&
+           isWarpUniform(cmpOp.getRhs(), depth + 1);
+  }
+
+  // LLVM integer comparison of uniform values is uniform
+  if (auto cmpOp = dyn_cast<LLVM::ICmpOp>(defOp)) {
+    return isWarpUniform(cmpOp.getLhs(), depth + 1) &&
+           isWarpUniform(cmpOp.getRhs(), depth + 1);
+  }
+
+  // Binary ops on uniform values are uniform
+  if (auto andOp = dyn_cast<arith::AndIOp>(defOp)) {
+    return isWarpUniform(andOp.getLhs(), depth + 1) &&
+           isWarpUniform(andOp.getRhs(), depth + 1);
+  }
+  if (auto orOp = dyn_cast<arith::OrIOp>(defOp)) {
+    return isWarpUniform(orOp.getLhs(), depth + 1) &&
+           isWarpUniform(orOp.getRhs(), depth + 1);
+  }
+  if (auto xorOp = dyn_cast<arith::XOrIOp>(defOp)) {
+    return isWarpUniform(xorOp.getLhs(), depth + 1) &&
+           isWarpUniform(xorOp.getRhs(), depth + 1);
+  }
+
+  // LLVM binary ops on uniform values are uniform
+  if (auto andOp = dyn_cast<LLVM::AndOp>(defOp)) {
+    return isWarpUniform(andOp.getLhs(), depth + 1) &&
+           isWarpUniform(andOp.getRhs(), depth + 1);
+  }
+  if (auto orOp = dyn_cast<LLVM::OrOp>(defOp)) {
+    return isWarpUniform(orOp.getLhs(), depth + 1) &&
+           isWarpUniform(orOp.getRhs(), depth + 1);
+  }
+  if (auto xorOp = dyn_cast<LLVM::XOrOp>(defOp)) {
+    return isWarpUniform(xorOp.getLhs(), depth + 1) &&
+           isWarpUniform(xorOp.getRhs(), depth + 1);
+  }
+
+  // Truncation/extension of uniform values are uniform
+  if (auto truncOp = dyn_cast<arith::TruncIOp>(defOp))
+    return isWarpUniform(truncOp.getIn(), depth + 1);
+  if (auto extOp = dyn_cast<arith::ExtSIOp>(defOp))
+    return isWarpUniform(extOp.getIn(), depth + 1);
+  if (auto extOp = dyn_cast<arith::ExtUIOp>(defOp))
+    return isWarpUniform(extOp.getIn(), depth + 1);
+
+  // LLVM truncation/extension of uniform values
+  if (auto truncOp = dyn_cast<LLVM::TruncOp>(defOp))
+    return isWarpUniform(truncOp.getArg(), depth + 1);
+  if (auto extOp = dyn_cast<LLVM::SExtOp>(defOp))
+    return isWarpUniform(extOp.getArg(), depth + 1);
+  if (auto extOp = dyn_cast<LLVM::ZExtOp>(defOp))
+    return isWarpUniform(extOp.getArg(), depth + 1);
+
+  return false;
+}
+
+/// Try to extract a scalar i1 condition from a potentially tensor condition.
+/// For warp-uniform tensor conditions (e.g., splatted from vote_ballot result),
+/// all elements have the same value, so we can extract any element.
+/// Returns the scalar condition if extractable, otherwise returns nullptr.
+static Value extractScalarCondition(Value cond, Location loc,
+                                    ConversionPatternRewriter &rewriter,
+                                    const LLVMTypeConverter *typeConverter) {
+  // If already a scalar i1, return it directly
+  if (!isa<RankedTensorType>(cond.getType())) {
+    if (cond.getType().isInteger(1))
+      return cond;
+    return nullptr;
+  }
+
+  // For tensor conditions, trace back through splat/broadcast to find scalar
+  Operation *defOp = cond.getDefiningOp();
+  if (!defOp)
+    return nullptr;
+
+  // Splat: tensor is created by splatting a scalar value
+  if (auto splatOp = dyn_cast<triton::SplatOp>(defOp)) {
+    return extractScalarCondition(splatOp.getSrc(), loc, rewriter,
+                                  typeConverter);
+  }
+
+  // Broadcast: tensor is created by broadcasting a smaller tensor
+  if (auto broadcastOp = dyn_cast<triton::BroadcastOp>(defOp)) {
+    return extractScalarCondition(broadcastOp.getSrc(), loc, rewriter,
+                                  typeConverter);
+  }
+
+  // For other tensor-producing ops where we know the value is uniform,
+  // we could potentially extract the first element. However, at this point
+  // in lowering, we need to be careful about how the tensor is represented.
+  // The condition tensor has already been lowered to LLVM struct of i1s.
+  // We can extract the first element from the struct.
+  return nullptr;
+}
+
+/// Convert arith.SelectOp with warp-uniform condition to branches.
+/// When the condition is uniform (same for all threads in a warp), we can
+/// use branches instead of select instructions without causing warp divergence.
+/// This can be beneficial when the true/false values are expensive to compute
+/// (e.g., memory loads) since only one branch will be executed.
+///
+/// Supports both scalar and tensor selects:
+/// - Scalar: Direct branch on the scalar condition
+/// - Tensor: Extract scalar condition from uniform tensor, branch on it,
+///           and yield entire tensor values in each branch
+struct UniformSelectToBranchConversion
+    : public ConvertOpToLLVMPattern<arith::SelectOp> {
+  using ConvertOpToLLVMPattern<arith::SelectOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::SelectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    // Check if condition is warp-uniform (no divergence)
+    if (!isWarpUniform(op.getCondition()))
+      return failure();
+
+    Value scalarCond = nullptr;
+    bool isTensorSelect = isa<RankedTensorType>(op.getTrueValue().getType());
+
+    if (isTensorSelect) {
+      // For tensor selects, we need to extract a scalar condition.
+      // First, try to trace back through splat/broadcast ops to find the
+      // original scalar condition before it was splatted to a tensor.
+      scalarCond = extractScalarCondition(op.getCondition(), loc, rewriter,
+                                          getTypeConverter());
+
+      if (!scalarCond) {
+        // If we can't trace back to a scalar, the condition tensor has been
+        // lowered to an LLVM struct. Since it's uniform, all elements are
+        // the same, so extract the first element.
+        Value condStruct = adaptor.getCondition();
+        Type condStructTy = condStruct.getType();
+
+        if (auto structTy = dyn_cast<LLVM::LLVMStructType>(condStructTy)) {
+          // Extract the first element from the struct
+          scalarCond = rewriter.create<LLVM::ExtractValueOp>(
+              loc, condStruct, ArrayRef<int64_t>{0});
+        } else {
+          // Condition is already a scalar (e.g., scalar condition with tensor
+          // operands)
+          scalarCond = condStruct;
+        }
+      }
+    } else {
+      // Scalar select - condition is already scalar
+      scalarCond = adaptor.getCondition();
+    }
+
+    if (!scalarCond || !scalarCond.getType().isInteger(1))
+      return failure();
+
+    // Create branch-based lowering:
+    //   %result = select %cond, %true, %false
+    // Becomes:
+    //   cond_br %cond, ^trueBB, ^falseBB
+    // ^trueBB:
+    //   br ^mergeBB(%true)
+    // ^falseBB:
+    //   br ^mergeBB(%false)
+    // ^mergeBB(%result):
+
+    Block *currentBlock = op->getBlock();
+    Block::iterator insertPoint = op->getIterator();
+    ++insertPoint; // Move past the current op
+
+    // Split the block after the select op
+    Block *mergeBlock = rewriter.splitBlock(currentBlock, insertPoint);
+
+    // Get the converted result type (for tensors, this is LLVM struct type)
+    Type resultTy = getTypeConverter()->convertType(op.getResult().getType());
+
+    // Add block argument for the result
+    mergeBlock->addArgument(resultTy, loc);
+
+    // Create true block - yields the true value (entire tensor if tensor
+    // select)
+    Block *trueBlock = rewriter.createBlock(mergeBlock);
+    rewriter.create<LLVM::BrOp>(loc, adaptor.getTrueValue(), mergeBlock);
+
+    // Create false block - yields the false value (entire tensor if tensor
+    // select)
+    Block *falseBlock = rewriter.createBlock(mergeBlock);
+    rewriter.create<LLVM::BrOp>(loc, adaptor.getFalseValue(), mergeBlock);
+
+    // Insert conditional branch at end of current block
+    rewriter.setInsertionPointToEnd(currentBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, scalarCond, trueBlock, falseBlock);
+
+    // The merge block argument has the converted LLVM type. Replace the select
+    // with this value - the conversion framework will handle type
+    // reconciliation for any users through the type converter.
+    rewriter.replaceOp(op, mergeBlock->getArgument(0));
+
+    return success();
+  }
+};
+
 } // namespace
 } // namespace gpu
 
@@ -945,6 +1182,15 @@ void mlir::triton::NVIDIA::populateElementwiseOpToLLVMPatterns(
 
   mlir::triton::populateElementwiseOpToLLVMPatterns(
       typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
+
+  // Register UniformSelectToBranchConversion with higher priority.
+  // This pattern converts scalar select ops with warp-uniform conditions
+  // (e.g., derived from vote_ballot_sync) to branches. Since the condition
+  // is uniform across all threads in a warp, no divergence occurs.
+  // Higher benefit ensures this pattern is tried before the default select
+  // conversion when the condition is detected as warp-uniform.
+  patterns.add<UniformSelectToBranchConversion>(
+      typeConverter, PatternBenefit(benefit.getBenefit() + 10));
 
 #define POPULATE_OP(SRC_OP, DST_OP)                                            \
   patterns.add<ElementwiseOpConversion<SRC_OP, DST_OP>>(                       \
