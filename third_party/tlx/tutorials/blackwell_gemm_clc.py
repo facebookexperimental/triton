@@ -107,7 +107,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # if tlx.thread_id(axis=0) == 0:
                 # tl.device_print("Default WG Processing CtaID", tile_id)
                 # producer
-                tlx.clc_producer(clc_context, p_producer=clc_phase_producer)
+                tlx.clc_producer(clc_context, clc_phase_producer)
                 clc_phase_producer ^= 1
 
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
@@ -142,7 +142,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
-                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
 
                 # Debug-only: verifying that CLC steals workloads successfully
@@ -199,7 +199,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
@@ -237,7 +237,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
 
 

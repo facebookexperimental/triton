@@ -2936,7 +2936,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
 
         while tile_id != -1:
             # CLC producer
-            tlx.clc_producer(clc_context, p_producer=clc_phase_producer)
+            tlx.clc_producer(clc_context, clc_phase_producer)
             clc_phase_producer ^= 1
 
             block_start = tile_id * BLOCK_SIZE
@@ -2950,7 +2950,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
             tl.store(z_ptr + offsets, output, mask=mask)
 
             # CLC consumer
-            tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer)
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
             clc_phase_consumer ^= 1
 
             if tlx.thread_id(axis=0) == 0:
