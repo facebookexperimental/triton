@@ -225,6 +225,7 @@ def _softmax_inner_loop(
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
         tlx.local_store(tlx.local_view(alpha_tiles, cid * BLOCK_N), alpha[:, None])
+        tlx.fence_async_shared()
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
@@ -237,6 +238,7 @@ def _softmax_inner_loop(
             tlx.local_view(p_scale_tiles, cid),
             VEC_SIZE,
         )
+        tlx.fence_async_shared()
         tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
         l_ij = tl.sum(p_i, 1)
@@ -417,6 +419,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         tlx.barrier_wait(alpha_fulls[cid], phase)
                         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
                         alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
+                        # Fence to ensure alpha load completes before signaling empty
+                        tlx.fence_async_shared()
                         tlx.barrier_arrive(alpha_empties[cid])
                         acc = tlx.local_load(acc_tiles[cid])
                         acc = _mul_f32x2(acc, alpha_1)
@@ -434,6 +438,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
                     # Signal qk_empties after both l and m loads complete,
                     # since both tiles share the same synchronization group.
+                    # Fence to ensure loads complete before signaling
+                    tlx.fence_async_shared()
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
@@ -536,6 +542,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # to disambigulate from alpha[0]/alpha[BLOCK_N]
                 tlx.local_store(l_tiles[cid * BLOCK_N + 1], l_i[:, None])
                 tlx.local_store(m_tiles[cid * BLOCK_N + 2], m_i[:, None])
+                tlx.fence_async_shared()
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_idx += num_progs
 
