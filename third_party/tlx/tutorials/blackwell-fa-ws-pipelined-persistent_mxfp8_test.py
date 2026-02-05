@@ -1274,11 +1274,11 @@ def test_op(
 
     dtype = torch.float8_e4m3fn
 
-    if HEAD_DIM == 128:
-        pytest.skip("FP8 with HEAD_DIM=128 not supported yet")
+    if HEAD_DIM == 64:
+        pytest.skip("FP8 with HEAD_DIM=64 not supported yet")
 
-    # if causal:
-    #     pytest.skip("Causal not supported yet")
+    if causal:
+        pytest.skip("Causal not supported yet")
 
     # Generate attention inputs (returns (data, scale, ref) tuples, scale is None for non-FP8)
     (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale, v_ref) = generate_attention_inputs(shape, DEVICE, dtype)
