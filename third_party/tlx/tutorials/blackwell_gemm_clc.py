@@ -241,7 +241,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 clc_phase_consumer ^= 1
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -258,13 +259,37 @@ def matmul(a, b):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    # Persistent kernel to have thread block resident in SM as long as possible
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
-    matmul_kernel_tma_ws_blackwell_clc[grid](
-        a_desc, b_desc, c_desc,  #
-        M, N, K,  #
-        NUM_SMS=NUM_SMS,  #
-        NUM_CLC_STAGES=1,  #
-    )
+    if config is not None:
+        a_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+        b_desc.block_shape = [config["BLOCK_SIZE_K"], config["BLOCK_SIZE_N"]]
+        if config.get("EPILOGUE_SUBTILE", False):
+            c_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"] // 2]
+        else:
+            c_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]]
+
+        grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]), )
+        matmul_kernel_tma_ws_blackwell_clc.fn[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            NUM_SMS=NUM_SMS,
+            NUM_CLC_STAGES=1,
+            **config,
+        )
+    else:
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+        matmul_kernel_tma_ws_blackwell_clc[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            NUM_SMS=NUM_SMS,
+            NUM_CLC_STAGES=1,
+        )
 
     return c

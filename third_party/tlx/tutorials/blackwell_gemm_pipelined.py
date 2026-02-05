@@ -147,7 +147,8 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     tlx.async_descriptor_store(desc_c, c_smem, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N])
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -159,13 +160,38 @@ def matmul(a, b):
     # Initialize TMA descriptor storgae allocator
     triton.set_allocator(alloc_fn)
 
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel_tma_pipelined_blackwell[grid](
-        a, b, c,  #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
-    )
+    if config is not None:
+        grid = (triton.cdiv(M, config['BLOCK_SIZE_M']) * triton.cdiv(N, config['BLOCK_SIZE_N']), )
+        matmul_kernel_tma_pipelined_blackwell.fn[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            **config,
+        )
+    else:
+        # 1D launch kernel where each block gets its own program.
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+        matmul_kernel_tma_pipelined_blackwell[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+        )
     return c

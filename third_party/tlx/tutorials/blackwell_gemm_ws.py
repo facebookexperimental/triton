@@ -459,7 +459,8 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 clc_phase_consumer ^= 1
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -474,17 +475,33 @@ def matmul(a, b):
     b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
-    # We don't cap grid size by NUM_SMS here because we use CLC by default
-    def grid(META):
-        total_tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        return (total_tiles, )
+    if config is not None:
+        a_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+        b_desc.block_shape = [config["BLOCK_SIZE_K"], config["BLOCK_SIZE_N"]]
+        c_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"] // config["EPILOGUE_SUBTILE"]]
 
-    matmul_kernel_tma_ws_blackwell[grid](
-        a_desc,
-        b_desc,
-        c_desc,
-        M,
-        N,
-        K,
-    )
+        grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]), )
+        matmul_kernel_tma_ws_blackwell.fn[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            **config,
+        )
+    else:
+        # We don't cap grid size by NUM_SMS here because we use CLC by default
+        def grid(META):
+            total_tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            return (total_tiles, )
+
+        matmul_kernel_tma_ws_blackwell[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+        )
     return c
