@@ -83,7 +83,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
-    clc_context = tlx.clc_create_context(NUM_CLC_STAGES, 3)
+    clc_context = tlx.clc_create_context(num_consumers=3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -102,16 +102,13 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
             clc_phase_producer = 1
             clc_phase_consumer = 0
-            clc_buf = 0
             while tile_id != -1:
-                clc_buf = clc_buf % NUM_CLC_STAGES
                 # Debug prints
                 # if tlx.thread_id(axis=0) == 0:
                 # tl.device_print("Default WG Processing CtaID", tile_id)
                 # producer
-                tlx.clc_producer(clc_context, clc_buf, clc_phase_producer)
-                # clc_phase_producer ^= 1
-                clc_phase_producer = clc_phase_producer ^ (clc_buf == (NUM_CLC_STAGES - 1))
+                tlx.clc_producer(clc_context, clc_phase_producer)
+                clc_phase_producer ^= 1
 
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
@@ -145,10 +142,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
 
-                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase_consumer)
-                # clc_phase_consumer ^= 1
-                clc_phase_consumer = clc_phase_consumer ^ (clc_buf == (NUM_CLC_STAGES - 1))
-                clc_buf += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
                 # Debug-only: verifying that CLC steals workloads successfully
                 # if tlx.thread_id(axis=0) == 0:
@@ -169,10 +164,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
 
             processed_k_iters = 0
             tile_id = start_pid
-            clc_phase = 0
-            clc_buf = 0
+            clc_phase_consumer = 0
             while tile_id != -1:
-                clc_buf = clc_buf % NUM_CLC_STAGES
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -206,10 +199,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 # possibly enter next iteration (next tile) without waiting for epilogue
                 cur_tmem_buf = (cur_tmem_buf + 1) % NUM_TMEM_BUFFERS
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
-                # clc_phase ^= 1
-                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
-                clc_buf += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=232):  # producer, TMA load
             # common code duplicated for each region to avoid SMEM overhead
@@ -226,10 +217,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
             processed_k_iters = 0
 
             tile_id = start_pid
-            clc_phase = 0
-            clc_buf = 0
+            clc_phase_consumer = 0
             while tile_id != -1:
-                clc_buf = clc_buf % NUM_CLC_STAGES
                 pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_SIZE_M
                 offs_bn = pid_n * BLOCK_SIZE_N
@@ -248,13 +237,12 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     # flip phase at the end of a round
                     load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
                 processed_k_iters += k_tiles
-                tile_id = tlx.clc_consumer(clc_context, clc_buf, clc_phase)
-                # clc_phase ^= 1
-                clc_phase = clc_phase ^ (clc_buf == (NUM_CLC_STAGES - 1))
-                clc_buf += 1
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                clc_phase_consumer ^= 1
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -271,13 +259,37 @@ def matmul(a, b):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    # Persistent kernel to have thread block resident in SM as long as possible
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
-    matmul_kernel_tma_ws_blackwell_clc[grid](
-        a_desc, b_desc, c_desc,  #
-        M, N, K,  #
-        NUM_SMS=NUM_SMS,  #
-        NUM_CLC_STAGES=1,  #
-    )
+    if config is not None:
+        a_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+        b_desc.block_shape = [config["BLOCK_SIZE_K"], config["BLOCK_SIZE_N"]]
+        if config.get("EPILOGUE_SUBTILE", False):
+            c_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"] // 2]
+        else:
+            c_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]]
+
+        grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]), )
+        matmul_kernel_tma_ws_blackwell_clc.fn[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            NUM_SMS=NUM_SMS,
+            NUM_CLC_STAGES=1,
+            **config,
+        )
+    else:
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+        matmul_kernel_tma_ws_blackwell_clc[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            NUM_SMS=NUM_SMS,
+            NUM_CLC_STAGES=1,
+        )
 
     return c

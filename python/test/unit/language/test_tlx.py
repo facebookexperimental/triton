@@ -2487,6 +2487,86 @@ def test_descriptor_load(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("eviction_policy", ["evict_first", "evict_last", ""])
+def test_descriptor_load_l2_cache_hint(eviction_policy, device):
+    """Test that TMA loads can use L2 cache hints via eviction_policy parameter."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_load_kernel_with_cache_hint(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr,
+                                               BLOCK_SIZE_N: tl.constexpr, EVICTION_POLICY: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        # Use eviction_policy parameter for L2 cache hint
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, eviction_policy=EVICTION_POLICY)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_load_kernel_with_cache_hint[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                                          BLOCK_SIZE_N=BLOCK_SIZE_N, EVICTION_POLICY=eviction_policy)
+
+    # Verify the TMA load is present in IR
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
+
+    # Check that eviction policy is set in the IR (only for non-default policies)
+    assert eviction_policy in kernel.asm["ttgir"]
+
+    # Verify PTX output
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.tensor" in ptx
+
+    if eviction_policy:
+        # Check for L2 cache policy creation and cache hint modifier
+        assert "createpolicy.fractional.L2" in ptx
+        assert "L2::cache_hint" in ptx
+    else:
+        # Normal/default policy should NOT have L2 cache hint
+        assert "createpolicy.fractional.L2" not in ptx
+        assert "L2::cache_hint" not in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_descriptor_load_multicast(device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
@@ -2932,13 +3012,11 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         # CLC Init
         clc_phase_producer = 1
         clc_phase_consumer = 0
-        # NUM_CLC_STAGES=1
-        # NUM_CONSUMERS=1
-        clc_context = tlx.clc_create_context(1, 1)
+        clc_context = tlx.clc_create_context(1)
 
         while tile_id != -1:
             # CLC producer
-            tlx.clc_producer(clc_context, 0, clc_phase_producer)
+            tlx.clc_producer(clc_context, clc_phase_producer)
             clc_phase_producer ^= 1
 
             block_start = tile_id * BLOCK_SIZE
@@ -2952,7 +3030,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
             tl.store(z_ptr + offsets, output, mask=mask)
 
             # CLC consumer
-            tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
             clc_phase_consumer ^= 1
 
             if tlx.thread_id(axis=0) == 0:

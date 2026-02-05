@@ -350,7 +350,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     # Dynamic tiling setup
-    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+    clc_context = tlx.clc_create_context(num_consumers=6 if PAIR_CTA else 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -364,7 +364,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
             while tile_id != -1:
                 # Persistent mode: process multiple tiles
 
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
                 cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
@@ -385,7 +385,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 )
                 tmem_accum_cnt += 1
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
@@ -423,7 +423,7 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                 )
                 tmem_accum_cnt += 1
 
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
@@ -455,11 +455,12 @@ def matmul_kernel_tma_ws_blackwell(a_desc, b_desc, c_desc, M, N, K, BLOCK_SIZE_M
                     PAIR_CTA,
                     cluster_cta_rank,
                 )
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -474,17 +475,33 @@ def matmul(a, b):
     b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
-    # We don't cap grid size by NUM_SMS here because we use CLC by default
-    def grid(META):
-        total_tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        return (total_tiles, )
+    if config is not None:
+        a_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+        b_desc.block_shape = [config["BLOCK_SIZE_K"], config["BLOCK_SIZE_N"]]
+        c_desc.block_shape = [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"] // config["EPILOGUE_SUBTILE"]]
 
-    matmul_kernel_tma_ws_blackwell[grid](
-        a_desc,
-        b_desc,
-        c_desc,
-        M,
-        N,
-        K,
-    )
+        grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]), )
+        matmul_kernel_tma_ws_blackwell.fn[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            **config,
+        )
+    else:
+        # We don't cap grid size by NUM_SMS here because we use CLC by default
+        def grid(META):
+            total_tiles = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            return (total_tiles, )
+
+        matmul_kernel_tma_ws_blackwell[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+        )
     return c

@@ -397,31 +397,28 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
 
 #### CLC API
 
-- `context = tlx.clc_create_context(num_stages, num_consumers)`
+- `context = tlx.clc_create_context(num_consumers=num_consumers)`
 
     Create a CLC pipeline context with the specified number of stages and expected consumer count.
 
     **Parameters:**
-    - `num_stages`: Number of pipeline stages for double/multi-buffering
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, k, phase, multi_ctas=False)`
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)`
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
-    - `k`: Pipeline stage index (for multi-buffering)
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False)`
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)`
 
     Decode the tile ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
-    - `k`: Pipeline stage index
     - `phase`: Current barrier phase
     - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
 
@@ -476,7 +473,7 @@ In multi-CTA mode (`multi_ctas=True`), multiple CTAs in a cluster work together 
 @triton.jit
 def matmul_kernel(..., PAIR_CTA: tl.constexpr):
     # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
-    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+    clc_context = tlx.clc_create_context(num_consumers= 6 if PAIR_CTA else 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # Epilogue consumer
@@ -486,13 +483,13 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
 
             while tile_id != -1:
                 # Producer: acquire next tile
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                tlx.clc_producer(clc_context, p_producer=clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             clc_phase_consumer = 0
@@ -502,7 +499,7 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             clc_phase_consumer = 0
@@ -512,7 +509,7 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
 ```
