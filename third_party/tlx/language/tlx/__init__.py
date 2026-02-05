@@ -74,6 +74,7 @@ from .utility import (
     stoch_round,
     thread_id,
 )
+from .mxfp8_utils import to_mxfp8
 
 __all__ = [
     # async_tasks
@@ -152,4 +153,6 @@ __all__ = [
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
+    # MXFP8
+    "to_mxfp8",
 ]
