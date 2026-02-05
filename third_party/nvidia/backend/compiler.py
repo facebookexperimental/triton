@@ -351,6 +351,11 @@ class CUDABackend(BaseBackend):
                                                          dump_enabled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            # Convert warp-uniform select to branch for conditional execution
+            # This allows skipping load→compute→store when condition is false
+            # Guarded by TRITON_ENABLE_SELECT_TO_BRANCH env variable
+            if knobs.nvidia.enable_select_to_branch:
+                nvidia.passes.ttnvgpuir.add_select_to_branch(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)

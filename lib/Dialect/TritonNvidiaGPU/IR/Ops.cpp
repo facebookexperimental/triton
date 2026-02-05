@@ -24,6 +24,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -894,6 +895,152 @@ LogicalResult TensormapCreateOp::verify() {
            << getElementStride().size() << " but expected " << rank;
   }
   return success();
+}
+
+// -- IfFromWhereOp --
+LogicalResult IfFromWhereOp::verify() {
+  // Condition must be a tensor of i1
+  auto condType = dyn_cast<RankedTensorType>(getCondition().getType());
+  if (!condType || !condType.getElementType().isInteger(1)) {
+    return emitOpError("condition must be a tensor of i1");
+  }
+
+  // Number of else values must match number of results
+  if (getElseValues().size() != getResults().size()) {
+    return emitOpError("number of else values must match number of results");
+  }
+
+  // Types of else values must match result types
+  for (auto [elseVal, result] : llvm::zip(getElseValues(), getResults())) {
+    if (elseVal.getType() != result.getType()) {
+      return emitOpError("else value type must match result type");
+    }
+  }
+
+  // Then region must have a yield with matching types
+  auto &thenBlock = getThenRegion().front();
+  auto yieldOp = dyn_cast<IfFromWhereYieldOp>(thenBlock.getTerminator());
+  if (!yieldOp) {
+    return emitOpError("then region must be terminated by "
+                       "ttng.if_from_where_yield");
+  }
+
+  if (yieldOp.getValues().size() != getResults().size()) {
+    return emitOpError("yield must have same number of values as op results");
+  }
+
+  for (auto [yieldVal, result] : llvm::zip(yieldOp.getValues(), getResults())) {
+    if (yieldVal.getType() != result.getType()) {
+      return emitOpError("yield value type must match result type");
+    }
+  }
+
+  return success();
+}
+
+void IfFromWhereOp::print(OpAsmPrinter &p) {
+  p << " " << getCondition();
+  if (!getElseValues().empty()) {
+    p << ", ";
+    p.printOperands(getElseValues());
+  }
+  p << " ";
+  p.printRegion(getThenRegion(), /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/true);
+  p.printOptionalAttrDict((*this)->getAttrs());
+  p << " : " << getCondition().getType();
+  if (!getElseValues().empty()) {
+    p << ", ";
+    llvm::interleaveComma(getElseValues().getTypes(), p);
+  }
+  if (!getResults().empty()) {
+    p << " -> ";
+    llvm::interleaveComma(getResults().getTypes(), p);
+  }
+}
+
+ParseResult IfFromWhereOp::parse(OpAsmParser &parser, OperationState &result) {
+  OpAsmParser::UnresolvedOperand condOperand;
+  SmallVector<OpAsmParser::UnresolvedOperand> elseOperands;
+  Type condType;
+  SmallVector<Type> elseTypes;
+  SmallVector<Type> resultTypes;
+
+  // Parse condition
+  if (parser.parseOperand(condOperand))
+    return failure();
+
+  // Parse optional else values
+  if (succeeded(parser.parseOptionalComma())) {
+    if (parser.parseOperandList(elseOperands))
+      return failure();
+  }
+
+  // Parse region
+  Region *thenRegion = result.addRegion();
+  if (parser.parseRegion(*thenRegion, /*arguments=*/{}, /*argTypes=*/{}))
+    return failure();
+
+  // Parse optional attributes
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse types
+  if (parser.parseColon() || parser.parseType(condType))
+    return failure();
+
+  if (!elseOperands.empty()) {
+    if (parser.parseComma() || parser.parseTypeList(elseTypes))
+      return failure();
+  }
+
+  // Parse optional result types
+  if (succeeded(parser.parseOptionalArrow())) {
+    if (parser.parseTypeList(resultTypes))
+      return failure();
+  }
+
+  // Resolve operands
+  if (parser.resolveOperand(condOperand, condType, result.operands))
+    return failure();
+
+  if (elseOperands.size() != elseTypes.size()) {
+    return parser.emitError(parser.getCurrentLocation(),
+                            "else operand count mismatch");
+  }
+
+  for (auto [operand, type] : llvm::zip(elseOperands, elseTypes)) {
+    if (parser.resolveOperand(operand, type, result.operands))
+      return failure();
+  }
+
+  result.addTypes(resultTypes);
+
+  // Ensure region has terminator
+  if (thenRegion->empty())
+    thenRegion->emplaceBlock();
+
+  return success();
+}
+
+// -- IfFromWhereOp RegionBranchOpInterface --
+void IfFromWhereOp::getSuccessorRegions(
+    RegionBranchPoint point, SmallVectorImpl<RegionSuccessor> &regions) {
+  // From the parent op, we can either go into the then region or skip to
+  // results
+  if (point.isParent()) {
+    regions.push_back(RegionSuccessor(&getThenRegion()));
+    regions.push_back(RegionSuccessor(getResults()));
+    return;
+  }
+  // From the then region, we go to the parent (returning results)
+  regions.push_back(RegionSuccessor(getResults()));
+}
+
+// -- IfFromWhereYieldOp RegionBranchTerminatorOpInterface --
+MutableOperandRange
+IfFromWhereYieldOp::getMutableSuccessorOperands(RegionBranchPoint point) {
+  return getValuesMutable();
 }
 
 } // namespace nvidia_gpu
