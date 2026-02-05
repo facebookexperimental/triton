@@ -7,8 +7,8 @@ import torch
 
 
 # This function is extracted from https://github.com/pytorch/ao/blob/v0.12.0/torchao/prototype/mx_formats/mx_tensor.py#L142
-def to_mxfp8(data_hp: torch.Tensor, ):
-    # Originally this was passed as an arg, but we don't want to allow a smaller block size than 32
+def to_mxfp8(data_hp: torch.Tensor):
+    # Originally this was passed as an arg, but we don't want to allow a block size other than 32
     block_size = 32
     assert data_hp.dtype in (
         torch.bfloat16,
