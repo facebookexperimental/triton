@@ -29,61 +29,21 @@ configs = [
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_KV": kv,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
+            "GROUP_SIZE_N": grp_n,
+            "RESCALE_OPT": rescale_opt,
+            "USE_WHERE": where, # used when RESCALE_OPT is True
         },
         num_stages=0,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
+    )
+    for kv in [3, 6]
+    for grp_n in [1, 4]
+    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
 ]
 
 
@@ -103,6 +63,11 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     bufIdx = accum_cnt % NUM_BUFFERS_KV
     phase = (accum_cnt // NUM_BUFFERS_KV) & 1
     return bufIdx, phase
+
+
+@triton.jit
+def _reduce_or(x, y):
+    return x | y
 
 
 @triton.jit
@@ -262,6 +227,126 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
     return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
 
 
+# Original add_round_down(x, y) did: add.rm.ftz.f32  (round-down)
+# We only need it to produce floor(x) when paired with the big-constant trick.
+# In Triton, just compute floor(x) explicitly and add y.
+@triton.jit
+def add_round_down(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            add.rm.ftz.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+# ============================================================================
+# Custom exp2 Polynomial Approximation (the "emulation" path)
+# ============================================================================
+
+
+@triton.jit
+def _fma_f32x2(a, b, c):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mov.b64 rc, { $6, $7 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { $0, $1 }, rd;
+        }
+        """,
+        "=r,=r,r,r,r,r,r,r",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def evaluate_polynomial(x, coeffs: tl.constexpr):
+    """
+    Returns P(x) with scalar coeffs using Horner's rule and inline PTX FMA.
+    P(t) = sum_{i=0..deg} coeffs[i] * t^i
+    """
+    deg = len(coeffs) - 1
+    out = coeffs[deg]
+    for i in range(deg - 1, -1, -1):
+        out = _fma_f32x2(out, x, coeffs[i])  # out = out*x + coeffs[i]
+    return out
+
+
+@triton.jit
+def combine_int_frac_ex2(x_rounded, frac_ex2):
+    """
+    Compose: out_bits = (x_rounded_bits << 23) + frac_ex2_bits
+    where:
+      - x_rounded carries the integer part (floor) in its low bits
+      - frac_ex2 carries the mantissa approximation of 2**fraction(x)
+    Returns fp32 with those bits.
+    """
+    out = tl.inline_asm_elementwise(
+        asm="""
+        {
+          .reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;
+          mov.b32 x_rounded_i, $1;
+          mov.b32 frac_ex_i, $2;
+          shl.b32 x_rounded_e, x_rounded_i, 23;
+          add.s32 out_i, x_rounded_e, frac_ex_i;
+          mov.b32 $0, out_i;
+        }
+        """,
+        constraints="=f, f, f",  # $0: out(float), $1: x_rounded(float), $2: frac_ex2(float)
+        args=[x_rounded, frac_ex2],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return out
+
+
+@triton.jit
+def ex2_emulation(x):
+    # We assume x <= 127.0
+    x = tl.maximum(x, -127.0)
+
+    FP32_ROUND_INT = (2.0**23) + (2.0**22)  # same constant you used
+
+    # Emulate your “round down fractional” split explicitly
+    x_rounded = add_round_down(x, FP32_ROUND_INT)
+    x_rounded_back = x_rounded - FP32_ROUND_INT
+    x_frac = x - x_rounded_back  # r in [0,1)
+
+    # Your degree-3 approximation coefficients for 2**r, r in [0,1)
+
+    # ---- inline polynomial for 2**r (degree-3, Horner) ----
+    # Coeffs: (C0, C1, C2, C3)
+    C0 = 1.0
+    C1 = 0.695146143436431884765625
+    C2 = 0.227564394474029541015625
+    C3 = 0.077119089663028717041015625
+
+    x_frac_ex2 = C3
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C2)  # t = C3*r + C2
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C1)  # t = (..)*r + C1
+    x_frac_ex2 = _fma_f32x2(x_frac_ex2, x_frac, C0)  # t = (..)*r + C0   ~ 2**r
+
+    return combine_int_frac_ex2(x_rounded, x_frac_ex2)  # 2**n * 2**r
+
+
 @triton.jit
 def _softmax_inner_loop(
     qk_fulls,
@@ -287,6 +372,7 @@ def _softmax_inner_loop(
     NUM_MMA_GROUPS: tl.constexpr,
     STAGE: tl.constexpr,
     P_PADDING: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
@@ -300,16 +386,47 @@ def _softmax_inner_loop(
             qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
         # compute m_i, p in registers
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        # update_row_max: row_max_new = _compute_row_max(qk, row_max[0])
+        # -> FA4 handles one row per thread (32 threads per warp * 4)
+        # -> use fmax_reduce(one row of qk, m_i[0])
+        # -> m_i|m_ij = row_max[0] * scale
+        if RESCALE_OPT:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
 
         # -- compute correction factor
-        alpha = tl.math.exp2(m_i - m_ij)
+        # update_row_max: acc_scale_ = (row_max[0] - row_max_new) * scale
+        # -> acc_scale = exp2(acc_scale_)
+        # -> if (acc_scale_ >= -8.0):
+        # ->   row_max_new = row_max[0]; acc_scale = 1.0
+        # -> row_max[0] = row_max_new
+        if RESCALE_OPT:
+            alpha_ = (m_i - m_ij) * qk_scale  # alpha_ is 1D distributed over the warp group
+            alpha = tl.math.exp2(alpha_)
+            rescale_mask = alpha_ >= -8.0
+            alpha = tl.where(rescale_mask, 1.0, alpha)
+            m_ij = tl.where(rescale_mask, m_i, m_ij)
+        else:
+            alpha = tl.math.exp2(m_i - m_ij)
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
         tlx.local_store(tlx.local_view(alpha_tiles, cid * BLOCK_N), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
-        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        # scale_subtract_rowmax:
+        # -> row_max_scaled = row_max_new * scale
+        # -> s[i], s[i+1] = fma_packed_f32x2((s[i], s[i+1]), (scale, scale), (-row_max_scaled, -row_max_scaled))
+        if RESCALE_OPT:
+            m_scaled = m_ij * qk_scale
+            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+        else:
+            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        # apply_epx2_convert in FA4:
+        # 128 elements per row is divided into 4 fragments, first fragement covers [0] to [31]
+        # for last fragment, always use SFU, for first 3 fragments, elements 0 to 11 use SFU,
+        # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
+        # the loop is unrolled twice likely for vectorization
         qks = _split_n(qk, NUM_MMA_SLICES)
         ps = ()
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
@@ -351,6 +468,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
                  GROUP_SIZE_N: tl.constexpr,  #
+                 RESCALE_OPT: tl.constexpr,  #
+                 USE_WHERE: tl.constexpr,  #
                  ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -481,16 +600,53 @@ def _attn_fwd_ws(sm_scale, M,  #
                         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
                         alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
                         tlx.barrier_arrive(alpha_empties[cid])
-                        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                            subslice = tlx.subslice(
-                                acc_tiles[cid],
-                                HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                HEAD_DIM // NUM_MMA_SLICES,
-                            )
-                            acc = tlx.local_load(subslice)
-                            # acc = acc * alpha_1
-                            acc = _mul_f32x2(acc, alpha_1)
-                            tlx.local_store(subslice, acc)
+                        # Perform warp-level ballot vote to check if any thread needs rescaling
+                        # 0xFFFFFFFF means all 32 threads in the warp participate
+                        if RESCALE_OPT:
+                            pred = alpha_1 < 1.0
+                            # ballot_result is a tensor with the same shape as pred
+                            # All elements contain the same warp-level ballot value
+                            # Non-zero means at least one thread has alpha_1 < 1.0
+                            ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+                            should_rescale = ballot_result != 0
+
+                        # FA4: each thread handles one row, 128 elements
+                        #   128 threads handle 128 rows
+                        #   each thread breaks one row into 8 fragments, each fragment 16 elements, unrolls by 2
+                        # TLX: with NUM_MMA_SLICES of 2, we handle 128x64, then another 128x64
+                        # Since Triton doesn't support ifOp on a tensor value, we try to combine the values
+                        # option 1: use tl.where
+                        if USE_WHERE:
+                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                                subslice = tlx.subslice(
+                                    acc_tiles[cid],
+                                    HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                                    HEAD_DIM // NUM_MMA_SLICES,
+                                )
+                                acc = tlx.local_load(subslice)
+                                # Use tl.where to conditionally apply rescaling
+                                # acc = acc * alpha_1 where should_rescale, else acc unchanged
+                                if RESCALE_OPT:
+                                    scaled_acc = _mul_f32x2(acc, alpha_1)
+                                    acc = tl.where(should_rescale, scaled_acc, acc)
+                                else:
+                                    acc = _mul_f32x2(acc, alpha_1)
+                                tlx.local_store(subslice, acc)
+                        else:
+                            # option 2: use a single scalar IfOp
+                            if RESCALE_OPT:
+                                should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
+                                should_rescale_scalar = tl.reshape(should_rescale_red, ())
+                            if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
+                                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                                    subslice = tlx.subslice(
+                                        acc_tiles[cid],
+                                        HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                                        HEAD_DIM // NUM_MMA_SLICES,
+                                    )
+                                    acc = tlx.local_load(subslice)
+                                    acc = _mul_f32x2(acc, alpha_1)
+                                    tlx.local_store(subslice, acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
@@ -506,7 +662,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
@@ -549,6 +705,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 )
                 # initialize pointer to m and l
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
+                # FA4 update_row_sum has init_val being None for the first iteration, here
+                # we use initial value of 1.0
                 l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
                 acc = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=tl.float32)
                 qk_scale = sm_scale
@@ -582,6 +740,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         NUM_MMA_GROUPS,
                         STAGE=4 - STAGE,
                         P_PADDING=P_PADDING,
+                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 if STAGE & 2:
@@ -609,6 +768,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         NUM_MMA_GROUPS,
                         STAGE=2,
                         P_PADDING=P_PADDING,
+                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 # prepare l_i for the epilog
@@ -729,7 +889,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         )
                         p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                         use_acc = acc1_init if slice_id == 0 else True
-                        mBarriers = ([kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                        mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -787,7 +947,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
                     p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                     use_acc = acc1_init if slice_id == 0 else True
-                    mBarriers = ([acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                    mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
                     tlx.async_dot(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -1876,9 +2036,9 @@ def test_op(
     dtype,
 ):
     torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_())
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), device=DEVICE).normal_(mean=0.0, std=0.5).to(dtype).requires_grad_()
     sm_scale = 0.5
     # reference implementation
     if dtype == torch.float8_e5m2:
@@ -1944,14 +2104,14 @@ BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
 print(N_HEADS)
 # vary seq length for fixed head and batch=4
 configs = []
-for mode in ["fwd", "bwd"]:
-    for causal in [False, True]:
-        for BWD_BLOCK_M1 in [64, 128]:
+for mode in ["fwd"]:  # , "bwd"]:
+    for causal in [False]:  # , True]:
+        for BWD_BLOCK_M1 in [64]:  # , 128]:
             for GROUP_SIZE_M in [8]:
                 configs.append(
                     triton.testing.Benchmark(
                         x_names=["N_CTX"],
-                        x_vals=[2**i for i in range(10, 15)],
+                        x_vals=[2**i for i in range(13, 14)],
                         line_arg="provider",
                         line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
                         line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),

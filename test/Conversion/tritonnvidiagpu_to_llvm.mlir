@@ -13,6 +13,99 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+// Test that tensor select with warp-uniform condition (from vote_ballot via splat)
+// is converted to branches instead of per-element select instructions.
+// This is the pattern used in Flash Attention for conditional rescaling.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: uniform_tensor_select_to_branch
+  // CHECK: nvvm.vote.sync  ballot
+  // CHECK: llvm.icmp "ne"
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.br
+  // CHECK: llvm.br
+  tt.func @uniform_tensor_select_to_branch(%mask: i32, %pred: i1, %true_val: tensor<16x32xf32, #blocked>, %false_val: tensor<16x32xf32, #blocked>, %ptr: !tt.ptr<f32>) {
+    // Get warp-uniform ballot result
+    %ballot = ttng.vote_ballot_sync %mask, %pred : i1 -> i32
+    %c0 = arith.constant 0 : i32
+    // Compare ballot result (scalar i32) - this is warp-uniform
+    %scalar_cond = arith.cmpi ne, %ballot, %c0 : i32
+    // Splat scalar condition to tensor shape to match tensor operands
+    %cond = tt.splat %scalar_cond : i1 -> tensor<16x32xi1, #blocked>
+    // Select with uniform tensor condition - should become branches
+    %result = arith.select %cond, %true_val, %false_val : tensor<16x32xi1, #blocked>, tensor<16x32xf32, #blocked>
+    // Store result (kernels can't return values)
+    %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<16x32x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %result : tensor<16x32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// Test the full Flash Attention pattern: tensor predicate -> vote_ballot -> tensor condition -> select
+// This matches the actual FA kernel pattern where pred = alpha_1 < 1.0 is a tensor.
+#blocked1d = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: uniform_tensor_select_tensor_pred
+  // CHECK: nvvm.vote.sync  ballot
+  // CHECK: llvm.icmp "ne"
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.br
+  // CHECK: llvm.br
+  tt.func @uniform_tensor_select_tensor_pred(%mask: i32, %alpha: tensor<128xf32, #blocked1d>, %acc: tensor<128xf32, #blocked1d>, %scaled_acc: tensor<128xf32, #blocked1d>, %ptr: !tt.ptr<f32>) {
+    // pred = alpha < 1.0 - this is a tensor predicate
+    %c1 = arith.constant dense<1.0> : tensor<128xf32, #blocked1d>
+    %pred = arith.cmpf olt, %alpha, %c1 : tensor<128xf32, #blocked1d>
+    // ballot_result is a tensor with the same shape, all elements contain warp ballot
+    %ballot = ttng.vote_ballot_sync %mask, %pred : tensor<128xi1, #blocked1d> -> tensor<128xi32, #blocked1d>
+    // should_rescale = ballot_result != 0
+    %c0 = arith.constant dense<0> : tensor<128xi32, #blocked1d>
+    %should_rescale = arith.cmpi ne, %ballot, %c0 : tensor<128xi32, #blocked1d>
+    // Conditional select - condition is uniform since ballot result is same for all threads in warp
+    %result = arith.select %should_rescale, %scaled_acc, %acc : tensor<128xi1, #blocked1d>, tensor<128xf32, #blocked1d>
+    // Store result (kernels can't return values)
+    %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked1d>
+    tt.store %ptrs, %result : tensor<128x!tt.ptr<f32>, #blocked1d>
+    tt.return
+  }
+}
+
+// -----
+
+// Test 2D Flash Attention pattern: alpha is 128x1 (broadcast dim), acc/scaled_acc are 128x64
+// This tests the broadcast scenario where alpha has a singleton dimension.
+#blocked2d = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2d_alpha = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: uniform_tensor_select_2d_broadcast
+  // CHECK: nvvm.vote.sync  ballot
+  // CHECK: llvm.icmp "ne"
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.br
+  // CHECK: llvm.br
+  tt.func @uniform_tensor_select_2d_broadcast(%mask: i32, %alpha: tensor<128x1xf32, #blocked2d_alpha>, %acc: tensor<128x64xf32, #blocked2d>, %scaled_acc: tensor<128x64xf32, #blocked2d>, %ptr: !tt.ptr<f32>) {
+    // pred = alpha < 1.0 - alpha is 128x1, will be broadcast
+    %c1 = arith.constant dense<1.0> : tensor<128x1xf32, #blocked2d_alpha>
+    %pred = arith.cmpf olt, %alpha, %c1 : tensor<128x1xf32, #blocked2d_alpha>
+    // ballot_result has same shape as pred (128x1)
+    %ballot = ttng.vote_ballot_sync %mask, %pred : tensor<128x1xi1, #blocked2d_alpha> -> tensor<128x1xi32, #blocked2d_alpha>
+    // should_rescale = ballot_result != 0 (128x1)
+    %c0 = arith.constant dense<0> : tensor<128x1xi32, #blocked2d_alpha>
+    %cond_small = arith.cmpi ne, %ballot, %c0 : tensor<128x1xi32, #blocked2d_alpha>
+    // Broadcast condition from 128x1 to 128x64 to match acc/scaled_acc shape
+    %should_rescale = tt.broadcast %cond_small : tensor<128x1xi1, #blocked2d_alpha> -> tensor<128x64xi1, #blocked2d>
+    // Conditional select with broadcast condition
+    %result = arith.select %should_rescale, %scaled_acc, %acc : tensor<128x64xi1, #blocked2d>, tensor<128x64xf32, #blocked2d>
+    // Store result
+    %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x64x!tt.ptr<f32>, #blocked2d>
+    tt.store %ptrs, %result : tensor<128x64x!tt.ptr<f32>, #blocked2d>
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
@@ -132,7 +225,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: vote_ballot_sync
   // CHECK: nvvm.vote.sync  ballot
   tt.func @vote_ballot_sync(%mask: i32, %pred: i1) {
-    %result = ttng.vote_ballot_sync %mask, %pred
+    %result = ttng.vote_ballot_sync %mask, %pred : i1 -> i32
+    tt.return
+  }
+}
+
+// -----
+
+// Test that scalar select with warp-uniform condition (from vote_ballot) is
+// converted to branches instead of select instruction.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: uniform_select_to_branch
+  // CHECK: nvvm.vote.sync  ballot
+  // CHECK: llvm.icmp "ne"
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.br
+  // CHECK: llvm.br
+  tt.func @uniform_select_to_branch(%mask: i32, %pred: i1, %true_val: i32, %false_val: i32, %ptr: !tt.ptr<i32>) {
+    %ballot = ttng.vote_ballot_sync %mask, %pred : i1 -> i32
+    %c0 = arith.constant 0 : i32
+    %cond = arith.cmpi ne, %ballot, %c0 : i32
+    %result = arith.select %cond, %true_val, %false_val : i32
+    // Store result (kernels can't return values)
+    tt.store %ptr, %result : !tt.ptr<i32>
     tt.return
   }
 }
