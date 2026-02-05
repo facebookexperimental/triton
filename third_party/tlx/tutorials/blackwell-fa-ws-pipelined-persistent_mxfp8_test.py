@@ -51,60 +51,11 @@ mxfp8_configs = [
         num_warps=4,
         pre_hook=_mxf8_host_descriptor_pre_hook,
     ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_mxf8_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "GROUP_SIZE_N": 1,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_mxf8_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_mxf8_host_descriptor_pre_hook,
-    ),
 ]
 
 
 def prune_configs_by_hdim_mxfp8(configs, named_args, **kwargs):
-    HEAD_DIM = kwargs["HEAD_DIM"]
-    STAGE = kwargs["STAGE"]
-    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
-    target_group_size_n = 4 if STAGE == 3 else 1
-    return [
-        conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
-        and conf.kwargs.get("GROUP_SIZE_N", 0) == target_group_size_n
-    ]
+    return configs
 
 
 @triton.jit
