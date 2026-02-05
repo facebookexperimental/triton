@@ -4555,14 +4555,15 @@ class TestLocalAllocWithStorageAliasSpec:
 class TestToMxfp8:
     """Tests for the to_mxfp8 utility function."""
 
-    def test_basic_conversion_bfloat16(self, device):
+    @pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_basic_conversion_bfloat16(self, elem_dtype, device):
         """Test basic MXFP8 conversion with bfloat16 input."""
         from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
 
         # Create a simple input tensor with shape divisible by block_size (32)
         input_tensor = torch.randn(4, 64, dtype=torch.bfloat16, device=device)
 
-        scale, data = to_mxfp8(input_tensor)
+        scale, data = to_mxfp8(input_tensor, elem_dtype)
 
         # Check output shapes
         # Scale should have shape (4, 2) since last dim 64 / 32 = 2
@@ -4572,15 +4573,16 @@ class TestToMxfp8:
 
         # Check output dtypes
         assert scale.dtype == torch.float8_e8m0fnu, f"Expected scale dtype float8_e8m0fnu, got {scale.dtype}"
-        assert data.dtype == torch.float8_e4m3fn, f"Expected data dtype float8_e4m3fn, got {data.dtype}"
+        assert data.dtype == elem_dtype, f"Expected data dtype {elem_dtype}, got {data.dtype}"
 
-    def test_basic_conversion_float32(self, device):
+    @pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_basic_conversion_float32(self, elem_dtype, device):
         """Test basic MXFP8 conversion with float32 input."""
         from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
 
         input_tensor = torch.randn(8, 32, dtype=torch.float32, device=device)
 
-        scale, data = to_mxfp8(input_tensor)
+        scale, data = to_mxfp8(input_tensor, elem_dtype)
 
         # Check output shapes
         assert scale.shape == (8, 1), f"Expected scale shape (8, 1), got {scale.shape}"
@@ -4588,30 +4590,34 @@ class TestToMxfp8:
 
         # Check output dtypes
         assert scale.dtype == torch.float8_e8m0fnu
-        assert data.dtype == torch.float8_e4m3fn
+        assert data.dtype == elem_dtype
 
-    def test_3d_tensor(self, device):
+    @pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_3d_tensor(self, elem_dtype, device):
         """Test MXFP8 conversion with 3D tensor."""
         from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
 
         input_tensor = torch.randn(2, 4, 128, dtype=torch.bfloat16, device=device)
 
-        scale, data = to_mxfp8(input_tensor)
+        scale, data = to_mxfp8(input_tensor, elem_dtype)
 
         # Scale shape: (2, 4, 4) since 128 / 32 = 4
         assert scale.shape == (2, 4, 4)
         assert data.shape == input_tensor.shape
+        assert data.dtype == elem_dtype
 
-    def test_zero_tensor(self, device):
+    @pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_zero_tensor(self, elem_dtype, device):
         """Test MXFP8 conversion with all zeros."""
         from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
 
         input_tensor = torch.zeros(2, 32, dtype=torch.bfloat16, device=device)
 
-        scale, data = to_mxfp8(input_tensor)
+        scale, data = to_mxfp8(input_tensor, elem_dtype)
 
         # All zeros should result in all zero data
         assert torch.all(data.to(torch.float32) == 0)
+        assert data.dtype == elem_dtype
 
     def test_invalid_last_dim_raises(self, device):
         """Test that non-divisible last dimension raises an error."""
@@ -4621,7 +4627,7 @@ class TestToMxfp8:
         input_tensor = torch.randn(4, 33, dtype=torch.bfloat16, device=device)
 
         with pytest.raises(AssertionError):
-            to_mxfp8(input_tensor)
+            to_mxfp8(input_tensor, torch.float8_e4m3fn)
 
     def test_non_contiguous_raises(self, device):
         """Test that non-contiguous tensor raises an error."""
@@ -4633,13 +4639,22 @@ class TestToMxfp8:
         assert not non_contiguous.is_contiguous()
 
         with pytest.raises(AssertionError):
-            to_mxfp8(non_contiguous)
+            to_mxfp8(non_contiguous, torch.float8_e4m3fn)
 
-    def test_unsupported_dtype_raises(self, device):
-        """Test that unsupported dtype raises an error."""
+    def test_unsupported_input_dtype_raises(self, device):
+        """Test that unsupported input dtype raises an error."""
         from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
 
         input_tensor = torch.randn(4, 32, dtype=torch.float16, device=device)
 
         with pytest.raises(AssertionError):
-            to_mxfp8(input_tensor)
+            to_mxfp8(input_tensor, torch.float8_e4m3fn)
+
+    def test_unsupported_elem_dtype_raises(self, device):
+        """Test that unsupported elem_dtype raises an error."""
+        from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
+
+        input_tensor = torch.randn(4, 32, dtype=torch.bfloat16, device=device)
+
+        with pytest.raises(AssertionError):
+            to_mxfp8(input_tensor, torch.float16)
