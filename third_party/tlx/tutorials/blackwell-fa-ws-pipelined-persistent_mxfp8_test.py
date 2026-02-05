@@ -1225,8 +1225,8 @@ def test_op(
 
     dtype = torch.float8_e4m3fn
 
-    if HEAD_DIM == 64:
-        pytest.skip("FP8 with HEAD_DIM=64 not supported yet")
+    if HEAD_DIM == 128:
+        pytest.skip("FP8 with HEAD_DIM=128 not supported yet")
 
     if causal:
         pytest.skip("Causal not supported yet")
