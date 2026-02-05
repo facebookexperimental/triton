@@ -7,8 +7,9 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
+from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
 
-from to_mxfp8_triton import to_mxfp8, triton_mx_block_rearrange, _to_mxfp8_block
+from to_mxfp8_triton import triton_mx_block_rearrange, _to_mxfp8_block
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -1158,21 +1159,6 @@ def generate_tensor_with_block_distributions(
     return generated_tensor
 
 
-def generate_mxfp8_tensors(shape, device):
-    """Generate MXFP8 quantized tensors for Q, K, V.
-
-    Returns:
-        Tuple of (data, scale) for each tensor where data is FP8 and scale is the MX scale.
-    """
-    # Create BF16 data first, then convert to MXFP8
-    tensor_bf16 = torch.empty(shape, device=device, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5).contiguous()
-
-    # Convert to MXFP8: returns (scale, data)
-    scale, data = to_mxfp8(tensor_bf16)
-
-    return data, scale
-
-
 def generate_attention_inputs(shape, device, dtype):
     """Generate Q, K, V tensors for attention.
 
@@ -1194,15 +1180,15 @@ def generate_attention_inputs(shape, device, dtype):
     k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     # Convert bf16 reference tensors to MXFP8
-    q_scale, q_data = to_mxfp8(q_ref)
-    k_scale, k_data = to_mxfp8(k_ref)
+    q_scale, q_data = to_mxfp8(q_ref, torch.float8_e4m3fn)
+    k_scale, k_data = to_mxfp8(k_ref, torch.float8_e4m3fn)
 
     # For V, we need scales along the N dimension (reduction dim in P @ V)
     # V shape: [B, H, N, HEAD_DIM]
     # to_mxfp8 scales along the last dimension, so we transpose before quantization
     # to get scales along N instead of HEAD_DIM
     v_transposed = v_ref.transpose(-2, -1).contiguous()  # [B, H, HEAD_DIM, N]
-    v_scale, v_data_transposed = to_mxfp8(v_transposed)  # v_scale: [B, H, HEAD_DIM, N//32]
+    v_scale, v_data_transposed = to_mxfp8(v_transposed, torch.float8_e4m3fn)  # v_scale: [B, H, HEAD_DIM, N//32]
     v_data = v_data_transposed.transpose(-2, -1).contiguous()  # [B, H, N, HEAD_DIM]
     # v_scale shape: [B, H, HEAD_DIM, N//32] - scales along N (correct for P @ V)
 
