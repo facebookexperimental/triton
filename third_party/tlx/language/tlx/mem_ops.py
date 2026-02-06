@@ -217,8 +217,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                                  f"doesn't match local_alloc storage ({storage.value})")
             shared_buffer_handle = reuse.handle
         else:
-            raise ValueError(f"reuse must be a buffered_tensor or storage_alias_spec, "
-                             f"got {type(reuse)}")
+            raise ValueError(f"reuse must be a buffered_tensor or storage_alias_spec, got {type(reuse)}")
 
     if storage == tlx.storage_kind.smem:
         tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle, alias_handle,
@@ -333,7 +332,7 @@ def remote_view(
     a cluster of shape [2, 4] a valid unique ID could be 0~7, including the executing CTA itself
     :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
     """
-    assert isinstance(local_allocated_buffer, tlx.mbarrier), ("remote_view only supports barrier for now")
+    assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
     assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
