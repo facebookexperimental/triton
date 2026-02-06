@@ -474,9 +474,11 @@ def test_prune_all_configs(device):
         _kernel[grid](dst, src, N=N)
         pytest.fail("Expected exception was not thrown.")
     except triton.TritonError as e:
-        assert e is not None and str(
-            e
-        ) == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+        assert (
+            e is not None
+            and str(e)
+            == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+        )
 
 
 def test_autotune_dump_dir_structure(device, monkeypatch, tmp_path):
@@ -530,3 +532,64 @@ def test_autotune_dump_dir_structure(device, monkeypatch, tmp_path):
         assert "warps4" in name, f"Expected warps info in {name}"
         assert "stages2" in name, f"Expected stages info in {name}"
         assert "ctas1" in name, f"Expected ctas info in {name}"
+
+
+def test_dump_best_config_ir(device, tmp_path):
+    """Test TRITON_KERNEL_DUMP_BEST_CONFIG only dumps IR for best autotuned config."""
+    import os
+    from triton import knobs
+
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = [
+        triton.Config(kwargs={'BLOCK_SIZE': 32}, num_warps=4, num_stages=2),
+        triton.Config(kwargs={'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+    ]
+
+    @triton.autotune(configs=configs, key=['N'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    dump_dir = str(tmp_path / "dump")
+    os.makedirs(dump_dir, exist_ok=True)
+
+    # Save original knob values
+    original_dump_best = knobs.autotuning.dump_best_config_ir
+    original_dump_ir = knobs.compilation.dump_ir
+    original_dump_dir = knobs.cache.dump_dir
+
+    try:
+        # Enable dumping for best config only
+        knobs.autotuning.dump_best_config_ir = True
+        knobs.compilation.dump_ir = False  # Should be off initially
+        knobs.cache.dump_dir = dump_dir
+
+        grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+        _kernel[grid](dst, src, N=N)
+
+        # Verify that IR was dumped (dump_dir should contain files)
+        ttir_files = list(tmp_path.glob("dump/**/*.ttir"))
+        ttgir_files = list(tmp_path.glob("dump/**/*.ttgir"))
+        assert len(ttir_files) > 0 or len(ttgir_files) > 0, (
+            f"Expected IR files to be dumped in {dump_dir}, but found none"
+        )
+
+        # Verify that only ONE config's IR was dumped (not all configs)
+        # Each config would have its own hash directory, so we check
+        # that there's only one hash directory with IR files
+        hash_dirs = [d for d in (tmp_path / "dump").iterdir() if d.is_dir()]
+        assert len(hash_dirs) == 1, f"Expected IR for only 1 config (best), but found {len(hash_dirs)} config(s)"
+
+        # Verify correctness
+        triton.testing.assert_close(dst, src)
+
+    finally:
+        # Restore original knob values
+        knobs.autotuning.dump_best_config_ir = original_dump_best
+        knobs.compilation.dump_ir = original_dump_ir
+        knobs.cache.dump_dir = original_dump_dir

@@ -269,11 +269,29 @@ class Autotuner(KernelInterface):
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
             config.pre_hook(full_nargs)
-        ret = self.fn.run(
-            *args,
-            **kwargs,
-            **config.all_kwargs(),
-        )
+        # Enable IR dumping for best config if requested
+        dump_best = knobs.autotuning.dump_best_config_ir
+        if dump_best:
+            original_dump_ir = knobs.compilation.dump_ir
+            original_always_compile = knobs.compilation.always_compile
+            knobs.compilation.dump_ir = True
+            knobs.compilation.always_compile = True
+            # Clear the JIT cache for this kernel to force recompilation
+            # so IR can be dumped
+            if hasattr(self.fn, 'device_caches'):
+                for device_cache in self.fn.device_caches.values():
+                    if isinstance(device_cache, tuple) and len(device_cache) >= 1:
+                        device_cache[0].clear()
+        try:
+            ret = self.fn.run(
+                *args,
+                **kwargs,
+                **config.all_kwargs(),
+            )
+        finally:
+            if dump_best:
+                knobs.compilation.dump_ir = original_dump_ir
+                knobs.compilation.always_compile = original_always_compile
         self.nargs = None
         return ret
 
