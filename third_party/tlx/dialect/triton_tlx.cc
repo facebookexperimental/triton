@@ -610,9 +610,9 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
-              Value source) -> void {
-             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord,
-                                                            source);
+              Value source, tt::EvictionPolicy evictionPolicy) -> void {
+             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord, source,
+                                                            evictionPolicy);
            })
       .def("create_async_TMA_store_wait",
            [](TritonOpBuilder &self, int pendings) {
