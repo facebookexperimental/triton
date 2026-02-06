@@ -255,6 +255,13 @@ Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                          triton::FuncOp &funcOp);
 
+/// Generate a DOT graph showing channels between partitions.
+/// Nodes are operations grouped by their async_task_id (partition).
+/// Edges represent channels connecting producer and consumer operations.
+/// Output can be rendered with Graphviz: dot -Tpng graph.dot -o graph.png
+void dumpChannelGraph(SmallVector<std::unique_ptr<Channel>> &channels,
+                      triton::FuncOp funcOp, llvm::raw_ostream &os);
+
 Operation *getSameLevelOp(Operation *p, Operation *c);
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,

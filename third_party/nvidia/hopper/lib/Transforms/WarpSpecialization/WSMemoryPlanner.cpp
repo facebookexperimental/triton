@@ -1511,6 +1511,13 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
       return failure();
   }
 
+  // Dump channel graph after memory planning (when operation_ids are set)
+  LLVM_DEBUG({
+    llvm::dbgs()
+        << "\n[doMemoryPlanner] Channel graph after memory planning:\n";
+    dumpChannelGraph(channelsOrigin, funcOp, llvm::dbgs());
+  });
+
   // If a write decision file is provided, serialize decisions to file.
   if (!writeDecisionFile.empty()) {
     if (failed(writeDecisionsToFile(channels, writeDecisionFile))) {

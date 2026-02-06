@@ -707,6 +707,338 @@ createChannelsForProducers(SmallVector<Operation *> &currentProds,
   }
 }
 
+/// Dump information about a single channel for debugging.
+static void dumpChannel(Channel *ch, llvm::raw_ostream &os) {
+  os << "  Channel ID: " << ch->uniqID << "\n";
+  os << "    Kind: " << to_string(ch->channelKind) << "\n";
+  os << "    Producer Task ID: " << ch->relation.first << "\n";
+  os << "    Consumer Task IDs: [";
+  for (size_t i = 0; i < ch->relation.second.size(); ++i) {
+    if (i > 0)
+      os << ", ";
+    os << ch->relation.second[i];
+  }
+  os << "]\n";
+  os << "    NumBuffers: " << ch->getNumBuffers() << "\n";
+  if (auto *allocOp = ch->getAllocOp()) {
+    os << "    AllocOp: ";
+    allocOp->print(os, OpPrintingFlags().skipRegions());
+    os << "\n";
+  }
+  if (auto *srcOp = ch->getSrcOp()) {
+    os << "    SrcOp: ";
+    srcOp->print(os, OpPrintingFlags().skipRegions());
+    os << "\n";
+  }
+  if (auto *dstOp = ch->getDstOp()) {
+    os << "    DstOp: ";
+    dstOp->print(os, OpPrintingFlags().skipRegions());
+    os << "\n";
+  }
+  // For TmemDataChannelPost, dump additional info
+  if (ch->channelKind == DataChannelKind::TMEMPost) {
+    auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+    os << "    isOperandD: " << (tmemCh->isOperandD ? "true" : "false") << "\n";
+    os << "    isOperandDNoAcc: "
+       << (tmemCh->isOperandDNoAcc ? "true" : "false") << "\n";
+  }
+}
+
+/// Dump all channels associated with an OperandD (same allocOp).
+static void
+dumpChannelsForOperandD(ttng::TMEMAllocOp tmemAllocOp,
+                        SmallVector<std::unique_ptr<Channel>> &channels,
+                        llvm::raw_ostream &os) {
+  os << "\n=== Channels for OperandD ===\n";
+  os << "TMEMAllocOp: ";
+  tmemAllocOp.getOperation()->print(os, OpPrintingFlags().skipRegions());
+  os << "\n";
+  os << "Number of channels: ";
+  size_t count = 0;
+  for (auto &ch : channels) {
+    if (ch->getAllocOp() == tmemAllocOp.getOperation()) {
+      ++count;
+    }
+  }
+  os << count << "\n";
+  for (auto &ch : channels) {
+    if (ch->getAllocOp() == tmemAllocOp.getOperation()) {
+      dumpChannel(ch.get(), os);
+    }
+  }
+  os << "=== End Channels for OperandD ===\n\n";
+}
+
+/// Dump all channels in the channel collection for debugging.
+static void dumpAllChannels(SmallVector<std::unique_ptr<Channel>> &channels,
+                            llvm::raw_ostream &os) {
+  os << "\n=== All Channels ===\n";
+  os << "Total channel count: " << channels.size() << "\n\n";
+  for (auto &ch : channels) {
+    dumpChannel(ch.get(), os);
+  }
+  os << "=== End All Channels ===\n\n";
+}
+
+/// Get a short name for an operation for display in the graph.
+static std::string getOpShortName(Operation *op) {
+  if (!op)
+    return "null";
+  std::string name = op->getName().getStringRef().str();
+  // Remove dialect prefix for brevity
+  size_t dotPos = name.find('.');
+  if (dotPos != std::string::npos && dotPos + 1 < name.size()) {
+    name = name.substr(dotPos + 1);
+  }
+  return name;
+}
+
+/// Get operation_id attribute value, or -1 if not present.
+static int getOperationId(Operation *op) {
+  if (!op)
+    return -1;
+  if (auto opIdAttr = op->getAttrOfType<IntegerAttr>("operation_id")) {
+    return opIdAttr.getInt();
+  }
+  return -1;
+}
+
+/// Get buffer.id attribute value, or -1 if not present.
+static int getBufferId(Operation *op) {
+  if (!op)
+    return -1;
+  if (auto bufIdAttr = op->getAttrOfType<IntegerAttr>("buffer.id")) {
+    return bufIdAttr.getInt();
+  }
+  return -1;
+}
+
+/// Get named location string from an operation, or empty string if not present.
+/// Supports NameLoc, FusedLoc, FileLineColLoc, and CallSiteLoc.
+static std::string getNamedLoc(Operation *op) {
+  if (!op)
+    return "";
+  Location loc = op->getLoc();
+
+  // Try to get NameLoc (e.g., loc("myName"))
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return nameLoc.getName().str();
+  }
+  // Try FusedLoc which may contain a NameLoc or FileLineColLoc
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
+        return nameLoc.getName().str();
+      }
+    }
+    // If no NameLoc found, try to get FileLineColLoc
+    for (Location subLoc : fusedLoc.getLocations()) {
+      if (auto fileLoc = dyn_cast<FileLineColLoc>(subLoc)) {
+        std::string filename = fileLoc.getFilename().str();
+        // Extract just the filename without path
+        size_t lastSlash = filename.rfind('/');
+        if (lastSlash != std::string::npos) {
+          filename = filename.substr(lastSlash + 1);
+        }
+        return filename + ":" + std::to_string(fileLoc.getLine());
+      }
+    }
+  }
+  // Try FileLineColLoc directly (e.g., "file.py":42:0)
+  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+    std::string filename = fileLoc.getFilename().str();
+    // Extract just the filename without path
+    size_t lastSlash = filename.rfind('/');
+    if (lastSlash != std::string::npos) {
+      filename = filename.substr(lastSlash + 1);
+    }
+    return filename + ":" + std::to_string(fileLoc.getLine());
+  }
+  // Try CallSiteLoc - extract location from callee
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    // Get the callee location (where the function is defined)
+    Location calleeLoc = callSiteLoc.getCallee();
+    if (auto fileLoc = dyn_cast<FileLineColLoc>(calleeLoc)) {
+      std::string filename = fileLoc.getFilename().str();
+      size_t lastSlash = filename.rfind('/');
+      if (lastSlash != std::string::npos) {
+        filename = filename.substr(lastSlash + 1);
+      }
+      return filename + ":" + std::to_string(fileLoc.getLine());
+    }
+    if (auto nameLoc = dyn_cast<NameLoc>(calleeLoc)) {
+      return nameLoc.getName().str();
+    }
+    // Try FusedLoc within callee
+    if (auto fusedLoc = dyn_cast<FusedLoc>(calleeLoc)) {
+      for (Location subLoc : fusedLoc.getLocations()) {
+        if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
+          return nameLoc.getName().str();
+        }
+      }
+      for (Location subLoc : fusedLoc.getLocations()) {
+        if (auto fileLoc = dyn_cast<FileLineColLoc>(subLoc)) {
+          std::string filename = fileLoc.getFilename().str();
+          size_t lastSlash = filename.rfind('/');
+          if (lastSlash != std::string::npos) {
+            filename = filename.substr(lastSlash + 1);
+          }
+          return filename + ":" + std::to_string(fileLoc.getLine());
+        }
+      }
+    }
+  }
+  return "";
+}
+
+/// Get a unique node ID for an operation.
+static std::string getNodeId(Operation *op) {
+  if (!op)
+    return "null";
+  std::stringstream ss;
+  // Use operation_id if available for more readable graph
+  int opId = getOperationId(op);
+  if (opId >= 0) {
+    ss << "op_" << opId;
+  } else {
+    // Use a hash of the pointer for consistent IDs
+    ss << "op_" << (reinterpret_cast<uintptr_t>(op) % 100000);
+  }
+  return ss.str();
+}
+
+/// Generate a DOT graph showing channels between partitions.
+/// Nodes are operations grouped by their async_task_id (partition).
+/// Edges represent channels connecting producer and consumer operations.
+/// Output can be rendered with Graphviz: dot -Tpng graph.dot -o graph.png
+void dumpChannelGraph(SmallVector<std::unique_ptr<Channel>> &channels,
+                      triton::FuncOp funcOp, llvm::raw_ostream &os) {
+  os << "\n=== Channel Graph (DOT format) ===\n";
+  os << "// Render with: dot -Tpng <file>.dot -o graph.png\n";
+  os << "digraph ChannelGraph {\n";
+  os << "  rankdir=LR;\n";
+  os << "  node [shape=box, fontsize=10];\n";
+  os << "  edge [fontsize=8];\n\n";
+
+  // Collect all operations involved in channels, grouped by partition
+  DenseMap<int, SmallVector<Operation *>> partitionOps;
+  DenseSet<Operation *> allOps;
+
+  for (auto &ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+    int producerId = ch->relation.first;
+
+    if (srcOp && !allOps.contains(srcOp)) {
+      partitionOps[producerId].push_back(srcOp);
+      allOps.insert(srcOp);
+    }
+
+    for (int consumerId : ch->relation.second) {
+      if (dstOp && !allOps.contains(dstOp)) {
+        partitionOps[consumerId].push_back(dstOp);
+        allOps.insert(dstOp);
+      }
+    }
+  }
+
+  // Sort partition IDs for consistent output
+  SmallVector<int> sortedPartitions;
+  for (auto &kv : partitionOps) {
+    sortedPartitions.push_back(kv.first);
+  }
+  llvm::sort(sortedPartitions);
+
+  // Create subgraphs for each partition (column in visualization)
+  for (int partId : sortedPartitions) {
+    os << "  subgraph cluster_partition_" << partId << " {\n";
+    os << "    label=\"Partition " << partId << "\";\n";
+    os << "    style=dashed;\n";
+    os << "    color=blue;\n";
+
+    for (Operation *op : partitionOps[partId]) {
+      std::string nodeId = getNodeId(op);
+      std::string opName = getOpShortName(op);
+
+      // Build label with operation_id and buffer.id prominently displayed
+      std::string label;
+      int opId = getOperationId(op);
+      int bufId = getBufferId(op);
+      if (opId >= 0) {
+        label = "[op" + std::to_string(opId) + "] " + opName;
+      } else if (bufId >= 0) {
+        label = "[buf" + std::to_string(bufId) + "] " + opName;
+      } else {
+        label = opName;
+      }
+
+      // Color based on channel type
+      std::string color = "black";
+      for (auto &ch : channels) {
+        if (ch->getSrcOp() == op || ch->getDstOp() == op) {
+          if (ch->channelKind == DataChannelKind::TMEMPost) {
+            color = "red";
+            break;
+          } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+            color = "darkgreen";
+          }
+        }
+      }
+
+      os << "    " << nodeId << " [label=\"" << label << "\", color=" << color
+         << "];\n";
+    }
+    os << "  }\n\n";
+  }
+
+  // Create edges for channels
+  os << "  // Channel edges\n";
+  for (auto &ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+
+    if (!srcOp || !dstOp)
+      continue;
+
+    std::string srcId = getNodeId(srcOp);
+    std::string dstId = getNodeId(dstOp);
+
+    // Edge style based on channel type
+    std::string style = "solid";
+    std::string color = "black";
+    std::string edgeLabel = "ch" + std::to_string(ch->uniqID);
+
+    // Add named location if available (try srcOp, then allocOp)
+    std::string locName = getNamedLoc(srcOp);
+    if (locName.empty()) {
+      locName = getNamedLoc(ch->getAllocOp());
+    }
+    if (!locName.empty()) {
+      // Escape quotes for DOT format (\" becomes \\" in DOT)
+      edgeLabel += "\\n\\\"" + locName + "\\\"";
+    }
+
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      color = "red";
+      edgeLabel += " (TMEM)";
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch.get());
+      if (tmemCh->isOperandD) {
+        style = "bold";
+        edgeLabel += "\\n[OperandD]";
+      }
+    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+      color = "darkgreen";
+      edgeLabel += " (SMEM)";
+    }
+
+    os << "  " << srcId << " -> " << dstId << " [label=\"" << edgeLabel
+       << "\", color=" << color << ", style=" << style << "];\n";
+  }
+
+  os << "}\n";
+  os << "=== End Channel Graph ===\n\n";
+}
+
 /// Handle TMEM used as operand D (accumulator) of an MMA operation.
 ///
 /// This function creates producer-consumer channels for a TMEM allocation that
@@ -940,6 +1272,10 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
       }
     }
   }
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[handleOperandD] Completed channel creation\n";
+    dumpChannelsForOperandD(tmemAllocOp, channels, llvm::dbgs());
+  });
   return success();
 }
 
@@ -1060,6 +1396,11 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
     } else if (dyn_cast<ttg::LocalAllocOp>(op)) {
       createChannelPost(op, dom, channels);
     }
+  });
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[collectPostChannels] Completed channel collection\n";
+    dumpAllChannels(channels, llvm::dbgs());
+    dumpChannelGraph(channels, funcOp, llvm::dbgs());
   });
 }
 
