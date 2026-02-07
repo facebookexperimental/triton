@@ -23,6 +23,8 @@ def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp">
       Option<"numCTAs", "num-ctas",
              "int32_t", /*default*/"1",
              "number of ctas in a cga">,
+      ListOption<"clusterDims", "cluster-dims", "int32_t",
+             "cluster dimensions (X, Y, Z)">,
    ];
 }
 

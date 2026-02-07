@@ -253,7 +253,9 @@ class CUDABackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # Pass cluster_dims as a list
+        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas,
+                                            list(opt.cluster_dims))
         passes.common.add_inliner(pm)
         # Handle storage lowering. In the future this may need
         # dummy layouts
