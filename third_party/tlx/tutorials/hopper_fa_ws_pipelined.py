@@ -1,11 +1,9 @@
-import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton._internal_testing import is_hopper
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -30,24 +28,24 @@ def _host_descriptor_pre_hook(nargs):
 
 configs = [
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 4, 'NUM_MMA_GROUPS': 1},
-                  num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+                  num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 8, 'NUM_MMA_GROUPS': 2},
-                  num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+                  num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
 ]
 
 
 @triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT"])
 @triton.jit
-def _attn_fwd_ws(sm_scale, M,  #
-                 Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-                 HEAD_DIM: tl.constexpr,  #
-                 BLOCK_M: tl.constexpr,  #
-                 BLOCK_N: tl.constexpr,  #
-                 FP8_OUTPUT: tl.constexpr,  #
-                 NUM_BUFFERS: tl.constexpr,  #
-                 NUM_MMA_WARPS: tl.constexpr,  #
-                 NUM_MMA_GROUPS: tl.constexpr,  #
-                 ):
+def _attn_fwd_ws_pipelined(sm_scale, M,  #
+                           Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+                           HEAD_DIM: tl.constexpr,  #
+                           BLOCK_M: tl.constexpr,  #
+                           BLOCK_N: tl.constexpr,  #
+                           FP8_OUTPUT: tl.constexpr,  #
+                           NUM_BUFFERS: tl.constexpr,  #
+                           NUM_MMA_WARPS: tl.constexpr,  #
+                           NUM_MMA_GROUPS: tl.constexpr,  #
+                           ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
@@ -131,56 +129,105 @@ def _attn_fwd_ws(sm_scale, M,  #
             q_tile = tlx.local_view(q_tiles, cid)
 
             lo, hi = 0, N_CTX
-            kv_phase = 1
-            acc_cnt = 0
+            k_phase = 0
+            v_phase = 1
+            k_buf_id = 0
+            v_buf_id = 0
+
+            # wait for the K[0] buffer to be populated by the producer
+            k_full = tlx.local_view(k_fulls, k_buf_id)
+            tlx.barrier_wait(k_full, k_phase)
+            k_tile = tlx.local_view(k_tiles, k_buf_id)
+
+            # -- compute qk[0] ----
+            k_tile = tlx.local_trans(k_tile)
+            qk = tlx.async_dot(q_tile, k_tile)
+            # wait for the MMA using to complete
+            qk = tlx.async_dot_wait(0, qk)
+            # release the K buffer
+            k_empty = tlx.local_view(k_empties, k_buf_id)
+            tlx.barrier_arrive(k_empty, 1)
+
+            # -- compute m_i and l_i ----
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+            p = tl.math.exp2(qk)
+            # -- compute correction factor
+            alpha = tl.math.exp2(m_i - m_ij)
+            # -- update output accumulator[0] --
+            acc = acc * alpha[:, None]
+            l_ij = tl.sum(p, 1)
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+            acc_cnt = 1
 
             # loop over k, v and update accumulator
-            for _ in tl.range(lo, hi, BLOCK_N):
-                buf_id = acc_cnt % NUM_BUFFERS
+            for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
+                k_buf_id = acc_cnt % NUM_BUFFERS
                 # buffers in a row share the same phase
-                kv_phase = kv_phase ^ (buf_id == 0)
+                k_phase = k_phase ^ (k_buf_id == 0)
 
                 # wait for the K buffer to be populated by the producer
-                k_full = tlx.local_view(k_fulls, buf_id)
-                tlx.barrier_wait(k_full, kv_phase)
-                k_tile = tlx.local_view(k_tiles, buf_id)
+                k_full = tlx.local_view(k_fulls, k_buf_id)
+                tlx.barrier_wait(k_full, k_phase)
+                k_tile = tlx.local_view(k_tiles, k_buf_id)
 
-                # -- compute qk ----
+                # compute qk for the current iteration
                 k_tile = tlx.local_trans(k_tile)
                 qk = tlx.async_dot(q_tile, k_tile)
-                # wait for the MMA using to complete
-                qk = tlx.async_dot_wait(0, qk)
+
+                # compute pv from the previous iteration
+                # wait for the previous V buffer to be populated by the producer
+                v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
+                v_phase = v_phase ^ (v_buf_id == 0)
+                v_full = tlx.local_view(v_fulls, v_buf_id)
+                tlx.barrier_wait(v_full, v_phase)
+                v_tile = tlx.local_view(v_tiles, v_buf_id)
+                # prepare p and v for the dot
+                p = p.to(tlx.dtype_of(desc_k))
+                acc = tlx.async_dot(p, v_tile, acc)
+
+                # wait for the current qk MMA to complete
+                qk = tlx.async_dot_wait(1, qk)
                 # release the K buffer
-                k_empty = tlx.local_view(k_empties, buf_id)
+                k_empty = tlx.local_view(k_empties, k_buf_id)
                 tlx.barrier_arrive(k_empty, 1)
 
+                # -- compute m_i and l_i ----
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
                 qk = qk * qk_scale - m_ij[:, None]
                 p = tl.math.exp2(qk)
                 # -- compute correction factor
                 alpha = tl.math.exp2(m_i - m_ij)
                 l_ij = tl.sum(p, 1)
-                # -- update output accumulator --
-                acc = acc * alpha[:, None]
-                # prepare p and v for the dot
-                p = p.to(tlx.dtype_of(desc_k))
-
-                # wait for the V buffer to be populated by the producer
-                v_full = tlx.local_view(v_fulls, buf_id)
-                tlx.barrier_wait(v_full, kv_phase)
-                v_tile = tlx.local_view(v_tiles, buf_id)
-                acc = tlx.async_dot(p, v_tile, acc)
-                # wait for the MMA using to complete
-                acc = tlx.async_dot_wait(0, acc)
-                # release the V buffer
-                v_empty = tlx.local_view(v_empties, buf_id)
-                tlx.barrier_arrive(v_empty, 1)
-
                 # update m_i and l_i
-                # place this at the end of the loop to reduce register pressure
                 l_i = l_i * alpha + l_ij
                 m_i = m_ij
+
+                # -- update output accumulator --
+                # wait for the previous pv MMA to complete
+                acc = tlx.async_dot_wait(0, acc)
+                # release the V buffer
+                v_empty = tlx.local_view(v_empties, v_buf_id)
+                tlx.barrier_arrive(v_empty, 1)
+                acc = acc * alpha[:, None]
                 acc_cnt += 1
+
+            # compute pv from the last iteration
+            # wait for the V buffer to be populated by the producer
+            v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
+            v_phase = v_phase ^ (v_buf_id == 0)
+            v_full = tlx.local_view(v_fulls, v_buf_id)
+            tlx.barrier_wait(v_full, v_phase)
+            v_tile = tlx.local_view(v_tiles, v_buf_id)
+            # prepare p and v for the dot
+            p = p.to(tlx.dtype_of(desc_k))
+            acc = tlx.async_dot(p, v_tile, acc)
+            # wait for the MMA using to complete
+            acc = tlx.async_dot_wait(0, acc)
+            # release the V buffer
+            v_empty = tlx.local_view(v_empties, v_buf_id)
+            tlx.barrier_arrive(v_empty, 1)
 
             # epilogue
             start_m = tl.program_id(0)
@@ -233,7 +280,7 @@ class _attention(torch.autograd.Function):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
-        _attn_fwd_ws[grid](
+        _attn_fwd_ws_pipelined[grid](
             sm_scale, M,  #
             q.shape[0], q.shape[1],  #
             desc_q, desc_k, desc_v, desc_o,  #
@@ -248,128 +295,50 @@ class _attention(torch.autograd.Function):
         return o
 
 
-attention = _attention.apply
+def attention(q, k, v, sm_scale, config=None):
+    if config is None:
+        return _attention.apply(q, k, v, sm_scale)
 
+    # Non-autotuned path with explicit config
+    HEAD_DIM_K = q.shape[-1]
+    o = torch.empty_like(q)
+    M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+    y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
-@pytest.mark.skipif(
-    not is_hopper(),
-    reason="Requires Hopper GPU",
-)
-@pytest.mark.parametrize("Z", [8])
-@pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024])
-@pytest.mark.parametrize("HEAD_DIM", [128])
-@pytest.mark.parametrize("mode", ["fwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"])
-def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, dtype=torch.float16):
-    if mode == "bwd":
-        pytest.skip("Backward pass not supported.")
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    sm_scale = 0.5
-    # reference implementation
-    ref_dtype = dtype
-    if mode == "fwd" and "fp8" in provider:
-        ref_dtype = torch.float32
-    q = q.to(ref_dtype)
-    k = k.to(ref_dtype)
-    v = v.to(ref_dtype)
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    p = torch.softmax(p.float(), dim=-1)
-    p = p.to(ref_dtype)
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v).half()
-    # triton implementation
-    if mode == "fwd" and "fp8" in provider:
-        q = q.to(torch.float8_e5m2)
-        k = k.to(torch.float8_e5m2)
-        v = v.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2)
-        v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, sm_scale).half()
-    if mode == "fwd":
-        atol = 3 if "fp8" in provider else 1e-2
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
-        return
-    # tri_dv, v.grad = v.grad.clone(), None
-    # tri_dk, k.grad = k.grad.clone(), None
-    # tri_dq, q.grad = q.grad.clone(), None
-    # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
-
-
-try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
-    HAS_FLASH = True
-except BaseException:
-    HAS_FLASH = False
-
-TORCH_HAS_FP8 = False
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
-# vary seq length for fixed head and batch=4
-configs = []
-configs.append(
-    triton.testing.Benchmark(
-        x_names=["N_CTX"],
-        x_vals=[2**i for i in range(10, 15)],
-        line_arg="provider",
-        line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-        line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
-        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-        ylabel="TFLOPS",
-        plot_name=f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
-        args={
-            "H": N_HEADS,
-            "BATCH": BATCH,
-            "HEAD_DIM": HEAD_DIM,
-            "mode": "fwd",
-        },
-    ))
-
-
-@triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
-    assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
-    if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        if mode == "fwd" and "fp8" in provider:
-            q = q.to(torch.float8_e5m2)
-            k = k.to(torch.float8_e5m2)
-            v = v.permute(0, 1, 3, 2).contiguous()
-            v = v.permute(0, 1, 3, 2)
-            v = v.to(torch.float8_e5m2)
-        sm_scale = 1.3
-        fn = lambda: attention(q, k, v, sm_scale)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-
-    if provider == "flash":
-        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        fn = lambda: flash_attn_func(qkv)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-    total_flops = 2 * flops_per_matmul
-    if mode == "bwd":
-        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
-    return total_flops * 1e-12 / (ms * 1e-3)
-
-
-if __name__ == "__main__":
-    if is_hopper():
-        print("Running benchmarks...")
-        bench_flash_attention.run(print_data=True)
+    dummy_block = [1, 1]
+    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    if q.dtype == torch.float8_e5m2:
+        desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1], block_shape=dummy_block)
     else:
-        print("Skipping benchmarks, no Hopper GPU found.")
+        desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+
+    # Apply pre_hook to set block shapes
+    nargs = {
+        **config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o,
+        "FP8_OUTPUT": q.dtype == torch.float8_e5m2
+    }
+    _host_descriptor_pre_hook(nargs)
+
+    def alloc_fn(size: int, align: int, _):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+
+    grid = (triton.cdiv(q.shape[2], config["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+    _attn_fwd_ws_pipelined.fn[grid](
+        sm_scale,
+        M,
+        q.shape[0],
+        q.shape[1],
+        desc_q,
+        desc_k,
+        desc_v,
+        desc_o,
+        N_CTX=q.shape[2],
+        HEAD_DIM=HEAD_DIM_K,
+        FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+        **config,
+    )
+    return o

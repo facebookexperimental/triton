@@ -1,10 +1,8 @@
 import torch
-import pytest
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_cuda, is_hip_cdna2
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -119,7 +117,8 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -127,90 +126,39 @@ def matmul(a, b):
     K, N = b.shape
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel_pipelined_hopper[grid](
-        a, b, c,  #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
-    )
-    return c
 
-
-@pytest.mark.skipif(
-    not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
-    reason="Requires Hopper GPU",
-)
-def test_op():
-    torch.manual_seed(0)
-    a = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((8192, 8192), device=DEVICE, dtype=torch.float16)
-    triton_output = matmul(a, b)
-    torch_output = torch.matmul(a, b)
-    print(f"triton_output_with_fp16_inputs={triton_output}")
-    print(f"torch_output_with_fp16_inputs={torch_output}")
-    rtol = 1e-2 if is_hip_cdna2() else 1e-4
-    # TODO. rtol 1e-5 failed while 1e-4 passed on Hopper
-    torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol)
-
-
-TORCH_HAS_FP8 = False
-
-# %%
-# Benchmark
-# ---------
-#
-# Square Matrix Performance
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~
-#
-# We can now compare the performance of our kernel against that of cuBLAS or rocBLAS. Here we focus on square matrices,
-# but feel free to arrange this script as you wish to benchmark any other matrix shape.
-
-ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
-
-configs = []
-for fp8_inputs in [False, True]:
-    if fp8_inputs and (not TORCH_HAS_FP8 or not is_cuda()):
-        continue
-    configs.append(
-        triton.testing.Benchmark(
-            x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-            x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
-            line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
-            # Possible values for `line_arg`
-            # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-            line_vals=["triton"] if fp8_inputs else [ref_lib.lower(), "triton"],  # Label name for the lines
-            line_names=["Triton"] if fp8_inputs else [ref_lib, "Triton"],  # Line styles
-            styles=[("green", "-"), ("blue", "-")],
-            ylabel="TFLOPS",  # Label name for the y-axis
-            plot_name="matmul-performance-" +
-            ("fp16" if not fp8_inputs else "fp8"),  # Name for the plot, used also as a file name for saving the plot.
-            args={"fp8_inputs": fp8_inputs},
-        ))
-
-
-@triton.testing.perf_report(configs)
-def benchmark(M, N, K, provider, fp8_inputs):
-    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-    if TORCH_HAS_FP8 and fp8_inputs:
-        a = a.to(torch.float8_e5m2)
-        b = b.T
-        b = b.to(torch.float8_e5m2)
-    quantiles = [0.5, 0.2, 0.8]
-    if provider == ref_lib.lower():
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
-    perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-    return perf(ms), perf(max_ms), perf(min_ms)
-
-
-if __name__ == "__main__":
-    if is_cuda() and torch.cuda.get_device_capability()[0] == 9:
-        print("Running benchmarks...")
-        benchmark.run(print_data=True)
+    if config is not None:
+        grid = (triton.cdiv(M, config['BLOCK_SIZE_M']) * triton.cdiv(N, config['BLOCK_SIZE_N']), )
+        matmul_kernel_pipelined_hopper.fn[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            **config,
+        )
     else:
-        print("Skipping benchmarks, no Hopper GPU found.")
+        # 1D launch kernel where each block gets its own program.
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+        matmul_kernel_pipelined_hopper[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+        )
+    return c
