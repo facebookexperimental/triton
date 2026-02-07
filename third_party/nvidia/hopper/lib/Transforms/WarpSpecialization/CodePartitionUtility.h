@@ -262,6 +262,19 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
 void dumpChannelGraph(SmallVector<std::unique_ptr<Channel>> &channels,
                       triton::FuncOp funcOp, llvm::raw_ostream &os);
 
+/// Generate a combined DOT graph showing key ops and channels side by side.
+/// Left subgraph: Key operations with control flow structure.
+/// Right subgraph: Channel connections between partitions.
+/// Output can be rendered with Graphviz: dot -Tpng graph.dot -o graph.png
+void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
+                       triton::FuncOp funcOp, llvm::raw_ostream &os);
+
+/// Dump key operations with control flow nesting.
+/// Key ops: GEMM (tc_gen5_mma), load/store operations, tensor computations.
+/// Output shows shapes without layout details for readability.
+/// Usage: Run with -debug flag, output can be captured from stderr.
+void dumpKeyOps(triton::FuncOp funcOp, llvm::raw_ostream &os);
+
 Operation *getSameLevelOp(Operation *p, Operation *c);
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,

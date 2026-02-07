@@ -907,10 +907,278 @@ static std::string getNodeId(Operation *op) {
   return ss.str();
 }
 
+/// Check if an operation is a key operation (GEMM, load/store, or tensor
+/// computation).
+static bool isKeyOp(Operation *op) {
+  // GEMM operations
+  if (isa<ttng::TCGen5MMAOp>(op))
+    return true;
+
+  // Load operations
+  if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp, ttg::LocalLoadOp>(
+          op))
+    return true;
+
+  // Store operations
+  if (isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
+          ttg::LocalStoreOp, tt::DescriptorReduceOp>(op))
+    return true;
+
+  // Tensor computation operations (arithmetic and math on tensors)
+  if (op->getNumResults() > 0) {
+    if (auto resultType = op->getResult(0).getType()) {
+      if (isa<RankedTensorType>(resultType)) {
+        if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+                arith::MaxNumFOp, arith::MinNumFOp, arith::TruncFOp,
+                math::ExpOp, math::Exp2Op, math::LogOp, math::Log2Op,
+                math::SqrtOp, math::RsqrtOp, math::TanhOp>(op))
+          return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/// Get NamedLoc from a Value's defining operation, if available.
+static std::string getValueName(Value val) {
+  if (!val)
+    return "";
+  if (auto *defOp = val.getDefiningOp()) {
+    std::string locName = getNamedLoc(defOp);
+    if (!locName.empty())
+      return locName;
+  }
+  // For block arguments, try to get a meaningful name
+  if (auto blockArg = dyn_cast<BlockArgument>(val)) {
+    return "arg" + std::to_string(blockArg.getArgNumber());
+  }
+  return "";
+}
+
+/// Get a simple shape string from a type (e.g., "128x128xf32").
+static std::string getShapeStr(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    std::string result;
+    llvm::raw_string_ostream ss(result);
+    for (int64_t dim : tensorType.getShape()) {
+      ss << dim << "x";
+    }
+    ss << tensorType.getElementType();
+    return result;
+  }
+  if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
+    std::string result;
+    llvm::raw_string_ostream ss(result);
+    for (int64_t dim : memDescType.getShape()) {
+      ss << dim << "x";
+    }
+    ss << memDescType.getElementType();
+    return result;
+  }
+  // Fallback: just print the type without layout details
+  std::string result;
+  llvm::raw_string_ostream ss(result);
+  ss << type;
+  return result;
+}
+
+/// Get a simplified operation description focusing on shapes and variable
+/// names.
+static std::string getKeyOpDescription(Operation *op) {
+  std::string result;
+  llvm::raw_string_ostream ss(result);
+
+  std::string opName = getOpShortName(op);
+
+  // Helper lambda to format input variable with name if available
+  auto formatInput = [](Value val) -> std::string {
+    std::string name = getValueName(val);
+    if (!name.empty())
+      return name;
+    return getShapeStr(val.getType());
+  };
+
+  // Helper lambda to format output variable with shape
+  auto formatOutput = [](Value val) -> std::string {
+    return getShapeStr(val.getType());
+  };
+
+  // For GEMM, show operand names/shapes: A @ B -> D
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+    ss << opName << " " << formatInput(mmaOp.getA()) << " @ "
+       << formatInput(mmaOp.getB()) << " -> " << formatInput(mmaOp.getD());
+    return result;
+  }
+
+  // For loads, show source and result
+  if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getPtr()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getSrc()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<ttg::LocalLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getSrc()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+
+  // For stores, show source and destination
+  if (auto storeOp = dyn_cast<tt::DescriptorStoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDesc());
+    return result;
+  }
+  if (auto storeOp = dyn_cast<tt::StoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getValue()) << " -> "
+       << formatInput(storeOp.getPtr());
+    return result;
+  }
+  if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDst());
+    return result;
+  }
+  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDst());
+    return result;
+  }
+  if (auto reduceOp = dyn_cast<tt::DescriptorReduceOp>(op)) {
+    ss << opName << " " << formatInput(reduceOp.getSrc()) << " -> "
+       << formatInput(reduceOp.getDesc());
+    return result;
+  }
+
+  // For arithmetic/math ops, show inputs and output
+  if (op->getNumResults() > 0) {
+    ss << opName << " ";
+    bool first = true;
+    for (Value operand : op->getOperands()) {
+      if (!first)
+        ss << ", ";
+      ss << formatInput(operand);
+      first = false;
+    }
+    ss << " -> " << formatOutput(op->getResult(0));
+    return result;
+  }
+
+  ss << opName;
+  return result;
+}
+
+/// Dump key operations with control flow nesting.
+/// Key ops: GEMM, load/store, tensor computations.
+/// Output shows shapes without layout details.
+void dumpKeyOps(triton::FuncOp funcOp, llvm::raw_ostream &os) {
+  os << "\n=== Key Operations with Control Flow ===\n";
+  os << "// GEMM: tc_gen5_mma\n";
+  os << "// Load: descriptor_load, load, tmem_load, local_load\n";
+  os << "// Store: descriptor_store, store, tmem_store, local_store, "
+        "descriptor_reduce\n";
+  os << "// Compute: arith.{addf,subf,mulf,divf,truncf}, "
+        "math.{exp,exp2,log,sqrt,...}\n\n";
+
+  std::function<void(Operation *, int)> walkOp = [&](Operation *op,
+                                                     int indent) {
+    std::string indentStr(indent * 2, ' ');
+
+    // Handle control flow operations
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      os << indentStr << "scf.for {\n";
+      for (Operation &innerOp : forOp.getBody()->getOperations()) {
+        walkOp(&innerOp, indent + 1);
+      }
+      os << indentStr << "}\n";
+      return;
+    }
+
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      os << indentStr << "scf.if {\n";
+      for (Operation &innerOp : ifOp.getThenRegion().front().getOperations()) {
+        walkOp(&innerOp, indent + 1);
+      }
+      if (!ifOp.getElseRegion().empty()) {
+        os << indentStr << "} else {\n";
+        for (Operation &innerOp :
+             ifOp.getElseRegion().front().getOperations()) {
+          walkOp(&innerOp, indent + 1);
+        }
+      }
+      os << indentStr << "}\n";
+      return;
+    }
+
+    if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+      os << indentStr << "scf.while {\n";
+      for (Operation &innerOp : whileOp.getBefore().front().getOperations()) {
+        walkOp(&innerOp, indent + 1);
+      }
+      os << indentStr << "} do {\n";
+      for (Operation &innerOp : whileOp.getAfter().front().getOperations()) {
+        walkOp(&innerOp, indent + 1);
+      }
+      os << indentStr << "}\n";
+      return;
+    }
+
+    // Check if this is a key operation
+    if (isKeyOp(op)) {
+      // Add operation ID if present
+      int opId = getOperationId(op);
+      if (opId >= 0) {
+        os << indentStr << "[op" << opId << "] ";
+      } else {
+        os << indentStr;
+      }
+
+      os << getKeyOpDescription(op);
+
+      // Add async_task_id if present
+      if (auto taskIdAttr = op->getAttrOfType<ArrayAttr>("async_task_id")) {
+        os << "  [task:";
+        bool first = true;
+        for (auto attr : taskIdAttr) {
+          if (!first)
+            os << ",";
+          os << cast<IntegerAttr>(attr).getInt();
+          first = false;
+        }
+        os << "]";
+      }
+
+      // Add named location of this op if available (for the output)
+      std::string locName = getNamedLoc(op);
+      if (!locName.empty()) {
+        os << "  // " << locName;
+      }
+
+      os << "\n";
+    }
+  };
+
+  // Walk through the function body
+  for (Operation &op : funcOp.getBody().front().getOperations()) {
+    walkOp(&op, 0);
+  }
+
+  os << "=== End Key Operations ===\n\n";
+}
+
 /// Generate a DOT graph showing channels between partitions.
 /// Nodes are operations grouped by their async_task_id (partition).
 /// Edges represent channels connecting producer and consumer operations.
-/// Output can be rendered with Graphviz: dot -Tpng graph.dot -o graph.png
 void dumpChannelGraph(SmallVector<std::unique_ptr<Channel>> &channels,
                       triton::FuncOp funcOp, llvm::raw_ostream &os) {
   os << "\n=== Channel Graph (DOT format) ===\n";
@@ -1037,6 +1305,273 @@ void dumpChannelGraph(SmallVector<std::unique_ptr<Channel>> &channels,
 
   os << "}\n";
   os << "=== End Channel Graph ===\n\n";
+}
+
+/// Generate a DOT subgraph for key operations with control flow structure.
+/// This creates a vertical flow showing the execution order of key ops.
+static void dumpKeyOpsSubgraph(triton::FuncOp funcOp, llvm::raw_ostream &os,
+                               const std::string &subgraphName) {
+  os << "  subgraph cluster_" << subgraphName << " {\n";
+  os << "    label=\"Key Operations\";\n";
+  os << "    style=filled;\n";
+  os << "    fillcolor=lightyellow;\n";
+  os << "    node [shape=box, fontsize=9, style=filled];\n\n";
+
+  // Track nodes and their hierarchy for edge creation
+  SmallVector<std::string> nodeSequence;
+  SmallVector<std::pair<std::string, int>> controlFlowStack; // (nodeId, depth)
+
+  int nodeCounter = 0;
+  std::function<void(Operation *, int, const std::string &)> walkOp =
+      [&](Operation *op, int depth, const std::string &parentId) {
+        std::string indentStr(depth * 2, ' ');
+
+        // Handle control flow operations
+        if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+          std::string forNodeId =
+              subgraphName + "_for_" + std::to_string(nodeCounter++);
+          os << "    " << forNodeId
+             << " [label=\"scf.for\", fillcolor=lightblue, shape=ellipse];\n";
+
+          if (!nodeSequence.empty()) {
+            os << "    " << nodeSequence.back() << " -> " << forNodeId
+               << " [style=dashed, color=gray];\n";
+          }
+          nodeSequence.push_back(forNodeId);
+
+          for (Operation &innerOp : forOp.getBody()->getOperations()) {
+            walkOp(&innerOp, depth + 1, forNodeId);
+          }
+          return;
+        }
+
+        if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+          std::string ifNodeId =
+              subgraphName + "_if_" + std::to_string(nodeCounter++);
+          os << "    " << ifNodeId
+             << " [label=\"scf.if\", fillcolor=lightpink, shape=diamond];\n";
+
+          if (!nodeSequence.empty()) {
+            os << "    " << nodeSequence.back() << " -> " << ifNodeId
+               << " [style=dashed, color=gray];\n";
+          }
+          nodeSequence.push_back(ifNodeId);
+
+          for (Operation &innerOp :
+               ifOp.getThenRegion().front().getOperations()) {
+            walkOp(&innerOp, depth + 1, ifNodeId);
+          }
+          if (!ifOp.getElseRegion().empty()) {
+            for (Operation &innerOp :
+                 ifOp.getElseRegion().front().getOperations()) {
+              walkOp(&innerOp, depth + 1, ifNodeId);
+            }
+          }
+          return;
+        }
+
+        // Check if this is a key operation
+        if (isKeyOp(op)) {
+          std::string nodeId = subgraphName + "_" + getNodeId(op);
+
+          // Build label
+          std::string label;
+          int opId = getOperationId(op);
+          if (opId >= 0) {
+            label = "[" + std::to_string(opId) + "] ";
+          }
+          label += getOpShortName(op);
+
+          // Add task IDs
+          if (auto taskIdAttr = op->getAttrOfType<ArrayAttr>("async_task_id")) {
+            label += " [";
+            bool first = true;
+            for (auto attr : taskIdAttr) {
+              if (!first)
+                label += ",";
+              label += std::to_string(cast<IntegerAttr>(attr).getInt());
+              first = false;
+            }
+            label += "]";
+          }
+
+          // Add named location
+          std::string locName = getNamedLoc(op);
+          if (!locName.empty()) {
+            label += "\\n" + locName;
+          }
+
+          // Color based on operation type
+          std::string fillcolor = "white";
+          if (isa<ttng::TCGen5MMAOp>(op)) {
+            fillcolor = "lightsalmon";
+          } else if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+                         ttg::LocalLoadOp>(op)) {
+            fillcolor = "lightgreen";
+          } else if (isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
+                         ttg::LocalStoreOp, tt::DescriptorReduceOp>(op)) {
+            fillcolor = "lightcoral";
+          }
+
+          os << "    " << nodeId << " [label=\"" << label
+             << "\", fillcolor=" << fillcolor << "];\n";
+
+          // Connect to previous node in sequence
+          if (!nodeSequence.empty()) {
+            os << "    " << nodeSequence.back() << " -> " << nodeId
+               << " [style=dashed, color=gray];\n";
+          }
+          nodeSequence.push_back(nodeId);
+        }
+      };
+
+  // Walk through the function body
+  for (Operation &op : funcOp.getBody().front().getOperations()) {
+    walkOp(&op, 0, "");
+  }
+
+  os << "  }\n\n";
+}
+
+/// Generate a combined DOT graph showing key ops and channels side by side.
+/// Left side: Key operations with control flow
+/// Right side: Channel connections between partitions
+void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
+                       triton::FuncOp funcOp, llvm::raw_ostream &os) {
+  os << "\n=== Combined Key Ops + Channel Graph (DOT format) ===\n";
+  os << "// Render with: dot -Tpng <file>.dot -o graph.png\n";
+  os << "digraph CombinedGraph {\n";
+  os << "  rankdir=TB;\n";
+  os << "  compound=true;\n";
+  os << "  node [fontsize=9];\n";
+  os << "  edge [fontsize=7];\n\n";
+
+  // Left side: Key operations subgraph
+  dumpKeyOpsSubgraph(funcOp, os, "keyops");
+
+  // Right side: Channel graph as subgraph
+  os << "  subgraph cluster_channels {\n";
+  os << "    label=\"Channel Connections\";\n";
+  os << "    style=filled;\n";
+  os << "    fillcolor=lavender;\n";
+  os << "    node [shape=box, fontsize=9];\n\n";
+
+  // Collect all operations involved in channels, grouped by partition
+  DenseMap<int, SmallVector<Operation *>> partitionOps;
+  DenseSet<Operation *> allOps;
+
+  for (auto &ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+    int producerId = ch->relation.first;
+
+    if (srcOp && !allOps.contains(srcOp)) {
+      partitionOps[producerId].push_back(srcOp);
+      allOps.insert(srcOp);
+    }
+
+    for (int consumerId : ch->relation.second) {
+      if (dstOp && !allOps.contains(dstOp)) {
+        partitionOps[consumerId].push_back(dstOp);
+        allOps.insert(dstOp);
+      }
+    }
+  }
+
+  // Sort partition IDs
+  SmallVector<int> sortedPartitions;
+  for (auto &kv : partitionOps) {
+    sortedPartitions.push_back(kv.first);
+  }
+  llvm::sort(sortedPartitions);
+
+  // Create nested subgraphs for each partition
+  for (int partId : sortedPartitions) {
+    os << "    subgraph cluster_ch_partition_" << partId << " {\n";
+    os << "      label=\"P" << partId << "\";\n";
+    os << "      style=dashed;\n";
+    os << "      color=blue;\n";
+
+    for (Operation *op : partitionOps[partId]) {
+      std::string nodeId = "ch_" + getNodeId(op);
+      std::string opName = getOpShortName(op);
+
+      std::string label;
+      int opId = getOperationId(op);
+      if (opId >= 0) {
+        label = "[" + std::to_string(opId) + "] " + opName;
+      } else {
+        label = opName;
+      }
+
+      // Color based on channel type
+      std::string color = "black";
+      for (auto &ch : channels) {
+        if (ch->getSrcOp() == op || ch->getDstOp() == op) {
+          if (ch->channelKind == DataChannelKind::TMEMPost) {
+            color = "red";
+            break;
+          } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+            color = "darkgreen";
+          }
+        }
+      }
+
+      os << "      " << nodeId << " [label=\"" << label << "\", color=" << color
+         << "];\n";
+    }
+    os << "    }\n";
+  }
+
+  // Channel edges
+  os << "\n    // Channel edges\n";
+  for (auto &ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+
+    if (!srcOp || !dstOp)
+      continue;
+
+    std::string srcId = "ch_" + getNodeId(srcOp);
+    std::string dstId = "ch_" + getNodeId(dstOp);
+
+    std::string style = "solid";
+    std::string color = "black";
+    std::string edgeLabel = "ch" + std::to_string(ch->uniqID);
+
+    std::string locName = getNamedLoc(srcOp);
+    if (locName.empty()) {
+      locName = getNamedLoc(ch->getAllocOp());
+    }
+    if (!locName.empty()) {
+      edgeLabel += "\\n\\\"" + locName + "\\\"";
+    }
+
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      color = "red";
+      edgeLabel += "\\n(TMEM)";
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch.get());
+      if (tmemCh->isOperandD) {
+        style = "bold";
+        edgeLabel += " [D]";
+      }
+    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+      color = "darkgreen";
+      edgeLabel += "\\n(SMEM)";
+    }
+
+    os << "    " << srcId << " -> " << dstId << " [label=\"" << edgeLabel
+       << "\", color=" << color << ", style=" << style << "];\n";
+  }
+
+  os << "  }\n\n";
+
+  // Add invisible edge to align the two subgraphs side by side
+  os << "  // Layout hint: place subgraphs side by side\n";
+  os << "  { rank=same; cluster_keyops; cluster_channels; }\n";
+
+  os << "}\n";
+  os << "=== End Combined Graph ===\n\n";
 }
 
 /// Handle TMEM used as operand D (accumulator) of an MMA operation.

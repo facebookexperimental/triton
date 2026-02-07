@@ -1511,11 +1511,23 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
       return failure();
   }
 
+  // Dump key operations with control flow nesting
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[doMemoryPlanner] Key operations:\n";
+    dumpKeyOps(funcOp, llvm::dbgs());
+  });
+
   // Dump channel graph after memory planning (when operation_ids are set)
   LLVM_DEBUG({
     llvm::dbgs()
         << "\n[doMemoryPlanner] Channel graph after memory planning:\n";
     dumpChannelGraph(channelsOrigin, funcOp, llvm::dbgs());
+  });
+
+  // Dump combined key ops + channel graph (side by side visualization)
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[doMemoryPlanner] Combined visualization:\n";
+    dumpCombinedGraph(channelsOrigin, funcOp, llvm::dbgs());
   });
 
   // If a write decision file is provided, serialize decisions to file.
