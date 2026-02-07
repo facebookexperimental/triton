@@ -475,9 +475,8 @@ def test_prune_all_configs(device):
         pytest.fail("Expected exception was not thrown.")
     except triton.TritonError as e:
         assert (
-            e is not None
-            and str(e)
-            == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+            e is not None and str(e) ==
+            "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
         )
 
 
@@ -576,8 +575,7 @@ def test_dump_best_config_ir(device, tmp_path):
         ttir_files = list(tmp_path.glob("dump/**/*.ttir"))
         ttgir_files = list(tmp_path.glob("dump/**/*.ttgir"))
         assert len(ttir_files) > 0 or len(ttgir_files) > 0, (
-            f"Expected IR files to be dumped in {dump_dir}, but found none"
-        )
+            f"Expected IR files to be dumped in {dump_dir}, but found none")
 
         # Verify that only ONE config's IR was dumped (not all configs)
         # Each config would have its own hash directory, so we check
