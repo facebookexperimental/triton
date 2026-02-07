@@ -766,15 +766,21 @@ python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py
 
 To run Blackwell GEMM tutorial kernels, you can use the following command:
 
-Correctness test:
-```
-[TLX_GEMM_VERSION={ws|clc|pipelined|2cta}] pytest third_party/tlx/tutorials/correctness_test.py
-```
+## Change 2: One correctness test script
 
-Performance test:
-```
-third_party/tlx/denoise.sh third_party/tlx/tutorials/blackwell_gemm_perf_test.py [--version {ws|clc|pipelined|2cta}]
-```
+`[TLX_VERSION=<kernel_name>] pytest third_party/tlx/tutorials/testing/test_correctness.py`
+
+By default only one autotune config will be used by correctness test.
+
+## Change 3: One performance test script for each op {gemm, matmul} x {hopper, blackwell}
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
 
 ## More reading materials
 
