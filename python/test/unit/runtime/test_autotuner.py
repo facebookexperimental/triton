@@ -477,3 +477,56 @@ def test_prune_all_configs(device):
         assert e is not None and str(
             e
         ) == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+
+
+def test_autotune_dump_dir_structure(device, monkeypatch, tmp_path):
+    """Test that IR dumps during autotuning use a common base directory with readable config subdirs."""
+
+    # Set up environment for IR dumping during autotuning
+    dump_dir = tmp_path / "triton_dump"
+    dump_dir.mkdir()
+    monkeypatch.setenv("TRITON_KERNEL_DUMP", "1")
+    monkeypatch.setenv("TRITON_PRINT_AUTOTUNING", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton_cache"))
+    monkeypatch.setenv("TRITON_DUMP_DIR", str(dump_dir))
+
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    configs = [
+        triton.Config(kwargs={'BLOCK_SIZE': 32}, num_warps=4, num_stages=2),
+        triton.Config(kwargs={'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+    ]
+
+    @triton.autotune(configs=configs, key=['N'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+
+    # Verify dump directory structure
+    # Should have exactly one base hash directory
+    base_dirs = list(dump_dir.iterdir())
+    assert len(base_dirs) == 1, f"Expected 1 base directory, got {len(base_dirs)}: {base_dirs}"
+
+    # Should have subdirectories for each config with readable names
+    config_dirs = list(base_dirs[0].iterdir())
+    assert len(config_dirs) == 2, f"Expected 2 config subdirectories, got {len(config_dirs)}: {config_dirs}"
+
+    # Config subdirectory names should contain block size info
+    config_names = [d.name for d in config_dirs]
+    assert any("B_32" in name or "BLOCK_SIZE_32" in name for name in config_names), \
+        f"Expected config with BLOCK_SIZE=32, got {config_names}"
+    assert any("B_64" in name or "BLOCK_SIZE_64" in name for name in config_names), \
+        f"Expected config with BLOCK_SIZE=64, got {config_names}"
+
+    # All config subdirs should contain warps/stages/ctas info
+    for name in config_names:
+        assert "warps4" in name, f"Expected warps info in {name}"
+        assert "stages2" in name, f"Expected stages info in {name}"
+        assert "ctas1" in name, f"Expected ctas info in {name}"
