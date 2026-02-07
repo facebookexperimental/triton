@@ -2567,6 +2567,93 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("eviction_policy", ["", "evict_first", "evict_last"])
+def test_descriptor_store_l2_cache_hint(eviction_policy, device):
+    """Test that TMA stores with L2 cache hint generate correct PTX."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        # Load without cache hint
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        # Store with eviction policy
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], eviction_policy=EVICTION_POLICY)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                           EVICTION_POLICY=eviction_policy)
+
+    # Verify the TMA store is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_local_to_global") == 1
+    if eviction_policy:
+        assert f"evictionPolicy = {eviction_policy}" in ttgir
+
+    # Verify PTX output
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.tensor" in ptx
+    if eviction_policy in ("evict_first", "evict_last"):
+        # Should have L2 cache hint in PTX
+        assert "createpolicy.fractional.L2" in ptx
+        assert "L2::cache_hint" in ptx
+    else:
+        # Normal/default policy should NOT have L2 cache hint
+        assert "createpolicy.fractional.L2" not in ptx
+        assert "L2::cache_hint" not in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_descriptor_load_multicast(device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):

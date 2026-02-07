@@ -733,14 +733,24 @@ def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
     offsets: list[tl.tensor],
+    eviction_policy: str = "",
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), (
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
+    from triton._C.libtriton import ir
+
+    evict = ir.EVICTION_POLICY.NORMAL
+    if eviction_policy == "evict_first":
+        evict = ir.EVICTION_POLICY.EVICT_FIRST
+    elif eviction_policy == "evict_last":
+        evict = ir.EVICTION_POLICY.EVICT_LAST
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle)
+    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
 
 
 @tl.builtin
