@@ -332,7 +332,7 @@ def _softmax_inner_loop(
 
 @triton.autotune(
     configs=configs,
-    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "STAGE"],
+    key=["N_CTX", "HEAD_DIM", "STAGE"],
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
@@ -341,7 +341,6 @@ def _attn_fwd_ws(sm_scale, M,  #
                  HEAD_DIM: tl.constexpr,  #
                  BLOCK_M: tl.constexpr,  #
                  BLOCK_N: tl.constexpr,  #
-                 FP8_OUTPUT: tl.constexpr,  #
                  STAGE: tl.constexpr,  #
                  NUM_BUFFERS_Q: tl.constexpr,  #
                  NUM_BUFFERS_KV: tl.constexpr,  #
@@ -504,7 +503,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
@@ -727,7 +726,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         )
                         p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                         use_acc = acc1_init if slice_id == 0 else True
-                        mBarriers = ([kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                        mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -785,7 +784,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
                     p_bufIdx = (NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES) * P_PADDING + slice_id
                     use_acc = acc1_init if slice_id == 0 else True
-                    mBarriers = ([acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else [])
+                    mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
                     tlx.async_dot(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -1652,7 +1651,6 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
-        # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
@@ -1721,8 +1719,6 @@ class _attention(torch.autograd.Function):
             desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
-            # Useful for resetting autotuning.
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             **extra_kern_args,
         )
@@ -1883,7 +1879,6 @@ def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M, config=None
         desc_o,
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
-        FP8_OUTPUT=q.dtype == torch.float8_e5m2,
         STAGE=stage,
         **config,
     )
