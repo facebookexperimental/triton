@@ -138,7 +138,6 @@ configs = [
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
-        ir_override="/home/pka/.triton/dump/_attn_fwd_override.ttgir",
     ) \
     for BM in [64, 128]\
     for BN in [32, 64, 128]\
@@ -565,10 +564,9 @@ class _attention(torch.autograd.Function):
 
         ctx.grid = grid
         if is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and q.dtype == torch.float16:
-                extra_kern_args["maxnreg"] = 168
-            else:
-                extra_kern_args["maxnreg"] = 80
+            # maxnreg must be >= max partition register requirement (152)
+            # Using 168 ensures enough register budget for all HEAD_DIM values
+            extra_kern_args["maxnreg"] = 168
         _attn_fwd[grid](
             sm_scale, M,  #
             q.shape[0], q.shape[1],  #
