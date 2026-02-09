@@ -1204,7 +1204,7 @@ def generate_attention_inputs(shape, device, dtype):
 
 @pytest.mark.skipif(
     not is_blackwell(),
-    reason="Requires Hopper GPU",
+    reason="Requires Blackwell GPU",
 )
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
