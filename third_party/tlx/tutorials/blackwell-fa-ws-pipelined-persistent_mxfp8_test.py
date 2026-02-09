@@ -957,7 +957,7 @@ class _attention(torch.autograd.Function):
 
         stage = 3 if causal else 1
 
-        o = torch.empty_like(q)
+        o = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         extra_kern_args = {}
 
         m_tensor = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
@@ -1198,7 +1198,7 @@ def generate_attention_inputs(shape, device, dtype):
     v_data = v_mx.qdata.t().reshape(shape).contiguous()
     q_scale = swizzled_to_tma_preshuffled(q_mx.scale, shape[2], shape[3], 32, shape[0] * shape[1])
     k_scale = swizzled_to_tma_preshuffled(k_mx.scale, shape[2], shape[3], 32, shape[0] * shape[1])
-    v_scale = swizzled_to_tma_preshuffled(k_mx.scale, shape[3], shape[2], 32, shape[0] * shape[1])
+    v_scale = swizzled_to_tma_preshuffled(v_mx.scale, shape[3], shape[2], 32, shape[0] * shape[1])
     return (q_data, q_scale, q_ref), (k_data, k_scale, k_ref), (v_data, v_scale, v_ref)
 
 
@@ -1242,7 +1242,7 @@ def test_op(
     # reference implementation using bf16 reference tensors
     ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=causal)
     # triton implementation
-    tri_out = attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal).to(dtype)
+    tri_out = attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
     tri_out = tri_out.to(ref_out.dtype)
     # MXFP8 has lower precision due to:
     # 1. FP8 E4M3 quantization of Q, K, V (3 mantissa bits = 12.5% relative error)
