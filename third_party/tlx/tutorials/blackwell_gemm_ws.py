@@ -102,11 +102,12 @@ def preprocess_configs(configs, named_args, **kwargs):
         # from TMEM to shared memory before TMA store to global memory
         EPILOGUE_SUBTILE = conf.kwargs["EPILOGUE_SUBTILE"]
         smem_epilog = BLOCK_M * (BLOCK_N // EPILOGUE_SUBTILE) * 2
-        smem_barriers = NUM_SMEM_BUFFERS * MBARRIER_SIZE
+        smem_barriers = NUM_SMEM_BUFFERS * MBARRIER_SIZE  # smem_full_bars
+        smem_barriers += NUM_SMEM_BUFFERS * MBARRIER_SIZE  # smem_empty_bars
         if PAIR_CTA:
             smem_barriers += NUM_SMEM_BUFFERS * MBARRIER_SIZE  # cta_bars
-        # tmem_full_bars
-        smem_barriers += NUM_TMEM_BUFFERS
+        smem_barriers += NUM_TMEM_BUFFERS * MBARRIER_SIZE  # tmem_full_bars
+        smem_barriers += NUM_TMEM_BUFFERS * MBARRIER_SIZE  # tmem_empty_bars
 
         smem_clc = CLC_RESPONSE_SIZE + MBARRIER_SIZE * 2
 
