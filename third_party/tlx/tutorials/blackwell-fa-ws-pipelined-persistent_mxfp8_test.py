@@ -7,9 +7,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton.language.extra.tlx.mxfp8_utils import to_mxfp8
-
-from to_mxfp8_triton import triton_mx_block_rearrange, _to_mxfp8_block
+from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block
+from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -1001,51 +1000,10 @@ class _attention(torch.autograd.Function):
         # 3. Reshape to 5D [B*H, scale_m_chunks, scale_k_chunks, 2, 256]
         assert k_scale is not None and v_scale is not None and q_scale is not None, (
             "All scales must be provided for MXFP8")
-        dummy_q_scale_block_shape = [1, 1, 1, 1, 1]
-        # q_scale from to_mxfp8: [B, H, M, HEAD_DIM/32]
-        B, H, M, num_scales_k = q_scale.shape
-        # Merge batch and heads, then swizzle each 2D [M, K_scales] slice
-        q_scale_flat = q_scale.reshape(B * H, M, num_scales_k)
-        # Swizzle each batch-head slice and stack
-        q_scale_swizzled_list = []
-        for i in range(B * H):
-            swizzled = triton_mx_block_rearrange(q_scale_flat[i].contiguous())
-            q_scale_swizzled_list.append(swizzled)
-        q_scale_swizzled = torch.stack(q_scale_swizzled_list, dim=0)
-        # Reshape to 5D: [B*H, scale_m_chunks, scale_k_chunks, 2, 256]
-        scale_m_chunks = q_scale_swizzled.shape[1] // 128
-        scale_k_chunks = q_scale_swizzled.shape[2] // 4
-        q_scale_5d = q_scale_swizzled.reshape(B * H, scale_m_chunks, scale_k_chunks, 2, 256)
-        desc_q_scale = TensorDescriptor.from_tensor(q_scale_5d, block_shape=dummy_q_scale_block_shape)
-
-        dummy_k_scale_block_shape = [1, 1, 1, 1, 1]
-        B, H, N, num_scales_k = k_scale.shape
-        k_scale_flat = k_scale.reshape(B * H, N, num_scales_k)
-        k_scale_swizzled_list = []
-        for i in range(B * H):
-            swizzled = triton_mx_block_rearrange(k_scale_flat[i].contiguous())
-            k_scale_swizzled_list.append(swizzled)
-        k_scale_swizzled = torch.stack(k_scale_swizzled_list, dim=0)
-        scale_n_chunks = k_scale_swizzled.shape[1] // 128
-        scale_k_chunks = k_scale_swizzled.shape[2] // 4
-        k_scale_5d = k_scale_swizzled.reshape(B * H, scale_n_chunks, scale_k_chunks, 2, 256)
-        desc_k_scale = TensorDescriptor.from_tensor(k_scale_5d, block_shape=dummy_k_scale_block_shape)
-
-        dummy_v_scale_block_shape = [1, 1, 1, 1, 1]
-        # V_scale shape: [B, H, HEAD_DIM, N//32] - scales along N dimension
-        # For P @ V: P is [BLOCK_M, BLOCK_N], V is [BLOCK_N, HEAD_DIM]
-        # V_scale[b, h, d, n] applies to V[b, h, n*32:(n+1)*32, d]
-        B, H, HEAD_DIM_SCALE, num_scales_n = v_scale.shape
-        v_scale_flat = v_scale.reshape(B * H, HEAD_DIM_SCALE, num_scales_n)
-        v_scale_swizzled_list = []
-        for i in range(B * H):
-            swizzled = triton_mx_block_rearrange(v_scale_flat[i].contiguous())
-            v_scale_swizzled_list.append(swizzled)
-        v_scale_swizzled = torch.stack(v_scale_swizzled_list, dim=0)
-        scale_head_chunks = v_scale_swizzled.shape[1] // 128
-        scale_n_chunks = v_scale_swizzled.shape[2] // 4
-        v_scale_5d = v_scale_swizzled.reshape(B * H, scale_head_chunks, scale_n_chunks, 2, 256)
-        desc_v_scale = TensorDescriptor.from_tensor(v_scale_5d, block_shape=dummy_v_scale_block_shape)
+        dummy_block_shape = [1, 1, 1, 1, 1]
+        desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
+        desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
+        desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -1179,19 +1137,38 @@ def generate_attention_inputs(shape, device, dtype):
     q_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
-    # Convert bf16 reference tensors to MXFP8
-    q_scale, q_data = to_mxfp8(q_ref, torch.float8_e4m3fn)
-    k_scale, k_data = to_mxfp8(k_ref, torch.float8_e4m3fn)
+    # Convert to 2D for MXFP8
+    q_2d = q_ref.reshape(shape[0] * shape[1], shape[2], shape[3]).contiguous()
+    k_2d = k_ref.reshape(shape[0] * shape[1], shape[2], shape[3]).contiguous()
+    # Transpose V so we can quantize along the N dimension
+    v_2d = v_ref.reshape(shape[0] * shape[1], shape[2], shape[3]).contiguous()
+    v_2d_t = v_2d.t().contiguous()
 
-    # For V, we need scales along the N dimension (reduction dim in P @ V)
-    # V shape: [B, H, N, HEAD_DIM]
-    # to_mxfp8 scales along the last dimension, so we transpose before quantization
-    # to get scales along N instead of HEAD_DIM
-    v_transposed = v_ref.transpose(-2, -1).contiguous()  # [B, H, HEAD_DIM, N]
-    v_scale, v_data_transposed = to_mxfp8(v_transposed, torch.float8_e4m3fn)  # v_scale: [B, H, HEAD_DIM, N//32]
-    v_data = v_data_transposed.transpose(-2, -1).contiguous()  # [B, H, N, HEAD_DIM]
-    # v_scale shape: [B, H, HEAD_DIM, N//32] - scales along N (correct for P @ V)
-
+    q_mx = MXTensor.to_mx(
+        q_2d,
+        dtype,
+        scaling_mode=ScaleCalculationMode.RCEIL,
+        is_swizzled_scales=True,
+    )
+    k_mx = MXTensor.to_mx(
+        k_2d,
+        dtype,
+        scaling_mode=ScaleCalculationMode.RCEIL,
+        is_swizzled_scales=True,
+    )
+    v_mx = MXTensor.to_mx(
+        v_2d_t,
+        dtype,
+        scaling_mode=ScaleCalculationMode.RCEIL,
+        is_swizzled_scales=True,
+    )
+    q_data = q_mx.qdata.reshape(shape).contiguous()
+    k_data = k_mx.qdata.reshape(shape).contiguous()
+    v_data = v_mx.qdata.t().reshape(shape).contiguous()
+    # TODO: Handle reshaping for swizzling to 5D TMA
+    q_scale = q_mx.scales
+    k_scale = k_mx.scales
+    v_scale = v_mx.scales
     return (q_data, q_scale, q_ref), (k_data, k_scale, k_ref), (v_data, v_scale, v_ref)
 
 
