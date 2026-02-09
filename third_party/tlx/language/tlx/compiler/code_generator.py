@@ -1,30 +1,52 @@
 # third_party/tlx/codegen/async.py
 
 import ast
+import threading
 from typing import List
 import triton.language.extra.tlx as tlx  # Make sure async_task(s) are exposed via tlx.__init__.py
 from contextlib import contextmanager
 
-# TLX allows users to specify the replicate number when definine
+# TLX allows users to specify the replicate number when defining
 # a non-default partition region. We use a stack to keep track of
 # replica_id of the region being compiled.
-region_replica_id_stack: List[int] = []
-sub_region_has_exception = False
+#
+# Thread-local storage for TLX compiler state
+# This allows parallel compilation of TLX templates without race conditions
+_tlx_state = threading.local()
+
+
+def _get_region_replica_id_stack() -> List[int]:
+    """Get the thread-local region_replica_id_stack, initializing if needed."""
+    if not hasattr(_tlx_state, 'region_replica_id_stack'):
+        _tlx_state.region_replica_id_stack = []
+    return _tlx_state.region_replica_id_stack
+
+
+def _get_sub_region_has_exception() -> bool:
+    """Get the thread-local sub_region_has_exception flag."""
+    if not hasattr(_tlx_state, 'sub_region_has_exception'):
+        _tlx_state.sub_region_has_exception = False
+    return _tlx_state.sub_region_has_exception
+
+
+def _set_sub_region_has_exception(value: bool) -> None:
+    """Set the thread-local sub_region_has_exception flag."""
+    _tlx_state.sub_region_has_exception = value
 
 
 @contextmanager
 def tlx_enter_sub_region():
-    global region_replica_id_stack
-    global sub_region_has_exception
+    region_replica_id_stack = _get_region_replica_id_stack()
     replica_id_stack_backup = region_replica_id_stack.copy()
     try:
         yield
     except Exception as e:
-        sub_region_has_exception = True
+        _set_sub_region_has_exception(True)
         raise e
     finally:
-        if not sub_region_has_exception:
-            assert region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
+        if not _get_sub_region_has_exception():
+            current_stack = _get_region_replica_id_stack()
+            assert current_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
 
 
 def _is_async_task(self, node) -> bool:
@@ -111,6 +133,9 @@ def visit_withAsyncTasks(self, node):
         liveins, _ = sr
         ip, last_loc = self._get_insertion_point_and_loc()
 
+        # Get thread-local region_replica_id_stack for this compilation
+        region_replica_id_stack = _get_region_replica_id_stack()
+
         def _flatten_value_handles(val):
             handles = []
             # Prefer the generic flatten hook to support multi-result values (e.g. tensor descriptors)
@@ -139,7 +164,6 @@ def visit_withAsyncTasks(self, node):
             perTaskStartIds = []
             perTaskReplicates = []
 
-            global region_replica_id_stack
             region_replica_id_stack.append(-1)  # dummy placeholder
 
             num_default = 0
