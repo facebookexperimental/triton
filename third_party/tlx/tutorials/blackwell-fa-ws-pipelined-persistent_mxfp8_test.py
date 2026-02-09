@@ -237,6 +237,7 @@ def _softmax_inner_loop(
             tlx.local_view(p_tiles, cid),
             tlx.local_view(p_scale_tiles, cid),
             VEC_SIZE,
+            out_dtype,
         )
         tlx.fence_async_shared()
         tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
@@ -1117,6 +1118,36 @@ def generate_tensor_with_block_distributions(
     return generated_tensor
 
 
+def swizzled_to_tma_preshuffled(swizzled_scales, M, K, block_size, batch):
+    """
+    Convert from to_blocked() swizzled format to TMA preshuffled format.
+
+    Args:
+        swizzled_scales: Swizzled scales, shape (A * B * C * 512,) or (A, B*C, 32, 16)
+        M: Original row dimension of data tensor
+        K: Original column dimension of data tensor
+        block_size: Quantization block size (32 for MX, 16 for NVFP4)
+        A: Batch dimension
+
+    Returns:
+        TMA preshuffled tensor of shape (A, B, C, 2, 256)
+    """
+    scale_rows = M
+    scale_cols = K // block_size
+
+    B = (scale_rows + 127) // 128  # ceil(M / 128)
+    C = (scale_cols + 3) // 4  # ceil(scale_cols / 4)
+
+    # Reshape: (A * B * C * 512,) -> (A, B, C, 512)
+    sf_tiles = swizzled_scales.view(batch, B, C, 512)
+
+    # Split each 512-byte SF tile into two 256-byte halves
+    # (A, B, C, 512) -> (A, B, C, 2, 256)
+    tma_format = sf_tiles.view(batch, B, C, 2, 256)
+
+    return tma_format
+
+
 def generate_attention_inputs(shape, device, dtype):
     """Generate Q, K, V tensors for attention.
 
@@ -1138,10 +1169,10 @@ def generate_attention_inputs(shape, device, dtype):
     k_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     v_ref = torch.empty(shape, device=device, dtype=orig_dtype).normal_(mean=0.0, std=0.5).contiguous()
     # Convert to 2D for MXFP8
-    q_2d = q_ref.reshape(shape[0] * shape[1], shape[2], shape[3]).contiguous()
-    k_2d = k_ref.reshape(shape[0] * shape[1], shape[2], shape[3]).contiguous()
+    q_2d = q_ref.reshape(shape[0] * shape[1] * shape[2], shape[3]).contiguous()
+    k_2d = k_ref.reshape(shape[0] * shape[1] * shape[2], shape[3]).contiguous()
     # Transpose V so we can quantize along the N dimension
-    v_2d = v_ref.reshape(shape[0] * shape[1], shape[2], shape[3]).contiguous()
+    v_2d = v_ref.reshape(shape[0] * shape[1] * shape[2], shape[3]).contiguous()
     v_2d_t = v_2d.t().contiguous()
 
     q_mx = MXTensor.to_mx(
@@ -1165,10 +1196,9 @@ def generate_attention_inputs(shape, device, dtype):
     q_data = q_mx.qdata.reshape(shape).contiguous()
     k_data = k_mx.qdata.reshape(shape).contiguous()
     v_data = v_mx.qdata.t().reshape(shape).contiguous()
-    # TODO: Handle reshaping for swizzling to 5D TMA
-    q_scale = q_mx.scales
-    k_scale = k_mx.scales
-    v_scale = v_mx.scales
+    q_scale = swizzled_to_tma_preshuffled(q_mx.scale, shape[2], shape[3], 32, shape[0] * shape[1])
+    k_scale = swizzled_to_tma_preshuffled(k_mx.scale, shape[2], shape[3], 32, shape[0] * shape[1])
+    v_scale = swizzled_to_tma_preshuffled(k_mx.scale, shape[3], shape[2], 32, shape[0] * shape[1])
     return (q_data, q_scale, q_ref), (k_data, k_scale, k_ref), (v_data, v_scale, v_ref)
 
 
