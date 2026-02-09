@@ -3,6 +3,8 @@ Helper functions available from either Python or JIT to help simplify working wi
 MXFP8 data in standard use cases.
 """
 
+from __future__ import annotations
+
 import torch
 import triton
 import triton.language as tl
@@ -171,6 +173,9 @@ def _to_mxfp8_block(
     BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
     NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
+    tl.static_assert(BLOCK_M == 128)
+    tl.static_assert(BLOCK_K == 128)
+    tl.static_assert(VEC_SIZE == 32)
 
     # Step 1: Compute scales and quantized data (all in registers)
     scale_e8m0, data_fp8 = _compute_scale_and_quantize(data_input, VEC_SIZE, dtype)
