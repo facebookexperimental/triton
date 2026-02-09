@@ -36,6 +36,7 @@ def _set_sub_region_has_exception(value: bool) -> None:
 
 @contextmanager
 def tlx_enter_sub_region():
+    _set_sub_region_has_exception(False)
     region_replica_id_stack = _get_region_replica_id_stack()
     replica_id_stack_backup = region_replica_id_stack.copy()
     try:

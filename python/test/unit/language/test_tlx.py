@@ -4731,10 +4731,94 @@ def test_async_tasks_thread_safety(device):
         torch.testing.assert_close(out, a * b, check_dtype=False)
         return True
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    # Use 4 workers: 2 run ws_add_kernel, 2 run ws_mul_kernel.
+    # This tests both different-kernel and same-kernel concurrent compilation.
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
+            executor.submit(compile_and_run_add),
+            executor.submit(compile_and_run_mul),
             executor.submit(compile_and_run_add),
             executor.submit(compile_and_run_mul),
         ]
         for future in as_completed(futures):
             assert future.result() is True
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_thread_exception_isolation(device):
+    """Verify that a compilation exception in one thread doesn't affect others."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    @triton.jit
+    def ws_good_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
+    def ws_bad_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            # Missing "default" task — this should fail during compilation
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                tl.store(out_ptr + offsets, x, mask=mask)
+
+    size = 98432
+    BLOCK_SIZE = 1024
+
+    def compile_and_run_good():
+        x = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_good_kernel[grid](x, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, x, check_dtype=False)
+        return True
+
+    def compile_and_run_bad():
+        x = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        try:
+            ws_bad_kernel[grid](x, out, n, BLOCK_SIZE, num_warps=4)
+        except Exception:
+            pass  # Expected to fail
+        return True
+
+    # Run bad kernel first to set exception flag, then verify good kernel
+    # still works on a thread that may be reused from the pool.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # Submit bad first, then good
+        bad_future = executor.submit(compile_and_run_bad)
+        bad_future.result()  # Wait for bad to finish
+        good_future = executor.submit(compile_and_run_good)
+        assert good_future.result() is True
