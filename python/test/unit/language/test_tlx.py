@@ -4637,3 +4637,104 @@ class TestLocalAllocWithStorageAliasSpec:
         # We can't fully test the error without a kernel context, but we can
         # verify the storage_alias_spec's storage property is accessible
         assert buf.storage == tlx.storage_kind.smem
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_thread_safety(device):
+    """Verify that concurrent compilation of warp-specialized kernels is thread-safe.
+
+    The TLX code generator uses thread-local storage for region_replica_id_stack
+    and sub_region_has_exception. This test compiles two different kernels using
+    async_tasks() + async_task_replica_id() from separate threads simultaneously
+    to verify no cross-thread state corruption occurs.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    @triton.jit
+    def ws_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + y + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + y + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
+    def ws_mul_kernel(
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = a * b + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = a * b + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    size = 98432
+    BLOCK_SIZE = 1024
+
+    def compile_and_run_add():
+        torch.manual_seed(42)
+        x = torch.rand(size, device=device)
+        y = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_add_kernel[grid](x, y, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, x + y, check_dtype=False)
+        return True
+
+    def compile_and_run_mul():
+        torch.manual_seed(43)
+        a = torch.rand(size, device=device)
+        b = torch.rand(size, device=device)
+        out = torch.empty_like(a)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_mul_kernel[grid](a, b, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, a * b, check_dtype=False)
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(compile_and_run_add),
+            executor.submit(compile_and_run_mul),
+        ]
+        for future in as_completed(futures):
+            assert future.result() is True
