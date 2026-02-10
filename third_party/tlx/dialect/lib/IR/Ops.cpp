@@ -82,6 +82,35 @@ LogicalResult StorageAliasLocalAllocOp::verify() {
   return success();
 }
 
+//-- ReuseGroupOp --
+
+LogicalResult ReuseGroupOp::verify() {
+  auto elements = getElements();
+
+  // Must have at least one element
+  if (elements.empty()) {
+    return emitOpError("reuse_group requires at least one element");
+  }
+
+  // Get result type properties
+  auto resultType = cast<ReuseGroupType>(getResult().getType());
+  auto expectedGroupKind = resultType.getGroupKind();
+
+  // Verify group_kind attribute matches result type
+  if (getGroupKind() != expectedGroupKind) {
+    return emitOpError("group_kind attribute (")
+           << stringifyReuseGroupKind(getGroupKind())
+           << ") doesn't match result type group kind ("
+           << stringifyReuseGroupKind(expectedGroupKind) << ")";
+  }
+
+  // Note: Validation that all elements reference the same storage_alias_spec
+  // is performed by the SetBufferOverlapOp verifier when the overlap scheme
+  // is defined. This allows reuse_group to be spec-agnostic.
+
+  return success();
+}
+
 } // namespace tlx
 } // namespace triton
 } // namespace mlir

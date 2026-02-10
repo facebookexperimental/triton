@@ -110,6 +110,76 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
 }
 
 //===----------------------------------------------------------------------===//
+// Reuse Group Operation
+//===----------------------------------------------------------------------===//
+
+// Define the allowed element types for reuse_group:
+// - TTG_MemDescType: buffered tensors from local_alloc (smem or tmem)
+// - TLX_ReuseGroupType: nested reuse groups
+def TLX_ReuseGroupElement : AnyTypeOf<[TTG_MemDescType, TLX_ReuseGroupType],
+    "buffered tensor (!ttg.memdesc) or nested reuse group (!tlx.reuse_group)">;
+
+def TLX_ReuseGroupOp : TLX_Op<"reuse_group", [Pure]> {
+  let summary = "Define a reuse group for buffer overlap relationships";
+
+  let description = [{
+    Creates a reuse group that defines buffer overlap relationships for
+    memory allocations (shared memory or tensor memory). A reuse group
+    organizes multiple buffers (or nested groups) with a specific
+    relationship type:
+
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times and can
+      share the same physical memory.
+    - **distinct**: Elements must be placed in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The reuse group forms a tree structure where:
+    - Leaf nodes are `!ttg.memdesc` values (buffered tensors from local_alloc
+      stored in smem or tmem)
+    - Internal nodes are nested `!tlx.reuse_group` values
+
+    Note: The storage_alias_spec is NOT part of this operation. Validation
+    that all elements reference the same storage_alias_spec is performed
+    by the SetBufferOverlapOp verifier when the overlap scheme is defined.
+
+    Constraints:
+    - At least one element must be provided.
+    - Nested reuse groups must have alternating group_kind (shared <-> distinct).
+    - All elements must use the same storage kind (smem or tmem).
+
+    Example:
+    ```mlir
+    // Simple shared group: A and B share the same memory
+    %group = tlx.reuse_group(%a, %b) group_kind = shared
+             : (!ttg.memdesc<2x64x64xf32, ...>, !ttg.memdesc<2x64x64xbf16, ...>)
+             -> !tlx.reuse_group<shared>
+
+    // Complex scheme: QK shared with (P distinct from alpha, l, m)
+    %inner = tlx.reuse_group(%p, %alpha, %l, %m) group_kind = distinct
+             : (...) -> !tlx.reuse_group<distinct>
+    %outer = tlx.reuse_group(%qk, %inner) group_kind = shared
+             : (!ttg.memdesc<...>, !tlx.reuse_group<distinct>)
+             -> !tlx.reuse_group<shared>
+    ```
+  }];
+
+  let arguments = (ins
+    Variadic<TLX_ReuseGroupElement>:$elements,
+    TLX_ReuseGroupKindAttr:$group_kind
+  );
+
+  let results = (outs TLX_ReuseGroupType:$result);
+
+  let assemblyFormat = [{
+    `(` $elements `)` `group_kind` `=` $group_kind attr-dict `:`
+    `(` qualified(type($elements)) `)` `->` qualified(type($result))
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // Layout Operations
 //===----------------------------------------------------------------------===//
 
