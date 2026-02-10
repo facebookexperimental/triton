@@ -292,14 +292,10 @@ def test_blackwell_fa_ws_pipelined_persistent():
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
-    if causal:
-        pytest.skip("Causal not supported yet")
     if HEAD_DIM == 128:
         pytest.skip("HEAD_DIM=128 not supported yet")
     sm_scale = 0.5
-    causal = False  # Causal not supported yet
     dtype = torch.float8_e4m3fn
-    # MXFP8 uses HEAD_DIM=64 (HEAD_DIM=128 not supported yet)
     shapes = [(8, 16, 1024)]
     for Z, H, N_CTX in shapes:
         torch.manual_seed(20)
@@ -311,11 +307,11 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         tri_out = _blackwell_fa_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal,
                                                               config=config)
         tri_out = tri_out.to(ref_out.dtype)
-        # Note: The largest difference is around 0.029. Without this change < 0.1%
-        # of values don't match.
-        atol = 0.03
-        rtol = 0.03
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
+        if causal:
+            atol = 0.1
+        else:
+            atol = 0.03
+        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 
 # =============================================================================
