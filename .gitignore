@@ -96,4 +96,5 @@ python/triton/tlx
 .DS_Store
 
 # claude
-.claude/
+.claude/*
+!.claude/knowledge/
