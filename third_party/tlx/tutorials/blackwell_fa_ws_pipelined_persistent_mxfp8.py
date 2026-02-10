@@ -179,6 +179,7 @@ def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
 
 @triton.jit
 def _softmax_inner_loop(
+    qk_empties,
     qk_fulls,
     qk_tiles,
     p_empties,
@@ -210,6 +211,7 @@ def _softmax_inner_loop(
         _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
         qk = tlx.local_load(tlx.local_view(qk_tiles, cid))
+        tlx.barrier_arrive(tlx.local_view(qk_empties, cid))
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
@@ -222,7 +224,7 @@ def _softmax_inner_loop(
         alpha = tl.math.exp2(m_i - m_ij)
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
-        tlx.local_store(tlx.local_view(alpha_tiles, cid * BLOCK_N), alpha[:, None])
+        tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
@@ -337,22 +339,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     K_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
     V_SCALE_BYTES: tl.constexpr = REP_N * REP_HEAD * 2 * 256
 
-    qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
-    # TODO: Update this diagram
-    # Shared buffer for QK, P and Alpha, l, and m.
-    # A single QK buffer is split evenly:
-    #   - First half  : stores P
-    #   - Second half  : stores Alpha, l, and m
-    #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
-    #     P:                                                |  BLK_M/2 * BLOCK_N * fp16 |
-    #  Alpha : |BLK_M/2*1*fp32|
-    #     l :                 |BLK_M/2*1*fp32|
-    #     m :                                |BLK_M/2*1*fp32|
-    # When working with smaller dtypes (e.g. FP8), we pad the original data to match the original
-    # boundaries and prevent overlap.
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
-                               reuse=qk_storage_alias)
-    # Note: P is not shared because of scaled_dot requirements.
+    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N),
         tlx.dtype_of(desc_v),
@@ -361,23 +348,20 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     alpha_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
     )
     l_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
     )
     m_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
         tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
     )
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
@@ -392,6 +376,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    l_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     with tlx.async_tasks():
         # correction group
@@ -416,7 +401,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         # -- update output accumulator --
                         tlx.barrier_wait(alpha_fulls[cid], phase)
                         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
-                        alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
+                        alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
                         acc = tlx.local_load(acc_tiles[cid])
                         acc = _mul_f32x2(acc, alpha_1)
@@ -428,11 +413,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue
                     tlx.barrier_wait(l_fulls[cid], phase)
-                    # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
-                    # to disambigulate from alpha[0]/alpha[BLOCK_N]
-                    l = tlx.local_load(l_tiles[cid * BLOCK_N + 1])
-                    m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
-                    tlx.barrier_arrive(qk_empties[cid])
+                    l = tlx.local_load(l_tiles[cid])
+                    m = tlx.local_load(m_tiles[cid])
+                    tlx.barrier_arrive(l_empties[cid])
                     m += tl.math.log2(l)
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -475,6 +458,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 offs_m = (start_m * BLOCK_M) + ((cid * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
                 if STAGE & 1:
                     m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
+                        qk_empties,
                         qk_fulls,
                         qk_tiles,
                         p_empties,
@@ -503,6 +487,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 if STAGE & 2:
                     m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
+                        qk_empties,
                         qk_fulls,
                         qk_tiles,
                         p_empties,
@@ -530,10 +515,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     )
 
                 # prepare l_i for the epilog
-                # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
-                # to disambigulate from alpha[0]/alpha[BLOCK_N]
-                tlx.local_store(l_tiles[cid * BLOCK_N + 1], l_i[:, None])
-                tlx.local_store(m_tiles[cid * BLOCK_N + 2], m_i[:, None])
+                _, phase = _get_bufidx_phase(i, 1)
+                tlx.barrier_wait(l_empties[cid], phase ^ 1)
+                tlx.local_store(l_tiles[cid], l_i[:, None])
+                tlx.local_store(m_tiles[cid], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_idx += num_progs
 
@@ -567,7 +552,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # -- compute q0 @ k ----
                 k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
-                tlx.barrier_wait(qk_empties[0], q_phase ^ 1)
+                _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+                tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
                 # Wait for Q and K scales to be loaded by the load group
                 # Use q_scale buffer index 0 for group 0 (q0)
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
@@ -587,7 +573,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # -- compute q1 @ k ----
                 tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
-                tlx.barrier_wait(qk_empties[1], q_phase ^ 1)
+                tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                 # Wait for Q1 scale (K scale already waited above)
                 # Use q_scale buffer index 1 for group 1 (q1)
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
@@ -606,8 +592,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         kv_scale_empties[k_bufIdx],
                     ],
                 )
-
-                _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
 
                 # -- compute p0 @ v ----
                 # wait for the V buffer to be populated by the producer
@@ -650,6 +634,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # Wait for K scale to be loaded by the load group
                     # k_bufIdx is always 0 (accum_cnt_kv % 2 where accum_cnt_kv increments by 2)
                     tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+                    tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
                     tlx.async_dot_scaled(
                         q_tiles[0],
                         k_tile,
@@ -682,6 +667,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     acc1_init = True
 
                     # -- compute q1 @ k ----
+                    tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                     tlx.async_dot_scaled(
                         q_tiles[1],
                         k_tile,
