@@ -223,7 +223,6 @@ def _softmax_inner_loop(
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
         tlx.local_store(tlx.local_view(alpha_tiles, cid * BLOCK_N), alpha[:, None])
-        tlx.fence_async_shared()
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
@@ -418,8 +417,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         tlx.barrier_wait(alpha_fulls[cid], phase)
                         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
                         alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
-                        # Fence to ensure alpha load completes before signaling empty
-                        tlx.fence_async_shared()
                         tlx.barrier_arrive(alpha_empties[cid])
                         acc = tlx.local_load(acc_tiles[cid])
                         acc = _mul_f32x2(acc, alpha_1)
@@ -435,10 +432,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # to disambigulate from alpha[0]/alpha[BLOCK_N]
                     l = tlx.local_load(l_tiles[cid * BLOCK_N + 1])
                     m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
-                    # Signal qk_empties after both l and m loads complete,
-                    # since both tiles share the same synchronization group.
-                    # Fence to ensure loads complete before signaling
-                    tlx.fence_async_shared()
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
@@ -541,7 +534,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # to disambigulate from alpha[0]/alpha[BLOCK_N]
                 tlx.local_store(l_tiles[cid * BLOCK_N + 1], l_i[:, None])
                 tlx.local_store(m_tiles[cid * BLOCK_N + 2], m_i[:, None])
-                tlx.fence_async_shared()
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_idx += num_progs
 
@@ -986,17 +978,6 @@ class _attention(torch.autograd.Function):
             strides=[HEAD_DIM_K, 1],
             block_shape=dummy_block,
         )
-        # By definition the scales for FP8 layouts require 5D TMA to ensure the scale
-        # is contiguous. The 5D format follows NVIDIA's block-scaled swizzle format:
-        # https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
-        #
-        # Input scale tensor from to_mxfp8: [B, H, M, HEAD_DIM/32]
-        # Target 5D format: [B*H, scale_m_chunks, scale_k_chunks, 2, 256]
-        #
-        # Following the pattern from mxfp8_grouped_gemm_tlx_fprop:
-        # 1. Flatten to 2D [M, K_scales] per batch-head
-        # 2. Apply triton_mx_block_rearrange to swizzle
-        # 3. Reshape to 5D [B*H, scale_m_chunks, scale_k_chunks, 2, 256]
         assert k_scale is not None and v_scale is not None and q_scale is not None, (
             "All scales must be provided for MXFP8")
         dummy_block_shape = [1, 1, 1, 1, 1]
