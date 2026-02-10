@@ -541,6 +541,34 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<tlx::StorageAliasSpecOp>(
                  resultType, storageAttr, bufferSizeAttr, bufferShapeAttr);
            })
+      .def("create_reuse_group",
+           [](TritonOpBuilder &self, const std::vector<mlir::Value> &elements,
+              const std::string &groupKind) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+
+             // Parse group kind
+             tlx::ReuseGroupKind groupKindEnum;
+             if (groupKind == "shared") {
+               groupKindEnum = tlx::ReuseGroupKind::shared;
+             } else if (groupKind == "distinct") {
+               groupKindEnum = tlx::ReuseGroupKind::distinct;
+             } else {
+               throw std::invalid_argument("Unknown group_kind: " + groupKind +
+                                           ", expected 'shared' or 'distinct'");
+             }
+
+             // Create the result type
+             auto resultType = tlx::ReuseGroupType::get(context, groupKindEnum);
+
+             // Create the group_kind attribute
+             auto groupKindAttr =
+                 tlx::ReuseGroupKindAttr::get(context, groupKindEnum);
+
+             // Create the operation (no storage_alias_spec - that's handled by
+             // set_buffer_overlap)
+             return self.create<tlx::ReuseGroupOp>(resultType, elements,
+                                                   groupKindAttr);
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {

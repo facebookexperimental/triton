@@ -4822,3 +4822,179 @@ def test_async_tasks_thread_exception_isolation(device):
         bad_future.result()  # Wait for bad to finish
         good_future = executor.submit(compile_and_run_good)
         assert good_future.result() is True
+
+
+class TestReuseGroupType:
+    """Tests for tlx.reuse_group_type enum."""
+
+    def test_reuse_group_type_values(self):
+        assert tlx.reuse_group_type.shared.value == "shared"
+        assert tlx.reuse_group_type.distinct.value == "distinct"
+
+    def test_reuse_group_type_enum_members(self):
+        # Verify all expected members exist
+        members = list(tlx.reuse_group_type)
+        assert len(members) == 2
+        assert tlx.reuse_group_type.shared in members
+        assert tlx.reuse_group_type.distinct in members
+
+
+def _make_test_storage_alias_spec(storage: tlx.storage_kind = tlx.storage_kind.smem):
+    """Helper to create a storage_alias_spec for testing reuse_group."""
+    return tlx.storage_alias_spec_type_class(handle=None, storage=storage)
+
+
+def _make_test_buffered_tensor(storage: tlx.storage_kind = tlx.storage_kind.smem):
+    """Helper to create a buffered_tensor for testing reuse_group."""
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=2)
+    return tlx.buffered_tensor(
+        handle=None,
+        element_ty=tl.float32,
+        shape=[64, 64],
+        num=2,
+        storage=storage,
+        layout=layout,
+    )
+
+
+class TestReuseGroup:
+    """Tests for tlx.reuse_group class."""
+
+    def test_reuse_group_basic_shared(self):
+        """Test basic reuse_group creation with shared type."""
+        elem1 = _make_test_buffered_tensor()
+        elem2 = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem1,
+            elem2,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        assert group.args == (elem1, elem2)
+        assert group.group_type == tlx.reuse_group_type.shared
+
+    def test_reuse_group_basic_distinct(self):
+        """Test basic reuse_group creation with distinct type."""
+        elem1 = _make_test_buffered_tensor()
+        elem2 = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem1,
+            elem2,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        assert group.args == (elem1, elem2)
+        assert group.group_type == tlx.reuse_group_type.distinct
+
+    def test_reuse_group_single_element(self):
+        """Test reuse_group with a single element."""
+        elem = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        assert len(group.args) == 1
+        assert group.args[0] is elem
+
+    def test_reuse_group_multiple_elements(self):
+        """Test reuse_group with more than 2 elements."""
+        elems = tuple(_make_test_buffered_tensor() for _ in range(4))
+        group = tlx.reuse_group(
+            *elems,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        assert group.args == elems
+        assert len(group.args) == 4
+
+    def test_reuse_group_nested(self):
+        """Test nested reuse_group (Flash Attention pattern)."""
+        # Inner group: distinct elements
+        p = _make_test_buffered_tensor()
+        alpha = _make_test_buffered_tensor()
+        inner_group = tlx.reuse_group(
+            p,
+            alpha,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+
+        # Outer group: shared with inner group
+        qk = _make_test_buffered_tensor()
+        outer_group = tlx.reuse_group(
+            qk,
+            inner_group,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        assert outer_group.group_type == tlx.reuse_group_type.shared
+        assert len(outer_group.args) == 2
+        assert outer_group.args[0] is qk
+        assert outer_group.args[1] is inner_group
+        assert inner_group.group_type == tlx.reuse_group_type.distinct
+
+    def test_reuse_group_deeply_nested(self):
+        """Test 3-level nested reuse_group."""
+        # Level 3 (innermost)
+        c = _make_test_buffered_tensor()
+        d = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            c,
+            d,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        # Level 2
+        b = _make_test_buffered_tensor()
+        middle = tlx.reuse_group(
+            b,
+            inner,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+
+        # Level 1 (outermost)
+        a = _make_test_buffered_tensor()
+        outer = tlx.reuse_group(
+            a,
+            middle,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        assert outer.group_type == tlx.reuse_group_type.shared
+        assert outer.args[1].group_type == tlx.reuse_group_type.distinct
+        assert outer.args[1].args[1].group_type == tlx.reuse_group_type.shared
+
+    def test_reuse_group_empty_args_raises_error(self):
+        """Test reuse_group raises error with empty args tuple."""
+        with pytest.raises(ValueError, match="at least one element"):
+            tlx.reuse_group(group_type=tlx.reuse_group_type.shared, )
+
+    def test_reuse_group_nested_same_type_shared_raises_error(self):
+        """Test that nesting shared inside shared raises an error."""
+        elem = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        with pytest.raises(ValueError, match="same group_type"):
+            tlx.reuse_group(
+                inner,
+                group_type=tlx.reuse_group_type.shared,
+            )
+
+    def test_reuse_group_nested_same_type_distinct_raises_error(self):
+        """Test that nesting distinct inside distinct raises an error."""
+        elem = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        with pytest.raises(ValueError, match="same group_type"):
+            tlx.reuse_group(
+                inner,
+                group_type=tlx.reuse_group_type.distinct,
+            )
+
+    def test_reuse_group_invalid_element_type_raises_error(self):
+        """Test that invalid element types raise TypeError."""
+        with pytest.raises(TypeError, match="must be buffered_tensor or reuse_group"):
+            tlx.reuse_group(
+                "invalid",
+                group_type=tlx.reuse_group_type.shared,
+            )
