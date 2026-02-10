@@ -33,6 +33,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <unordered_set>
@@ -217,38 +218,36 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
 
 /// Dump memory effects of an operation for debugging
 void dumpMemoryEffects(Operation *op) {
-  auto memInterface = dyn_cast<MemoryEffectOpInterface>(op);
-  if (!memInterface) {
+  if (auto memInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
     LDBG("  Op '" << op->getName()
-                  << "' does not implement MemoryEffectOpInterface");
-    return;
+                  << "' does not implement MemoryEffectOpInterface.");
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    memInterface.getEffects(effects);
+    if (effects.empty()) {
+      LDBG("  Op '" << op->getName() << "' has no memory effects.");
+      return;
+    }
+    for (const auto &effect : effects) {
+      llvm::StringRef effectType;
+      if (isa<MemoryEffects::Read>(effect.getEffect()))
+        effectType = "Read";
+      else if (isa<MemoryEffects::Write>(effect.getEffect()))
+        effectType = "Write";
+      else if (isa<MemoryEffects::Allocate>(effect.getEffect()))
+        effectType = "Allocate";
+      else if (isa<MemoryEffects::Free>(effect.getEffect()))
+        effectType = "Free";
+      else
+        effectType = "Unknown";
+
+      llvm::StringRef resourceName = effect.getResource()->getName();
+      LDBG("  Op '" << op->getName() << "' has effect: " << effectType
+                    << " on resource: " << resourceName);
+    }
+  } else if (!op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
+    LDBG("  Op '" << op->getName() << "' may have recursive memory effects.");
   }
-
-  SmallVector<MemoryEffects::EffectInstance> effects;
-  memInterface.getEffects(effects);
-
-  if (effects.empty()) {
-    LDBG("  Op '" << op->getName() << "' has no memory effects");
-    return;
-  }
-
-  for (const auto &effect : effects) {
-    llvm::StringRef effectType;
-    if (isa<MemoryEffects::Read>(effect.getEffect()))
-      effectType = "Read";
-    else if (isa<MemoryEffects::Write>(effect.getEffect()))
-      effectType = "Write";
-    else if (isa<MemoryEffects::Allocate>(effect.getEffect()))
-      effectType = "Allocate";
-    else if (isa<MemoryEffects::Free>(effect.getEffect()))
-      effectType = "Free";
-    else
-      effectType = "Unknown";
-
-    llvm::StringRef resourceName = effect.getResource()->getName();
-    LDBG("  Op '" << op->getName() << "' has effect: " << effectType
-                  << " on resource: " << resourceName);
-  }
+  return;
 }
 
 /// Find the end boundary op for the critical region.
@@ -274,7 +273,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
       return nullptr;
     }
     if (!isMemoryEffectFree(curOp)) {
-      LDBG("Found op with memory effects:");
+      LDBG("Found op with memory effects: " << curOp->getName());
       dumpMemoryEffects(curOp);
       return curOp;
     }
@@ -328,34 +327,21 @@ Operation *lastOpInBlock(llvm::ArrayRef<Operation *> endOps) {
 }
 
 /// Returns the partition ID that contains the keyOp that occurs first.
-/// Ordering is determined by:
-///   1. Stage number (lower stage executes first)
-///   2. Cluster number (lower cluster executes first if same stage)
-///   3. Program order (isBeforeInBlock if same stage and cluster)
-int arrivesFirst(llvm::ArrayRef<Operation *> keyOps) {
+int arrivesFirst(scf::ForOp forOp, triton::CoarseSchedule schedule,
+                 llvm::ArrayRef<Operation *> keyOps) {
   assert(llvm::all_of(
              keyOps, [&](Operation *op) { return ttg::getStageCluster(op); }) &&
          "Loop stage and cluster not found for all key ops");
 
-  auto it = llvm::min_element(keyOps, [](Operation *a, Operation *b) {
-    auto scA = ttg::getStageCluster(a);
-    auto scB = ttg::getStageCluster(b);
+  // Find the earliest critical op in the schedule
+  Operation *firstOp =
+      *llvm::min_element(keyOps, [&](Operation *a, Operation *b) {
+        return schedule.isOpBefore(a, b);
+      });
 
-    int stageA = scA->first;
-    int stageB = scB->first;
-    int clusterA = scA->second;
-    int clusterB = scB->second;
-    if (stageA == stageB) {
-      if (clusterA == clusterB) {
-        return a->isBeforeInBlock(b);
-      } else {
-        return clusterA < clusterB;
-      }
-    } else {
-      return stageA < stageB;
-    }
-  });
-  return getSingleTaskId(*it);
+  assert(firstOp && "Failed to find the earliest op in the schedule");
+  int firstPartitionId = getSingleTaskId(firstOp);
+  return firstPartitionId;
 }
 
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
@@ -438,6 +424,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 
     // Find the start and end ops for each key operation in the pingpong region
     bool foundNullEndOp = false;
+    int arrivesFirstPartitionId = -1;
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       if (partitionId != -1) {
@@ -455,19 +442,26 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
           LDBG("numWarps of " << partitionId << " is "
                               << numWarps[partitionId]);
         }
+        // Get the first partition id from the attribute
+        if (auto attr = keyOp->getAttrOfType<IntegerAttr>(
+                "pingpong_first_partition_id")) {
+          arrivesFirstPartitionId = attr.getInt();
+        }
       }
     }
     if (foundNullEndOp)
       continue;
 
+    if (arrivesFirstPartitionId == -1) {
+      LDBG("pingpong_first_partition_id attribute not found");
+      continue;
+    }
+    LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
+
     if (startOps.size() != 2 || endOps.size() != 2 || numWarps.size() != 2) {
       LDBG("pingpong ops are not in two partitions");
       continue;
     }
-
-    // Find which partition arrives first
-    int arrivesFirstPartitionId = arrivesFirst(keyOps);
-    LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
 
     int numberOfThreads = 0;
     for (auto [partitionId, startOp] : startOps) {
@@ -597,7 +591,7 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 
 /// doPingPongPrep pass: Group expensive ops into pingpong regions
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
-                    int capability) {
+                    int capability, int defaultNumStages) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   capability = getNVIDIAComputeCapability(moduleOp);
 
@@ -608,7 +602,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   // Each group contains ops at the same pingpong region.
   llvm::SmallVector<llvm::SmallVector<Operation *, 4>> expensiveOps;
 
-  // Scan all operations in the function to find expensive ops
+  // Step 1: Group find expensive ops into pingpong regions
   funcOp.walk([&](Operation *op) {
     if (!crManager.isExpensiveOp(op, capability))
       return;
@@ -664,26 +658,65 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   // pingpong region ID
   unsigned pingpongID = 0;
 
-  // Assign pingpong region IDs to groups
+  // Step 2: Assign pingpong region ID to each group
   for (auto &group : expensiveOps) {
-    // Count the number of distinct partitions in the group
+    // The number of distinct partitions in the group
     llvm::SmallDenseSet<int, 4> partitionIds;
+    // The parent scf::ForOp for the critical ops
+    scf::ForOp forOp = nullptr;
     for (auto *op : group) {
       int taskId = getSingleTaskId(op);
       if (taskId != -1)
         partitionIds.insert(taskId);
+      // ops share control flow, so taking the last parent ForOp is safe
+      if (auto parentFor = op->getParentOfType<scf::ForOp>())
+        forOp = parentFor;
     }
 
     // Only handle pingpong for the case of 2 different partitions
     if (partitionIds.size() != 2)
       continue;
 
+    // Only handle pingpong when inside loops
+    if (!forOp) {
+      LDBG("No parent ForOp found, skipping this critical region.");
+      continue;
+    }
+
+    // Extract the schedule from the parent ForOp
+    triton::CoarseSchedule schedule;
+    if (failed(schedule.deSerialize(forOp))) {
+      LDBG("No schedule found, re-running scheduleLoops");
+
+      // Get the parent ModuleOp
+      auto moduleOp = forOp->getParentOfType<ModuleOp>();
+
+      // Re-run scheduling for all loops in the module
+      int numStages = triton::getNumStagesOrDefault(forOp, defaultNumStages);
+      bool useMetaWS = true; // or false depending on your use case
+      triton::gpu::scheduleLoops(moduleOp, numStages, useMetaWS);
+
+      // Now try deserializing again
+      if (failed(schedule.deSerialize(forOp))) {
+        LDBG("Still failed after re-running scheduleLoops, skipping");
+        continue;
+      }
+    }
+
+    // Find which partition has ops that arrive first
+    int arrivesFirstPartitionId = arrivesFirst(forOp, schedule, group);
+
     for (auto *op : group) {
       op->setAttr(
           "pingpong_id",
           IntegerAttr::get(IntegerType::get(op->getContext(), 32), pingpongID));
+      op->setAttr("pingpong_first_partition_id",
+                  IntegerAttr::get(IntegerType::get(op->getContext(), 32),
+                                   arrivesFirstPartitionId));
       LDBG("Assign pingpong_id " << pingpongID << " to op '" << op->getName()
-                                 << "' with task_id " << getSingleTaskId(op));
+                                 << "' with task_id " << getSingleTaskId(op)
+                                 << ", first_partition_id "
+                                 << arrivesFirstPartitionId);
     }
     pingpongID++;
   }
@@ -699,7 +732,7 @@ public:
       NVGPUTestPingPongPrepPass>::NVGPUTestPingPongPrepBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    doPingPongPrep(funcOp, numWarpGroups, capability);
+    doPingPongPrep(funcOp, numWarpGroups, capability, numStages);
   }
 
   void runOnOperation() override {
