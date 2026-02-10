@@ -1,10 +1,8 @@
-import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -608,127 +606,53 @@ class _attention(torch.autograd.Function):
         return o
 
 
-attention = _attention.apply
+def attention(q, k, v, sm_scale, causal, config=None):
+    if config is None:
+        return _attention.apply(q, k, v, sm_scale, causal)
 
+    # Non-autotuned path with explicit config
+    HEAD_DIM_K = q.shape[-1]
+    stage = 3 if causal else 1
+    o = torch.empty_like(q)
+    M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+    y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
-@pytest.mark.skipif(
-    not is_blackwell(),
-    reason="Requires Blackwell GPU",
-)
-@pytest.mark.parametrize("Z", [8])
-@pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024])
-@pytest.mark.parametrize("HEAD_DIM", [128])
-@pytest.mark.parametrize("mode", ["fwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("causal", [True, False])
-def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, causal, dtype=torch.float16):
-    if mode == "bwd":
-        pytest.skip("Backward pass not supported.")
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    sm_scale = 0.5
-    # reference implementation
-    ref_dtype = dtype
-    if mode == "fwd" and "fp8" in provider:
-        ref_dtype = torch.float32
-    q = q.to(ref_dtype)
-    k = k.to(ref_dtype)
-    v = v.to(ref_dtype)
-    ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
-    # triton implementation
-    if mode == "fwd" and "fp8" in provider:
-        q = q.to(torch.float8_e5m2)
-        k = k.to(torch.float8_e5m2)
-        v = v.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2)
-        v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, sm_scale, causal).half()
-    if mode == "fwd":
-        atol = 3 if "fp8" in provider else 1e-2
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
-        return
-
-
-try:
-    from flash_attn.flash_attn_interface import (
-        flash_attn_qkvpacked_func as flash_attn_func, )
-
-    HAS_FLASH = True
-except BaseException:
-    HAS_FLASH = False
-
-TORCH_HAS_FP8 = False
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
-print(N_HEADS)
-# vary seq length for fixed head and batch=4
-configs = []
-configs.append(
-    triton.testing.Benchmark(
-        x_names=["N_CTX"],
-        x_vals=[2**i for i in range(10, 15)],
-        line_arg="provider",
-        line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-        line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
-        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-        ylabel="TFLOPS",
-        plot_name=f"fused-attention-ws-persistent-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
-        args={
-            "H": N_HEADS,
-            "BATCH": BATCH,
-            "HEAD_DIM": HEAD_DIM,
-            "mode": "fwd",
-        },
-    ))
-
-
-@triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
-    assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
-    if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        if mode == "fwd" and "fp8" in provider:
-            q = q.to(torch.float8_e5m2)
-            k = k.to(torch.float8_e5m2)
-            v = v.permute(0, 1, 3, 2).contiguous()
-            v = v.permute(0, 1, 3, 2)
-            v = v.to(torch.float8_e5m2)
-        sm_scale = 1.3
-        fn = lambda: attention(q, k, v, sm_scale)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-
-    if provider == "flash":
-        qkv = torch.randn(
-            (BATCH, N_CTX, 3, H, HEAD_DIM),
-            dtype=dtype,
-            device=device,
-            requires_grad=True,
-        )
-        fn = lambda: flash_attn_func(qkv)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-    total_flops = 2 * flops_per_matmul
-    if mode == "bwd":
-        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
-    return total_flops * 1e-12 / (ms * 1e-3)
-
-
-if __name__ == "__main__":
-    if is_blackwell():
-        print("Running benchmarks...")
-        bench_flash_attention.run(print_data=True)
+    dummy_block = [1, 1]
+    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    if q.dtype == torch.float8_e5m2:
+        desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1], block_shape=dummy_block)
     else:
-        print("Skipping benchmarks, no Blackwell GPU found.")
+        desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+
+    # Apply pre_hook to set block shapes
+    nargs = {
+        **config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o,
+        "FP8_OUTPUT": q.dtype == torch.float8_e5m2
+    }
+    _host_descriptor_pre_hook(nargs)
+
+    def alloc_fn(size: int, align: int, _):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    grid = (min(NUM_SMS, triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
+    _attn_fwd_ws.fn[grid](
+        sm_scale,
+        M,
+        q.shape[0],
+        q.shape[1],
+        desc_q,
+        desc_k,
+        desc_v,
+        desc_o,
+        N_CTX=q.shape[2],
+        HEAD_DIM=HEAD_DIM_K,
+        FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+        STAGE=stage,
+        **config,
+    )
+    return o

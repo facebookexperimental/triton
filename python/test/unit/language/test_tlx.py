@@ -2497,8 +2497,15 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel_with_cache_hint(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr,
-                                               BLOCK_SIZE_N: tl.constexpr, EVICTION_POLICY: tl.constexpr):
+    def descriptor_load_kernel_with_cache_hint(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -2555,6 +2562,93 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
 
     if eviction_policy:
         # Check for L2 cache policy creation and cache hint modifier
+        assert "createpolicy.fractional.L2" in ptx
+        assert "L2::cache_hint" in ptx
+    else:
+        # Normal/default policy should NOT have L2 cache hint
+        assert "createpolicy.fractional.L2" not in ptx
+        assert "L2::cache_hint" not in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("eviction_policy", ["", "evict_first", "evict_last"])
+def test_descriptor_store_l2_cache_hint(eviction_policy, device):
+    """Test that TMA stores with L2 cache hint generate correct PTX."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        # Load without cache hint
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        # Store with eviction policy
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], eviction_policy=EVICTION_POLICY)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                           EVICTION_POLICY=eviction_policy)
+
+    # Verify the TMA store is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_local_to_global") == 1
+    if eviction_policy:
+        assert f"evictionPolicy = {eviction_policy}" in ttgir
+
+    # Verify PTX output
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.tensor" in ptx
+    if eviction_policy in ("evict_first", "evict_last"):
+        # Should have L2 cache hint in PTX
         assert "createpolicy.fractional.L2" in ptx
         assert "L2::cache_hint" in ptx
     else:
@@ -4522,10 +4616,10 @@ class TestLocalAllocWithStorageAliasSpec:
         from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
 
         sig = inspect.signature(local_alloc_func)
-        reuse_param = sig.parameters['reuse']
+        reuse_param = sig.parameters["reuse"]
         # The annotation should include Union or | with both types
         annotation_str = str(reuse_param.annotation)
-        assert 'buffered_tensor' in annotation_str or 'tlx.buffered_tensor' in annotation_str
+        assert "buffered_tensor" in annotation_str or "tlx.buffered_tensor" in annotation_str
 
     def test_local_alloc_reuse_type_check_storage_alias_spec(self):
         """Verify local_alloc accepts storage_alias_spec in reuse (new behavior)."""
@@ -4533,10 +4627,10 @@ class TestLocalAllocWithStorageAliasSpec:
         from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
 
         sig = inspect.signature(local_alloc_func)
-        reuse_param = sig.parameters['reuse']
+        reuse_param = sig.parameters["reuse"]
         # The annotation should include Union or | with both types
         annotation_str = str(reuse_param.annotation)
-        assert 'storage_alias_spec' in annotation_str or 'tlx.storage_alias_spec' in annotation_str
+        assert "storage_alias_spec" in annotation_str or "tlx.storage_alias_spec" in annotation_str
 
     def test_reuse_storage_mismatch_error_message(self):
         """Verify helpful error message when storage kinds don't match."""
@@ -4670,3 +4764,364 @@ class TestToMxfp8:
         ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
         torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
         assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_thread_safety(device):
+    """Verify that concurrent compilation of warp-specialized kernels is thread-safe.
+
+    The TLX code generator uses thread-local storage for region_replica_id_stack
+    and sub_region_has_exception. This test compiles two different kernels using
+    async_tasks() + async_task_replica_id() from separate threads simultaneously
+    to verify no cross-thread state corruption occurs.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    @triton.jit
+    def ws_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + y + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + y + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
+    def ws_mul_kernel(
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = a * b + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = a * b + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    size = 98432
+    BLOCK_SIZE = 1024
+
+    def compile_and_run_add():
+        torch.manual_seed(42)
+        x = torch.rand(size, device=device)
+        y = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_add_kernel[grid](x, y, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, x + y, check_dtype=False)
+        return True
+
+    def compile_and_run_mul():
+        torch.manual_seed(43)
+        a = torch.rand(size, device=device)
+        b = torch.rand(size, device=device)
+        out = torch.empty_like(a)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_mul_kernel[grid](a, b, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, a * b, check_dtype=False)
+        return True
+
+    # Use 4 workers: 2 run ws_add_kernel, 2 run ws_mul_kernel.
+    # This tests both different-kernel and same-kernel concurrent compilation.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(compile_and_run_add),
+            executor.submit(compile_and_run_mul),
+            executor.submit(compile_and_run_add),
+            executor.submit(compile_and_run_mul),
+        ]
+        for future in as_completed(futures):
+            assert future.result() is True
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_thread_exception_isolation(device):
+    """Verify that a compilation exception in one thread doesn't affect others."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    @triton.jit
+    def ws_good_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
+    def ws_bad_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            # Missing "default" task — this should fail during compilation
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                tl.store(out_ptr + offsets, x, mask=mask)
+
+    size = 98432
+    BLOCK_SIZE = 1024
+
+    def compile_and_run_good():
+        x = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_good_kernel[grid](x, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, x, check_dtype=False)
+        return True
+
+    def compile_and_run_bad():
+        x = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        try:
+            ws_bad_kernel[grid](x, out, n, BLOCK_SIZE, num_warps=4)
+        except Exception:
+            pass  # Expected to fail
+        return True
+
+    # Run bad kernel first to set exception flag, then verify good kernel
+    # still works on a thread that may be reused from the pool.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # Submit bad first, then good
+        bad_future = executor.submit(compile_and_run_bad)
+        bad_future.result()  # Wait for bad to finish
+        good_future = executor.submit(compile_and_run_good)
+        assert good_future.result() is True
+
+
+class TestReuseGroupType:
+    """Tests for tlx.reuse_group_type enum."""
+
+    def test_reuse_group_type_values(self):
+        assert tlx.reuse_group_type.shared.value == "shared"
+        assert tlx.reuse_group_type.distinct.value == "distinct"
+
+    def test_reuse_group_type_enum_members(self):
+        # Verify all expected members exist
+        members = list(tlx.reuse_group_type)
+        assert len(members) == 2
+        assert tlx.reuse_group_type.shared in members
+        assert tlx.reuse_group_type.distinct in members
+
+
+def _make_test_storage_alias_spec(storage: tlx.storage_kind = tlx.storage_kind.smem):
+    """Helper to create a storage_alias_spec for testing reuse_group."""
+    return tlx.storage_alias_spec_type_class(handle=None, storage=storage)
+
+
+def _make_test_buffered_tensor(storage: tlx.storage_kind = tlx.storage_kind.smem):
+    """Helper to create a buffered_tensor for testing reuse_group."""
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=2)
+    return tlx.buffered_tensor(
+        handle=None,
+        element_ty=tl.float32,
+        shape=[64, 64],
+        num=2,
+        storage=storage,
+        layout=layout,
+    )
+
+
+class TestReuseGroup:
+    """Tests for tlx.reuse_group class."""
+
+    def test_reuse_group_basic_shared(self):
+        """Test basic reuse_group creation with shared type."""
+        elem1 = _make_test_buffered_tensor()
+        elem2 = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem1,
+            elem2,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        assert group.args == (elem1, elem2)
+        assert group.group_type == tlx.reuse_group_type.shared
+
+    def test_reuse_group_basic_distinct(self):
+        """Test basic reuse_group creation with distinct type."""
+        elem1 = _make_test_buffered_tensor()
+        elem2 = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem1,
+            elem2,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        assert group.args == (elem1, elem2)
+        assert group.group_type == tlx.reuse_group_type.distinct
+
+    def test_reuse_group_single_element(self):
+        """Test reuse_group with a single element."""
+        elem = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        assert len(group.args) == 1
+        assert group.args[0] is elem
+
+    def test_reuse_group_multiple_elements(self):
+        """Test reuse_group with more than 2 elements."""
+        elems = tuple(_make_test_buffered_tensor() for _ in range(4))
+        group = tlx.reuse_group(
+            *elems,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        assert group.args == elems
+        assert len(group.args) == 4
+
+    def test_reuse_group_nested(self):
+        """Test nested reuse_group (Flash Attention pattern)."""
+        # Inner group: distinct elements
+        p = _make_test_buffered_tensor()
+        alpha = _make_test_buffered_tensor()
+        inner_group = tlx.reuse_group(
+            p,
+            alpha,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+
+        # Outer group: shared with inner group
+        qk = _make_test_buffered_tensor()
+        outer_group = tlx.reuse_group(
+            qk,
+            inner_group,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        assert outer_group.group_type == tlx.reuse_group_type.shared
+        assert len(outer_group.args) == 2
+        assert outer_group.args[0] is qk
+        assert outer_group.args[1] is inner_group
+        assert inner_group.group_type == tlx.reuse_group_type.distinct
+
+    def test_reuse_group_deeply_nested(self):
+        """Test 3-level nested reuse_group."""
+        # Level 3 (innermost)
+        c = _make_test_buffered_tensor()
+        d = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            c,
+            d,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        # Level 2
+        b = _make_test_buffered_tensor()
+        middle = tlx.reuse_group(
+            b,
+            inner,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+
+        # Level 1 (outermost)
+        a = _make_test_buffered_tensor()
+        outer = tlx.reuse_group(
+            a,
+            middle,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        assert outer.group_type == tlx.reuse_group_type.shared
+        assert outer.args[1].group_type == tlx.reuse_group_type.distinct
+        assert outer.args[1].args[1].group_type == tlx.reuse_group_type.shared
+
+    def test_reuse_group_empty_args_raises_error(self):
+        """Test reuse_group raises error with empty args tuple."""
+        with pytest.raises(ValueError, match="at least one element"):
+            tlx.reuse_group(group_type=tlx.reuse_group_type.shared, )
+
+    def test_reuse_group_nested_same_type_shared_raises_error(self):
+        """Test that nesting shared inside shared raises an error."""
+        elem = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        with pytest.raises(ValueError, match="same group_type"):
+            tlx.reuse_group(
+                inner,
+                group_type=tlx.reuse_group_type.shared,
+            )
+
+    def test_reuse_group_nested_same_type_distinct_raises_error(self):
+        """Test that nesting distinct inside distinct raises an error."""
+        elem = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        with pytest.raises(ValueError, match="same group_type"):
+            tlx.reuse_group(
+                inner,
+                group_type=tlx.reuse_group_type.distinct,
+            )
+
+    def test_reuse_group_invalid_element_type_raises_error(self):
+        """Test that invalid element types raise TypeError."""
+        with pytest.raises(TypeError, match="must be buffered_tensor or reuse_group"):
+            tlx.reuse_group(
+                "invalid",
+                group_type=tlx.reuse_group_type.shared,
+            )

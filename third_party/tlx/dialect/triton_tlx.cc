@@ -541,6 +541,34 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<tlx::StorageAliasSpecOp>(
                  resultType, storageAttr, bufferSizeAttr, bufferShapeAttr);
            })
+      .def("create_reuse_group",
+           [](TritonOpBuilder &self, const std::vector<mlir::Value> &elements,
+              const std::string &groupKind) -> mlir::Value {
+             auto context = self.getBuilder().getContext();
+
+             // Parse group kind
+             tlx::ReuseGroupKind groupKindEnum;
+             if (groupKind == "shared") {
+               groupKindEnum = tlx::ReuseGroupKind::shared;
+             } else if (groupKind == "distinct") {
+               groupKindEnum = tlx::ReuseGroupKind::distinct;
+             } else {
+               throw std::invalid_argument("Unknown group_kind: " + groupKind +
+                                           ", expected 'shared' or 'distinct'");
+             }
+
+             // Create the result type
+             auto resultType = tlx::ReuseGroupType::get(context, groupKindEnum);
+
+             // Create the group_kind attribute
+             auto groupKindAttr =
+                 tlx::ReuseGroupKindAttr::get(context, groupKindEnum);
+
+             // Create the operation (no storage_alias_spec - that's handled by
+             // set_buffer_overlap)
+             return self.create<tlx::ReuseGroupOp>(resultType, elements,
+                                                   groupKindAttr);
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {
@@ -610,9 +638,9 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
-              Value source) -> void {
-             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord,
-                                                            source);
+              Value source, tt::EvictionPolicy evictionPolicy) -> void {
+             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord, source,
+                                                            evictionPolicy);
            })
       .def("create_async_TMA_store_wait",
            [](TritonOpBuilder &self, int pendings) {
@@ -737,8 +765,21 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXPrintTTGIRToTLX);
   ADD_PASS_WRAPPER_0("add_tlx_storage_alias_lowering",
                      tlx::createTLXStorageAliasLowering);
-  ADD_PASS_OPTION_WRAPPER_4("add_triton_tlx_fixup", tlx::createTritonTLXFixup,
-                            std::string, int32_t, int32_t, int32_t);
+  // Custom wrapper for TritonTLXFixup to handle cluster_dims as vector
+  //  ADD_PASS_WRAPPER_5 cannot handle the clusterDims list
+  m.def("add_triton_tlx_fixup",
+        [](mlir::PassManager &pm, std::string target, int32_t numWarps,
+           int32_t threadsPerWarp, int32_t numCTAs,
+           std::vector<int32_t> clusterDims) {
+          tlx::TritonTLXFixupOptions options;
+          options.target = target;
+          options.numWarps = numWarps;
+          options.threadsPerWarp = threadsPerWarp;
+          options.numCTAs = numCTAs;
+          // SmallVector doesn't have operator= for std::vector, use assign()
+          options.clusterDims.assign(clusterDims.begin(), clusterDims.end());
+          pm.addPass(tlx::createTritonTLXFixup(options));
+        });
 }
 
 void init_triton_tlx(py::module &&m) {
