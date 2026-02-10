@@ -5125,3 +5125,124 @@ class TestReuseGroup:
                 "invalid",
                 group_type=tlx.reuse_group_type.shared,
             )
+
+
+class TestToMxfp8:
+    """Tests for the _to_mxfp8_block library function callable from JIT code with VEC_SIZE=32."""
+
+    @staticmethod
+    def _reference_mxfp8_quantize(data, vec_size, torch_dtype):
+        """Python reference for MXFP8 quantization matching _compute_scale_and_quantize.
+
+        Returns:
+            scale_e8m0: uint8 tensor [M, K // vec_size]
+            data_fp8: fp8 tensor [M, K]
+        """
+        fp8_max = torch.finfo(torch_dtype).max
+        M, K = data.shape
+        num_scales = K // vec_size
+        data_f32 = data.float()
+        data_reshaped = data_f32.reshape(M, num_scales, vec_size)
+        max_abs = data_reshaped.abs().amax(dim=2)
+        descale = max_abs / fp8_max
+        log2_descale = torch.log2(descale)
+        ceil_log2 = torch.ceil(log2_descale)
+        clamped_exp = torch.clamp(ceil_log2, -127.0, 127.0)
+        is_zero = descale < 1e-38
+        biased_exp = torch.where(is_zero, torch.zeros_like(clamped_exp), clamped_exp + 127)
+        scale_e8m0 = biased_exp.to(torch.uint8)
+        descale_fp = torch.where(
+            biased_exp == 0,
+            torch.ones_like(biased_exp),
+            torch.exp2(127 - biased_exp),
+        )
+        scaled_data = data_reshaped * descale_fp.unsqueeze(2)
+        scaled_data = torch.clamp(scaled_data, -fp8_max, fp8_max)
+        data_flat = scaled_data.reshape(M, K)
+        data_fp8 = data_flat.to(torch_dtype)
+        return scale_e8m0, data_fp8
+
+    @staticmethod
+    def _reference_swizzle_scales(scales):
+        """Swizzle [128, 4] uint8 -> [512] uint8 matching _online_swizzle_prefill."""
+        return scales.reshape(4, 32, 4).permute(1, 0, 2).reshape(512).contiguous()
+
+    @staticmethod
+    def _run_to_mxfp8_block(input_data, elem_dtype, device):
+        """Run _to_mxfp8_block in a JIT kernel and return FP8 data and swizzled scales."""
+        torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
+        M, K, VEC_SIZE = 128, 128, 32
+
+        @triton.jit
+        def kernel(
+            input_ptr,
+            data_out_ptr,
+            scale_out_ptr,
+            BLOCK_M: tl.constexpr,
+            BLOCK_K: tl.constexpr,
+            VEC_SIZE: tl.constexpr,
+            ELEM_DTYPE: tl.constexpr,
+        ):
+            offs_m = tl.arange(0, BLOCK_M)
+            offs_k = tl.arange(0, BLOCK_K)
+            data = tl.load(input_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+            if ELEM_DTYPE == "e4m3":
+                fp8_type: tl.constexpr = tl.float8e4nv
+            else:
+                fp8_type: tl.constexpr = tl.float8e5
+            data_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), fp8_type, tl.constexpr(1))
+            scale_tile = tlx.local_alloc((1, 1, 1, 2, 256), tl.uint8, tl.constexpr(1))
+            tlx._to_mxfp8_block(data, data_tile[0], scale_tile[0], VEC_SIZE, fp8_type)
+            data_fp8 = tlx.local_load(data_tile[0])
+            tl.store(data_out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], data_fp8)
+            scale_loaded = tlx.local_load(scale_tile[0])
+            scale_flat = tl.reshape(scale_loaded, [512])
+            tl.store(scale_out_ptr + tl.arange(0, 512), scale_flat)
+
+        data_out = torch.empty(M, K, dtype=torch_dtype, device=device)
+        scale_out = torch.empty(512, dtype=torch.uint8, device=device)
+        kernel[(1, )](input_data, data_out, scale_out, M, K, VEC_SIZE, elem_dtype)
+        return data_out, scale_out
+
+    @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+    @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
+    def test_to_mxfp8_block_uniform(self, elem_dtype, device):
+        """Test _to_mxfp8_block with uniform 1.0 input and VEC_SIZE=32."""
+        torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
+        M, K, VEC = 128, 128, 32
+        input_data = torch.ones(M, K, dtype=torch.float32, device=device)
+
+        data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
+
+        ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
+        ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
+        torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
+        assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
+
+    @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+    @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
+    def test_to_mxfp8_block_zeros(self, elem_dtype, device):
+        """Test _to_mxfp8_block with all-zero input."""
+        M, K = 128, 128
+        input_data = torch.zeros(M, K, dtype=torch.float32, device=device)
+
+        data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
+
+        assert torch.all(data_out.float() == 0)
+        assert torch.all(scale_out == 0)
+
+    @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+    @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
+    def test_to_mxfp8_block_random(self, elem_dtype, device):
+        """Test _to_mxfp8_block with random data against Python reference."""
+        torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
+        M, K, VEC = 128, 128, 32
+        torch.manual_seed(42)
+        input_data = torch.randn(M, K, dtype=torch.float32, device=device) * 100
+
+        data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
+
+        ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
+        ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
+        torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
+        assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
