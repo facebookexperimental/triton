@@ -412,6 +412,68 @@ struct CLCQueryCancelOpConversion
     return success();
   }
 };
+
+struct VoteBallotSyncOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::VoteBallotSyncOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::VoteBallotSyncOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::VoteBallotSyncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    Type predType = op.getPred().getType();
+
+    // Scalar case: simple pass-through to NVVM
+    if (!isa<RankedTensorType>(predType)) {
+      Value result = rewriter.create<NVVM::VoteSyncOp>(
+          loc, rewriter.getI32Type(), adaptor.getMask(), adaptor.getPred(),
+          NVVM::VoteSyncKind::ballot);
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    // Tensor case: unpack elements, apply ballot to each, pack results
+    auto predTensorType = cast<RankedTensorType>(predType);
+    auto resultType = op.getResult().getType();
+
+    // Unpack the tensor predicate elements - each thread owns some elements
+    SmallVector<Value> predElems =
+        unpackLLElements(loc, adaptor.getPred(), rewriter);
+
+    // For vote_ballot_sync with tensor predicates:
+    // 1. First, OR all local predicate elements together to get a single bool
+    // 2. Apply the ballot operation once with the combined predicate
+    // 3. Replicate the result to all elements of the output tensor
+
+    TritonLLVMOpBuilder b(loc, rewriter);
+
+    // Combine all local predicate elements with OR
+    Value combinedPred;
+    if (predElems.empty()) {
+      combinedPred = b.i1_val(false);
+    } else {
+      combinedPred = predElems[0];
+      for (size_t i = 1; i < predElems.size(); ++i) {
+        combinedPred = b.or_(combinedPred, predElems[i]);
+      }
+    }
+
+    // Perform the warp-level ballot with the combined predicate
+    Value ballot = rewriter.create<NVVM::VoteSyncOp>(
+        loc, rewriter.getI32Type(), adaptor.getMask(), combinedPred,
+        NVVM::VoteSyncKind::ballot);
+
+    // Replicate the ballot result to all elements of the output tensor
+    SmallVector<Value> resultElems(predElems.size(), ballot);
+
+    // Pack results back into tensor
+    Value packedResult = packLLElements(loc, getTypeConverter(), resultElems,
+                                        rewriter, resultType);
+    rewriter.replaceOp(op, packedResult);
+    return success();
+  }
+};
 } // namespace
 
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
@@ -427,4 +489,5 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);
   patterns.add<AsyncCLCTryCancelOpConversion>(typeConverter, benefit);
   patterns.add<CLCQueryCancelOpConversion>(typeConverter, benefit);
+  patterns.add<VoteBallotSyncOpConversion>(typeConverter, benefit);
 }

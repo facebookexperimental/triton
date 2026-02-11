@@ -223,6 +223,62 @@ LogicalResult ArriveBarrierOp::verify() {
   return success();
 }
 
+// -- VoteBallotSyncOp --
+LogicalResult VoteBallotSyncOp::verify() {
+  Type predType = getPred().getType();
+  Type resultType = getResult().getType();
+
+  bool predIsTensor = isa<RankedTensorType>(predType);
+  bool resultIsTensor = isa<RankedTensorType>(resultType);
+
+  // Both must be scalars or both must be tensors
+  if (predIsTensor != resultIsTensor) {
+    return emitOpError("predicate and result must both be scalars or both be "
+                       "tensors, got pred=")
+           << predType << " and result=" << resultType;
+  }
+
+  if (predIsTensor) {
+    auto predTensorType = cast<RankedTensorType>(predType);
+    auto resultTensorType = cast<RankedTensorType>(resultType);
+
+    // Check element types
+    if (!predTensorType.getElementType().isInteger(1)) {
+      return emitOpError("tensor predicate must have i1 element type, got ")
+             << predTensorType.getElementType();
+    }
+    if (!resultTensorType.getElementType().isInteger(32)) {
+      return emitOpError("tensor result must have i32 element type, got ")
+             << resultTensorType.getElementType();
+    }
+
+    // Shapes must match
+    if (predTensorType.getShape() != resultTensorType.getShape()) {
+      return emitOpError("predicate and result tensor shapes must match, got ")
+             << predTensorType.getShape() << " vs "
+             << resultTensorType.getShape();
+    }
+
+    // Encodings must match (if present)
+    if (predTensorType.getEncoding() != resultTensorType.getEncoding()) {
+      return emitOpError(
+                 "predicate and result tensor encodings must match, got ")
+             << predTensorType.getEncoding() << " vs "
+             << resultTensorType.getEncoding();
+    }
+  } else {
+    // Scalar case
+    if (!predType.isInteger(1)) {
+      return emitOpError("scalar predicate must be i1, got ") << predType;
+    }
+    if (!resultType.isInteger(32)) {
+      return emitOpError("scalar result must be i32, got ") << resultType;
+    }
+  }
+
+  return success();
+}
+
 // -- AsyncTMACopyGlobalToLocalOp --
 LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
   if (failed(verifyBarrierType(*this, getBarrier().getType())))
