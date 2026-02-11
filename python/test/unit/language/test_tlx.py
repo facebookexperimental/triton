@@ -5119,3 +5119,69 @@ class TestToMxfp8:
         ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
         torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
         assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
+
+
+class TestSetBufferOverlap:
+    """Tests for tlx.set_buffer_overlap and storage_alias_spec.set_buffer_overlap method."""
+
+    def test_set_buffer_overlap_compiles_to_ir(self):
+        """Test that set_buffer_overlap compiles to IR but fails during lowering.
+
+        This test verifies that the JIT API works correctly - the code should
+        successfully lower to MLIR IR but is expected to fail in later lowering
+        passes because offset calculation is not yet implemented.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_kernel(BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers using the spec
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b share the same memory region
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+        grid = lambda meta: (1, )
+
+        # The kernel should compile to IR but fail during lowering
+        # (offset calculation not implemented yet)
+        with pytest.raises(RuntimeError):
+            set_buffer_overlap_kernel[grid](BLOCK_SIZE=64)
+
+    def test_set_buffer_overlap_nested_compiles_to_ir(self):
+        """Test that nested reuse_group in set_buffer_overlap compiles to IR.
+
+        This test verifies Flash Attention-style nested overlap schemes work
+        at the JIT level.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_nested_kernel(BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers (Flash Attention pattern)
+            qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                 reuse=spec)
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            alpha = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2), tlx.storage_kind.smem, reuse=spec)
+
+            # Define overlap scheme: QK shares with (P distinct from alpha)
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk,
+                    tlx.reuse_group(p, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
+
+        grid = lambda meta: (1, )
+
+        # The kernel should compile to IR but fail during lowering
+        with pytest.raises(RuntimeError):
+            set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)

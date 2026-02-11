@@ -569,6 +569,13 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<tlx::ReuseGroupOp>(resultType, elements,
                                                    groupKindAttr);
            })
+      .def("create_set_buffer_overlap",
+           [](TritonOpBuilder &self, mlir::Value storageAliasSpec,
+              mlir::Value overlapDef) -> void {
+             // Create the set_buffer_overlap operation
+             // This links the storage_alias_spec to the reuse_group tree
+             self.create<tlx::SetBufferOverlapOp>(storageAliasSpec, overlapDef);
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {

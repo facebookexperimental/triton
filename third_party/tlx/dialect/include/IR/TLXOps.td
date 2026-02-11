@@ -180,6 +180,61 @@ def TLX_ReuseGroupOp : TLX_Op<"reuse_group", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Set Buffer Overlap Operation
+//===----------------------------------------------------------------------===//
+
+def TLX_SetBufferOverlapOp : TLX_Op<"set_buffer_overlap", []> {
+  let summary = "Define the buffer overlap scheme for a storage alias spec";
+
+  let description = [{
+    Defines the buffer overlap scheme for allocations using a storage alias spec.
+    This operation links a storage_alias_spec to its overlap definition (a reuse_group).
+
+    The compiler will use this information in subsequent passes to:
+    1. Validate that the overlap scheme is achievable
+    2. Compute buffer offsets to satisfy the overlap requirements
+
+    This operation is eliminated during the ReusedBufferOffsetCalculationPass
+    after offsets have been computed and applied.
+
+    Constraints:
+    - All leaf elements in the reuse_group tree must be allocated from the
+      same storage_alias_spec via tlx.storage_alias_local_alloc
+    - All elements must use the same storage kind (smem or tmem)
+    - This operation should appear after all local_alloc operations that
+      reference the storage_alias_spec
+
+    Example:
+    ```mlir
+    %spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %qk = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<...>
+    %p = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<...>
+
+    %group = tlx.reuse_group(%qk, %p) group_kind = shared
+             : (!ttg.memdesc<...>, !ttg.memdesc<...>) -> !tlx.reuse_group<shared>
+
+    tlx.set_buffer_overlap(%spec, %group)
+             : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+    ```
+  }];
+
+  let arguments = (ins
+    TLX_StorageAliasSpecType:$storage_alias_spec,
+    TLX_ReuseGroupType:$overlap_def
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `(` $storage_alias_spec `,` $overlap_def `)`
+    `:` `(` qualified(type($storage_alias_spec)) `,` qualified(type($overlap_def)) `)` `->` `(` `)`
+    attr-dict
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // Layout Operations
 //===----------------------------------------------------------------------===//
 
