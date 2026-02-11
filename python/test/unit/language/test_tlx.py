@@ -115,6 +115,173 @@ def test_async_tasks(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("ENABLE_SECOND_TASK", [True, False])
+def test_async_tasks_constexpr_guard(BLOCK_SIZE, ENABLE_SECOND_TASK, device):
+    """Test that a tl.constexpr if-check can guard an async_task within async_tasks.
+
+    The first async_task (default) is always present. The second async_task
+    is conditionally included based on the ENABLE_SECOND_TASK constexpr flag.
+    Both configurations should produce the correct result.
+    """
+
+    @triton.jit
+    def add_kernel_conditional_task(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        ENABLE_SECOND_TASK: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                output = x + y
+                tl.store(z_ptr + offsets, output, mask=mask)
+            if ENABLE_SECOND_TASK:
+                with tlx.async_task(num_warps=1, registers=100):
+                    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < n_elements
+                    a = tl.load(a_ptr + offsets, mask=mask)
+                    b = tl.load(b_ptr + offsets, mask=mask)
+                    output = a + b
+                    tl.store(c_ptr + offsets, output, mask=mask)
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    a = torch.rand(size, device=device)
+    b = torch.rand(size, device=device)
+    output_z = torch.empty_like(x)
+    output_c = torch.empty_like(a)
+    n_elements = output_z.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = add_kernel_conditional_task[grid](
+        x,
+        y,
+        output_z,
+        a,
+        b,
+        output_c,
+        n_elements,
+        BLOCK_SIZE,
+        ENABLE_SECOND_TASK,
+        num_warps=4,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    if ENABLE_SECOND_TASK:
+        assert re.search(r"ttg.warp_specialize",
+                         ttgir), ("Expected warp_specialize in TTGIR when ENABLE_SECOND_TASK=True")
+        assert re.search(r"partition0\([^\n]*\)\s+num_warps\(1\)", ttgir,
+                         flags=re.DOTALL), ("Expected partition0 with num_warps(1) when ENABLE_SECOND_TASK=True")
+    else:
+        assert not re.search(r"ttg.warp_specialize",
+                             ttgir), ("Did not expect warp_specialize in TTGIR when ENABLE_SECOND_TASK=False")
+
+    torch.testing.assert_close(output_z, x + y, check_dtype=False)
+    if ENABLE_SECOND_TASK:
+        torch.testing.assert_close(output_c, a + b, check_dtype=False)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("USE_LARGE_DEFAULT", [True, False])
+def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, device):
+    """Test that a constexpr if/else can select between two different default tasks.
+
+    Both branches of the if/else contain a default async_task, but only one
+    survives constexpr resolution. This exercises the num_default == 1 assertion
+    which must hold after resolution, not before.
+    """
+
+    @triton.jit
+    def kernel_select_default(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        USE_LARGE_DEFAULT: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            if USE_LARGE_DEFAULT:
+                with tlx.async_task("default", registers=200):
+                    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < n_elements
+                    x = tl.load(x_ptr + offsets, mask=mask)
+                    y = tl.load(y_ptr + offsets, mask=mask)
+                    output = x + y
+                    tl.store(z_ptr + offsets, output, mask=mask)
+            else:
+                with tlx.async_task("default", registers=120):
+                    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < n_elements
+                    x = tl.load(x_ptr + offsets, mask=mask)
+                    y = tl.load(y_ptr + offsets, mask=mask)
+                    output = x * y
+                    tl.store(z_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                output = a + b
+                tl.store(c_ptr + offsets, output, mask=mask)
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    a = torch.rand(size, device=device)
+    b = torch.rand(size, device=device)
+    output_z = torch.empty_like(x)
+    output_c = torch.empty_like(a)
+    n_elements = output_z.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = kernel_select_default[grid](
+        x,
+        y,
+        output_z,
+        a,
+        b,
+        output_c,
+        n_elements,
+        BLOCK_SIZE,
+        USE_LARGE_DEFAULT,
+        num_warps=4,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    assert re.search(r"ttg.warp_specialize", ttgir), \
+        "Expected warp_specialize in TTGIR"
+    if USE_LARGE_DEFAULT:
+        assert re.search(r"requestedRegisters = array<i32: 100>", ttgir), \
+            "Expected registers=100 for non-default task"
+        torch.testing.assert_close(output_z, x + y, check_dtype=False)
+    else:
+        assert re.search(r"requestedRegisters = array<i32: 100>", ttgir), \
+            "Expected registers=100 for non-default task"
+        torch.testing.assert_close(output_z, x * y, check_dtype=False)
+    torch.testing.assert_close(output_c, a + b, check_dtype=False)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_local_load(BLOCK_SIZE, device):
 
