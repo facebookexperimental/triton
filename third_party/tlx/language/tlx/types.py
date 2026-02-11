@@ -399,6 +399,7 @@ class reuse_group:
             raise ValueError("reuse_group requires at least one element")
 
         # Validate element types and check for nested same group_type
+        args = tuple(tl._unwrap_if_constexpr(elem) for elem in args)
         for elem in args:
             if isinstance(elem, reuse_group):
                 if elem.group_type == group_type:
@@ -428,27 +429,35 @@ class reuse_group:
         for elem in self._args:
             elem._flatten_ir(handles)
 
+    def to_ir(self, builder) -> ir.value:
+        """
+        Recursively lower this reuse_group tree to IR.
+
+        Args:
+            builder: The IR builder.
+
+        Returns:
+            The IR value representing the reuse_group.
+        """
+        # Collect IR values for elements
+        ir_elements = []
+        for elem in self._args:
+            if isinstance(elem, reuse_group):
+                # Recursively lower nested reuse_group
+                ir_elements.append(elem.to_ir(builder))
+            elif isinstance(elem, buffered_tensor):
+                # Get the memdesc handle from the buffered_tensor
+                ir_elements.append(elem.handle)
+            else:
+                raise TypeError(f"reuse_group element must be buffered_tensor or reuse_group, "
+                                f"got {type(elem).__name__}")
+
+        # Create the reuse_group IR operation
+        group_kind = self._group_type.value  # "shared" or "distinct"
+        return builder.create_reuse_group(ir_elements, group_kind)
+
     def __repr__(self):
         return f"reuse_group({self._args}, group_type={self._group_type.value})"
-
-
-def _validate_reuse_group_elements(args: tuple, group_type: reuse_group_type) -> None:
-    """
-    Validate reuse_group elements for nesting constraints.
-
-    This is an internal validation function used during lowering.
-
-    Args:
-        args: Tuple of elements to validate.
-        group_type: The group_type of the parent reuse_group.
-
-    Raises:
-        ValueError: If a nested reuse_group has the same group_type.
-    """
-    for elem in args:
-        if isinstance(elem, reuse_group) and elem.group_type == group_type:
-            raise ValueError(f"Cannot nest reuse_group with the same group_type ({group_type.value}). "
-                             f"Nested groups must alternate between 'shared' and 'distinct'.")
 
 
 class reuse_group_ir_type(tl.base_type):
@@ -558,6 +567,61 @@ class storage_alias_spec(tl.base_value):
     def buffer_size_bytes(self) -> Optional[int]:
         """The explicit buffer size in bytes, or None if unsized (read-only)."""
         return self._buffer_size_bytes
+
+    @tl.builtin
+    def set_buffer_overlap(self, overlap_def: "reuse_group", _semantic=None) -> None:
+        """
+        Define the buffer overlap scheme for allocations using this storage alias spec.
+
+        This method specifies how buffers should be laid out in memory relative to
+        each other. The overlap_def is a reuse_group tree that defines:
+        - **shared**: Elements logically occupy the same memory region
+        - **distinct**: Elements must be in non-overlapping memory regions
+
+        This function lowers to an IR operation that links the storage alias spec
+        to its defined overlap scheme. The compiler will use this information to
+        compute buffer offsets in subsequent passes.
+
+        Note: This method should be called after all allocations using this
+        storage_alias_spec have been created, and the reuse_group should contain
+        all relevant buffered_tensor objects.
+
+        Args:
+            overlap_def: A reuse_group defining the buffer overlap relationships.
+            _semantic: Internal semantic parameter (passed automatically in JIT context).
+
+        Raises:
+            TypeError: If overlap_def is not a reuse_group.
+
+        Example:
+            ```python
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers
+            qk_tiles = tlx.local_alloc(..., reuse=spec)
+            p_tiles = tlx.local_alloc(..., reuse=spec)
+            alpha = tlx.local_alloc(..., reuse=spec)
+
+            # Define overlap scheme: QK shares with (P and alpha which are distinct)
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                )
+            )
+            ```
+        """
+        overlap_def = tl._unwrap_if_constexpr(overlap_def)
+        # Validate input type
+        if not isinstance(overlap_def, reuse_group):
+            raise TypeError(f"overlap_def must be a reuse_group, got {type(overlap_def).__name__}")
+
+        # Recursively lower the reuse_group tree to IR
+        overlap_def_ir = overlap_def.to_ir(_semantic.builder)
+
+        # Create the set_buffer_overlap IR operation
+        _semantic.builder.create_set_buffer_overlap(self._handle, overlap_def_ir)
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self._handle)
