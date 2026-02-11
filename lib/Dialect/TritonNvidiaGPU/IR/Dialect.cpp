@@ -56,11 +56,13 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
   if (isa<TensorMemoryScalesEncodingAttr>(memDescType.getEncoding())) {
     // For scales the data are packed and replicated 4 times.
     assert(memDescType.getElementType().getIntOrFloatBitWidth() == 8);
-    assert(memDescType.getShape().size() == 2 &&
-           "TODO handle multibuffering of scales.");
-    int k = shapePerCTA[1];
-    int m = shapePerCTA[0];
-    int numColumn = ceil<int>(m, 32) * ceil<int>(k, 4);
+    auto shape = memDescType.getShape();
+    assert((shape.size() == 2 || shape.size() == 3) &&
+           "Scales must be 2D or 3D (with multibuffering).");
+    int k = shapePerCTA.back();
+    int m = shapePerCTA[shapePerCTA.size() - 2];
+    int numBuffers = shape.size() == 3 ? shape[0] : 1;
+    int numColumn = ceil<int>(m, 32) * ceil<int>(k, 4) * numBuffers;
     return TMemAllocation(numColumn, numTmemRows);
   }
   assert(isa<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
