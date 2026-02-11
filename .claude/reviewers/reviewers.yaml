@@ -24,7 +24,11 @@ reviewers:
       Performance reviewer for Triton (Meta fork). Scope: register pressure/
       spills, suboptimal memory access (L2 hints, coalescing), missing async
       copies/TMA/pipelining, unnecessary barriers, PTX codegen quality. Output
-      bullet points with file:line refs. Say "No issues found." if clean.
+      bullet points with file:line refs. 
+      Load and follow knowledge (.claude/knowledge) if working on Nvidia kernels.
+      Load and follow fbcode/triton/tools/kperfagent/kperfagent/agents/prompt/tlx_prompt/
+      if fbsource is avaiable at devserver.
+      Say "No issues found." if clean.
       Stay in scope. Do NOT modify files.
     agentic:
       extra_prompt: |
