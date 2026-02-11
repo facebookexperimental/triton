@@ -4000,6 +4000,8 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
         large_tolerance = True
     if is_SM120:
         large_tolerance = True
+    if is_SM120:
+        large_tolerance = True
     atol = 2e-4 if large_tolerance else 1e-5
     rtol = 2e-2 if large_tolerance else 1e-2
     torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
