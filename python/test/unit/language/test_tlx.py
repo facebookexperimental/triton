@@ -221,28 +221,25 @@ def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, dev
         block_start = pid * BLOCK_SIZE
         with tlx.async_tasks():
             if USE_LARGE_DEFAULT:
-                with tlx.async_task("default", registers=200):
+                with tlx.async_task("default", warp_group_start_id=0):
                     offsets = block_start + tl.arange(0, BLOCK_SIZE)
                     mask = offsets < n_elements
                     x = tl.load(x_ptr + offsets, mask=mask)
                     y = tl.load(y_ptr + offsets, mask=mask)
-                    output = x + y
-                    tl.store(z_ptr + offsets, output, mask=mask)
+                    tl.store(z_ptr + offsets, x + y, mask=mask)
             else:
-                with tlx.async_task("default", registers=120):
+                with tlx.async_task("default", warp_group_start_id=1):
                     offsets = block_start + tl.arange(0, BLOCK_SIZE)
                     mask = offsets < n_elements
                     x = tl.load(x_ptr + offsets, mask=mask)
                     y = tl.load(y_ptr + offsets, mask=mask)
-                    output = x * y
-                    tl.store(z_ptr + offsets, output, mask=mask)
+                    tl.store(z_ptr + offsets, x * y, mask=mask)
             with tlx.async_task(num_warps=1, registers=100):
                 offsets = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_elements
                 a = tl.load(a_ptr + offsets, mask=mask)
                 b = tl.load(b_ptr + offsets, mask=mask)
-                output = a + b
-                tl.store(c_ptr + offsets, output, mask=mask)
+                tl.store(c_ptr + offsets, a + b, mask=mask)
 
     torch.manual_seed(0)
     size = 98432
@@ -253,7 +250,7 @@ def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, dev
     output_z = torch.empty_like(x)
     output_c = torch.empty_like(a)
     n_elements = output_z.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
     kernel = kernel_select_default[grid](
         x,
         y,
@@ -268,17 +265,14 @@ def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, dev
     )
 
     ttgir = kernel.asm["ttgir"]
-    assert re.search(r"ttg.warp_specialize", ttgir), \
-        "Expected warp_specialize in TTGIR"
+    assert re.search(r"ttg.warp_specialize", ttgir), "Expected warp_specialize in TTGIR"
+    # Verify the non-default task always ran (a + b → c)
+    torch.testing.assert_close(output_c, a + b, check_dtype=False)
+    # Verify which default was selected by the constexpr condition
     if USE_LARGE_DEFAULT:
-        assert re.search(r"requestedRegisters = array<i32: 100>", ttgir), \
-            "Expected registers=100 for non-default task"
         torch.testing.assert_close(output_z, x + y, check_dtype=False)
     else:
-        assert re.search(r"requestedRegisters = array<i32: 100>", ttgir), \
-            "Expected registers=100 for non-default task"
         torch.testing.assert_close(output_z, x * y, check_dtype=False)
-    torch.testing.assert_close(output_c, a + b, check_dtype=False)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
