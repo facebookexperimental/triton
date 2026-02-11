@@ -651,13 +651,8 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
     return success();
   if (type.getEncoding()) {
+    // Skip verification for placeholder layouts - they will be resolved later
     if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
-      return success();
-    // Skip TMEM compatibility check for scales when the source doesn't have
-    // a LinearEncodingAttr yet -- RelayoutTritonGPU will assign the correct
-    // layout later.
-    if (isa<TensorMemoryScalesEncodingAttr>(memdesc.getEncoding()) &&
-        !isa<triton::gpu::LinearEncodingAttr>(type.getEncoding()))
       return success();
     auto enc = dyn_cast<DistributedEncodingTrait>(type.getEncoding());
     if (!enc) {
