@@ -1,8 +1,8 @@
 # [WIP] TLX `storage_alias_spec` Design Proposal
 
 **Author:** Nick Riasanovsky
-**Updated:** 2026-01-26
-**Status:** Draft - Phase 1 & Phase 2
+**Updated:** 2026-02-07
+**Status:** Draft - Phase 1, Phase 2, Phase 3 & Phase 4
 
 ---
 
@@ -1171,19 +1171,759 @@ def test_storage_mismatch_error():
 ```
 
 ---
+---
+
+# Phase 3: Reuse Group IR API
+
+This phase defines the IR interface for reuse groups, which are used to express buffer overlap relationships. Reuse groups organize multiple buffers (or nested groups) into a tree structure that defines how buffers share or are distinct from each other in memory. Reuse groups support both shared memory (smem) and tensor memory (tmem) allocations.
+
+---
+
+## Scope
+
+This phase covers:
+- New enum: `ReuseGroupKind` (`shared`, `distinct`)
+- New MLIR type: `ReuseGroupType`
+- New MLIR operation: `ReuseGroupOp`
+- Python classes: `reuse_group_type`, `reuse_group`, `reuse_group_ir_type`
+
+**Out of scope** for this phase:
+- Offset calculation based on reuse groups (Phase 4)
+- `set_buffer_overlap` API (Phase 4)
+
+---
+
+## Reuse Group Concepts
+
+A **reuse group** defines buffer overlap relationships for memory allocations in shared memory (smem) or tensor memory (tmem):
+
+- **shared**: Elements logically occupy the same memory region at each buffer index. Useful when buffers are used at different times and can share the same physical memory.
+- **distinct**: Elements must be placed in non-overlapping memory regions. Useful when buffers need to be accessed simultaneously.
+
+The reuse group forms a tree structure where:
+- Leaf nodes are `buffered_tensor` objects (from `local_alloc`)
+- Internal nodes are nested `reuse_group` objects
+- The root defines the top-level sharing relationship
+
+### Nesting Constraint
+
+Nested reuse groups must alternate between `shared` and `distinct` types. This constraint ensures a well-formed tree structure where the relationship type changes at each level.
+
+---
+
+## IR Design
+
+### New Enum: `ReuseGroupKind`
+
+```tablegen
+def TLX_ReuseGroupKind_Shared : I32EnumAttrCase<"shared", 0, "shared">;
+def TLX_ReuseGroupKind_Distinct : I32EnumAttrCase<"distinct", 1, "distinct">;
+
+def TLX_ReuseGroupKindAttr : I32EnumAttr<
+    "ReuseGroupKind", "TLX reuse group kind for buffer overlap definitions",
+    [TLX_ReuseGroupKind_Shared, TLX_ReuseGroupKind_Distinct]> {
+  let cppNamespace = "::mlir::triton::tlx";
+  let description = [{
+    Defines the relationship between elements in a reuse group:
+
+    - **shared**: Elements must logically occupy the same region in memory.
+      There is no cross-index overlap, and elements share the memory at each
+      buffer index. Useful when buffers are used at different times.
+    - **distinct**: Elements must be placed into non-overlapping regions of
+      memory. Elements can be accessed simultaneously without conflicts.
+  }];
+}
+```
+
+### New MLIR Type: `ReuseGroupType`
+
+```tablegen
+def TLX_ReuseGroupType : TLXTypeDef<"ReuseGroup", "reuse_group", []> {
+  let summary = "A reuse group type for buffer overlap definitions";
+
+  let description = [{
+    Represents a reuse group that defines buffer overlap relationships for
+    memory allocations (shared memory or tensor memory). A reuse group organizes multiple buffers
+    (or nested groups) with a specific relationship type:
+
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times.
+    - **distinct**: Elements must be in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The reuse group forms a tree structure where leaf nodes are memory
+    allocations and internal nodes are nested reuse groups.
+
+    Constraints:
+    - All elements must have the same buffer count (num).
+    - All elements must use the same storage kind (smem or tmem).
+      The storage kind is inferred from the elements and not stored in the type.
+
+    Example:
+    ```mlir
+    // A and B share the same memory (used at different times)
+    %group = tlx.reuse_group(%a, %b) {group_type = shared}
+             : (!ttg.memdesc<...>, !ttg.memdesc<...>) -> !tlx.reuse_group<shared>
+
+    // Nested groups for complex sharing schemes
+    %inner = tlx.reuse_group(%c, %d, %e) {group_type = distinct}
+             : (...) -> !tlx.reuse_group<distinct>
+    %outer = tlx.reuse_group(%a, %inner) {group_type = shared}
+             : (...) -> !tlx.reuse_group<shared>
+    ```
+  }];
+
+  let parameters = (ins
+    EnumParameter<TLX_ReuseGroupKindAttr>:$groupKind
+  );
+
+  let assemblyFormat = "`<` $groupKind `>`";
+
+  let genVerifyDecl = 1;
+}
+```
+
+### New MLIR Operation: `ReuseGroupOp`
+
+```tablegen
+def TLX_ReuseGroupOp : TLX_Op<"reuse_group", [Pure]> {
+  let summary = "Define a reuse group for buffer overlap relationships";
+
+  let description = [{
+    Creates a reuse group that defines buffer overlap relationships for
+    memory allocations (shared memory or tensor memory). A reuse group organizes multiple buffers (or nested
+    groups) with a specific relationship:
+
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times.
+    - **distinct**: Elements must be in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The operation takes a variadic list of elements (buffered tensors or
+    nested reuse groups) and produces a reuse group.
+
+    Note: The storage_alias_spec is NOT part of this operation. Validation
+    that all elements reference the same storage_alias_spec is performed
+    by the SetBufferOverlapOp verifier.
+
+    Constraints:
+    - Nested reuse_groups cannot have the same group_kind as their parent.
+    - All elements must use the same storage kind (smem or tmem).
+
+    Example:
+    ```mlir
+    // Create shared reuse group for A and B
+    %group = tlx.reuse_group(%a, %b) group_kind = shared
+             : (!ttg.memdesc<...>, !ttg.memdesc<...>)
+             -> !tlx.reuse_group<shared>
+    ```
+  }];
+
+  let arguments = (ins
+    Variadic<TLX_ReuseGroupElement>:$elements,
+    TLX_ReuseGroupKindAttr:$group_kind
+  );
+
+  let results = (outs TLX_ReuseGroupType:$result);
+
+  let assemblyFormat = [{
+    `(` $elements `)` `group_kind` `=` $group_kind attr-dict `:`
+    `(` qualified(type($elements)) `)` `->` qualified(type($result))
+  }];
+
+  let hasVerifier = 1;
+}
+```
+
+---
+
+## Python API
+
+### `reuse_group_type` Enum
+
+```python
+class reuse_group_type(enum.Enum):
+    """
+    Type of buffer relationship within a reuse group.
+
+    - **shared**: Elements must logically occupy the same region in memory.
+      There is no cross-index overlap, and elements share the memory. Elements
+      should be used at different times.
+    - **distinct**: Elements must be placed into non-overlapping regions of
+      memory. Elements can be accessed simultaneously without conflicts.
+    """
+
+    shared = "shared"
+    distinct = "distinct"
+```
+
+### `reuse_group` Class
+
+```python
+class reuse_group:
+    """
+    Defines buffer overlap relationships for memory allocations (shared memory or tensor memory).
+
+    A reuse_group organizes multiple buffers (or nested groups) into either:
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times and can
+      share the same physical memory.
+    - **distinct**: Elements must be placed in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The reuse_group forms a tree structure where:
+    - Leaf nodes are `buffered_tensor` objects
+    - Internal nodes are nested `reuse_group` objects
+    - The root defines the top-level sharing relationship
+
+Note: The storage_alias_spec is NOT passed to reuse_group directly in Python.
+    Instead, the spec is associated with the reuse group tree when passed to
+    `storage_alias_spec.set_buffer_overlap()`. During IR lowering, the spec is
+    then attached to each `ReuseGroupOp` in the tree.
+
+    Example - Flash Attention buffer sharing:
+        ```python
+        spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+        # Allocate buffers
+        qk_tiles = tlx.local_alloc(..., reuse=spec)
+        p_tiles = tlx.local_alloc(..., reuse=spec)
+        alpha = tlx.local_alloc(..., reuse=spec)
+
+        # QK and (P, alpha) share the same memory region
+        # P and alpha are placed in distinct (non-overlapping) regions
+        # Note: spec is passed to set_buffer_overlap, not to reuse_group
+        spec.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
+        ```
+
+    Constraints:
+        - Nested reuse_groups must have different group_type than the parent.
+    """
+
+    def __init__(
+        self,
+        *args: "buffered_tensor | reuse_group",
+        group_type: reuse_group_type,
+    ):
+        """
+        Initialize a reuse group.
+
+        Args:
+            *args: buffered_tensor or reuse_group objects. Must not be empty.
+            group_type: The relationship type for elements in this group.
+                - shared: Elements occupy the same logical memory region.
+                - distinct: Elements must be in non-overlapping regions.
+
+        Raises:
+            ValueError: If args is empty.
+            ValueError: If a nested reuse_group has the same group_type as this group.
+            TypeError: If any element is not a buffered_tensor or reuse_group.
+        """
+        ...
+
+    @property
+    def args(self) -> tuple:
+        """The elements in this group (read-only)."""
+        ...
+
+    @property
+    def group_type(self) -> reuse_group_type:
+        """The relationship type for this group (read-only)."""
+        ...
+```
+
+---
+
+## Example IR Output
+
+### Simple Shared Reuse Group
+
+Python:
+```python
+spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+a = tlx.local_alloc((64, 64), tl.float32, 2, tlx.storage_kind.smem, reuse=spec)
+b = tlx.local_alloc((64, 64), tl.bfloat16, 2, tlx.storage_kind.smem, reuse=spec)
+
+# The spec is associated via set_buffer_overlap, not passed to reuse_group
+spec.set_buffer_overlap(
+    tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared)
+)
+```
+
+MLIR:
+```mlir
+%spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+%a = ttg.local_alloc ... : () -> !ttg.memdesc<2x64x64xf32, ...>
+%b = ttg.local_alloc ... : () -> !ttg.memdesc<2x64x64xbf16, ...>
+%group = tlx.reuse_group(%a, %b) group_kind = shared
+         : (!ttg.memdesc<2x64x64xf32, ...>, !ttg.memdesc<2x64x64xbf16, ...>)
+         -> !tlx.reuse_group<shared>
+tlx.set_buffer_overlap(%spec, %group)
+         : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+```
+
+### Nested Reuse Groups
+
+Python:
+```python
+spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+qk = tlx.local_alloc(..., reuse=spec)
+p = tlx.local_alloc(..., reuse=spec)
+alpha = tlx.local_alloc(..., reuse=spec)
+
+# P and alpha are distinct, then QK shares with (P, alpha)
+# Note: spec is NOT passed to reuse_group - it's passed to set_buffer_overlap
+spec.set_buffer_overlap(
+    tlx.reuse_group(
+        qk,
+        tlx.reuse_group(p, alpha, group_type=tlx.reuse_group_type.distinct),
+        group_type=tlx.reuse_group_type.shared,
+    )
+)
+```
+
+MLIR:
+```mlir
+%spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+%qk = ttg.local_alloc ... : () -> !ttg.memdesc<...>
+%p = ttg.local_alloc ... : () -> !ttg.memdesc<...>
+%alpha = ttg.local_alloc ... : () -> !ttg.memdesc<...>
+
+%inner = tlx.reuse_group(%p, %alpha) group_kind = distinct
+         : (!ttg.memdesc<...>, !ttg.memdesc<...>) -> !tlx.reuse_group<distinct>
+%outer = tlx.reuse_group(%qk, %inner) group_kind = shared
+         : (!ttg.memdesc<...>, !tlx.reuse_group<distinct>)
+         -> !tlx.reuse_group<shared>
+tlx.set_buffer_overlap(%spec, %outer)
+         : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+```
+
+---
+
+## Testing Plan
+
+### Unit Tests
+
+1. **Python API tests**
+   - Create shared reuse group
+   - Create distinct reuse group
+   - Verify nested groups with alternating types
+   - Verify error on nested groups with same type
+   - Verify error on empty elements
+   - Verify error on invalid element types
+
+2. **IR lowering tests**
+   - Verify correct MLIR operation is generated
+   - Verify group_kind attribute is correctly set
+   - Verify type is correctly constructed
+
+3. **Operation verifier tests**
+   - Nested reuse_group with same group_kind should fail
+   - Empty elements list should fail
+
+---
+
+## Summary
+
+Phase 3 delivers the IR interface for reuse groups:
+
+| Component | Description |
+|-----------|-------------|
+| `ReuseGroupKind` enum | `shared` and `distinct` relationship types |
+| `ReuseGroupType` | MLIR type representing reuse group with its kind |
+| `ReuseGroupOp` | Operation to create reuse groups from elements |
+| `reuse_group_type` | Python enum for group kinds |
+| `reuse_group` | Python class for defining buffer relationships (spec-free) |
+
+**Design Principle**: Reuse groups form a tree structure that declaratively describes buffer overlap relationships. Neither the Python `reuse_group` class nor the IR `ReuseGroupOp` include the spec - validation is performed by `SetBufferOverlapOp`. The actual offset calculation and memory layout is deferred to Phase 5.
+
+---
+---
+
+# Phase 4: `set_buffer_overlap` JIT API
+
+This phase defines the JIT interface for `set_buffer_overlap`, which allows users to define buffer overlap schemes using reuse groups. This phase focuses solely on the frontend API and IR generation, without any lowering or offset calculations.
+
+**Important**: Code using `set_buffer_overlap` will successfully lower to IR but is expected to fail during subsequent lowering passes until Phase 5 implements the offset calculation.
+
+---
+
+## Scope
+
+This phase covers:
+- `set_buffer_overlap` method on `storage_alias_spec`
+- New MLIR operation: `SetBufferOverlapOp`
+- Verification that reuse groups are valid
+
+**Out of scope** for this phase:
+- Offset calculation based on overlap definitions (Phase 5)
+- `SharedBufferSizeDefinitionPass` integration (Phase 5)
+- `ReusedBufferOffsetCalculationPass` (Phase 5)
+
+---
+
+## Motivation
+
+The `set_buffer_overlap` API allows users to declaratively specify their buffer overlap scheme. This is crucial because:
+
+1. **Simplicity**: Users define the logical relationship between buffers without manual offset calculations.
+2. **Safety**: The compiler can verify that the overlap scheme is valid and achievable.
+3. **Flexibility**: The overlap scheme can change based on compile-time constants (e.g., block sizes, data types).
+
+By separating the overlap definition from the offset calculation, users can express their intent while the compiler handles the implementation details.
+
+---
+
+## API Design
+
+### `set_buffer_overlap` Method
+
+The `set_buffer_overlap` method is added to the `storage_alias_spec` class:
+
+```python
+class storage_alias_spec:
+    """
+    Definition of a storage alias specification.
+    ...
+    """
+
+    def set_buffer_overlap(self, overlap_def: reuse_group) -> None:
+        """
+        Define the buffer overlap scheme for allocations using this storage alias spec.
+
+        This method specifies how buffers should be laid out in memory relative to
+        each other. The overlap_def is a reuse_group tree that defines:
+        - **shared**: Elements logically occupy the same memory region
+        - **distinct**: Elements must be in non-overlapping memory regions
+
+        This function lowers to an IR operation that links the storage alias spec
+        to its defined overlap scheme. The compiler will use this information to
+        compute buffer offsets in subsequent passes.
+
+        Note: This method should be called after all allocations using this
+        storage_alias_spec have been created, and the reuse_group should contain
+        all relevant buffered_tensor objects.
+
+        Args:
+            overlap_def: A reuse_group defining the buffer overlap relationships.
+                         The reuse_group must use this storage_alias_spec.
+
+        Raises:
+            ValueError: If overlap_def does not use this storage_alias_spec.
+            TypeError: If overlap_def is not a reuse_group.
+
+        Example:
+            ```python
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers
+            qk_tiles = tlx.local_alloc(..., reuse=spec)
+            p_tiles = tlx.local_alloc(..., reuse=spec)
+            alpha = tlx.local_alloc(..., reuse=spec)
+
+            # Define overlap scheme: QK shares with (P and alpha which are distinct)
+            # Note: spec is NOT passed to reuse_group in Python.
+            # It gets attached to each ReuseGroupOp during IR lowering.
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                )
+            )
+            ```
+        """
+        ...
+```
+
+### Design Rationale
+
+The API is designed with these principles:
+
+1. **Called in JIT code**: This allows the overlap definition to depend on compile-time constants (e.g., `tl.constexpr` values), enabling different overlap schemes based on autotuning parameters or data types.
+
+2. **Method on `storage_alias_spec`**: This establishes a clear ownership relationship - the storage alias spec owns its overlap definition.
+
+3. **Takes a `reuse_group`**: Reuses the existing reuse group infrastructure from Phase 3, providing a consistent tree-based overlap representation.
+
+4. **Spec association during lowering**: The Python `reuse_group` class does not take the spec as a parameter. The spec is only associated at the `SetBufferOverlapOp` level, which validates that all leaf elements in the reuse group tree were allocated with the correct storage_alias_spec.
+
+---
+
+## IR Design
+
+### New MLIR Operation: `SetBufferOverlapOp`
+
+```tablegen
+def TLX_SetBufferOverlapOp : TLX_Op<"set_buffer_overlap", []> {
+  let summary = "Define the buffer overlap scheme for a storage alias spec";
+
+  let description = [{
+    Defines the buffer overlap scheme for allocations using a storage alias spec.
+    This operation links a storage_alias_spec to its overlap definition (a reuse_group).
+
+    The compiler will use this information in subsequent passes to:
+    1. Validate that the overlap scheme is achievable
+    2. Compute buffer offsets to satisfy the overlap requirements
+
+    This operation is eliminated during the ReusedBufferOffsetCalculationPass
+    after offsets have been computed and applied.
+
+    Constraints:
+    - The reuse_group must reference the same storage_alias_spec
+    - All elements in the reuse_group must use the same storage kind
+    - This operation should appear after all local_alloc operations that
+      reference the storage_alias_spec
+
+    Example:
+    ```mlir
+    %spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %qk = ttg.local_alloc ... : () -> !ttg.memdesc<...>
+    %p = ttg.local_alloc ... : () -> !ttg.memdesc<...>
+
+    %group = tlx.reuse_group(%spec : %qk, %p) group_kind = shared
+             : (!tlx.storage_alias_spec<smem> : ...) -> !tlx.reuse_group<shared>
+
+    tlx.set_buffer_overlap(%spec, %group)
+             : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+    ```
+  }];
+
+  let arguments = (ins
+    TLX_StorageAliasSpecType:$storage_alias_spec,
+    TLX_ReuseGroupType:$overlap_def
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    `(` $storage_alias_spec `,` $overlap_def `)`
+    `:` `(` qualified(type($storage_alias_spec)) `,` qualified(type($overlap_def)) `)` `->` `(` `)`
+    attr-dict
+  }];
+
+  let hasVerifier = 1;
+}
+```
+
+### Verifier Checks
+
+The `ReuseGroupOp` verifier should check:
+
+1. Nested reuse_groups cannot have the same group_kind as their parent
+2. All elements must use the same storage kind (smem or tmem)
+
+The `SetBufferOverlapOp` verifier should check:
+
+1. All leaf elements (buffered tensors) in the reuse group tree were allocated with the same `storage_alias_spec`
+2. The storage kind of all elements matches the storage kind of the `storage_alias_spec`
+
+---
+
+## Python Implementation
+
+### `set_buffer_overlap` Implementation
+
+```python
+class storage_alias_spec(tl.base_value):
+    """..."""
+
+    def set_buffer_overlap(self, overlap_def: reuse_group) -> None:
+        """Define the buffer overlap scheme for this storage alias spec."""
+        # Validate input type
+        if not isinstance(overlap_def, reuse_group):
+            raise TypeError(f"overlap_def must be a reuse_group, got {type(overlap_def).__name__}")
+
+        # Lower to IR operation
+        # The semantic function will create the SetBufferOverlapOp
+        # During lowering, this spec is attached to each ReuseGroupOp in the tree
+        return tlx_language.set_buffer_overlap(self, overlap_def)
+
+
+@builtin
+def set_buffer_overlap(
+    storage_alias_spec: storage_alias_spec,
+    overlap_def: reuse_group,
+    _builder: ir.builder = None,
+) -> None:
+    """
+    Semantic function that lowers set_buffer_overlap to IR.
+
+    The reuse_group tree is lowered to IR without the spec - each ReuseGroupOp
+    only contains its elements and group_kind. The SetBufferOverlapOp then
+    links the spec to the root reuse group, and its verifier validates that
+    all leaf elements were allocated with this spec.
+    """
+    # Get the IR handles
+    spec_handle = storage_alias_spec.handle
+
+    # Lower the reuse_group tree to IR (creates ReuseGroupOp for each node)
+    overlap_handle = _lower_reuse_group(overlap_def, _builder)
+
+    # Create the set_buffer_overlap operation linking spec to the overlap tree
+    _builder.create_set_buffer_overlap(spec_handle, overlap_handle)
+```
+
+---
+
+## Example Usage
+
+### Simple Shared Overlap
+
+```python
+@triton.jit
+def kernel(...):
+    spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+    # Allocate buffers that will share memory
+    a_tiles = tlx.local_alloc((64, 64), tl.float32, 2, tlx.storage_kind.smem, reuse=spec)
+    b_tiles = tlx.local_alloc((64, 64), tl.bfloat16, 2, tlx.storage_kind.smem, reuse=spec)
+
+    # Define that a and b share the same memory region
+    # Note: spec is not passed to reuse_group - it gets attached during lowering
+    spec.set_buffer_overlap(
+        tlx.reuse_group(a_tiles, b_tiles, group_type=tlx.reuse_group_type.shared)
+    )
+
+    # ... kernel code using a_tiles and b_tiles ...
+```
+
+Generated IR:
+```mlir
+%spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+%a = ttg.local_alloc ... : () -> !ttg.memdesc<2x64x64xf32, ...>
+%b = ttg.local_alloc ... : () -> !ttg.memdesc<2x64x64xbf16, ...>
+
+%group = tlx.reuse_group(%a, %b) group_kind = shared
+         : (!ttg.memdesc<...>, !ttg.memdesc<...>)
+         -> !tlx.reuse_group<shared>
+
+tlx.set_buffer_overlap(%spec, %group)
+         : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+```
+
+### Complex Nested Overlap (Flash Attention Pattern)
+
+```python
+@triton.jit
+def flash_attention_kernel(...):
+    spec = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+
+    # Allocate buffers
+    qk_tiles = tlx.local_alloc((BLOCK_M, HEAD_DIM), tl.float32, NUM_BUFFERS, tlx.storage_kind.tmem, reuse=spec)
+    p_tiles = tlx.local_alloc((BLOCK_M, HEAD_DIM), tl.bfloat16, NUM_BUFFERS, tlx.storage_kind.tmem, reuse=spec)
+    alpha = tlx.local_alloc((BLOCK_M, 1), tl.float32, NUM_BUFFERS, tlx.storage_kind.tmem, reuse=spec)
+    l = tlx.local_alloc((BLOCK_M, 1), tl.float32, NUM_BUFFERS, tlx.storage_kind.tmem, reuse=spec)
+    m = tlx.local_alloc((BLOCK_M, 1), tl.float32, NUM_BUFFERS, tlx.storage_kind.tmem, reuse=spec)
+
+    # Define overlap scheme:
+    # - QK shares with (P and (alpha, l, m))
+    # - P is distinct from (alpha, l, m)
+    # - alpha, l, m are distinct from each other
+    spec.set_buffer_overlap(
+        tlx.reuse_group(
+            spec,
+            qk_tiles,
+            tlx.reuse_group(
+                spec,
+                p_tiles,
+                tlx.reuse_group(spec, alpha, l, m, group_type=tlx.reuse_group_type.distinct),
+                group_type=tlx.reuse_group_type.distinct,
+            ),
+            group_type=tlx.reuse_group_type.shared,
+        )
+    )
+
+    # ... kernel code ...
+```
+
+### Conditional Overlap Based on Block Size
+
+```python
+@triton.jit
+def kernel(BLOCK_M: tl.constexpr, ...):
+    spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+    a_tiles = tlx.local_alloc((BLOCK_M, 64), tl.float32, 2, tlx.storage_kind.smem, reuse=spec)
+    b_tiles = tlx.local_alloc((BLOCK_M, 64), tl.float32, 2, tlx.storage_kind.smem, reuse=spec)
+
+    # Only share buffers if block size is large (memory constrained)
+    if BLOCK_M >= 128:
+        spec.set_buffer_overlap(
+            tlx.reuse_group(a_tiles, b_tiles, group_type=tlx.reuse_group_type.shared)
+        )
+    else:
+        # With smaller blocks, buffers are distinct (no sharing needed)
+        spec.set_buffer_overlap(
+            tlx.reuse_group(a_tiles, b_tiles, group_type=tlx.reuse_group_type.distinct)
+        )
+```
+
+---
+
+## Testing Plan
+
+### Unit Tests
+
+1. **Python API tests**
+   - Call `set_buffer_overlap` with valid reuse_group
+   - Verify error on non-reuse_group argument
+   - Verify error when reuse_group uses different storage_alias_spec
+
+2. **IR lowering tests**
+   - Verify `SetBufferOverlapOp` is correctly generated
+   - Verify operation references correct storage_alias_spec and reuse_group
+   - Verify assembly format is correct
+
+3. **Verifier tests**
+   - Test that mismatched storage_alias_spec in reuse_group fails verification
+
+### Expected Behavior
+
+In this phase, kernels using `set_buffer_overlap` will:
+- ✅ Successfully parse Python code
+- ✅ Successfully lower to TTIR
+- ✅ Successfully lower to TTGIR
+- ❌ Fail during `ReusedBufferOffsetCalculationPass` (not yet implemented)
+
+This is the expected behavior until Phase 5 implements the offset calculation pass.
+
+---
+
+## Summary
+
+Phase 4 delivers the JIT interface for defining buffer overlap schemes:
+
+| Component | Description |
+|-----------|-------------|
+| `set_buffer_overlap` method | Method on `storage_alias_spec` to define overlap scheme |
+| `SetBufferOverlapOp` | MLIR operation linking storage alias spec to overlap definition |
+| Python validation | Type and consistency checks for the API |
+
+**Design Principle**: This phase establishes the frontend API and IR representation without implementing the backend passes. This allows users to start writing code with the new API while the offset calculation logic is developed in Phase 5.
+
+**Note**: Code using `set_buffer_overlap` will fail during lowering until Phase 5 is implemented. This is intentional and allows incremental development of the feature.
+
+---
+---
 
 ## Future Work
 
 The following will be addressed in subsequent phases:
 
-1. **Phase 3**: Define the APIs for reuse groups.
-1. **Phase 4**: Add `set_buffer_overlap` API for defining overlap schemes and implement offset calculation based on overlap definitions
-2. **Phase 5**: Buffer reuse analysis warnings (optional performance tool)
-3. **Phase 5**: Deprecation path for existing `reuse=buffered_tensor` pattern
+1. **Phase 5**: Implement `ReusedBufferOffsetCalculationPass` to compute offsets based on overlap definitions
+2. **Phase 6**: Buffer reuse analysis warnings (optional performance tool)
+3. **Phase 6**: Deprecation path for existing `reuse=buffered_tensor` pattern
 
 ---
 
-## Summary
+## Overall Summary
 
 Phase 2 delivers the core functionality for shared buffer allocation:
 
