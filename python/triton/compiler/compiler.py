@@ -15,6 +15,7 @@ import re
 import functools
 import os
 import time
+import copy
 import weakref
 
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
