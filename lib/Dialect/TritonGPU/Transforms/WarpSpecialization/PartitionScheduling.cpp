@@ -1575,6 +1575,8 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
   }
 
   // Schedule epilogue stores (both inside loops AND post-loop stores)
+  // Also schedule the backward slice of post-loop epilogue stores (tmem_load,
+  // truncf, etc.)
   if (epiloguePartition) {
     // Stores inside loops
     for (auto loop : loops)
@@ -1582,11 +1584,42 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
         schedule.trySchedule(epiloguePartition, op);
 
     // Also schedule categorized epilogue stores (includes post-loop stores for
-    // bwd)
+    // bwd) and their backward slice (tmem_load, truncf that feed into them)
     auto epilogueStoreOps =
         categorizer.getOpsInCategory(OpCategory::EpilogueStore);
     for (const auto &catOp : epilogueStoreOps) {
       schedule.trySchedule(epiloguePartition, catOp.op);
+
+      // Only schedule backward slice for post-loop stores (not inside any loop)
+      // This captures ops like tmem_load, truncf that prepare data for storing
+      bool isPostLoop = !catOp.op->getParentOfType<scf::ForOp>();
+      if (isPostLoop) {
+        SetVector<Operation *> slice;
+        BackwardSliceOptions options;
+        options.omitBlockArguments = true;
+        // Only include ops in the same block AND that are not loops or
+        // scheduled
+        options.filter = [&](Operation *op) {
+          // Must be in the same block as the store (post-loop region)
+          if (op->getBlock() != catOp.op->getBlock())
+            return false;
+          // Skip scf.for and other control flow - we only want data-producing
+          // ops
+          if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(op))
+            return false;
+          // Skip ops that are already scheduled
+          if (schedule.isScheduled(op))
+            return false;
+          return true;
+        };
+        (void)getBackwardSlice(catOp.op, &slice, options);
+        for (Operation *op : slice) {
+          // Skip constants - they can be shared across partitions
+          if (isa<arith::ConstantOp>(op))
+            continue;
+          schedule.trySchedule(epiloguePartition, op);
+        }
+      }
     }
   }
 
