@@ -230,6 +230,61 @@ static std::string getOpLabel(Operation *op) {
   return label;
 }
 
+/// Get a one-line pretty representation of an operation for debug printing.
+/// Format: "op_name <shape> (depth=N)"
+static std::string prettyOp(Operation *op) {
+  std::string result;
+  llvm::raw_string_ostream os(result);
+
+  // Op name (short form without dialect prefix)
+  StringRef opName = op->getName().getStringRef();
+  size_t dotPos = opName.rfind('.');
+  if (dotPos != StringRef::npos)
+    os << opName.substr(dotPos + 1);
+  else
+    os << opName;
+
+  // Result type info (shape + element type for tensors/memdescs)
+  if (op->getNumResults() > 0) {
+    SmallVector<std::string> typeStrs;
+    for (Value r : op->getResults()) {
+      Type ty = r.getType();
+      std::string ts;
+      llvm::raw_string_ostream tos(ts);
+      if (auto tensorTy = dyn_cast<RankedTensorType>(ty)) {
+        tos << "<";
+        for (unsigned d = 0; d < tensorTy.getRank(); d++) {
+          if (d > 0)
+            tos << "x";
+          tos << tensorTy.getDimSize(d);
+        }
+        tos << "x" << tensorTy.getElementType() << ">";
+      } else if (auto memDescTy = dyn_cast<MemDescType>(ty)) {
+        tos << "<memdesc ";
+        for (unsigned d = 0; d < memDescTy.getRank(); d++) {
+          if (d > 0)
+            tos << "x";
+          tos << memDescTy.getShape()[d];
+        }
+        tos << ">";
+      }
+      if (!ts.empty())
+        typeStrs.push_back(std::move(ts));
+    }
+    if (!typeStrs.empty()) {
+      os << " ";
+      for (unsigned i = 0; i < typeStrs.size(); i++) {
+        if (i > 0)
+          os << ", ";
+        os << typeStrs[i];
+      }
+    }
+  }
+
+  os << " (depth=" << getLoopDepth(op) << ")";
+  return result;
+}
+
 /// Get color for an operation based on its type.
 //===----------------------------------------------------------------------===//
 // Scheduling Templates (Unified Approach)
@@ -299,6 +354,9 @@ public:
 
   /// Get template options.
   virtual const TemplateOptions &getOptions() const = 0;
+
+  /// Get the abstract partition name for a physical partition (for debugging).
+  virtual std::string getPartitionName(Partition *partition) const = 0;
 };
 
 /// Unified Flash Attention template using general partition rules.
@@ -369,6 +427,29 @@ public:
   StringRef getName() const override { return "UnifiedFA"; }
   const TemplateOptions &getOptions() const override { return options; }
 
+  std::string getPartitionName(Partition *partition) const override {
+    if (partition == defaultPartition)
+      return "default";
+    if (partition == gemmPartition)
+      return "gemm";
+    if (partition == loadPartition)
+      return "load";
+    if (partition == correctionPartition && options.hasCorrection)
+      return "correction";
+    if (partition == reductionPartition && options.hasReduction)
+      return "reduction";
+    if (partition == epiloguePartition)
+      return "epilogue";
+    for (unsigned i = 0; i < computationPartitions.size(); ++i) {
+      if (partition == computationPartitions[i]) {
+        if (computationPartitions.size() == 1)
+          return "computation";
+        return "computation[" + std::to_string(i) + "]";
+      }
+    }
+    return "dynamic";
+  }
+
 private:
   TemplateOptions options;
   Partition *gemmPartition = nullptr;
@@ -409,6 +490,18 @@ public:
   const TemplateOptions &getOptions() const override {
     static TemplateOptions defaultOpts;
     return defaultOpts;
+  }
+
+  std::string getPartitionName(Partition *partition) const override {
+    if (partition == defaultPartition)
+      return "default";
+    if (partition == gemmPartition)
+      return "gemm";
+    if (partition == loadPartition)
+      return "load";
+    if (partition == epiloguePartition)
+      return "epilogue";
+    return "dynamic";
   }
 
 private:
@@ -538,7 +631,7 @@ public:
     return -1;
   }
 
-  /// Print categorization summary for debugging.
+  /// Print categorization summary (counts only) for debugging.
   void printSummary() const {
     llvm::errs() << "[OpCategorizer] Summary:\n";
     llvm::errs() << "  Loops: " << loops.size() << "\n";
@@ -552,6 +645,40 @@ public:
     }
     for (auto &[cat, count] : counts) {
       llvm::errs() << "  " << toString(cat) << ": " << count << "\n";
+    }
+  }
+
+  /// Pretty-print all categorized ops grouped by category.
+  void printCategorizedOps(llvm::raw_ostream &os) const {
+    os << "=== OpCategorizer Results ===\n";
+    os << "  Loops: " << loops.size() << ", MMAs: " << mmas.size()
+       << ", dpFactor: " << dataPartitionFactor << "\n";
+
+    // Group ops by category in deterministic order
+    constexpr OpCategory categoryOrder[] = {
+        OpCategory::MMA,           OpCategory::Load,
+        OpCategory::LocalAlloc,    OpCategory::MemDescView,
+        OpCategory::EpilogueStore, OpCategory::TMAReduction,
+        OpCategory::Correction,    OpCategory::DataPartition,
+        OpCategory::Shared,        OpCategory::Default};
+
+    for (OpCategory cat : categoryOrder) {
+      SmallVector<const CategorizedOp *> ops;
+      for (auto &[op, catOp] : opCategories) {
+        if (catOp.category == cat)
+          ops.push_back(&catOp);
+      }
+      if (ops.empty())
+        continue;
+
+      os << "  [" << toString(cat) << "] (" << ops.size() << " ops):\n";
+      for (const auto *catOp : ops) {
+        os << "    " << prettyOp(catOp->op);
+        if (catOp->dataPartitionId > 0 ||
+            catOp->category == OpCategory::DataPartition)
+          os << " [dp=" << catOp->dataPartitionId << "]";
+        os << "\n";
+      }
     }
   }
 
@@ -922,6 +1049,58 @@ static void dumpPartitionsToDot(const WarpSchedule &schedule, scf::ForOp loop,
   llvm::errs() << "Dumped partition graph to " << filename << "\n";
 }
 
+/// Pretty-print partition assignments showing key ops in each partition.
+/// This gives a human-readable view of the scheduling result.
+static void printPartitionAssignments(const WarpSchedule &schedule,
+                                      scf::ForOp loop,
+                                      const OpCategorizer *categorizer,
+                                      const SchedulingTemplate *tmpl,
+                                      llvm::raw_ostream &os) {
+  os << "=== Partition Assignments ===\n";
+  os << "  Partitions: "
+     << std::distance(schedule.getPartitions().begin(),
+                      schedule.getPartitions().end())
+     << "\n";
+
+  for (const Partition &partition : schedule.getPartitions()) {
+    SmallVector<Operation *> keyOps;
+    unsigned otherCount = 0;
+
+    for (Operation *op : partition.getOps()) {
+      if (isKeyOperation(op))
+        keyOps.push_back(op);
+      else
+        otherCount++;
+    }
+
+    os << "  P" << partition.getIndex() << " (stage " << partition.getStage()
+       << ")";
+    // Print abstract partition name from the template
+    if (tmpl) {
+      std::string name =
+          tmpl->getPartitionName(const_cast<Partition *>(&partition));
+      os << " [" << name << "]";
+    }
+    if (keyOps.empty() && otherCount == 0) {
+      os << ": (empty)\n";
+      continue;
+    }
+    os << ":\n";
+
+    for (Operation *op : keyOps) {
+      os << "    " << prettyOp(op);
+      if (categorizer) {
+        auto it = categorizer->getAllOps().find(op);
+        if (it != categorizer->getAllOps().end())
+          os << " [" << toString(it->second.category) << "]";
+      }
+      os << "\n";
+    }
+    if (otherCount > 0)
+      os << "    (" << otherCount << " other ops)\n";
+  }
+}
+
 /// Select the appropriate scheduling template based on the categorized ops.
 /// Uses unified template approach - no forward/backward distinction needed.
 /// The UnifiedFATemplate creates partitions based on abstract operation roles:
@@ -1172,6 +1351,11 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
   OpCategorizer categorizer(mainLoop, mmas);
   categorizer.categorize();
 
+  // Print categorized ops if DOT dumping is enabled
+  if (shouldDumpDotFile()) {
+    categorizer.printCategorizedOps(llvm::errs());
+  }
+
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   llvm::errs() << "[tritongpu-partition-scheduling] Using template-based "
                   "scheduling with data partition factor: "
@@ -1362,6 +1546,12 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
                     mmaOp);
       ++Idx;
     }
+  }
+
+  // Print partition assignments if DOT dumping is enabled
+  if (shouldDumpDotFile()) {
+    printPartitionAssignments(schedule, loops.back(), &categorizer, tmpl.get(),
+                              llvm::errs());
   }
 
   // Dump partitions to DOT file if enabled
