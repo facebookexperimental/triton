@@ -647,9 +647,17 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
+  // Skip verification for placeholder layouts - they will be resolved later
+  if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
+    return success();
   if (type.getEncoding()) {
-    // Skip verification for placeholder layouts - they will be resolved later
     if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
+      return success();
+    // Skip TMEM compatibility check for scales when the source doesn't have
+    // a LinearEncodingAttr yet -- RelayoutTritonGPU will assign the correct
+    // layout later.
+    if (isa<TensorMemoryScalesEncodingAttr>(memdesc.getEncoding()) &&
+        !isa<triton::gpu::LinearEncodingAttr>(type.getEncoding()))
       return success();
     auto enc = dyn_cast<DistributedEncodingTrait>(type.getEncoding());
     if (!enc) {
@@ -677,7 +685,8 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
 
 LogicalResult TMEMStoreOp::verify() {
   if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
-           TensorMemoryScalesEncodingAttr>(getDst().getType().getEncoding()))
+           TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMEMLayoutAttr>(
+          getDst().getType().getEncoding()))
     return emitOpError("should use tensor memory encoding.");
   if (!getDst().getType().getMutableMemory()) {
     return emitOpError("Cannot store into an immutable alloc");

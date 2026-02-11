@@ -145,26 +145,24 @@ def _to_mxfp8_block(
     dtype: tl.constexpr,
 ):
     """
-    Convert a float32 tensor to MXFP8 format and store to SMEM.
+    Convert a float32 tensor to MXFP8 format and store results.
 
     This function converts float32 data to FP8 data with E8M0 per-block scales,
     suitable for use with Blackwell's scaled MMA operations. All data stays in
-    registers except for the final stores to SMEM.
+    registers except for the final stores.
 
     Args:
         data_input: Input tensor of shape [BLOCK_M, BLOCK_K] in float32 (in registers)
         data_out_tile: Preallocated SMEM buffer for FP8 data output
-        scale_out_tile: Preallocated SMEM buffer for int8 (F8M0) scale output
+        scale_out_tile: Preallocated buffer for int8 (E8M0) scale output (SMEM or TMEM)
         VEC_SIZE: The MX block size (typically 32)
         dtype: Target output dtype, either tl.float8e4nv or tl.float8e5
 
     Note:
-        Uses tlx.local_store to write data to SMEM buffers.
-        The scale output is swizzled for TMEM format with prefill.
+        Uses tlx.local_store to write data and scales to their respective buffers.
     """
     BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
-    NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
     tl.static_assert(BLOCK_M == 128)
     tl.static_assert(BLOCK_K == 128)
     tl.static_assert(VEC_SIZE == 32)
@@ -175,5 +173,5 @@ def _to_mxfp8_block(
     # Step 2: Store FP8 data to SMEM
     tlx.local_store(data_out_tile, data_fp8)
 
-    # Step 3: Swizzle and store scales to SMEM
-    _online_swizzle_prefill(scale_e8m0, scale_out_tile, BLOCK_M, NUM_SCALES)
+    # Step 3: Store scales
+    tlx.local_store(scale_out_tile, scale_e8m0)

@@ -327,7 +327,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q buffers for q_scale
     q_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_tiles = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
-    p_scale_tiles = tlx.local_alloc((1, REP_M, REP_N, 2, 256), tl.uint8, NUM_MMA_GROUPS)
+    p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
+                                    tlx.storage_kind.tmem)
 
     q_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     q_scale_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
