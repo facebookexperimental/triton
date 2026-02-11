@@ -5,60 +5,9 @@ MXFP8 data in standard use cases.
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-F8E5M2_MAX = torch.finfo(torch.float8_e5m2).max  # 57344.0
-E8M0_EXPONENT_BIAS = 127
-
-
-@triton.jit
-def _online_swizzle_prefill(
-    scale_input,  # [BLOCK_ROWS, BLOCK_COLS] tensor (already loaded)
-    scale_output_smem,  # Output Location
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-):
-    """
-    Swizzle a block of scales to 5D format and store to output.
-
-    The swizzling follows NVIDIA's block scaling factors layout:
-    - 128 rows are grouped into 4 sub-blocks of 32 rows
-    - Swizzle formula: dest_idx = (r % 32) * 16 + (r // 32) * 4 + c
-
-    For a [128, 4] input, the output layout is [32, 16] where:
-    - The 128 rows are split into 4 groups of 32 rows
-    - Each group of 32 rows is interleaved with the 4 columns
-
-    Args:
-        scale_input: Loaded scale tensor [BLOCK_ROWS, BLOCK_COLS]
-        scale_output_smem: Output smemm buffer [1, 1, 1, 2, 256]
-        BLOCK_ROWS: Number of rows (typically 128)
-        BLOCK_COLS: Number of columns (typically 4)
-    """
-    tl.static_assert(BLOCK_ROWS == 128)
-    tl.static_assert(BLOCK_COLS == 4)
-    # Optimized SMEM path: use reshape + transpose to swizzle in registers
-    # The swizzle formula: dest_idx = (r % 32) * 16 + (r // 32) * 4 + c
-    # can be expressed as:
-    #   1. Reshape [128, 4] → [4, 32, 4]  (split rows into 4 groups of 32)
-    #   2. Transpose to [32, 4, 4]         (interleave the groups)
-    #   3. Reshape to output shape
-    NUM_GROUPS: tl.constexpr = BLOCK_ROWS // 32  # = 4
-    GROUP_SIZE: tl.constexpr = 32
-
-    # Reshape: [BLOCK_ROWS, BLOCK_COLS] → [NUM_GROUPS, GROUP_SIZE, BLOCK_COLS]
-    scale_3d = tl.reshape(scale_input, [NUM_GROUPS, GROUP_SIZE, BLOCK_COLS])
-
-    # Transpose: [NUM_GROUPS, GROUP_SIZE, BLOCK_COLS] → [GROUP_SIZE, NUM_GROUPS, BLOCK_COLS]
-    scale_transposed = tl.trans(scale_3d, 1, 0, 2)
-
-    # Reshape to 5D output: [1, 1, 1, 2, 256]
-    scale_5d = tl.reshape(scale_transposed, [1, 1, 1, 2, 256])
-    tlx.local_store(scale_output_smem, scale_5d)
 
 
 @triton.jit
