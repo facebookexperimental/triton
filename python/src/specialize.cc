@@ -135,7 +135,7 @@ bool init_globals() noexcept try {
 
   try {
     torch_tensor_cls = import_from("torch", "Tensor");
-  } catch (py::error_already_set&) {
+  } catch (py::error_already_set &) {
   }
 
   init_interned_strings();
