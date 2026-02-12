@@ -237,9 +237,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
-// Test that multibuffering is cancelled for TMEM scales allocations.
+// Test that scales encoding is propagated to multi-buffered TMEM allocations.
 // When a TMEMAllocOp with a 3D shape (1xMxK) receives TensorMemoryScalesEncodingAttr,
-// the shape should be flattened to 2D (MxK) and memdesc_index ops should be removed.
+// the 3D shape is preserved and memdesc_index ops produce 2D views with scales encoding.
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1, 1, 1, 1], CTASplitNum = [1, 1, 1, 1, 1], CTAOrder = [4, 3, 2, 1, 0]}>
@@ -251,8 +251,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // CHECK-DAG: #[[$TMEM_SCALES:.*]] = #ttng.tensor_memory_scales_encoding<>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: @cancel_multibuffering_for_tmem_scales
-  tt.func public @cancel_multibuffering_for_tmem_scales(
+  // CHECK-LABEL: @propagate_scales_encoding_to_tmem
+  tt.func public @propagate_scales_encoding_to_tmem(
       %a_smem: !ttg.memdesc<128x256xf8E4M3FN, #shared, #smem, mutable>,
       %b_smem: !ttg.memdesc<256x128xf8E4M3FN, #shared, #smem, mutable>,
       %a_scale_smem: !ttg.memdesc<1x1x2x2x256xi8, #shared_scales, #smem, mutable>,
@@ -264,14 +264,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Accumulator in TMEM
     %c_tile = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem_acc, #tmem, mutable>
 
-    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<128x8xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
+    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x128x8xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
     %a_scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x8xi8, #dummy_tmem_layout, #tmem, mutable>
-    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<256x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
+    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x256x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
     %b_scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<1x256x4xi8, #dummy_tmem_layout, #tmem, mutable>
 
-    // CHECK-NOT: ttg.memdesc_index %{{.*}} : !ttg.memdesc<1x128x8xi8
-    // CHECK-NOT: ttg.memdesc_index %{{.*}} : !ttg.memdesc<1x256x4xi8
+    // CHECK: ttg.memdesc_index %{{.*}} : !ttg.memdesc<1x128x8xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x8xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
     %a_scale_indexed = ttg.memdesc_index %a_scale_tmem[%c0_i32] : !ttg.memdesc<1x128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+    // CHECK: ttg.memdesc_index %{{.*}} : !ttg.memdesc<1x256x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<256x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
     %b_scale_indexed = ttg.memdesc_index %b_scale_tmem[%c0_i32] : !ttg.memdesc<1x256x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
 
     // Copy scales from SMEM to TMEM
