@@ -267,6 +267,29 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                       NUM_MMA_GROUPS: tl.constexpr,  #
                       GROUP_SIZE_N: tl.constexpr,  #
                       ):
+    """
+    This kernel is adapted from the Blackwell FA kernel for MXFP8.
+    This requires the following changes for correctness:
+
+    1. P must move to SMEM. As a result, for HEAD-DIM=64 it is no longer
+    necessary/helpful to share buffers QK (you have enough TMEM). This
+    kernel moves P, alpha, m, and l to their own individual buffers and
+    adds corresponding barriers (including for qk_empties).
+
+    2. The FP8 data is generated with scales, converting the dots to scale
+    dots. This follows the pattern of going bf16 -> torchao CuBlas format
+    -> 5D TMA format. This creates separate Tensor Descriptors which
+    currently match the load placement of the original tensors.
+
+    3. P is converted to FP8 online and both the data and scales are placed
+    in SMEM.
+
+    4. Subtiling is removed. It is an open question to explore how this will
+    work with scale dots.
+
+    This kernel has not yet been tuned in its autotuning configs and future work
+    will further modify this kernel.
+    """
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
