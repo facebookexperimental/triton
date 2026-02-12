@@ -5005,6 +5005,7 @@ class TestReuseGroup:
                 group_type=tlx.reuse_group_type.shared,
             )
 
+
 class TestToMxfp8:
     """Tests for the _to_mxfp8_block library function callable from JIT code with VEC_SIZE=32."""
 
@@ -5190,6 +5191,7 @@ class TestSetBufferOverlap:
         # The kernel should compile to IR but fail during lowering
         with pytest.raises(RuntimeError):
             set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)
+
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_vote_ballot_sync(device):
