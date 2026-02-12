@@ -15,12 +15,29 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include <atomic>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
+
+#include "llvm/Support/raw_os_ostream.h"
 
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+// Environment variable to dump DOT files: TRITON_DUMP_WS_GRAPHS
+// When set to a directory path, dumps visualization files there.
+// Example: TRITON_DUMP_WS_GRAPHS=/tmp/graphs
+static std::optional<std::string> getGraphDumpDir() {
+  if (const char *env = std::getenv("TRITON_DUMP_WS_GRAPHS")) {
+    return std::string(env);
+  }
+  return std::nullopt;
+}
+
+// Counter for unique file names when multiple kernels are compiled
+static std::atomic<int> graphDumpCounter{0};
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -473,6 +490,37 @@ public:
   LogicalResult run(unsigned numBuffers) override {
     getValuesAndSizes();
     resolveLiveness();
+
+    // Dump SMEM buffer liveness using pre-calculated intervals
+    // Create public data structures from private bufferRange
+    llvm::MapVector<Allocation::BufferId, std::pair<Interval<size_t>, size_t>>
+        bufferInfo;
+    DenseMap<Allocation::BufferId, Operation *> bufferOwners;
+    for (auto &bufferIter : bufferRange) {
+      auto *buffer = bufferIter.first;
+      auto &interval = bufferIter.second;
+      bufferInfo[buffer->id] = std::make_pair(interval, buffer->size);
+      bufferOwners[buffer->id] = buffer->owner;
+    }
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "\n[MemoryPlanner] SMEM buffer liveness:\n";
+      dumpSmemBufferLiveness(bufferInfo, bufferOwners, *channels, llvm::dbgs());
+    });
+
+    // Dump to file if TRITON_DUMP_WS_GRAPHS is set
+    if (auto dumpDir = getGraphDumpDir()) {
+      int id = graphDumpCounter++;
+      std::string filename =
+          *dumpDir + "/smem_liveness_" + std::to_string(id) + ".dot";
+      std::ofstream ofs(filename);
+      if (ofs.is_open()) {
+        llvm::raw_os_ostream os(ofs);
+        dumpSmemBufferLiveness(bufferInfo, bufferOwners, *channels, os);
+        llvm::errs() << "Dumped SMEM liveness to: " << filename << "\n";
+      }
+    }
+
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
 
@@ -783,6 +831,28 @@ public:
       tBuf->reuseOwner = nullptr;
       buffers.emplace_back(tBuf);
     }
+
+    // Dump TMEM buffer liveness using pre-calculated intervals
+    LLVM_DEBUG({
+      llvm::dbgs() << "\n[MemoryPlannerTmem] TMEM buffer liveness:\n";
+      dumpTmemBufferLiveness(allocs, allocToIntervals, allocToSize,
+                             allocToChannel, *channels, llvm::dbgs());
+    });
+
+    // Dump to file if TRITON_DUMP_WS_GRAPHS is set
+    if (auto dumpDir = getGraphDumpDir()) {
+      int id = graphDumpCounter++;
+      std::string filename =
+          *dumpDir + "/tmem_liveness_" + std::to_string(id) + ".dot";
+      std::ofstream ofs(filename);
+      if (ofs.is_open()) {
+        llvm::raw_os_ostream os(ofs);
+        dumpTmemBufferLiveness(allocs, allocToIntervals, allocToSize,
+                               allocToChannel, *channels, os);
+        llvm::errs() << "Dumped TMEM liveness to: " << filename << "\n";
+      }
+    }
+
     for (auto valueBufferIter : allocation.valueBuffer) {
       auto *buffer = valueBufferIter.second;
       // valueBuffer maps value to BufferT
@@ -1504,6 +1574,28 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   unsigned bufferId = planner.getLastBufferId();
   LLVM_DEBUG(funcOp.dump());
   LLVM_DEBUG(planner.dumpBuffers());
+
+  // Dump combined key ops + channel graph (side by side visualization)
+  // Note: Placed before MemoryPlannerTmem to visualize state even if TMEM
+  // allocation fails
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[doMemoryPlanner] Combined visualization:\n";
+    dumpCombinedGraph(channelsOrigin, funcOp, llvm::dbgs());
+  });
+
+  // Dump to file if TRITON_DUMP_WS_GRAPHS is set
+  if (auto dumpDir = getGraphDumpDir()) {
+    int id = graphDumpCounter++;
+    std::string filename =
+        *dumpDir + "/combined_graph_" + std::to_string(id) + ".dot";
+    std::ofstream ofs(filename);
+    if (ofs.is_open()) {
+      llvm::raw_os_ostream os(ofs);
+      dumpCombinedGraph(channelsOrigin, funcOp, os);
+      llvm::errs() << "Dumped combined graph to: " << filename << "\n";
+    }
+  }
+
   {
     Allocation allocation;
     triton::MemoryPlannerTmem planner(funcOp, &allocation, &channels);
