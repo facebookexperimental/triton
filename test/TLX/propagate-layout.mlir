@@ -1239,3 +1239,81 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     tt.return
   }
 }
+
+// -----
+
+// Test that RequireLayoutOps on tensors feeding into TMEMStoreOps with
+// TensorMemoryScalesEncodingAttr get the correct linear scales layout
+// from getScaleTMEMStoreLinearLayout (128x8 shape, double-buffered).
+
+#blocked_a_scales = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#tmem = #ttng.tensor_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#scales_encoding = #ttng.tensor_memory_scales_encoding<>
+
+// CHECK-DAG: #[[$LINEAR_SCALES:.*]] = #ttg.linear<{{.*}}>
+// CHECK-DAG: #[[$TMEM_SCALES:.*]] = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_store_scales_fixup_128x8
+  tt.func public @tmem_store_scales_fixup_128x8(
+      %a_scale_src: tensor<128x8xi8, #blocked_a_scales>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+
+    // Allocate TMEM with dummy layout (double-buffered, not cancelled)
+    %a_scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+    %a_scale_indexed = ttg.memdesc_index %a_scale_tmem[%c0_i32] : !ttg.memdesc<2x128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    // Require scales encoding on memdesc (drives backward layout propagation)
+    %a_scale_req = tlx.require_layout %a_scale_indexed : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable>
+
+    // Require layout on source tensor (the pass should fix this up with
+    // the correct linear layout from getScaleTMEMStoreLinearLayout)
+    %a_src_req = tlx.require_layout %a_scale_src : tensor<128x8xi8, #blocked_a_scales> -> tensor<128x8xi8, #blocked_a_scales>
+
+    // CHECK: ttg.convert_layout %{{.*}} : tensor<128x8xi8, #{{.*}}> -> tensor<128x8xi8, #[[$LINEAR_SCALES]]>
+    // CHECK: ttng.tmem_store %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x8xi8, #[[$LINEAR_SCALES]]> -> !ttg.memdesc<128x8xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
+    ttng.tmem_store %a_src_req, %a_scale_indexed, %true : tensor<128x8xi8, #blocked_a_scales> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    tt.return
+  }
+}
+
+// -----
+
+// Test that RequireLayoutOps on tensors feeding into TMEMStoreOps with
+// TensorMemoryScalesEncodingAttr get the correct linear scales layout
+// from getScaleTMEMStoreLinearLayout (256x4 shape, double-buffered).
+
+#blocked_b_scales = #ttg.blocked<{sizePerThread = [2, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#tmem = #ttng.tensor_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#scales_encoding = #ttng.tensor_memory_scales_encoding<>
+
+// CHECK-DAG: #[[$LINEAR_SCALES:.*]] = #ttg.linear<{{.*}}>
+// CHECK-DAG: #[[$TMEM_SCALES:.*]] = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_store_scales_fixup_256x4
+  tt.func public @tmem_store_scales_fixup_256x4(
+      %b_scale_src: tensor<256x4xi8, #blocked_b_scales>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+
+    // Allocate TMEM with dummy layout (double-buffered, not cancelled)
+    %b_scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<2x256x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %b_scale_indexed = ttg.memdesc_index %b_scale_tmem[%c0_i32] : !ttg.memdesc<2x256x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    // Require scales encoding on memdesc (drives backward layout propagation)
+    %b_scale_req = tlx.require_layout %b_scale_indexed : !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<256x4xi8, #scales_encoding, #tmem, mutable>
+
+    // Require layout on source tensor (the pass should fix this up with
+    // the correct linear layout from getScaleTMEMStoreLinearLayout)
+    %b_src_req = tlx.require_layout %b_scale_src : tensor<256x4xi8, #blocked_b_scales> -> tensor<256x4xi8, #blocked_b_scales>
+
+    // CHECK: ttg.convert_layout %{{.*}} : tensor<256x4xi8, #{{.*}}> -> tensor<256x4xi8, #[[$LINEAR_SCALES]]>
+    // CHECK: ttng.tmem_store %{{.*}}, %{{.*}}, %{{.*}} : tensor<256x4xi8, #[[$LINEAR_SCALES]]> -> !ttg.memdesc<256x4xi8, #[[$TMEM_SCALES]], #ttng.tensor_memory, mutable>
+    ttng.tmem_store %b_src_req, %b_scale_indexed, %true : tensor<256x4xi8, #blocked_b_scales> -> !ttg.memdesc<256x4xi8, #dummy_tmem_layout, #tmem, mutable>
+
+    tt.return
+  }
+}
