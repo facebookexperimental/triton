@@ -74,7 +74,7 @@ def _compute_scale_and_quantize(
     scaled_data = data_reshaped * quant_scale_expanded
 
     # Clamp to FP8 E4M3 representable range
-    scaled_data = tl.maximum(tl.minimum(scaled_data, FLOAT_MAX), -FLOAT_MAX)
+    scaled_data = tl.clamp(scaled_data, -FLOAT_MAX, FLOAT_MAX)
 
     # Reshape back to [BLOCK_M, BLOCK_K]
     data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
