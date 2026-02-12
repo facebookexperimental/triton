@@ -2497,8 +2497,15 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel_with_cache_hint(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr,
-                                               BLOCK_SIZE_N: tl.constexpr, EVICTION_POLICY: tl.constexpr):
+    def descriptor_load_kernel_with_cache_hint(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -2720,8 +2727,8 @@ def test_descriptor_load_multicast(device):
     kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
                                           ctas_per_cga=(2, 2, 1))
 
-    assert kernel.asm["ptx"].count(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    assert (kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1)
     # x:
     # [ x0 | x2]
     # [ x1 | x3]
@@ -4034,16 +4041,15 @@ def test_make_tensor_descriptor_mxfp8(device):
     ttgir = kernel.asm["ttgir"]
 
     # Verify that tensormap_create and reinterpret_tensor_descriptor operations are present
-    assert ttgir.count("ttng.tensormap_create"
-                       ) == 4, f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}"
-    assert ttgir.count(
-        "ttng.reinterpret_tensor_descriptor"
-    ) == 4, f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    assert ttgir.count("ttng.tensormap_create") == 4, (
+        f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}")
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 4, (
+        f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    )
 
     # Verify encoding propagation: tensormap_create should have shared memory encoding
     # The encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp
-    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, \
-        "Expected shared memory encoding in ttgir"
+    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, "Expected shared memory encoding in ttgir"
 
     # Compute reference
     def fp8e8m0_to_float32(scale):
@@ -4610,10 +4616,10 @@ class TestLocalAllocWithStorageAliasSpec:
         from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
 
         sig = inspect.signature(local_alloc_func)
-        reuse_param = sig.parameters['reuse']
+        reuse_param = sig.parameters["reuse"]
         # The annotation should include Union or | with both types
         annotation_str = str(reuse_param.annotation)
-        assert 'buffered_tensor' in annotation_str or 'tlx.buffered_tensor' in annotation_str
+        assert "buffered_tensor" in annotation_str or "tlx.buffered_tensor" in annotation_str
 
     def test_local_alloc_reuse_type_check_storage_alias_spec(self):
         """Verify local_alloc accepts storage_alias_spec in reuse (new behavior)."""
@@ -4621,10 +4627,10 @@ class TestLocalAllocWithStorageAliasSpec:
         from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
 
         sig = inspect.signature(local_alloc_func)
-        reuse_param = sig.parameters['reuse']
+        reuse_param = sig.parameters["reuse"]
         # The annotation should include Union or | with both types
         annotation_str = str(reuse_param.annotation)
-        assert 'storage_alias_spec' in annotation_str or 'tlx.storage_alias_spec' in annotation_str
+        assert "storage_alias_spec" in annotation_str or "tlx.storage_alias_spec" in annotation_str
 
     def test_reuse_storage_mismatch_error_message(self):
         """Verify helpful error message when storage kinds don't match."""
