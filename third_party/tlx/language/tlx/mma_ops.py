@@ -37,8 +37,8 @@ def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=N
 
 
 def require_tmem_layout_unpacked(src: tlx.buffered_tensor, unpacked: bool, _builder=None):
-    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem and isinstance(
-        src.type.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+    assert (isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem
+            and isinstance(src.type.layout, tlx.tensor_memory_layout_encoding)), "input must be a TMEM tensor"
     old_layout = src.type.layout
     if old_layout.unpacked != unpacked:
         layout_handle = _builder.make_tensor_memory_encoding_attr(
@@ -134,7 +134,7 @@ def async_dot(
         use_acc_handle = None
         if use_acc is not None:
             assert isinstance(use_acc, tl.tensor) or isinstance(
-                use_acc, tl.constexpr), f"use_acc must be a tensor or constexpr, but got {type(use_acc)}"
+                use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
             if isinstance(use_acc, tl.tensor):
                 use_acc_handle = use_acc.handle
             else:

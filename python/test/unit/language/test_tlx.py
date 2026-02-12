@@ -2602,8 +2602,15 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel_with_cache_hint(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr,
-                                               BLOCK_SIZE_N: tl.constexpr, EVICTION_POLICY: tl.constexpr):
+    def descriptor_load_kernel_with_cache_hint(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -2825,8 +2832,8 @@ def test_descriptor_load_multicast(device):
     kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
                                           ctas_per_cga=(2, 2, 1))
 
-    assert kernel.asm["ptx"].count(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    assert (kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1)
     # x:
     # [ x0 | x2]
     # [ x1 | x3]
@@ -4139,16 +4146,15 @@ def test_make_tensor_descriptor_mxfp8(device):
     ttgir = kernel.asm["ttgir"]
 
     # Verify that tensormap_create and reinterpret_tensor_descriptor operations are present
-    assert ttgir.count("ttng.tensormap_create"
-                       ) == 4, f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}"
-    assert ttgir.count(
-        "ttng.reinterpret_tensor_descriptor"
-    ) == 4, f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    assert ttgir.count("ttng.tensormap_create") == 4, (
+        f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}")
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 4, (
+        f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    )
 
     # Verify encoding propagation: tensormap_create should have shared memory encoding
     # The encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp
-    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, \
-        "Expected shared memory encoding in ttgir"
+    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, "Expected shared memory encoding in ttgir"
 
     # Compute reference
     def fp8e8m0_to_float32(scale):
@@ -4715,10 +4721,10 @@ class TestLocalAllocWithStorageAliasSpec:
         from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
 
         sig = inspect.signature(local_alloc_func)
-        reuse_param = sig.parameters['reuse']
+        reuse_param = sig.parameters["reuse"]
         # The annotation should include Union or | with both types
         annotation_str = str(reuse_param.annotation)
-        assert 'buffered_tensor' in annotation_str or 'tlx.buffered_tensor' in annotation_str
+        assert "buffered_tensor" in annotation_str or "tlx.buffered_tensor" in annotation_str
 
     def test_local_alloc_reuse_type_check_storage_alias_spec(self):
         """Verify local_alloc accepts storage_alias_spec in reuse (new behavior)."""
@@ -4726,10 +4732,10 @@ class TestLocalAllocWithStorageAliasSpec:
         from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
 
         sig = inspect.signature(local_alloc_func)
-        reuse_param = sig.parameters['reuse']
+        reuse_param = sig.parameters["reuse"]
         # The annotation should include Union or | with both types
         annotation_str = str(reuse_param.annotation)
-        assert 'storage_alias_spec' in annotation_str or 'tlx.storage_alias_spec' in annotation_str
+        assert "storage_alias_spec" in annotation_str or "tlx.storage_alias_spec" in annotation_str
 
     def test_reuse_storage_mismatch_error_message(self):
         """Verify helpful error message when storage kinds don't match."""
@@ -5104,7 +5110,6 @@ class TestReuseGroup:
                 group_type=tlx.reuse_group_type.shared,
             )
 
-
 class TestToMxfp8:
     """Tests for the _to_mxfp8_block library function callable from JIT code with VEC_SIZE=32."""
 
@@ -5224,3 +5229,128 @@ class TestToMxfp8:
         ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
         torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
         assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
+
+
+class TestSetBufferOverlap:
+    """Tests for tlx.set_buffer_overlap and storage_alias_spec.set_buffer_overlap method."""
+
+    def test_set_buffer_overlap_compiles_to_ir(self):
+        """Test that set_buffer_overlap compiles to IR but fails during lowering.
+
+        This test verifies that the JIT API works correctly - the code should
+        successfully lower to MLIR IR but is expected to fail in later lowering
+        passes because offset calculation is not yet implemented.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_kernel(BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers using the spec
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b share the same memory region
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+        grid = lambda meta: (1, )
+
+        # The kernel should compile to IR but fail during lowering
+        # (offset calculation not implemented yet)
+        with pytest.raises(RuntimeError):
+            set_buffer_overlap_kernel[grid](BLOCK_SIZE=64)
+
+    def test_set_buffer_overlap_nested_compiles_to_ir(self):
+        """Test that nested reuse_group in set_buffer_overlap compiles to IR.
+
+        This test verifies Flash Attention-style nested overlap schemes work
+        at the JIT level.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_nested_kernel(BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers (Flash Attention pattern)
+            qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                 reuse=spec)
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            alpha = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2), tlx.storage_kind.smem, reuse=spec)
+
+            # Define overlap scheme: QK shares with (P distinct from alpha)
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk,
+                    tlx.reuse_group(p, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
+
+        grid = lambda meta: (1, )
+
+        # The kernel should compile to IR but fail during lowering
+        with pytest.raises(RuntimeError):
+            set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_vote_ballot_sync(device):
+    """Test vote_ballot_sync TLX operation for warp-level voting."""
+
+    @triton.jit
+    def vote_ballot_kernel(
+        output_ptr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Each thread's lane ID (use x-axis thread ID)
+        tid = tlx.thread_id(0)
+
+        # Create a predicate: lanes 0-15 vote True, lanes 16-31 vote False
+        pred = tid < 16
+
+        # Perform warp-level ballot vote
+        # 0xFFFFFFFF means all 32 threads in the warp participate
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+
+        # Store the ballot result from thread 0 only
+        if tid == 0:
+            tl.store(output_ptr, ballot_result)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Run the kernel with 1 warp
+    vote_ballot_kernel[(1, )](output, BLOCK_SIZE=32, num_warps=1)
+    torch.cuda.synchronize()
+
+    # Expected ballot result: threads 0-15 have pred=True, threads 16-31 have pred=False
+    # So ballot should be 0x0000FFFF (lower 16 bits set)
+    expected_ballot = 0x0000FFFF
+    assert output.item() == expected_ballot, f"Expected {hex(expected_ballot)}, got {hex(output.item())}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_vote_ballot_sync_ir_emission(device):
+    """Test that vote_ballot_sync generates the correct IR."""
+
+    @triton.jit
+    def vote_ballot_ir_kernel(output_ptr, ):
+        tid = tlx.thread_id(0)
+        pred = tid < 16  # First 16 threads True
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+        if tid == 0:
+            tl.store(output_ptr, ballot_result)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    kernel = vote_ballot_ir_kernel[(1, )](output, num_warps=1)
+
+    # Verify the TTGIR contains the vote_ballot_sync op
+    ttgir = kernel.asm["ttgir"]
+    assert "vote_ballot_sync" in ttgir, "Expected vote_ballot_sync in TTGIR"
+
+    # Verify the LLVM IR contains the NVVM vote instruction
+    llir = kernel.asm["llir"]
+    assert "nvvm.vote.ballot.sync" in llir or "vote.sync.ballot" in llir, (
+        "Expected nvvm.vote.ballot.sync or vote.sync.ballot in LLVM IR")
