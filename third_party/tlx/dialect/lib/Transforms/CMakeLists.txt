@@ -8,6 +8,7 @@ add_triton_library(TritonTLXTransforms
   StorageAliasSizeDefinition.cpp
   StorageAliasAllocation.cpp
   StorageAliasLowering.cpp
+  BufferOffsetCalculation.cpp
 
   DEPENDS
   TritonTLXTransformsIncGen
