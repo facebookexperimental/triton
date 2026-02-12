@@ -21,7 +21,7 @@ namespace tlx {
 
 // Recursively compute the size of an element in the reuse group tree
 // For allocations: size is the per-buffer allocation size
-// For shared groups: size is the max of children
+// For shared groups: size is the max of children (multiplied by group_size)
 // For distinct groups: size is the sum of children
 static int64_t getElementSize(Value element) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
@@ -32,13 +32,15 @@ static int64_t getElementSize(Value element) {
   if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
     auto groupKind = reuseGroupOp.getGroupKind();
     auto elements = reuseGroupOp.getElements();
+    int64_t groupSize = reuseGroupOp.getGroupSize();
 
     if (groupKind == ReuseGroupKind::shared) {
       int64_t maxSize = 0;
       for (auto child : elements) {
         maxSize = std::max(maxSize, getElementSize(child));
       }
-      return maxSize;
+      // Multiply by group_size for subtiling
+      return maxSize * groupSize;
     } else { // distinct
       int64_t totalSize = 0;
       for (auto child : elements) {
