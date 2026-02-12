@@ -1776,3 +1776,32 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
     tt.return
   }
 }
+
+// -----
+
+#A = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: @multi_cluster_exp2
+// CHECK: scf.for
+// CHECK: math.exp2
+// CHECK: math.exp2
+tt.func @multi_cluster_exp2(%lb : index, %ub : index, %step : index,
+                 %a_ptr_init : tensor<128x32x!tt.ptr<f32>, #A> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32},
+                 %b_ptr_init : tensor<128x32x!tt.ptr<f32>, #A> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}) -> () {
+  scf.for %iv = %lb to %ub step %step : index {
+    %a = tt.load %a_ptr_init {loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #A>
+    %b = tt.load %b_ptr_init {loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #A>
+    %c = tt.load %a_ptr_init {loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #A>
+    %d = tt.load %b_ptr_init {loop.cluster = 3 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #A>
+    %e = tt.load %a_ptr_init {loop.cluster = 4 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #A>
+    %f = tt.load %b_ptr_init {loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #A>
+    %g = arith.addf %a, %b {loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x32xf32, #A>
+    %exp1 = math.exp2 %c {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x32xf32, #A>
+    %h = arith.mulf %d, %e {loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x32xf32, #A>
+    %exp2 = math.exp2 %g {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x32xf32, #A>
+    "use"(%exp1, %exp2, %f, %h) {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x32xf32, #A>, tensor<128x32xf32, #A>, tensor<128x32xf32, #A>, tensor<128x32xf32, #A>) -> ()
+  } {tt.scheduled_max_stage = 2 : i32}
+  tt.return
+}
+}

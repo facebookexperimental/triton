@@ -1,3 +1,4 @@
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -1028,6 +1029,26 @@ void lowerLoop(scf::ForOp forOp,
   if (failed(schedule.deSerialize(forOp))) {
     return;
   }
+
+  // Debug: iterate linearized schedule starting from first math.exp2
+  {
+    Operation *firstExp2 = nullptr;
+    forOp.getBody()->walk([&](math::Exp2Op op) {
+      if (!firstExp2)
+        firstExp2 = op.getOperation();
+    });
+    if (firstExp2) {
+      llvm::dbgs() << "[exp2] " << *firstExp2 << "\n";
+      auto debugSchedule = schedule.linearized(forOp, firstExp2);
+      for (int i = 0; i < 50; ++i) {
+        auto next = debugSchedule.findNext();
+        if (!next)
+          break;
+        llvm::dbgs() << "linearized[" << i << "]: " << **next << "\n";
+      }
+    }
+  }
+
   scf::ForOp newForOp = lowerMMAs(forOp, schedule);
   newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis);
   newForOp = lowerTMADescriptors(newForOp, schedule);
