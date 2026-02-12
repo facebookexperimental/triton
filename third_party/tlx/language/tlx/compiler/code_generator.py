@@ -60,6 +60,36 @@ def _is_async_task(self, node) -> bool:
     return False
 
 
+def _resolve_async_task_stmts(self, stmts):
+    """Resolve constexpr if-guards around async_task statements.
+
+    Statements inside async_tasks() must be either:
+      - `with tlx.async_task(...)` (passed through directly), or
+      - `if CONSTEXPR:` guarding one or more `with tlx.async_task(...)`.
+
+    For constexpr if-guards, the condition is evaluated at compile time and
+    only the active branch's async_task statements are included.
+    """
+    from triton.language.core import _unwrap_if_constexpr
+
+    resolved = []
+    for stmt in stmts:
+        if _is_async_task(self, stmt):
+            resolved.append(stmt)
+        elif isinstance(stmt, ast.If):
+            cond = self.visit(stmt.test)
+            cond = _unwrap_if_constexpr(cond)
+            active_block = stmt.body if cond else stmt.orelse
+            for inner_stmt in active_block:
+                assert _is_async_task(self, inner_stmt), ("Statements inside a constexpr if-guard within async_tasks() "
+                                                          "must be `with tlx.async_task(...)` blocks")
+                resolved.append(inner_stmt)
+        else:
+            assert False, ("Statements inside async_tasks() must be `with tlx.async_task(...)` "
+                           "blocks or constexpr if-guards around them")
+    return resolved
+
+
 def _get_async_task(self, node):
     context = node.items[0].context_expr
     # Parse positional args (e.g., [0])
@@ -151,6 +181,23 @@ def visit_withAsyncTasks(self, node):
         if not _is_list_like(stmts):
             stmts = [stmts]
 
+        # Resolve constexpr if-guards so that only async_task statements remain
+        stmts = _resolve_async_task_stmts(self, stmts)
+
+        # Check if only the default task remains after constexpr resolution.
+        # If so, skip warp specialization entirely and emit the default task inline.
+        has_non_default = False
+        for stmt in stmts:
+            task_check = _get_async_task(self, stmt)
+            if not task_check.is_default:
+                has_non_default = True
+                break
+
+        if not has_non_default:
+            for stmt in stmts:
+                self.visit(stmt)
+            return
+
         # dry visit async task body to count the number of sub tasks
         with tlx_enter_sub_region():
             block = self.builder.create_block()
@@ -169,7 +216,6 @@ def visit_withAsyncTasks(self, node):
 
             num_default = 0
             for stmt in stmts:
-                assert _is_async_task(self, stmt)
                 task = _get_async_task(self, stmt)
                 assert task.is_explict
                 assert task.replicate is not None, "Replicate must be non-None task"
@@ -228,7 +274,6 @@ def visit_withAsyncTasks(self, node):
         # dry visit async task body to calculate captures
         index = 0
         for stmt in stmts:
-            assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
             assert task.is_explict
             task_replicate = (task.replicate - 1) if task.is_default else task.replicate
@@ -260,7 +305,6 @@ def visit_withAsyncTasks(self, node):
         # real codegen
         index = 0
         for stmt in stmts:
-            assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
             if task.is_default:
                 region_replica_id_stack.append(0)
