@@ -14,6 +14,10 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     matmul as _blackwell_gemm_2cta, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
     attention as _blackwell_fa_ws_pipelined_persistent, )
+from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
+    attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
+    generate_attention_inputs as _generate_mxfp8_attention_inputs,
+)
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined import (
     attention as _blackwell_fa_ws_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_persistent import (
@@ -152,6 +156,15 @@ class FlashAttention:
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 1,
         },
+        "blackwell_fa_ws_pipelined_persistent_mxfp8": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "GROUP_SIZE_N": 1,
+        },
         "hopper_fa_ws": {
             "BLOCK_M": 128,
             "BLOCK_N": 128,
@@ -272,6 +285,33 @@ def test_blackwell_fa_ws_pipelined_persistent():
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, 64, 1, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
+    if HEAD_DIM == 128:
+        pytest.skip("HEAD_DIM=128 not supported yet")
+    sm_scale = 0.5
+    dtype = torch.float8_e4m3fn
+    shapes = [(8, 16, 1024)]
+    for Z, H, N_CTX in shapes:
+        torch.manual_seed(20)
+        shape = (Z, H, N_CTX, HEAD_DIM)
+        (q, q_scale, q_ref), (k, k_scale, k_ref), (v, v_scale,
+                                                   v_ref) = _generate_mxfp8_attention_inputs(shape, DEVICE, dtype)
+        ref_out = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale,
+                                                                   is_causal=causal)
+        tri_out = _blackwell_fa_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal,
+                                                              config=config)
+        tri_out = tri_out.to(ref_out.dtype)
+        if causal:
+            atol = 0.1
+        else:
+            atol = 0.03
+        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 
 # =============================================================================
