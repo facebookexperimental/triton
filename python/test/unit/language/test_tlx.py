@@ -250,7 +250,7 @@ def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, dev
     output_z = torch.empty_like(x)
     output_c = torch.empty_like(a)
     n_elements = output_z.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
     kernel = kernel_select_default[grid](
         x,
         y,
