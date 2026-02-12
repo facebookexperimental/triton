@@ -69,7 +69,6 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
     // TMEM block dimensions.
     assert(rank == 2 &&
            "Only supporting 2D tensors for TMEM compatible layout.");
-    assert(!elementType.isInteger() && "Integer type not supported for TMEM.");
     assert((numWarps == 4 || numWarps == 8) &&
            "Currently only support numWarps 4 or 8 for TMEM load and store.");
 

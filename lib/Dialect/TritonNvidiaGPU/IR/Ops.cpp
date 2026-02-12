@@ -703,6 +703,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
+  // Skip verification for placeholder layouts - they will be resolved later
+  if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
+    return success();
   if (type.getEncoding()) {
     // Skip verification for placeholder layouts - they will be resolved later
     if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
@@ -733,7 +736,8 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
 
 LogicalResult TMEMStoreOp::verify() {
   if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
-           TensorMemoryScalesEncodingAttr>(getDst().getType().getEncoding()))
+           TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMEMLayoutAttr>(
+          getDst().getType().getEncoding()))
     return emitOpError("should use tensor memory encoding.");
   if (!getDst().getType().getMutableMemory()) {
     return emitOpError("Cannot store into an immutable alloc");

@@ -2138,6 +2138,111 @@ def test_async_dot_scaled_tmem_scales(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_buffer_scales_two_entries(device):
+    """
+    Test storing to a TMEM buffer for scales with 2 entries.
+    Stores all 0s (uint8) to entry 0 and all 127s (uint8) to entry 1,
+    then verifies correctness by using each entry as scales in a
+    separate scaled MMA operation.
+
+    In E8M0 encoding, byte 0 maps to float 0.0 (so MMA result is zero)
+    and byte 127 maps to 2^(127-127) = 1.0 (so MMA result equals the
+    unscaled matmul).
+    """
+
+    @triton.jit
+    def kernel(
+        a_desc,
+        b_desc,
+        c0_desc,
+        c1_desc,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        SCALE_K: tl.constexpr = BLOCK_K // 32
+        SCALE_N: tl.constexpr = BLOCK_N // 32
+
+        # Load A, B to SMEM via TMA
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES)
+        tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        # Allocate TMEM scale buffers with 2 entries
+        a_scale_tmem = tlx.local_alloc((BLOCK_M, SCALE_K), tl.uint8, tl.constexpr(2), tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_K, SCALE_N), tl.uint8, tl.constexpr(2), tlx.storage_kind.tmem)
+
+        # Entry 0: store all 0s
+        tlx.local_store(a_scale_tmem[0], tl.full((BLOCK_M, SCALE_K), 0, tl.uint8))
+        tlx.local_store(b_scale_tmem[0], tl.full((BLOCK_K, SCALE_N), 0, tl.uint8))
+
+        # Entry 1: store all 127s
+        tlx.local_store(a_scale_tmem[1], tl.full((BLOCK_M, SCALE_K), 127, tl.uint8))
+        tlx.local_store(b_scale_tmem[1], tl.full((BLOCK_K, SCALE_N), 127, tl.uint8))
+
+        # Accumulator in TMEM
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        # MMA with entry 0 scales
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tmem[0], A_format, b_scale_tmem[0], B_format,
+                             use_acc=False)
+        result0 = tlx.local_load(c_tile[0])
+        c0_desc.store([0, 0], result0.to(tlx.dtype_of(c0_desc)))
+
+        # MMA with entry 1 scales
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tmem[1], A_format, b_scale_tmem[1], B_format,
+                             use_acc=False)
+        result1 = tlx.local_load(c_tile[0])
+        c1_desc.store([0, 0], result1.to(tlx.dtype_of(c1_desc)))
+
+    torch.manual_seed(0)
+    M, N, K = 128, 128, 256
+    BLOCK_M, BLOCK_N, BLOCK_K = M, N, K
+
+    A_DATA_TYPE = "e4m3"
+    B_DATA_TYPE = "e4m3"
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    c0 = torch.zeros((M, N), device=device, dtype=torch.float16)
+    c1 = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
+    c0_desc = TensorDescriptor.from_tensor(c0, block_shape=[BLOCK_M, BLOCK_N])
+    c1_desc = TensorDescriptor.from_tensor(c1, block_shape=[BLOCK_M, BLOCK_N])
+
+    kernel[(1, 1)](
+        a_desc,
+        b_desc,
+        c0_desc,
+        c1_desc,
+        A_DATA_TYPE,
+        B_DATA_TYPE,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    VEC_SIZE = 32
+
+    # E8M0 byte 0 → float 0.0, so result is exactly 0
+    torch.testing.assert_close(c0, torch.zeros_like(c0), atol=0, rtol=0)
+
+    # E8M0 byte 127 → float 2^(127-127) = 1.0, so result equals unscaled matmul
+    ref_c1 = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
+    torch.testing.assert_close(c1, ref_c1, atol=atol, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_tcgen05_commit(device):
     """
     Test tcgen05.commit tracking multiple tcgen05 ops
@@ -5166,6 +5271,7 @@ class TestReuseGroup:
                 group_type=tlx.reuse_group_type.shared,
             )
 
+
 class TestToMxfp8:
     """Tests for the _to_mxfp8_block library function callable from JIT code with VEC_SIZE=32."""
 
@@ -5351,6 +5457,7 @@ class TestSetBufferOverlap:
         # The kernel should compile to IR but fail during lowering
         with pytest.raises(RuntimeError):
             set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)
+
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_vote_ballot_sync(device):
