@@ -5,60 +5,9 @@ MXFP8 data in standard use cases.
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-F8E5M2_MAX = torch.finfo(torch.float8_e5m2).max  # 57344.0
-E8M0_EXPONENT_BIAS = 127
-
-
-@triton.jit
-def _online_swizzle_prefill(
-    scale_input,  # [BLOCK_ROWS, BLOCK_COLS] tensor (already loaded)
-    scale_output_smem,  # Output Location
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-):
-    """
-    Swizzle a block of scales to 5D format and store to output.
-
-    The swizzling follows NVIDIA's block scaling factors layout:
-    - 128 rows are grouped into 4 sub-blocks of 32 rows
-    - Swizzle formula: dest_idx = (r % 32) * 16 + (r // 32) * 4 + c
-
-    For a [128, 4] input, the output layout is [32, 16] where:
-    - The 128 rows are split into 4 groups of 32 rows
-    - Each group of 32 rows is interleaved with the 4 columns
-
-    Args:
-        scale_input: Loaded scale tensor [BLOCK_ROWS, BLOCK_COLS]
-        scale_output_smem: Output smemm buffer [1, 1, 1, 2, 256]
-        BLOCK_ROWS: Number of rows (typically 128)
-        BLOCK_COLS: Number of columns (typically 4)
-    """
-    tl.static_assert(BLOCK_ROWS == 128)
-    tl.static_assert(BLOCK_COLS == 4)
-    # Optimized SMEM path: use reshape + transpose to swizzle in registers
-    # The swizzle formula: dest_idx = (r % 32) * 16 + (r // 32) * 4 + c
-    # can be expressed as:
-    #   1. Reshape [128, 4] → [4, 32, 4]  (split rows into 4 groups of 32)
-    #   2. Transpose to [32, 4, 4]         (interleave the groups)
-    #   3. Reshape to output shape
-    NUM_GROUPS: tl.constexpr = BLOCK_ROWS // 32  # = 4
-    GROUP_SIZE: tl.constexpr = 32
-
-    # Reshape: [BLOCK_ROWS, BLOCK_COLS] → [NUM_GROUPS, GROUP_SIZE, BLOCK_COLS]
-    scale_3d = tl.reshape(scale_input, [NUM_GROUPS, GROUP_SIZE, BLOCK_COLS])
-
-    # Transpose: [NUM_GROUPS, GROUP_SIZE, BLOCK_COLS] → [GROUP_SIZE, NUM_GROUPS, BLOCK_COLS]
-    scale_transposed = tl.trans(scale_3d, 1, 0, 2)
-
-    # Reshape to 5D output: [1, 1, 1, 2, 256]
-    scale_5d = tl.reshape(scale_transposed, [1, 1, 1, 2, 256])
-    tlx.local_store(scale_output_smem, scale_5d)
 
 
 @triton.jit
@@ -125,7 +74,7 @@ def _compute_scale_and_quantize(
     scaled_data = data_reshaped * quant_scale_expanded
 
     # Clamp to FP8 E4M3 representable range
-    scaled_data = tl.maximum(tl.minimum(scaled_data, FLOAT_MAX), -FLOAT_MAX)
+    scaled_data = tl.clamp(scaled_data, -FLOAT_MAX, FLOAT_MAX)
 
     # Reshape back to [BLOCK_M, BLOCK_K]
     data_scaled_flat = tl.reshape(scaled_data, [BLOCK_M, BLOCK_K])
@@ -145,26 +94,24 @@ def _to_mxfp8_block(
     dtype: tl.constexpr,
 ):
     """
-    Convert a float32 tensor to MXFP8 format and store to SMEM.
+    Convert a float32 tensor to MXFP8 format and store results.
 
     This function converts float32 data to FP8 data with E8M0 per-block scales,
     suitable for use with Blackwell's scaled MMA operations. All data stays in
-    registers except for the final stores to SMEM.
+    registers except for the final stores.
 
     Args:
         data_input: Input tensor of shape [BLOCK_M, BLOCK_K] in float32 (in registers)
         data_out_tile: Preallocated SMEM buffer for FP8 data output
-        scale_out_tile: Preallocated SMEM buffer for int8 (F8M0) scale output
+        scale_out_tile: Preallocated buffer for int8 (E8M0) scale output (SMEM or TMEM)
         VEC_SIZE: The MX block size (typically 32)
         dtype: Target output dtype, either tl.float8e4nv or tl.float8e5
 
     Note:
-        Uses tlx.local_store to write data to SMEM buffers.
-        The scale output is swizzled for TMEM format with prefill.
+        Uses tlx.local_store to write data and scales to their respective buffers.
     """
     BLOCK_M: tl.constexpr = data_input.shape[0]
     BLOCK_K: tl.constexpr = data_input.shape[1]
-    NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
     tl.static_assert(BLOCK_M == 128)
     tl.static_assert(BLOCK_K == 128)
     tl.static_assert(VEC_SIZE == 32)
@@ -175,5 +122,5 @@ def _to_mxfp8_block(
     # Step 2: Store FP8 data to SMEM
     tlx.local_store(data_out_tile, data_fp8)
 
-    # Step 3: Swizzle and store scales to SMEM
-    _online_swizzle_prefill(scale_e8m0, scale_out_tile, BLOCK_M, NUM_SCALES)
+    # Step 3: Store scales
+    tlx.local_store(scale_out_tile, scale_e8m0)
