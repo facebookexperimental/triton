@@ -785,12 +785,17 @@ def get_git_version_suffix():
 
 
 def get_triton_version_suffix():
-    # Either "" or "+<git-hash>" based on git state
-    return get_git_version_suffix()
+    git_sfx = get_git_version_suffix()
+    # Should start with "+" that will replaced with "-" if needed
+    env_sfx = os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", "")
+    # version suffix can only contain one plus-character
+    if "+" in git_sfx and "+" in env_sfx:
+        env_sfx = env_sfx.replace("+", "-")
+    return git_sfx + env_sfx
 
 
 # keep it separate for easy substitution
-TRITON_VERSION = "3.6.0" + get_triton_version_suffix() + os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", "")
+TRITON_VERSION = "3.6.0" + get_triton_version_suffix()
 
 # Dynamically define supported Python versions and classifiers
 MIN_PYTHON = (3, 10)
@@ -816,7 +821,6 @@ setup(
     description="A language and compiler for custom Deep Learning operations",
     long_description="",
     install_requires=[
-        "importlib-metadata; python_version < '3.10'",
     ],
     packages=list(get_packages()),
     package_dir=dict(get_package_dirs()),
