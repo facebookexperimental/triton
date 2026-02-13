@@ -86,8 +86,7 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
     called with a `storage_alias_spec` in the `reuse` parameter.
 
     After the StorageAliasAllocationPass runs, this operation is replaced with
-    a LocalAliasOp (or MemDescSubviewOp for non-zero offsets) pointing to a
-    standard LocalAllocOp/TMEMAllocOp.
+    a LocalAliasOp pointing to a standard LocalAllocOp/TMEMAllocOp.
 
     Example:
     ```mlir
@@ -97,7 +96,9 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
     ```
   }];
 
-  let arguments = (ins TLX_StorageAliasSpecType:$storage_alias);
+  let arguments = (ins
+    TLX_StorageAliasSpecType:$storage_alias
+  );
 
   let results = (outs TTG_MemDescType:$result);
 
@@ -139,40 +140,44 @@ def TLX_ReuseGroupOp : TLX_Op<"reuse_group", [Pure]> {
       stored in smem or tmem)
     - Internal nodes are nested `!tlx.reuse_group` values
 
+    The `group_size` attribute enables **subtiling** for mixed buffer counts.
+    When group_size > 1, K consecutive buffers are treated as a single logical
+    group for offset calculation. For example, if a tensor has 4 buffers and
+    group_size=2, buffers [0,1] form logical group 0 and [2,3] form group 1.
+
     Note: The storage_alias_spec is NOT part of this operation. Validation
     that all elements reference the same storage_alias_spec is performed
     by the SetBufferOverlapOp verifier when the overlap scheme is defined.
 
     Constraints:
     - At least one element must be provided.
-    - Nested reuse groups must have alternating group_kind (shared <-> distinct).
     - All elements must use the same storage kind (smem or tmem).
+    - group_size must be a positive integer (default: 1).
 
     Example:
     ```mlir
     // Simple shared group: A and B share the same memory
-    %group = tlx.reuse_group(%a, %b) group_kind = shared
+    %group = tlx.reuse_group(%a, %b) group_kind = shared, group_size = 1
              : (!ttg.memdesc<2x64x64xf32, ...>, !ttg.memdesc<2x64x64xbf16, ...>)
              -> !tlx.reuse_group<shared>
 
-    // Complex scheme: QK shared with (P distinct from alpha, l, m)
-    %inner = tlx.reuse_group(%p, %alpha, %l, %m) group_kind = distinct
-             : (...) -> !tlx.reuse_group<distinct>
-    %outer = tlx.reuse_group(%qk, %inner) group_kind = shared
-             : (!ttg.memdesc<...>, !tlx.reuse_group<distinct>)
-             -> !tlx.reuse_group<shared>
+    // Subtiling: P has 4 buffers, treated as 2 logical groups of 2
+    %subtiled = tlx.reuse_group(%p) group_kind = shared, group_size = 2
+                : (!ttg.memdesc<4x64x64xf32, ...>)
+                -> !tlx.reuse_group<shared>
     ```
   }];
 
   let arguments = (ins
     Variadic<TLX_ReuseGroupElement>:$elements,
-    TLX_ReuseGroupKindAttr:$group_kind
+    TLX_ReuseGroupKindAttr:$group_kind,
+    DefaultValuedAttr<I64Attr, "1">:$group_size
   );
 
   let results = (outs TLX_ReuseGroupType:$result);
 
   let assemblyFormat = [{
-    `(` $elements `)` `group_kind` `=` $group_kind attr-dict `:`
+    `(` $elements `)` `group_kind` `=` $group_kind (`,` `group_size` `=` $group_size^)? attr-dict `:`
     `(` qualified(type($elements)) `)` `->` qualified(type($result))
   }];
 
@@ -267,11 +272,27 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
 }
 
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
-                                 [SameOperandAndResultMemorySpace,
-                                  Pure]> {
+                                   [SameOperandAndResultMemorySpace,
+                                    Pure]> {
   let summary = "Create an alias of a local memory buffer";
 
-  let arguments = (ins TTG_TensorOrMemDesc:$src);
+  let description = [{
+    Creates an alias of a local memory buffer with a different view (shape,
+    element type, or encoding). This operation is produced during the
+    StorageAliasAllocationPass when lowering StorageAliasLocalAllocOp.
+
+    Example:
+    ```mlir
+    %backing = ttg.local_alloc : () -> !ttg.memdesc<32768xi8, #shared, #smem, mutable>
+    %alias = tlx.local_alias %backing
+             : !ttg.memdesc<32768xi8, #shared, #smem, mutable>
+             -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    ```
+  }];
+
+  let arguments = (ins
+    TTG_TensorOrMemDesc:$src
+  );
 
   let results = (outs TTG_TensorOrMemDesc:$result);
 

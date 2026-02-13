@@ -28,6 +28,26 @@ constexpr static char AttrTLXEnablePairedCTAMMAName[] =
     "tlx.enable_paired_cta_mma";
 
 bool tlxEnablePairedMMA(Operation *op);
+
+// Get element size in bytes for a type, handling pointer types (8 bytes)
+// and using ceiling division for sub-byte types.
+inline int64_t getElementBytes(mlir::Type elemType) {
+  int64_t elemBits = isa<triton::PointerType>(elemType)
+                         ? 64
+                         : elemType.getIntOrFloatBitWidth();
+  return (elemBits + 7) / 8;
+}
+
+// Compute the size of one buffer in an allocation (excluding the num
+// dimension). For a shape like [num, d1, d2, ...], returns d1 * d2 * ... *
+// elemBytes.
+inline int64_t
+getAllocationSizePerBuffer(triton::gpu::MemDescType memDescType) {
+  int64_t totalBytes = memDescType.getNumElements() *
+                       getElementBytes(memDescType.getElementType());
+  return totalBytes / memDescType.getShape()[0];
+}
+
 } // namespace tlx
 } // namespace triton
 } // namespace mlir
