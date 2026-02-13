@@ -64,3 +64,49 @@ def test_compile_stats(device: str, fresh_knobs_except_libraries: Any, fresh_tri
     assert captured[3].total_lowering == 0
     assert captured[3].store_results == 0
     assert captured[3].total > 0
+
+
+@triton.jit
+def add_kernel(ptr):
+    block = ptr + tl.arange(0, 4)
+    x = tl.load(block)
+    tl.store(block, x + 1)
+
+
+def test_profile_compile(device: str, fresh_knobs_except_libraries: Any, fresh_triton_cache: str, capsys) -> None:
+    fresh_knobs_except_libraries.compilation.profile_compile = True
+
+    x = torch.randn(4, device=device)
+    add_kernel[(1, )](x)
+
+    captured = capsys.readouterr()
+    # Profiling output goes to stderr
+    lines = [l for l in captured.err.splitlines() if l.startswith("[triton] compile")]
+    assert len(lines) == 1, f"Expected 1 compile profile line, got {len(lines)}: {captured.err}"
+    line = lines[0]
+    # Should contain stage breakdowns (cache miss)
+    assert "total=" in line
+    assert "ir_init=" in line
+    assert "ttir=" in line or "ttgir=" in line
+    assert "cache hit" not in line
+
+    # Now run again — should be a cache hit
+    add_kernel.device_caches.clear()
+    add_kernel[(1, )](x)
+
+    captured = capsys.readouterr()
+    lines = [l for l in captured.err.splitlines() if l.startswith("[triton] compile")]
+    assert len(lines) == 1, f"Expected 1 compile profile line, got {len(lines)}: {captured.err}"
+    assert "cache hit" in lines[0]
+
+
+def test_profile_compile_off_by_default(device: str, fresh_knobs_except_libraries: Any, fresh_triton_cache: str,
+                                        capsys) -> None:
+    # profile_compile defaults to False — no output should appear
+    x = torch.randn(4, device=device)
+    add_kernel.device_caches.clear()
+    add_kernel[(1, )](x)
+
+    captured = capsys.readouterr()
+    profile_lines = [l for l in captured.err.splitlines() if l.startswith("[triton] compile")]
+    assert len(profile_lines) == 0, f"Expected no profile output, got: {captured.err}"

@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import functools
 import os
+import sys
 import time
 import weakref
 
@@ -219,6 +220,34 @@ class CompileTimer:
         )
 
 
+def _compile_config_desc(src, options) -> str:
+    parts = []
+    if isinstance(src, ASTSource):
+        arg_names = src.fn.arg_names
+        for idx, val in sorted(src.constants.items()):
+            if isinstance(idx, tuple) and len(idx) == 1:
+                name = arg_names[idx[0]]
+                short_name = name.replace("BLOCK_SIZE_", "B").replace("GROUP_SIZE_", "G")
+                parts.append(f"{short_name}={val}")
+    parts.append(f"warps={options.num_warps}")
+    parts.append(f"stages={options.num_stages}")
+    return ", ".join(parts)
+
+
+def _print_compile_profile(name: str, times: knobs.CompileTimes, cache_hit: bool, config_desc: str = "") -> None:
+    config_str = f"  ({config_desc})" if config_desc else ""
+    if cache_hit:
+        print(f"[triton] compile {name}{config_str}  cache hit  total={times.total / 1000:.1f}ms", file=sys.stderr,
+              flush=True)
+        return
+    parts = [f"ir_init={times.ir_initialization / 1000:.1f}ms"]
+    for stage_name, duration in times.lowering_stages:
+        parts.append(f"{stage_name}={duration / 1000:.1f}ms")
+    parts.append(f"store={times.store_results / 1000:.1f}ms")
+    print(f"[triton] compile {name}{config_str}  total={times.total / 1000:.1f}ms  [{', '.join(parts)}]",
+          file=sys.stderr, flush=True)
+
+
 # Facebook begin T207797237
 def _sanitize_extern_libs(options):
     options = dict(options)
@@ -254,7 +283,8 @@ def _replace_ptx_line_info(ptx_text: str, ptx_file_path: str) -> str:
 
 def compile(src, target=None, options=None, _env_vars=None):
     compilation_listener = knobs.compilation.listener
-    if compilation_listener:
+    profile_compile = knobs.compilation.profile_compile
+    if compilation_listener or profile_compile:
         timer = CompileTimer()
 
     if target is None:
@@ -320,14 +350,18 @@ def compile(src, target=None, options=None, _env_vars=None):
     if not always_compile and metadata_path is not None:
         # cache hit!
         res = CompiledKernel(src, metadata_group, hash)
-        if compilation_listener:
-            compilation_listener(
-                src=src,
-                metadata=res.metadata._asdict(),
-                metadata_group=metadata_group,
-                times=timer.end(),
-                cache_hit=True,
-            )
+        if compilation_listener or profile_compile:
+            times = timer.end()
+            if profile_compile:
+                _print_compile_profile(src.name, times, cache_hit=True, config_desc=_compile_config_desc(src, options))
+            if compilation_listener:
+                compilation_listener(
+                    src=src,
+                    metadata=res.metadata._asdict(),
+                    metadata_group=metadata_group,
+                    times=times,
+                    cache_hit=True,
+                )
         return res
 
     # initialize metadata
@@ -373,7 +407,7 @@ def compile(src, target=None, options=None, _env_vars=None):
         module.create_location_snapshot(src.path)
         print(f"Creating new locations for {src.path}")
 
-    if compilation_listener:
+    if compilation_listener or profile_compile:
         timer.finished_ir_initialization()
     for ext, compile_ir in list(stages.items())[first_stage:]:
         next_module = compile_ir(module, metadata)
@@ -406,7 +440,7 @@ def compile(src, target=None, options=None, _env_vars=None):
             next_module.create_location_snapshot(ir_full_name)
             print(f"Creating new locations for {ir_full_name}")
         module = next_module
-        if compilation_listener:
+        if compilation_listener or profile_compile:
             timer.stage_finished(ext)
     # write-back metadata
     # facebook begin T207797237
@@ -430,9 +464,13 @@ def compile(src, target=None, options=None, _env_vars=None):
         context.disable_multithreading()
 
     # notify any listener
-    if compilation_listener:
-        compilation_listener(src=src, metadata=metadata, metadata_group=metadata_group, times=timer.end(),
-                             cache_hit=False)
+    if compilation_listener or profile_compile:
+        times = timer.end()
+        if profile_compile:
+            _print_compile_profile(src.name, times, cache_hit=False, config_desc=_compile_config_desc(src, options))
+        if compilation_listener:
+            compilation_listener(src=src, metadata=metadata, metadata_group=metadata_group, times=times,
+                                 cache_hit=False)
     # return handle to compiled kernel
     return CompiledKernel(src, metadata_group, hash)
 
