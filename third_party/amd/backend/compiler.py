@@ -199,7 +199,7 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        pm.run(mod)
+        pm.run(mod, 'make_ttir')
         return mod
 
     @staticmethod
@@ -208,7 +208,7 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
                                            options.num_ctas)
-        pm.run(mod)
+        pm.run(mod, 'make_ttgir_early')
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         emuTF32 = False
@@ -281,7 +281,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         if use_async_copy:
             amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
-        pm.run(mod)
+        pm.run(mod, 'make_ttgir')
         return mod
 
     @staticmethod
@@ -297,7 +297,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
-        pm.run(mod)
+        pm.run(mod, 'gluon_to_ttgir')
         return mod
 
     @staticmethod
@@ -350,7 +350,7 @@ class HIPBackend(BaseBackend):
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)
-        pm.run(mod)
+        pm.run(mod, 'make_llir')
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
