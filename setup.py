@@ -786,7 +786,7 @@ def get_git_version_suffix():
 
 def get_triton_version_suffix():
     git_sfx = get_git_version_suffix()
-    # Should start with "+" that will replaced with "-" if needed
+    # Should start with "+" that will be replaced with "-" if needed
     env_sfx = os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", "")
     # version suffix can only contain one plus-character
     if "+" in git_sfx and "+" in env_sfx:
