@@ -576,6 +576,137 @@ def _attn_fwd_persist(
         tile_idx += num_progs
 
 
+@triton.jit
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         Z, H, N_CTX,  #
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                         ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_hz = tl.program_id(1)
+    off_n = tl.arange(0, HEAD_DIM)
+    # load
+    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    delta = tl.sum(o * do, axis=1)
+    # write-back
+    tl.store(Delta + off_hz * N_CTX + off_m, delta)
+
+
+def _bwd_pre_hook(nargs):
+    """Zero out DQ before each autotune benchmark run.
+    DQ is accumulated via atomic_add, so stale values from prior runs corrupt results."""
+    nargs["DQ"].zero_()
+
+
+configs_bwd = [
+    triton.Config(
+        {
+            "BLOCK_M1": BM,
+            "BLOCK_N1": BN,
+        },
+        num_warps=4,
+        num_stages=1,
+        pre_hook=_bwd_pre_hook,
+    ) for BM in [64] for BN in [64, 128]
+]
+
+
+@triton.autotune(configs=configs_bwd, key=["N_CTX", "HEAD_DIM"])
+@triton.jit
+def _attn_bwd(
+    Q,
+    K,
+    V,
+    sm_scale,
+    DO,
+    DQ,
+    DK,
+    DV,
+    M,
+    D,
+    stride_z,
+    stride_h,
+    stride_tok,
+    stride_d,
+    H,
+    N_CTX,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Monolithic backward kernel: one thread block per K/V block.
+    Copied from the proven _bwd_simple pattern in test_bwd_debug.py."""
+    bhid = tl.program_id(2)
+    off_chz = (bhid * N_CTX).to(tl.int64)
+    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
+    pid = tl.program_id(0)
+
+    Q += adj
+    K += adj
+    V += adj
+    DO += adj
+    DQ += adj
+    DK += adj
+    DV += adj
+    M += off_chz
+    D += off_chz
+
+    offs_k = tl.arange(0, HEAD_DIM)
+    start_n = pid * BLOCK_N1
+    offs_n = start_n + tl.arange(0, BLOCK_N1)
+
+    # Load K and V for this block — they stay in SRAM for the entire inner loop.
+    k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+    v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+
+    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+    # Iterate over all Q blocks (the entire inner loop is inlined here,
+    # NOT delegated to a helper function — this is critical for correctness).
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    curr_m = 0
+    for _ in range(N_CTX // BLOCK_M1):
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+
+        q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        m = tl.load(M + offs_m)
+        Di = tl.load(D + offs_m)
+
+        # Recompute P = softmax(QK^T * sm_scale) in log2 space
+        qk = tl.dot(q, tl.trans(k))  # [M, N]
+        qk = qk * (sm_scale * RCP_LN2)
+        p = tl.math.exp2(qk - m[:, None])  # [M, N]
+
+        # dV += P^T @ dO
+        pp = p.to(tl.float16)
+        dv += tl.dot(tl.trans(pp), do)
+
+        # dP = dO @ V^T, dS = P * (dP - Delta)
+        dp = tl.dot(do, tl.trans(v)).to(tl.float32)  # [M, N]
+        ds = p * (dp - Di[:, None])  # [M, N]
+        ds = ds.to(tl.float16)
+
+        # dK += dS^T @ Q
+        dk += tl.dot(tl.trans(ds), q)
+
+        # dQ += dS @ K * sm_scale (accumulated via atomic add)
+        dq = tl.dot(ds, k)  # [M, D]
+        dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+        tl.atomic_add(dq_ptrs, dq.to(tl.float32) * sm_scale)
+
+        curr_m += BLOCK_M1
+
+    # Store dK (scaled) and dV
+    dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    dk = dk * sm_scale
+    tl.store(dk_ptrs, dk)
+    tl.store(dv_ptrs, dv)
+
+
 def torch_dtype_to_triton(dtype):
     if dtype == torch.float8_e5m2:
         return tl.float8e5
@@ -730,6 +861,43 @@ class _attention_opt(torch.autograd.Function):
         ctx.causal = causal
         return o
 
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, M = ctx.saved_tensors
+        assert do.is_contiguous()
+        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dk = torch.empty_like(k, dtype=torch.float32)
+        dv = torch.empty_like(v, dtype=torch.float32)
+        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        PRE_BLOCK = 128
+        assert N_CTX % PRE_BLOCK == 0
+        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        delta = torch.empty_like(M)
+        _attn_bwd_preprocess[pre_grid](
+            o, do,  #
+            delta,  #
+            BATCH, N_HEAD, N_CTX,  #
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
+        )
+
+        def grid(meta):
+            return (
+                triton.cdiv(N_CTX, meta["BLOCK_N1"]),
+                1,
+                BATCH * N_HEAD,
+            )
+
+        _attn_bwd[grid](
+            q, k, v, ctx.sm_scale, do, dq, dk, dv,  #
+            M, delta,  #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            N_HEAD, N_CTX,  #
+            HEAD_DIM=ctx.HEAD_DIM,  #
+        )
+
+        return dq, dk, dv, None, None, None, None, None, None
+
 
 attention = _attention_opt.apply
 
@@ -743,7 +911,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("N_CTX", [1024, 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("mode", ["fwd"])
+@pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0, 1, 2, 3])
