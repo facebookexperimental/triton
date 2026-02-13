@@ -784,8 +784,13 @@ def get_git_version_suffix():
         return get_git_commit_hash()
 
 
+def get_triton_version_suffix():
+    # Either "" or "+<git-hash>" based on git state
+    return get_git_version_suffix()
+
+
 # keep it separate for easy substitution
-TRITON_VERSION = "3.4.0" + get_git_version_suffix() + os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", "")
+TRITON_VERSION = "3.6.0" + get_triton_version_suffix() + os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", "")
 
 # Dynamically define supported Python versions and classifiers
 MIN_PYTHON = (3, 9)
