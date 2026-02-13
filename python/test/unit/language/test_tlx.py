@@ -5279,6 +5279,10 @@ class TestToMxfp8:
     def _reference_mxfp8_quantize(data, vec_size, torch_dtype):
         """Python reference for MXFP8 quantization matching _compute_scale_and_quantize.
 
+        Note: These tests store the data in SMEM without appropriate prescale swizzling to
+        match the assumptions of TMEM. We do not test TMEM directly because we cannot provide
+        enough information for an accurate layout.
+
         Returns:
             scale_e8m0: uint8 tensor [M, K // vec_size]
             data_fp8: fp8 tensor [M, K]
@@ -5308,13 +5312,8 @@ class TestToMxfp8:
         return scale_e8m0, data_fp8
 
     @staticmethod
-    def _reference_swizzle_scales(scales):
-        """Swizzle [128, 4] uint8 -> [512] uint8 matching _online_swizzle_prefill."""
-        return scales.reshape(4, 32, 4).permute(1, 0, 2).reshape(512).contiguous()
-
-    @staticmethod
     def _run_to_mxfp8_block(input_data, elem_dtype, device):
-        """Run _to_mxfp8_block in a JIT kernel and return FP8 data and swizzled scales."""
+        """Run _to_mxfp8_block in a JIT kernel and return FP8 data and scales."""
         torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
         M, K, VEC_SIZE = 128, 128, 32
 
@@ -5335,17 +5334,18 @@ class TestToMxfp8:
                 fp8_type: tl.constexpr = tl.float8e4nv
             else:
                 fp8_type: tl.constexpr = tl.float8e5
+            NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
             data_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), fp8_type, tl.constexpr(1))
-            scale_tile = tlx.local_alloc((1, 1, 1, 2, 256), tl.uint8, tl.constexpr(1))
+            scale_tile = tlx.local_alloc((BLOCK_M, NUM_SCALES), tl.uint8, tl.constexpr(1))
             tlx._to_mxfp8_block(data, data_tile[0], scale_tile[0], VEC_SIZE, fp8_type)
             data_fp8 = tlx.local_load(data_tile[0])
             tl.store(data_out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], data_fp8)
             scale_loaded = tlx.local_load(scale_tile[0])
-            scale_flat = tl.reshape(scale_loaded, [512])
-            tl.store(scale_out_ptr + tl.arange(0, 512), scale_flat)
+            scale_flat = tl.reshape(scale_loaded, [BLOCK_M * NUM_SCALES])
+            tl.store(scale_out_ptr + tl.arange(0, BLOCK_M * NUM_SCALES), scale_flat)
 
         data_out = torch.empty(M, K, dtype=torch_dtype, device=device)
-        scale_out = torch.empty(512, dtype=torch.uint8, device=device)
+        scale_out = torch.empty(M * (K // VEC_SIZE), dtype=torch.uint8, device=device)
         kernel[(1, )](input_data, data_out, scale_out, M, K, VEC_SIZE, elem_dtype)
         return data_out, scale_out
 
@@ -5360,9 +5360,8 @@ class TestToMxfp8:
         data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
 
         ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
-        ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
         torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
-        assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
+        assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
 
     @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
     @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
@@ -5388,9 +5387,8 @@ class TestToMxfp8:
         data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
 
         ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
-        ref_scale_swizzled = self._reference_swizzle_scales(ref_scale)
         torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
-        assert torch.equal(scale_out.cpu(), ref_scale_swizzled)
+        assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
 
 
 class TestSetBufferOverlap:
