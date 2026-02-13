@@ -3094,7 +3094,221 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
   });
 }
 
+// Split local_alloc ops that have a tensor source into a separate
+// empty local_alloc + local_store. This ensures doCodePartitionPost
+// can detect cross-task SMEM channels via the LocalStoreOp producer.
+static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
+  SmallVector<ttg::LocalAllocOp> toSplit;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    if (allocOp.getSrc())
+      toSplit.push_back(allocOp);
+  });
+
+  OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+  for (auto allocOp : toSplit) {
+    auto allocDescType = cast<ttg::MemDescType>(allocOp.getType());
+    SmallVector<int64_t> shape(allocDescType.getShape());
+    Type memdescType = ttg::MemDescType::get(
+        shape, allocDescType.getElementType(), allocDescType.getEncoding(),
+        allocDescType.getMemorySpace(), /*mutableMemory*/ true);
+
+    builder.setInsertionPoint(allocOp);
+    auto newAlloc =
+        builder.create<ttg::LocalAllocOp>(allocOp.getLoc(), memdescType);
+
+    auto originTaskIds = builder.getAsyncTaskIds();
+    auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
+    builder.setAsyncTaskIdsFromOp(allocOp);
+    builder.setLoopScheduleInfoFromOp(allocOp);
+    auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+        allocOp.getLoc(), allocOp.getSrc(), newAlloc);
+    storeOp->moveBefore(allocOp);
+
+    mlir::triton::replaceUsesAndPropagateType(builder, allocOp,
+                                              newAlloc.getResult());
+    builder.setAsynTaskIdsFromArray(originTaskIds);
+    builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
+    allocOp.erase();
+  }
+}
+
+// When a local_alloc stores into a transposed nvmma_shared layout (#shared2)
+// and its sole use is a memdesc_trans back to non-transposed (#shared) that
+// feeds into operand A of a tc_gen5_mma, swap the layouts so the alloc uses
+// #shared directly. This enables the alloc to share a buffer with other allocs
+// of the same source that already use #shared layout.
+//
+// Before:
+//   %a = local_alloc %val -> memdesc<#shared_transposed>
+//   %b = memdesc_trans %a  -> memdesc<#shared_nontransposed>
+//   tc_gen5_mma %b, ...    (operand A)
+//
+// After:
+//   %a = local_alloc %val -> memdesc<#shared_nontransposed>
+//   %b = memdesc_trans %a  -> memdesc<#shared_transposed>
+//   tc_gen5_mma %b, ...    (operand A)
+static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
+  SmallVector<ttg::LocalAllocOp> toSwap;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    if (!allocOp.getSrc())
+      return;
+    auto memDescType = cast<ttg::MemDescType>(allocOp.getType());
+    auto encoding =
+        dyn_cast<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
+    if (!encoding || !encoding.getTransposed())
+      return;
+    if (!allocOp->hasOneUse())
+      return;
+    auto transOp = dyn_cast<ttg::MemDescTransOp>(*allocOp->user_begin());
+    if (!transOp)
+      return;
+    // Verify the memdesc_trans result feeds into operand A of a tc_gen5_mma.
+    bool feedsIntoMmaOperandA = false;
+    for (auto *user : transOp->getUsers()) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        if (mmaOp.getA() == transOp.getResult()) {
+          feedsIntoMmaOperandA = true;
+          break;
+        }
+      }
+    }
+    if (!feedsIntoMmaOperandA)
+      return;
+    toSwap.push_back(allocOp);
+  });
+
+  for (auto allocOp : toSwap) {
+    auto memDescType = cast<ttg::MemDescType>(allocOp.getType());
+    auto encoding =
+        cast<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
+    auto transOp = cast<ttg::MemDescTransOp>(*allocOp->user_begin());
+    auto transDescType = cast<ttg::MemDescType>(transOp.getType());
+
+    // Create non-transposed encoding for the alloc.
+    auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
+        encoding.getContext(), encoding.getSwizzlingByteWidth(),
+        /*transposed=*/false, encoding.getElementBitWidth(),
+        encoding.getFp4Padded(), encoding.getCTALayout());
+
+    // New alloc type: non-transposed encoding.
+    auto newAllocType = ttg::MemDescType::get(
+        memDescType.getShape(), memDescType.getElementType(),
+        nonTransposedEncoding, memDescType.getMemorySpace(),
+        memDescType.getMutableMemory());
+
+    // New memdesc_trans output type: transposed encoding (the original).
+    auto newTransType = ttg::MemDescType::get(
+        transDescType.getShape(), transDescType.getElementType(), encoding,
+        transDescType.getMemorySpace(), transDescType.getMutableMemory());
+
+    LLVM_DEBUG({
+      LDBG("swapTransposedLocalAllocs: swapping layouts for alloc at "
+           << allocOp.getLoc());
+      LDBG("  alloc: " << memDescType << " -> " << newAllocType);
+      LDBG("  trans: " << transDescType << " -> " << newTransType);
+    });
+
+    allocOp.getResult().setType(newAllocType);
+    transOp.getResult().setType(newTransType);
+  }
+}
+
+// Merge duplicate local_alloc ops that have:
+// 1. Same source value
+// 2. Same SMEM layout (MemDescType)
+// 3. No modification to the source value between the allocs
+//
+// This optimization is enabled after swapTransposedLocalAllocs, which
+// normalizes transposed allocs to use non-transposed layout so they can
+// share the same buffer.
+//
+// Before:
+//   %val = descriptor_load ...
+//   %a = local_alloc %val -> memdesc<#shared>
+//   ... (no modification to %val) ...
+//   %b = local_alloc %val -> memdesc<#shared>  // same src, same layout
+//
+// After:
+//   %val = descriptor_load ...
+//   %a = local_alloc %val -> memdesc<#shared>
+//   ... (no modification to %val) ...
+//   // %b is replaced with %a
+static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
+  // Map from (src, memDescType) to the first alloc op with that signature.
+  // We use a vector of pairs since we need to process allocs in program order.
+  SmallVector<ttg::LocalAllocOp> allocs;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    if (allocOp.getSrc())
+      allocs.push_back(allocOp);
+  });
+
+  // Group allocs by source value and MemDescType.
+  // For each group, check if they can be merged.
+  DenseMap<Value, SmallVector<ttg::LocalAllocOp>> allocsBySrc;
+  for (auto allocOp : allocs) {
+    allocsBySrc[allocOp.getSrc()].push_back(allocOp);
+  }
+
+  SmallVector<ttg::LocalAllocOp> toErase;
+
+  for (auto &[src, allocGroup] : allocsBySrc) {
+    if (allocGroup.size() < 2)
+      continue;
+
+    // Further group by MemDescType (layout).
+    DenseMap<Type, SmallVector<ttg::LocalAllocOp>> allocsByType;
+    for (auto allocOp : allocGroup) {
+      allocsByType[allocOp.getType()].push_back(allocOp);
+    }
+
+    for (auto &[type, typeGroup] : allocsByType) {
+      if (typeGroup.size() < 2)
+        continue;
+
+      // Sort by program order (using operation order in the IR).
+      // The first alloc in the group is the "canonical" one.
+      // We check if subsequent allocs can be merged into the first.
+      // For now, we do a simple check: if the source value is not modified
+      // between allocs (i.e., src is defined once and not reassigned).
+      // Since SSA values are immutable, if two allocs have the same src,
+      // the source cannot have been modified between them.
+
+      ttg::LocalAllocOp firstAlloc = typeGroup[0];
+      for (size_t i = 1; i < typeGroup.size(); ++i) {
+        ttg::LocalAllocOp laterAlloc = typeGroup[i];
+
+        // Check dominance: firstAlloc must dominate laterAlloc.
+        // Since we walk in program order, firstAlloc comes before laterAlloc.
+        // We can simply replace laterAlloc's uses with firstAlloc's result.
+
+        LLVM_DEBUG({
+          LDBG("mergeDuplicateLocalAllocs: merging alloc at "
+               << laterAlloc.getLoc() << " into alloc at "
+               << firstAlloc.getLoc());
+          LDBG("  src: " << src);
+          LDBG("  type: " << type);
+        });
+
+        laterAlloc.getResult().replaceAllUsesWith(firstAlloc.getResult());
+        toErase.push_back(laterAlloc);
+      }
+    }
+  }
+
+  for (auto allocOp : toErase) {
+    allocOp.erase();
+  }
+}
+
 void doBufferAllocation(triton::FuncOp &funcOp) {
+  // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
+  // allocs that share the same source value can also share a buffer.
+  swapTransposedLocalAllocs(funcOp);
+
+  // Step 0.5: Merge duplicate local_allocs with same src and layout.
+  // This must be done after swapTransposedLocalAllocs which normalizes layouts.
+  mergeDuplicateLocalAllocs(funcOp);
+
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
@@ -3102,15 +3316,17 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
   for (const auto &c : channelsOrigin) {
     channels.push_back(c.get());
   }
-  if (channels.empty()) {
-    return;
+  if (!channels.empty()) {
+    // Step 2: Reorder ops based on channel information.
+    reorderEpilogOps(channels, funcOp);
+
+    // Step 3: Create buffers. A buffer for each channel.
+    createBuffer(channels, funcOp, true);
   }
 
-  // Step 2: Reorder ops based on channel information.
-  reorderEpilogOps(channels, funcOp);
-
-  // Step 3: Create buffers. A buffer for each channel.
-  createBuffer(channels, funcOp, true);
+  // Step 4: Split remaining local_alloc with tensor source into
+  // local_alloc + local_store for downstream channel detection.
+  separateLocalAllocWithSrc(funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {

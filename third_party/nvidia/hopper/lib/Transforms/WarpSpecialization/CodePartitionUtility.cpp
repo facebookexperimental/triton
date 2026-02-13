@@ -2335,6 +2335,7 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     }
   } else {
     assert(isa<ttg::LocalAllocOp>(allocOp));
+    auto localAlloc = cast<ttg::LocalAllocOp>(allocOp);
     for (auto user : allocOp->getUsers()) {
       if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
         // Alloc associated with operand D can have multiple producers.
@@ -2346,6 +2347,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       } else
         consumers.push_back(user);
     }
+    // If no LocalStoreOp user but the alloc has a tensor source,
+    // the local_alloc itself is the producer (direct alloc+store).
+    if (!producerOp && localAlloc.getSrc())
+      producerOp = allocOp;
   }
   // FIXME: If we couldn't find a valid producer (e.g., for allocs outside the
   // loop), skip creating a channel for this allocation.
