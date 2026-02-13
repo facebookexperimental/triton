@@ -931,14 +931,111 @@ public:
       DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
       DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
       unsigned bufferId) {
+    // Check whether dstOp is in the forward SSA slice of srcOp,
+    // i.e. dstOp transitively uses a result of srcOp.  Also follows
+    // memory dependencies: if an op stores into a memdesc operand,
+    // the traversal continues through other users of that memdesc.
+    auto isDataDependent = [](Operation *srcOp, Operation *dstOp) -> bool {
+      SmallVector<Operation *, 16> worklist;
+      DenseSet<Operation *> visited;
+      auto enqueueUsers = [&](Operation *op) {
+        // Follow SSA result users.
+        for (Value result : op->getResults()) {
+          for (Operation *user : result.getUsers()) {
+            if (visited.insert(user).second)
+              worklist.push_back(user);
+          }
+        }
+        // Follow memory dependencies: if op writes to a memdesc
+        // operand (e.g. local_store, tmem_store), continue through
+        // all other users of that memdesc.
+        if (isa<triton::gpu::LocalStoreOp>(op) ||
+            isa<triton::nvidia_gpu::TMEMStoreOp>(op)) {
+          for (Value operand : op->getOperands()) {
+            if (isa<triton::gpu::MemDescType>(operand.getType())) {
+              for (Operation *user : operand.getUsers()) {
+                if (user != op && visited.insert(user).second)
+                  worklist.push_back(user);
+              }
+            }
+          }
+        }
+      };
+      enqueueUsers(srcOp);
+      while (!worklist.empty()) {
+        Operation *op = worklist.pop_back_val();
+        if (op == dstOp)
+          return true;
+        enqueueUsers(op);
+      }
+      return false;
+    };
+    // Check whether any TMEM channel forms a valid transitive dependency
+    // from consumerOp to producerOp across partition boundaries via
+    // actual data (SSA use-def) dependency chains.
+    //
+    // For a channel to prove a dependency chain, it must satisfy:
+    //   1. The channel's src is in the same partition as consumerOp
+    //   2. The channel's dst is in the same partition as producerOp
+    //   3. chSrcOp is data-dependent on consumerOp (SSA reachable)
+    //   4. producerOp is data-dependent on chDstOp (SSA reachable)
+    //
+    // Example (FA bwd): consumerOp = tmem_load(qkT) [61] P4,
+    //   producerOp = tmem_store(ppT) [68] P4.  Both in P4 so direct
+    //   match succeeds.  For cross-partition cases, e.g. qkT→dpT,
+    //   the check correctly rejects because dv MMA [69] has no SSA
+    //   data path to dpT MMA [73].
+    auto hasTransitiveDependency =
+        [&](Operation *consumerOp, Operation *producerOp,
+            const SmallVector<AsyncTaskId> &consumerTasks,
+            const SmallVector<AsyncTaskId> &producerTasks) -> bool {
+      DenseSet<AsyncTaskId> consumerSet(consumerTasks.begin(),
+                                        consumerTasks.end());
+      DenseSet<AsyncTaskId> producerSet(producerTasks.begin(),
+                                        producerTasks.end());
+      for (auto *ch : *channels) {
+        if (ch->channelKind != DataChannelKind::TMEMPost)
+          continue;
+        auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+        Operation *chSrcOp = tmemCh->getSrcOp();
+        Operation *chDstOp = tmemCh->getDstOp();
+        auto chSrcTasks = getAsyncTaskIds(chSrcOp);
+        auto chDstTasks = getAsyncTaskIds(chDstOp);
+        // Partition co-location: channel src in consumer's partition,
+        // channel dst in producer's partition.
+        bool srcMatch = llvm::any_of(
+            chSrcTasks, [&](AsyncTaskId t) { return consumerSet.contains(t); });
+        bool dstMatch = llvm::any_of(
+            chDstTasks, [&](AsyncTaskId t) { return producerSet.contains(t); });
+        if (!srcMatch || !dstMatch)
+          continue;
+        // Data dependency: chSrcOp must transitively use consumerOp's
+        // results, and producerOp must transitively use chDstOp's
+        // results.
+        if (isDataDependent(consumerOp, chSrcOp) &&
+            isDataDependent(chDstOp, producerOp))
+          return true;
+      }
+      return false;
+    };
     auto alongDependencyChain = [&](Operation *src, Operation *dst,
                                     unsigned depChainCondition) -> bool {
-      // consumer of srcAlloc --> producer of dstAlloc
-      // consumer partition of srcAllc vs. producer partition of dstAlloc
       auto *srcCh = allocToChannel[src];
       auto *dstCh = allocToChannel[dst];
-      if (getAsyncTaskIds(dstCh->getSrcOp()) ==
-          getAsyncTaskIds(srcCh->getDstOp()))
+      Operation *consumerOp = srcCh->getDstOp();
+      Operation *producerOp = dstCh->getSrcOp();
+      auto consumerTasks = getAsyncTaskIds(consumerOp);
+      auto producerTasks = getAsyncTaskIds(producerOp);
+      if (consumerTasks == producerTasks)
+        return true;
+      // Direct data dependency: consumerOp feeds into producerOp
+      // across partition boundaries (e.g. dpT→dq: tmem_load(dpT)[P4]
+      // → subf → mulf → truncf → local_store → memdesc_trans →
+      // dq MMA[P0]).
+      if (isDataDependent(consumerOp, producerOp))
+        return true;
+      if (hasTransitiveDependency(consumerOp, producerOp, consumerTasks,
+                                  producerTasks))
         return true;
       return false;
     };
@@ -1058,11 +1155,14 @@ public:
                               unsigned depChainCondition) -> size_t {
       size_t maxColOffset = 0;
       // Try to find the colOffset in this reuseOwner. If there is already a
-      // reuse in the same loop, move up colOffset.
+      // reuse whose liveness overlaps with the candidate, move up colOffset.
+      // Note: we use liveness intersection rather than sameLoop here because
+      // two buffers in the same loop whose liveness ranges don't intersect
+      // (e.g. ppT [68-70) and dsT [82-84) in FA bwd) can safely share the
+      // same column offset — they are never live simultaneously.
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
-          if (sameLoop(alloc) ||
-              bufferRange[alloc].intersects(bufferRange[cand]))
+          if (bufferRange[alloc].intersects(bufferRange[cand]))
             maxColOffset =
                 std::max(alloc->colOffset + alloc->colSize, maxColOffset);
         }
@@ -1078,8 +1178,11 @@ public:
         for (auto *alloc : buffers) {
           if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner &&
               alloc->colOffset == 0 && sameLoop(alloc) &&
-              alongDependencyChain(alloc->owner, cand->owner,
-                                   depChainCondition)) {
+              (bufferRange[cand].start() < bufferRange[alloc].start()
+                   ? alongDependencyChain(cand->owner, alloc->owner,
+                                          depChainCondition)
+                   : alongDependencyChain(alloc->owner, cand->owner,
+                                          depChainCondition))) {
             auto tOffset = findUsesInCtrlOp(alloc, cand);
             LLVM_DEBUG({
               LDBG("findUsesInCtrlOp returns " << tOffset);
@@ -1134,8 +1237,15 @@ public:
               ((!sameLoop(alloc) &&
                 samePartition(alloc, cand, partitionCondition)) ||
                (sameLoop(alloc) &&
-                alongDependencyChain(alloc->owner, cand->owner,
-                                     depChainCondition)))) {
+                // Check the dependency chain in the correct temporal
+                // direction: the buffer whose liveness starts first is
+                // the "source" (its consumer leads to the other's
+                // producer).
+                (bufferRange[cand].start() < bufferRange[alloc].start()
+                     ? alongDependencyChain(cand->owner, alloc->owner,
+                                            depChainCondition)
+                     : alongDependencyChain(alloc->owner, cand->owner,
+                                            depChainCondition))))) {
             // Make sure there is no liveness overlap with other buffers using
             // the space.
             auto colOffset = findReuseSpace(cand, alloc, depChainCondition);
@@ -1554,14 +1664,31 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     }
   }
 
-  // If a read decision file is provided, apply decisions from file instead of
-  // running the planner.
-  if (!readDecisionFile.empty()) {
-    if (failed(readDecisionsFromFile(channels, readDecisionFile))) {
-      return failure();
+  // If a read decision file is provided (via argument or env var), apply
+  // decisions from file instead of running the planner.
+  StringRef effectiveReadFile = readDecisionFile;
+  std::string envReadFile;
+  bool fromEnv = false;
+  if (effectiveReadFile.empty()) {
+    if (const char *envVal = std::getenv("TRITON_WS_DECISION_FILE")) {
+      envReadFile = envVal;
+      effectiveReadFile = envReadFile;
+      fromEnv = true;
     }
-    LDBG("Skipping memory planner - using decisions from file");
-    return success();
+  }
+  if (!effectiveReadFile.empty()) {
+    if (failed(readDecisionsFromFile(channels, effectiveReadFile))) {
+      if (fromEnv) {
+        LDBG("Decision file from env var does not match this kernel, "
+             "falling back to planner");
+      } else {
+        return failure();
+      }
+    } else {
+      LDBG("Skipping memory planner - using decisions from: "
+           << effectiveReadFile);
+      return success();
+    }
   }
 
   // Step 2: figure out smem/tmem sizes and liveness.
