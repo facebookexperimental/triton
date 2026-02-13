@@ -95,6 +95,7 @@ class HIPOptions:
 
 class HIPBackend(BaseBackend):
     instrumentation = None
+    supports_native_tensor_specialization = False
 
     @staticmethod
     def supports_target(target: GPUTarget):
@@ -176,11 +177,9 @@ class HIPBackend(BaseBackend):
         return ret
 
     @staticmethod
-    def get_arg_specialization(arg, ty, **kwargs):
-        ret = BaseBackend.get_arg_specialization(arg, ty, **kwargs)
-        # Only attempt to do buffer ops specialization if buffer ops are enabled.
-        # Otherwise the is_within_2gb check is unnecessary overhead.
-        if knobs.amd.use_buffer_ops and ty == "tensor" and HIPBackend.is_within_2gb(arg):
+    def get_tensor_specialization(arg, **kwargs):
+        ret = BaseBackend.get_tensor_specialization(arg, **kwargs)
+        if knobs.amd.use_buffer_ops and HIPBackend.is_within_2gb(arg):
             ret += "S"
         return ret
 
@@ -188,7 +187,8 @@ class HIPBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"hip:{options.arch}", options.num_warps, 64, options.num_ctas)
+        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"hip:{options.arch}", options.num_warps, 64, options.num_ctas,
+                                            list((1, 1, 1)))
         passes.common.add_inliner(pm)
         passes.ttir.add_rewrite_tensor_pointer(pm)
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)

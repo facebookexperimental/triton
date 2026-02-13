@@ -91,6 +91,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerConvertTritonGPUToLLVMPass();
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerAllocateSharedMemoryNvPass();
+  mlir::triton::registerCudaWarningsPass();
   mlir::registerLLVMDIScope();
   mlir::LLVM::registerInlinerInterface(registry);
   mlir::NVVM::registerInlinerInterface(registry);

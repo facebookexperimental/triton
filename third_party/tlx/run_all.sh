@@ -90,14 +90,14 @@ read user_choice
 case $user_choice in
     c)
         echo "Verifying correctness of TLX tutorial kernels"
-        pytest third_party/tlx/tutorials/*.py
+        pytest third_party/tlx/tutorials/testing/test_correctness.py
         ;;
     p)
         echo "Measuring performance of TLX tutorial kernels"
-        for k in third_party/tlx/tutorials/*.py; do
-            echo "Running $k"
-            third_party/tlx/denoise.sh python $k
-        done
+        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py
+        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py
+        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py
+        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py
         ;;
     n)
         break

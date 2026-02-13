@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -16,9 +17,18 @@
 
 namespace mlir {
 
+// Helper to get printing flags with location info enabled
+static OpPrintingFlags getOpPrintingFlagsWithLoc() {
+  OpPrintingFlags flags;
+  flags.enableDebugInfo();
+  return flags;
+}
+
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
-void doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers);
+LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
+                              StringRef readDecisionFile = "",
+                              StringRef writeDecisionFile = "");
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
@@ -86,9 +96,10 @@ public:
         // Partition key ops into multiple async tasks.
         doTaskPartition(funcOp, numWarpGroups);
         if (dumpIntermediateSteps) {
-          llvm::dbgs()
-              << "// -----// WarpSpec internal IR Dump After: doTaskPartition\n"
-              << moduleOp << "\n\n\n";
+          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                          "doTaskPartition\n";
+          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+          llvm::dbgs() << "\n\n\n";
         }
         // Propagate taskId.
         int retCode = doTaskIdPropagate(funcOp);
@@ -96,16 +107,18 @@ public:
           continue;
         if (dumpIntermediateSteps) {
           llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskIdPropagate\n"
-                       << moduleOp << "\n\n\n";
+                          "doTaskIdPropagate\n";
+          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+          llvm::dbgs() << "\n\n\n";
         }
 
         // Partition ops into parallel sub ops.
         if (doDataPartition(funcOp, numWarpGroups - 1)) {
           if (dumpIntermediateSteps) {
             llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                            "doDataPartition\n"
-                         << moduleOp << "\n\n\n";
+                            "doDataPartition\n";
+            moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+            llvm::dbgs() << "\n\n\n";
           }
           success = true;
           break;
@@ -120,8 +133,9 @@ public:
         signalPassFailure();
       if (dumpIntermediateSteps) {
         llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doTaskIdPropagate\n"
-                     << moduleOp << "\n\n\n";
+                        "doTaskIdPropagate\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
       }
     }
 
@@ -130,55 +144,66 @@ public:
     doBufferAllocation(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
-    doMemoryPlanner(funcOp, numStages);
+    if (failed(doMemoryPlanner(funcOp, numStages))) {
+      signalPassFailure();
+      return;
+    }
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     doCodePartitionPost(funcOp, numStages);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
         llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n"
-            << moduleOp << "\n\n\n";
+            << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
       }
     }
 
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedulePreprocessing\n"
-                   << moduleOp << "\n\n\n";
+                      "doLoopSchedulePreprocessing\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
     triton::gpu::scheduleLoops(moduleOp, defaultNumStages, true);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedule\n"
-                   << moduleOp << "\n\n\n";
+                      "doLoopSchedule\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
   }
 
   void runOnOperation() override {
+    assert(numStages >= 1 && "numStages must be at least 1");
     getOperation()->walk(
         [&](triton::FuncOp funcOp) { runOnFuncOp(funcOp, numStages); });
 

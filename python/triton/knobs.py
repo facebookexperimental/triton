@@ -371,6 +371,7 @@ class compilation_knobs(base_knobs):
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
+    dump_best_config_ir: env_bool = env_bool("TRITON_KERNEL_DUMP_BEST_CONFIG")
 
 
 class LaunchHook(Protocol):
@@ -492,6 +493,7 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
 
 
 class amd_knobs(base_knobs):

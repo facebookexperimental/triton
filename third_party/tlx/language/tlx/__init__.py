@@ -38,7 +38,9 @@ from .mem_ops import (
     remote_shmem_store,
     async_remote_shmem_store,
     remote_view,
+    storage_alias_spec,
     subslice,
+    tmem_copy,
 )
 from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
 from .types import (
@@ -53,6 +55,11 @@ from .types import (
     mbarrier,
     mbarrier_type,
     nv_mma_shared_layout_encoding,
+    reuse_group,
+    reuse_group_ir_type,
+    reuse_group_type,
+    storage_alias_spec as storage_alias_spec_type_class,
+    storage_alias_spec_type,
     shared_layout_encoding,
     storage_kind,
     swizzled_shared_layout_encoding,
@@ -65,10 +72,14 @@ from .utility import (
     clock64,
     cluster_cta_rank,
     dtype_of,
+    get_fp8_format_name,
     size_of,
     stoch_round,
     thread_id,
 )
+from .mxfp8_utils import _to_mxfp8_block
+from .warp_ops import (
+    vote_ballot_sync, )
 
 __all__ = [
     # async_tasks
@@ -83,6 +94,11 @@ __all__ = [
     "storage_kind",
     "buffered_tensor",
     "buffered_tensor_type",
+    "storage_alias_spec",
+    "storage_alias_spec_type",
+    "storage_alias_spec_type_class",
+    "reuse_group",
+    "reuse_group_type",
     "mbarrier",
     "mbarrier_type",
     "clc_response",
@@ -131,6 +147,7 @@ __all__ = [
     "thread_id",
     "async_task_replica_id",
     "dtype_of",
+    "get_fp8_format_name",
     "size_of",
     "clock64",
     "stoch_round",
@@ -143,4 +160,8 @@ __all__ = [
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
+    # MXFP8
+    "_to_mxfp8_block",
+    # warp_ops
+    "vote_ballot_sync",
 ]

@@ -22,7 +22,7 @@ def _is_layout_applicable(layout) -> bool:
             return False
         return True
     elif is_hip():
-        if layout in ["padded_shared_layout_single_interval", "padded_shared_layout_multi_interval"]:
+        if isinstance(layout, ttgl.PaddedSharedLayout):
             return True
         # TODO: Add other amd layouts
         return isinstance(layout, ttgl.amd.AMDMFMALayout)
@@ -140,7 +140,12 @@ def _reduce_layouts():
                                transposed=True),
         ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[1, 4], tiles_per_warp=[1, 1], instr_shape=[32, 32],
                                transposed=True),
-        # TODO: AMDWMMA layouts
+        ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[1, 4], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=4, warps_per_cta=[1, 4], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
+        ttgl.amd.AMDWMMALayout(version=1, transposed=True, warps_per_cta=[1, 4]),
+        ttgl.amd.AMDWMMALayout(version=2, transposed=True, warps_per_cta=[1, 4]),
         ttgl.DotOperandLayout(
             parent=ttgl.NVMMADistributedLayout(
                 version=[2, 0],
@@ -795,72 +800,68 @@ _mma_pairs = [
             instr_shape=[16, 64, 16],
         ),
     ],
-    # AMD MFMA layouts
+    # AMD MFMA v1 layouts
     [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
-                               transposed=False),
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
-                               transposed=False),
+        ttgl.amd.AMDMFMALayout(version=1, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=1, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
     ],
     [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
-                               transposed=False),
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
-                               transposed=False),
+        ttgl.amd.AMDMFMALayout(version=1, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=1, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+                               transposed=True),
     ],
+    # AMD MFMA v2 layouts
     [
         ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
-                               transposed=False),
+                               transposed=True),
         ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
                                transposed=True),
     ],
     [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
-                               transposed=False),
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
                                transposed=True),
-    ],
-    [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
-                               transposed=False),
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
-                               transposed=False),
-    ],
-    [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
-                               transposed=False),
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
-                               transposed=False),
-    ],
-    [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
-                               transposed=False),
         ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
                                transposed=True),
     ],
+    # AMD MFMA v3 layouts
     [
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
-                               transposed=False),
-        ttgl.amd.AMDMFMALayout(version=2, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+        ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
                                transposed=True),
     ],
-    # TODO: AMD WMMA layouts
-    # [
-    #    WmmaLayout(1, [4, 4]),
-    #    WmmaLayout(1, [16, 1]),
-    # ],
-    # [
-    #    WmmaLayout(1, [16, 1]),
-    #    WmmaLayout(1, [4, 4]),
-    # ],
-    # [
-    #    WmmaLayout(2, [4, 4]),
-    #    WmmaLayout(2, [16, 1]),
-    # ],
-    # [
-    #    WmmaLayout(2, [16, 1]),
-    #    WmmaLayout(2, [4, 4]),
-    # ],
+    [
+        ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+                               transposed=True),
+    ],
+    # AMD MFMA v4 layouts
+    [
+        ttgl.amd.AMDMFMALayout(version=4, warps_per_cta=[2, 2], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=4, warps_per_cta=[4, 1], tiles_per_warp=[1, 1], instr_shape=[32, 32],
+                               transposed=True),
+    ],
+    [
+        ttgl.amd.AMDMFMALayout(version=4, warps_per_cta=[4, 4], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+                               transposed=True),
+        ttgl.amd.AMDMFMALayout(version=4, warps_per_cta=[16, 1], tiles_per_warp=[1, 1], instr_shape=[16, 16],
+                               transposed=True),
+    ],
+    # AMD WMMA v1 layouts
+    [
+        ttgl.amd.AMDWMMALayout(version=1, transposed=True, warps_per_cta=[4, 4]),
+        ttgl.amd.AMDWMMALayout(version=1, transposed=True, warps_per_cta=[16, 1]),
+    ],
+    # AMD WMMA v2 layouts
+    [
+        ttgl.amd.AMDWMMALayout(version=2, transposed=True, warps_per_cta=[4, 4]),
+        ttgl.amd.AMDWMMALayout(version=2, transposed=True, warps_per_cta=[16, 1]),
+    ],
 ]
 
 
@@ -1070,6 +1071,7 @@ _ld_st_shared_layouts = _filter_layouts([
     ttgl.SwizzledSharedLayout(vec=4, per_phase=2, max_phase=4, order=[0, 1]),
     ttgl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=8, order=[1, 0]),
     ttgl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=16, order=[1, 0]),
+    "shared_linear_layout",
 ])
 
 
@@ -1085,6 +1087,20 @@ _ld_st_shared_layouts = _filter_layouts([
 @pytest.mark.parametrize("dist_layout", _ld_st_dot_layouts + _ld_st_mma_layouts)
 @pytest.mark.parametrize("shared_layout", _ld_st_shared_layouts)
 def test_local_load_store_2d_layouts(shape, dtype, dist_layout, shared_layout, device):
+    if shared_layout == "shared_linear_layout":
+        rank = len(shape)
+        assert rank == 2
+        offset_bases = []
+        for dim, size in enumerate(shape):
+            assert size > 0 and (size & (size - 1)) == 0
+            stride = 1
+            while stride < size:
+                basis = [0] * rank
+                basis[dim] = stride
+                offset_bases.append(basis)
+                stride <<= 1
+        shared_layout = ttgl.SharedLinearLayout(offset_bases=offset_bases, block_bases=[], shape=list(shape))
+
     if isinstance(shared_layout, ttgl.NVMMASharedLayout):
         contig_dim = 0 if shared_layout.transposed else 1
         if shape[contig_dim] < (8 * shared_layout.swizzle_byte_width) / shared_layout.element_bitwidth:

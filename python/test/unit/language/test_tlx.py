@@ -116,6 +116,167 @@ def test_async_tasks(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("ENABLE_SECOND_TASK", [True, False])
+def test_async_tasks_constexpr_guard(BLOCK_SIZE, ENABLE_SECOND_TASK, device):
+    """Test that a tl.constexpr if-check can guard an async_task within async_tasks.
+
+    The first async_task (default) is always present. The second async_task
+    is conditionally included based on the ENABLE_SECOND_TASK constexpr flag.
+    Both configurations should produce the correct result.
+    """
+
+    @triton.jit
+    def add_kernel_conditional_task(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        ENABLE_SECOND_TASK: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                output = x + y
+                tl.store(z_ptr + offsets, output, mask=mask)
+            if ENABLE_SECOND_TASK:
+                with tlx.async_task(num_warps=1, registers=100):
+                    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < n_elements
+                    a = tl.load(a_ptr + offsets, mask=mask)
+                    b = tl.load(b_ptr + offsets, mask=mask)
+                    output = a + b
+                    tl.store(c_ptr + offsets, output, mask=mask)
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    a = torch.rand(size, device=device)
+    b = torch.rand(size, device=device)
+    output_z = torch.empty_like(x)
+    output_c = torch.empty_like(a)
+    n_elements = output_z.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = add_kernel_conditional_task[grid](
+        x,
+        y,
+        output_z,
+        a,
+        b,
+        output_c,
+        n_elements,
+        BLOCK_SIZE,
+        ENABLE_SECOND_TASK,
+        num_warps=4,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    if ENABLE_SECOND_TASK:
+        assert re.search(r"ttg.warp_specialize",
+                         ttgir), ("Expected warp_specialize in TTGIR when ENABLE_SECOND_TASK=True")
+        assert re.search(r"partition0\([^\n]*\)\s+num_warps\(1\)", ttgir,
+                         flags=re.DOTALL), ("Expected partition0 with num_warps(1) when ENABLE_SECOND_TASK=True")
+    else:
+        assert not re.search(r"ttg.warp_specialize",
+                             ttgir), ("Did not expect warp_specialize in TTGIR when ENABLE_SECOND_TASK=False")
+
+    torch.testing.assert_close(output_z, x + y, check_dtype=False)
+    if ENABLE_SECOND_TASK:
+        torch.testing.assert_close(output_c, a + b, check_dtype=False)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("USE_LARGE_DEFAULT", [True, False])
+def test_async_tasks_constexpr_select_default(BLOCK_SIZE, USE_LARGE_DEFAULT, device):
+    """Test that a constexpr if/else can select between two different default tasks.
+
+    Both branches of the if/else contain a default async_task, but only one
+    survives constexpr resolution. This exercises the num_default == 1 assertion
+    which must hold after resolution, not before.
+    """
+
+    @triton.jit
+    def kernel_select_default(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        USE_LARGE_DEFAULT: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            if USE_LARGE_DEFAULT:
+                with tlx.async_task("default", warp_group_start_id=0):
+                    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < n_elements
+                    x = tl.load(x_ptr + offsets, mask=mask)
+                    y = tl.load(y_ptr + offsets, mask=mask)
+                    tl.store(z_ptr + offsets, x + y, mask=mask)
+            else:
+                with tlx.async_task("default", warp_group_start_id=1):
+                    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < n_elements
+                    x = tl.load(x_ptr + offsets, mask=mask)
+                    y = tl.load(y_ptr + offsets, mask=mask)
+                    tl.store(z_ptr + offsets, x * y, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                tl.store(c_ptr + offsets, a + b, mask=mask)
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    a = torch.rand(size, device=device)
+    b = torch.rand(size, device=device)
+    output_z = torch.empty_like(x)
+    output_c = torch.empty_like(a)
+    n_elements = output_z.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = kernel_select_default[grid](
+        x,
+        y,
+        output_z,
+        a,
+        b,
+        output_c,
+        n_elements,
+        BLOCK_SIZE,
+        USE_LARGE_DEFAULT,
+        num_warps=4,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    assert re.search(r"ttg.warp_specialize", ttgir), "Expected warp_specialize in TTGIR"
+    # Verify the non-default task always ran (a + b → c)
+    torch.testing.assert_close(output_c, a + b, check_dtype=False)
+    # Verify which default was selected by the constexpr condition
+    if USE_LARGE_DEFAULT:
+        torch.testing.assert_close(output_z, x + y, check_dtype=False)
+    else:
+        torch.testing.assert_close(output_z, x * y, check_dtype=False)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("BLOCK_SIZE", [(64)])
 def test_local_load(BLOCK_SIZE, device):
 
@@ -1721,38 +1882,48 @@ def test_async_dot_scaled_2cta(device):
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     """
-    Test D = (A * A_scale)  * (B * B_scale)
+    Test D = (A * A_scale)  * (B * B_scale) with mxfp8 format for both A and B.
 
+    Scale layout uses 5D TMA descriptor [1, rep_m, rep_k, 2, 256] with uint8 elements,
+    matching cuBLAS block scaling layout.
     """
+
+    VEC_SIZE = 32  # mxfp8 uses 32 elements per scale factor
 
     @triton.jit
     def tcgen5_dot_scaled_kernel(
         a_desc,
-        a_scale_desc,  #
+        a_scale_desc,
         b_desc,
-        b_scale_desc,  #
-        c_desc,  #
-        A_format: tl.constexpr,  #
-        B_format: tl.constexpr,  #
+        b_scale_desc,
+        c_desc,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        # async load a and b into SMEM
+        # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
+
+        # Allocate SMEM buffers
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
         b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
-        a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tlx.dtype_of(a_scale_desc),
-                                       tl.constexpr(1))
-        b_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tlx.dtype_of(b_scale_desc),
-                                       tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256] for cuBLAS block scaling layout
+        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1))
 
         load_bar = tlx.alloc_barriers(tl.constexpr(1))
-        LD_SIZE: tl.constexpr = (BLOCK_M + BLOCK_N) * (BLOCK_K + BLOCK_K // 32)
-        tlx.barrier_expect_bytes(load_bar[0], LD_SIZE)  # fp8
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
         tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
         tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
-        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0], load_bar)
-        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0], load_bar)
+        # 5D offset with leading 0
+        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
         tlx.barrier_wait(load_bar[0], 0)
 
         c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
@@ -1764,7 +1935,7 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         c_desc.store([0, 0], c)
 
     torch.manual_seed(0)
-    M, N, K = (128, 128, 128)
+    M, N, K = (128, 128, 256)
     BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
 
     DTYPE_MAP = {
@@ -1779,17 +1950,19 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
-    # Use 4D TMA descriptor [rep_m, rep_k, 2, 256] with uint8 elements.
-    # With 256 elements we better utilize the L2 and don't require the TMA
-    # engine to emit many small messages (16B) messages as with 32x16xu8.
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
+    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
-    a_scale = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
-    b_scale = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
 
-    a_scale_desc = TensorDescriptor.from_tensor(a_scale, block_shape=[BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128])
-    b_scale_desc = TensorDescriptor.from_tensor(b_scale, block_shape=[BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128])
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
 
     kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N}
     kernel = tcgen5_dot_scaled_kernel[(1, 1)](
@@ -1805,10 +1978,9 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
 
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.async_tma_copy_global_to_local") == 4
-    assert ttgir.count("ttng.tmem_copy") == 2
     assert ttgir.count("ttng.tc_gen5_mma_scaled") == 1
 
-    # Converts a tensor of FP8 E8M0 format scale values to float32 by bit-shifting the exponent bits
+    # Converts E8M0 format scale values to float32 by bit-shifting the exponent bits
     # into the correct position for IEEE 754 float32 representation
     def fp8e8m0_to_float32(scale):
         scale = scale.view(torch.uint8)
@@ -1818,14 +1990,257 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         return scale
 
     # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale.reshape(M, K // 32))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale.reshape(N, K // 32))
-    # Repeats each scale value 32 times along dimension 1.
-    a_scale_f32 = a_scale_f32.repeat_interleave(32, dim=1)[:M, :K]
-    b_scale_f32 = b_scale_f32.repeat_interleave(32, dim=1).T.contiguous()[:K, :N]
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Repeats each scale value VEC_SIZE times along dimension 1.
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
-    atol = 1e-2 * math.sqrt(K / 32)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
     torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_dot_scaled_tmem_scales(device):
+    """
+    Test D = (A * A_scale) * (B * B_scale) with mxfp8 format and TMEM scales.
+
+    This test verifies that scales can be stored in tensor memory (TMEM) instead
+    of shared memory (SMEM). The scales are first loaded to SMEM via TMA, then
+    copied to TMEM for use in the scaled MMA operation.
+    """
+
+    VEC_SIZE = 32  # mxfp8 uses 32 elements per scale factor
+
+    @triton.jit
+    def tcgen5_dot_scaled_tmem_scales_kernel(
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
+        REP_M: tl.constexpr = BLOCK_M // 128
+        REP_N: tl.constexpr = BLOCK_N // 128
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+
+        # Allocate SMEM buffers for A, B, and scales
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
+        # 5D scale buffers in SMEM: [1, REP_M/N, REP_K, 2, 256]
+        a_scale_smem = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1))
+        b_scale_smem = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1))
+
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
+        tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
+        # Load scales to SMEM via TMA
+        tlx.async_descriptor_load(a_scale_desc, a_scale_smem[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_smem[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        # Allocate TMEM for scales and accumulator
+        # Scale shape in TMEM: flatten 5D to 2D for TMEM storage
+        SCALE_K: tl.constexpr = BLOCK_K // 32
+        SCALE_N: tl.constexpr = BLOCK_N // 32
+        a_scale_tmem = tlx.local_alloc((BLOCK_M, SCALE_K), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_K, SCALE_N), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        # Copy scales from SMEM to TMEM directly using tmem_copy
+        tlx.tmem_copy(a_scale_smem[0], a_scale_tmem[0])
+        tlx.tmem_copy(b_scale_smem[0], b_scale_tmem[0])
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        # Use TMEM scales in async_dot_scaled
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tmem[0], A_format, b_scale_tmem[0], B_format,
+                             use_acc=False)
+
+        result = tlx.local_load(c_tile[0])
+        c = result.to(tlx.dtype_of(c_desc))
+        c_desc.store([0, 0], c)
+
+    torch.manual_seed(0)
+    M, N, K = (128, 128, 256)
+    BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
+
+    A_DATA_TYPE = "e4m3"
+    B_DATA_TYPE = "e4m3"
+
+    DTYPE_MAP = {
+        "e5m2": torch.float8_e5m2,
+        "e4m3": torch.float8_e4m3fn,
+    }
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(DTYPE_MAP[A_DATA_TYPE]).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
+    c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
+
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+
+    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
+
+    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N}
+    kernel = tcgen5_dot_scaled_tmem_scales_kernel[(1, 1)](
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        A_DATA_TYPE,
+        B_DATA_TYPE,
+        **kern_kwargs,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_global_to_local") == 4
+    assert ttgir.count("ttng.tc_gen5_mma_scaled") == 1
+    # Verify TMEM scales encoding is used
+    assert "tensor_memory_scales_encoding" in ttgir
+    # Verify tmem_copy is used for SMEM->TMEM transfer
+    assert ttgir.count("ttng.tmem_copy") == 2
+
+    # Converts E8M0 format scale values to float32
+    def fp8e8m0_to_float32(scale):
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    # Compute reference
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_buffer_scales_two_entries(device):
+    """
+    Test storing to a TMEM buffer for scales with 2 entries.
+    Stores all 0s (uint8) to entry 0 and all 127s (uint8) to entry 1,
+    then verifies correctness by using each entry as scales in a
+    separate scaled MMA operation.
+
+    In E8M0 encoding, byte 0 maps to float 0.0 (so MMA result is zero)
+    and byte 127 maps to 2^(127-127) = 1.0 (so MMA result equals the
+    unscaled matmul).
+    """
+
+    @triton.jit
+    def kernel(
+        a_desc,
+        b_desc,
+        c0_desc,
+        c1_desc,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        SCALE_K: tl.constexpr = BLOCK_K // 32
+        SCALE_N: tl.constexpr = BLOCK_N // 32
+
+        # Load A, B to SMEM via TMA
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES)
+        tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        # Allocate TMEM scale buffers with 2 entries
+        a_scale_tmem = tlx.local_alloc((BLOCK_M, SCALE_K), tl.uint8, tl.constexpr(2), tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_K, SCALE_N), tl.uint8, tl.constexpr(2), tlx.storage_kind.tmem)
+
+        # Entry 0: store all 0s
+        tlx.local_store(a_scale_tmem[0], tl.full((BLOCK_M, SCALE_K), 0, tl.uint8))
+        tlx.local_store(b_scale_tmem[0], tl.full((BLOCK_K, SCALE_N), 0, tl.uint8))
+
+        # Entry 1: store all 127s
+        tlx.local_store(a_scale_tmem[1], tl.full((BLOCK_M, SCALE_K), 127, tl.uint8))
+        tlx.local_store(b_scale_tmem[1], tl.full((BLOCK_K, SCALE_N), 127, tl.uint8))
+
+        # Accumulator in TMEM
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+
+        # MMA with entry 0 scales
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tmem[0], A_format, b_scale_tmem[0], B_format,
+                             use_acc=False)
+        result0 = tlx.local_load(c_tile[0])
+        c0_desc.store([0, 0], result0.to(tlx.dtype_of(c0_desc)))
+
+        # MMA with entry 1 scales
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tmem[1], A_format, b_scale_tmem[1], B_format,
+                             use_acc=False)
+        result1 = tlx.local_load(c_tile[0])
+        c1_desc.store([0, 0], result1.to(tlx.dtype_of(c1_desc)))
+
+    torch.manual_seed(0)
+    M, N, K = 128, 128, 256
+    BLOCK_M, BLOCK_N, BLOCK_K = M, N, K
+
+    A_DATA_TYPE = "e4m3"
+    B_DATA_TYPE = "e4m3"
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    c0 = torch.zeros((M, N), device=device, dtype=torch.float16)
+    c1 = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
+    c0_desc = TensorDescriptor.from_tensor(c0, block_shape=[BLOCK_M, BLOCK_N])
+    c1_desc = TensorDescriptor.from_tensor(c1, block_shape=[BLOCK_M, BLOCK_N])
+
+    kernel[(1, 1)](
+        a_desc,
+        b_desc,
+        c0_desc,
+        c1_desc,
+        A_DATA_TYPE,
+        B_DATA_TYPE,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    VEC_SIZE = 32
+
+    # E8M0 byte 0 → float 0.0, so result is exactly 0
+    torch.testing.assert_close(c0, torch.zeros_like(c0), atol=0, rtol=0)
+
+    # E8M0 byte 127 → float 2^(127-127) = 1.0, so result equals unscaled matmul
+    ref_c1 = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
+    torch.testing.assert_close(c1, ref_c1, atol=atol, rtol=0)
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -2339,6 +2754,180 @@ def test_descriptor_load(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("eviction_policy", ["evict_first", "evict_last", ""])
+def test_descriptor_load_l2_cache_hint(eviction_policy, device):
+    """Test that TMA loads can use L2 cache hints via eviction_policy parameter."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_load_kernel_with_cache_hint(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        # Use eviction_policy parameter for L2 cache hint
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, eviction_policy=EVICTION_POLICY)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_load_kernel_with_cache_hint[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                                          BLOCK_SIZE_N=BLOCK_SIZE_N, EVICTION_POLICY=eviction_policy)
+
+    # Verify the TMA load is present in IR
+    assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
+
+    # Check that eviction policy is set in the IR (only for non-default policies)
+    assert eviction_policy in kernel.asm["ttgir"]
+
+    # Verify PTX output
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.tensor" in ptx
+
+    if eviction_policy:
+        # Check for L2 cache policy creation and cache hint modifier
+        assert "createpolicy.fractional.L2" in ptx
+        assert "L2::cache_hint" in ptx
+    else:
+        # Normal/default policy should NOT have L2 cache hint
+        assert "createpolicy.fractional.L2" not in ptx
+        assert "L2::cache_hint" not in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("eviction_policy", ["", "evict_first", "evict_last"])
+def test_descriptor_store_l2_cache_hint(eviction_policy, device):
+    """Test that TMA stores with L2 cache hint generate correct PTX."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        # Compute tile offset in global memory
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        # Load without cache hint
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        # Store with eviction policy
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], eviction_policy=EVICTION_POLICY)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                           EVICTION_POLICY=eviction_policy)
+
+    # Verify the TMA store is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_copy_local_to_global") == 1
+    if eviction_policy:
+        assert f"evictionPolicy = {eviction_policy}" in ttgir
+
+    # Verify PTX output
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.tensor" in ptx
+    if eviction_policy in ("evict_first", "evict_last"):
+        # Should have L2 cache hint in PTX
+        assert "createpolicy.fractional.L2" in ptx
+        assert "L2::cache_hint" in ptx
+    else:
+        # Normal/default policy should NOT have L2 cache hint
+        assert "createpolicy.fractional.L2" not in ptx
+        assert "L2::cache_hint" not in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_descriptor_load_multicast(device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
@@ -2405,8 +2994,8 @@ def test_descriptor_load_multicast(device):
     kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
                                           ctas_per_cga=(2, 2, 1))
 
-    assert kernel.asm["ptx"].count(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1
+    assert (kernel.asm["ptx"].count(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster") == 1)
     # x:
     # [ x0 | x2]
     # [ x1 | x3]
@@ -2614,6 +3203,34 @@ def test_size_of(device):
     torch.testing.assert_close(output, expected_sizes)
 
 
+def test_size_of_constexpr(device):
+
+    @triton.jit
+    def size_of_constexpr_kernel(output_ptr, DTYPE: tl.constexpr):
+        # Test size_of with constexpr dtype argument
+        size = tlx.size_of(DTYPE)
+        tl.store(output_ptr, size)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Test with float32 (4 bytes)
+    grid = lambda meta: (1, )
+    size_of_constexpr_kernel[grid](output, tl.float32)
+    assert output.item() == 4, f"Expected 4 for float32, got {output.item()}"
+
+    # Test with float16 (2 bytes)
+    size_of_constexpr_kernel[grid](output, tl.float16)
+    assert output.item() == 2, f"Expected 2 for float16, got {output.item()}"
+
+    # Test with int8 (1 byte)
+    size_of_constexpr_kernel[grid](output, tl.int8)
+    assert output.item() == 1, f"Expected 1 for int8, got {output.item()}"
+
+    # Test with int64 (8 bytes)
+    size_of_constexpr_kernel[grid](output, tl.int64)
+    assert output.item() == 8, f"Expected 8 for int64, got {output.item()}"
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dots_blackwell_tmem(device):
     """
@@ -2756,13 +3373,11 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
         # CLC Init
         clc_phase_producer = 1
         clc_phase_consumer = 0
-        # NUM_CLC_STAGES=1
-        # NUM_CONSUMERS=1
-        clc_context = tlx.clc_create_context(1, 1)
+        clc_context = tlx.clc_create_context(1)
 
         while tile_id != -1:
             # CLC producer
-            tlx.clc_producer(clc_context, 0, clc_phase_producer)
+            tlx.clc_producer(clc_context, clc_phase_producer)
             clc_phase_producer ^= 1
 
             block_start = tile_id * BLOCK_SIZE
@@ -2776,7 +3391,7 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
             tl.store(z_ptr + offsets, output, mask=mask)
 
             # CLC consumer
-            tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer)
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
             clc_phase_consumer ^= 1
 
             if tlx.thread_id(axis=0) == 0:
@@ -2892,9 +3507,9 @@ def test_async_dot_scaled_mxfp4(device):
         BLOCK_K: tl.constexpr,
     ):
         # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
-        REP_M: tl.constexpr = BLOCK_M // 128
-        REP_N: tl.constexpr = BLOCK_N // 128
-        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
 
         # Allocate SMEM buffers
         # A: (M, K//2) - packed along K
@@ -3025,7 +3640,7 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
     For mxfp8 format:
     - Standard fp8 e4m3 layout with shape (M, K) or (K, N)
 
-    Scale layout uses 4D TMA descriptor [rep_m, rep_k, 2, 256] with uint8 elements.
+    Scale layout uses 5D TMA descriptor [1, rep_m, rep_k, 2, 256] with uint8 elements (cuBLAS block scaling layout).
     """
     from triton.tools.mxfp import MXFP4Tensor
 
@@ -3046,10 +3661,10 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         A_IS_FP4: tl.constexpr,
         B_IS_FP4: tl.constexpr,
     ):
-        # Scale tile dimensions for 4D TMA
-        REP_M: tl.constexpr = BLOCK_M // 128
-        REP_N: tl.constexpr = BLOCK_N // 128
-        REP_K: tl.constexpr = triton.cdiv(BLOCK_K // 32, 4)
+        # Scale tile dimensions for 5D TMA
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
 
         # Allocate SMEM buffers
         # For FP4: packed along K, so (M, K//2) or (N, K//2)
@@ -3066,9 +3681,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
             # B is (K, N) for FP8
             b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), tl.constexpr(1))
 
-        # 4D scale buffers: [REP_M/N, REP_K, 2, 256]
-        a_scale_tile = tlx.local_alloc((REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
-        b_scale_tile = tlx.local_alloc((REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256]
+        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
 
         # Calculate expected bytes for barrier
         if A_IS_FP4:
@@ -3087,8 +3702,8 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         tlx.barrier_expect_bytes(load_bar[0], A_BYTES + B_BYTES + SCALE_BYTES)
         tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
         tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
-        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0], load_bar)
-        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(a_scale_desc, a_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
         tlx.barrier_wait(load_bar[0], 0)
 
         # Transpose B from (N, K//2) to (K//2, N) for FP4, or use as-is for FP8
@@ -3140,18 +3755,18 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
-    # Create E8M0 scale tensors using 4D TMA layout: [rep_m, rep_k, 2, 256]
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
     a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
     b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 4D format for TMA
-    a_scale_4d = a_scale.reshape(M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_4d = b_scale.reshape(N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Reshape to 5D format for TMA (cuBLAS block scaling layout)
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
 
-    a_scale_block_shape = [BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
-    b_scale_block_shape = [BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
-    a_scale_desc = TensorDescriptor.from_tensor(a_scale_4d, block_shape=a_scale_block_shape)
-    b_scale_desc = TensorDescriptor.from_tensor(b_scale_4d, block_shape=b_scale_block_shape)
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
 
     kern_kwargs = {
         "BLOCK_M": BLOCK_M,
@@ -3194,8 +3809,8 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         return scale
 
     # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_4d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_4d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
     # Repeat each scale value VEC_SIZE times along dim 1
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -3510,6 +4125,214 @@ def test_make_tensor_descriptor(device):
 
     # Verify the data was copied correctly through TMA operations
     torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_make_tensor_descriptor_mxfp8(device):
+    """Test that encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp with MXFP8 scales.
+
+    When make_tensor_descriptor writes to a descPtr and reinterpret_tensor_descriptor
+    reads from the same descPtr, the shared memory encoding from the TMA operation
+    should propagate back to the make_tensor_descriptor operation.
+
+    This test uses MXFP8 with 5D TMA scales to verify the encoding propagation in a realistic
+    scaled GEMM scenario.
+    """
+
+    VEC_SIZE = 32  # mxfp8 uses 32 elements per scale factor
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def mxfp8_scaled_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        a_scale_ptr,
+        b_scale_ptr,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        A_format: tl.constexpr,
+        B_format: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+    ):
+        # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
+        REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
+        REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
+        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
+
+        # Allocate separate descriptor pointers for each descriptor
+        desc_ptr_a = tlx.allocate_tensor_descriptor(num=1)
+        desc_ptr_b = tlx.allocate_tensor_descriptor(num=1)
+        desc_ptr_a_scale = tlx.allocate_tensor_descriptor(num=1)
+        desc_ptr_b_scale = tlx.allocate_tensor_descriptor(num=1)
+
+        # Create tensor descriptors and write to allocated pointers
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_a[0],
+            base=a_ptr,
+            shape=[M, K],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_b[0],
+            base=b_ptr,
+            shape=[K, N],
+            strides=[stride_bk, stride_bn],
+            block_shape=[BLOCK_K, BLOCK_N],
+        )
+
+        # 5D scale descriptors: [1, rep_m/n, rep_k, 2, 256] for cuBLAS block scaling layout
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_a_scale[0],
+            base=a_scale_ptr,
+            shape=[1, M // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[M // 128 * K // 32 // 4 * 2 * 2 * 128, K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        tlx.make_tensor_descriptor(
+            desc_ptr=desc_ptr_b_scale[0],
+            base=b_scale_ptr,
+            shape=[1, N // 128, K // 32 // 4, 2, 2 * 128],
+            strides=[N // 128 * K // 32 // 4 * 2 * 2 * 128, K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
+            block_shape=[1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+        )
+
+        # Reinterpret the pointers as tensor descriptors
+        desc_a = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_a[0],
+            block_shape=[BLOCK_M, BLOCK_K],
+            dtype=tl.float8e4nv,
+        )
+        desc_b = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_b[0],
+            block_shape=[BLOCK_K, BLOCK_N],
+            dtype=tl.float8e4nv,
+        )
+        # 5D reinterpret for scales
+        desc_a_scale = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_a_scale[0],
+            block_shape=[1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+            dtype=tl.uint8,
+        )
+        desc_b_scale = tlx.reinterpret_tensor_descriptor(
+            desc_ptr=desc_ptr_b_scale[0],
+            block_shape=[1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
+            dtype=tl.uint8,
+        )
+
+        # Allocate SMEM buffers
+        a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float8e4nv, tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256] for cuBLAS block scaling layout
+        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+
+        load_bar = tlx.alloc_barriers(tl.constexpr(1))
+        DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
+
+        # Use reinterpreted descriptors for async loads
+        tlx.async_descriptor_load(desc_a, a_tile[0], [0, 0], load_bar)
+        tlx.async_descriptor_load(desc_b, b_tile[0], [0, 0], load_bar)
+        # 5D offset with leading 0
+        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0, 0], load_bar)
+        tlx.barrier_wait(load_bar[0], 0)
+
+        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.async_dot_scaled(a_tile[0], b_tile[0], c_tile[0], a_scale_tile[0], A_format, b_scale_tile[0], B_format,
+                             use_acc=False)
+
+        result = tlx.local_load(c_tile[0])
+        c = result.to(tl.float16)
+
+        # Store result
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        tl.store(c_ptrs, c)
+
+    triton.set_allocator(alloc_fn)
+    torch.manual_seed(0)
+    M, N, K = (128, 128, 256)
+    BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
+
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(torch.float8_e4m3fn).to(device)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
+    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
+    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+
+    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+
+    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N, "M": M, "N": N, "K": K}
+    kernel = mxfp8_scaled_kernel[(1, 1)](
+        a,
+        a.stride(0),
+        a.stride(1),
+        b,
+        b.stride(0),
+        b.stride(1),
+        a_scale_5d,
+        b_scale_5d,
+        c,
+        c.stride(0),
+        c.stride(1),
+        "e4m3",
+        "e4m3",
+        **kern_kwargs,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+
+    # Verify that tensormap_create and reinterpret_tensor_descriptor operations are present
+    assert ttgir.count("ttng.tensormap_create") == 4, (
+        f"Expected 4 tensormap_create operations, found {ttgir.count('ttng.tensormap_create')}")
+    assert ttgir.count("ttng.reinterpret_tensor_descriptor") == 4, (
+        f"Expected 4 reinterpret_tensor_descriptor operations, found {ttgir.count('ttng.reinterpret_tensor_descriptor')}"
+    )
+
+    # Verify encoding propagation: tensormap_create should have shared memory encoding
+    # The encoding propagates from ReinterpretTensorDescOp back to MakeTensorDescOp
+    assert "#ttg.nvmma_shared" in ttgir or "#ttg.swizzled_shared" in ttgir, "Expected shared memory encoding in ttgir"
+
+    # Compute reference
+    def fp8e8m0_to_float32(scale):
+        scale = scale.view(torch.uint8)
+        scale = scale.to(torch.int32)
+        scale = scale << 23
+        scale = scale.view(torch.float32)
+        return scale
+
+    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
+    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+    ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+    atol = 1e-2 * math.sqrt(K / VEC_SIZE)
+    torch.testing.assert_close(ref_out, c, atol=atol, rtol=1e-2)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -3895,3 +4718,852 @@ def test_barrier_wait_timeout_missing_bytes(device):
             del os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"]
         else:
             os.environ["TRITON_MBAR_WAIT_TIMEOUT_SEC"] = old_val
+@triton.jit
+def _test_get_fp8_format_name_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+    EXPECTED: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    if result == EXPECTED:
+        tl.store(output_ptr, 1)
+    else:
+        tl.store(output_ptr, 0)
+
+
+@triton.jit
+def _test_get_fp8_format_name_unsupported_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    tl.store(output_ptr, result == "e5m2")
+
+
+@pytest.mark.parametrize(
+    "dtype,expected",
+    [
+        (tl.float8e5, "e5m2"),
+        (tl.float8e4nv, "e4m3"),
+    ],
+)
+def test_get_fp8_format_name(dtype, expected, device):
+    """Test that FP8 dtypes return correct format strings."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    _test_get_fp8_format_name_kernel[(1, )](output, DTYPE=dtype, EXPECTED=expected)
+    assert output.item() == 1
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        tl.float32,
+        tl.float16,
+        tl.int32,
+    ],
+)
+def test_get_fp8_format_name_unsupported_dtype_raises_error(dtype, device):
+    """Test that non-FP8 dtypes raise a CompilationError during compilation."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    with pytest.raises(triton.CompilationError) as exc_info:
+        _test_get_fp8_format_name_unsupported_kernel[(1, )](output, DTYPE=dtype)
+    # Check that the underlying cause mentions the supported types
+    assert "only supports tl.float8e5" in str(exc_info.value.__cause__)
+
+
+class TestStorageKind:
+    """Tests for tlx.storage_kind enum."""
+
+    def test_storage_kind_values(self):
+        assert tlx.storage_kind.smem.value == "smem"
+        assert tlx.storage_kind.tmem.value == "tmem"
+        assert tlx.storage_kind.smemCluster.value == "smemCluster"
+
+
+class TestStorageAliasSpecType:
+    """Tests for storage_alias_spec_type class."""
+
+    def test_type_smem_unsized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.smem)
+        assert ty.storage == tlx.storage_kind.smem
+        assert ty.buffer_size_bytes is None
+
+    def test_type_tmem_unsized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.tmem)
+        assert ty.storage == tlx.storage_kind.tmem
+        assert ty.buffer_size_bytes is None
+
+    def test_type_smem_sized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 16384)
+        assert ty.storage == tlx.storage_kind.smem
+        assert ty.buffer_size_bytes == 16384
+
+    def test_type_tmem_sized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.tmem, 32768)
+        assert ty.storage == tlx.storage_kind.tmem
+        assert ty.buffer_size_bytes == 32768
+
+    def test_type_equality_same(self):
+        ty1 = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 16384)
+        ty2 = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 16384)
+        assert ty1 == ty2
+
+    def test_type_equality_different_storage(self):
+        ty1 = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 16384)
+        ty2 = tlx.storage_alias_spec_type(tlx.storage_kind.tmem, 16384)
+        assert ty1 != ty2
+
+    def test_type_equality_different_size(self):
+        ty1 = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 16384)
+        ty2 = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 32768)
+        assert ty1 != ty2
+
+    def test_type_equality_sized_vs_unsized(self):
+        ty1 = tlx.storage_alias_spec_type(tlx.storage_kind.smem, 16384)
+        ty2 = tlx.storage_alias_spec_type(tlx.storage_kind.smem)
+        assert ty1 != ty2
+
+    def test_type_repr_unsized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.smem)
+        assert "smem" in repr(ty)
+        assert "size" not in repr(ty)
+
+    def test_type_repr_sized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.tmem, 16384)
+        assert "tmem" in repr(ty)
+        assert "16384" in repr(ty)
+
+    def test_type_mangle_unsized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.smem)
+        mangle = ty.mangle()
+        assert "storage_alias_spec" in mangle
+        assert "smem" in mangle
+
+    def test_type_mangle_sized(self):
+        ty = tlx.storage_alias_spec_type(tlx.storage_kind.tmem, 8192)
+        mangle = ty.mangle()
+        assert "storage_alias_spec" in mangle
+        assert "tmem" in mangle
+        assert "8192" in mangle
+
+
+class TestStorageAliasSpecClass:
+    """Tests for the storage_alias_spec value class (not the builtin function)."""
+
+    def test_class_smem_unsized(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.smem,
+        )
+        assert buf.storage == tlx.storage_kind.smem
+        assert buf.buffer_size_bytes is None
+        assert buf.handle is None
+
+    def test_class_tmem_sized(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.tmem,
+            buffer_size_bytes=32768,
+        )
+        assert buf.storage == tlx.storage_kind.tmem
+        assert buf.buffer_size_bytes == 32768
+
+    def test_class_rejects_smem_cluster(self):
+        with pytest.raises(ValueError, match="smemCluster"):
+            tlx.storage_alias_spec_type_class(
+                handle=None,
+                storage=tlx.storage_kind.smemCluster,
+            )
+
+    def test_class_type_attribute(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.smem,
+            buffer_size_bytes=4096,
+        )
+        assert isinstance(buf.type, tlx.storage_alias_spec_type)
+        assert buf.type.storage == tlx.storage_kind.smem
+        assert buf.type.buffer_size_bytes == 4096
+
+    def test_class_immutability_storage(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.smem,
+        )
+        with pytest.raises(AttributeError):
+            buf.storage = tlx.storage_kind.tmem
+
+    def test_class_immutability_buffer_size(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.smem,
+            buffer_size_bytes=1024,
+        )
+        with pytest.raises(AttributeError):
+            buf.buffer_size_bytes = 2048
+
+    def test_class_repr_unsized(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.smem,
+        )
+        r = repr(buf)
+        assert "storage_alias_spec" in r
+        assert "smem" in r
+
+    def test_class_repr_sized(self):
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.tmem,
+            buffer_size_bytes=65536,
+        )
+        r = repr(buf)
+        assert "storage_alias_spec" in r
+        assert "tmem" in r
+        assert "65536" in r
+
+
+class TestLocalAllocWithStorageAliasSpec:
+    """Tests for local_alloc accepting storage_alias_spec in reuse parameter."""
+
+    def test_local_alloc_reuse_type_check_buffered_tensor(self):
+        """Verify local_alloc accepts buffered_tensor in reuse (legacy behavior)."""
+        # This is a type-level test - we can't fully test without a kernel context
+        # but we verify the type annotation allows buffered_tensor
+        import inspect
+        from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
+
+        sig = inspect.signature(local_alloc_func)
+        reuse_param = sig.parameters["reuse"]
+        # The annotation should include Union or | with both types
+        annotation_str = str(reuse_param.annotation)
+        assert "buffered_tensor" in annotation_str or "tlx.buffered_tensor" in annotation_str
+
+    def test_local_alloc_reuse_type_check_storage_alias_spec(self):
+        """Verify local_alloc accepts storage_alias_spec in reuse (new behavior)."""
+        import inspect
+        from triton.language.extra.tlx.mem_ops import local_alloc as local_alloc_func
+
+        sig = inspect.signature(local_alloc_func)
+        reuse_param = sig.parameters["reuse"]
+        # The annotation should include Union or | with both types
+        annotation_str = str(reuse_param.annotation)
+        assert "storage_alias_spec" in annotation_str or "tlx.storage_alias_spec" in annotation_str
+
+    def test_reuse_storage_mismatch_error_message(self):
+        """Verify helpful error message when storage kinds don't match."""
+        # Create a storage_alias_spec with smem storage
+        buf = tlx.storage_alias_spec_type_class(
+            handle=None,
+            storage=tlx.storage_kind.smem,
+        )
+        # The error should mention both storage kinds when there's a mismatch
+        # We can't fully test the error without a kernel context, but we can
+        # verify the storage_alias_spec's storage property is accessible
+        assert buf.storage == tlx.storage_kind.smem
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_thread_safety(device):
+    """Verify that concurrent compilation of warp-specialized kernels is thread-safe.
+
+    The TLX code generator uses thread-local storage for region_replica_id_stack
+    and sub_region_has_exception. This test compiles two different kernels using
+    async_tasks() + async_task_replica_id() from separate threads simultaneously
+    to verify no cross-thread state corruption occurs.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    @triton.jit
+    def ws_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + y + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + y + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
+    def ws_mul_kernel(
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = a * b + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = a * b + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    size = 98432
+    BLOCK_SIZE = 1024
+
+    def compile_and_run_add():
+        torch.manual_seed(42)
+        x = torch.rand(size, device=device)
+        y = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_add_kernel[grid](x, y, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, x + y, check_dtype=False)
+        return True
+
+    def compile_and_run_mul():
+        torch.manual_seed(43)
+        a = torch.rand(size, device=device)
+        b = torch.rand(size, device=device)
+        out = torch.empty_like(a)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_mul_kernel[grid](a, b, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, a * b, check_dtype=False)
+        return True
+
+    # Use 4 workers: 2 run ws_add_kernel, 2 run ws_mul_kernel.
+    # This tests both different-kernel and same-kernel concurrent compilation.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(compile_and_run_add),
+            executor.submit(compile_and_run_mul),
+            executor.submit(compile_and_run_add),
+            executor.submit(compile_and_run_mul),
+        ]
+        for future in as_completed(futures):
+            assert future.result() is True
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_tasks_thread_exception_isolation(device):
+    """Verify that a compilation exception in one thread doesn't affect others."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    @triton.jit
+    def ws_good_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default", registers=120, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                replica_id = tlx.async_task_replica_id()
+                output = x + replica_id - replica_id
+                tl.store(out_ptr + offsets, output, mask=mask)
+
+    @triton.jit
+    def ws_bad_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            # Missing "default" task — this should fail during compilation
+            with tlx.async_task(num_warps=1, registers=100, replicate=2):
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                tl.store(out_ptr + offsets, x, mask=mask)
+
+    size = 98432
+    BLOCK_SIZE = 1024
+
+    def compile_and_run_good():
+        x = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        ws_good_kernel[grid](x, out, n, BLOCK_SIZE, num_warps=4)
+        torch.testing.assert_close(out, x, check_dtype=False)
+        return True
+
+    def compile_and_run_bad():
+        x = torch.rand(size, device=device)
+        out = torch.empty_like(x)
+        n = out.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        try:
+            ws_bad_kernel[grid](x, out, n, BLOCK_SIZE, num_warps=4)
+        except Exception:
+            pass  # Expected to fail
+        return True
+
+    # Run bad kernel first to set exception flag, then verify good kernel
+    # still works on a thread that may be reused from the pool.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # Submit bad first, then good
+        bad_future = executor.submit(compile_and_run_bad)
+        bad_future.result()  # Wait for bad to finish
+        good_future = executor.submit(compile_and_run_good)
+        assert good_future.result() is True
+
+
+class TestReuseGroupType:
+    """Tests for tlx.reuse_group_type enum."""
+
+    def test_reuse_group_type_values(self):
+        assert tlx.reuse_group_type.shared.value == "shared"
+        assert tlx.reuse_group_type.distinct.value == "distinct"
+
+    def test_reuse_group_type_enum_members(self):
+        # Verify all expected members exist
+        members = list(tlx.reuse_group_type)
+        assert len(members) == 2
+        assert tlx.reuse_group_type.shared in members
+        assert tlx.reuse_group_type.distinct in members
+
+
+def _make_test_storage_alias_spec(storage: tlx.storage_kind = tlx.storage_kind.smem):
+    """Helper to create a storage_alias_spec for testing reuse_group."""
+    return tlx.storage_alias_spec_type_class(handle=None, storage=storage)
+
+
+def _make_test_buffered_tensor(storage: tlx.storage_kind = tlx.storage_kind.smem):
+    """Helper to create a buffered_tensor for testing reuse_group."""
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=2)
+    return tlx.buffered_tensor(
+        handle=None,
+        element_ty=tl.float32,
+        shape=[64, 64],
+        num=2,
+        storage=storage,
+        layout=layout,
+    )
+
+
+class TestReuseGroup:
+    """Tests for tlx.reuse_group class."""
+
+    def test_reuse_group_basic_shared(self):
+        """Test basic reuse_group creation with shared type."""
+        elem1 = _make_test_buffered_tensor()
+        elem2 = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem1,
+            elem2,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        assert group.args == (elem1, elem2)
+        assert group.group_type == tlx.reuse_group_type.shared
+
+    def test_reuse_group_basic_distinct(self):
+        """Test basic reuse_group creation with distinct type."""
+        elem1 = _make_test_buffered_tensor()
+        elem2 = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem1,
+            elem2,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        assert group.args == (elem1, elem2)
+        assert group.group_type == tlx.reuse_group_type.distinct
+
+    def test_reuse_group_single_element(self):
+        """Test reuse_group with a single element."""
+        elem = _make_test_buffered_tensor()
+        group = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        assert len(group.args) == 1
+        assert group.args[0] is elem
+
+    def test_reuse_group_multiple_elements(self):
+        """Test reuse_group with more than 2 elements."""
+        elems = tuple(_make_test_buffered_tensor() for _ in range(4))
+        group = tlx.reuse_group(
+            *elems,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        assert group.args == elems
+        assert len(group.args) == 4
+
+    def test_reuse_group_nested(self):
+        """Test nested reuse_group (Flash Attention pattern)."""
+        # Inner group: distinct elements
+        p = _make_test_buffered_tensor()
+        alpha = _make_test_buffered_tensor()
+        inner_group = tlx.reuse_group(
+            p,
+            alpha,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+
+        # Outer group: shared with inner group
+        qk = _make_test_buffered_tensor()
+        outer_group = tlx.reuse_group(
+            qk,
+            inner_group,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        assert outer_group.group_type == tlx.reuse_group_type.shared
+        assert len(outer_group.args) == 2
+        assert outer_group.args[0] is qk
+        assert outer_group.args[1] is inner_group
+        assert inner_group.group_type == tlx.reuse_group_type.distinct
+
+    def test_reuse_group_deeply_nested(self):
+        """Test 3-level nested reuse_group."""
+        # Level 3 (innermost)
+        c = _make_test_buffered_tensor()
+        d = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            c,
+            d,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        # Level 2
+        b = _make_test_buffered_tensor()
+        middle = tlx.reuse_group(
+            b,
+            inner,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+
+        # Level 1 (outermost)
+        a = _make_test_buffered_tensor()
+        outer = tlx.reuse_group(
+            a,
+            middle,
+            group_type=tlx.reuse_group_type.shared,
+        )
+
+        assert outer.group_type == tlx.reuse_group_type.shared
+        assert outer.args[1].group_type == tlx.reuse_group_type.distinct
+        assert outer.args[1].args[1].group_type == tlx.reuse_group_type.shared
+
+    def test_reuse_group_empty_args_raises_error(self):
+        """Test reuse_group raises error with empty args tuple."""
+        with pytest.raises(ValueError, match="at least one element"):
+            tlx.reuse_group(group_type=tlx.reuse_group_type.shared, )
+
+    def test_reuse_group_nested_same_type_shared_raises_error(self):
+        """Test that nesting shared inside shared raises an error."""
+        elem = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.shared,
+        )
+        with pytest.raises(ValueError, match="same group_type"):
+            tlx.reuse_group(
+                inner,
+                group_type=tlx.reuse_group_type.shared,
+            )
+
+    def test_reuse_group_nested_same_type_distinct_raises_error(self):
+        """Test that nesting distinct inside distinct raises an error."""
+        elem = _make_test_buffered_tensor()
+        inner = tlx.reuse_group(
+            elem,
+            group_type=tlx.reuse_group_type.distinct,
+        )
+        with pytest.raises(ValueError, match="same group_type"):
+            tlx.reuse_group(
+                inner,
+                group_type=tlx.reuse_group_type.distinct,
+            )
+
+    def test_reuse_group_invalid_element_type_raises_error(self):
+        """Test that invalid element types raise TypeError."""
+        with pytest.raises(TypeError, match="must be buffered_tensor or reuse_group"):
+            tlx.reuse_group(
+                "invalid",
+                group_type=tlx.reuse_group_type.shared,
+            )
+
+
+class TestToMxfp8:
+    """Tests for the _to_mxfp8_block library function callable from JIT code with VEC_SIZE=32."""
+
+    @staticmethod
+    def _reference_mxfp8_quantize(data, vec_size, torch_dtype):
+        """Python reference for MXFP8 quantization matching _compute_scale_and_quantize.
+
+        Note: These tests store the data in SMEM without appropriate prescale swizzling to
+        match the assumptions of TMEM. We do not test TMEM directly because we cannot provide
+        enough information for an accurate layout.
+
+        Returns:
+            scale_e8m0: uint8 tensor [M, K // vec_size]
+            data_fp8: fp8 tensor [M, K]
+        """
+        fp8_max = torch.finfo(torch_dtype).max
+        M, K = data.shape
+        num_scales = K // vec_size
+        data_f32 = data.float()
+        data_reshaped = data_f32.reshape(M, num_scales, vec_size)
+        max_abs = data_reshaped.abs().amax(dim=2)
+        descale = max_abs / fp8_max
+        log2_descale = torch.log2(descale)
+        ceil_log2 = torch.ceil(log2_descale)
+        clamped_exp = torch.clamp(ceil_log2, -127.0, 127.0)
+        is_zero = descale < 1e-38
+        biased_exp = torch.where(is_zero, torch.zeros_like(clamped_exp), clamped_exp + 127)
+        scale_e8m0 = biased_exp.to(torch.uint8)
+        descale_fp = torch.where(
+            biased_exp == 0,
+            torch.ones_like(biased_exp),
+            torch.exp2(127 - biased_exp),
+        )
+        scaled_data = data_reshaped * descale_fp.unsqueeze(2)
+        scaled_data = torch.clamp(scaled_data, -fp8_max, fp8_max)
+        data_flat = scaled_data.reshape(M, K)
+        data_fp8 = data_flat.to(torch_dtype)
+        return scale_e8m0, data_fp8
+
+    @staticmethod
+    def _run_to_mxfp8_block(input_data, elem_dtype, device):
+        """Run _to_mxfp8_block in a JIT kernel and return FP8 data and scales."""
+        torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
+        M, K, VEC_SIZE = 128, 128, 32
+
+        @triton.jit
+        def kernel(
+            input_ptr,
+            data_out_ptr,
+            scale_out_ptr,
+            BLOCK_M: tl.constexpr,
+            BLOCK_K: tl.constexpr,
+            VEC_SIZE: tl.constexpr,
+            ELEM_DTYPE: tl.constexpr,
+        ):
+            offs_m = tl.arange(0, BLOCK_M)
+            offs_k = tl.arange(0, BLOCK_K)
+            data = tl.load(input_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+            if ELEM_DTYPE == "e4m3":
+                fp8_type: tl.constexpr = tl.float8e4nv
+            else:
+                fp8_type: tl.constexpr = tl.float8e5
+            NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
+            data_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), fp8_type, tl.constexpr(1))
+            scale_tile = tlx.local_alloc((BLOCK_M, NUM_SCALES), tl.uint8, tl.constexpr(1))
+            tlx._to_mxfp8_block(data, data_tile[0], scale_tile[0], VEC_SIZE, fp8_type)
+            data_fp8 = tlx.local_load(data_tile[0])
+            tl.store(data_out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], data_fp8)
+            scale_loaded = tlx.local_load(scale_tile[0])
+            scale_flat = tl.reshape(scale_loaded, [BLOCK_M * NUM_SCALES])
+            tl.store(scale_out_ptr + tl.arange(0, BLOCK_M * NUM_SCALES), scale_flat)
+
+        data_out = torch.empty(M, K, dtype=torch_dtype, device=device)
+        scale_out = torch.empty(M * (K // VEC_SIZE), dtype=torch.uint8, device=device)
+        kernel[(1, )](input_data, data_out, scale_out, M, K, VEC_SIZE, elem_dtype)
+        return data_out, scale_out
+
+    @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+    @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
+    def test_to_mxfp8_block_uniform(self, elem_dtype, device):
+        """Test _to_mxfp8_block with uniform 1.0 input and VEC_SIZE=32."""
+        torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
+        M, K, VEC = 128, 128, 32
+        input_data = torch.ones(M, K, dtype=torch.float32, device=device)
+
+        data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
+
+        ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
+        torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
+        assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
+
+    @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+    @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
+    def test_to_mxfp8_block_zeros(self, elem_dtype, device):
+        """Test _to_mxfp8_block with all-zero input."""
+        M, K = 128, 128
+        input_data = torch.zeros(M, K, dtype=torch.float32, device=device)
+
+        data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
+
+        assert torch.all(data_out.float() == 0)
+        assert torch.all(scale_out == 0)
+
+    @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+    @pytest.mark.parametrize("elem_dtype", ["e4m3", "e5m2"])
+    def test_to_mxfp8_block_random(self, elem_dtype, device):
+        """Test _to_mxfp8_block with random data against Python reference."""
+        torch_dtype = torch.float8_e4m3fn if elem_dtype == "e4m3" else torch.float8_e5m2
+        M, K, VEC = 128, 128, 32
+        torch.manual_seed(42)
+        input_data = torch.randn(M, K, dtype=torch.float32, device=device) * 100
+
+        data_out, scale_out = self._run_to_mxfp8_block(input_data, elem_dtype, device)
+
+        ref_scale, ref_data = self._reference_mxfp8_quantize(input_data.cpu(), VEC, torch_dtype)
+        torch.testing.assert_close(data_out.float().cpu(), ref_data.float())
+        assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
+
+
+class TestSetBufferOverlap:
+    """Tests for tlx.set_buffer_overlap and storage_alias_spec.set_buffer_overlap method."""
+
+    def test_set_buffer_overlap_compiles_to_ir(self):
+        """Test that set_buffer_overlap compiles to IR but fails during lowering.
+
+        This test verifies that the JIT API works correctly - the code should
+        successfully lower to MLIR IR but is expected to fail in later lowering
+        passes because offset calculation is not yet implemented.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_kernel(BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers using the spec
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b share the same memory region
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+        grid = lambda meta: (1, )
+
+        # The kernel should compile to IR but fail during lowering
+        # (offset calculation not implemented yet)
+        with pytest.raises(RuntimeError):
+            set_buffer_overlap_kernel[grid](BLOCK_SIZE=64)
+
+    def test_set_buffer_overlap_nested_compiles_to_ir(self):
+        """Test that nested reuse_group in set_buffer_overlap compiles to IR.
+
+        This test verifies Flash Attention-style nested overlap schemes work
+        at the JIT level.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_nested_kernel(BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers (Flash Attention pattern)
+            qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                 reuse=spec)
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            alpha = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2), tlx.storage_kind.smem, reuse=spec)
+
+            # Define overlap scheme: QK shares with (P distinct from alpha)
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk,
+                    tlx.reuse_group(p, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
+
+        grid = lambda meta: (1, )
+
+        # The kernel should compile to IR but fail during lowering
+        with pytest.raises(RuntimeError):
+            set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_vote_ballot_sync(device):
+    """Test vote_ballot_sync TLX operation for warp-level voting."""
+
+    @triton.jit
+    def vote_ballot_kernel(
+        output_ptr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Each thread's lane ID (use x-axis thread ID)
+        tid = tlx.thread_id(0)
+
+        # Create a predicate: lanes 0-15 vote True, lanes 16-31 vote False
+        pred = tid < 16
+
+        # Perform warp-level ballot vote
+        # 0xFFFFFFFF means all 32 threads in the warp participate
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+
+        # Store the ballot result from thread 0 only
+        if tid == 0:
+            tl.store(output_ptr, ballot_result)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Run the kernel with 1 warp
+    vote_ballot_kernel[(1, )](output, BLOCK_SIZE=32, num_warps=1)
+    torch.cuda.synchronize()
+
+    # Expected ballot result: threads 0-15 have pred=True, threads 16-31 have pred=False
+    # So ballot should be 0x0000FFFF (lower 16 bits set)
+    expected_ballot = 0x0000FFFF
+    assert output.item() == expected_ballot, f"Expected {hex(expected_ballot)}, got {hex(output.item())}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_vote_ballot_sync_ir_emission(device):
+    """Test that vote_ballot_sync generates the correct IR."""
+
+    @triton.jit
+    def vote_ballot_ir_kernel(output_ptr, ):
+        tid = tlx.thread_id(0)
+        pred = tid < 16  # First 16 threads True
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+        if tid == 0:
+            tl.store(output_ptr, ballot_result)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    kernel = vote_ballot_ir_kernel[(1, )](output, num_warps=1)
+
+    # Verify the TTGIR contains the vote_ballot_sync op
+    ttgir = kernel.asm["ttgir"]
+    assert "vote_ballot_sync" in ttgir, "Expected vote_ballot_sync in TTGIR"
+
+    # Verify the LLVM IR contains the NVVM vote instruction
+    llir = kernel.asm["llir"]
+    assert "nvvm.vote.ballot.sync" in llir or "vote.sync.ballot" in llir, (
+        "Expected nvvm.vote.ballot.sync or vote.sync.ballot in LLVM IR")

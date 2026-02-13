@@ -7,10 +7,10 @@
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -139,6 +139,45 @@ public:
       }
       return WalkResult::advance();
     });
+
+    // Fix up RequireLayoutOps feeding into TMEMStoreOps with scales encoding.
+    // ResolvePlaceholderLayouts assigned a generic TMEM-compatible register
+    // layout, but for scales the register layout must use
+    // getScaleTMEMStoreLinearLayout.
+    funcOp.walk([&](ttng::TMEMStoreOp storeOp) {
+      auto memTy = storeOp.getDst().getType();
+      if (!isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding()))
+        return WalkResult::advance();
+
+      auto requireOp = storeOp.getSrc().getDefiningOp<RequireLayoutOp>();
+      if (!requireOp)
+        return WalkResult::advance();
+
+      auto srcTy = cast<RankedTensorType>(requireOp.getResult().getType());
+      int numWarps = ttg::lookupNumWarps(storeOp);
+      auto scalesLL = ttg::getScaleTMEMStoreLinearLayout(srcTy, numWarps);
+      auto newEncoding =
+          ttg::LinearEncodingAttr::get(srcTy.getContext(), scalesLL);
+      auto newType = RankedTensorType::get(srcTy.getShape(),
+                                           srcTy.getElementType(), newEncoding);
+      requireOp->getResult(0).setType(newType);
+      return WalkResult::advance();
+    });
+
+    // Verify that no DummyTMEMLayoutAttr remains after layout propagation
+    bool hasDummyLayout = false;
+    funcOp.walk([&](ttng::TMEMAllocOp allocOp) {
+      auto encoding = allocOp.getType().getEncoding();
+      if (isa_and_nonnull<DummyTMEMLayoutAttr>(encoding)) {
+        allocOp.emitError(
+            "DummyTMEMLayoutAttr was not resolved during layout propagation");
+        hasDummyLayout = true;
+      }
+      return WalkResult::advance();
+    });
+    if (hasDummyLayout)
+      return signalPassFailure();
+
     return;
   }
 

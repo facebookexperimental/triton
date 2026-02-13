@@ -279,6 +279,73 @@ While this approach places more responsibility on the user, it reduces the compi
     tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
     ```
 
+    **TMEM-backed MX Scales:**
+
+    For scaled MMA operations on Blackwell GPUs, scales can be stored in Tensor Memory (TMEM) for efficient access. TLX provides automatic layout resolution for TMEM scale buffers.
+
+    *Allocating TMEM Scale Buffers:*
+
+    When allocating TMEM buffers for uint8/int8 types (used for MX scales), TLX uses a placeholder layout (`DummyTMEMLayoutAttr`) that gets automatically resolved to `TensorMemoryScalesEncodingAttr` during compilation when the buffer is used with `async_dot_scaled`.
+
+    ```python
+    # Allocate TMEM buffers for scales (layout is automatically resolved)
+    a_scale_tmem = tlx.local_alloc((128, 8), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+    b_scale_tmem = tlx.local_alloc((256, 4), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+    ```
+
+    *Copying Scales from SMEM to TMEM:*
+
+    Use `tlx.tmem_copy` to efficiently transfer scale data from shared memory to tensor memory:
+
+    ```python
+    # Copy scales from SMEM to TMEM (asynchronous, uses tcgen05.cp instruction)
+    tlx.tmem_copy(a_scale_smem, a_scale_tmem)
+    tlx.tmem_copy(b_scale_smem, b_scale_tmem)
+    ```
+
+    *Using TMEM Scales with Scaled MMA:*
+
+    ```python
+    # TMEM scales are automatically detected and used with the correct layout
+    tlx.async_dot_scaled(
+        a_smem, b_smem, acc_tmem,
+        A_scale=a_scale_tmem, A_format="e4m3",
+        B_scale=b_scale_tmem, B_format="e4m3",
+        use_acc=True,
+        mBarriers=[mma_bar],
+    )
+    ```
+
+    *Complete Example: TMEM-backed Scaled GEMM:*
+
+    ```python
+    @triton.jit
+    def scaled_gemm_kernel(...):
+        # Allocate TMEM for accumulator and scales
+        acc = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, num=1, storage=tlx.storage_kind.tmem)
+        a_scale_tmem = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+        b_scale_tmem = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
+
+        # Load scales from global memory to SMEM
+        tlx.async_descriptor_load(a_scale_desc, a_scale_smem, [...], barrier=bar)
+        tlx.async_descriptor_load(b_scale_desc, b_scale_smem, [...], barrier=bar)
+        tlx.barrier_wait(bar, phase)
+
+        # Copy scales from SMEM to TMEM
+        tlx.tmem_copy(a_scale_smem[0], a_scale_tmem[0])
+        tlx.tmem_copy(b_scale_smem[0], b_scale_tmem[0])
+
+        # Perform scaled MMA with TMEM scales
+        tlx.async_dot_scaled(
+            a_smem[0], b_smem[0], acc[0],
+            A_scale=a_scale_tmem[0], A_format="e4m3",
+            B_scale=b_scale_tmem[0], B_format="e4m3",
+            use_acc=False,
+        )
+    ```
+
+    **Note:** Multibuffering is automatically cancelled for scale buffers since TMEM scales don't support multibuffering. 3D allocations (1×M×K) are automatically flattened to 2D (M×K).
+
 - `acc = tlx.async_dot_wait(pendings, acc)`
 
     Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.
@@ -330,31 +397,28 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
 
 #### CLC API
 
-- `context = tlx.clc_create_context(num_stages, num_consumers)`
+- `context = tlx.clc_create_context(num_consumers=num_consumers)`
 
     Create a CLC pipeline context with the specified number of stages and expected consumer count.
 
     **Parameters:**
-    - `num_stages`: Number of pipeline stages for double/multi-buffering
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, k, phase, multi_ctas=False)`
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)`
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
-    - `k`: Pipeline stage index (for multi-buffering)
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False)`
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)`
 
     Decode the tile ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
-    - `k`: Pipeline stage index
     - `phase`: Current barrier phase
     - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
 
@@ -409,7 +473,7 @@ In multi-CTA mode (`multi_ctas=True`), multiple CTAs in a cluster work together 
 @triton.jit
 def matmul_kernel(..., PAIR_CTA: tl.constexpr):
     # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
-    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+    clc_context = tlx.clc_create_context(num_consumers= 6 if PAIR_CTA else 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # Epilogue consumer
@@ -419,13 +483,13 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
 
             while tile_id != -1:
                 # Producer: acquire next tile
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                tlx.clc_producer(clc_context, p_producer=clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             clc_phase_consumer = 0
@@ -435,7 +499,7 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             clc_phase_consumer = 0
@@ -445,7 +509,7 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
 ```
@@ -658,25 +722,37 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
     ```
 
+- `tlx.vote_ballot_sync(mask, pred)`
+
+    Collects a predicate from each thread in the warp and returns a 32-bit
+    mask where each bit represents the predicate value from the corresponding
+    lane. Only threads specified by `mask` participate in the vote.
+    ```
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+    ```
 
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
-[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-pipelined_test.py)
+[Pipelined GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_pipelined_test.py)
 
-[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-pipelined_test.py)
+[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_ws_test.py)
 
-[Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper-gemm-ws_test.py)
+[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws.py)
 
-[Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell-gemm-ws_test.py)
+[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell_grouped_gemm_test.py)
 
-[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell-grouped-gemm_test.py)
+[Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_pipelined.py)
+
+[CLC GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_clc.py)
+
+[2-CTA GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_2cta.py)
 
 ### Attention kernels
 
-[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell-fa-ws-pipelined-persistent_test.py)
+[Warp-specialized pipelined persistent FA fwd/bwd on Blackwell](third_party/tlx/tutorials/blackwell_fa_ws_pipelined_persistent_test.py)
 
-[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py)
+[Warp-Specialized computation-pipelined pingpong FA fwd on Hopper](third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py)
 
 
 
@@ -693,8 +769,26 @@ pip install -e .
 
 Run the tutorials after the build finishes, e.g,
 ```
-python third_party/tlx/tutorials/hopper-fa-ws-pipelined-pingpong_test.py
+python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py
 ```
+
+To run Blackwell GEMM tutorial kernels, you can use the following command:
+
+## Change 2: One correctness test script
+
+`[TLX_VERSION=<kernel_name>] pytest third_party/tlx/tutorials/testing/test_correctness.py`
+
+By default only one autotune config will be used by correctness test.
+
+## Change 3: One performance test script for each op {gemm, matmul} x {hopper, blackwell}
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
 
 ## More reading materials
 

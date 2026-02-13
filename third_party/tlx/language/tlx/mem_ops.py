@@ -14,6 +14,92 @@ def _assert_blackwell_for_tmem(arch):
     assert capability >= 100, "tmem is only available on Blackwell"
 
 
+@tl.builtin
+def storage_alias_spec(
+    storage: tlx.storage_kind = tlx.storage_kind.smem,
+    buffer_size_bytes: Optional[tl.constexpr] = None,
+    _semantic=None,
+) -> tlx.storage_alias_spec:
+    """
+    Create a storage alias specification.
+
+    This function creates a storage alias specification that can be referenced by
+    multiple `local_alloc` calls via the `reuse` parameter. Unlike directly
+    passing a `buffered_tensor` to `reuse`, using a `storage_alias_spec` makes
+    all referencing allocations equal peers with no primary owner.
+
+    The storage alias spec can be either unsized or sized:
+
+    - **Unsized (default)**: The compiler sets the buffer size to accommodate
+      the largest allocation that references it.
+    - **Sized**: The user specifies an explicit size, and the compiler verifies
+      all referencing allocations fit within this size.
+
+    All attributes of the returned object are immutable after construction.
+
+    Args:
+        storage: The storage kind for this buffer. Must be `smem` or `tmem`.
+            All `local_alloc` calls that reference this `storage_alias_spec`
+            must use the same storage kind. `smemCluster` is not supported.
+        buffer_size_bytes: Optional explicit size in bytes. If provided, must
+            be a compile-time constant (`tl.constexpr`). The compiler will
+            verify that all referencing allocations fit within this size.
+            This value is immutable after construction.
+        _semantic: Internal parameter for Triton semantics.
+
+    Returns:
+        A `storage_alias_spec` object that can be passed to `local_alloc` via
+        the `reuse` parameter.
+
+    Raises:
+        ValueError: If storage is not a valid `storage_kind`.
+        ValueError: If storage is `smemCluster` (not supported).
+        ValueError: If buffer_size_bytes is not a compile-time constant.
+        ValueError: If buffer_size_bytes is not positive.
+
+    Example:
+        # Create an unsized storage alias spec (size determined by largest user)
+        alias_spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+        # Create a sized storage alias spec with explicit size
+        alias_spec = tlx.storage_alias_spec(
+            storage=tlx.storage_kind.tmem,
+            buffer_size_bytes=16384,
+        )
+
+        # Use with local_alloc (Phase 2 - not yet implemented)
+        # buf_a = tlx.local_alloc(..., reuse=alias_spec)
+        # buf_b = tlx.local_alloc(..., reuse=alias_spec)
+    """
+    # Validate storage kind
+    if not isinstance(storage, tlx.storage_kind):
+        raise ValueError(f"storage must be a tlx.storage_kind, got {type(storage)}")
+
+    # smemCluster is not supported
+    if storage == tlx.storage_kind.smemCluster:
+        raise ValueError("smemCluster storage is not supported for storage_alias_spec")
+
+    # Validate and unwrap buffer_size_bytes if provided
+    unwrapped_size = None
+    if buffer_size_bytes is not None:
+        unwrapped_size = tl._unwrap_if_constexpr(buffer_size_bytes)
+        if unwrapped_size <= 0:
+            raise ValueError(f"buffer_size_bytes must be positive, got {unwrapped_size}")
+
+    # Create IR operation
+    handle = _semantic.builder.create_storage_alias_spec(
+        storage.value,
+        unwrapped_size,
+    )
+
+    # Return wrapper object (immutable)
+    return tlx.storage_alias_spec(
+        handle=handle,
+        storage=storage,
+        buffer_size_bytes=unwrapped_size,
+    )
+
+
 def _create_tmem_compatible_tensor_layout_encoding(
     builder,
     tensor: tlx.buffered_tensor,
@@ -27,12 +113,28 @@ def local_alloc(
     dtype: tl.dtype,
     num: tl.constexpr,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
-    reuse: Optional[tlx.buffered_tensor] = None,
+    reuse: Optional[tlx.buffered_tensor | tlx.storage_alias_spec] = None,
     layout: Optional[tlx.shared_layout_encoding] = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
     Allocates buffer in shared memory and return a view of the buffer.
+
+    Args:
+        shape: Shape of each buffer (excluding the num dimension).
+        dtype: Data type of the buffer elements.
+        num: Number of buffers to allocate (compile-time constant).
+        storage: Storage kind (smem or tmem).
+        reuse: Optional buffer reuse specification:
+            - buffered_tensor: Reuse an existing buffer's memory (legacy).
+            - storage_alias_spec: Reference a storage alias specification.
+        layout: Optional memory layout encoding.
+
+    Returns:
+        A buffered_tensor representing the allocated buffers.
+
+    Raises:
+        ValueError: If reuse storage kind doesn't match the specified storage.
     """
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
@@ -81,31 +183,44 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.swizzled,
                 )
         else:
-            layout = tlx.tensor_memory_layout_encoding.make_default(shape)
-            layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
-                layout.blockM,
-                layout.blockN,
-                layout.unpacked,
-                layout.CTASplitM,
-                layout.CTASplitN,
-            )
+            # For 8-bit element types (uint8/int8), use a dummy TMEM layout that will
+            # be resolved during layout propagation. This is used for scales in
+            # scaled MMA operations where the final layout depends on usage context.
+            if dtype.primitive_bitwidth < 16:
+                if dtype == tl.uint8 or dtype == tl.int8:
+                    layout = tlx.DummyTMEMLayoutEncoding()
+                else:
+                    raise NotImplementedError(f"TMEM Layouts not supported for {dtype} yet")
+            else:
+                layout = tlx.tensor_memory_layout_encoding.make_default(shape)
+            layout_handle = layout.to_ir(_semantic.builder)
     else:
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
     alias_handle = None
+    shared_buffer_handle = None
     if reuse:
-        # reuse tensor has to be a buffered tensor
-        if not isinstance(reuse, tlx.buffered_tensor):
-            raise ValueError("reuse tensor has to be a buffered tensor")
-        # verify that the reuse tensor has the same storage
-        if reuse.type.storage != storage:
-            raise ValueError("reuse tensor has different storage")
-        alias_handle = reuse.handle
+        if isinstance(reuse, tlx.buffered_tensor):
+            # Legacy behavior: reuse an existing buffer's memory
+            # verify that the reuse tensor has the same storage
+            if reuse.type.storage != storage:
+                raise ValueError("reuse tensor has different storage")
+            alias_handle = reuse.handle
+        elif isinstance(reuse, tlx.storage_alias_spec):
+            # New behavior: reference a storage alias specification
+            if reuse.storage != storage:
+                raise ValueError(f"storage_alias_spec storage ({reuse.storage.value}) "
+                                 f"doesn't match local_alloc storage ({storage.value})")
+            shared_buffer_handle = reuse.handle
+        else:
+            raise ValueError(f"reuse must be a buffered_tensor or storage_alias_spec, got {type(reuse)}")
 
     if storage == tlx.storage_kind.smem:
-        tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle, alias_handle)
+        tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle, alias_handle,
+                                                             shared_buffer_handle)
     else:
-        tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle)
+        tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle,
+                                                            shared_buffer_handle)
 
     return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
@@ -213,7 +328,7 @@ def remote_view(
     a cluster of shape [2, 4] a valid unique ID could be 0~7, including the executing CTA itself
     :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
     """
-    assert isinstance(local_allocated_buffer, tlx.mbarrier), ("remote_view only supports barrier for now")
+    assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
     assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
@@ -391,13 +506,21 @@ def async_load(
     """
     Loads buffer from global to local memory asynchronously.
     """
+    # Unwrap constexpr and convert to tensor (same as tl.load)
+    mask = tl._unwrap_if_constexpr(mask)
+    other = tl._unwrap_if_constexpr(other)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+    if other is not None:
+        other = _semantic.to_tensor(other)
+
     if src.type.is_ptr() and src.type.element_ty.is_block():
         # Load by a block pointer: `pointer_type<block_type<>>`
         # unsupported for now
         raise NotImplementedError("async_load by block pointer is not supported yet")
     else:
         # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
-        _, src, mask, other = _semantic._prepare_legacy_load(src, mask, other, None, None)
+        _, src, mask, other, _ = _semantic._prepare_legacy_load(src, mask, other, None, None)
 
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
@@ -484,6 +607,35 @@ def local_store(
 
 
 @tl.builtin
+def tmem_copy(
+    src: tlx.buffered_tensor,
+    dst: tlx.buffered_tensor,
+    _semantic=None,
+) -> None:
+    """
+    Start an asynchronous copy from shared memory to tensor memory.
+
+    This maps directly to NVIDIA Blackwell's tcgen05.cp instruction,
+    enabling efficient data movement from SMEM to TMEM without going
+    through registers.
+
+    Args:
+        src: Source buffer in shared memory (SMEM).
+        dst: Destination buffer in tensor memory (TMEM).
+
+    Note:
+        The current semantics of the instruction are not well defined and
+        the API may change in the future. Use at your own risk.
+    """
+    assert isinstance(src, tlx.buffered_tensor), "source must be a buffered tensor"
+    assert isinstance(dst, tlx.buffered_tensor), "destination must be a buffered tensor"
+    assert src.type.storage == tlx.storage_kind.smem, "source must be in shared memory"
+    assert dst.type.storage == tlx.storage_kind.tmem, "destination must be in tensor memory"
+    _assert_blackwell_for_tmem(_semantic.builder.options.arch)
+    _semantic.builder.create_tmem_copy(src.handle, dst.handle)
+
+
+@tl.builtin
 def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic=None) -> tlx.buffered_tensor:
     """
     Permutes the dimensions of a tensor.
@@ -545,6 +697,8 @@ def async_descriptor_load(
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), \
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
@@ -574,14 +728,24 @@ def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
     offsets: list[tl.tensor],
+    eviction_policy: str = "",
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), (
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
+    from triton._C.libtriton import ir
+
+    evict = ir.EVICTION_POLICY.NORMAL
+    if eviction_policy == "evict_first":
+        evict = ir.EVICTION_POLICY.EVICT_FIRST
+    elif eviction_policy == "evict_last":
+        evict = ir.EVICTION_POLICY.EVICT_LAST
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle)
+    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
 
 
 @tl.builtin

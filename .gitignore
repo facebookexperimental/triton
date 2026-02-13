@@ -94,3 +94,10 @@ python/triton/tlx
 
 # macOS
 .DS_Store
+
+# claude
+.claude/*
+!.claude/knowledge/
+!.claude/reviewers/
+!.claude/rules/
+!.claude/skills/

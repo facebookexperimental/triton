@@ -41,8 +41,9 @@ def thread_id(axis, _semantic=None):
 
 @tl.builtin
 def async_task_replica_id(_semantic=None):
-    from triton.language.extra.tlx.compiler.code_generator import region_replica_id_stack
+    from triton.language.extra.tlx.compiler.code_generator import _get_region_replica_id_stack
 
+    region_replica_id_stack = _get_region_replica_id_stack()
     assert len(region_replica_id_stack) > 0, (
         "async_task_replica_id must be called inside an async region where the stack must be non-empty")
     return tl.constexpr(region_replica_id_stack[-1])
@@ -69,8 +70,42 @@ def size_of(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
     """
     Returns the size of a given dtype.
     """
+    dtype = tl._unwrap_if_constexpr(dtype)
     assert isinstance(dtype, tl.dtype), f"size_of expects a dtype, but got {type(dtype)}"
     return tl.constexpr(dtype.primitive_bitwidth // 8)
+
+
+@tl.builtin
+def get_fp8_format_name(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
+    """
+    Returns the FP8 format name string for a given FP8 dtype.
+
+    This extracts the format identifier (e.g., "e5m2", "e4m3") from the dtype
+    for use with scaled MMA operations like async_dot_scaled.
+
+    Args:
+        dtype: An FP8 dtype (tl.float8e5m2 or tl.float8e4nv)
+
+    Returns:
+        A constexpr string with the format name ("e5m2" or "e4m3")
+
+    Raises:
+        AssertionError: If the dtype is not a supported FP8 type.
+
+    Example:
+        Q_FP8_FORMAT: tl.constexpr = tlx.get_fp8_format_name(tlx.dtype_of(desc_q))
+    """
+    # Unwrap constexpr if needed (when dtype is passed as a tl.constexpr kernel parameter)
+    dtype = tl._unwrap_if_constexpr(dtype)
+    assert isinstance(dtype, tl.dtype), f"get_fp8_format_name expects a dtype, but got {type(dtype)}"
+    # Only support FP8 types that map to "e5m2" or "e4m3" for scaled MMA operations
+    if dtype == tl.float8e5:
+        return tl.constexpr("e5m2")
+    elif dtype == tl.float8e4nv:
+        return tl.constexpr("e4m3")
+    else:
+        raise AssertionError(f"get_fp8_format_name only supports tl.float8e5 (e5m2) and tl.float8e4nv (e4m3), "
+                             f"but got {dtype}")
 
 
 @tl.builtin

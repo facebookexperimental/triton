@@ -253,15 +253,6 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
                            AsyncTaskId asyncTaskId) {
   // Create newForOp for each task Id.
   auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
-  // This is for the epilogue partition.
-  const unsigned EpiloguePartition = 3;
-  if (asyncTaskId == EpiloguePartition) { // HACK tracked in T238592410
-    auto parentForOp = forOp->getParentOfType<scf::ForOp>();
-    if (!parentForOp) {
-      usedArgs.pop_back();
-      LDBG("SpecializeForOp hack to remove last argIdx");
-    }
-  }
 
   // Prepare newLoopArgs.
   SmallVector<Value> newLoopArgs;
@@ -384,6 +375,102 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   return nullptr;
 }
 
+static void logOpStillHasUsers(Operation *op) {
+  LLVM_DEBUG({
+    llvm::errs() << "Op still has users: " << op->getName();
+    if (auto partitionAttr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
+      llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
+    }
+    auto taskIds = getAsyncTaskIds(op);
+    if (!taskIds.empty()) {
+      llvm::errs() << " (taskIds: ";
+      for (size_t i = 0; i < taskIds.size(); ++i) {
+        if (i > 0)
+          llvm::errs() << ", ";
+        llvm::errs() << taskIds[i];
+      }
+      llvm::errs() << ")";
+    }
+    auto attrs = op->getAttrs();
+    if (!attrs.empty()) {
+      llvm::errs() << " [attrs: ";
+      bool first = true;
+      for (auto namedAttr : attrs) {
+        if (!first)
+          llvm::errs() << ", ";
+        llvm::errs() << namedAttr.getName().str();
+        first = false;
+      }
+      llvm::errs() << "]";
+    }
+    // llvm::errs() << "  Full IR: ";
+    // op->print(llvm::errs());
+    llvm::errs() << "\n";
+    for (unsigned i = 0; i < op->getNumResults(); ++i) {
+      for (Operation *user : op->getResult(i).getUsers()) {
+        llvm::errs() << "  User: " << user->getName();
+        // llvm::errs() << "  Full IR: ";
+        // user->print(llvm::errs());
+        if (auto userPartitionAttr =
+                user->getAttrOfType<IntegerAttr>("ttg.partition")) {
+          llvm::errs() << " (partition: " << userPartitionAttr.getInt() << ")";
+        }
+        auto userTaskIds = getAsyncTaskIds(user);
+        if (!userTaskIds.empty()) {
+          llvm::errs() << " (taskIds: ";
+          for (size_t j = 0; j < userTaskIds.size(); ++j) {
+            if (j > 0)
+              llvm::errs() << ", ";
+            llvm::errs() << userTaskIds[j];
+          }
+          llvm::errs() << ")";
+        }
+        llvm::errs() << "\n";
+      }
+    }
+  });
+}
+
+// Topologically sort operations to ensure dependencies are cloned before uses
+static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
+  DenseSet<Operation *> opsInList(opList.begin(), opList.end());
+  DenseMap<Operation *, unsigned>
+      visitState; // 0=unvisited, 1=visiting, 2=visited
+  SmallVector<Operation *> sortedOpList;
+
+  std::function<void(Operation *)> topoVisit = [&](Operation *op) {
+    auto state = visitState.lookup(op);
+    if (state == 2)
+      return; // Already visited
+    if (state == 1) {
+      // Cycle detected - just skip, maintain original order for cycles
+      return;
+    }
+
+    visitState[op] = 1; // Mark as visiting
+
+    // Visit dependencies first (operands defined by ops in opList)
+    for (auto operand : op->getOperands()) {
+      if (auto defOp = operand.getDefiningOp()) {
+        if (opsInList.count(defOp)) {
+          topoVisit(defOp);
+        }
+      }
+    }
+
+    visitState[op] = 2; // Mark as visited
+    sortedOpList.push_back(op);
+  };
+
+  // Visit all operations in original order, which will recursively visit
+  // dependencies
+  for (Operation *op : opList) {
+    topoVisit(op);
+  }
+
+  return sortedOpList;
+}
+
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   LLVM_DEBUG({
@@ -404,6 +491,12 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         opList.push_back(&op);
     }
   }
+  // FIXME:
+  // Topologically sort opList to ensure dependencies are cloned before uses
+  // This is necessary because operations can appear out of order in the IR
+  opList = topologicalSort(opList);
+
+  DenseSet<Operation *> opsInList(opList.begin(), opList.end());
 
   LLVM_DEBUG({
     LDBG("ops to be specialized: ");
@@ -448,6 +541,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     Block *defaultBlock = impB.createBlock(&wsOp.getDefaultRegion());
     taskBuilder.setInsertionPointToStart(defaultBlock);
     IRMapping mapping;
+
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
@@ -466,6 +560,35 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     taskBuilder.setInsertionPointToStart(partitionBlock);
 
     IRMapping mapping;
+
+    // Pre-populate mapping for ForOp results.
+    // When a ForOp result is used by operations that appear before the ForOp
+    // in the IR, we need to map those results to their init args before we
+    // start cloning operations.
+    for (Operation *op : opList) {
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        for (unsigned resIdx = 0; resIdx < forOp.getNumResults(); ++resIdx) {
+          auto result = forOp.getResult(resIdx);
+          // Check if this result is used by any operation in this partition
+          bool usedInPartition = false;
+          for (Operation *user : result.getUsers()) {
+            if (hasAsyncTaskId(user, asyncTaskId)) {
+              usedInPartition = true;
+              break;
+            }
+          }
+          // Pre-map the result to its init arg.
+          // This will be updated later when the ForOp is specialized if the
+          // result is actually produced in this partition.
+          if (usedInPartition) {
+            Value initArg = forOp.getInitArgs()[resIdx];
+            mapping.map(result, initArg);
+          }
+        }
+      }
+    }
+
+    // Now clone operations in order
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
@@ -488,6 +611,13 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       continue;
     }
 
+    // Skip captures that are defined by operations in opList.
+    // These operations will be erased, and their results have already been
+    // cloned within the partition regions, so we don't need to capture them.
+    if (capture.getDefiningOp() && opsInList.count(capture.getDefiningOp())) {
+      continue;
+    }
+
     if (isa<RankedTensorType>(capture.getType())) {
       mlir::emitWarning(capture.getLoc(),
                         "FIXME: capturing tensor values into warp "
@@ -502,13 +632,22 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   }
 
+  // Run dead code elimination before manually erasing operations.
+  IRRewriter rewriter(context);
+  (void)runRegionDCE(rewriter, funcOp->getRegions());
+
+  // Recover wsOp after DCE as it may have been modified.
+  ttg::WarpSpecializeOp newWsOp;
+  funcOp.walk([&](ttg::WarpSpecializeOp op) { newWsOp = op; });
+  assert(newWsOp && "WarpSpecializeOp should still exist after DCE");
+
   LLVM_DEBUG({
     LDBG("\n\nWith task Id checks");
     funcOp.dump();
   });
 
   SmallVector<Operation *> toErase;
-  wsOp.walk([&](Operation *op) {
+  newWsOp.walk([&](Operation *op) {
     unsigned numUsers = std::distance(op->user_begin(), op->user_end());
     bool isYield = isa<scf::YieldOp>(op);
     bool isAdd = isa<arith::AddIOp>(op);
@@ -524,8 +663,20 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   }
 
   // Remove original operations that have been cloned in reverse order.
+  // Recompute opList after DCE as some operations may have been erased.
+  opList.clear();
+  for (auto &block : funcOp.getBody().getBlocks()) {
+    for (Operation &op : block.getOperations()) {
+      auto taskIds = getAsyncTaskIds(&op);
+      if (!taskIds.empty())
+        opList.push_back(&op);
+    }
+  }
+  opList = topologicalSort(opList);
+
   for (auto it = opList.rbegin(); it != opList.rend(); ++it) {
     Operation *op = *it;
+
     LLVM_DEBUG({
       LDBG("erasing op ");
       op->dump();
@@ -541,6 +692,9 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
+    if (hasUse)
+      logOpStillHasUsers(op);
+
     op->erase();
   }
 }

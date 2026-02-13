@@ -23,6 +23,8 @@ def TritonTLXFixup : Pass</*cli-arg*/"triton-tlx-fixup", /*Op*/"mlir::ModuleOp">
       Option<"numCTAs", "num-ctas",
              "int32_t", /*default*/"1",
              "number of ctas in a cga">,
+      ListOption<"clusterDims", "cluster-dims", "int32_t",
+             "cluster dimensions (X, Y, Z)">,
    ];
 }
 
@@ -78,6 +80,51 @@ def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir
 
     Each resolved layout uses the same default values as the corresponding
     Python make_default() methods.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
+  let summary = "Print TTGIR operations with their TLX equivalents";
+
+  let description = [{
+    This pass walks through the TTGIR module and prints annotations showing
+    the mapping from TTGIR operations back to their TLX API equivalents.
+    This is useful for understanding the correspondence between the high-level
+    TLX Python API and the low-level TTGIR operations.
+
+    Example mappings:
+    - ttng::InitBarrierOp -> tlx.alloc_barriers
+    - ttng::WaitBarrierOp -> tlx.barrier_wait
+    - ttng::WarpGroupDotOp -> tlx.async_dot (Hopper)
+    - ttng::TCGen5MMAOp -> tlx.async_dot (Blackwell)
+    - ttg::LocalAllocOp -> tlx.local_alloc (smem)
+    - ttng::TMEMAllocOp -> tlx.local_alloc (tmem)
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
+def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower storage alias operations";
+
+  let description = [{
+    This pass lowers storage alias operations by:
+
+    1. Computing or validating storage alias sizes - For each storage_alias_spec,
+       computes the required buffer size as the maximum of all referencing
+       storage_alias_local_alloc operations. If an explicit size is provided,
+       validates it is sufficient.
+
+    2. Materializing storage alias allocations - Creates LocalAllocOp/TMEMAllocOp
+       for each storage_alias_spec and replaces storage_alias_local_alloc with
+       local_alias referencing the allocation.
   }];
 
   let dependentDialects = [

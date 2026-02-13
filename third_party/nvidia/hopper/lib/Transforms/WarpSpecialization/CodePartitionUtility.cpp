@@ -18,6 +18,14 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+// Helper function to check if a channel is needed between producer and
+// consumers. Returns false if the producer task ID matches all consumer task
+// IDs (no cross-warp synchronization needed).
+static bool needsChannel(int producer, const SmallVector<int> &consumers) {
+  return !llvm::all_of(
+      consumers, [producer](int consumerId) { return consumerId == producer; });
+}
+
 // Check to see if op is enclosed under ifOp.
 bool enclosing(scf::IfOp ifOp, Operation *op) {
   return ifOp->isProperAncestor(op);
@@ -84,13 +92,15 @@ static Operation *getCommonScope(Operation *a, Operation *b) {
     parentScopes.insert(op);
     op = op->getParentOp();
   }
+  // Worst case the function should enclose both A and B.
+  parentScopes.insert(op);
   op = b;
   while (!isa<triton::FuncOp>(op)) {
     if (parentScopes.count(op))
       return op;
     op = op->getParentOp();
   }
-  return nullptr;
+  return parentScopes.count(op) ? op : nullptr;
 }
 
 // Return the lifted "op" that is directly under scope.
@@ -113,7 +123,6 @@ bool appearsBefore(Operation *A, Operation *B) {
     auto *outScope = getCommonScope(A, B);
     return appearsBefore(getLiftedOp(A, outScope), getLiftedOp(B, outScope));
   }
-  assert(A->getBlock() == B->getBlock());
   auto block = A->getBlock();
   for (auto &op : block->getOperations()) {
     if (&op == A) {
@@ -468,10 +477,18 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
 std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                              Location loc, Value accumCnt,
                                              unsigned numBuffers) {
-  Value numBuffersVal =
-      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
-  numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
-      loc, builder.getI64Type(), numBuffersVal);
+  // ensure type compatibility
+  Value numBuffersVal;
+  if (accumCnt.getType().isIndex()) {
+    // accumCnt is index type, create an index constant
+    numBuffersVal =
+        builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, numBuffers);
+  } else {
+    // accumCnt is integer type, create a matching integer constant
+    auto intType = llvm::cast<IntegerType>(accumCnt.getType());
+    numBuffersVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        loc, numBuffers, intType.getWidth());
+  }
   // Calculate accumCnt / numBuffers
   // initBufferIdx = accumCnt - accumCnt / numBuffers * numBuffers
   // initPhase = (accumCnt / numBuffers) & 1
@@ -481,14 +498,46 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                                              numBuffersVal);
   Value initBufferIdx =
       builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, mulOp);
-  initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
-      loc, builder.getI32Type(), initBufferIdx);
 
-  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  // Convert to i32 for buffer indexing
+  if (initBufferIdx.getType().isIndex()) {
+    // For index type, use index_cast to convert to i32
+    initBufferIdx = builder.createWithAsyncTaskIds<arith::IndexCastOp>(
+        loc, builder.getI32Type(), initBufferIdx);
+  } else {
+    // For integer types, truncate to i32
+    initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+        loc, builder.getI32Type(), initBufferIdx);
+  }
+
+  // ensure type compatibility
+  Value one;
+  if (bufferIdx.getType().isIndex()) {
+    // For index type, create a constant index
+    one = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, 1);
+  } else if (auto intType = llvm::dyn_cast<IntegerType>(bufferIdx.getType())) {
+    // For integer types, create a constant with matching bit width
+    one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        loc, 1, intType.getWidth());
+  } else {
+    llvm_unreachable("bufferIdx must be either index or integer type");
+  }
   bufferIdx =
       builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
-  Value initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
-      loc, builder.getI1Type(), bufferIdx);
+
+  // Convert to i1 for phase
+  Value initPhase;
+  if (bufferIdx.getType().isIndex()) {
+    // For index type, first cast to i32, then truncate to i1
+    Value bufferIdxI32 = builder.createWithAsyncTaskIds<arith::IndexCastOp>(
+        loc, builder.getI32Type(), bufferIdx);
+    initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+        loc, builder.getI1Type(), bufferIdxI32);
+  } else {
+    // For integer types, truncate to i1
+    initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+        loc, builder.getI1Type(), bufferIdx);
+  }
   return {initBufferIdx, initPhase};
 }
 
@@ -511,6 +560,14 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
   auto parentForOp = op->getParentOfType<scf::ForOp>();
+
+  // Handle operations outside loops (e.g., epilogue operations).
+  // These operations don't participate in buffer cycling, so return constant 0.
+  if (!parentForOp) {
+    LDBG("getAccumCount: operation outside loop, returning constant 0");
+    return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
+  }
+
   auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
@@ -578,8 +635,16 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   }
   // Increment accumCnt if there are multiple channels in the reuseGroup in this
   // region.
-  Value idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      op->getLoc(), theIdx, 64);
+  // Create idxVal with the same type as accumCnt to ensure type compatibility
+  Value idxVal;
+  if (accumCnt.getType().isIndex()) {
+    idxVal = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+        op->getLoc(), theIdx);
+  } else {
+    auto intType = llvm::cast<IntegerType>(accumCnt.getType());
+    idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        op->getLoc(), theIdx, intType.getWidth());
+  }
   Value addRes = builder.createWithAsyncTaskIds<arith::AddIOp>(
       op->getLoc(), accumCnt, idxVal);
 
@@ -619,9 +684,1377 @@ static void setTmemChannelAttr(Operation *op, int channelId,
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
-static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
-                           ttng::TCGen5MMAOp mmaOp,
+// Helper function to create channels from multiple producers to a single
+// consumer. Creates one channel per producer in the currentProds vector.
+// @param currentProds Vector of producer operations
+// @param producerTaskId Task ID of the producers (must all be the same)
+// @param consumerIds Consumer task IDs
+// @param allocOp The TMEM allocation operation
+// @param consumerOp The consumer operation
+// @param channels Output vector to add created channels to
+static void
+createChannelsForProducers(SmallVector<Operation *> &currentProds,
+                           int producerTaskId, SmallVector<int> &consumerIds,
+                           Operation *allocOp, Operation *consumerOp,
                            SmallVector<std::unique_ptr<Channel>> &channels) {
+  for (auto *prod : currentProds) {
+    auto channelID = channels.size();
+    channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+        producerTaskId, consumerIds, allocOp, true /*isOperandD*/, true,
+        channelID));
+    setTmemChannelAttr(prod, channelID, "tmem.start");
+    setTmemChannelAttr(consumerOp, channelID, "tmem.end");
+  }
+}
+
+/// Dump information about a single channel for debugging.
+static void dumpChannel(Channel *ch, llvm::raw_ostream &os) {
+  os << "  Channel ID: " << ch->uniqID << "\n";
+  os << "    Kind: " << to_string(ch->channelKind) << "\n";
+  os << "    Producer Task ID: " << ch->relation.first << "\n";
+  os << "    Consumer Task IDs: [";
+  for (size_t i = 0; i < ch->relation.second.size(); ++i) {
+    if (i > 0)
+      os << ", ";
+    os << ch->relation.second[i];
+  }
+  os << "]\n";
+  os << "    NumBuffers: " << ch->getNumBuffers() << "\n";
+  if (auto *allocOp = ch->getAllocOp()) {
+    os << "    AllocOp: ";
+    allocOp->print(os, OpPrintingFlags().skipRegions());
+    os << "\n";
+  }
+  if (auto *srcOp = ch->getSrcOp()) {
+    os << "    SrcOp: ";
+    srcOp->print(os, OpPrintingFlags().skipRegions());
+    os << "\n";
+  }
+  if (auto *dstOp = ch->getDstOp()) {
+    os << "    DstOp: ";
+    dstOp->print(os, OpPrintingFlags().skipRegions());
+    os << "\n";
+  }
+  // For TmemDataChannelPost, dump additional info
+  if (ch->channelKind == DataChannelKind::TMEMPost) {
+    auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+    os << "    isOperandD: " << (tmemCh->isOperandD ? "true" : "false") << "\n";
+    os << "    isOperandDNoAcc: "
+       << (tmemCh->isOperandDNoAcc ? "true" : "false") << "\n";
+  }
+}
+
+/// Dump all channels associated with an OperandD (same allocOp).
+static void
+dumpChannelsForOperandD(ttng::TMEMAllocOp tmemAllocOp,
+                        SmallVector<std::unique_ptr<Channel>> &channels,
+                        llvm::raw_ostream &os) {
+  os << "\n=== Channels for OperandD ===\n";
+  os << "TMEMAllocOp: ";
+  tmemAllocOp.getOperation()->print(os, OpPrintingFlags().skipRegions());
+  os << "\n";
+  os << "Number of channels: ";
+  size_t count = 0;
+  for (auto &ch : channels) {
+    if (ch->getAllocOp() == tmemAllocOp.getOperation()) {
+      ++count;
+    }
+  }
+  os << count << "\n";
+  for (auto &ch : channels) {
+    if (ch->getAllocOp() == tmemAllocOp.getOperation()) {
+      dumpChannel(ch.get(), os);
+    }
+  }
+  os << "=== End Channels for OperandD ===\n\n";
+}
+
+/// Dump all channels in the channel collection for debugging.
+static void dumpAllChannels(SmallVector<std::unique_ptr<Channel>> &channels,
+                            llvm::raw_ostream &os) {
+  os << "\n=== All Channels ===\n";
+  os << "Total channel count: " << channels.size() << "\n\n";
+  for (auto &ch : channels) {
+    dumpChannel(ch.get(), os);
+  }
+  os << "=== End All Channels ===\n\n";
+}
+
+/// Get a short name for an operation for display in the graph.
+static std::string getOpShortName(Operation *op) {
+  if (!op)
+    return "null";
+  std::string name = op->getName().getStringRef().str();
+  // Remove dialect prefix for brevity
+  size_t dotPos = name.find('.');
+  if (dotPos != std::string::npos && dotPos + 1 < name.size()) {
+    name = name.substr(dotPos + 1);
+  }
+  return name;
+}
+
+/// Get operation_id attribute value, or -1 if not present.
+static int getOperationId(Operation *op) {
+  if (!op)
+    return -1;
+  if (auto opIdAttr = op->getAttrOfType<IntegerAttr>("operation_id")) {
+    return opIdAttr.getInt();
+  }
+  return -1;
+}
+
+/// Get buffer.id attribute value, or -1 if not present.
+static int getBufferId(Operation *op) {
+  if (!op)
+    return -1;
+  if (auto bufIdAttr = op->getAttrOfType<IntegerAttr>("buffer.id")) {
+    return bufIdAttr.getInt();
+  }
+  return -1;
+}
+
+/// Get named location string from an operation, or empty string if not present.
+/// Supports NameLoc, FusedLoc, FileLineColLoc, and CallSiteLoc.
+static std::string getNamedLoc(Operation *op) {
+  if (!op)
+    return "";
+  Location loc = op->getLoc();
+
+  // Try to get NameLoc (e.g., loc("myName"))
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return nameLoc.getName().str();
+  }
+  // Try FusedLoc which may contain a NameLoc or FileLineColLoc
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
+        return nameLoc.getName().str();
+      }
+    }
+    // If no NameLoc found, try to get FileLineColLoc
+    for (Location subLoc : fusedLoc.getLocations()) {
+      if (auto fileLoc = dyn_cast<FileLineColLoc>(subLoc)) {
+        std::string filename = fileLoc.getFilename().str();
+        // Extract just the filename without path
+        size_t lastSlash = filename.rfind('/');
+        if (lastSlash != std::string::npos) {
+          filename = filename.substr(lastSlash + 1);
+        }
+        return filename + ":" + std::to_string(fileLoc.getLine());
+      }
+    }
+  }
+  // Try FileLineColLoc directly (e.g., "file.py":42:0)
+  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+    std::string filename = fileLoc.getFilename().str();
+    // Extract just the filename without path
+    size_t lastSlash = filename.rfind('/');
+    if (lastSlash != std::string::npos) {
+      filename = filename.substr(lastSlash + 1);
+    }
+    return filename + ":" + std::to_string(fileLoc.getLine());
+  }
+  // Try CallSiteLoc - extract location from callee
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    // Get the callee location (where the function is defined)
+    Location calleeLoc = callSiteLoc.getCallee();
+    if (auto fileLoc = dyn_cast<FileLineColLoc>(calleeLoc)) {
+      std::string filename = fileLoc.getFilename().str();
+      size_t lastSlash = filename.rfind('/');
+      if (lastSlash != std::string::npos) {
+        filename = filename.substr(lastSlash + 1);
+      }
+      return filename + ":" + std::to_string(fileLoc.getLine());
+    }
+    if (auto nameLoc = dyn_cast<NameLoc>(calleeLoc)) {
+      return nameLoc.getName().str();
+    }
+    // Try FusedLoc within callee
+    if (auto fusedLoc = dyn_cast<FusedLoc>(calleeLoc)) {
+      for (Location subLoc : fusedLoc.getLocations()) {
+        if (auto nameLoc = dyn_cast<NameLoc>(subLoc)) {
+          return nameLoc.getName().str();
+        }
+      }
+      for (Location subLoc : fusedLoc.getLocations()) {
+        if (auto fileLoc = dyn_cast<FileLineColLoc>(subLoc)) {
+          std::string filename = fileLoc.getFilename().str();
+          size_t lastSlash = filename.rfind('/');
+          if (lastSlash != std::string::npos) {
+            filename = filename.substr(lastSlash + 1);
+          }
+          return filename + ":" + std::to_string(fileLoc.getLine());
+        }
+      }
+    }
+  }
+  return "";
+}
+
+/// Get a unique node ID for an operation.
+static std::string getNodeId(Operation *op) {
+  if (!op)
+    return "null";
+  std::stringstream ss;
+  // Use operation_id if available for more readable graph
+  int opId = getOperationId(op);
+  if (opId >= 0) {
+    ss << "op_" << opId;
+  } else {
+    // Use a hash of the pointer for consistent IDs
+    ss << "op_" << (reinterpret_cast<uintptr_t>(op) % 100000);
+  }
+  return ss.str();
+}
+
+/// Check if an operation is a key operation (GEMM, load/store, or tensor
+/// computation).
+static bool isKeyOp(Operation *op) {
+  // GEMM operations
+  if (isa<ttng::TCGen5MMAOp>(op))
+    return true;
+
+  // Load operations
+  if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp, ttg::LocalLoadOp>(
+          op))
+    return true;
+
+  // Store operations
+  if (isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
+          ttg::LocalStoreOp, tt::DescriptorReduceOp>(op))
+    return true;
+
+  // Tensor computation operations (arithmetic and math on tensors)
+  if (op->getNumResults() > 0) {
+    if (auto resultType = op->getResult(0).getType()) {
+      if (isa<RankedTensorType>(resultType)) {
+        if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+                arith::MaxNumFOp, arith::MinNumFOp, arith::TruncFOp,
+                math::ExpOp, math::Exp2Op, math::LogOp, math::Log2Op,
+                math::SqrtOp, math::RsqrtOp, math::TanhOp>(op))
+          return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/// Get NamedLoc from a Value's defining operation, if available.
+static std::string getValueName(Value val) {
+  if (!val)
+    return "";
+  if (auto *defOp = val.getDefiningOp()) {
+    std::string locName = getNamedLoc(defOp);
+    if (!locName.empty())
+      return locName;
+  }
+  // For block arguments, try to get a meaningful name
+  if (auto blockArg = dyn_cast<BlockArgument>(val)) {
+    return "arg" + std::to_string(blockArg.getArgNumber());
+  }
+  return "";
+}
+
+/// Get a simple shape string from a type (e.g., "128x128xf32").
+static std::string getShapeStr(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    std::string result;
+    llvm::raw_string_ostream ss(result);
+    for (int64_t dim : tensorType.getShape()) {
+      ss << dim << "x";
+    }
+    ss << tensorType.getElementType();
+    return result;
+  }
+  if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
+    std::string result;
+    llvm::raw_string_ostream ss(result);
+    for (int64_t dim : memDescType.getShape()) {
+      ss << dim << "x";
+    }
+    ss << memDescType.getElementType();
+    return result;
+  }
+  // Fallback: just print the type without layout details
+  std::string result;
+  llvm::raw_string_ostream ss(result);
+  ss << type;
+  return result;
+}
+
+/// Get a simplified operation description focusing on shapes and variable
+/// names.
+static std::string getKeyOpDescription(Operation *op) {
+  std::string result;
+  llvm::raw_string_ostream ss(result);
+
+  std::string opName = getOpShortName(op);
+
+  // Helper lambda to format input variable with name if available
+  auto formatInput = [](Value val) -> std::string {
+    std::string name = getValueName(val);
+    if (!name.empty())
+      return name;
+    return getShapeStr(val.getType());
+  };
+
+  // Helper lambda to format output variable with shape
+  auto formatOutput = [](Value val) -> std::string {
+    return getShapeStr(val.getType());
+  };
+
+  // For GEMM, show operand names/shapes: A @ B -> D
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+    ss << opName << " " << formatInput(mmaOp.getA()) << " @ "
+       << formatInput(mmaOp.getB()) << " -> " << formatInput(mmaOp.getD());
+    return result;
+  }
+
+  // For loads, show source and result
+  if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getPtr()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getSrc()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<ttg::LocalLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getSrc()) << " -> "
+       << formatOutput(loadOp.getResult());
+    return result;
+  }
+
+  // For stores, show source and destination
+  if (auto storeOp = dyn_cast<tt::DescriptorStoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDesc());
+    return result;
+  }
+  if (auto storeOp = dyn_cast<tt::StoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getValue()) << " -> "
+       << formatInput(storeOp.getPtr());
+    return result;
+  }
+  if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDst());
+    return result;
+  }
+  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(op)) {
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDst());
+    return result;
+  }
+  if (auto reduceOp = dyn_cast<tt::DescriptorReduceOp>(op)) {
+    ss << opName << " " << formatInput(reduceOp.getSrc()) << " -> "
+       << formatInput(reduceOp.getDesc());
+    return result;
+  }
+
+  // For arithmetic/math ops, show inputs and output
+  if (op->getNumResults() > 0) {
+    ss << opName << " ";
+    bool first = true;
+    for (Value operand : op->getOperands()) {
+      if (!first)
+        ss << ", ";
+      ss << formatInput(operand);
+      first = false;
+    }
+    ss << " -> " << formatOutput(op->getResult(0));
+    return result;
+  }
+
+  ss << opName;
+  return result;
+}
+
+/// Check if an operation or its nested regions contain any key operations.
+static bool containsKeyOps(Operation *op) {
+  if (isKeyOp(op))
+    return true;
+
+  // Check nested regions
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &innerOp : block) {
+        if (containsKeyOps(&innerOp))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// Simplify a name that may be in filename:linenumber format.
+/// If the name matches "filename.py:123" pattern, return just "L123"
+static std::string simplifyName(const std::string &name) {
+  if (name.empty())
+    return name;
+
+  // Check if name contains a colon (file:line format)
+  size_t colonPos = name.rfind(':');
+  if (colonPos != std::string::npos && colonPos + 1 < name.size()) {
+    // Check if what follows the colon is a number
+    std::string afterColon = name.substr(colonPos + 1);
+    bool isNumber =
+        !afterColon.empty() &&
+        std::all_of(afterColon.begin(), afterColon.end(), ::isdigit);
+    if (isNumber) {
+      return "L" + afterColon;
+    }
+  }
+  return name;
+}
+
+/// Get the loop depth of an operation (number of enclosing scf.for loops)
+static int getLoopDepth(Operation *op) {
+  int depth = 0;
+  Operation *parent = op->getParentOp();
+  while (parent) {
+    if (isa<scf::ForOp>(parent)) {
+      depth++;
+    }
+    parent = parent->getParentOp();
+  }
+  return depth;
+}
+
+/// Get the name of a value for display purposes.
+/// Returns named location if available, otherwise a placeholder.
+static std::string getValueDisplayName(Value val) {
+  if (Operation *defOp = val.getDefiningOp()) {
+    std::string name = getNamedLoc(defOp);
+    if (!name.empty())
+      return simplifyName(name);
+  }
+  return "?";
+}
+
+/// Generate a compact label for a key operation.
+/// Format:
+/// Line 1: [opId] output = operator(inputs)
+/// Line 2: shape, Ln (loop depth)
+static std::string getKeyOpLabel(Operation *op) {
+  std::string label;
+
+  // Add operation ID
+  int opId = getOperationId(op);
+  if (opId >= 0) {
+    label = "[" + std::to_string(opId) + "] ";
+  }
+
+  std::string opName = getOpShortName(op);
+  std::string locName = getNamedLoc(op);
+  std::string outputName = locName.empty() ? "?" : simplifyName(locName);
+
+  // Helper to get tensor input names (skip non-tensor operands)
+  auto getTensorInputs = [](Operation *op) -> std::string {
+    std::string inputs;
+    bool first = true;
+    for (Value operand : op->getOperands()) {
+      Type type = operand.getType();
+      // Check if it's a tensor-like type
+      if (isa<RankedTensorType>(type) || isa<triton::gpu::MemDescType>(type) ||
+          isa<triton::PointerType>(type)) {
+        if (!first)
+          inputs += ", ";
+        inputs += getValueDisplayName(operand);
+        first = false;
+      }
+    }
+    return inputs;
+  };
+
+  // Helper to get only the source tensor name for store operations
+  auto getStoreSrcName = [](Operation *op) -> std::string {
+    if (auto storeOp = dyn_cast<tt::DescriptorStoreOp>(op)) {
+      return getValueDisplayName(storeOp.getSrc());
+    }
+    if (auto storeOp = dyn_cast<tt::StoreOp>(op)) {
+      return getValueDisplayName(storeOp.getValue());
+    }
+    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
+      return getValueDisplayName(storeOp.getSrc());
+    }
+    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(op)) {
+      return getValueDisplayName(storeOp.getSrc());
+    }
+    if (auto reduceOp = dyn_cast<tt::DescriptorReduceOp>(op)) {
+      return getValueDisplayName(reduceOp.getSrc());
+    }
+    return "?";
+  };
+
+  // Helper to get output shape (excluding !ttg.async.token)
+  auto getOutputShape = [](Operation *op) -> std::string {
+    if (op->getNumResults() > 0) {
+      std::string shape = getShapeStr(op->getResult(0).getType());
+      // Remove !ttg.async.token
+      if (shape.find("!ttg.async.token") != std::string::npos) {
+        return "";
+      }
+      return shape;
+    }
+    // For store ops, get shape from the stored value
+    if (auto storeOp = dyn_cast<tt::DescriptorStoreOp>(op)) {
+      return getShapeStr(storeOp.getSrc().getType());
+    }
+    if (auto storeOp = dyn_cast<tt::StoreOp>(op)) {
+      return getShapeStr(storeOp.getValue().getType());
+    }
+    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(op)) {
+      return getShapeStr(storeOp.getSrc().getType());
+    }
+    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(op)) {
+      return getShapeStr(storeOp.getSrc().getType());
+    }
+    return "";
+  };
+
+  // Build the label based on operation type
+  if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+    // GEMM: D = mma(A, B)
+    std::string aName = getValueDisplayName(mmaOp.getA());
+    std::string bName = getValueDisplayName(mmaOp.getB());
+    label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
+  } else if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+                 ttg::LocalLoadOp>(op)) {
+    // Load: out = load(src)
+    std::string inputs = getTensorInputs(op);
+    label += outputName + " = " + opName + "(" + inputs + ")";
+  } else if (isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
+                 ttg::LocalStoreOp, tt::DescriptorReduceOp>(op)) {
+    // Store: store(src) - only show the source tensor, not the destination
+    std::string srcName = getStoreSrcName(op);
+    label += opName + "(" + srcName + ")";
+  } else {
+    // Generic: out = op(inputs)
+    std::string inputs = getTensorInputs(op);
+    if (op->getNumResults() > 0) {
+      label += outputName + " = " + opName + "(" + inputs + ")";
+    } else {
+      label += opName + "(" + inputs + ")";
+    }
+  }
+
+  // Add shape and loop depth on second line
+  std::string shape = getOutputShape(op);
+  int loopDepth = getLoopDepth(op);
+
+  std::string secondLine;
+  if (!shape.empty()) {
+    secondLine = shape;
+  }
+  if (loopDepth > 0) {
+    if (!secondLine.empty())
+      secondLine += ", ";
+    secondLine += "L" + std::to_string(loopDepth);
+  }
+  if (!secondLine.empty()) {
+    label += "\\n" + secondLine;
+  }
+
+  return label;
+}
+
+/// Generate a DOT subgraph for key operations with control flow structure.
+/// This creates a vertical flow showing the execution order of key ops.
+static void dumpKeyOpsSubgraph(triton::FuncOp funcOp, llvm::raw_ostream &os,
+                               const std::string &subgraphName) {
+  os << "  subgraph cluster_" << subgraphName << " {\n";
+  os << "    label=\"Key Operations\";\n";
+  os << "    style=filled;\n";
+  os << "    fillcolor=lightyellow;\n";
+  os << "    node [shape=box, fontsize=9, style=filled];\n\n";
+
+  int nodeCounter = 0;
+  int clusterCounter = 0;
+
+  // Recursive function to walk operations and create nested clusters
+  std::function<void(Operation *, int, llvm::raw_ostream &, std::string &)>
+      walkOp = [&](Operation *op, int depth, llvm::raw_ostream &clusterOs,
+                   std::string &prevNodeId) {
+        // Handle control flow operations - create nested clusters
+        if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+          if (!containsKeyOps(op))
+            return;
+
+          std::string clusterId =
+              subgraphName + "_cluster_for_" + std::to_string(clusterCounter++);
+          std::string forNodeId =
+              subgraphName + "_for_" + std::to_string(nodeCounter++);
+
+          // Start a new subgraph cluster for this for loop
+          clusterOs << "    subgraph cluster_" << clusterId << " {\n";
+          clusterOs << "      label=\"scf.for\";\n";
+          clusterOs << "      style=rounded;\n";
+          clusterOs << "      color=blue;\n";
+          clusterOs << "      bgcolor=lightcyan;\n";
+
+          std::string innerPrevId = "";
+          for (Operation &innerOp : forOp.getBody()->getOperations()) {
+            walkOp(&innerOp, depth + 1, clusterOs, innerPrevId);
+          }
+
+          clusterOs << "    }\n";
+
+          // Connect previous node to first node in this cluster (if any)
+          if (!prevNodeId.empty() && !innerPrevId.empty()) {
+            // We'll handle this with ltail/lhead later if needed
+          }
+          if (!innerPrevId.empty()) {
+            prevNodeId = innerPrevId;
+          }
+          return;
+        }
+
+        if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+          if (!containsKeyOps(op))
+            return;
+
+          std::string clusterId =
+              subgraphName + "_cluster_if_" + std::to_string(clusterCounter++);
+
+          // Start a new subgraph cluster for this if statement
+          clusterOs << "    subgraph cluster_" << clusterId << " {\n";
+          clusterOs << "      label=\"scf.if\";\n";
+          clusterOs << "      style=rounded;\n";
+          clusterOs << "      color=magenta;\n";
+          clusterOs << "      bgcolor=mistyrose;\n";
+
+          std::string innerPrevId = "";
+          for (Operation &innerOp :
+               ifOp.getThenRegion().front().getOperations()) {
+            walkOp(&innerOp, depth + 1, clusterOs, innerPrevId);
+          }
+          if (!ifOp.getElseRegion().empty()) {
+            for (Operation &innerOp :
+                 ifOp.getElseRegion().front().getOperations()) {
+              walkOp(&innerOp, depth + 1, clusterOs, innerPrevId);
+            }
+          }
+
+          clusterOs << "    }\n";
+
+          if (!innerPrevId.empty()) {
+            prevNodeId = innerPrevId;
+          }
+          return;
+        }
+
+        // Check if this is a key operation
+        if (isKeyOp(op)) {
+          std::string nodeId = subgraphName + "_" + getNodeId(op);
+
+          // Build label using the new format
+          std::string label = getKeyOpLabel(op);
+
+          // Color based on partition number (async_task_id)
+          // Color palette for different partitions
+          static const std::vector<std::string> partitionColors = {
+              "lightblue",   // Partition 0
+              "lightgreen",  // Partition 1
+              "lightsalmon", // Partition 2
+              "lightyellow", // Partition 3
+              "lightpink",   // Partition 4
+              "lightcyan",   // Partition 5
+              "lavender",    // Partition 6
+              "wheat",       // Partition 7
+          };
+
+          std::string fillcolor = "white";
+          auto taskIds = getAsyncTaskIds(op);
+          if (!taskIds.empty()) {
+            int partitionNum = taskIds.front();
+            fillcolor = partitionColors[partitionNum % partitionColors.size()];
+          }
+
+          clusterOs << "      " << nodeId << " [label=\"" << label
+                    << "\", fillcolor=" << fillcolor << "];\n";
+
+          // Connect to previous node for vertical ordering
+          if (!prevNodeId.empty()) {
+            clusterOs << "      " << prevNodeId << " -> " << nodeId
+                      << " [style=invis];\n";
+          }
+          prevNodeId = nodeId;
+        }
+      };
+
+  // Walk through the function body
+  std::string prevNodeId = "";
+  for (Operation &op : funcOp.getBody().front().getOperations()) {
+    walkOp(&op, 0, os, prevNodeId);
+  }
+
+  os << "  }\n\n";
+}
+
+/// Generate a combined DOT graph showing key ops and channels side by side.
+/// Left side: Key operations with control flow
+/// Right side: Channel connections between partitions
+void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
+                       triton::FuncOp funcOp, llvm::raw_ostream &os) {
+  os << "\n=== Combined Key Ops + Channel Graph (DOT format) ===\n";
+  os << "// Render with: dot -Tpng <file>.dot -o graph.png\n";
+  os << "digraph CombinedGraph {\n";
+  os << "  rankdir=TB;\n";
+  os << "  compound=true;\n";
+  os << "  node [shape=box, style=filled, fontsize=9];\n";
+  os << "  edge [fontsize=7];\n\n";
+
+  // Color palette for different partitions
+  static const std::vector<std::string> partitionColors = {
+      "lightblue",   // Partition 0
+      "lightgreen",  // Partition 1
+      "lightsalmon", // Partition 2
+      "lightyellow", // Partition 3
+      "lightpink",   // Partition 4
+      "lightcyan",   // Partition 5
+      "lavender",    // Partition 6
+      "wheat",       // Partition 7
+  };
+
+  // Collect all key operations and channel operations, grouped by partition
+  DenseMap<int, SmallVector<Operation *>> partitionOps;
+  DenseSet<Operation *> channelOps; // Track ops that are in channels
+
+  // First, collect operations from channels
+  for (auto &ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+    int producerId = ch->relation.first;
+
+    if (srcOp) {
+      channelOps.insert(srcOp);
+      // Add to partition if not already there
+      auto &ops = partitionOps[producerId];
+      if (std::find(ops.begin(), ops.end(), srcOp) == ops.end()) {
+        ops.push_back(srcOp);
+      }
+    }
+
+    for (int consumerId : ch->relation.second) {
+      if (dstOp) {
+        channelOps.insert(dstOp);
+        auto &ops = partitionOps[consumerId];
+        if (std::find(ops.begin(), ops.end(), dstOp) == ops.end()) {
+          ops.push_back(dstOp);
+        }
+      }
+    }
+  }
+
+  // Now collect all key operations and add those not in channels
+  std::function<void(Operation *)> collectKeyOps = [&](Operation *op) {
+    // Recurse into nested regions
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (Operation &innerOp : block) {
+          collectKeyOps(&innerOp);
+        }
+      }
+    }
+
+    // Check if this is a key operation
+    if (isKeyOp(op)) {
+      // Get partition from async_task_id
+      auto taskIds = getAsyncTaskIds(op);
+      if (!taskIds.empty()) {
+        int partitionId = taskIds.front();
+        auto &ops = partitionOps[partitionId];
+        if (std::find(ops.begin(), ops.end(), op) == ops.end()) {
+          ops.push_back(op);
+        }
+      }
+    }
+  };
+
+  // Collect key ops from function body
+  for (Operation &op : funcOp.getBody().front().getOperations()) {
+    collectKeyOps(&op);
+  }
+
+  // Sort partition IDs
+  SmallVector<int> sortedPartitions;
+  for (auto &kv : partitionOps) {
+    sortedPartitions.push_back(kv.first);
+  }
+  llvm::sort(sortedPartitions);
+
+  // Create nested subgraphs for each partition with nodes in program order
+  for (int partId : sortedPartitions) {
+    // Sort operations by operation_id (program order)
+    auto &ops = partitionOps[partId];
+    llvm::sort(ops, [](Operation *a, Operation *b) {
+      return getOperationId(a) < getOperationId(b);
+    });
+
+    std::string fillcolor = partitionColors[partId % partitionColors.size()];
+    // Use a lighter version of the color for the cluster background
+    // Graphviz uses #RRGGBBAA format for transparency
+    std::string bgColor = fillcolor;
+
+    os << "  subgraph cluster_partition_" << partId << " {\n";
+    os << "    label=\"Partition " << partId << "\";\n";
+    os << "    style=filled;\n";
+    os << "    fillcolor=\"" << bgColor << "\";\n";
+    os << "    color=blue;\n";
+
+    std::string prevNodeId = "";
+    for (Operation *op : ops) {
+      std::string nodeId = "op_" + getNodeId(op);
+
+      // Use key op label format for all nodes
+      std::string label = getKeyOpLabel(op);
+
+      // Color node based on partition
+      std::string nodeFillColor = fillcolor;
+
+      // Add border color based on channel type
+      std::string borderColor = "black";
+      bool inChannel = channelOps.contains(op);
+      if (inChannel) {
+        for (auto &ch : channels) {
+          if (ch->getSrcOp() == op || ch->getDstOp() == op) {
+            if (ch->channelKind == DataChannelKind::TMEMPost) {
+              borderColor = "red";
+              break;
+            } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+              borderColor = "darkgreen";
+            }
+          }
+        }
+      }
+
+      os << "    " << nodeId << " [label=\"" << label << "\", fillcolor=\""
+         << nodeFillColor << "\", color=" << borderColor << "];\n";
+
+      // Add invisible edge for vertical ordering within partition
+      if (!prevNodeId.empty()) {
+        os << "    " << prevNodeId << " -> " << nodeId << " [style=invis];\n";
+      }
+      prevNodeId = nodeId;
+    }
+    os << "  }\n\n";
+  }
+
+  // Channel edges
+  os << "  // Channel edges\n";
+  for (auto &ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+
+    if (!srcOp || !dstOp)
+      continue;
+
+    std::string srcId = "op_" + getNodeId(srcOp);
+    std::string dstId = "op_" + getNodeId(dstOp);
+
+    std::string style = "solid";
+    std::string color = "black";
+    std::string edgeLabel = "ch" + std::to_string(ch->uniqID);
+
+    // Add buffer ID if available
+    Operation *allocOp = ch->getAllocOp();
+    int bufferId = getBufferId(allocOp);
+    if (bufferId >= 0) {
+      edgeLabel += " B" + std::to_string(bufferId);
+    }
+
+    std::string locName = getNamedLoc(srcOp);
+    if (locName.empty()) {
+      locName = getNamedLoc(allocOp);
+    }
+    if (!locName.empty()) {
+      edgeLabel += "\\n\\\"" + locName + "\\\"";
+    }
+
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      color = "red";
+      edgeLabel += "\\n(TMEM)";
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch.get());
+      if (tmemCh->isOperandD) {
+        style = "bold";
+        edgeLabel += " [D]";
+      }
+    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+      color = "darkgreen";
+      edgeLabel += "\\n(SMEM)";
+    }
+
+    os << "  " << srcId << " -> " << dstId << " [label=\"" << edgeLabel
+       << "\", color=" << color << ", style=" << style << "];\n";
+  }
+
+  os << "}\n";
+  os << "=== End Combined Graph ===\n";
+}
+
+/// Generate a buffer liveness visualization for TMEM allocations using
+/// pre-calculated liveness intervals from the memory planner.
+void dumpTmemBufferLiveness(
+    SmallVector<ttng::TMEMAllocOp> &allocs,
+    DenseMap<Operation *, Interval<size_t>> &allocToIntervals,
+    DenseMap<Operation *, ttng::TMemAllocation> &allocToSize,
+    DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
+    SmallVector<Channel *> &channels, llvm::raw_ostream &os) {
+  os << "=== TMEM Buffer Liveness Graph ===\n";
+  os << "digraph TmemBufferLiveness {\n";
+  os << "  rankdir=LR;\n";
+  os << "  node [shape=record, fontsize=9];\n";
+  os << "  edge [style=invis];\n\n";
+
+  if (allocs.empty()) {
+    os << "  empty [label=\"No TMEM allocations\"];\n";
+    os << "}\n";
+    os << "=== End TMEM Buffer Liveness Graph ===\n";
+    return;
+  }
+
+  // Find all channels for each alloc (handles OperandD case with multiple
+  // channels)
+  DenseMap<Operation *, SmallVector<Channel *>> allocToAllChannels;
+  for (auto *ch : channels) {
+    if (ch->channelKind != DataChannelKind::TMEMPost)
+      continue;
+    Operation *allocOp = ch->getAllocOp();
+    if (allocOp)
+      allocToAllChannels[allocOp].push_back(ch);
+  }
+
+  // Find global min/max for axis
+  size_t globalMin = std::numeric_limits<size_t>::max();
+  size_t globalMax = 0;
+  for (auto &alloc : allocs) {
+    auto it = allocToIntervals.find(alloc.getOperation());
+    if (it != allocToIntervals.end()) {
+      globalMin = std::min(globalMin, it->second.start());
+      globalMax = std::max(globalMax, it->second.end());
+    }
+  }
+
+  if (globalMin == std::numeric_limits<size_t>::max()) {
+    os << "  empty [label=\"No liveness intervals\"];\n";
+    os << "}\n";
+    os << "=== End TMEM Buffer Liveness Graph ===\n";
+    return;
+  }
+
+  // Create a time axis at the top
+  os << "  // Time axis\n";
+  os << "  subgraph cluster_axis {\n";
+  os << "    label=\"Operation ID\";\n";
+  os << "    style=invis;\n";
+  os << "    axis [shape=none, label=\"";
+  size_t step = std::max((globalMax - globalMin) / 10, (size_t)1);
+  for (size_t i = globalMin; i <= globalMax; i += step) {
+    os << i;
+    if (i + step <= globalMax)
+      os << "  |  ";
+  }
+  os << "\"];\n";
+  os << "  }\n\n";
+
+  // Color palette for buffers
+  static const std::vector<std::string> tmemColors = {
+      "lightpink",   "lavender",  "peachpuff", "thistle",
+      "lightyellow", "lightcyan", "wheat",     "lightgreen"};
+
+  // Create a subgraph for each TMEM alloc
+  int allocIdx = 0;
+  std::string prevAllocNode;
+
+  for (auto &alloc : allocs) {
+    auto intervalIt = allocToIntervals.find(alloc.getOperation());
+    if (intervalIt == allocToIntervals.end())
+      continue;
+
+    Interval<size_t> interval = intervalIt->second;
+    std::string color = tmemColors[allocIdx % tmemColors.size()];
+    std::string allocNode = "tmem_" + std::to_string(allocIdx);
+
+    // Get buffer name from location
+    std::string bufferName = getNamedLoc(alloc.getOperation());
+    if (bufferName.empty())
+      bufferName = "alloc" + std::to_string(allocIdx);
+
+    // Get row x col size
+    std::string sizeStr;
+    auto sizeIt = allocToSize.find(alloc.getOperation());
+    if (sizeIt != allocToSize.end()) {
+      sizeStr = std::to_string(sizeIt->second.numRows) + "x" +
+                std::to_string(sizeIt->second.numCols);
+    }
+
+    // Get all channels for this alloc
+    auto &allocChannels = allocToAllChannels[alloc.getOperation()];
+
+    // Count OperandD channels
+    int operandDCount = 0;
+    for (auto *ch : allocChannels) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      if (tmemCh->isOperandD)
+        operandDCount++;
+    }
+
+    // Build label with row x col size
+    std::string bufLabel = bufferName;
+    if (!sizeStr.empty())
+      bufLabel += " " + sizeStr;
+    bufLabel += " [" + std::to_string(interval.start()) + "-" +
+                std::to_string(interval.end()) + ")";
+    if (operandDCount > 0) {
+      bufLabel += " [" + std::to_string(operandDCount) + " OperandD]";
+    }
+
+    os << "  // TMEM Alloc: " << bufferName << "\n";
+    os << "  subgraph cluster_" << allocNode << " {\n";
+    os << "    label=\"" << bufLabel << "\";\n";
+    os << "    style=filled;\n";
+    os << "    fillcolor=\"" << color << "\";\n";
+    os << "    color=black;\n\n";
+
+    // Create a node for each channel in this alloc
+    std::string prevChNode;
+    for (auto *ch : allocChannels) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      std::string chNode = allocNode + "_ch" + std::to_string(ch->uniqID);
+
+      // Get src/dst operation IDs if available
+      std::string label = "ch" + std::to_string(ch->uniqID);
+      if (tmemCh->isOperandD) {
+        label += " [D]";
+      }
+
+      // Add src->dst info
+      Operation *srcOp = ch->getSrcOp();
+      Operation *dstOp = ch->getDstOp();
+      if (srcOp && dstOp) {
+        int srcId = getOperationId(srcOp);
+        int dstId = getOperationId(dstOp);
+        if (srcId >= 0 && dstId >= 0) {
+          label += " (" + std::to_string(srcId) + " to " +
+                   std::to_string(dstId) + ")";
+        }
+      }
+
+      os << "    " << chNode << " [label=\"" << label
+         << "\", style=filled, fillcolor=white];\n";
+
+      if (!prevChNode.empty()) {
+        os << "    " << prevChNode << " -> " << chNode << " [style=invis];\n";
+      }
+      prevChNode = chNode;
+    }
+
+    // If no channels, show the liveness interval
+    if (allocChannels.empty()) {
+      std::string infoNode = allocNode + "_info";
+      os << "    " << infoNode << " [label=\"no channels\", style=filled, "
+         << "fillcolor=white];\n";
+      prevChNode = infoNode;
+    }
+
+    os << "  }\n\n";
+
+    // Link allocs to maintain order
+    if (!prevAllocNode.empty() && !prevChNode.empty()) {
+      os << "  " << prevAllocNode << " -> "
+         << (allocChannels.empty()
+                 ? allocNode + "_info"
+                 : allocNode + "_ch" + std::to_string(allocChannels[0]->uniqID))
+         << " [style=invis];\n";
+    }
+    if (!prevChNode.empty()) {
+      prevAllocNode = prevChNode;
+    }
+    allocIdx++;
+  }
+
+  // Create a summary table
+  os << "\n  // Summary table\n";
+  os << "  subgraph cluster_summary {\n";
+  os << "    label=\"TMEM Allocation Summary\";\n";
+  os << "    style=filled;\n";
+  os << "    fillcolor=white;\n";
+  os << "    summary [shape=none, label=<\n";
+  os << "      <TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\">\n";
+  os << "        "
+        "<TR><TD><B>Name</B></TD><TD><B>Size</B></TD><TD><B>Channels</B></"
+        "TD><TD><B>"
+        "Liveness</B></TD><TD><B>OperandD</B></TD></TR>\n";
+
+  for (auto &alloc : allocs) {
+    auto intervalIt = allocToIntervals.find(alloc.getOperation());
+    if (intervalIt == allocToIntervals.end())
+      continue;
+
+    std::string bufferName = getNamedLoc(alloc.getOperation());
+    if (bufferName.empty())
+      bufferName = "alloc";
+
+    // Get row x col size for summary
+    std::string sizeStr = "-";
+    auto sizeIt = allocToSize.find(alloc.getOperation());
+    if (sizeIt != allocToSize.end()) {
+      sizeStr = std::to_string(sizeIt->second.numRows) + "x" +
+                std::to_string(sizeIt->second.numCols);
+    }
+
+    auto &allocChannels = allocToAllChannels[alloc.getOperation()];
+    int operandDCount = 0;
+    for (auto *ch : allocChannels) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      if (tmemCh->isOperandD)
+        operandDCount++;
+    }
+
+    os << "        <TR><TD>" << bufferName << "</TD><TD>" << sizeStr
+       << "</TD><TD>" << allocChannels.size() << "</TD><TD>["
+       << intervalIt->second.start() << "-" << intervalIt->second.end()
+       << ")</TD><TD>" << operandDCount << "</TD></TR>\n";
+  }
+
+  os << "      </TABLE>\n";
+  os << "    >];\n";
+  os << "  }\n";
+
+  os << "}\n";
+  os << "=== End TMEM Buffer Liveness Graph ===\n";
+}
+
+void dumpSmemBufferLiveness(
+    llvm::MapVector<Allocation::BufferId, std::pair<Interval<size_t>, size_t>>
+        &bufferInfo,
+    DenseMap<Allocation::BufferId, Operation *> &bufferOwners,
+    SmallVector<Channel *> &channels, llvm::raw_ostream &os) {
+  os << "=== SMEM Buffer Liveness Graph ===\n";
+  os << "digraph SmemBufferLiveness {\n";
+  os << "  rankdir=LR;\n";
+  os << "  node [shape=record, fontsize=9];\n";
+  os << "  edge [style=invis];\n\n";
+
+  if (bufferInfo.empty()) {
+    os << "  empty [label=\"No SMEM allocations\"];\n";
+    os << "}\n";
+    os << "=== End SMEM Buffer Liveness Graph ===\n";
+    return;
+  }
+
+  // Find all SMEM channels for each alloc
+  DenseMap<Operation *, SmallVector<Channel *>> allocToAllChannels;
+  for (auto *ch : channels) {
+    if (ch->channelKind != DataChannelKind::SMEMPost)
+      continue;
+    Operation *allocOp = ch->getAllocOp();
+    if (allocOp)
+      allocToAllChannels[allocOp].push_back(ch);
+  }
+
+  // Find global min/max for axis
+  size_t globalMin = std::numeric_limits<size_t>::max();
+  size_t globalMax = 0;
+  for (auto &[bufferId, info] : bufferInfo) {
+    auto &interval = info.first;
+    if (interval.start() == 0 && interval.end() == 0)
+      continue;
+    globalMin = std::min(globalMin, interval.start());
+    globalMax = std::max(globalMax, interval.end());
+  }
+
+  if (globalMin == std::numeric_limits<size_t>::max()) {
+    os << "  empty [label=\"No liveness intervals\"];\n";
+    os << "}\n";
+    os << "=== End SMEM Buffer Liveness Graph ===\n";
+    return;
+  }
+
+  // Create a time axis at the top
+  os << "  // Time axis\n";
+  os << "  subgraph cluster_axis {\n";
+  os << "    label=\"Operation ID\";\n";
+  os << "    style=invis;\n";
+  os << "    axis [shape=none, label=\"";
+  size_t step = std::max((globalMax - globalMin) / 10, (size_t)1);
+  for (size_t i = globalMin; i <= globalMax; i += step) {
+    os << i;
+    if (i + step <= globalMax)
+      os << "  |  ";
+  }
+  os << "\"];\n";
+  os << "  }\n\n";
+
+  // Color palette for buffers
+  static const std::vector<std::string> smemColors = {
+      "lightblue",   "lightgreen", "lightyellow", "lightcoral",
+      "lightsalmon", "lightcyan",  "lavender",    "peachpuff"};
+
+  // Create a subgraph for each SMEM buffer
+  int bufferIdx = 0;
+  std::string prevBufferNode;
+
+  for (auto &[bufferId, info] : bufferInfo) {
+    auto &interval = info.first;
+    auto bufferSize = info.second;
+
+    if (interval.start() == 0 && interval.end() == 0)
+      continue;
+
+    Operation *owner = bufferOwners.lookup(bufferId);
+    std::string color = smemColors[bufferIdx % smemColors.size()];
+    std::string bufferNode = "smem_" + std::to_string(bufferIdx);
+
+    // Get buffer name from location
+    std::string bufferName = owner ? getNamedLoc(owner) : "";
+    if (bufferName.empty())
+      bufferName = "alloc" + std::to_string(bufferIdx);
+
+    // Get all channels for this alloc
+    auto &allocChannels =
+        owner ? allocToAllChannels[owner] : allocToAllChannels[nullptr];
+
+    // Build label with buffer ID and size
+    std::string bufLabel = bufferName + " B" + std::to_string(bufferId) + " [" +
+                           std::to_string(interval.start()) + "-" +
+                           std::to_string(interval.end()) + ")";
+    bufLabel += " size=" + std::to_string(bufferSize);
+
+    os << "  // SMEM Buffer: " << bufferName << "\n";
+    os << "  subgraph cluster_" << bufferNode << " {\n";
+    os << "    label=\"" << bufLabel << "\";\n";
+    os << "    style=filled;\n";
+    os << "    fillcolor=\"" << color << "\";\n";
+    os << "    color=black;\n\n";
+
+    // Create a node for each channel in this buffer
+    std::string prevChNode;
+    for (auto *ch : allocChannels) {
+      std::string chNode = bufferNode + "_ch" + std::to_string(ch->uniqID);
+
+      // Get src/dst operation IDs if available
+      std::string label = "ch" + std::to_string(ch->uniqID);
+
+      // Add src->dst info
+      Operation *srcOp = ch->getSrcOp();
+      Operation *dstOp = ch->getDstOp();
+      if (srcOp && dstOp) {
+        int srcId = getOperationId(srcOp);
+        int dstId = getOperationId(dstOp);
+        if (srcId >= 0 && dstId >= 0) {
+          label += " (" + std::to_string(srcId) + " to " +
+                   std::to_string(dstId) + ")";
+        }
+      }
+
+      os << "    " << chNode << " [label=\"" << label
+         << "\", style=filled, fillcolor=white];\n";
+
+      if (!prevChNode.empty()) {
+        os << "    " << prevChNode << " -> " << chNode << " [style=invis];\n";
+      }
+      prevChNode = chNode;
+    }
+
+    // If no channels, show the liveness interval
+    if (allocChannels.empty()) {
+      std::string infoNode = bufferNode + "_info";
+      os << "    " << infoNode << " [label=\"no channels\", style=filled, "
+         << "fillcolor=white];\n";
+      prevChNode = infoNode;
+    }
+
+    os << "  }\n\n";
+
+    // Link buffers to maintain order
+    if (!prevBufferNode.empty() && !prevChNode.empty()) {
+      os << "  " << prevBufferNode << " -> "
+         << (allocChannels.empty()
+                 ? bufferNode + "_info"
+                 : bufferNode + "_ch" +
+                       std::to_string(allocChannels[0]->uniqID))
+         << " [style=invis];\n";
+    }
+    if (!prevChNode.empty()) {
+      prevBufferNode = prevChNode;
+    }
+    bufferIdx++;
+  }
+
+  // Create a summary table
+  os << "\n  // Summary table\n";
+  os << "  subgraph cluster_summary {\n";
+  os << "    label=\"SMEM Buffer Summary\";\n";
+  os << "    style=filled;\n";
+  os << "    fillcolor=white;\n";
+  os << "    summary [shape=none, label=<\n";
+  os << "      <TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\">\n";
+  os << "        <TR><TD><B>Name</B></TD><TD><B>BufferID</B></TD><TD><B>"
+        "Size</B></TD><TD><B>Channels</B></TD><TD><B>Liveness</B></TD></TR>\n";
+
+  bufferIdx = 0;
+  for (auto &[bufferId, info] : bufferInfo) {
+    auto &interval = info.first;
+    auto bufferSize = info.second;
+
+    if (interval.start() == 0 && interval.end() == 0)
+      continue;
+
+    Operation *owner = bufferOwners.lookup(bufferId);
+    std::string bufferName = owner ? getNamedLoc(owner) : "";
+    if (bufferName.empty())
+      bufferName = "alloc" + std::to_string(bufferIdx);
+
+    auto &allocChannels =
+        owner ? allocToAllChannels[owner] : allocToAllChannels[nullptr];
+
+    os << "        <TR><TD>" << bufferName << "</TD><TD>" << bufferId
+       << "</TD><TD>" << bufferSize << "</TD><TD>" << allocChannels.size()
+       << "</TD><TD>[" << interval.start() << "-" << interval.end()
+       << ")</TD></TR>\n";
+    bufferIdx++;
+  }
+
+  os << "      </TABLE>\n";
+  os << "    >];\n";
+  os << "  }\n";
+
+  os << "}\n";
+  os << "=== End SMEM Buffer Liveness Graph ===\n";
+}
+///
+/// This function creates producer-consumer channels for a TMEM allocation that
+/// is used as the accumulator (operand D) of a TCGen5MMA operation. The
+/// accumulator follows a read-modify-write pattern where:
+///   1. A producer writes to the TMEM (either a tmem_store or an MMA)
+///   2. The MMA reads the accumulator, performs computation, and writes back
+///
+/// The function handles several cases for finding the initial producer:
+///   - TMEMStoreOp outside the loop: Initialization before the loop starts
+///   - MMA with use_acc=false: The MMA overwrites (doesn't accumulate), so it
+///     becomes the first producer without needing a prior value
+///   - TMEMStoreOp inside the loop: Re-initialization within the loop
+///
+/// For each producer-consumer pair, a TmemDataChannelPost is created to track
+/// the data dependency for warp specialization scheduling.
+///
+/// @param tmemAllocOp The TMEM allocation used as operand D
+/// @param mmaOp The MMA operation that uses this TMEM as its accumulator
+/// @param channels Output vector to collect the created channels
+/// @return success() if channels were created successfully, failure() otherwise
+static LogicalResult
+handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
+               SmallVector<std::unique_ptr<Channel>> &channels) {
   SmallVector<Operation *> consumers;
   SmallVector<Operation *> producers;
   // Go through ops in the body to figure out producer/consumer of the tmem.
@@ -632,9 +2065,29 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
     users.insert(user);
   }
   auto forOp = mmaOp->getParentOfType<scf::ForOp>();
-  Operation *currentProd = nullptr;
+  if (!forOp) {
+    return mmaOp.emitError(
+        "handleOperandD: MMA operation is not inside a scf.for loop");
+  }
+  // Track multiple producers when channels are skipped (same task IDs).
+  // All producers in the vector must share the exact same task IDs.
+  SmallVector<Operation *> currentProds;
   auto ctx = forOp.getContext();
   SmallVector<int> channelsToBeUpdate;
+
+  // Check for producers outside the loop body (e.g., tmem_store before the
+  // loop that initializes the accumulator). These producers dominate the loop.
+  for (auto user : tmemAllocOp.getResult().getUsers()) {
+    if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+      // Check if this store is outside the loop (not nested under forOp)
+      if (!forOp->isProperAncestor(storeOp)) {
+        currentProds.clear();
+        currentProds.push_back(storeOp);
+        handledUsers.insert(storeOp);
+      }
+    }
+  }
+
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!users.count(&op))
       continue;
@@ -642,53 +2095,119 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
     if (auto mmaOpT = dyn_cast<ttng::TCGen5MMAOp>(&op)) {
       if (&op == mmaOp.getOperation()) {
         // This uses and defines D. Will be both producer and consumer.
-        assert(currentProd != nullptr);
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
+        // If useAcc is false, the MMA doesn't read the accumulator - it
+        // overwrites it completely. In this case, the MMA is the first
+        // producer and doesn't need a prior producer.
+        if (currentProds.empty()) {
+          Value useAccFlag = mmaOpT.useAccumulator();
+          bool useAccIsFalse = false;
+          if (useAccFlag) {
+            // If useAccFlag is a block argument of the loop, trace it back
+            // to its init value. Even if useAccFlag may be true, we don't
+            // need a producer if useAcc = False for the first iteration.
+            if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
+              if (blockArg.getOwner() == forOp.getBody()) {
+                // Block arg 0 is the induction variable, so iter args start
+                // at index 1.
+                unsigned argNum = blockArg.getArgNumber();
+                if (argNum > 0) {
+                  useAccFlag = forOp.getInitArgs()[argNum - 1];
+                }
+              }
+            }
+            if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
+              if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue())) {
+                useAccIsFalse = !boolAttr.getValue();
+              } else if (auto intAttr =
+                             dyn_cast<IntegerAttr>(constOp.getValue())) {
+                useAccIsFalse = intAttr.getInt() == 0;
+              }
+            }
+          }
+          if (useAccIsFalse) {
+            // MMA with use_acc=false is the first producer
+            currentProds.clear();
+            currentProds.push_back(&op);
+            continue;
+          }
+        }
+        if (currentProds.empty()) {
+          mmaOp.emitError(
+              "handleOperandD: no producer found for MMA operand D. "
+              "Expected a tmem_store before the loop or use_acc=false.");
+          return failure();
+        }
+        // Start a channel from currentProds to op
+        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
-        assert(producerTaskIds.size() == 1);
-        auto producerTaskId = producerTaskIds.front();
-        auto channelID = channels.size();
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, true, channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
-        currentProd = &op;
+        if (producerTaskIds.size() != 1) {
+          mmaOp.emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
+        int producerTaskId = producerTaskIds.front();
+        if (needsChannel(producerTaskId, consumerIds)) {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), &op, channels);
+          currentProds.clear();
+          currentProds.push_back(&op);
+        } else {
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
+        }
       } else {
-        assert(mmaOpT.getD() != tmemAllocOp.getResult());
+        if (mmaOpT.getD() == tmemAllocOp.getResult()) {
+          mmaOp.emitError(
+              "handleOperandD: unexpected MMA using same TMEM as operand D");
+          return failure();
+        }
         // This uses tmem. mark as tmem.end = channel_id
-        assert(currentProd != nullptr);
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
-        assert(producerTaskIds.size() == 1);
+        if (currentProds.empty()) {
+          mmaOpT.emitError(
+              "handleOperandD: no producer found for MMA consumer");
+          return failure();
+        }
+        // Start a channel from currentProds to op
+        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
+        if (producerTaskIds.size() != 1) {
+          mmaOpT.emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
         auto producerTaskId = producerTaskIds.front();
-        auto channelID = channels.size();
         auto consumerIds = getAsyncTaskIds(&op);
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, true, channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
+        if (needsChannel(producerTaskId, consumerIds)) {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), &op, channels);
+        } else {
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
+        }
       }
     } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(&op)) {
-      currentProd = &op; // mark as tmem.start = channel_id
+      currentProds.clear();
+      currentProds.push_back(&op); // mark as tmem.start = channel_id
     } else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(&op)) {
-      if (currentProd) {
-        // Start a channel from currentProd to op
-        auto producerTaskIds = getAsyncTaskIds(currentProd);
-        assert(producerTaskIds.size() == 1);
+      if (!currentProds.empty()) {
+        // Start a channel from currentProds to op
+        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
+        if (producerTaskIds.size() != 1) {
+          loadOp.emitError("handleOperandD: expected exactly one producer task "
+                           "ID for TMEMLoad, got ")
+              << producerTaskIds.size();
+          return failure();
+        }
         auto producerTaskId = producerTaskIds.front();
-        auto channelID = channels.size();
         auto consumerIds = getAsyncTaskIds(&op);
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-            producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-            true /*isOperandD*/, true, channels.size()));
-        // Mark producer and consumer.
-        setTmemChannelAttr(currentProd, channelID, "tmem.start");
-        setTmemChannelAttr(&op, channelID, "tmem.end");
+        if (needsChannel(producerTaskId, consumerIds)) {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), &op, channels);
+        } else {
+          // Channel skipped - append to producers vector
+          currentProds.push_back(&op);
+        }
       } else {
         channelsToBeUpdate.push_back(channels.size());
         auto channelID = channels.size();
@@ -700,14 +2219,23 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         setTmemChannelAttr(&op, channelID, "tmem.end");
       }
     } else {
-      assert(0);
+      // Unexpected operation type using the TMEM
+      return op.emitError(
+          "handleOperandD: unexpected operation type using TMEM");
     }
   }
   // Update channel's producer here.
   for (auto idx : channelsToBeUpdate) {
-    assert(currentProd); // assuming ForOp runs at least one iteration.
-    channels[idx]->relation.first = getAsyncTaskIds(currentProd).front();
-    setTmemChannelAttr(currentProd, channels[idx]->uniqID, "tmem.start");
+    if (currentProds.empty()) {
+      // This can happen if ForOp never produces - should not occur in valid IR
+      return mmaOp.emitError(
+          "handleOperandD: no producer found for deferred channel update");
+    }
+    // For deferred channels, we only have one channel per consumer, so use
+    // the last producer in the vector (which should be the most recent).
+    auto *lastProd = currentProds.back();
+    channels[idx]->relation.first = getAsyncTaskIds(lastProd).front();
+    setTmemChannelAttr(lastProd, channels[idx]->uniqID, "tmem.start");
   }
   // For consumers outside of ForOp.
   for (auto *user : users) {
@@ -715,21 +2243,32 @@ static void handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
       continue;
     // only handle tmem_load. FIXME: check if it is after the ForOp
     if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(user)) {
-      assert(currentProd);
-      // Start a channel from currentProd to user
-      auto producerTaskIds = getAsyncTaskIds(currentProd);
-      assert(producerTaskIds.size() == 1);
+      if (currentProds.empty()) {
+        return loadOp.emitError(
+            "handleOperandD: no producer found for TMEMLoad outside loop");
+      }
+      // Start a channel from currentProds to user
+      auto producerTaskIds = getAsyncTaskIds(currentProds.front());
+      if (producerTaskIds.size() != 1) {
+        return loadOp.emitError("handleOperandD: expected exactly one producer "
+                                "task ID, got ")
+               << producerTaskIds.size();
+      }
       auto producerTaskId = producerTaskIds.front();
-      auto channelID = channels.size();
       auto consumerIds = getAsyncTaskIds(user);
-      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-          producerTaskId, consumerIds, tmemAllocOp.getOperation(),
-          true /*isOperandD*/, true, channels.size()));
-      // Mark producer and consumer.
-      setTmemChannelAttr(currentProd, channelID, "tmem.start");
-      setTmemChannelAttr(user, channelID, "tmem.end");
+      if (needsChannel(producerTaskId, consumerIds)) {
+        createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                   tmemAllocOp.getOperation(), user, channels);
+      } else {
+        assert(false && "Unexpected Producer Found");
+      }
     }
   }
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[handleOperandD] Completed channel creation\n";
+    dumpChannelsForOperandD(tmemAllocOp, channels, llvm::dbgs());
+  });
+  return success();
 }
 
 static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
@@ -775,7 +2314,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     if (isOperandD) {
       // Create a list of virtual channels for this case. Each virtual channel
       // has a single producer.
-      handleOperandD(tmemAllocOp, mmaOp, channels);
+      if (failed(handleOperandD(tmemAllocOp, mmaOp, channels))) {
+        // Error already emitted by handleOperandD
+        return;
+      }
       return;
     }
 
@@ -805,6 +2347,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
         consumers.push_back(user);
     }
   }
+  // FIXME: If we couldn't find a valid producer (e.g., for allocs outside the
+  // loop), skip creating a channel for this allocation.
+  if (!producerOp)
+    return;
   auto producerTaskIds = getAsyncTaskIds(producerOp);
   assert(producerTaskIds.size() == 1);
   auto producerTaskId = producerTaskIds.front();
@@ -818,11 +2364,13 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
                           producerTaskId);
   consumerTaskIds.erase(iter, consumerTaskIds.end());
 
-  if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp))
-    channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
-        producerTaskIds.front(), consumerTaskIds, allocOp, false,
-        isOperandDNoAcc, channels.size()));
-  else
+  if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
+    if (needsChannel(producerTaskId, consumerTaskIds)) {
+      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+          producerTaskId, consumerTaskIds, allocOp, false, isOperandDNoAcc,
+          channels.size()));
+    }
+  } else
     channels.push_back(std::make_unique<ChannelPost>(
         producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
 }
@@ -840,6 +2388,10 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
     } else if (dyn_cast<ttg::LocalAllocOp>(op)) {
       createChannelPost(op, dom, channels);
     }
+  });
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n[collectPostChannels] Completed channel collection\n";
+    dumpAllChannels(channels, llvm::dbgs());
   });
 }
 

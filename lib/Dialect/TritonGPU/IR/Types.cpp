@@ -1,5 +1,6 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "mlir/IR/DialectImplementation.h" // required by `Types.cpp.inc`
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -157,12 +158,19 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
       return emitError() << "memorySpace must be TensorMemorySpace";
     }
-    if (allocShape.size() != 2) {
-      return emitError() << "Scales don't currently support multibuffering";
+    if (allocShape.size() != 2 && allocShape.size() != 3) {
+      return emitError() << "Scales must be 2D or 3D (with multibuffering)";
     }
     auto bitwidth = elementType.getIntOrFloatBitWidth();
     if (bitwidth != 8) {
       return emitError() << "bitwidth must be 8";
+    }
+  } else if (isa<triton::tlx::DummyTMEMLayoutAttr>(encoding)) {
+    // Dummy TMEM layout for deferred resolution - allow any shape for TMEM
+    // The layout will be resolved to a concrete encoding during layout
+    // propagation (e.g., TensorMemoryScalesEncodingAttr for scales)
+    if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
+      return emitError() << "memorySpace must be TensorMemorySpace";
     }
   } else {
     return emitError() << encoding << " is not a valid encoding";

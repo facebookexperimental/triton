@@ -281,7 +281,33 @@ def compile(src, target=None, options=None, _env_vars=None):
     enable_ir_dump = knobs.compilation.dump_ir
     store_only_binary = knobs.compilation.store_binary_only
     fn_override_manager = get_override_manager(src.hash()) if enable_override else None
-    fn_dump_manager = get_dump_manager(src.hash()) if enable_ir_dump else None
+    # For dumping, use fn.cache_key as base directory when autotuning (consistent across configs).
+    # Otherwise use src.hash() to keep different constant values in separate directories.
+    if enable_ir_dump and knobs.autotuning.print and not ir_source:
+        dump_base_key = hashlib.sha256(src.fn.cache_key.encode("utf-8")).hexdigest()
+    else:
+        dump_base_key = src.hash()
+    fn_dump_manager = get_dump_manager(dump_base_key) if enable_ir_dump else None
+    if enable_ir_dump and knobs.autotuning.print:
+        # Build readable config name from constants (block sizes) and options (warps, stages, ctas)
+        config_parts = []
+        if not ir_source:
+            # Map constant indices back to arg names for readable output
+            arg_names = src.fn.arg_names
+            for idx, val in sorted(src.constants.items()):
+                if isinstance(idx, tuple) and len(idx) == 1:
+                    name = arg_names[idx[0]]
+                    # Shorten common prefixes for brevity
+                    short_name = name.replace("BLOCK_SIZE_", "B").replace("GROUP_SIZE_", "G")
+                    config_parts.append(f"{short_name}_{val}")
+        config_parts.append(f"warps{options.num_warps}")
+        config_parts.append(f"stages{options.num_stages}")
+        config_parts.append(f"ctas{options.num_ctas}")
+        config_name = "_".join(config_parts)
+        config_dump_dir = os.path.join(fn_dump_manager.cache_dir, config_name)
+        os.makedirs(config_dump_dir, exist_ok=True)
+        fn_dump_manager.cache_dir = config_dump_dir
+        print(f"  IR dump dir: {config_dump_dir}", flush=True)
     # Pre-truncate the file name here to avoid hitting the 255 character limit on common platforms.
     # The final file name in the cache will have a format of f"{filename}.{ext}.tmp.pid_{pid}_{uuid}".
     # A PID string can be 5-character long. A UUID string has typically 36 characters. Let's truncate
