@@ -3094,6 +3094,44 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
   });
 }
 
+// Split local_alloc ops that have a tensor source into a separate
+// empty local_alloc + local_store. This ensures doCodePartitionPost
+// can detect cross-task SMEM channels via the LocalStoreOp producer.
+static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
+  SmallVector<ttg::LocalAllocOp> toSplit;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    if (allocOp.getSrc())
+      toSplit.push_back(allocOp);
+  });
+
+  OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+  for (auto allocOp : toSplit) {
+    auto allocDescType = cast<ttg::MemDescType>(allocOp.getType());
+    SmallVector<int64_t> shape(allocDescType.getShape());
+    Type memdescType = ttg::MemDescType::get(
+        shape, allocDescType.getElementType(), allocDescType.getEncoding(),
+        allocDescType.getMemorySpace(), /*mutableMemory*/ true);
+
+    builder.setInsertionPoint(allocOp);
+    auto newAlloc =
+        builder.create<ttg::LocalAllocOp>(allocOp.getLoc(), memdescType);
+
+    auto originTaskIds = builder.getAsyncTaskIds();
+    auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
+    builder.setAsyncTaskIdsFromOp(allocOp);
+    builder.setLoopScheduleInfoFromOp(allocOp);
+    auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+        allocOp.getLoc(), allocOp.getSrc(), newAlloc);
+    storeOp->moveBefore(allocOp);
+
+    mlir::triton::replaceUsesAndPropagateType(builder, allocOp,
+                                              newAlloc.getResult());
+    builder.setAsynTaskIdsFromArray(originTaskIds);
+    builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
+    allocOp.erase();
+  }
+}
+
 void doBufferAllocation(triton::FuncOp &funcOp) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -3102,15 +3140,17 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
   for (const auto &c : channelsOrigin) {
     channels.push_back(c.get());
   }
-  if (channels.empty()) {
-    return;
+  if (!channels.empty()) {
+    // Step 2: Reorder ops based on channel information.
+    reorderEpilogOps(channels, funcOp);
+
+    // Step 3: Create buffers. A buffer for each channel.
+    createBuffer(channels, funcOp, true);
   }
 
-  // Step 2: Reorder ops based on channel information.
-  reorderEpilogOps(channels, funcOp);
-
-  // Step 3: Create buffers. A buffer for each channel.
-  createBuffer(channels, funcOp, true);
+  // Step 4: Split remaining local_alloc with tensor source into
+  // local_alloc + local_store for downstream channel detection.
+  separateLocalAllocWithSrc(funcOp);
 }
 
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
