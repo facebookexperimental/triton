@@ -271,7 +271,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        pm.run(mod)
+        pm.run(mod, 'make_ttir')
         return mod
 
     @staticmethod
@@ -382,8 +382,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
 
-        pm.run(mod)
-
+        pm.run(mod, 'make_ttgir')
         metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
@@ -404,7 +403,7 @@ class CUDABackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
-        pm.run(mod)
+        pm.run(mod, 'gluon_to_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -449,7 +448,7 @@ class CUDABackend(BaseBackend):
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
-        pm.run(mod)
+        pm.run(mod, 'make_llir')
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
