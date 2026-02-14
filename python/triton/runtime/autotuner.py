@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import sys
 import time
 import inspect
 import hashlib
@@ -212,6 +213,7 @@ class Autotuner(KernelInterface):
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
+        self.compile_time = 0
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
@@ -233,10 +235,28 @@ class Autotuner(KernelInterface):
                         waitcounter.__enter__()
 
                     # facebook end
-                    bench_start = time.time()
-                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                    bench_end = time.time()
-                    self.bench_time = bench_end - bench_start
+                    compile_us = 0
+                    prev_listener = knobs.compilation.listener
+                    if knobs.compilation.profile_compile:
+
+                        def _accumulate_compile_time(*, src, metadata, metadata_group, times, cache_hit):
+                            nonlocal compile_us
+                            if not cache_hit:
+                                compile_us += times.total
+                            if prev_listener:
+                                prev_listener(src=src, metadata=metadata, metadata_group=metadata_group, times=times,
+                                              cache_hit=cache_hit)
+
+                        knobs.compilation.listener = _accumulate_compile_time
+                    try:
+                        bench_start = time.time()
+                        timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                        bench_end = time.time()
+                        self.bench_time = bench_end - bench_start
+                        self.compile_time = compile_us / 1000000
+                    finally:
+                        if knobs.compilation.profile_compile:
+                            knobs.compilation.listener = prev_listener
                     # facebook begin T203283446
                     if importlib.util.find_spec("torch.monitor") is not None:
                         waitcounter.__exit__()
@@ -266,6 +286,12 @@ class Autotuner(KernelInterface):
         if knobs.autotuning.print and not used_cached_result:
             print(f"Triton autotuning for function {self.base_fn.__name__},\nwith key as {key},\n"
                   f"finished after {self.bench_time:.2f}s,\nbest config selected: {self.best_config};")
+        if knobs.compilation.profile_compile and not used_cached_result:
+            bench_only = self.bench_time - self.compile_time
+            print(
+                f"[triton] benchmark {self.base_fn.__name__}  total={self.bench_time:.2f}s"
+                f"  compile={self.compile_time:.2f}s  bench={bench_only:.2f}s"
+                f"  ({len(self.configs_timings)} configs)", file=sys.stderr, flush=True)
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
             config.pre_hook(full_nargs)

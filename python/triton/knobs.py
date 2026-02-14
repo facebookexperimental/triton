@@ -365,6 +365,7 @@ class compilation_knobs(base_knobs):
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
     allow_non_constexpr_globals: env_bool = env_bool("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS")
     enable_experimental_consan: env_bool = env_bool("TRITON_ENABLE_EXPERIMENTAL_CONSAN")
+    profile_compile: env_bool = env_bool("TRITON_PROFILE_COMPILE")
     listener: Union[CompilationListener, None] = None
 
 
