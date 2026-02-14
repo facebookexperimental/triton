@@ -28,42 +28,6 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
-
-namespace {
-
-// Get the absolute thread ID (not adjusted for warp groups).
-// This is needed for barrier initialization which must be done by
-// exactly one thread across all warp groups (thread 0).
-Value getAbsoluteThreadId(OpBuilder &rewriter, Location loc) {
-  Value tid =
-      rewriter.create<::mlir::gpu::ThreadIdOp>(loc, ::mlir::gpu::Dimension::x);
-  return rewriter.create<arith::IndexCastOp>(loc, i32_ty, tid);
-}
-
-// Check if we're inside a warp specialize region.
-bool isInsideWarpSpecialize(OpBuilder &rewriter) {
-  Block *block = rewriter.getInsertionBlock();
-  while (block && block->getParentOp()) {
-    if (isa<triton::gpu::WarpSpecializePartitionsOp>(block->getParentOp()))
-      return true;
-    block = block->getParentOp()->getBlock();
-  }
-  return false;
-}
-
-// Get the appropriate thread ID for barrier operations.
-// Inside warp specialize regions, use relative thread ID (only that group's
-// thread 0 should operate). Outside, use absolute thread ID (only global
-// thread 0 should operate).
-Value getBarrierThreadId(OpBuilder &rewriter, Location loc) {
-  if (isInsideWarpSpecialize(rewriter)) {
-    return getThreadId(rewriter, loc);
-  }
-  return getAbsoluteThreadId(rewriter, loc);
-}
-
-} // namespace
 
 #include "Utility.h"
 
@@ -105,11 +69,7 @@ struct InitBarrierOpConversion
         typeConverter->convertType(op.getAlloc().getType().getElementType()),
         rewriter);
 
-    // Use getBarrierThreadId to get the appropriate thread ID:
-    // - Inside warp specialize regions: use relative thread ID
-    // - Outside warp specialize regions: use absolute thread ID
-    // This ensures exactly one thread initializes each barrier.
-    auto id = getBarrierThreadId(rewriter, loc);
+    auto id = getThreadId(rewriter, loc);
     auto pred = b.icmp_eq(id, b.i32_val(0));
     ::mlir::triton::PTXBuilder ptxBuilder;
     const std::string ptx = "@$0 mbarrier.init.shared::cta.b64 [$1], " +
@@ -139,8 +99,7 @@ struct InvalBarrierOpConversion
         typeConverter->convertType(op.getAlloc().getType().getElementType()),
         rewriter);
 
-    // Use getBarrierThreadId to get the appropriate thread ID for invalidation.
-    auto id = getBarrierThreadId(rewriter, loc);
+    auto id = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(id, b.i32_val(0));
     ::mlir::triton::PTXBuilder ptxBuilder;
     const std::string ptx = "@$0 mbarrier.inval.shared::cta.b64 [$1];";
@@ -169,8 +128,7 @@ struct BarrierExpectConversion
         typeConverter->convertType(op.getAlloc().getType().getElementType()),
         rewriter);
 
-    // Use getBarrierThreadId to get the appropriate thread ID for expect_tx.
-    auto id = getBarrierThreadId(rewriter, loc);
+    auto id = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(id, b.i32_val(0));
     pred = b.and_(pred, adaptor.getPred());
     ::mlir::triton::PTXBuilder ptxBuilder;
