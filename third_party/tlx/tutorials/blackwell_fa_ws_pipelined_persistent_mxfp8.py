@@ -600,6 +600,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q_tmem_base])
+                tlx.fence_async_shared()
                 tlx.barrier_arrive(q_scale_empties[q_bufIdx])
                 tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
                 tlx.async_dot_scaled(
@@ -621,6 +622,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q_tmem_base + 1])
+                tlx.fence_async_shared()
                 tlx.barrier_arrive(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.async_dot_scaled(
                     q_tiles[1],
