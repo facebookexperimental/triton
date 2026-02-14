@@ -326,22 +326,70 @@ Operation *lastOpInBlock(llvm::ArrayRef<Operation *> endOps) {
   return *it;
 }
 
-/// Returns the partition ID that contains the keyOp that occurs first.
-int arrivesFirst(scf::ForOp forOp, triton::CoarseSchedule schedule,
-                 llvm::ArrayRef<Operation *> keyOps) {
+/// Validate that critical ops alternate between partitions in contiguous blocks
+/// and return the partition ID that arrives first. Returns -1 if the schedule
+/// is invalid (ops have interleaved schedule order or don't alternate properly).
+///
+/// Uses the linearized schedule to walk from the first critical op and verify
+/// the pattern:
+///   [partition A ops] [partition B ops] [partition A ops] [partition B ops] ...
+int arrivesFirst(
+    scf::ForOp forOp, const triton::CoarseSchedule &schedule,
+    const llvm::DenseMap<int, SmallVector<Operation *>> &partitionOps) {
+  // Collect all critical ops across partitions
+  SmallVector<Operation *> allOps;
+  for (auto &[partitionId, ops] : partitionOps) {
+    allOps.append(ops.begin(), ops.end());
+  }
+
   assert(llvm::all_of(
-             keyOps, [&](Operation *op) { return ttg::getStageCluster(op); }) &&
+             allOps, [&](Operation *op) { return ttg::getStageCluster(op); }) &&
          "Loop stage and cluster not found for all key ops");
+
+  // Build a set of critical ops for fast lookup
+  llvm::SmallDenseSet<Operation *, 8> criticalOps(allOps.begin(), allOps.end());
 
   // Find the earliest critical op in the schedule
   Operation *firstOp =
-      *llvm::min_element(keyOps, [&](Operation *a, Operation *b) {
+      *llvm::min_element(allOps, [&](Operation *a, Operation *b) {
         return schedule.isOpBefore(a, b);
       });
-
   assert(firstOp && "Failed to find the earliest op in the schedule");
-  int firstPartitionId = getSingleTaskId(firstOp);
-  return firstPartitionId;
+
+  // Validate that the schedule alternates between partitions
+  int curPartitionId = getSingleTaskId(firstOp);
+  int curSeenOps = 1;
+
+  auto linearized = schedule.linearized(forOp, firstOp);
+
+  while (auto nextOp = linearized.findNext(
+        [&](Operation *op) { return criticalOps.contains(op); })) {
+    int nextPartitionId = getSingleTaskId(*nextOp);
+    if (nextPartitionId == curPartitionId) {
+      curSeenOps++;
+      if (curSeenOps > partitionOps.lookup(curPartitionId).size()) {
+        LDBG("Partition " << curPartitionId << " have scheduled "
+              << curSeenOps << " ops consecutively, not alternating.");
+        return -1;
+      }
+    } else {
+      if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
+        LDBG("Partition " << curPartitionId << " scheduled "
+                          << curSeenOps << " before the next partition, not alternating.");
+        return -1;
+      }
+      curSeenOps = 1;
+    }
+    curPartitionId = nextPartitionId;
+  }
+
+  if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
+    LDBG("Partition " << curPartitionId << " scheduled "
+                      << curSeenOps << " before the next partition, not alternating.");
+    return -1;
+  }
+
+  return getSingleTaskId(firstOp);
 }
 
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
@@ -660,21 +708,21 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
 
   // Step 2: Assign pingpong region ID to each group
   for (auto &group : expensiveOps) {
-    // The number of distinct partitions in the group
-    llvm::SmallDenseSet<int, 4> partitionIds;
+    // Categorize ops into ping and pong partitions
+    llvm::DenseMap<int, SmallVector<Operation *>> partitionOps;
     // The parent scf::ForOp for the critical ops
     scf::ForOp forOp = nullptr;
     for (auto *op : group) {
       int taskId = getSingleTaskId(op);
       if (taskId != -1)
-        partitionIds.insert(taskId);
+        partitionOps[taskId].push_back(op);
       // ops share control flow, so taking the last parent ForOp is safe
       if (auto parentFor = op->getParentOfType<scf::ForOp>())
         forOp = parentFor;
     }
 
     // Only handle pingpong for the case of 2 different partitions
-    if (partitionIds.size() != 2)
+    if (partitionOps.size() != 2)
       continue;
 
     // Only handle pingpong when inside loops
@@ -703,8 +751,13 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       }
     }
 
-    // Find which partition has ops that arrive first
-    int arrivesFirstPartitionId = arrivesFirst(forOp, schedule, group);
+    // Find which partition arrives first and validate alternation pattern.
+    // Returns -1 if the schedule is invalid (ops interleave or don't alternate).
+    int arrivesFirstPartitionId = arrivesFirst(forOp, schedule, partitionOps);
+    if (arrivesFirstPartitionId == -1) {
+      LDBG("Skipping group due to invalid pingpong schedule pattern");
+      continue;
+    }
 
     for (auto *op : group) {
       op->setAttr(
