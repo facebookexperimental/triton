@@ -277,7 +277,7 @@ def _attn_bwd_dkdv(dk, dv,  #
                    HEAD_DIM: tl.constexpr,  #
                    # Filled in by the wrapper.
                    start_n, start_m, num_steps,  #
-                   MASK: tl.constexpr):
+                   MASK: tl.constexpr, warp_specialize: tl.constexpr = False):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -287,7 +287,7 @@ def _attn_bwd_dkdv(dk, dv,  #
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
-    for blk_idx in range(num_steps):
+    for blk_idx in tl.range(0, num_steps, warp_specialize=warp_specialize):
         qT = tl.load(qT_ptrs)
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
@@ -329,7 +329,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
                  HEAD_DIM: tl.constexpr,
                  # Filled in by the wrapper.
                  start_m, start_n, num_steps,  #
-                 MASK: tl.constexpr):
+                 MASK: tl.constexpr, warp_specialize: tl.constexpr = False):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -341,7 +341,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
     step_n = BLOCK_N2
-    for blk_idx in range(num_steps):
+    for blk_idx in tl.range(0, num_steps, warp_specialize=warp_specialize):
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
         qk = tl.dot(q, kT)
@@ -391,6 +391,7 @@ def _attn_bwd(
     BLK_SLICE_FACTOR: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
     CAUSAL: tl.constexpr,
+    warp_specialize: tl.constexpr = False,
 ):
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -429,31 +430,56 @@ def _attn_bwd(
     if CAUSAL:
         start_m = start_n
         num_steps = BLOCK_N1 // MASK_BLOCK_M1
-        dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                                Q, k, v, sm_scale,  #
-                                DO,  #
-                                M, D,  #
-                                stride_tok, stride_d,  #
-                                H, N_CTX,  #
-                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                                start_n, start_m, num_steps,  #
-                                MASK=True,  #
-                                )
+        dk, dv = _attn_bwd_dkdv(
+            dk,
+            dv,  #
+            Q,
+            k,
+            v,
+            sm_scale,  #
+            DO,  #
+            M,
+            D,  #
+            stride_tok,
+            stride_d,  #
+            H,
+            N_CTX,  #
+            MASK_BLOCK_M1,
+            BLOCK_N1,
+            HEAD_DIM,  #
+            start_n,
+            start_m,
+            num_steps,  #
+            MASK=True,  #
+            warp_specialize=warp_specialize,
+        )
 
         start_m += num_steps * MASK_BLOCK_M1
 
     # Compute dK and dV for non-masked blocks.
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(  #
-        dk, dv,  #
-        Q, k, v, sm_scale,  #
+        dk,
+        dv,  #
+        Q,
+        k,
+        v,
+        sm_scale,  #
         DO,  #
-        M, D,  #
-        stride_tok, stride_d,  #
-        H, N_CTX,  #
-        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-        start_n, start_m, num_steps,  #
+        M,
+        D,  #
+        stride_tok,
+        stride_d,  #
+        H,
+        N_CTX,  #
+        BLOCK_M1,
+        BLOCK_N1,
+        HEAD_DIM,  #
+        start_n,
+        start_m,
+        num_steps,  #
         MASK=False,  #
+        warp_specialize=warp_specialize,
     )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -487,27 +513,53 @@ def _attn_bwd(
         # structure for dK & dV above as much as possible.
         end_n = start_m + BLOCK_M2
         num_steps = BLOCK_M2 // MASK_BLOCK_N2
-        dq = _attn_bwd_dq(dq, q, K, V,  #
-                          do, m, D,  #
-                          stride_tok, stride_d,  #
-                          H, N_CTX,  #
-                          BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
-                          MASK=True,  #
-                          )
+        dq = _attn_bwd_dq(
+            dq,
+            q,
+            K,
+            V,  #
+            do,
+            m,
+            D,  #
+            stride_tok,
+            stride_d,  #
+            H,
+            N_CTX,  #
+            BLOCK_M2,
+            MASK_BLOCK_N2,
+            HEAD_DIM,  #
+            start_m,
+            end_n - num_steps * MASK_BLOCK_N2,
+            num_steps,  #
+            MASK=True,  #
+            warp_specialize=warp_specialize,
+        )
         end_n -= num_steps * MASK_BLOCK_N2
         # stage 2
         num_steps = end_n // BLOCK_N2
         start_n = end_n - num_steps * BLOCK_N2
 
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, D,  #
-                      stride_tok, stride_d,  #
-                      H, N_CTX,  #
-                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-                      start_m, start_n, num_steps,  #
-                      MASK=False,  #
-                      )
+    dq = _attn_bwd_dq(
+        dq,
+        q,
+        K,
+        V,  #
+        do,
+        m,
+        D,  #
+        stride_tok,
+        stride_d,  #
+        H,
+        N_CTX,  #
+        BLOCK_M2,
+        BLOCK_N2,
+        HEAD_DIM,  #
+        start_m,
+        start_n,
+        num_steps,  #
+        MASK=False,  #
+        warp_specialize=warp_specialize,
+    )
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
@@ -583,6 +635,7 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
+        ctx.warp_specialize = warp_specialize
         return o
 
     @staticmethod
@@ -624,6 +677,7 @@ class _attention(torch.autograd.Function):
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES,  #
             CAUSAL=ctx.causal,  #
+            warp_specialize=ctx.warp_specialize,  #
         )
 
         return dq, dk, dv, None, None, None, None
