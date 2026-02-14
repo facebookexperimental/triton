@@ -163,6 +163,8 @@ class FlashAttention:
             "NUM_BUFFERS_KV": 3,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
+            "NUM_Q_SCALE_TMEM_BUFFERS": 1,
+            "NUM_KV_SCALE_TMEM_BUFFERS": 2,
             "GROUP_SIZE_N": 1,
         },
         "hopper_fa_ws": {
