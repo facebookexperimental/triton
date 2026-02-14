@@ -1055,22 +1055,6 @@ public:
                                                    << bufferRange[alloc].end());
             alloc->owner->dump();
           });
-          // Check element type width compatibility.
-          // We cannot reuse buffers with different element type widths because
-          // memdesc_reinterpret would interpret the raw bits incorrectly.
-          // For example, reusing an f32 buffer for f16 data would read garbage
-          // since the truncf conversion happens in a different warp partition.
-          auto candType = cast<ttg::MemDescType>(
-              cast<ttng::TMEMAllocOp>(cand->owner).getType());
-          auto allocType = cast<ttg::MemDescType>(
-              cast<ttng::TMEMAllocOp>(alloc->owner).getType());
-          if (candType.getElementTypeBitWidth() !=
-              allocType.getElementTypeBitWidth()) {
-            LDBG("-- element type width mismatch: "
-                 << candType.getElementTypeBitWidth() << " vs "
-                 << allocType.getElementTypeBitWidth());
-            continue;
-          }
           // The buffer owner owns a set of rows.
           // If alloc and cand are in different loops, we can reuse as
           // long as they have the same partitions.
