@@ -8,6 +8,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
@@ -45,6 +46,125 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 using OperationListT = std::vector<Operation *>;
+
+//===----------------------------------------------------------------------===//
+// reorderOpsBySchedule - Reorder ops in pipelined loops by cluster assignment
+//===----------------------------------------------------------------------===//
+
+/// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
+static int getLoopStage(Operation *op) {
+  auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  return attr ? attr.getValue().getSExtValue() : -1;
+}
+
+/// Helper to read the loop.cluster attribute from an op. Returns -1 if absent.
+static int getLoopCluster(Operation *op) {
+  auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  return attr ? attr.getValue().getSExtValue() : -1;
+}
+
+/// Returns true if `op` has a data dependency on any result of `defOp`
+/// (i.e. `op` uses a value defined by `defOp`).
+static bool dependsOn(Operation *op, Operation *defOp) {
+  for (Value operand : op->getOperands()) {
+    if (Operation *d = operand.getDefiningOp()) {
+      if (d == defOp)
+        return true;
+    }
+  }
+  return false;
+}
+
+/// For each innermost scf::ForOp that carries loop.stage / loop.cluster
+/// attributes, reorder the operations so that within the same stage,
+/// ops with smaller cluster IDs appear before ops with larger cluster IDs.
+/// Within the same (stage, cluster), original program order is preserved.
+///
+/// Algorithm (per ForOp):
+///   For each stage x (ascending):
+///     Find the smallest cluster number for this stage.
+///     For each cluster y from smallest to largest:
+///       If y is the smallest cluster, set lastOp to the last op in this
+///         cluster (they are already in program order) and continue.
+///       Let A = the last op with cluster y-1 (i.e. lastOp from previous
+///         cluster).
+///       For each op in [stage x, cluster y] in program order:
+///         If the op is already after A, update lastOp and continue.
+///         Otherwise, move it to be right after A (if dependency constraints
+///           are satisfied).
+///
+/// A move is skipped if it would place an op before an op it depends on.
+static void reorderOpsBySchedule(Operation *funcOp) {
+  funcOp->walk([](scf::ForOp forOp) {
+    Block *body = forOp.getBody();
+
+    // ---- 1. Collect scheduled ops, grouped by (stage, cluster) ----
+    // stageMap[stage][cluster] = list of ops in program order
+    std::map<int, std::map<int, SmallVector<Operation *>>> stageMap;
+    for (Operation &op : body->without_terminator()) {
+      int stage = getLoopStage(&op);
+      int cluster = getLoopCluster(&op);
+      if (stage < 0 || cluster < 0)
+        continue;
+      stageMap[stage][cluster].push_back(&op);
+    }
+
+    if (stageMap.empty())
+      return;
+
+    // ---- 2. For each stage, reorder clusters ----
+    for (auto &[stage, clusterMap] : stageMap) {
+      Operation *lastOp = nullptr;
+
+      // clusterMap is std::map<int,...> so iteration is ascending by cluster.
+      bool isFirstCluster = true;
+      for (auto &[cluster, ops] : clusterMap) {
+        if (isFirstCluster) {
+          // Smallest cluster: ops stay in place; just record the last one.
+          lastOp = ops.back();
+          isFirstCluster = false;
+          continue;
+        }
+
+        // For each op in this cluster (in program order), ensure it comes
+        // after lastOp (the last op from the previous cluster).
+        Operation *A = lastOp;
+        for (Operation *op : ops) {
+          if (A->isBeforeInBlock(op)) {
+            // Already after A — nothing to do.
+            lastOp = op;
+          } else {
+            // op is before A: need to move op to right after A.
+            // Check that none of op's operands are defined by an op that
+            // would end up after the insertion point.
+            bool safe = true;
+            for (Value operand : op->getOperands()) {
+              Operation *defOp = operand.getDefiningOp();
+              if (!defOp || defOp->getBlock() != body)
+                continue;
+              // defOp must be before or equal to A for the move to be safe.
+              if (A->isBeforeInBlock(defOp) || defOp == op) {
+                LDBG("reorderOpsBySchedule: cannot move "
+                     << *op << " after " << *A << " — depends on " << *defOp);
+                safe = false;
+                break;
+              }
+            }
+            if (safe) {
+              op->moveAfter(A);
+              lastOp = op;
+            } else {
+              // Cannot move; leave in place but still track for subsequent ops.
+              lastOp = op;
+            }
+          }
+          // Update A so subsequent ops in this cluster go after the latest one.
+          A = lastOp;
+        }
+      }
+    }
+  });
+}
 
 //===----------------------------------------------------------------------===//
 // MemoryPlannerBase - Abstract base class for memory planners
@@ -1640,6 +1760,10 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "") {
 
+  // Step 0: reorder ops within pipelined loops so that within each stage,
+  // ops with smaller cluster IDs appear before ops with larger cluster IDs.
+  reorderOpsBySchedule(funcOp);
+
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectPostChannels(channelsOrigin, funcOp);
@@ -1661,6 +1785,57 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
           static_cast<ttng::TmemDataChannelPost *>(ch);
       LDBG("channel type TMEM" << TheCh->isOperandD << " "
                                << TheCh->isOperandDNoAcc);
+    }
+  }
+
+  // Step 1.5: Identify channels whose source and destination(s) are in
+  // different pipeline stages.  This information is useful for SWP-aware
+  // memory planning (e.g. determining multi-buffer depth).
+  for (auto *ch : channels) {
+    Operation *srcOp = ch->getSrcOp();
+    if (!srcOp)
+      continue;
+    int srcStage = getLoopStage(srcOp);
+    if (srcStage < 0)
+      continue;
+
+    SmallVector<Operation *> dstOps;
+    // TmemDataChannelPost::getDstOps asserts !isOperandD, so for TMEM
+    // accumulator channels we fall back to getDstOp/getDstOpLast.
+    bool isTmemOperandD = false;
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      isTmemOperandD = tmemCh->isOperandD;
+    }
+    if (isTmemOperandD) {
+      if (Operation *dst = ch->getDstOp())
+        dstOps.push_back(dst);
+    } else {
+      ch->getDstOps(dstOps);
+      if (dstOps.empty()) {
+        if (Operation *dst = ch->getDstOp())
+          dstOps.push_back(dst);
+      }
+    }
+
+    for (Operation *dstOp : dstOps) {
+      int dstStage = getLoopStage(dstOp);
+      if (dstStage < 0)
+        continue;
+      if (srcStage != dstStage) {
+        LDBG("cross-stage channel " << ch->uniqID << ": src stage=" << srcStage
+                                    << " dst stage=" << dstStage);
+        LLVM_DEBUG({
+          llvm::dbgs() << "  src: ";
+          srcOp->dump();
+          llvm::dbgs() << "  dst: ";
+          dstOp->dump();
+          if (ch->getAllocOp()) {
+            llvm::dbgs() << "  alloc: ";
+            ch->getAllocOp()->dump();
+          }
+        });
+      }
     }
   }
 
