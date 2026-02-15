@@ -1838,7 +1838,8 @@ deserializeBufferDecisionsFromString(StringRef jsonStr) {
     auto bufferCopy = obj->getInteger("bufferCopy");
     auto bufferOffset = obj->getInteger("bufferOffset");
 
-    if (!channelId || !bufferId || !bufferCopy || !bufferOffset) {
+    if (!channelId.has_value() || !bufferId.has_value() ||
+        !bufferCopy.has_value() || !bufferOffset.has_value()) {
       LDBG("Missing required field in decision");
       return std::nullopt;
     }
@@ -2024,34 +2025,19 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   // decisions from file instead of running the planner.
   StringRef effectiveReadFile = readDecisionFile;
   std::string envReadFile;
-  bool fromEnv = false;
   if (effectiveReadFile.empty()) {
     if (const char *envVal = std::getenv("TRITON_WS_DECISION_FILE")) {
       envReadFile = envVal;
       effectiveReadFile = envReadFile;
-      fromEnv = true;
     }
   }
   if (!effectiveReadFile.empty()) {
-    if (failed(readDecisionsFromFile(channels, effectiveReadFile))) {
-      if (fromEnv) {
-        LDBG("Decision file from env var does not match this kernel, "
-             "falling back to planner");
-      } else {
-        return failure();
-      }
-    } else {
-      LDBG("Applied decisions from: " << effectiveReadFile);
-      if (failed(tmemPlanner.verifyBufferDecisions())) {
-        if (fromEnv) {
-          LDBG("Decision verification failed, falling back to planner");
-        } else {
-          return failure();
-        }
-      } else {
-        return success();
-      }
-    }
+    if (failed(readDecisionsFromFile(channels, effectiveReadFile)))
+      return failure();
+    LDBG("Applied decisions from: " << effectiveReadFile);
+    if (failed(tmemPlanner.verifyBufferDecisions()))
+      return failure();
+    return success();
   }
 
   // Step 4: Run TMEM allocation heuristic.
