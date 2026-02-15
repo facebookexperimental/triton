@@ -1059,6 +1059,155 @@ public:
     return allocToSize;
   }
 
+  /// Verify that the buffer decisions (buffer.id, buffer.offset, buffer.copy)
+  /// currently set on the TMEM alloc ops are feasible.  This checks hard
+  /// constraints only — not heuristic quality signals (dependency chains,
+  /// partition matching).
+  ///
+  /// Must be called after collectTMemAllocsAndLiveness() and after the
+  /// decisions have been applied to the alloc ops (e.g. via
+  /// readDecisionsFromFile).
+  LogicalResult verifyBufferDecisions() {
+    LDBG("verifyBufferDecisions: checking " << allocs.size() << " allocs");
+
+    // Step 1: Read decisions from alloc op attributes and group by buffer.id.
+    struct AllocInfo {
+      Operation *op;
+      int bufferId;
+      int bufferCopy;
+      int bufferOffset; // column offset
+      size_t rowSize;
+      size_t colSize;
+      Interval<size_t> liveness;
+    };
+
+    SmallVector<AllocInfo> infos;
+    for (auto alloc : allocs) {
+      Operation *op = alloc.getOperation();
+      auto idAttr = op->getAttrOfType<IntegerAttr>("buffer.id");
+      auto copyAttr = op->getAttrOfType<IntegerAttr>("buffer.copy");
+      auto offsetAttr = op->getAttrOfType<IntegerAttr>("buffer.offset");
+
+      if (!idAttr) {
+        return op->emitError("verifyBufferDecisions: missing buffer.id");
+      }
+      int bid = idAttr.getInt();
+      int bcopy = copyAttr ? copyAttr.getInt() : 1;
+      int boffset = offsetAttr ? offsetAttr.getInt() : 0;
+
+      auto sizeIt = allocToSize.find(op);
+      if (sizeIt == allocToSize.end()) {
+        return op->emitError(
+            "verifyBufferDecisions: alloc not found in allocToSize");
+      }
+      auto intIt = allocToIntervals.find(op);
+      if (intIt == allocToIntervals.end()) {
+        return op->emitError(
+            "verifyBufferDecisions: alloc not found in allocToIntervals");
+      }
+
+      infos.push_back(
+          {op, bid, bcopy, boffset, static_cast<size_t>(sizeIt->second.numRows),
+           static_cast<size_t>(sizeIt->second.numCols), intIt->second});
+      LDBG("  alloc buffer.id="
+           << bid << " buffer.offset=" << boffset << " buffer.copy=" << bcopy
+           << " rows=" << sizeIt->second.numRows
+           << " cols=" << sizeIt->second.numCols << " live=["
+           << intIt->second.start() << "," << intIt->second.end() << ")");
+    }
+
+    // Group by buffer.id.
+    DenseMap<int, SmallVector<size_t>> idToIndices;
+    for (size_t i = 0; i < infos.size(); ++i) {
+      idToIndices[infos[i].bufferId].push_back(i);
+    }
+
+    // Step 2: Check buffer.copy consistency — TMEM buffers must be 1.
+    for (auto &info : infos) {
+      if (info.bufferCopy != 1) {
+        return info.op->emitError("verifyBufferDecisions: TMEM buffer.copy "
+                                  "must be 1, got ")
+               << info.bufferCopy;
+      }
+    }
+
+    // Step 3: Per buffer.id group checks.
+    size_t totalRowUsage = 0;
+    for (auto &[bid, indices] : idToIndices) {
+      LDBG("  group buffer.id=" << bid << " with " << indices.size()
+                                << " allocs");
+
+      // 3a. Find the owner — the alloc with offset 0 and the largest colSize.
+      size_t ownerIdx = indices[0];
+      for (size_t idx : indices) {
+        if (infos[idx].bufferOffset == 0 &&
+            infos[idx].colSize >= infos[ownerIdx].colSize) {
+          ownerIdx = idx;
+        }
+      }
+      auto &owner = infos[ownerIdx];
+      LDBG("    owner: rows=" << owner.rowSize << " cols=" << owner.colSize);
+
+      // 3b. Row size consistency — all allocs in the group must match.
+      for (size_t idx : indices) {
+        if (infos[idx].rowSize != owner.rowSize) {
+          return infos[idx].op->emitError(
+                     "verifyBufferDecisions: row size mismatch in buffer.id=")
+                 << bid << ": expected " << owner.rowSize << " got "
+                 << infos[idx].rowSize;
+        }
+      }
+
+      // 3c. Column capacity — offset + colSize must fit within owner.
+      for (size_t idx : indices) {
+        size_t endCol = infos[idx].bufferOffset + infos[idx].colSize;
+        if (endCol > owner.colSize) {
+          return infos[idx].op->emitError(
+                     "verifyBufferDecisions: column overflow in buffer.id=")
+                 << bid << ": offset(" << infos[idx].bufferOffset << ") + cols("
+                 << infos[idx].colSize << ") = " << endCol << " > owner.cols("
+                 << owner.colSize << ")";
+        }
+      }
+
+      // 3d. Liveness × column conflict — within the same buffer.id, any two
+      //     allocs with overlapping liveness must have non-overlapping columns.
+      for (size_t i = 0; i < indices.size(); ++i) {
+        for (size_t j = i + 1; j < indices.size(); ++j) {
+          auto &a = infos[indices[i]];
+          auto &b = infos[indices[j]];
+          if (a.liveness.intersects(b.liveness)) {
+            Interval<size_t> aCol(a.bufferOffset, a.bufferOffset + a.colSize);
+            Interval<size_t> bCol(b.bufferOffset, b.bufferOffset + b.colSize);
+            if (aCol.intersects(bCol)) {
+              return a.op->emitError(
+                         "verifyBufferDecisions: liveness+column conflict in "
+                         "buffer.id=")
+                     << bid << ": alloc at offset " << a.bufferOffset
+                     << " (cols=" << a.colSize << ", live=["
+                     << a.liveness.start() << "," << a.liveness.end()
+                     << ")) conflicts with alloc at offset " << b.bufferOffset
+                     << " (cols=" << b.colSize << ", live=["
+                     << b.liveness.start() << "," << b.liveness.end() << "))";
+            }
+          }
+        }
+      }
+
+      totalRowUsage += owner.rowSize;
+    }
+
+    // Step 4: Total row capacity — must not exceed 512.
+    LDBG("  total TMEM row usage: " << totalRowUsage << " / 512");
+    if (totalRowUsage > 512) {
+      return allocs[0].emitError("verifyBufferDecisions: total TMEM row usage ")
+             << totalRowUsage << " exceeds 512-row hardware limit";
+    }
+
+    LDBG("verifyBufferDecisions: all checks passed");
+    return success();
+  }
+
   // ---------------------------------------------------------------
   // Helper methods factored out of allocateTMemAllocs.
   // These operate on the member state populated by
@@ -1892,11 +2041,16 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
         return failure();
       }
     } else {
-      LDBG("Skipping TMEM planner - using decisions from: "
-           << effectiveReadFile);
-      // TODO: verify TMEM decisions using tmemPlanner.getAllocIntervals()
-      // and tmemPlanner.getAllocSizes() before accepting.
-      return success();
+      LDBG("Applied decisions from: " << effectiveReadFile);
+      if (failed(tmemPlanner.verifyBufferDecisions())) {
+        if (fromEnv) {
+          LDBG("Decision verification failed, falling back to planner");
+        } else {
+          return failure();
+        }
+      } else {
+        return success();
+      }
     }
   }
 
