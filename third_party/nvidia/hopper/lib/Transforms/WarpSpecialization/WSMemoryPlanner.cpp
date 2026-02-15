@@ -805,6 +805,14 @@ private:
 
   BufferRangeMapT bufferRange;
 
+  // Data collected by collectTMemAllocsAndLiveness().
+  SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
+  SmallVector<BufferT *> buffers;
+  Allocation tmemAllocation;
+  DenseMap<Operation *, Interval<size_t>> allocToIntervals;
+  DenseMap<Operation *, ttng::TMemAllocation> allocToSize;
+  DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
+
   Interval<size_t> getLiveIntervals(Value value, Liveness &liveness,
                                     DenseMap<Operation *, size_t> &opId,
                                     SmallVector<Channel *> &chans) {
@@ -845,9 +853,11 @@ private:
   }
 
 public:
-  LogicalResult run(unsigned bufferId) override {
+  /// Phase 1: Collect TMEM allocs, compute liveness intervals, sort by
+  /// priority, and create buffer objects. Must be called before
+  /// allocateBuffers() or before verifying deserialized decisions.
+  LogicalResult collectTMemAllocsAndLiveness() {
     Operation *parentOp = operation;
-    SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
     buildOperationIdMap();
     parentOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
       if (auto alloc = dyn_cast<triton::nvidia_gpu::TMEMAllocOp>(op)) {
@@ -855,9 +865,6 @@ public:
       }
     });
     Liveness liveness(parentOp);
-    DenseMap<Operation *, Interval<size_t>> allocToIntervals;
-    DenseMap<Operation *, ttng::TMemAllocation> allocToSize;
-    DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       ttng::TMEMAllocOp alloc = *it;
       Interval<size_t> liveInterval =
@@ -881,7 +888,6 @@ public:
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
-    // This can be adjusted later on.
     sort(allocs, [&](ttng::TMEMAllocOp a, ttng::TMEMAllocOp b) {
       Channel *aChBase = findChannelForAlloc(a, *channels);
       Channel *bChBase = findChannelForAlloc(b, *channels);
@@ -936,12 +942,10 @@ public:
       return (iter1->second.numRows * iter1->second.numCols) >
              (iter2->second.numRows * iter2->second.numCols);
     });
-    Allocation allocation;
-    SmallVector<BufferT *> buffers;
     for (auto alloc : allocs) {
       // size is 0, alignment is default, offset is default
-      allocation.addBuffer<BufferT::BufferKind::Explicit>(alloc, 0);
-      BufferT *tBuf = allocation.valueBuffer[alloc];
+      tmemAllocation.addBuffer<BufferT::BufferKind::Explicit>(alloc, 0);
+      BufferT *tBuf = tmemAllocation.valueBuffer[alloc];
       auto iter1 = allocToSize.find(alloc.getOperation());
       tBuf->rowSize = iter1->second.numRows;
       tBuf->colSize = iter1->second.numCols;
@@ -973,26 +977,18 @@ public:
       }
     }
 
-    for (auto valueBufferIter : allocation.valueBuffer) {
+    for (auto valueBufferIter : tmemAllocation.valueBuffer) {
       auto *buffer = valueBufferIter.second;
-      // valueBuffer maps value to BufferT
       Operation *alloc = valueBufferIter.first.getDefiningOp();
-      // bufferRange maps BufferT to interval
       bufferRange[buffer] = allocToIntervals[alloc];
     }
-    // For each innermost loop according to program order (via
-    // getIntervalForCtrlOp)
-    //   Go through all buffers that are live in the loop
-    //   Start with buffers with longest span within the loop
-    //   For each buffer
-    //     either allocate new space (owner of a set of rows)
-    //     or reuse an existing buffer's space
-    //     if this buffer interferes with all allocated buffers, allocate new
-    //     space if this buffer is along the dependency chain, reuse space if
-    //     there is enough space, allocate new space otherwise, reuse space
+    return success();
+  }
 
-    // Use BufferT to track rowSize/colSize/rowOffset etc, use bufferRange to
-    // track intervals.
+  /// Phase 2: Run the per-loop TMEM allocation heuristic using collected
+  /// liveness data. collectTMemAllocsAndLiveness() must have been called first.
+  LogicalResult allocateBuffers(unsigned bufferId) {
+    Operation *parentOp = operation;
     SmallVector<Operation *> innermostLoops;
     parentOp->walk([&](Operation *subOp) {
       if (auto theForOp = dyn_cast<scf::ForOp>(subOp))
@@ -1043,6 +1039,24 @@ public:
       bufferId = *result;
     }
     return success();
+  }
+
+  /// Combined: collect liveness then allocate.
+  LogicalResult run(unsigned bufferId) override {
+    if (failed(collectTMemAllocsAndLiveness()))
+      return failure();
+    return allocateBuffers(bufferId);
+  }
+
+  // Accessors for verification of deserialized decisions.
+  const SmallVector<triton::nvidia_gpu::TMEMAllocOp> &getAllocs() const {
+    return allocs;
+  }
+  const DenseMap<Operation *, Interval<size_t>> &getAllocIntervals() const {
+    return allocToIntervals;
+  }
+  const DenseMap<Operation *, ttng::TMemAllocation> &getAllocSizes() const {
+    return allocToSize;
   }
 
   FailureOr<unsigned> allocateTMemAllocs(
@@ -1839,33 +1853,6 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     }
   }
 
-  // If a read decision file is provided (via argument or env var), apply
-  // decisions from file instead of running the planner.
-  StringRef effectiveReadFile = readDecisionFile;
-  std::string envReadFile;
-  bool fromEnv = false;
-  if (effectiveReadFile.empty()) {
-    if (const char *envVal = std::getenv("TRITON_WS_DECISION_FILE")) {
-      envReadFile = envVal;
-      effectiveReadFile = envReadFile;
-      fromEnv = true;
-    }
-  }
-  if (!effectiveReadFile.empty()) {
-    if (failed(readDecisionsFromFile(channels, effectiveReadFile))) {
-      if (fromEnv) {
-        LDBG("Decision file from env var does not match this kernel, "
-             "falling back to planner");
-      } else {
-        return failure();
-      }
-    } else {
-      LDBG("Skipping memory planner - using decisions from: "
-           << effectiveReadFile);
-      return success();
-    }
-  }
-
   // Step 2: figure out smem/tmem sizes and liveness.
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
   // otherwise, the liveness can't overlap.
@@ -1898,12 +1885,45 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     }
   }
 
-  {
-    Allocation allocation;
-    triton::MemoryPlannerTmem planner(funcOp, &allocation, &channels);
-    if (failed(planner.run(bufferId)))
-      return failure();
+  // Step 3: Collect TMEM allocs and liveness BEFORE the decision branch so
+  // that we have liveness data available for verifying deserialized decisions.
+  Allocation tmemAllocation;
+  triton::MemoryPlannerTmem tmemPlanner(funcOp, &tmemAllocation, &channels);
+  if (failed(tmemPlanner.collectTMemAllocsAndLiveness()))
+    return failure();
+
+  // If a read decision file is provided (via argument or env var), apply
+  // decisions from file instead of running the planner.
+  StringRef effectiveReadFile = readDecisionFile;
+  std::string envReadFile;
+  bool fromEnv = false;
+  if (effectiveReadFile.empty()) {
+    if (const char *envVal = std::getenv("TRITON_WS_DECISION_FILE")) {
+      envReadFile = envVal;
+      effectiveReadFile = envReadFile;
+      fromEnv = true;
+    }
   }
+  if (!effectiveReadFile.empty()) {
+    if (failed(readDecisionsFromFile(channels, effectiveReadFile))) {
+      if (fromEnv) {
+        LDBG("Decision file from env var does not match this kernel, "
+             "falling back to planner");
+      } else {
+        return failure();
+      }
+    } else {
+      LDBG("Skipping TMEM planner - using decisions from: "
+           << effectiveReadFile);
+      // TODO: verify TMEM decisions using tmemPlanner.getAllocIntervals()
+      // and tmemPlanner.getAllocSizes() before accepting.
+      return success();
+    }
+  }
+
+  // Step 4: Run TMEM allocation heuristic.
+  if (failed(tmemPlanner.allocateBuffers(bufferId)))
+    return failure();
 
   // If a write decision file is provided, serialize decisions to file.
   if (!writeDecisionFile.empty()) {
