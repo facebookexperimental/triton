@@ -595,28 +595,36 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value responseAddr, Value mbar) -> void {
              self.create<ttng::AsyncCLCTryCancelOp>(mbar, responseAddr);
            })
-      // clc_query: Extract tile ID from CLC response.
+      // clc_query: Extract cluster CTA ID from CLC response.
       //
-      // Returns the tile ID decoded from the CLC response buffer, offset by
-      // cluster_cta_rank() so each CTA gets a unique tile assignment
-      // (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
-      // Returns -1 if no work available.
+      // Returns all three dimensions of the cluster CTA ID (x, y, z), with
+      // the x dimension offset by cluster_cta_rank() so each CTA gets a
+      // unique tile assignment (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.).
+      // Returns (-1, -1, -1) if no work available.
       //
-      // Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the
-      // offset is a no-op. This allows the same code path for both cases.
+      // Note: For single-CTA clusters, cluster_cta_rank() returns 0,
+      // so the offset is a no-op. This allows the same code path for both
+      // cases.
       .def("clc_query",
-           [](TritonOpBuilder &self, Value responseAddr) -> Value {
-             Value tileId = self.create<ttng::CLCQueryCancelOp>(responseAddr);
-             // Always offset by cluster_cta_rank() - for single CTA, rank=0
+           [](TritonOpBuilder &self, Value responseAddr) -> std::vector<Value> {
+             auto queryOp = self.create<ttng::CLCQueryCancelOp>(responseAddr);
+             Value ctaIdX = queryOp.getCtaIdX();
+             Value ctaIdY = queryOp.getCtaIdY();
+             Value ctaIdZ = queryOp.getCtaIdZ();
+
+             // Always offset X by cluster_cta_rank() - for single CTA, rank=0
              Value ctaRank = self.create<triton::nvgpu::ClusterCTAIdOp>(
                  self.getBuilder().getI32Type());
              Value negOne = self.create<mlir::arith::ConstantIntOp>(-1, 32);
-             Value isNegOne = self.create<mlir::arith::CmpIOp>(
-                 mlir::arith::CmpIPredicate::eq, tileId, negOne);
-             Value offset = self.create<mlir::arith::AddIOp>(tileId, ctaRank);
-             tileId =
-                 self.create<mlir::arith::SelectOp>(isNegOne, tileId, offset);
-             return tileId;
+
+             // Offset X dimension only (cluster scheduling is 1D)
+             Value isNegOneX = self.create<mlir::arith::CmpIOp>(
+                 mlir::arith::CmpIPredicate::eq, ctaIdX, negOne);
+             Value offsetX = self.create<mlir::arith::AddIOp>(ctaIdX, ctaRank);
+             ctaIdX =
+                 self.create<mlir::arith::SelectOp>(isNegOneX, ctaIdX, offsetX);
+
+             return {ctaIdX, ctaIdY, ctaIdZ};
            })
       .def("vote_ballot_sync",
            [](TritonOpBuilder &self, Value mask, Value pred) -> Value {

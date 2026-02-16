@@ -121,7 +121,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: clusterlaunchcontrol.query_cancel.is_canceled.pred.b128
   // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128
   tt.func @clc_query_cancel(%clc_response: !ttg.memdesc<1xui128, #shared0, #smem, mutable>) {
-    %x = ttng.clc_query_cancel %clc_response : (!ttg.memdesc<1xui128, #shared0, #smem, mutable>) -> i32
+    %ctaIdX, %ctaIdY, %ctaIdZ = ttng.clc_query_cancel %clc_response : (!ttg.memdesc<1xui128, #shared0, #smem, mutable>) -> (i32, i32, i32)
     tt.return
   }
 }

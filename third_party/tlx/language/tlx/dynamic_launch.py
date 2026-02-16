@@ -48,18 +48,23 @@ def _clc_query(
     _semantic=None,
 ):
     """
-    Extract tile ID from CLC response.
+    Extract cluster CTA ID from CLC response.
 
-    Returns the tile ID decoded from the CLC response buffer, automatically
-    offset by cluster_cta_rank() so each CTA gets a unique tile assignment
-    (CTA 0 gets tile N, CTA 1 gets tile N+1, etc.). Returns -1 if no work available.
+    Returns a tuple of (tile_id_x, tile_id_y, tile_id_z) decoded from the CLC
+    response buffer. The x dimension is automatically offset by cluster_cta_rank()
+    so each CTA gets a unique tile assignment (CTA 0 gets tile N, CTA 1 gets
+    tile N+1, etc.). Returns (-1, -1, -1) if no work available.
 
     Note: For single-CTA clusters, cluster_cta_rank() returns 0, so the offset
     is a no-op. This allows the same code path for both single and multi-CTA modes.
     """
     assert isinstance(clc_response_addr, tlx.clc_response)
-    x = _semantic.builder.clc_query(clc_response_addr.handle)
-    return _semantic.tensor(x, tl.int32)
+    results = _semantic.builder.clc_query(clc_response_addr.handle)
+    return (
+        _semantic.tensor(results[0], tl.int32),
+        _semantic.tensor(results[1], tl.int32),
+        _semantic.tensor(results[2], tl.int32),
+    )
 
 
 @tl.builtin
@@ -129,9 +134,9 @@ def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _seman
 
 
 @tl.builtin
-def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _semantic=None):
+def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return_3d: bool = False, _semantic=None):
     """
-    Decode the tile ID from a CLC response and signal completion.
+    Decode the cluster CTA ID from a CLC response and signal completion.
 
     Multi-CTA Synchronization ("Arrive Remote, Wait Local"):
     ---------------------------------------------------------
@@ -139,7 +144,7 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
             CLC try_cancel with multicast::cluster::all writes the response AND
             signals the mbarrier in every CTA's shared memory. Each CTA must wait
             on its own local mbarrier before reading the response.
-    - QUERY: Extract tile_id from response. Automatically offset by cluster_cta_rank().
+    - QUERY: Extract tile ID(s) from response. X is automatically offset by cluster_cta_rank().
     - SIGNAL: All CTAs signal CTA 0's bar_empty via remote_cta_rank=0.
               This is valid because we can arrive at remote mbar, but not wait on it.
 
@@ -148,8 +153,12 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
         k: Stage index
         p_consumer: Phase for consumer
         multi_ctas: If True, compute pred_cta0 internally and use remote signaling
+        return_3d: If True, return tuple (tile_id_x, tile_id_y, tile_id_z).
+                   If False (default), return only tile_id_x for backwards compatibility.
 
-    Returns the tile ID if successful, otherwise -1.
+    Returns:
+        If return_3d=True: Tuple of (tile_id_x, tile_id_y, tile_id_z), or (-1, -1, -1) if no work.
+        If return_3d=False: tile_id_x only, or -1 if no work available.
 
     PTX instructions generated:
         clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_response;
@@ -166,7 +175,7 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
     barrier_wait(bar_full, p_consumer, _semantic=_semantic)
 
     # Extract tile_id (automatically offset by cluster_cta_rank())
-    stolen_tile_id = _clc_query(response, _semantic=_semantic)
+    tile_id_x, tile_id_y, tile_id_z = _clc_query(response, _semantic=_semantic)
 
     # Signal completion: all CTAs signal CTA 0's bar_empty
     if multi_ctas:
@@ -176,4 +185,7 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
     else:
         barrier_arrive(bar_empty, _semantic=_semantic)
 
-    return stolen_tile_id
+    if return_3d:
+        return (tile_id_x, tile_id_y, tile_id_z)
+    else:
+        return tile_id_x
