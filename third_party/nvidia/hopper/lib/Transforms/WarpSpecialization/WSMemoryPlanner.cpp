@@ -1148,13 +1148,14 @@ public:
       auto &owner = infos[ownerIdx];
       LDBG("    owner: rows=" << owner.rowSize << " cols=" << owner.colSize);
 
-      // 3b. Row size consistency — all allocs in the group must match.
+      // 3b. Row size — reuser must fit within owner's row space.
       for (size_t idx : indices) {
-        if (infos[idx].rowSize != owner.rowSize) {
+        if (infos[idx].rowSize > owner.rowSize) {
           return infos[idx].op->emitError(
-                     "verifyBufferDecisions: row size mismatch in buffer.id=")
-                 << bid << ": expected " << owner.rowSize << " got "
-                 << infos[idx].rowSize;
+                     "verifyBufferDecisions: row size exceeds owner in "
+                     "buffer.id=")
+                 << bid << ": reuser needs " << infos[idx].rowSize
+                 << " rows but owner has " << owner.rowSize;
         }
       }
 
@@ -1171,26 +1172,132 @@ public:
       }
 
       // 3d. Liveness × column conflict — within the same buffer.id, any two
-      //     allocs with overlapping liveness must have non-overlapping columns.
+      //     allocs with overlapping liveness must have non-overlapping columns
+      //     UNLESS they satisfy findReuseSpace Pass 2: both are in the same
+      //     loop and connected by a dependency chain.
       for (size_t i = 0; i < indices.size(); ++i) {
         for (size_t j = i + 1; j < indices.size(); ++j) {
           auto &a = infos[indices[i]];
           auto &b = infos[indices[j]];
-          if (a.liveness.intersects(b.liveness)) {
-            Interval<size_t> aCol(a.bufferOffset, a.bufferOffset + a.colSize);
-            Interval<size_t> bCol(b.bufferOffset, b.bufferOffset + b.colSize);
-            if (aCol.intersects(bCol)) {
-              return a.op->emitError(
-                         "verifyBufferDecisions: liveness+column conflict in "
-                         "buffer.id=")
-                     << bid << ": alloc at offset " << a.bufferOffset
-                     << " (cols=" << a.colSize << ", live=["
-                     << a.liveness.start() << "," << a.liveness.end()
-                     << ")) conflicts with alloc at offset " << b.bufferOffset
-                     << " (cols=" << b.colSize << ", live=["
-                     << b.liveness.start() << "," << b.liveness.end() << "))";
+          if (!a.liveness.intersects(b.liveness))
+            continue;
+          Interval<size_t> aCol(a.bufferOffset, a.bufferOffset + a.colSize);
+          Interval<size_t> bCol(b.bufferOffset, b.bufferOffset + b.colSize);
+          if (!aCol.intersects(bCol))
+            continue;
+          // Column overlap with live overlap — check Pass 2 exception:
+          // both in same loop + dependency chain.
+          BufferT *aBuf = getBuffer(a.op);
+          BufferT *bBuf = getBuffer(b.op);
+          Operation *ctrlOp = a.op->getParentOfType<scf::ForOp>();
+          bool pass2Ok = false;
+          if (aBuf && bBuf && ctrlOp && isInSameLoop(bBuf, ctrlOp)) {
+            pass2Ok = a.liveness.start() < b.liveness.start()
+                          ? alongDependencyChain(a.op, b.op, 1)
+                          : alongDependencyChain(b.op, a.op, 1);
+          }
+          if (!pass2Ok) {
+            return a.op->emitError(
+                       "verifyBufferDecisions: liveness+column conflict in "
+                       "buffer.id=")
+                   << bid << ": alloc at offset " << a.bufferOffset
+                   << " (cols=" << a.colSize << ", live=[" << a.liveness.start()
+                   << "," << a.liveness.end()
+                   << ")) conflicts with alloc at offset " << b.bufferOffset
+                   << " (cols=" << b.colSize << ", live=[" << b.liveness.start()
+                   << "," << b.liveness.end() << "))";
+          }
+          LDBG("    liveness+column overlap in buffer.id="
+               << bid << " allowed by dependency chain (Pass 2)");
+        }
+      }
+
+      // 3e. Reuse eligibility — for each non-owner alloc in this group,
+      //     check it would pass the findReuseChannel criteria against the
+      //     owner.  This mirrors the two-pass search: try
+      //     partitionCondition=2 (strict) first, then 1 (relaxed).
+      for (size_t idx : indices) {
+        if (idx == ownerIdx)
+          continue;
+        auto &reuser = infos[idx];
+        BufferT *ownerBuf = getBuffer(owner.op);
+        BufferT *reuserBuf = getBuffer(reuser.op);
+        if (!ownerBuf || !reuserBuf) {
+          LDBG("    skip reuse check — BufferT not found");
+          continue;
+        }
+        // Liveness must not overlap between owner and reuser.
+        if (owner.liveness.intersects(reuser.liveness)) {
+          return reuser.op->emitError(
+                     "verifyBufferDecisions: reuser liveness overlaps owner "
+                     "in buffer.id=")
+                 << bid << ": reuser live=[" << reuser.liveness.start() << ","
+                 << reuser.liveness.end() << ") vs owner live=["
+                 << owner.liveness.start() << "," << owner.liveness.end()
+                 << ")";
+        }
+        // Find the innermost loop enclosing the owner to determine
+        // whether owner and reuser are in the same loop.
+        Operation *ctrlOp = owner.op->getParentOfType<scf::ForOp>();
+        bool inSameLoop = ctrlOp ? isInSameLoop(reuserBuf, ctrlOp) : false;
+        bool eligible = false;
+        if (inSameLoop) {
+          // Same loop: require a dependency chain between the pair.
+          eligible = reuser.liveness.start() < owner.liveness.start()
+                         ? alongDependencyChain(reuser.op, owner.op, 1)
+                         : alongDependencyChain(owner.op, reuser.op, 1);
+        } else {
+          // Different loops: require partition matching.
+          eligible = samePartition(ownerBuf, reuserBuf, 2);
+          if (!eligible)
+            eligible = samePartition(ownerBuf, reuserBuf, 1);
+        }
+        if (!eligible) {
+          LDBG("    WARNING: reuse pair in buffer.id="
+               << bid << " does not satisfy findReuseChannel conditions"
+               << " (inSameLoop=" << inSameLoop << ")");
+        }
+
+        // 3f. Column offset — verify the reuser's colOffset satisfies
+        //     findReuseSpace constraints.  Compute the minimum valid
+        //     colOffset as max(other.colOffset + other.colSize) over all
+        //     sibling reusers whose liveness intersects this reuser.
+        size_t minValidOffset = 0;
+        for (size_t sibIdx : indices) {
+          if (sibIdx == idx || sibIdx == ownerIdx)
+            continue;
+          auto &sib = infos[sibIdx];
+          if (!sib.liveness.intersects(reuser.liveness))
+            continue;
+          // Skip siblings that overlap via Pass 2 dep-chain exception.
+          BufferT *sibBuf = getBuffer(sib.op);
+          if (sibBuf && reuserBuf) {
+            Operation *sibCtrl = sib.op->getParentOfType<scf::ForOp>();
+            if (sibCtrl && isInSameLoop(reuserBuf, sibCtrl)) {
+              bool depOk = sib.liveness.start() < reuser.liveness.start()
+                               ? alongDependencyChain(sib.op, reuser.op, 1)
+                               : alongDependencyChain(reuser.op, sib.op, 1);
+              if (depOk)
+                continue;
             }
           }
+          minValidOffset =
+              std::max(minValidOffset, sib.bufferOffset + sib.colSize);
+        }
+        if (reuser.bufferOffset < minValidOffset) {
+          LDBG("    WARNING: reuser colOffset="
+               << reuser.bufferOffset << " in buffer.id=" << bid
+               << " is less than minValidOffset=" << minValidOffset
+               << " from findReuseSpace Pass 1");
+        }
+        if (reuser.bufferOffset + reuser.colSize > owner.colSize) {
+          return reuser.op->emitError(
+                     "verifyBufferDecisions: reuser column overflow in "
+                     "buffer.id=")
+                 << bid << ": colOffset(" << reuser.bufferOffset << ") + cols("
+                 << reuser.colSize
+                 << ") = " << (reuser.bufferOffset + reuser.colSize)
+                 << " > owner.cols(" << owner.colSize << ")";
         }
       }
 
