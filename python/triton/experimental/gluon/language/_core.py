@@ -510,6 +510,14 @@ def warp_specialize(
 
 
 @builtin
+def num_warps(_semantic=None, _generator=None):
+    """
+    Returns the number of warps that execute the current context, including in warp-specialized regions.
+    """
+    return _semantic.num_warps(_generator)
+
+
+@builtin
 def thread_barrier(_semantic=None):
     """
     Insert a barrier to synchronize threads within a CTA.
