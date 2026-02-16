@@ -1041,7 +1041,7 @@ public:
     return success();
   }
 
-  /// Combined: collect liveness then allocate.
+  /// Override pure virtual — combines both phases.
   LogicalResult run(unsigned bufferId) override {
     if (failed(collectTMemAllocsAndLiveness()))
       return failure();
@@ -1500,35 +1500,43 @@ public:
     };
     auto findReuseSpace = [&](BufferT *cand, BufferT *reuseOwner,
                               unsigned depChainCondition) -> size_t {
+      // Pass 1: find the first free column offset after all live reusers.
       size_t maxColOffset = 0;
       for (auto *alloc : buffers) {
-        if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
-          if (bufferRange[alloc].intersects(bufferRange[cand]))
-            maxColOffset =
-                std::max(alloc->colOffset + alloc->colSize, maxColOffset);
-        }
+        if (alloc->isOwnerOfSpace || alloc->reuseOwner != reuseOwner)
+          continue;
+        if (!bufferRange[alloc].intersects(bufferRange[cand]))
+          continue;
+        maxColOffset =
+            std::max(alloc->colOffset + alloc->colSize, maxColOffset);
       }
       LDBG("findReuseSpace first pass maxColOffset " << maxColOffset);
       if (maxColOffset + cand->colSize <= reuseOwner->colSize)
         return maxColOffset;
-      if (!sameLoop(reuseOwner)) {
-        for (auto *alloc : buffers) {
-          if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner &&
-              alloc->colOffset == 0 && sameLoop(alloc) &&
-              (bufferRange[cand].start() < bufferRange[alloc].start()
-                   ? alongDependencyChain(cand->owner, alloc->owner,
-                                          depChainCondition)
-                   : alongDependencyChain(alloc->owner, cand->owner,
-                                          depChainCondition))) {
-            auto tOffset = findUsesInCtrlOp(alloc, cand);
-            LLVM_DEBUG({
-              LDBG("findUsesInCtrlOp returns " << tOffset);
-              alloc->owner->dump();
-            });
-            if (tOffset + cand->colSize <= alloc->colSize)
-              return tOffset;
-          }
-        }
+      // Pass 2: if the owner is in a different loop, try to overlap with
+      // an existing reuser at column 0 that is in the same loop as cand
+      // and connected by a dependency chain.
+      if (sameLoop(reuseOwner))
+        return std::numeric_limits<size_t>::max();
+      for (auto *alloc : buffers) {
+        if (alloc->isOwnerOfSpace || alloc->reuseOwner != reuseOwner)
+          continue;
+        if (alloc->colOffset != 0 || !sameLoop(alloc))
+          continue;
+        bool onChain = bufferRange[cand].start() < bufferRange[alloc].start()
+                           ? alongDependencyChain(cand->owner, alloc->owner,
+                                                  depChainCondition)
+                           : alongDependencyChain(alloc->owner, cand->owner,
+                                                  depChainCondition);
+        if (!onChain)
+          continue;
+        auto tOffset = findUsesInCtrlOp(alloc, cand);
+        LLVM_DEBUG({
+          LDBG("findUsesInCtrlOp returns " << tOffset);
+          alloc->owner->dump();
+        });
+        if (tOffset + cand->colSize <= alloc->colSize)
+          return tOffset;
       }
       return std::numeric_limits<size_t>::max();
     };
@@ -1546,49 +1554,59 @@ public:
     auto findReuseChannel = [&](BufferT *cand, unsigned partitionCondition,
                                 unsigned depChainCondition) -> BufferT * {
       for (auto *alloc : buffers) {
-        if (alloc->isOwnerOfSpace) {
+        if (!alloc->isOwnerOfSpace)
+          continue;
+        LLVM_DEBUG({
+          LDBG("check to reuse buffer owned by " << bufferRange[alloc].start()
+                                                 << " "
+                                                 << bufferRange[alloc].end());
+          alloc->owner->dump();
+        });
+        // Skip allocs not live-range disjoint or too small to fit cand.
+        if (bufferRange[alloc].intersects(bufferRange[cand]))
+          continue;
+        if (alloc->colSize < cand->colSize)
+          continue;
+        // Reuse eligibility depends on whether alloc and cand are in the
+        // same loop.  Inside the same loop, reuse requires a dependency
+        // chain between the two (the earlier-live one must feed into the
+        // later-live one) so the compiler can guarantee non-overlapping
+        // lifetimes.  Across different loops, a weaker partition-matching
+        // check suffices because the loops are sequenced by control flow.
+        bool inSameLoop = sameLoop(alloc);
+        bool canReuse =
+            inSameLoop ? (bufferRange[cand].start() < bufferRange[alloc].start()
+                              ? alongDependencyChain(cand->owner, alloc->owner,
+                                                     depChainCondition)
+                              : alongDependencyChain(alloc->owner, cand->owner,
+                                                     depChainCondition))
+                       : samePartition(alloc, cand, partitionCondition);
+        if (!canReuse) {
           LLVM_DEBUG({
-            LDBG("check to reuse buffer owned by " << bufferRange[alloc].start()
-                                                   << " "
-                                                   << bufferRange[alloc].end());
+            LDBG("can't reuse owner — partition/dep check failed");
             alloc->owner->dump();
           });
-          if (!bufferRange[alloc].intersects(bufferRange[cand]) &&
-              alloc->colSize >= cand->colSize &&
-              ((!sameLoop(alloc) &&
-                samePartition(alloc, cand, partitionCondition)) ||
-               (sameLoop(alloc) &&
-                (bufferRange[cand].start() < bufferRange[alloc].start()
-                     ? alongDependencyChain(cand->owner, alloc->owner,
-                                            depChainCondition)
-                     : alongDependencyChain(alloc->owner, cand->owner,
-                                            depChainCondition))))) {
-            auto colOffset = findReuseSpace(cand, alloc, depChainCondition);
-            if (colOffset == std::numeric_limits<size_t>::max()) {
-              LDBG("-- findReuseSpace fails");
-              continue;
-            }
-            if (!checkOtherReuses(cand, alloc, colOffset)) {
-              LDBG("-- checkOtherReuses fails");
-              continue;
-            }
-            cand->isOwnerOfSpace = false;
-            cand->rowOffset = alloc->rowOffset;
-            cand->colOffset = colOffset;
-            cand->reuseOwner = alloc;
-            LLVM_DEBUG({
-              LDBG("set offset to " << cand->rowOffset << " " << cand->colOffset
-                                    << " sameLoop " << sameLoop(alloc) << ":");
-              cand->owner->dump();
-            });
-            return alloc;
-          }
-          LLVM_DEBUG({
-            LDBG("can't reuse owner "
-                 << bufferRange[alloc].intersects(bufferRange[cand]));
-            alloc->owner->dump();
-          });
+          continue;
         }
+        auto colOffset = findReuseSpace(cand, alloc, depChainCondition);
+        if (colOffset == std::numeric_limits<size_t>::max()) {
+          LDBG("-- findReuseSpace fails");
+          continue;
+        }
+        if (!checkOtherReuses(cand, alloc, colOffset)) {
+          LDBG("-- checkOtherReuses fails");
+          continue;
+        }
+        cand->isOwnerOfSpace = false;
+        cand->rowOffset = alloc->rowOffset;
+        cand->colOffset = colOffset;
+        cand->reuseOwner = alloc;
+        LLVM_DEBUG({
+          LDBG("set offset to " << cand->rowOffset << " " << cand->colOffset
+                                << " sameLoop " << inSameLoop << ":");
+          cand->owner->dump();
+        });
+        return alloc;
       }
       return nullptr;
     };
@@ -1614,6 +1632,16 @@ public:
                                  "tmem alloc when all buffers interfere");
         }
       } else {
+        // Two-pass reuse search with decreasing strictness:
+        //   partitionCondition=2: combined tasks of src+dst must match
+        //                         (strictest — both sides touch same
+        //                         partitions)
+        //   partitionCondition=1: channel endpoints must match
+        //                         (relaxed — only checks src.dst vs dst.src
+        //                         tasks)
+        //   depChainCondition=1:  currently unused inside alongDependencyChain,
+        //                         reserved for future multi-level dependency
+        //                         checks
         auto *reuseBuf = findReuseChannel(candBuf, 2 /*partitionCondition*/,
                                           1 /*depChainCondition*/);
         if (!reuseBuf)
