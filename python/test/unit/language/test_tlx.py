@@ -5499,58 +5499,107 @@ class TestToMxfp8:
         assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
 
 
+@pytest.mark.skipif(is_hip(), reason="Not supported on AMD")
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 class TestSetBufferOverlap:
     """Tests for tlx.set_buffer_overlap and storage_alias_spec.set_buffer_overlap method."""
 
-    def test_set_buffer_overlap_compiles_to_ir(self):
-        """Test that set_buffer_overlap compiles to IR but fails during lowering.
+    def test_set_buffer_overlap_shared_different_sizes(self):
+        """Test shared overlap with different sized allocations (f32 vs bf16).
 
-        This test verifies that the JIT API works correctly - the code should
-        successfully lower to MLIR IR but is expected to fail in later lowering
-        passes because offset calculation is not yet implemented.
+        When allocations of different sizes share memory, the smaller allocation's
+        shape is expanded to account for the larger allocation's buffer spacing.
+        This test verifies that shape expansion and index rewriting work correctly.
         """
 
         @triton.jit
-        def set_buffer_overlap_kernel(BLOCK_SIZE: tl.constexpr):
+        def set_buffer_overlap_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
             # Create a storage alias spec
             spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
 
             # Allocate buffers using the spec
+            # a: 2 x BLOCK_SIZE x BLOCK_SIZE x f32 = 2 x 64 x 64 x 4 = 32768 bytes
+            # b: 2 x BLOCK_SIZE x BLOCK_SIZE x bf16 = 2 x 64 x 64 x 2 = 16384 bytes
             a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
                                 reuse=spec)
             b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
                                 reuse=spec)
 
             # Define overlap scheme: a and b share the same memory region
+            # bytes_between_buffers = max(16384, 8192) = 16384
+            # For b (8192 bytes): scale = 16384/8192 = 2
+            # b's shape expands from 2 to 4 buffers
             spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float32)
+
+            # Initialize all 4 output regions to 0
+            for i in tl.static_range(4):
+                out_offsets = out_ptr + i * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+                tl.store(out_offsets, zeros)
+
+            # Write 1.0 to a[0] (16384 bytes per buffer)
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(a[0], ones)
+
+            # Write 2.0 to a[1]
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float32)
+            tlx.local_store(a[1], twos)
+
+            # Since b shares memory with a and has scale=2:
+            # b[0] maps to physical slot 0 (same as a[0])
+            # b[1] maps to physical slot 2 (same as a[1]'s start, since a's buffer is 2x size of b's)
+            # So reading b[0] should give us the first half of a[0]'s data (reinterpreted as bf16)
+
+            # Read from b[0] and b[1] and store to output
+            b0_data = tlx.local_load(b[0])
+            b0_as_f32 = b0_data.to(tl.float32)
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, b0_as_f32)
+
+            b1_data = tlx.local_load(b[1])
+            b1_as_f32 = b1_data.to(tl.float32)
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_1, b1_as_f32)
 
         grid = lambda meta: (1, )
 
-        # The kernel should compile to IR but fail during lowering
-        # (offset calculation not implemented yet)
-        with pytest.raises(RuntimeError):
-            set_buffer_overlap_kernel[grid](BLOCK_SIZE=64)
+        BLOCK_SIZE = 64
+        out = torch.zeros((2 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        set_buffer_overlap_kernel[grid](out, BLOCK_SIZE)
 
-    def test_set_buffer_overlap_nested_compiles_to_ir(self):
-        """Test that nested reuse_group in set_buffer_overlap compiles to IR.
+        # The values stored as f32 and read back as bf16->f32 will have precision loss
+        # but should be non-zero (proving the memory is shared)
+        # b[0] should contain data from a[0] reinterpreted as bf16
+        # b[1] should contain data from a[1] reinterpreted as bf16
+        assert out[:BLOCK_SIZE, :].abs().sum() > 0, "b[0] should have non-zero data from a[0]"
+        assert out[BLOCK_SIZE:, :].abs().sum() > 0, "b[1] should have non-zero data from a[1]"
 
-        This test verifies Flash Attention-style nested overlap schemes work
-        at the JIT level.
+    def test_set_buffer_overlap_nested_shared_distinct(self):
+        """Test nested reuse_group: shared(qk, distinct(p, alpha)).
+
+        This test verifies Flash Attention-style nested overlap schemes work.
+        The distinct group places p and alpha at different offsets within the
+        shared region with qk.
         """
 
         @triton.jit
-        def set_buffer_overlap_nested_kernel(BLOCK_SIZE: tl.constexpr):
+        def set_buffer_overlap_nested_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
             # Create a storage alias spec
             spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
 
-            # Allocate buffers (Flash Attention pattern)
+            # Allocate buffers (Flash Attention like pattern)
             qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
                                  reuse=spec)
-            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
                                 reuse=spec)
-            alpha = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2), tlx.storage_kind.smem, reuse=spec)
+            # alpha: 2 x 64 x f32 = 512 bytes (256 per buffer)
+            alpha = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE // 2), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                    reuse=spec)
 
-            # Define overlap scheme: QK shares with (P distinct from alpha)
             spec.set_buffer_overlap(
                 tlx.reuse_group(
                     qk,
@@ -5558,11 +5607,253 @@ class TestSetBufferOverlap:
                     group_type=tlx.reuse_group_type.shared,
                 ))
 
+            # Write 1.0 to qk[0]
+            data = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(qk[0], data)
+
+            # Read from alpha[0] (should alias with half of qk[0] since they share)
+            alpha0_data = tlx.local_load(alpha[0])
+
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n_half = tl.arange(0, BLOCK_SIZE // 2)
+
+            # Write alpha[0] to the first half of output columns
+            offs_n_half = tl.arange(0, BLOCK_SIZE // 2)
+            out_offsets_first_half = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n_half[None, :])
+            tl.store(out_offsets_first_half, alpha0_data)
+
         grid = lambda meta: (1, )
 
-        # The kernel should compile to IR but fail during lowering
-        with pytest.raises(RuntimeError):
-            set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)
+        BLOCK_SIZE = 64
+        out = torch.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        set_buffer_overlap_nested_kernel[grid](out, BLOCK_SIZE)
+        # alpha[0] should have half of qk[0]'s data (1s)
+        # Output should be 1s for the first half of columns, 0s for the second half
+        expected = torch.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        expected[:, :BLOCK_SIZE // 2] = 1.0
+        torch.testing.assert_close(out, expected)
+
+    def test_basic_shared_buffer_overlap(self):
+        """Test that allocating two identical buffers with shared overlap works.
+
+        Both buffers have the same type and size, so scale=1 and offset=0 for both.
+        No shape expansion or index rewriting is needed.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers using the spec (same type and size)
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b share the same memory region
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float16)
+
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, zeros)
+            tl.store(out_offsets_1, zeros)
+
+            # Write all 1s to a[0]
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float16)
+            tlx.local_store(a[0], ones)
+
+            # Write all 2s to b[1]
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float16)
+            tlx.local_store(b[1], twos)
+
+            # Since a and b share the same memory, b[0] should equal a[0] (all 1s)
+            # and a[1] should equal b[1] (all 2s)
+
+            # Write b[0] to out_ptr (should be all 1s)
+            b0_data = tlx.local_load(b[0])
+            tl.store(out_offsets_0, b0_data)
+
+            # Write a[1] to out_ptr + BLOCK_SIZE*BLOCK_SIZE (should be all 2s)
+            a1_data = tlx.local_load(a[1])
+            tl.store(out_offsets_1, a1_data)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((2 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        set_buffer_overlap_kernel[grid](out, BLOCK_SIZE)
+
+        # First half should be all 1s (from b[0] which shares memory with a[0])
+        expected_ones = torch.ones((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        # Second half should be all 2s (from a[1] which shares memory with b[1])
+        expected_twos = torch.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, dtype=torch.float16, device="cuda")
+
+        torch.testing.assert_close(out[:BLOCK_SIZE, :], expected_ones)
+        torch.testing.assert_close(out[BLOCK_SIZE:, :], expected_twos)
+
+    def test_distinct_buffer_overlap(self):
+        """Test distinct overlap where buffers are placed at different offsets.
+
+        Two identical allocations in a distinct group:
+        - a at offset 0
+        - b at offset = a's buffer size
+        Shape expansion: both get scale=2 (since bytes_between_buffers = 2 * buffer_size)
+        Index rewriting:
+        - a[i] -> physical slot 2*i
+        - b[i] -> physical slot 2*i + 1
+        """
+
+        @triton.jit
+        def distinct_buffer_overlap_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate two identical buffers
+            # Each: 2 x 64 x 64 x f16 = 2 x 8192 bytes = 16384 total
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b are distinct (placed sequentially)
+            # bytes_between_buffers = 8192 + 8192 = 16384
+            # For a: scale = 16384/8192 = 2, offset = 0
+            # For b: scale = 16384/8192 = 2, offset_slots = 8192/8192 = 1
+            # Shape expansion: a: 2 -> 4, b: 2 -> 5 (2*2 + 1)
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.distinct))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float16)
+
+            for i in tl.static_range(4):
+                out_offsets = out_ptr + i * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+                tl.store(out_offsets, zeros)
+
+            # Write to a[0] - should go to physical slot 0
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float16)
+            tlx.local_store(a[0], ones)
+
+            # Write to a[1] - should go to physical slot 2
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float16)
+            tlx.local_store(a[1], twos)
+
+            # Write to b[0] - should go to physical slot 1
+            threes = tl.full((BLOCK_SIZE, BLOCK_SIZE), 3.0, tl.float16)
+            tlx.local_store(b[0], threes)
+
+            # Write to b[1] - should go to physical slot 3
+            fours = tl.full((BLOCK_SIZE, BLOCK_SIZE), 4.0, tl.float16)
+            tlx.local_store(b[1], fours)
+
+            # Read back and verify distinct memory regions
+            # Reading a[0] should give 1s (not overwritten by b)
+            a0_data = tlx.local_load(a[0])
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, a0_data)
+
+            # Reading b[0] should give 3s (distinct from a)
+            b0_data = tlx.local_load(b[0])
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_1, b0_data)
+
+            # Reading a[1] should give 2s
+            a1_data = tlx.local_load(a[1])
+            out_offsets_2 = out_ptr + 2 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_2, a1_data)
+
+            # Reading b[1] should give 4s
+            b1_data = tlx.local_load(b[1])
+            out_offsets_3 = out_ptr + 3 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_3, b1_data)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((4 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        distinct_buffer_overlap_kernel[grid](out, BLOCK_SIZE)
+
+        # Verify each region has the expected value
+        expected_ones = torch.ones((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        expected_twos = torch.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, dtype=torch.float16, device="cuda")
+        expected_threes = torch.full((BLOCK_SIZE, BLOCK_SIZE), 3.0, dtype=torch.float16, device="cuda")
+        expected_fours = torch.full((BLOCK_SIZE, BLOCK_SIZE), 4.0, dtype=torch.float16, device="cuda")
+
+        torch.testing.assert_close(out[:BLOCK_SIZE, :], expected_ones)
+        torch.testing.assert_close(out[BLOCK_SIZE:2 * BLOCK_SIZE, :], expected_threes)
+        torch.testing.assert_close(out[2 * BLOCK_SIZE:3 * BLOCK_SIZE, :], expected_twos)
+        torch.testing.assert_close(out[3 * BLOCK_SIZE:, :], expected_fours)
+
+    def test_shared_different_element_sizes(self):
+        """Test shared overlap with different element types (f32 vs f16).
+
+        When f32 and f16 buffers share memory:
+        - f32: 2 x 64 x 64 x 4 bytes = 32768 bytes (16384 per buffer)
+        - f16: 2 x 64 x 64 x 2 bytes = 16384 bytes (8192 per buffer)
+        - bytes_between_buffers = max(16384, 8192) = 16384
+        - For f16: scale = 16384/8192 = 2, shape expands 2 -> 4
+        - Index rewriting: f16[i] -> physical slot 2*i
+        """
+
+        @triton.jit
+        def shared_different_sizes_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate f32 and f16 buffers
+            a_f32 = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                    reuse=spec)
+            b_f16 = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                    reuse=spec)
+
+            # Define shared overlap
+            spec.set_buffer_overlap(tlx.reuse_group(a_f32, b_f16, group_type=tlx.reuse_group_type.shared))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros_f32 = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float32)
+
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, zeros_f32)
+            tl.store(out_offsets_1, zeros_f32)
+
+            # Write to a_f32[0]
+            ones_f32 = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(a_f32[0], ones_f32)
+
+            # Write to a_f32[1]
+            twos_f32 = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float32)
+            tlx.local_store(a_f32[1], twos_f32)
+
+            # Read b_f16[0] and b_f16[1] - these should contain data from a_f32
+            # (reinterpreted as f16, so values will be different but non-zero)
+            b0_data = tlx.local_load(b_f16[0])
+            b0_as_f32 = b0_data.to(tl.float32)
+            tl.store(out_offsets_0, b0_as_f32)
+
+            b1_data = tlx.local_load(b_f16[1])
+            b1_as_f32 = b1_data.to(tl.float32)
+            tl.store(out_offsets_1, b1_as_f32)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((2 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        shared_different_sizes_kernel[grid](out, BLOCK_SIZE)
+
+        # The f16 reinterpretation of f32 data will produce non-zero values
+        # We can't predict exact values due to bit reinterpretation, but they should be non-zero
+        assert out[:BLOCK_SIZE, :].abs().sum() > 0, "b_f16[0] should have non-zero data from a_f32[0]"
+        assert out[BLOCK_SIZE:, :].abs().sum() > 0, "b_f16[1] should have non-zero data from a_f32[1]"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
