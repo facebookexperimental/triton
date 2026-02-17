@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -400,8 +401,9 @@ public:
     else
       correctionPartition = nullptr;
 
-    // Epilogue: only if there are epilogue stores.
-    if (options.hasEpilogue)
+    // Epilogue: only if there are epilogue stores and not merged into
+    // computation.
+    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation)
       epiloguePartition = schedule.addPartition(0);
     else
       epiloguePartition = nullptr;
@@ -1192,7 +1194,8 @@ static void printPartitionAssignments(const WarpSchedule &schedule,
 /// - reduction: TMA reduction operations
 /// Template options control merging behavior (e.g., epilogue into computation).
 static std::unique_ptr<SchedulingTemplate>
-selectTemplate(const OpCategorizer &categorizer) {
+selectTemplate(const OpCategorizer &categorizer,
+               bool mergeEpilogueIntoComputation = false) {
   unsigned dpFactor = categorizer.getDataPartitionFactor();
   bool hasCorrection =
       !categorizer.getOpsInCategory(OpCategory::Correction).empty();
@@ -1261,7 +1264,7 @@ selectTemplate(const OpCategorizer &categorizer) {
     opts.hasCorrection = hasCorrection;
     opts.hasReduction = hasReduction;
     opts.hasEpilogue = !epilogueStores.empty();
-    opts.mergeEpilogueIntoComputation = false;
+    opts.mergeEpilogueIntoComputation = mergeEpilogueIntoComputation;
     opts.mergeReductionIntoComputation = false;
     llvm::errs()
         << "[tritongpu-partition-scheduling] Selected template: UnifiedFA"
@@ -1454,14 +1457,25 @@ static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
   }
 }
 
+// Result of getInitialSchedule, including the schedule and the epilogue
+// partition pointer (may be null if merged into computation).
+struct ScheduleResult {
+  WarpSchedule schedule;
+  Partition *epiloguePartition = nullptr;
+};
+
 // Given a partitioning scheme, determine an initial schedule by performing a
 // first-order partition assignment to the operations in the scheme and its
 // users and/or dependencies. This sets up the initial partitioning of the ops.
-static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
+static std::optional<ScheduleResult>
+getInitialSchedule(scf::ForOp mainLoop,
+                   bool mergeEpilogueIntoComputation = false) {
   // Check for an existing schedule.
   if (FailureOr<WarpSchedule> scheduleOr = WarpSchedule::deserialize(mainLoop);
       succeeded(scheduleOr))
-    return {std::move(*scheduleOr)};
+    // Deserialized schedule: epilogue partition is unknown, use null.
+    return ScheduleResult{std::move(*scheduleOr),
+                          /*epiloguePartition=*/nullptr};
 
   // Collect all loops (nested + main)
   SmallVector<scf::ForOp> loops{mainLoop.getOps<scf::ForOp>()};
@@ -1493,7 +1507,8 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
   //===--------------------------------------------------------------------===//
   // Phase 2: Select and create template
   //===--------------------------------------------------------------------===//
-  std::unique_ptr<SchedulingTemplate> tmpl = selectTemplate(categorizer);
+  std::unique_ptr<SchedulingTemplate> tmpl =
+      selectTemplate(categorizer, mergeEpilogueIntoComputation);
   llvm::errs() << "[tritongpu-partition-scheduling] Selected template: "
                << tmpl->getName() << "\n";
 
@@ -1814,7 +1829,7 @@ static std::optional<WarpSchedule> getInitialSchedule(scf::ForOp mainLoop) {
                         "/tmp/partition_scheduling.dot");
   }
 
-  return schedule;
+  return ScheduleResult{std::move(schedule), epiloguePartition};
 }
 
 namespace {
@@ -2112,26 +2127,30 @@ struct PartitionScheduling
 } // namespace
 
 void PartitionScheduling::runOnOperation() {
+  // Allow env var override: TRITON_MERGE_EPILOGUE=1
+  bool mergeEpilogue = mergeEpilogueIntoComputation;
+  if (const char *env = std::getenv("TRITON_MERGE_EPILOGUE"))
+    mergeEpilogue = std::string(env) == "1";
+
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
     if (loop->hasAttr(kWarpSpecializeAttrName))
       loops.push_back(loop);
   });
   for (auto [idx, loop] : llvm::enumerate(loops)) {
-    if (std::optional<WarpSchedule> schedule = getInitialSchedule(loop)) {
-      propagatePartitions(loop, *schedule);
+    if (std::optional<ScheduleResult> result =
+            getInitialSchedule(loop, mergeEpilogue)) {
+      WarpSchedule &schedule = result->schedule;
+      propagatePartitions(loop, schedule);
 
       // Schedule post-loop operations into the epilogue partition after
-      // propagatePartitions completes. The epilogue partition is the last
-      // partition created (see getInitialSchedule).
-      if (schedule->getNumPartitions() > 0) {
-        Partition *epiloguePartition =
-            schedule->getPartition(schedule->getNumPartitions() - 1);
-        schedulePostLoopOps(loop, *schedule, epiloguePartition);
-      }
+      // propagatePartitions completes. When mergeEpilogueIntoComputation is
+      // true, epiloguePartition is null and post-loop ops are handled by
+      // propagation instead.
+      schedulePostLoopOps(loop, schedule, result->epiloguePartition);
 
-      optimizeSchedule(loop, *schedule);
-      schedule->serialize(loop);
+      optimizeSchedule(loop, schedule);
+      schedule.serialize(loop);
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
