@@ -328,11 +328,13 @@ Operation *lastOpInBlock(llvm::ArrayRef<Operation *> endOps) {
 
 /// Validate that critical ops alternate between partitions in contiguous blocks
 /// and return the partition ID that arrives first. Returns -1 if the schedule
-/// is invalid (ops have interleaved schedule order or don't alternate properly).
+/// is invalid (ops have interleaved schedule order or don't alternate
+/// properly).
 ///
 /// Uses the linearized schedule to walk from the first critical op and verify
 /// the pattern:
-///   [partition A ops] [partition B ops] [partition A ops] [partition B ops] ...
+///   [partition A ops] [partition B ops] [partition A ops] [partition B ops]
+///   ...
 int arrivesFirst(
     scf::ForOp forOp, const triton::CoarseSchedule &schedule,
     const llvm::DenseMap<int, SmallVector<Operation *>> &partitionOps) {
@@ -363,19 +365,19 @@ int arrivesFirst(
   auto linearized = schedule.linearized(forOp, firstOp);
 
   while (auto nextOp = linearized.findNext(
-        [&](Operation *op) { return criticalOps.contains(op); })) {
+             [&](Operation *op) { return criticalOps.contains(op); })) {
     int nextPartitionId = getSingleTaskId(*nextOp);
     if (nextPartitionId == curPartitionId) {
       curSeenOps++;
       if (curSeenOps > partitionOps.lookup(curPartitionId).size()) {
-        LDBG("Partition " << curPartitionId << " have scheduled "
-              << curSeenOps << " ops consecutively, not alternating.");
+        LDBG("Partition " << curPartitionId << " have scheduled " << curSeenOps
+                          << " ops consecutively, not alternating.");
         return -1;
       }
     } else {
       if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
-        LDBG("Partition " << curPartitionId << " scheduled "
-                          << curSeenOps << " before the next partition, not alternating.");
+        LDBG("Partition " << curPartitionId << " scheduled " << curSeenOps
+                          << " before the next partition, not alternating.");
         return -1;
       }
       curSeenOps = 1;
@@ -384,8 +386,8 @@ int arrivesFirst(
   }
 
   if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
-    LDBG("Partition " << curPartitionId << " scheduled "
-                      << curSeenOps << " before the next partition, not alternating.");
+    LDBG("Partition " << curPartitionId << " scheduled " << curSeenOps
+                      << " before the next partition, not alternating.");
     return -1;
   }
 
@@ -752,7 +754,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     }
 
     // Find which partition arrives first and validate alternation pattern.
-    // Returns -1 if the schedule is invalid (ops interleave or don't alternate).
+    // Returns -1 if the schedule is invalid (ops interleave or don't
+    // alternate).
     int arrivesFirstPartitionId = arrivesFirst(forOp, schedule, partitionOps);
     if (arrivesFirstPartitionId == -1) {
       LDBG("Skipping group due to invalid pingpong schedule pattern");
