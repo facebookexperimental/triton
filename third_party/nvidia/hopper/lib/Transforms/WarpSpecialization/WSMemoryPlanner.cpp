@@ -514,6 +514,29 @@ private:
     return isInnermostLoop(parentLoop);
   }
 
+  /// Check if a channel's producer is a TMA operation (descriptor_load).
+  /// A channel is TMA-related if:
+  ///   - Its source op is an AsyncTMACopyGlobalToLocalOp, OR
+  ///   - Its source op is a LocalStoreOp whose stored value comes from a
+  ///     DescriptorLoadOp.
+  bool isTMAChannel(Operation *alloc) {
+    Channel *ch = findChannelForOp(alloc, *channels);
+    if (!ch || ch->channelKind != getChannelKind())
+      return false;
+    auto *chPost = static_cast<ChannelPost *>(ch);
+    Operation *srcOp = chPost->getSrcOp();
+    if (!srcOp)
+      return false;
+    if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
+      return true;
+    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
+      Value stored = storeOp.getSrc();
+      if (auto *defOp = stored.getDefiningOp())
+        return isa<tt::DescriptorLoadOp>(defOp);
+    }
+    return false;
+  }
+
   void getExplicitValueSize(Operation *op) {
     auto alloc = dyn_cast<ttg::LocalAllocOp>(op);
     if (!alloc || !alloc.isSharedMemoryAlloc())
@@ -656,7 +679,13 @@ public:
         if (shape > 1)
           ++numD;
       }
-      if (usersInInnermostLoop(owner) && numD >= 2) {
+      bool isInnermost = usersInInnermostLoop(owner) && numD >= 2;
+      bool isTMA = isInnermost && isTMAChannel(owner);
+      LDBG("buffer " << bufferId << " isInnermost=" << isInnermost
+                     << " isTMA=" << isTMA);
+      // Priority: TMA channels in innermost loop get multi-buffered.
+      // Non-TMA channels in innermost loop start with 1 copy.
+      if (isInnermost && isTMA) {
         if (bufferIdInnermost < 0) {
           bufferIdInnermost = bufferId;
           ++bufferId;

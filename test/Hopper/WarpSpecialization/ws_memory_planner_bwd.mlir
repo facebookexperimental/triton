@@ -27,7 +27,7 @@
 // CHECK-LABEL: tt.func public @_attn_bwd
 //
 // SMEM allocations: dsT, do, q share buffer 0, triple-buffered
-// CHECK: %dsT = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32}
+// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 //
 // TMEM allocation: dv (bf16) reuses qkT's buffer at offset 0
 // CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32}
