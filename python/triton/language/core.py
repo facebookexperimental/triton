@@ -14,6 +14,7 @@ import inspect
 
 from .._C.libtriton import ir
 from .._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth
+from .. import knobs
 
 T = TypeVar('T')
 
@@ -3270,7 +3271,7 @@ class range(base_value):
     """
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
-                 disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
+                 disallow_acc_multi_buffer=None, flatten=False, warp_specialize=False, disable_licm=False,
                  data_partition_factor=None):
         if step is None:
             self.step = constexpr(1)
@@ -3284,6 +3285,8 @@ class range(base_value):
             self.end = arg2
         self.num_stages = num_stages
         self.loop_unroll_factor = loop_unroll_factor
+        if disallow_acc_multi_buffer is None:
+            disallow_acc_multi_buffer = bool(knobs.nvidia.use_meta_ws)
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.data_partition_factor = data_partition_factor
         self.flatten = flatten
