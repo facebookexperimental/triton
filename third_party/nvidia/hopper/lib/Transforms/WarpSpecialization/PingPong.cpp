@@ -351,18 +351,17 @@ int arrivesFirst(
   // Build a set of critical ops for fast lookup
   llvm::SmallDenseSet<Operation *, 8> criticalOps(allOps.begin(), allOps.end());
 
-  // Find the earliest critical op in the schedule
-  Operation *firstOp =
-      *llvm::min_element(allOps, [&](Operation *a, Operation *b) {
-        return schedule.isOpBefore(a, b);
-      });
-  assert(firstOp && "Failed to find the earliest op in the schedule");
+  // Find the earliest critical op by linearizing from the start of the loop
+  auto linearized = schedule.linearized(
+      forOp, &*forOp.getBody()->without_terminator().begin());
+  auto firstCriticalOp = linearized.findNext(
+      [&](Operation *op) { return criticalOps.contains(op); });
+  assert(firstCriticalOp && "Failed to find the earliest op in the schedule");
+  Operation *firstOp = *firstCriticalOp;
 
   // Validate that the schedule alternates between partitions
   int curPartitionId = getSingleTaskId(firstOp);
   int curSeenOps = 1;
-
-  auto linearized = schedule.linearized(forOp, firstOp);
 
   while (auto nextOp = linearized.findNext(
              [&](Operation *op) { return criticalOps.contains(op); })) {
