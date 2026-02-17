@@ -1829,7 +1829,17 @@ getInitialSchedule(scf::ForOp mainLoop,
                         "/tmp/partition_scheduling.dot");
   }
 
-  return ScheduleResult{std::move(schedule), epiloguePartition};
+  // When epilogue is merged into computation, post-loop ops should be
+  // assigned to the computation partition (not the default partition).
+  // For bwd (dpFactor<=1), sharedComputePartition is the single computation
+  // partition. For fwd (dpFactor>1), fall back to defaultPartition since
+  // there are multiple per-group computation partitions.
+  Partition *postLoopPartition = epiloguePartition;
+  if (!postLoopPartition)
+    postLoopPartition = sharedComputePartition;
+  if (!postLoopPartition)
+    postLoopPartition = defaultPartition;
+  return ScheduleResult{std::move(schedule), postLoopPartition};
 }
 
 namespace {
@@ -2127,17 +2137,18 @@ struct PartitionScheduling
 } // namespace
 
 void PartitionScheduling::runOnOperation() {
-  // Allow env var override: TRITON_MERGE_EPILOGUE=1
-  bool mergeEpilogue = mergeEpilogueIntoComputation;
-  if (const char *env = std::getenv("TRITON_MERGE_EPILOGUE"))
-    mergeEpilogue = std::string(env) == "1";
-
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
     if (loop->hasAttr(kWarpSpecializeAttrName))
       loops.push_back(loop);
   });
   for (auto [idx, loop] : llvm::enumerate(loops)) {
+    // Check for per-loop tt.merge_epilogue attribute on the forOp,
+    // falling back to the pass option.
+    bool mergeEpilogue = mergeEpilogueIntoComputation;
+    if (auto attr = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue"))
+      mergeEpilogue = attr.getValue();
+
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, mergeEpilogue)) {
       WarpSchedule &schedule = result->schedule;
