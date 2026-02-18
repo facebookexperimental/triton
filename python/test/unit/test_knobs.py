@@ -293,3 +293,46 @@ def test_opt_bool(fresh_knobs, monkeypatch):
     assert fresh_knobs.amd.use_block_pingpong
     monkeypatch.delenv("TRITON_HIP_USE_BLOCK_PINGPONG")
     assert fresh_knobs.amd.use_block_pingpong is None
+
+
+def test_autotune_warmup_rep_defaults(fresh_knobs):
+    assert fresh_knobs.autotuning.warmup == 25
+    assert fresh_knobs.autotuning.rep == 100
+
+
+def test_autotune_warmup_rep_env(fresh_knobs, monkeypatch):
+    monkeypatch.setenv("TRITON_AUTOTUNE_WARMUP", "50")
+    monkeypatch.setenv("TRITON_AUTOTUNE_REP", "200")
+    assert fresh_knobs.autotuning.warmup == 50
+    assert fresh_knobs.autotuning.rep == 200
+
+
+def test_autotune_warmup_rep_set_directly(fresh_knobs):
+    fresh_knobs.autotuning.warmup = 10
+    fresh_knobs.autotuning.rep = 40
+    assert fresh_knobs.autotuning.warmup == 10
+    assert fresh_knobs.autotuning.rep == 40
+
+
+def test_autotune_warmup_rep_reset(fresh_knobs, monkeypatch):
+    triton.knobs.propagate_env = False
+    fresh_knobs.autotuning.warmup = 10
+    fresh_knobs.autotuning.rep = 40
+    fresh_knobs.autotuning.reset()
+    assert fresh_knobs.autotuning.warmup == 25
+    assert fresh_knobs.autotuning.rep == 100
+    triton.knobs.propagate_env = True
+
+
+def test_autotune_warmup_rep_scope(fresh_knobs, monkeypatch):
+    fresh_knobs.autotuning.warmup = 10
+    fresh_knobs.autotuning.rep = 40
+
+    with fresh_knobs.autotuning.scope():
+        fresh_knobs.autotuning.warmup = 77
+        fresh_knobs.autotuning.rep = 88
+        assert fresh_knobs.autotuning.warmup == 77
+        assert fresh_knobs.autotuning.rep == 88
+
+    assert fresh_knobs.autotuning.warmup == 10
+    assert fresh_knobs.autotuning.rep == 40
