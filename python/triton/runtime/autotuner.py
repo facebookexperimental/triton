@@ -105,7 +105,7 @@ class Autotuner(KernelInterface):
                 from ..testing import do_bench_cudagraph
                 self._do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
                     kernel_call,
-                    rep=rep if rep is not None else 100,
+                    rep=rep if rep is not None else knobs.autotuning.rep,
                     quantiles=quantiles,
                 )
                 return
@@ -113,8 +113,8 @@ class Autotuner(KernelInterface):
             import triton.testing
             self._do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
                 kernel_call,
-                warmup=warmup if warmup is not None else 25,
-                rep=rep if rep is not None else 100,
+                warmup=warmup if warmup is not None else knobs.autotuning.warmup,
+                rep=rep if rep is not None else knobs.autotuning.rep,
                 quantiles=quantiles,
             )
             return
@@ -122,7 +122,17 @@ class Autotuner(KernelInterface):
     @cached_property
     def do_bench(self):
         if self._do_bench is None:
-            return driver.active.get_benchmarker()
+            benchmarker = driver.active.get_benchmarker()
+            warmup = knobs.autotuning.warmup
+            rep = knobs.autotuning.rep
+            if warmup != 25 or rep != 100:
+                print(f"Autotuning benchmarker using warmup={warmup}ms, rep={rep}ms")
+            return lambda kernel_call, quantiles: benchmarker(
+                kernel_call,
+                warmup=warmup,
+                rep=rep,
+                quantiles=quantiles,
+            )
         return self._do_bench
 
     def _bench(self, *args, config, **meta):
