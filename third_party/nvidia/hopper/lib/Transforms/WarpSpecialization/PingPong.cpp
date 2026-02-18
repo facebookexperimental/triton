@@ -36,7 +36,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include <unordered_set>
 
 #define DEBUG_TYPE "nvgpu-ping-pong-sync"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -219,8 +218,7 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
 /// Dump memory effects of an operation for debugging
 void dumpMemoryEffects(Operation *op) {
   if (auto memInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
-    LDBG("  Op '" << op->getName()
-                  << "' does not implement MemoryEffectOpInterface.");
+    LDBG("  Op '" << op->getName() << "' implements MemoryEffectOpInterface.");
     SmallVector<MemoryEffects::EffectInstance> effects;
     memInterface.getEffects(effects);
     if (effects.empty()) {
@@ -247,7 +245,6 @@ void dumpMemoryEffects(Operation *op) {
   } else if (!op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
     LDBG("  Op '" << op->getName() << "' may have recursive memory effects.");
   }
-  return;
 }
 
 /// Find the end boundary op for the critical region.
@@ -339,17 +336,15 @@ int arrivesFirst(
     scf::ForOp forOp, const triton::CoarseSchedule &schedule,
     const llvm::DenseMap<int, SmallVector<Operation *>> &partitionOps) {
   // Collect all critical ops across partitions
-  SmallVector<Operation *> allOps;
+  llvm::SmallDenseSet<Operation *, 8> criticalOps;
   for (auto &[partitionId, ops] : partitionOps) {
-    allOps.append(ops.begin(), ops.end());
+    criticalOps.insert(ops.begin(), ops.end());
   }
 
-  assert(llvm::all_of(
-             allOps, [&](Operation *op) { return ttg::getStageCluster(op); }) &&
-         "Loop stage and cluster not found for all key ops");
-
-  // Build a set of critical ops for fast lookup
-  llvm::SmallDenseSet<Operation *, 8> criticalOps(allOps.begin(), allOps.end());
+  assert(
+      llvm::all_of(criticalOps,
+                   [&](Operation *op) { return ttg::getStageCluster(op); }) &&
+      "Loop stage and cluster not found for all key ops");
 
   // Find the earliest critical op by linearizing from the start of the loop
   auto linearized = schedule.linearized(
@@ -519,7 +514,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       Operation *unionStartOp = firstOpInBlock(startOp);
       Operation *unionEndOp = lastOpInBlock(endOps[partitionId]);
 
-      // The pong partition is the partition that arrives first
+      // The pong partition goes first and ping waits
       if (partitionId != arrivesFirstPartitionId) {
         crManager.pingpongIdToPingBoundaryOps[pingpongId].push_back(
             unionStartOp);
@@ -626,8 +621,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  capability = getNVIDIAComputeCapability(moduleOp);
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &bodyOp : block.getOperations()) {
       Operation *op = &bodyOp;
@@ -641,8 +634,6 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 /// doPingPongPrep pass: Group expensive ops into pingpong regions
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages) {
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  capability = getNVIDIAComputeCapability(moduleOp);
 
   // Initialize the critical region manager
   CriticalRegionManager crManager;
@@ -737,12 +728,10 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
     if (failed(schedule.deSerialize(forOp))) {
       LDBG("No schedule found, re-running scheduleLoops");
 
-      // Get the parent ModuleOp
-      auto moduleOp = forOp->getParentOfType<ModuleOp>();
-
       // Re-run scheduling for all loops in the module
+      auto moduleOp = funcOp->getParentOfType<ModuleOp>();
       int numStages = triton::getNumStagesOrDefault(forOp, defaultNumStages);
-      bool useMetaWS = true; // or false depending on your use case
+      bool useMetaWS = true;
       triton::gpu::scheduleLoops(moduleOp, numStages, useMetaWS);
 
       // Now try deserializing again
