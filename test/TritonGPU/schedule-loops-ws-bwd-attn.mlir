@@ -119,7 +119,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.descriptor_reduce add, %arg21[%37, %c0_i32], %70 {loop.cluster = 0 : i32, loop.stage = 1 : i32} : !tt.tensordesc<tensor<128x128xf32, #shared1>>, tensor<128x128xf32, #blocked1>
       %71 = arith.addi %arg44, %c128_i32 {loop.cluster = 1 : i32, loop.stage = 1 : i32} : i32
       scf.yield %71, %true, %token_14, %54, %token_17, %65, %token_20 : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
-    } {tt.disallow_acc_multi_buffer, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize}
+    } {tt.scheduled_max_stage = 1 : i32, tt.warp_specialize}
     %result_9, %token_10 = ttng.tmem_load %result_1[%28#3] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     %result_11, %token_12 = ttng.tmem_load %result_5[%28#5] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     %29 = arith.truncf %result_9 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
