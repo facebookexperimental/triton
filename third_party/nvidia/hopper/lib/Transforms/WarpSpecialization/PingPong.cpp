@@ -735,23 +735,16 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       continue;
     }
 
-    // Extract the schedule from the parent ForOp; if there are gaps, re-run
-    // SWP scheduling.
+    // Ensure the schedule is available for this loop. scheduleLoops is a no-op
+    // if the schedule is already complete.
+    auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    int numStages = triton::getNumStagesOrDefault(forOp, defaultNumStages);
+    triton::gpu::scheduleLoops(moduleOp, numStages, /*useMetaWS=*/true);
+
     triton::CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
-      LDBG("No schedule found, re-running scheduleLoops");
-
-      // Re-run scheduling
-      auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-      int numStages = triton::getNumStagesOrDefault(forOp, defaultNumStages);
-      bool useMetaWS = true;
-      triton::gpu::scheduleLoops(moduleOp, numStages, useMetaWS);
-
-      // Now try deserializing again
-      if (failed(schedule.deSerialize(forOp))) {
-        LDBG("Still failed after re-running scheduleLoops, skipping");
-        continue;
-      }
+      LDBG("Failed to deserialize schedule, skipping");
+      continue;
     }
 
     // Find which partition arrives first and validate alternation pattern.
