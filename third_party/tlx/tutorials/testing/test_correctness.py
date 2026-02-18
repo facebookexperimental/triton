@@ -59,6 +59,7 @@ class Gemm:
             "GROUP_SIZE_M": 8,
             "NUM_SMEM_BUFFERS": 2,
             "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1,
             "EPILOGUE_SUBTILE": 1,
             "PAIR_CTA": False,
         },
@@ -99,14 +100,14 @@ class Gemm:
     }
 
     @staticmethod
-    def run_test(matmul_fn, config, shapes=None):
+    def run_test(matmul_fn, config, shapes=None, dtype=torch.float16):
         if shapes is None:
             shapes = Gemm.SHAPES
         for shape in shapes:
             M, N, K = shape
             torch.manual_seed(0)
-            a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-            b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+            a = torch.randn((M, K), device=DEVICE, dtype=dtype)
+            b = torch.randn((K, N), device=DEVICE, dtype=dtype)
             torch_output = torch.matmul(a, b)
             triton_output = matmul_fn(a, b, config=config)
             torch.testing.assert_close(triton_output, torch_output)
@@ -232,6 +233,26 @@ def test_blackwell_gemm_pipelined():
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_2cta():
     Gemm.run_test(_blackwell_gemm_2cta, Gemm.CONFIGS["blackwell_gemm_2cta"])
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_bf16():
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=torch.bfloat16)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_clc_bf16():
+    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc"], dtype=torch.bfloat16)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_pipelined_bf16():
+    Gemm.run_test(_blackwell_gemm_pipelined, Gemm.CONFIGS["blackwell_gemm_pipelined"], dtype=torch.bfloat16)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_2cta_bf16():
+    Gemm.run_test(_blackwell_gemm_2cta, Gemm.CONFIGS["blackwell_gemm_2cta"], dtype=torch.bfloat16)
 
 
 # =============================================================================
