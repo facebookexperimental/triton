@@ -346,7 +346,8 @@ int arrivesFirst(
                    [&](Operation *op) { return ttg::getStageCluster(op); }) &&
       "Loop stage and cluster not found for all key ops");
 
-  // Find the earliest critical op by linearizing from the start of the loop
+  // Step 1: Find the earliest critical op by linearizing from the start of the
+  // loop
   auto linearized = schedule.linearized(
       forOp, &*forOp.getBody()->without_terminator().begin());
   auto firstCriticalOp = linearized.findNext(
@@ -354,7 +355,12 @@ int arrivesFirst(
   assert(firstCriticalOp && "Failed to find the earliest op in the schedule");
   Operation *firstOp = *firstCriticalOp;
 
-  // Validate that the schedule alternates between partitions
+  // Step 2: Validate that the schedule alternates between partitions
+  //         - Correct alternation means: after all ops in one partition
+  //         execute,
+  //           the next scheduled op must be in the other partition
+  //         - Check correct alternation until we reach the end of linearized
+  //         schedule
   int curPartitionId = getSingleTaskId(firstOp);
   int curSeenOps = 1;
 
@@ -362,6 +368,8 @@ int arrivesFirst(
              [&](Operation *op) { return criticalOps.contains(op); })) {
     int nextPartitionId = getSingleTaskId(*nextOp);
     if (nextPartitionId == curPartitionId) {
+      // Check if operations in the same partition get scheduled consecutively
+      // more than once
       curSeenOps++;
       if (curSeenOps > partitionOps.lookup(curPartitionId).size()) {
         LDBG("Partition " << curPartitionId << " have scheduled " << curSeenOps
@@ -369,6 +377,8 @@ int arrivesFirst(
         return -1;
       }
     } else {
+      // Check if operations in the other partition get scheduled after ALL
+      // operations in the current partition are scheduled
       if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
         LDBG("Partition " << curPartitionId << " scheduled " << curSeenOps
                           << " before the next partition, not alternating.");
@@ -723,12 +733,13 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
       continue;
     }
 
-    // Extract the schedule from the parent ForOp
+    // Extract the schedule from the parent ForOp; if there are gaps, re-run
+    // SWP scheduling.
     triton::CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
       LDBG("No schedule found, re-running scheduleLoops");
 
-      // Re-run scheduling for all loops in the module
+      // Re-run scheduling
       auto moduleOp = funcOp->getParentOfType<ModuleOp>();
       int numStages = triton::getNumStagesOrDefault(forOp, defaultNumStages);
       bool useMetaWS = true;
