@@ -125,6 +125,8 @@ class Autotuner(KernelInterface):
             benchmarker = driver.active.get_benchmarker()
             warmup = knobs.autotuning.warmup
             rep = knobs.autotuning.rep
+            if warmup != 25 or rep != 100:
+                print(f"Autotuning benchmarker using warmup={warmup}ms, rep={rep}ms")
             return lambda kernel_call, quantiles: benchmarker(
                 kernel_call, warmup=warmup, rep=rep, quantiles=quantiles,
             )

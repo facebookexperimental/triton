@@ -301,8 +301,8 @@ def test_autotune_warmup_rep_defaults(fresh_knobs):
 
 
 def test_autotune_warmup_rep_env(fresh_knobs, monkeypatch):
-    monkeypatch.setenv("TRITON_AUTOTUNE_WARMUP", "50")
-    monkeypatch.setenv("TRITON_AUTOTUNE_REP", "200")
+    monkeypatch.setenv("TRITON_AUTOTUNE_WARMUP_MS", "50")
+    monkeypatch.setenv("TRITON_AUTOTUNE_REP_MS", "200")
     assert fresh_knobs.autotuning.warmup == 50
     assert fresh_knobs.autotuning.rep == 200
 
