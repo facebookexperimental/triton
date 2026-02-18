@@ -154,7 +154,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
             tmemEncoding.getContext(), srcEncoding.getBlockM(),
-            srcEncoding.getBlockN(), tmemEncoding.getUnpacked(),
+            srcEncoding.getBlockN(), tmemEncoding.getColStride(),
             tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN());
         const auto updatedResultLayoutEncoding =
             LayoutEncoding(newTmemEncoding);
@@ -282,7 +282,7 @@ LogicalResult LayoutForwardPropagation::visitOperation(
             operandLayoutEncoding.getLayoutEncoding());
         auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
             op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
-            encoding.getUnpacked(), encoding.getCTASplitM(),
+            encoding.getColStride(), encoding.getCTASplitM(),
             encoding.getCTASplitN());
         operandLayoutEncoding = LayoutEncoding(newEncoding);
       }
