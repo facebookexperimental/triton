@@ -357,8 +357,7 @@ int arrivesFirst(
 
   // Step 2: Validate that the schedule alternates between partitions
   //         - Correct alternation means: after all ops in one partition
-  //         execute,
-  //           the next scheduled op must be in the other partition
+  //         execute, the next scheduled op must be in the other partition
   //         - Check correct alternation until we reach the end of linearized
   //         schedule
   int curPartitionId = getSingleTaskId(firstOp);
