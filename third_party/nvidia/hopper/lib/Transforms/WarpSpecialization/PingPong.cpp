@@ -352,7 +352,10 @@ int arrivesFirst(
       forOp, &*forOp.getBody()->without_terminator().begin());
   auto firstCriticalOp = linearized.findNext(
       [&](Operation *op) { return criticalOps.contains(op); });
-  assert(firstCriticalOp && "Failed to find the earliest op in the schedule");
+  if (!firstCriticalOp) {
+    LDBG("Failed to find the earliest critical op in the schedule");
+    return -1;
+  }
   Operation *firstOp = *firstCriticalOp;
 
   // Step 2: Validate that the schedule alternates between partitions
