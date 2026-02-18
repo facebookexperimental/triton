@@ -1651,6 +1651,41 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     torch.testing.assert_close(z, ref_out)
 
 
+def _swizzle_scale_to_5d(scale, outer_chunks, k_chunks):
+    """Convert raw E8M0 scales to swizzled 5D format for TMA/async_dot_scaled.
+
+    Applies the cuBLAS block scaling layout within each 128x4 block.
+    dest[row%32 * 16 + row//32 * 4 + col] = src[row, col]
+
+    Args:
+        scale: Raw scale tensor of shape (batch, rows, K//32) in uint8.
+        outer_chunks: Number of 128-row chunks (rows // 128).
+        k_chunks: Number of 4-column chunks (K // 32 // 4).
+
+    Returns:
+        Swizzled 5D tensor of shape (batch, outer_chunks, k_chunks, 2, 256).
+    """
+    batch = scale.shape[0]
+    cols = scale.shape[2]
+    padded_cols = k_chunks * 4
+
+    if cols < padded_cols:
+        scale = torch.nn.functional.pad(scale, (0, padded_cols - cols))
+
+    blocks = (scale.reshape(batch, outer_chunks, 128, k_chunks,
+                            4).permute(0, 1, 3, 2, 4).reshape(batch, outer_chunks, k_chunks, 512))
+
+    _r = torch.arange(128)
+    _c = torch.arange(4)
+    _rg, _cg = torch.meshgrid(_r, _c, indexing="ij")
+    idx = ((_rg % 32) * 16 + (_rg // 32) * 4 + _cg).reshape(-1)
+    idx = idx.to(scale.device).expand_as(blocks)
+    output = torch.empty_like(blocks)
+    output.scatter_(-1, idx, blocks)
+
+    return output.reshape(batch, outer_chunks, k_chunks, 2, 256)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_scaled_2cta(device):
     """
@@ -1803,10 +1838,10 @@ def test_async_dot_scaled_2cta(device):
     b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
-    a_scale_4d = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
-    b_scale_4d = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+    a_scale = torch.randint(124, 130, (M, K // 32), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // 32), dtype=torch.uint8, device=device)
+    a_scale_4d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // 32), M // 128, K // 32 // 4).squeeze(0)
+    b_scale_4d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4).squeeze(0)
 
     BLOCK_M = M // 2  # 128 per CTA
     BLOCK_N = N  # 256 total, 128 per CTA for B data
@@ -1950,13 +1985,12 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
     # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
-    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
-    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(124, 130, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -1988,9 +2022,9 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     # Repeats each scale value VEC_SIZE times along dimension 1.
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -2087,12 +2121,12 @@ def test_async_dot_scaled_tmem_scales(device):
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
     # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
-    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(124, 130, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -2127,9 +2161,9 @@ def test_async_dot_scaled_tmem_scales(device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
@@ -3681,9 +3715,9 @@ def test_async_dot_scaled_mxfp4(device):
     a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
     b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -3713,9 +3747,9 @@ def test_async_dot_scaled_mxfp4(device):
         scale = scale.view(torch.float32)
         return scale
 
-    # print(a_scale_5d[0][0][0][0][0].item())
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     # Repeat each scale value VEC_SIZE times along dim 1
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -3866,9 +3900,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
     a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
     b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA (cuBLAS block scaling layout)
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -3915,9 +3949,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     # Repeat each scale value VEC_SIZE times along dim 1
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -4387,12 +4421,12 @@ def test_make_tensor_descriptor_mxfp8(device):
 
     # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
     # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
-    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(124, 130, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N, "M": M, "N": N, "K": K}
     kernel = mxfp8_scaled_kernel[(1, 1)](
@@ -4433,8 +4467,8 @@ def test_make_tensor_descriptor_mxfp8(device):
         scale = scale.view(torch.float32)
         return scale
 
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
