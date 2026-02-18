@@ -217,7 +217,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // Test TMEM allocation creates TMEMAllocOp with tensor_memory_encoding
 // TMEM uses max blockM and blockN from user allocations (2D layout assumption),
 // with blockN scaled down for smaller element types (divided by 4/elementBytes).
-#tmem_enc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, unpacked = true>
+#tmem_enc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 2>
 #tmem = #ttng.tensor_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @alloc_tmem_buffer
@@ -236,7 +236,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Test TMEM allocation respects explicit size when it's larger than needed
 // The blockN should be padded to accommodate the larger explicit size
-#tmem_enc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, unpacked = true>
+#tmem_enc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 2>
 #tmem = #ttng.tensor_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @alloc_tmem_explicit_size_larger

@@ -108,11 +108,11 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
+    def __init__(self, blockM, blockN, colStride, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
         self.blockN = blockN
-        self.unpacked = unpacked
+        self.colStride = colStride
         self.CTASplitM = CTASplitM
         self.CTASplitN = CTASplitN
 
@@ -125,7 +125,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         return cls(
             blockM=shape[0],
             blockN=shape[1],
-            unpacked=True,
+            colStride=1,
             CTASplitM=1,
             CTASplitN=1,
         )
@@ -134,7 +134,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         return builder.make_tensor_memory_encoding_attr(
             self.blockM,
             self.blockN,
-            self.unpacked,
+            self.colStride,
             self.CTASplitM,
             self.CTASplitN,
         )
