@@ -253,7 +253,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Test reuse_group with tmem storage
 // Note: #tmem binds to tensor_memory_encoding, memory space is #ttng.tensor_memory
-#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, unpacked = true>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @reuse_group_shared_tmem
   tt.func @reuse_group_shared_tmem() {

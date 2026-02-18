@@ -5,13 +5,12 @@
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
-#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, unpacked = true>
-#tmem1 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, unpacked = false>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
+#tmem1 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
 
 // CHECK-DAG: #[[$SHARED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
 // CHECK-DAG: #[[$SHARED1:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
-// CHECK-DAG: #[[$TMEM:.*]] = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, unpacked = true>
-// CHECK-DAG: #[[$TMEM1:.*]] = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, unpacked = false>
+// CHECK-DAG: #[[$TMEM:.*]] = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
 
 module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = true, tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tcgen5_fa_kernel
@@ -28,7 +27,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable>
 
     // CHECK-NOT: tlx.local_alias
-    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM1]], #ttng.tensor_memory, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
     %result_0 = tlx.local_alias %result : !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     %result_1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     ttg.warp_specialize(%0, %result_0, %1, %2, %result_1, %result)
