@@ -128,7 +128,10 @@ class Autotuner(KernelInterface):
             if warmup != 25 or rep != 100:
                 print(f"Autotuning benchmarker using warmup={warmup}ms, rep={rep}ms")
             return lambda kernel_call, quantiles: benchmarker(
-                kernel_call, warmup=warmup, rep=rep, quantiles=quantiles,
+                kernel_call,
+                warmup=warmup,
+                rep=rep,
+                quantiles=quantiles,
             )
         return self._do_bench
 
