@@ -3132,7 +3132,92 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
   }
 }
 
+// When a local_alloc stores into a transposed nvmma_shared layout (#shared2)
+// and its sole use is a memdesc_trans back to non-transposed (#shared) that
+// feeds into operand A of a tc_gen5_mma, swap the layouts so the alloc uses
+// #shared directly. This enables the alloc to share a buffer with other allocs
+// of the same source that already use #shared layout.
+//
+// Before:
+//   %a = local_alloc %val -> memdesc<#shared_transposed>
+//   %b = memdesc_trans %a  -> memdesc<#shared_nontransposed>
+//   tc_gen5_mma %b, ...    (operand A)
+//
+// After:
+//   %a = local_alloc %val -> memdesc<#shared_nontransposed>
+//   %b = memdesc_trans %a  -> memdesc<#shared_transposed>
+//   tc_gen5_mma %b, ...    (operand A)
+static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
+  SmallVector<ttg::LocalAllocOp> toSwap;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    if (!allocOp.getSrc())
+      return;
+    auto memDescType = cast<ttg::MemDescType>(allocOp.getType());
+    auto encoding =
+        dyn_cast<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
+    if (!encoding || !encoding.getTransposed())
+      return;
+    if (!allocOp->hasOneUse())
+      return;
+    auto transOp = dyn_cast<ttg::MemDescTransOp>(*allocOp->user_begin());
+    if (!transOp)
+      return;
+    // Verify the memdesc_trans result feeds into operand A of a tc_gen5_mma.
+    bool feedsIntoMmaOperandA = false;
+    for (auto *user : transOp->getUsers()) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        if (mmaOp.getA() == transOp.getResult()) {
+          feedsIntoMmaOperandA = true;
+          break;
+        }
+      }
+    }
+    if (!feedsIntoMmaOperandA)
+      return;
+    toSwap.push_back(allocOp);
+  });
+
+  for (auto allocOp : toSwap) {
+    auto memDescType = cast<ttg::MemDescType>(allocOp.getType());
+    auto encoding =
+        cast<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
+    auto transOp = cast<ttg::MemDescTransOp>(*allocOp->user_begin());
+    auto transDescType = cast<ttg::MemDescType>(transOp.getType());
+
+    // Create non-transposed encoding for the alloc.
+    auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
+        encoding.getContext(), encoding.getSwizzlingByteWidth(),
+        /*transposed=*/false, encoding.getElementBitWidth(),
+        encoding.getFp4Padded(), encoding.getCTALayout());
+
+    // New alloc type: non-transposed encoding.
+    auto newAllocType = ttg::MemDescType::get(
+        memDescType.getShape(), memDescType.getElementType(),
+        nonTransposedEncoding, memDescType.getMemorySpace(),
+        memDescType.getMutableMemory());
+
+    // New memdesc_trans output type: transposed encoding (the original).
+    auto newTransType = ttg::MemDescType::get(
+        transDescType.getShape(), transDescType.getElementType(), encoding,
+        transDescType.getMemorySpace(), transDescType.getMutableMemory());
+
+    LLVM_DEBUG({
+      LDBG("swapTransposedLocalAllocs: swapping layouts for alloc at "
+           << allocOp.getLoc());
+      LDBG("  alloc: " << memDescType << " -> " << newAllocType);
+      LDBG("  trans: " << transDescType << " -> " << newTransType);
+    });
+
+    allocOp.getResult().setType(newAllocType);
+    transOp.getResult().setType(newTransType);
+  }
+}
+
 void doBufferAllocation(triton::FuncOp &funcOp) {
+  // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
+  // allocs that share the same source value can also share a buffer.
+  swapTransposedLocalAllocs(funcOp);
+
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
