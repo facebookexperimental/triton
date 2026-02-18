@@ -27,61 +27,21 @@ configs = [
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_KV": kv,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
+            "GROUP_SIZE_N": grp_n,
+            "RESCALE_OPT": rescale_opt,
+            "USE_WHERE": where,  # used when RESCALE_OPT is True
         },
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=1,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
-        },
-        num_stages=1,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=1,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
+    )
+    for kv in [3, 6]
+    for grp_n in [1, 4]
+    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
 ]
 
 
@@ -101,6 +61,11 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     bufIdx = accum_cnt % NUM_BUFFERS_KV
     phase = (accum_cnt // NUM_BUFFERS_KV) & 1
     return bufIdx, phase
+
+
+@triton.jit
+def _reduce_or(x, y):
+    return x | y
 
 
 @triton.jit
@@ -282,6 +247,7 @@ def _softmax_inner_loop(
     BLOCK_N: tl.constexpr,
     NUM_MMA_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
@@ -295,15 +261,46 @@ def _softmax_inner_loop(
             qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
         # compute m_i, p in registers
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        # update_row_max: row_max_new = _compute_row_max(qk, row_max[0])
+        # -> FA4 handles one row per thread (32 threads per warp * 4)
+        # -> use fmax_reduce(one row of qk, m_i[0])
+        # -> m_i|m_ij = row_max[0] * scale
+        if RESCALE_OPT:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
 
         # -- compute correction factor
-        alpha = tl.math.exp2(m_i - m_ij)
+        # update_row_max: acc_scale_ = (row_max[0] - row_max_new) * scale
+        # -> acc_scale = exp2(acc_scale_)
+        # -> if (acc_scale_ >= -8.0):
+        # ->   row_max_new = row_max[0]; acc_scale = 1.0
+        # -> row_max[0] = row_max_new
+        if RESCALE_OPT:
+            alpha_ = (m_i - m_ij) * qk_scale  # alpha_ is 1D distributed over the warp group
+            alpha = tl.math.exp2(alpha_)
+            rescale_mask = alpha_ >= -8.0
+            alpha = tl.where(rescale_mask, 1.0, alpha)
+            m_ij = tl.where(rescale_mask, m_i, m_ij)
+        else:
+            alpha = tl.math.exp2(m_i - m_ij)
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
-        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        # scale_subtract_rowmax:
+        # -> row_max_scaled = row_max_new * scale
+        # -> s[i], s[i+1] = fma_packed_f32x2((s[i], s[i+1]), (scale, scale), (-row_max_scaled, -row_max_scaled))
+        if RESCALE_OPT:
+            m_scaled = m_ij * qk_scale
+            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+        else:
+            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        # apply_epx2_convert in FA4:
+        # 128 elements per row is divided into 4 fragments, first fragement covers [0] to [31]
+        # for last fragment, always use SFU, for first 3 fragments, elements 0 to 11 use SFU,
+        # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
+        # the loop is unrolled twice likely for vectorization
         qks = _split_n(qk, NUM_MMA_SLICES)
         ps = ()
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
@@ -341,6 +338,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
                  GROUP_SIZE_N: tl.constexpr,  #
+                 RESCALE_OPT: tl.constexpr,  #
+                 USE_WHERE: tl.constexpr,  #
                  ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -473,16 +472,53 @@ def _attn_fwd_ws(sm_scale, M,  #
                         tlx.barrier_wait(alpha_fulls[cid], phase)
                         alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
-                        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                            subslice = tlx.subslice(
-                                acc_tiles[cid],
-                                HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                HEAD_DIM // NUM_MMA_SLICES,
-                            )
-                            acc = tlx.local_load(subslice)
-                            # acc = acc * alpha_1
-                            acc = _mul_f32x2(acc, alpha_1)
-                            tlx.local_store(subslice, acc)
+                        # Perform warp-level ballot vote to check if any thread needs rescaling
+                        # 0xFFFFFFFF means all 32 threads in the warp participate
+                        if RESCALE_OPT:
+                            pred = alpha_1 < 1.0
+                            # ballot_result is a tensor with the same shape as pred
+                            # All elements contain the same warp-level ballot value
+                            # Non-zero means at least one thread has alpha_1 < 1.0
+                            ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+                            should_rescale = ballot_result != 0
+
+                        # FA4: each thread handles one row, 128 elements
+                        #   128 threads handle 128 rows
+                        #   each thread breaks one row into 8 fragments, each fragment 16 elements, unrolls by 2
+                        # TLX: with NUM_MMA_SLICES of 2, we handle 128x64, then another 128x64
+                        # Since Triton doesn't support ifOp on a tensor value, we try to combine the values
+                        # option 1: use tl.where
+                        if USE_WHERE:
+                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                                subslice = tlx.subslice(
+                                    acc_tiles[cid],
+                                    HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                                    HEAD_DIM // NUM_MMA_SLICES,
+                                )
+                                acc = tlx.local_load(subslice)
+                                # Use tl.where to conditionally apply rescaling
+                                # acc = acc * alpha_1 where should_rescale, else acc unchanged
+                                if RESCALE_OPT:
+                                    scaled_acc = _mul_f32x2(acc, alpha_1)
+                                    acc = tl.where(should_rescale, scaled_acc, acc)
+                                else:
+                                    acc = _mul_f32x2(acc, alpha_1)
+                                tlx.local_store(subslice, acc)
+                        else:
+                            # option 2: use a single scalar IfOp
+                            if RESCALE_OPT:
+                                should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
+                                should_rescale_scalar = tl.reshape(should_rescale_red, ())
+                            if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
+                                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                                    subslice = tlx.subslice(
+                                        acc_tiles[cid],
+                                        HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                                        HEAD_DIM // NUM_MMA_SLICES,
+                                    )
+                                    acc = tlx.local_load(subslice)
+                                    acc = _mul_f32x2(acc, alpha_1)
+                                    tlx.local_store(subslice, acc)
                         tlx.barrier_arrive(acc_fulls[cid])
                     accum_cnt += 1
 
@@ -539,6 +575,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 )
                 # initialize pointer to m and l
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
+                # FA4 update_row_sum has init_val being None for the first iteration, here
+                # we use initial value of 1.0
                 l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
                 acc = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=tl.float32)
                 qk_scale = sm_scale
@@ -569,6 +607,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         BLOCK_N,
                         NUM_MMA_SLICES,
                         STAGE=4 - STAGE,
+                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 if STAGE & 2:
@@ -593,6 +632,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                         BLOCK_N,
                         NUM_MMA_SLICES,
                         STAGE=2,
+                        RESCALE_OPT=RESCALE_OPT,
                     )
 
                 # prepare l_i for the epilog
