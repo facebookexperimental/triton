@@ -47,8 +47,8 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
     )
 
     # async load a and b into SMEM
-    buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
-    buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float16, tl.constexpr(1))  # 2cta specific
+    buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), tl.constexpr(1))
+    buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tlx.dtype_of(b_ptr), tl.constexpr(1))  # 2cta specific
     a_smem = tlx.local_view(buf_alloc_a, 0)
     b_smem = tlx.local_view(buf_alloc_b, 0)
 
@@ -95,7 +95,7 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
 
     result = tlx.local_load(acc_tmem)
 
-    c = result.to(tl.float16)
+    c = result.to(tlx.dtype_of(c_ptr))
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c)
 
@@ -109,7 +109,7 @@ def matmul(a, b, config=None):
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     triton.set_allocator(alloc_fn)
 
