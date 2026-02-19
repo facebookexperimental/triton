@@ -5,6 +5,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tlx-storage-alias-size-definition"
@@ -13,20 +14,11 @@
 
 using namespace mlir;
 namespace ttg = ::mlir::triton::gpu;
+namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 namespace triton {
 namespace tlx {
-
-// Helper to get element type bit width, handling pointer types specially
-static int64_t getElementBitWidth(ttg::MemDescType memDescType) {
-  Type elemType = memDescType.getElementType();
-  // Pointer types are 64-bit (8 bytes)
-  if (isa<triton::PointerType>(elemType)) {
-    return 64;
-  }
-  return elemType.getIntOrFloatBitWidth();
-}
 
 LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m) {
   LDBG("computeOrValidateStorageAliasSizes");
@@ -61,27 +53,52 @@ LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m) {
     int64_t totalSizeBytes;
 
     if (storage == StorageKind::smem) {
-      // SMEM: Compute 1D shape (total size in bytes)
-      int64_t maxRequiredSize = 0;
-      for (auto allocOp : users) {
-        auto memDescType =
-            cast<ttg::MemDescType>(allocOp.getResult().getType());
-        int64_t size =
-            memDescType.getNumElements() * getElementBitWidth(memDescType) / 8;
-        if (size < 0) {
-          allocOp.emitError()
-              << "unsupported element type for storage alias allocation: "
-              << memDescType.getElementType();
-          hasError = true;
-          return;
+      // SMEM: Check if there's a set_buffer_overlap that defines the layout
+      SetBufferOverlapOp overlapOp = nullptr;
+      for (auto user : specValue.getUsers()) {
+        if (auto op = dyn_cast<SetBufferOverlapOp>(user)) {
+          overlapOp = op;
+          break;
         }
-        LDBG("  SMEM allocation requires " << size << " bytes");
-        maxRequiredSize = std::max(maxRequiredSize, size);
       }
-      LDBG(
-          "Max required size for SMEM storage_alias_spec: " << maxRequiredSize);
-      bufferShape.push_back(maxRequiredSize);
-      totalSizeBytes = maxRequiredSize;
+
+      if (overlapOp) {
+        // Use the reuse group tree to compute the correct size
+        Value overlapDef = overlapOp.getOverlapDef();
+        int64_t alignment = getElementAlignment(overlapDef);
+        int64_t sizePerBuffer =
+            alignUp(getElementSize(overlapDef, alignment), alignment);
+
+        // Get num buffers from any allocation
+        int64_t numBuffers = 1;
+        for (auto allocOp : users) {
+          auto memDescType =
+              cast<ttg::MemDescType>(allocOp.getResult().getType());
+          auto shape = memDescType.getShape();
+          numBuffers = shape[0]; // First dimension is num
+          break;
+        }
+
+        totalSizeBytes = sizePerBuffer * numBuffers;
+        LDBG("SMEM size from overlap definition: "
+             << sizePerBuffer << " per buffer * " << numBuffers
+             << " buffers = " << totalSizeBytes);
+      } else {
+        // No overlap defined, compute max size across all allocations
+        int64_t maxRequiredSize = 0;
+        for (auto allocOp : users) {
+          auto memDescType =
+              cast<ttg::MemDescType>(allocOp.getResult().getType());
+          int64_t size = memDescType.getNumElements() *
+                         getElementBytes(memDescType.getElementType());
+          LDBG("  SMEM allocation requires " << size << " bytes");
+          maxRequiredSize = std::max(maxRequiredSize, size);
+        }
+        LDBG("Max required size for SMEM storage_alias_spec: "
+             << maxRequiredSize);
+        totalSizeBytes = maxRequiredSize;
+      }
+      bufferShape.push_back(totalSizeBytes);
     } else {
       // TMEM: Compute 2D shape based on maximum dimensions across all users
       // Note: TMEM allocations may be 2D or 3D (with leading NUM_MMA_GROUPS
@@ -104,8 +121,8 @@ LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m) {
           return;
         }
 
-        int64_t elementBits = getElementBitWidth(memDescType);
-        int64_t elementBytes = elementBits / 8;
+        Type elemType = memDescType.getElementType();
+        int64_t elementBytes = getElementBytes(elemType);
 
         // Get base blockM and blockN from the last two dimensions
         int64_t blockM = shape[shape.size() - 2];

@@ -86,8 +86,7 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
     called with a `storage_alias_spec` in the `reuse` parameter.
 
     After the StorageAliasAllocationPass runs, this operation is replaced with
-    a LocalAliasOp (or MemDescSubviewOp for non-zero offsets) pointing to a
-    standard LocalAllocOp/TMEMAllocOp.
+    a LocalAliasOp pointing to a standard LocalAllocOp/TMEMAllocOp.
 
     Example:
     ```mlir
@@ -97,7 +96,9 @@ def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
     ```
   }];
 
-  let arguments = (ins TLX_StorageAliasSpecType:$storage_alias);
+  let arguments = (ins
+    TLX_StorageAliasSpecType:$storage_alias
+  );
 
   let results = (outs TTG_MemDescType:$result);
 
@@ -267,11 +268,27 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
 }
 
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
-                                 [SameOperandAndResultMemorySpace,
-                                  Pure]> {
+                                   [SameOperandAndResultMemorySpace,
+                                    Pure]> {
   let summary = "Create an alias of a local memory buffer";
 
-  let arguments = (ins TTG_TensorOrMemDesc:$src);
+  let description = [{
+    Creates an alias of a local memory buffer with a different view (shape,
+    element type, or encoding). This operation is produced during the
+    StorageAliasAllocationPass when lowering StorageAliasLocalAllocOp.
+
+    Example:
+    ```mlir
+    %backing = ttg.local_alloc : () -> !ttg.memdesc<32768xi8, #shared, #smem, mutable>
+    %alias = tlx.local_alias %backing
+             : !ttg.memdesc<32768xi8, #shared, #smem, mutable>
+             -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    ```
+  }];
+
+  let arguments = (ins
+    TTG_TensorOrMemDesc:$src
+  );
 
   let results = (outs TTG_TensorOrMemDesc:$result);
 

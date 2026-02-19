@@ -2,7 +2,7 @@
 
 **Author:** Nick Riasanovsky
 **Updated:** 2026-02-07
-**Status:** Draft - Phase 1, Phase 2, Phase 3 & Phase 4
+**Status:** Draft - Phase 1, Phase 2, Phase 3, Phase 4 & Phase 5
 
 ---
 
@@ -1736,6 +1736,7 @@ class storage_alias_spec(tl.base_value):
 
     def set_buffer_overlap(self, overlap_def: reuse_group) -> None:
         """Define the buffer overlap scheme for this storage alias spec."""
+        overlap_def = tl._unwrap_if_constexpr(overlap_def)
         # Validate input type
         if not isinstance(overlap_def, reuse_group):
             raise TypeError(f"overlap_def must be a reuse_group, got {type(overlap_def).__name__}")
@@ -1913,13 +1914,939 @@ Phase 4 delivers the JIT interface for defining buffer overlap schemes:
 ---
 ---
 
+# Phase 5: Buffer Offset Calculation Pass
+
+This phase implements the `ReusedBufferOffsetCalculationPass`, which computes the `initial_offset` and `bytes_between_buffers` for each allocation based on the reuse group definitions. This pass processes `SetBufferOverlapOp` operations and assigns memory layout attributes to allocations.
+
+---
+
+## Scope
+
+This phase covers:
+- Buffer offset calculation logic integrated into `TLXStorageAliasLowering` pass
+- In-memory mapping from `LocalAliasOp` results to `(buffer_offset, bytes_between_buffers)` pairs
+- Elimination of `SetBufferOverlapOp` after processing
+- Error handling for insufficient space and duplicate `set_buffer_overlap` calls
+
+**Implementation approach**: The buffer offset calculation is integrated into the `TLXStorageAliasLowering` pass. Offset information is NOT stored as IR attributes on `LocalAliasOp`. Instead, offsets are computed and stored in an in-memory `DenseMap<Value, std::pair<int64_t, int64_t>>` that is passed forward for use in subsequent lowering steps (Phase 6).
+
+**Out of scope** for this phase:
+- Integration with allocation lowering (Phase 6)
+- Buffer reuse analysis warnings (Phase 7)
+
+---
+
+## Concepts
+
+### Buffer Layout Model
+
+Each `storage_alias_local_alloc` produces a multi-buffered allocation with shape `[num, ...]`. The memory layout for a single allocation is:
+
+```
+|<------ bytes_between_buffers ----->|
+|                                    |
+v                                    v
+|<--- buffer 0 --->|<--- padding --->|<--- buffer 1 --->|<--- padding --->|...
+^
+buffer_offset
+```
+
+Where:
+- **`buffer_offset`**: The starting offset (in bytes) from the base of the storage alias spec for buffer index 0
+- **`bytes_between_buffers`**: The stride (in bytes) between the **starting points** of consecutive buffer indices. This is the distance from the start of buffer N to the start of buffer N+1.
+
+For a simple allocation without overlap:
+- `buffer_offset = 0`
+- `bytes_between_buffers = ceil(element_size * product(shape[1:]))` (i.e., the allocation size per buffer)
+
+### Reuse Group Offset Calculation
+
+The reuse group tree defines how allocations are laid out relative to each other:
+
+1. **shared**: All elements in the group start at the same `buffer_offset`. The group's size is the maximum element size.
+
+2. **distinct**: Elements are placed sequentially in memory. Each element's `buffer_offset` is computed as `parent_offset + sum(sizes of preceding elements)`. The group's size is the sum of all element sizes.
+
+---
+
+## Algorithm
+
+### Step 1: Calculate bytes_between_buffers (Static)
+
+The `bytes_between_buffers` is computed once for the entire `storage_alias_spec` and is the same for all allocations:
+
+```cpp
+int64_t totalBytes = specOp.getBufferSizeBytes();
+int64_t numBuffers = getNumBuffersForSpec(spec);  // From first allocation's shape[0]
+int64_t bytesBetweenBuffers = totalBytes / numBuffers;
+```
+
+This value is static and represents the stride between buffer indices for all allocations sharing this spec.
+
+### Step 2: Assign Offsets Recursively
+
+The algorithm recursively walks the reuse group tree, assigning `buffer_offset` to each allocation in the in-memory map. The `bytes_between_buffers` remains constant throughout.
+
+```cpp
+LogicalResult assignOffsets(Value element, int64_t currentOffset,
+                            int64_t bytesBetweenBuffers,
+                            DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap) {
+  if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
+    // Store the offset information in the map (NOT as IR attributes)
+    offsetMap[allocOp.getResult()] = {currentOffset, bytesBetweenBuffers};
+    return success();
+  }
+
+  if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
+    if (reuseGroupOp.getGroupKind() == ReuseGroupKind::shared) {
+      // All children start at the same offset
+      for (auto child : reuseGroupOp.getElements()) {
+        if (failed(assignOffsets(child, currentOffset, bytesBetweenBuffers, builder)))
+          return failure();
+      }
+    } else {  // distinct
+      // Children are placed sequentially
+      int64_t runningOffset = currentOffset;
+      for (auto child : reuseGroupOp.getElements()) {
+        if (failed(assignOffsets(child, runningOffset, bytesBetweenBuffers, builder)))
+          return failure();
+        runningOffset += getElementSize(child);
+      }
+
+      // Verify we have enough space
+      int64_t totalSize = runningOffset - currentOffset;
+      if (totalSize > bytesBetweenBuffers) {
+        return reuseGroupOp.emitError()
+            << "not enough space for distinct allocations: need "
+            << totalSize << " bytes, have " << bytesBetweenBuffers << " bytes";
+      }
+    }
+    return success();
+  }
+
+  llvm_unreachable("unexpected element type in reuse group");
+}
+```
+
+**Key insight**: The `bytes_between_buffers` is the available space per buffer index. For `distinct` groups, we verify that the sum of all allocation sizes fits within this space.
+
+### Step 4: Eliminate SetBufferOverlapOp
+
+After processing each `SetBufferOverlapOp`:
+1. Mark the `storage_alias_spec` as processed
+2. Erase the `SetBufferOverlapOp` from the IR
+3. Erase all `ReuseGroupOp` operations that are no longer needed
+
+### Step 5: Validation
+
+After all `SetBufferOverlapOp` operations are processed:
+1. **Error if duplicate**: If a `storage_alias_spec` has multiple `SetBufferOverlapOp` referencing it, emit an error
+2. **Error if remaining**: If any `SetBufferOverlapOp` remains in the IR after the pass, emit an error
+
+---
+
+## IR Changes
+
+### In-Memory Offset Mapping
+
+Instead of storing `buffer_offset` and `bytes_between_buffers` as IR attributes on `LocalAliasOp`, the offset information is kept in an in-memory data structure. This is passed through the lowering pass steps:
+
+```cpp
+// In StorageAliasLowering.cpp
+DenseMap<Value, std::pair<int64_t, int64_t>> localAliasOffsetMap;
+// Maps: LocalAliasOp result -> (buffer_offset, bytes_between_buffers)
+```
+
+Where:
+- **`buffer_offset`**: The starting offset (in bytes) from the base of the storage alias spec for buffer index 0
+- **`bytes_between_buffers`**: The stride (in bytes) between the **starting points** of consecutive buffer indices
+
+This approach has several advantages:
+1. **Simpler IR**: `LocalAliasOp` remains a pure aliasing operation without additional attributes
+2. **No verifier complexity**: No need to verify that attributes are zero until lowering runs
+3. **Encapsulation**: Offset information is only visible within the lowering pass where it's needed
+
+---
+
+## C++ Implementation
+
+The buffer offset calculation is implemented as C++ helper functions called from `add_tlx_storage_alias_lowering`. This is NOT a standalone MLIR pass.
+
+### Integration Point: `add_tlx_storage_alias_lowering`
+
+```cpp
+// In triton_tlx.cc
+
+void add_tlx_storage_alias_lowering(mlir::ModuleOp module) {
+  // ... existing lowering logic ...
+
+  // Process SetBufferOverlapOps and calculate offsets
+  if (failed(processBufferOverlapOps(module))) {
+    llvm::report_fatal_error("Failed to process buffer overlap definitions");
+  }
+
+  // ... continue with allocation lowering ...
+}
+```
+
+### Buffer Offset Calculation
+
+The main entry point `processBufferOverlapOps` does the following:
+
+1. Collects all `SetBufferOverlapOp` operations
+2. For each operation:
+   - Check for duplicate `set_buffer_overlap` on the same spec (error if found)
+   - Compute `bytes_between_buffers = totalBytes / numBuffers`
+   - Recursively assign offsets to all allocations in the reuse group tree
+   - Erase the `SetBufferOverlapOp`
+3. Verify no unprocessed `SetBufferOverlapOp` remains
+4. Clean up unused `ReuseGroupOp` operations
+
+```cpp
+mlir::LogicalResult assignOffsets(mlir::Value element, int64_t currentOffset,
+                                  int64_t bytesBetweenBuffers,
+                                  mlir::OpBuilder &builder) {
+  if (auto allocOp = element.getDefiningOp<tlx::StorageAliasLocalAllocOp>()) {
+    // Error if attributes are already set (may have been manually specified)
+    if (allocOp.getBufferOffset() || allocOp.getBytesBetweenBuffers()) {
+      return allocOp.emitError("buffer layout attributes already set; "
+                               "cannot process set_buffer_overlap");
+    }
+
+    // Set the offset attributes
+    allocOp.setBufferOffsetAttr(builder.getI64IntegerAttr(currentOffset));
+    allocOp.setBytesBetweenBuffersAttr(builder.getI64IntegerAttr(bytesBetweenBuffers));
+    return mlir::success();
+  }
+
+  if (auto reuseGroupOp = element.getDefiningOp<tlx::ReuseGroupOp>()) {
+    if (reuseGroupOp.getGroupKind() == tlx::ReuseGroupKind::shared) {
+      // All children start at the same offset
+      for (auto child : reuseGroupOp.getElements()) {
+        if (mlir::failed(assignOffsets(child, currentOffset, bytesBetweenBuffers, builder)))
+          return mlir::failure();
+      }
+    } else {  // distinct
+      // Children are placed sequentially
+      int64_t runningOffset = currentOffset;
+      for (auto child : reuseGroupOp.getElements()) {
+        if (mlir::failed(assignOffsets(child, runningOffset, bytesBetweenBuffers, builder)))
+          return mlir::failure();
+        runningOffset += getElementSize(child);
+      }
+
+      // Verify we have enough space
+      int64_t totalSize = runningOffset - currentOffset;
+      if (totalSize > bytesBetweenBuffers) {
+        return reuseGroupOp.emitError()
+            << "not enough space for distinct allocations: need "
+            << totalSize << " bytes, have " << bytesBetweenBuffers << " bytes";
+      }
+    }
+    return mlir::success();
+  }
+
+  llvm_unreachable("unexpected element type in reuse group");
+}
+```
+
+**Key behavior**:
+- If `buffer_offset` or `bytes_between_buffers` is already set on an allocation, it's an error
+- For `shared` groups: all children get the same offset
+- For `distinct` groups: children are placed sequentially, with size validation
+
+---
+
+## Example IR Transformation
+
+### Input (after Phase 4)
+
+```mlir
+tt.func @kernel() {
+  %spec = tlx.storage_alias_spec storage = smem, size = 32768 : !tlx.storage_alias_spec<smem, 32768>
+
+  // QK: 2 x 64 x 64 x f32 = 32768 bytes total, 16384 per buffer
+  %qk = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768>
+        -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+
+  // P: 2 x 64 x 64 x f16 = 16384 bytes total, 8192 per buffer
+  %p = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768>
+       -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+
+  // Alpha: 2 x 64 x f32 = 512 bytes total, 256 per buffer
+  %alpha = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768>
+           -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+
+  // P and alpha are distinct, QK shares with (P, alpha)
+  %inner = tlx.reuse_group(%p, %alpha) group_kind = distinct : ... -> !tlx.reuse_group<distinct>
+  %outer = tlx.reuse_group(%qk, %inner) group_kind = shared : ... -> !tlx.reuse_group<shared>
+
+  tlx.set_buffer_overlap(%spec, %outer) : ...
+
+  tt.return
+}
+```
+
+### After Buffer Offset Calculation (within TLXStorageAliasLowering)
+
+After the offset calculation step, the offsets are stored in an in-memory map (not as IR attributes). The `SetBufferOverlapOp` and `ReuseGroupOp` are eliminated:
+
+```mlir
+tt.func @kernel() {
+  %spec = tlx.storage_alias_spec storage = smem, size = 32768 : !tlx.storage_alias_spec<smem, 32768>
+
+  // space_per_buffer = 32768 / 2 = 16384 bytes
+  // bytes_between_buffers = 16384 (stored in offsetMap, not as attributes)
+
+  // QK: offset = 0 (shared group starts at 0)
+  %qk = tlx.storage_alias_local_alloc %spec
+        : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+
+  // P: offset = 0 (first in distinct group which shares with QK)
+  %p = tlx.storage_alias_local_alloc %spec
+       : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+
+  // Alpha: offset = 8192 (after P in distinct group: 0 + 8192 = 8192)
+  %alpha = tlx.storage_alias_local_alloc %spec
+           : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+
+  // SetBufferOverlapOp and ReuseGroupOps are eliminated
+  // offsetMap contains:
+  //   %qk -> (buffer_offset=0, bytes_between_buffers=16384)
+  //   %p -> (buffer_offset=0, bytes_between_buffers=16384)
+  //   %alpha -> (buffer_offset=8192, bytes_between_buffers=16384)
+
+  tt.return
+}
+```
+
+### Memory Layout Visualization
+
+```
+Buffer Index 0 (offset 0-16383):
+|<-- QK (0-16383, 16384 bytes) ------------------------------------------->|
+|<-- P (0-8191, 8192 bytes) ---------->|<-- Alpha (8192-8447, 256 bytes) ->|
+
+Buffer Index 1 (offset 16384-32767):
+|<-- QK (16384-32767, 16384 bytes) ------------------------------------------->|
+|<-- P (16384-24575, 8192 bytes) ------>|<-- Alpha (24576-24831, 256 bytes) -->|
+```
+
+---
+
+## Error Cases
+
+### Error: Not Enough Space for Distinct Allocations
+
+```python
+spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem, buffer_size_bytes=1024)
+a = tlx.local_alloc((64, 64), tl.float32, 2, reuse=spec)  # 16384 bytes per buffer
+b = tlx.local_alloc((64, 64), tl.float32, 2, reuse=spec)  # 16384 bytes per buffer
+
+# Error: distinct requires 32768 bytes but only 512 per buffer available
+spec.set_buffer_overlap(
+    tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.distinct)
+)
+```
+
+Error message:
+```
+error: 'tlx.reuse_group' op not enough space for distinct allocations: need 32768 bytes, have 512 bytes
+```
+
+### Error: Duplicate set_buffer_overlap
+
+```python
+spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+a = tlx.local_alloc((64, 64), tl.float32, 2, reuse=spec)
+b = tlx.local_alloc((64, 64), tl.float32, 2, reuse=spec)
+
+# First overlap definition
+spec.set_buffer_overlap(
+    tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared)
+)
+
+# Error: duplicate overlap definition for same spec
+spec.set_buffer_overlap(
+    tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.distinct)
+)
+```
+
+Error message:
+```
+error: 'tlx.set_buffer_overlap' op storage_alias_spec already has a set_buffer_overlap defined; each spec can only have one overlap definition
+```
+
+### Error: Unprocessed set_buffer_overlap
+
+If for some reason a `SetBufferOverlapOp` is not processed (e.g., malformed IR):
+
+```
+error: 'tlx.set_buffer_overlap' op set_buffer_overlap was not processed by ReusedBufferOffsetCalculationPass
+```
+
+---
+
+## Testing Plan
+
+### Unit Tests
+
+1. **Basic offset calculation tests**
+   - Two allocations with `shared`: both get offset 0
+   - Two allocations with `distinct`: sequential offsets
+   - Three or more allocations with `distinct`
+
+2. **Nested reuse group tests**
+   - `shared` containing `distinct`: inner elements get sequential offsets
+   - `distinct` containing `shared`: shared group counts as max size
+   - Three-level nesting
+
+3. **Error case tests**
+   - Not enough space for `distinct` allocations
+   - Duplicate `set_buffer_overlap` on same spec
+   - Unprocessed `set_buffer_overlap` remaining after pass
+
+4. **bytes_between_buffers tests**
+   - Verify correct stride calculation
+   - Different num values
+
+### MLIR Lit Tests
+
+```mlir
+// RUN: triton-opt %s --tlx-reused-buffer-offset-calculation --verify-each=false | FileCheck %s
+
+// Test: basic shared offset calculation
+#shared = #ttg.swizzled_shared<{...}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @test_shared_offset
+  tt.func @test_shared_offset() {
+    %spec = tlx.storage_alias_spec storage = smem, size = 32768 : !tlx.storage_alias_spec<smem, 32768>
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 16384 : i64}
+    %a = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 16384 : i64}
+    %b = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+
+    %group = tlx.reuse_group(%a, %b) group_kind = shared : (...) -> !tlx.reuse_group<shared>
+    tlx.set_buffer_overlap(%spec, %group) : (...) -> ()
+
+    // CHECK-NOT: tlx.set_buffer_overlap
+    // CHECK-NOT: tlx.reuse_group
+    tt.return
+  }
+}
+
+// -----
+
+// Test: distinct offset calculation
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @test_distinct_offset
+  tt.func @test_distinct_offset() {
+    %spec = tlx.storage_alias_spec storage = smem, size = 65536 : !tlx.storage_alias_spec<smem, 65536>
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 32768 : i64}
+    %a = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 16384 : i64, bytes_between_buffers = 32768 : i64}
+    %b = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+
+    %group = tlx.reuse_group(%a, %b) group_kind = distinct : (...) -> !tlx.reuse_group<distinct>
+    tlx.set_buffer_overlap(%spec, %group) : (...) -> ()
+
+    tt.return
+  }
+}
+```
+
+### Error Test Cases
+
+Create a separate file for error tests with `--verify-diagnostics`:
+
+```mlir
+// RUN: triton-opt %s --tlx-reused-buffer-offset-calculation --verify-diagnostics
+
+// Test: duplicate set_buffer_overlap
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @test_duplicate_overlap() {
+    %spec = tlx.storage_alias_spec storage = smem, size = 32768 : !tlx.storage_alias_spec<smem, 32768>
+    %a = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, ...>
+    %b = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf16, ...>
+
+    %group1 = tlx.reuse_group(%a, %b) group_kind = shared : (...) -> !tlx.reuse_group<shared>
+    tlx.set_buffer_overlap(%spec, %group1) : (...) -> ()
+
+    %group2 = tlx.reuse_group(%a, %b) group_kind = distinct : (...) -> !tlx.reuse_group<distinct>
+    // expected-error @+1 {{storage_alias_spec already has a set_buffer_overlap defined}}
+    tlx.set_buffer_overlap(%spec, %group2) : (...) -> ()
+
+    tt.return
+  }
+}
+
+// -----
+
+// Test: not enough space for distinct allocations
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @test_insufficient_space() {
+    // Only 1024 bytes total = 512 per buffer, but need 32768
+    %spec = tlx.storage_alias_spec storage = smem, size = 1024 : !tlx.storage_alias_spec<smem, 1024>
+    %a = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, ...>
+    %b = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, ...>
+
+    // expected-error @+1 {{not enough space for distinct allocations}}
+    %group = tlx.reuse_group(%a, %b) group_kind = distinct : (...) -> !tlx.reuse_group<distinct>
+    tlx.set_buffer_overlap(%spec, %group) : (...) -> ()
+
+    tt.return
+  }
+}
+```
+
+---
+
+## Pass Pipeline Integration
+
+The pass should be added to the TLX pipeline after `SharedBufferSizeDefinitionPass`:
+
+```cpp
+void addTLXPasses(OpPassManager &pm) {
+  // Phase 2 passes
+  pm.addPass(createSharedBufferSizeDefinitionPass());
+
+  // Phase 5 pass
+  pm.addPass(createReusedBufferOffsetCalculationPass());
+
+  // Phase 2 passes (continued)
+  pm.addPass(createSharedBufferAllocationPass());
+}
+```
+
+**Pass ordering**:
+1. `SharedBufferSizeDefinitionPass` - compute buffer sizes
+2. `ReusedBufferOffsetCalculationPass` - compute offsets based on reuse groups (NEW)
+3. `SharedBufferAllocationPass` - materialize allocations
+
+---
+
+## Summary
+
+Phase 5 delivers the buffer offset calculation based on reuse group definitions:
+
+| Component | Description |
+|-----------|-------------|
+| `buffer_offset` attribute | Starting offset for buffer index 0 |
+| `bytes_between_buffers` attribute | Stride between buffer indices |
+| `ReusedBufferOffsetCalculationPass` | Computes offsets from reuse group tree |
+| Verifier update | Ensures attributes are zero until pass runs |
+| Error handling | Insufficient space and duplicate overlap errors |
+
+### Key Design Decisions
+
+1. **Greedy processing**: For `shared` groups, all elements start at offset 0. For `distinct` groups, elements are assigned offsets sequentially in order.
+
+2. **Size calculation**: `shared` uses max element size, `distinct` uses sum of element sizes.
+
+3. **Space validation**: The pass emits an error if `distinct` elements don't fit in the available `space_per_buffer`.
+
+4. **Single overlap per spec**: Each `storage_alias_spec` can have at most one `set_buffer_overlap` definition.
+
+5. **Clean elimination**: `SetBufferOverlapOp` and unused `ReuseGroupOp` operations are removed after processing.
+
+---
+
+# Phase 6: LLVM Lowering for Buffer Padding via Shape Transformation
+
+This phase addresses how the `buffer_offset` and `bytes_between_buffers` values computed in Phase 5 are used during lowering. These values are stored in an in-memory hashmap (not as IR attributes) and used to transform accesses.
+
+## Alternatives Considered
+
+Two alternative approaches were considered but rejected:
+
+1. **Extend `MemDescReinterpretOp` and `MemDescIndexOp`**: Add optional `buffer_offset` and `bytes_between_buffers` attributes to the existing TritonGPU operations and update their LLVM lowering to use these values.
+
+2. **Introduce custom IR nodes**: Create new TLX-specific operations (`PaddedMemDescReinterpretOp`, `PaddedMemDescIndexOp`) that explicitly carry offset/stride information.
+
+Both alternatives were rejected because they may violate assumptions in the `LinearLayout` system. The `LinearLayout` infrastructure computes physical addresses from logical coordinates based on the allocation shape. Introducing explicit offsets or non-standard strides that don't match the shape would break these assumptions, potentially causing incorrect address calculations in swizzled shared memory layouts. These could be harmless, but given the lack of a compelling use
+case it seems safer to avoid them.
+
+## Chosen Approach: Shape Transformation with Index Rewriting
+
+The chosen approach transforms the IR by modifying the allocation shape to absorb padding, then rewrites all buffer index accesses to use scaled indices. This leverages the existing `MemDescIndexOp` stride computation without any changes to the lowering, ensuring full compatibility with `LinearLayout`.
+
+In effect this is equivalent to the manual padding that users were previously required to apply to their allocation shapes. The difference is that the padding is now computed automatically based on the reuse group definitions, the reduce mistakes
+and move complexity to the compiler.
+
+### Core Concept
+
+Padding between buffers can be represented as an expanded buffer dimension:
+
+**Example 1: Padding doubles the buffer stride**
+
+```
+Original:
+  Shape: 2 x 4 x 8 (2 buffers, each 4x8 = 32 elements = 64 bytes for fp16)
+  bytes_between_buffers: 128 bytes (64 bytes padding per buffer)
+  buffer_offset: 0
+
+Transformed:
+  Shape: 4 x 4 x 8 (doubled buffer dimension)
+  Access buffer[i] becomes buffer[2*i]
+
+Physical layout:
+  [buffer 0 data][padding][buffer 1 data][padding]
+  [   64 bytes  ][64 bytes][  64 bytes  ][64 bytes]
+       ↑                         ↑
+    index 0                   index 2
+```
+
+**Example 2: Padding with offset**
+
+```
+Original:
+  Shape: 2 x 4 x 8 (2 buffers)
+  bytes_between_buffers: 128 bytes
+  buffer_offset: 64 bytes (starts at second "slot")
+
+Transformed:
+  Shape: 4 x 4 x 8 (doubled buffer dimension)
+  Access buffer[i] becomes buffer[2*i + 1]
+
+Physical layout:
+  [padding][buffer 0 data][padding][buffer 1 data]
+  [64 bytes][  64 bytes  ][64 bytes][  64 bytes  ]
+       ↑          ↑            ↑          ↑
+    index 0    index 1      index 2    index 3
+```
+
+### Mathematical Formulation
+
+Given:
+- `original_buffer_size`: size of one buffer in bytes = `product(shape[1:]) * element_size`
+- `bytes_between_buffers`: stride between buffer starts in bytes
+- `buffer_offset`: offset of buffer 0 from allocation base in bytes
+- `num_buffers`: original shape[0]
+
+Compute:
+```
+scale_factor = bytes_between_buffers / original_buffer_size
+offset_slots = buffer_offset / original_buffer_size
+
+new_buffer_dim = num_buffers * scale_factor + offset_slots
+new_shape = [new_buffer_dim] + shape[1:]
+
+// For access to logical buffer i:
+physical_index = scale_factor * i + offset_slots
+```
+
+**Constraints**:
+- `bytes_between_buffers` must be an integer multiple of `original_buffer_size`
+- `buffer_offset` must be an integer multiple of `original_buffer_size`
+
+### Implementation: Integrated into `TLXStorageAliasLowering` Pass
+
+The shape transformation and index rewriting logic is added as a new step in the existing `TLXStorageAliasLowering` pass. This combined pass already handles storage alias size computation, buffer overlap processing, and allocation materialization. Adding padding transformation here ensures correct ordering and avoids a separate pass.
+
+The `TLXStorageAliasLowering` pass is extended with a new Step 4:
+
+1. **Step 1 (existing)**: Compute or validate storage alias sizes
+2. **Step 2 (existing)**: Process buffer overlap operations (compute offsets)
+3. **Step 3 (existing)**: Materialize storage alias allocations (creates `LocalAliasOp`)
+4. **Step 4 (new)**: Transform padded accesses (rewrite `MemDescIndexOp` indices)
+
+```cpp
+// StorageAliasLowering.cpp (extended)
+
+// Forward declaration for the new step
+LogicalResult transformPaddedAccesses(ModuleOp m);
+
+struct TLXStorageAliasLoweringPass
+    : public impl::TLXStorageAliasLoweringBase<TLXStorageAliasLoweringPass> {
+public:
+  using impl::TLXStorageAliasLoweringBase<
+      TLXStorageAliasLoweringPass>::TLXStorageAliasLoweringBase;
+
+  void runOnOperation() override {
+    ModuleOp m = getOperation();
+
+    LDBG("Running TLXStorageAliasLowering (combined pass)");
+
+    // Step 1: Compute or validate storage alias sizes
+    LDBG("Step 1: Computing/validating storage alias sizes");
+    if (failed(computeOrValidateStorageAliasSizes(m))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Step 2: Process buffer overlap operations (compute offsets)
+    LDBG("Step 2: Processing buffer overlap operations");
+    DenseMap<Value, std::pair<int64_t, int64_t>> offsetMap;
+    if (failed(processBufferOverlapOps(m, offsetMap))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Step 3: Materialize storage alias allocations
+    LDBG("Step 3: Materializing storage alias allocations");
+    if (failed(materializeStorageAliasAllocations(m, offsetMap))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Step 4: Transform padded accesses (NEW)
+    // This rewrites MemDescIndexOp indices to account for buffer_offset
+    // and bytes_between_buffers by applying the formula:
+    //   physical_index = scale_factor * logical_index + offset_slots
+    LDBG("Step 4: Transforming padded accesses");
+    if (failed(transformPaddedAccesses(m))) {
+      signalPassFailure();
+      return;
+    }
+
+      LDBG("TLXStorageAliasLowering completed successfully");
+    }
+  };
+```
+
+### Step 4: Transform Padded Accesses
+
+The final step uses the offset information from `localAliasOffsetMap` to transform `MemDescIndexOp` indices:
+
+```cpp
+// NEW: Step 4 implementation - Transform padded accesses
+LogicalResult transformPaddedAccesses(
+    ModuleOp m,
+    const DenseMap<Value, std::pair<int64_t, int64_t>> &localAliasOffsetMap) {
+  OpBuilder builder(m.getContext());
+
+  // Process LocalAliasOps with non-default offset information from the map
+  for (auto &[aliasResult, offsets] : localAliasOffsetMap) {
+    int64_t bufferOffset = offsets.first;
+    int64_t bytesPerBuffer = offsets.second;
+
+    // Get the LocalAliasOp
+    auto aliasOp = aliasResult.getDefiningOp<tlx::LocalAliasOp>();
+    if (!aliasOp)
+      continue;
+
+    auto aliasType = cast<ttg::MemDescType>(aliasOp.getType());
+
+    // Compute original buffer size
+    auto aliasShape = aliasType.getShape();
+    int64_t elemBits = aliasType.getElementTypeBitWidth();
+    int64_t bufferElements = 1;
+    for (size_t i = 1; i < aliasShape.size(); ++i) {
+      bufferElements *= aliasShape[i];
+    }
+    int64_t bufferBytes = (bufferElements * elemBits) / 8;
+
+    // Validate constraints
+    if (bytesPerBuffer % bufferBytes != 0) {
+      return aliasOp.emitError(
+          "bytes_between_buffers must be multiple of buffer size");
+    }
+    if (bufferOffset % bufferBytes != 0) {
+      return aliasOp.emitError(
+          "buffer_offset must be multiple of buffer size");
+    }
+
+    int64_t scaleFactor = bytesPerBuffer / bufferBytes;
+    int64_t offsetSlots = bufferOffset / bufferBytes;
+
+    if (scaleFactor == 1 && offsetSlots == 0) {
+      // No transformation needed (default layout)
+      continue;
+    }
+
+    // Rewrite all MemDescIndexOp users with scaled indices
+    SmallVector<ttg::MemDescIndexOp> indexOps;
+    collectIndexOps(aliasOp.getResult(), indexOps);
+
+    for (auto indexOp : indexOps) {
+      builder.setInsertionPoint(indexOp);
+      Location loc = indexOp.getLoc();
+
+      Value originalIndex = indexOp.getIndex();
+
+      // Compute: newIndex = scaleFactor * originalIndex + offsetSlots
+      Value scaledIndex = originalIndex;
+      if (scaleFactor != 1) {
+        Value scaleVal = builder.create<arith::ConstantOp>(
+            loc, builder.getI32IntegerAttr(scaleFactor));
+        scaledIndex = builder.create<arith::MulIOp>(
+            loc, originalIndex, scaleVal);
+      }
+
+      Value newIndex = scaledIndex;
+      if (offsetSlots != 0) {
+        Value offsetVal = builder.create<arith::ConstantOp>(
+            loc, builder.getI32IntegerAttr(offsetSlots));
+        newIndex = builder.create<arith::AddIOp>(loc, scaledIndex, offsetVal);
+      }
+
+      // Update the index operand
+      indexOp.getIndexMutable().assign(newIndex);
+    }
+  }
+
+  return success();
+}
+
+void collectIndexOps(Value memDesc, SmallVector<ttg::MemDescIndexOp> &result) {
+  // Walk through all users, following through MemDescReinterpretOp
+  for (auto &use : memDesc.getUses()) {
+    Operation *user = use.getOwner();
+    if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(user)) {
+      result.push_back(indexOp);
+    } else if (auto reinterpret = dyn_cast<ttg::MemDescReinterpretOp>(user)) {
+      // Follow through reinterpret ops
+      collectIndexOps(reinterpret.getResult(), result);
+    } else if (auto alias = dyn_cast<tlx::LocalAliasOp>(user)) {
+      // Follow through nested aliases
+      collectIndexOps(alias.getResult(), result);
+    }
+  }
+}
+```
+
+### Identifying Accesses
+
+The primary challenge is correctly identifying all `MemDescIndexOp` operations that need rewriting. The access patterns include:
+
+#### Direct Access Pattern
+
+```mlir
+%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffers = 128}
+%view = ttg.memdesc_index %alias[%i]  // Direct user - easy to find
+```
+
+**Detection**: Walk `aliasOp.getResult().getUses()` directly.
+
+#### Access Through Reinterpret
+
+```mlir
+%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffers = 128}
+%reinterp = ttg.memdesc_reinterpret %alias : !type1 -> !type2
+%view = ttg.memdesc_index %reinterp[%i]  // Indirect user
+```
+
+**Detection**: Recursively follow through `MemDescReinterpretOp` users.
+
+#### Access Through Control Flow
+
+```mlir
+%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffers = 128}
+scf.if %cond {
+  scf.yield %alias
+} else {
+  scf.yield %other
+} -> %result
+%view = ttg.memdesc_index %result[%i]  // Merged value
+```
+
+**Detection**: Use MLIR's data flow analysis or conservative approximation. For control flow, the algorithm must follow through `scf.yield`, `scf.condition`, and `cf.branch` operations to find all reachable `MemDescIndexOp` uses.
+
+### IR Example: Before and After
+
+**Before transformation:**
+
+```mlir
+// 2 buffers of 4x8 fp16, with 128-byte stride and 64-byte offset
+%alloc = ttg.local_alloc : () -> !ttg.memdesc<4x4x8xf16, #shared>
+
+%alias = tlx.local_alias %alloc {
+  buffer_offset = 64,          // 32 elements
+  bytes_between_buffers = 128  // 64 elements
+} : !ttg.memdesc<4x4x8xf16> -> !ttg.memdesc<2x4x8xf16>
+
+// Access buffer 0: should access physical slot 1 (offset by 1)
+%c0 = arith.constant 0 : i32
+%view0 = ttg.memdesc_index %alias[%c0]
+
+// Access buffer 1: should access physical slot 3 (2*1 + 1)
+%c1 = arith.constant 1 : i32
+%view1 = ttg.memdesc_index %alias[%c1]
+```
+
+**After transformation:**
+
+```mlir
+// Allocation stays the same (4 slots available)
+%alloc = ttg.local_alloc : () -> !ttg.memdesc<4x4x8xf16, #shared>
+
+// Alias type updated to reflect physical layout
+%alias = tlx.local_alias %alloc : !ttg.memdesc<4x4x8xf16> -> !ttg.memdesc<4x4x8xf16>
+
+// Access buffer 0: newIndex = 2*0 + 1 = 1
+%c0 = arith.constant 0 : i32
+%scale = arith.constant 2 : i32
+%offset = arith.constant 1 : i32
+%scaled0 = arith.muli %c0, %scale : i32
+%idx0 = arith.addi %scaled0, %offset : i32  // idx0 = 1
+%view0 = ttg.memdesc_index %alias[%idx0]
+
+// Access buffer 1: newIndex = 2*1 + 1 = 3
+%c1 = arith.constant 1 : i32
+%scaled1 = arith.muli %c1, %scale : i32
+%idx1 = arith.addi %scaled1, %offset : i32  // idx1 = 3
+%view1 = ttg.memdesc_index %alias[%idx1]
+```
+
+### Constant Folding
+
+For constant indices (the common case), the arithmetic folds at compile time:
+
+```mlir
+// After canonicalization:
+%idx0 = arith.constant 1 : i32
+%view0 = ttg.memdesc_index %alias[%idx0]
+
+%idx1 = arith.constant 3 : i32
+%view1 = ttg.memdesc_index %alias[%idx1]
+```
+
+MLIR's built-in canonicalization patterns handle this automatically.
+
+### Pass Pipeline Integration
+
+The padding transformation is now part of Step 4 in the existing `TLXStorageAliasLowering` pass, so no additional pass is needed:
+
+```cpp
+void addTLXPasses(OpPassManager &pm) {
+  // Phase 5 + 6 combined: TLXStorageAliasLowering now handles:
+  //   Step 1: Compute/validate storage alias sizes
+  //   Step 2: Process buffer overlap operations (compute offsets)
+  //   Step 3: Materialize storage alias allocations (creates LocalAliasOp)
+  //   Step 4: Transform padded accesses (rewrite MemDescIndexOp indices)
+  pm.addPass(createTLXStorageAliasLoweringPass());
+
+  // Standard canonicalization to fold constant index arithmetic
+  pm.addPass(createCanonicalizerPass());
+
+  // Existing Phase 2 passes
+  pm.addPass(createTLXRewriteLocalAliasPass());
+}
+```
+
+This integrated approach has several advantages:
+
+1. **Correct ordering**: The transformation runs immediately after `LocalAliasOp` is created (Step 3), while the `buffer_offset` and `bytes_between_buffers` attributes are still available.
+2. **Single combined pass**: All storage alias lowering logic is in one place, making it easier to understand and maintain.
+3. **No pass ordering issues**: The transformation is guaranteed to run before any subsequent passes that might modify the IR.
+
+### Constraints and Limitations
+
+1. **Alignment requirement**: `bytes_between_buffers` and `buffer_offset` must be integer multiples of `buffer_size`. Non-aligned padding is not supported.
+
+2. **Memory overhead**: The expanded shape includes unused "padding slots" which waste memory.
+
+3. **Static buffer counts**: The number of buffers must be statically known to compute the expanded shape.
+
+---
+
 ## Future Work
 
 The following will be addressed in subsequent phases:
 
-1. **Phase 5**: Implement `ReusedBufferOffsetCalculationPass` to compute offsets based on overlap definitions
-2. **Phase 6**: Buffer reuse analysis warnings (optional performance tool)
-3. **Phase 6**: Deprecation path for existing `reuse=buffered_tensor` pattern
+1. **Phase 7**: Buffer reuse analysis warnings (optional performance tool)
+2. **Phase 8**: Deprecation path for existing `reuse=buffered_tensor` pattern
 
 ---
 
