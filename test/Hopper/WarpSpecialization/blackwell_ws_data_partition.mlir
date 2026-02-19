@@ -13,8 +13,8 @@
 #shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
-#tmem1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = false>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @_helion_attention_kernel
   tt.func public @_helion_attention_kernel(%q: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %k: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %v: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %lse: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %o: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {

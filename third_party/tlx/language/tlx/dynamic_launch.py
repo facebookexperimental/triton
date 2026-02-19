@@ -63,7 +63,11 @@ def _clc_query(
 
 
 @tl.builtin
-def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> tlx.CLCPipelineContext:
+def clc_create_context(num_consumers, num_stages: tl.tensor = 1, _semantic=None) -> tlx.CLCPipelineContext:
+    if not isinstance(num_stages, tl.constexpr):
+        num_stages = tl.constexpr(num_stages)
+    if not isinstance(num_consumers, tl.constexpr):
+        num_consumers = tl.constexpr(num_consumers)
     return tlx.CLCPipelineContext(
         clc_mbars_empty=alloc_barriers(num_barriers=num_stages, arrive_count=num_consumers, _semantic=_semantic),
         clc_mbars_full=alloc_barriers(num_barriers=num_stages, _semantic=_semantic),
@@ -72,7 +76,7 @@ def clc_create_context(num_stages: tl.tensor, num_consumers, _semantic=None) -> 
 
 
 @tl.builtin
-def clc_producer(context, k, p_producer, multi_ctas: bool = False, _semantic=None):
+def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _semantic=None):
     """
     Issue a CLC try_cancel request from the first CTA in the cluster.
 
@@ -111,8 +115,10 @@ def clc_producer(context, k, p_producer, multi_ctas: bool = False, _semantic=Non
     # Only CTA 0 waits on its LOCAL bar_empty (arrive remote, wait local)
     barrier_wait(bar_empty, p_producer, pred_cta0, _semantic=_semantic)
 
-    # Only CTA 0 sets barrier_expect_bytes
-    barrier_expect_bytes(bar_full, tl.constexpr(16), pred_cta0, _semantic=_semantic)
+    # ALL CTAs set barrier_expect_bytes on their local bar_full.
+    # The try_cancel with multicast::cluster::all signals the mbarrier on each
+    # CTA's shared memory, so each CTA needs its own barrier initialized.
+    barrier_expect_bytes(bar_full, tl.constexpr(16), _semantic=_semantic)
 
     # CLC issue - hardware handles multicast to all CTAs
     _clc_issue(
@@ -123,14 +129,16 @@ def clc_producer(context, k, p_producer, multi_ctas: bool = False, _semantic=Non
 
 
 @tl.builtin
-def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, _semantic=None):
+def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _semantic=None):
     """
     Decode the tile ID from a CLC response and signal completion.
 
     Multi-CTA Synchronization ("Arrive Remote, Wait Local"):
     ---------------------------------------------------------
-    - WAIT: Only CTA 0 waits on its LOCAL bar_full (predicated by pred_cta0).
-            CLC multicasts response to all CTAs, but only CTA 0 needs to wait.
+    - WAIT: ALL CTAs wait on their own LOCAL bar_full (unpredicated).
+            CLC try_cancel with multicast::cluster::all writes the response AND
+            signals the mbarrier in every CTA's shared memory. Each CTA must wait
+            on its own local mbarrier before reading the response.
     - QUERY: Extract tile_id from response. Automatically offset by cluster_cta_rank().
     - SIGNAL: All CTAs signal CTA 0's bar_empty via remote_cta_rank=0.
               This is valid because we can arrive at remote mbar, but not wait on it.
@@ -151,17 +159,11 @@ def clc_consumer(context, k, p_consumer, multi_ctas: bool = False, _semantic=Non
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
-    # Compute pred_cta0 internally for multi-CTA mode
-    if multi_ctas:
-        cta_rank = cluster_cta_rank(_semantic=_semantic)
-        zero = _semantic.builder.get_int32(0)
-        pred_cta0_handle = _semantic.builder.create_icmpEQ(cta_rank.handle, zero)
-        pred_cta0 = tl.tensor(pred_cta0_handle, tl.int1)
-    else:
-        pred_cta0 = None
-
-    # Only CTA 0 waits on its LOCAL bar_full
-    barrier_wait(bar_full, p_consumer, pred_cta0, _semantic=_semantic)
+    # ALL CTAs wait on their own LOCAL bar_full.
+    # The try_cancel.async with multicast::cluster::all signals the mbarrier
+    # in every CTA's shared memory, so each CTA must wait on its own copy
+    # before reading the CLC response.
+    barrier_wait(bar_full, p_consumer, _semantic=_semantic)
 
     # Extract tile_id (automatically offset by cluster_cta_rank())
     stolen_tile_id = _clc_query(response, _semantic=_semantic)

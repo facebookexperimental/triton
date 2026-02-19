@@ -371,6 +371,9 @@ class compilation_knobs(base_knobs):
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
+    dump_best_config_ir: env_bool = env_bool("TRITON_KERNEL_DUMP_BEST_CONFIG")
+    warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
+    rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
 
 
 class LaunchHook(Protocol):

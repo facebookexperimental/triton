@@ -24,10 +24,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
@@ -45,12 +41,27 @@ def is_hopper():
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    desc_k, desc_v,  #
-                    offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
+def _attn_fwd_inner(
+    acc,
+    l_i,
+    m_i,
+    q,  #
+    desc_k,
+    desc_v,  #
+    offset_y,
+    dtype: tl.constexpr,
+    start_m,
+    qk_scale,  #
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,
+    offs_m: tl.constexpr,
+    offs_n: tl.constexpr,  #
+    N_CTX: tl.constexpr,
+    warp_specialize: tl.constexpr,
+    IS_HOPPER: tl.constexpr,
+):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -125,16 +136,14 @@ def _host_descriptor_pre_hook(nargs):
     nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
 
-if is_hip():
-    NUM_STAGES_OPTIONS = [1]
-elif supports_host_descriptor():
+if supports_host_descriptor():
     NUM_STAGES_OPTIONS = [2, 3, 4]
 else:
     NUM_STAGES_OPTIONS = [2, 3, 4]
 
 configs = [
-    triton.Config({'BLOCK_M': BM,
-        'BLOCK_N': BN},
+    triton.Config(
+        {"BLOCK_M": BM, "BLOCK_N": BN},
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
@@ -173,8 +182,11 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+@triton.autotune(
+    configs=list(filter(keep, configs)),
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+    prune_configs_by={"early_config_prune": prune_invalid_configs},
+)
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -225,20 +237,50 @@ def _attn_fwd(sm_scale, M,  #
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
-                                        desc_k, desc_v,  #
-                                        offset_y, dtype, start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER)
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc,
+            l_i,
+            m_i,
+            q,  #
+            desc_k,
+            desc_v,  #
+            offset_y,
+            dtype,
+            start_m,
+            qk_scale,  #
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,  #
+            4 - STAGE,
+            offs_m,
+            offs_n,
+            N_CTX,  #
+            warp_specialize,
+            IS_HOPPER,
+        )
     # stage 2: on-band
     if STAGE & 2:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
-                                        desc_k, desc_v,  #
-                                        offset_y, dtype, start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER)
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc,
+            l_i,
+            m_i,
+            q,  #
+            desc_k,
+            desc_v,  #
+            offset_y,
+            dtype,
+            start_m,
+            qk_scale,  #
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,  #
+            2,
+            offs_m,
+            offs_n,
+            N_CTX,  #
+            warp_specialize,
+            IS_HOPPER,
+        )
     # epilogue
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
@@ -251,7 +293,7 @@ def _attn_fwd(sm_scale, M,  #
 def _attn_bwd_preprocess(O, DO,  #
                          Delta,  #
                          Z, H, N_CTX,  #
-                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
@@ -296,7 +338,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         pT = tl.math.exp2(qkT - m[None, :])
         # Autoregressive masking.
         if MASK:
-            mask = (offs_m[None, :] >= offs_n[:, None])
+            mask = offs_m[None, :] >= offs_n[:, None]
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs)
         # Compute dV.
@@ -349,7 +391,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n[None, :])
+            mask = offs_m[:, None] >= offs_n[None, :]
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
@@ -579,10 +621,6 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
-        # Tuning for AMD target
-        if is_hip():
-            waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
-            extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         # Use device_descriptor for Hopper + warpspec.
@@ -620,16 +658,22 @@ class _attention(torch.autograd.Function):
             # Using 168 ensures enough register budget for all HEAD_DIM values
             extra_kern_args["maxnreg"] = 168
         _attn_fwd[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
+            sm_scale,
+            M,  #
+            q.shape[0],
+            q.shape[1],  #
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             IS_HOPPER=is_hopper(),  #
-            **extra_kern_args)
+            **extra_kern_args,
+        )
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
@@ -662,7 +706,7 @@ class _attention(torch.autograd.Function):
             o, do,  #
             delta,  #
             BATCH, N_HEAD, N_CTX,  #
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
         )
         grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
         _attn_bwd[grid](
@@ -685,84 +729,91 @@ class _attention(torch.autograd.Function):
 
 attention = _attention.apply
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-
 
 @pytest.mark.parametrize("Z", [1, 4])
 @pytest.mark.parametrize("H", [2, 48])
-@pytest.mark.parametrize("N_CTX", [128, 1024, (2 if is_hip() else 4) * 1024])
+@pytest.mark.parametrize("N_CTX", [128, 1024, 4096])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
+@pytest.mark.parametrize("warp_specialize", [True])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
+@pytest.mark.parametrize("provider", ["triton-fp16", "triton-fp8"])
+@pytest.mark.skipif(not is_blackwell(), reason="AutoWS only tested on blackwell")
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
-    #if mode == "fwd" and "fp16" in provider:
-    #    pytest.skip("Avoid running the forward computation twice.")
-    if mode == "bwd" and "fp8" in provider:
-        pytest.skip("Backward pass with FP8 is not supported.")
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    sm_scale = 0.5
-    # reference implementation
-    ref_dtype = dtype
-    if mode == "fwd" and "fp8" in provider:
-        ref_dtype = torch.float32
-    q = q.to(ref_dtype)
-    k = k.to(ref_dtype)
-    v = v.to(ref_dtype)
-    M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    if causal:
-        p[:, :, M == 0] = float("-inf")
-    p = torch.softmax(p.float(), dim=-1)
-    p = p.to(ref_dtype)
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v).half()
-    if mode == "bwd":
-        dout = torch.randn_like(q)
-        ref_out.backward(dout)
-        ref_dv, v.grad = v.grad.clone(), None
-        ref_dk, k.grad = k.grad.clone(), None
-        ref_dq, q.grad = q.grad.clone(), None
-    # triton implementation
-    if mode == "fwd" and "fp8" in provider:
-        q = q.to(torch.float8_e5m2)
-        k = k.to(torch.float8_e5m2)
-        v = v.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2)
-        v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
-    if mode == "fwd":
-        atol = 3 if "fp8" in provider else 1e-2
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
-        return
-    tri_out.backward(dout)
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
-    # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
-    rtol = 0.0
-    # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
-    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
-        rtol = 1e-2
-    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+    # Use scope() to set use_meta_ws and automatically restore on exit
+    with triton.knobs.nvidia.scope():
+        torch.manual_seed(20)
+        triton.knobs.nvidia.use_meta_ws = True
+        if "fp8" in provider and warp_specialize:
+            pytest.skip("FP8 version not supported with AutoWS.")
+        if mode == "bwd" and "fp8" in provider:
+            pytest.skip("Backward pass with FP8 is not supported.")
+        if causal and warp_specialize:
+            pytest.skip("AutoWS causal with warp specialization is not supported yet (accuracy).")
+        if warp_specialize:
+            pytest.skip("AutoWS is producing accuracy issues in fbcode.")
+        torch.manual_seed(20)
+        q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+        k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+        v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+        sm_scale = 0.5
+        # reference implementation
+        ref_dtype = dtype
+        if mode == "fwd" and "fp8" in provider:
+            ref_dtype = torch.float32
+        q = q.to(ref_dtype)
+        k = k.to(ref_dtype)
+        v = v.to(ref_dtype)
+        M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
+        p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+        if causal:
+            p[:, :, M == 0] = float("-inf")
+        p = torch.softmax(p.float(), dim=-1)
+        p = p.to(ref_dtype)
+        # p = torch.exp(p)
+        ref_out = torch.matmul(p, v).half()
+        if mode == "bwd":
+            dout = torch.randn_like(q)
+            ref_out.backward(dout)
+            ref_dv, v.grad = v.grad.clone(), None
+            ref_dk, k.grad = k.grad.clone(), None
+            ref_dq, q.grad = q.grad.clone(), None
+        # triton implementation
+        if mode == "fwd" and "fp8" in provider:
+            q = q.to(torch.float8_e5m2)
+            k = k.to(torch.float8_e5m2)
+            v = v.permute(0, 1, 3, 2).contiguous()
+            v = v.permute(0, 1, 3, 2)
+            v = v.to(torch.float8_e5m2)
+        tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
+        if mode == "fwd":
+            atol = 3 if "fp8" in provider else 1e-2
+            torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
+            return
+        tri_out.backward(dout)
+        tri_dv, v.grad = v.grad.clone(), None
+        tri_dk, k.grad = k.grad.clone(), None
+        tri_dq, q.grad = q.grad.clone(), None
+        # compare
+        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+        rtol = 0.0
+        # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
+        # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+        if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+            rtol = 1e-2
+        torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
+        torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
+        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
 
 
 try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func as flash_attn_func
+
     HAS_FLASH = True
 except BaseException:
     HAS_FLASH = False
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
+TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []

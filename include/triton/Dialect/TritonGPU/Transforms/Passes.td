@@ -36,7 +36,9 @@ def TritonGPUAssignLatencies : Pass<"tritongpu-assign-latencies", "mlir::ModuleO
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
-           "number of pipeline stages">
+           "number of pipeline stages">,
+    Option<"useMetaWS", "use-meta-ws", "bool", /*default*/"false",
+           "Which WS path to use">
   ];
 }
 

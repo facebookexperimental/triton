@@ -1,30 +1,53 @@
 # third_party/tlx/codegen/async.py
 
 import ast
+import threading
 from typing import List
 import triton.language.extra.tlx as tlx  # Make sure async_task(s) are exposed via tlx.__init__.py
 from contextlib import contextmanager
 
-# TLX allows users to specify the replicate number when definine
+# TLX allows users to specify the replicate number when defining
 # a non-default partition region. We use a stack to keep track of
 # replica_id of the region being compiled.
-region_replica_id_stack: List[int] = []
-sub_region_has_exception = False
+#
+# Thread-local storage for TLX compiler state
+# This allows parallel compilation of TLX templates without race conditions
+_tlx_state = threading.local()
+
+
+def _get_region_replica_id_stack() -> List[int]:
+    """Get the thread-local region_replica_id_stack, initializing if needed."""
+    if not hasattr(_tlx_state, 'region_replica_id_stack'):
+        _tlx_state.region_replica_id_stack = []
+    return _tlx_state.region_replica_id_stack
+
+
+def _get_sub_region_has_exception() -> bool:
+    """Get the thread-local sub_region_has_exception flag."""
+    if not hasattr(_tlx_state, 'sub_region_has_exception'):
+        _tlx_state.sub_region_has_exception = False
+    return _tlx_state.sub_region_has_exception
+
+
+def _set_sub_region_has_exception(value: bool) -> None:
+    """Set the thread-local sub_region_has_exception flag."""
+    _tlx_state.sub_region_has_exception = value
 
 
 @contextmanager
 def tlx_enter_sub_region():
-    global region_replica_id_stack
-    global sub_region_has_exception
+    region_replica_id_stack = _get_region_replica_id_stack()
     replica_id_stack_backup = region_replica_id_stack.copy()
     try:
+        _set_sub_region_has_exception(False)
         yield
     except Exception as e:
-        sub_region_has_exception = True
+        _set_sub_region_has_exception(True)
         raise e
     finally:
-        if not sub_region_has_exception:
-            assert region_replica_id_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
+        if not _get_sub_region_has_exception():
+            current_stack = _get_region_replica_id_stack()
+            assert current_stack == replica_id_stack_backup, "region_replica_id_stack is not restored"
 
 
 def _is_async_task(self, node) -> bool:
@@ -35,6 +58,36 @@ def _is_async_task(self, node) -> bool:
             if withitemClass == tlx.async_task:
                 return True
     return False
+
+
+def _resolve_async_task_stmts(self, stmts):
+    """Resolve constexpr if-guards around async_task statements.
+
+    Statements inside async_tasks() must be either:
+      - `with tlx.async_task(...)` (passed through directly), or
+      - `if CONSTEXPR:` guarding one or more `with tlx.async_task(...)`.
+
+    For constexpr if-guards, the condition is evaluated at compile time and
+    only the active branch's async_task statements are included.
+    """
+    from triton.language.core import _unwrap_if_constexpr
+
+    resolved = []
+    for stmt in stmts:
+        if _is_async_task(self, stmt):
+            resolved.append(stmt)
+        elif isinstance(stmt, ast.If):
+            cond = self.visit(stmt.test)
+            cond = _unwrap_if_constexpr(cond)
+            active_block = stmt.body if cond else stmt.orelse
+            for inner_stmt in active_block:
+                assert _is_async_task(self, inner_stmt), ("Statements inside a constexpr if-guard within async_tasks() "
+                                                          "must be `with tlx.async_task(...)` blocks")
+                resolved.append(inner_stmt)
+        else:
+            assert False, ("Statements inside async_tasks() must be `with tlx.async_task(...)` "
+                           "blocks or constexpr if-guards around them")
+    return resolved
 
 
 def _get_async_task(self, node):
@@ -111,6 +164,9 @@ def visit_withAsyncTasks(self, node):
         liveins, _ = sr
         ip, last_loc = self._get_insertion_point_and_loc()
 
+        # Get thread-local region_replica_id_stack for this compilation
+        region_replica_id_stack = _get_region_replica_id_stack()
+
         def _flatten_value_handles(val):
             handles = []
             # Prefer the generic flatten hook to support multi-result values (e.g. tensor descriptors)
@@ -124,6 +180,23 @@ def visit_withAsyncTasks(self, node):
         # Ensure that stmts is iterable
         if not _is_list_like(stmts):
             stmts = [stmts]
+
+        # Resolve constexpr if-guards so that only async_task statements remain
+        stmts = _resolve_async_task_stmts(self, stmts)
+
+        # Check if only the default task remains after constexpr resolution.
+        # If so, skip warp specialization entirely and emit the default task inline.
+        has_non_default = False
+        for stmt in stmts:
+            task_check = _get_async_task(self, stmt)
+            if not task_check.is_default:
+                has_non_default = True
+                break
+
+        if not has_non_default:
+            for stmt in stmts:
+                self.visit(stmt)
+            return
 
         # dry visit async task body to count the number of sub tasks
         with tlx_enter_sub_region():
@@ -139,12 +212,10 @@ def visit_withAsyncTasks(self, node):
             perTaskStartIds = []
             perTaskReplicates = []
 
-            global region_replica_id_stack
             region_replica_id_stack.append(-1)  # dummy placeholder
 
             num_default = 0
             for stmt in stmts:
-                assert _is_async_task(self, stmt)
                 task = _get_async_task(self, stmt)
                 assert task.is_explict
                 assert task.replicate is not None, "Replicate must be non-None task"
@@ -203,7 +274,6 @@ def visit_withAsyncTasks(self, node):
         # dry visit async task body to calculate captures
         index = 0
         for stmt in stmts:
-            assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
             assert task.is_explict
             task_replicate = (task.replicate - 1) if task.is_default else task.replicate
@@ -235,7 +305,6 @@ def visit_withAsyncTasks(self, node):
         # real codegen
         index = 0
         for stmt in stmts:
-            assert _is_async_task(self, stmt)
             task = _get_async_task(self, stmt)
             if task.is_default:
                 region_replica_id_stack.append(0)

@@ -108,11 +108,11 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
+    def __init__(self, blockM, blockN, colStride, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
         self.blockN = blockN
-        self.unpacked = unpacked
+        self.colStride = colStride
         self.CTASplitM = CTASplitM
         self.CTASplitN = CTASplitN
 
@@ -125,7 +125,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         return cls(
             blockM=shape[0],
             blockN=shape[1],
-            unpacked=True,
+            colStride=1,
             CTASplitM=1,
             CTASplitN=1,
         )
@@ -134,7 +134,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         return builder.make_tensor_memory_encoding_attr(
             self.blockM,
             self.blockN,
-            self.unpacked,
+            self.colStride,
             self.CTASplitM,
             self.CTASplitN,
         )
@@ -281,6 +281,215 @@ class storage_kind(enum.Enum):
     smemCluster = "smemCluster"
 
 
+class DummyTMEMLayoutEncoding(layout_encoding):
+    """
+    Placeholder layout for TMEM tensors that will be resolved during layout propagation.
+    Used for sub-16-bit element types where the final layout depends on usage context
+    (e.g., as scales in scaled MMA operations).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def to_ir(self, builder: ir.builder):
+        return builder.make_dummy_tmem_layout_attr()
+
+    def __repr__(self):
+        return "DummyTMEMLayoutEncoding<>"
+
+    def __eq__(self, other):
+        return isinstance(other, DummyTMEMLayoutEncoding)
+
+    def __hash__(self):
+        return hash(self.__class__.__name__)
+
+
+class reuse_group_type(enum.Enum):
+    """
+    Type of buffer relationship within a reuse group.
+
+    - **shared**: Elements must logically occupy the same region in memory.
+      There is no cross-index overlap, and elements share the memory. Elements
+      are guaranteed to overlap at the same buffer index.
+    - **distinct**: Elements must be placed into non-overlapping regions of
+      memory. Elements can be accessed simultaneously without conflicts.
+
+    Example:
+        In the Flash Attention buffer sharing scheme:
+        - qk_tiles and (p_tiles, alpha, l, m) are **shared** because they
+          occupy the same logical memory region at each buffer index.
+        - p_tiles, alpha, l, and m are **distinct** because they must not
+          overlap with each other within a buffer index.
+
+    Note:
+        The "shared" requirement does not mean elements are identical or must
+        physically overlap. With infinite memory, elements could be placed in
+        completely separate regions. However, when elements are shared, the
+        user is responsible for proper synchronization via barriers.
+    """
+
+    shared = "shared"
+    distinct = "distinct"
+
+
+class reuse_group:
+    """
+    Defines buffer overlap relationships for memory allocations (shared memory or tensor memory).
+
+    A reuse_group organizes multiple buffers (or nested groups) into either:
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times and can
+      share the same physical memory.
+    - **distinct**: Elements must be placed in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The reuse_group forms a tree structure where:
+    - Leaf nodes are `buffered_tensor` objects
+    - Internal nodes are nested `reuse_group` objects
+    - The root defines the top-level sharing relationship
+
+    Note: The storage_alias_spec is NOT passed to reuse_group. Instead, the
+    spec is associated with the reuse group tree when passed to
+    `storage_alias_spec.set_buffer_overlap()`. Validation that all elements
+    reference the same storage_alias_spec is performed during that call.
+
+    Example - Flash Attention buffer sharing:
+        ```python
+        spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+        qk_tiles = tlx.local_alloc(..., reuse=spec)
+        p_tiles = tlx.local_alloc(..., reuse=spec)
+        alpha = tlx.local_alloc(..., reuse=spec)
+
+        # QK and (P, alpha) share the same memory region
+        # P and alpha are placed in distinct (non-overlapping) regions
+        # Note: spec is passed to set_buffer_overlap, not to reuse_group
+        spec.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
+        ```
+
+    Constraints:
+        - Nested reuse_groups must have different group_type than the parent.
+    """
+
+    def __init__(
+        self,
+        *args: "buffered_tensor | reuse_group",
+        group_type: reuse_group_type,
+    ):
+        """
+        Initialize a reuse group.
+
+        Args:
+            *args: buffered_tensor or reuse_group objects. Must not be empty.
+            group_type: The relationship type for elements in this group.
+                - shared: Elements occupy the same logical memory region.
+                - distinct: Elements must be in non-overlapping regions.
+
+        Raises:
+            ValueError: If args is empty.
+            ValueError: If a nested reuse_group has the same group_type as this group.
+            TypeError: If any element is not a buffered_tensor or reuse_group.
+        """
+        if len(args) == 0:
+            raise ValueError("reuse_group requires at least one element")
+
+        # Validate element types and check for nested same group_type
+        args = tuple(tl._unwrap_if_constexpr(elem) for elem in args)
+        for elem in args:
+            if isinstance(elem, reuse_group):
+                if elem.group_type == group_type:
+                    raise ValueError(f"Cannot nest reuse_group with the same group_type ({group_type.value}). "
+                                     f"Nested groups must alternate between 'shared' and 'distinct'.")
+            elif isinstance(elem, buffered_tensor):
+                pass  # Valid element type
+            else:
+                raise TypeError(f"reuse_group elements must be buffered_tensor or reuse_group, "
+                                f"got {type(elem).__name__}")
+
+        self._args = args
+        self._group_type = group_type
+
+    @property
+    def args(self) -> tuple:
+        """The elements in this group (read-only)."""
+        return self._args
+
+    @property
+    def group_type(self) -> reuse_group_type:
+        """The relationship type for this group (read-only)."""
+        return self._group_type
+
+    def _flatten_ir(self, handles) -> None:
+        """Recursively flatten IR handles from all elements in the group."""
+        for elem in self._args:
+            elem._flatten_ir(handles)
+
+    def to_ir(self, builder) -> ir.value:
+        """
+        Recursively lower this reuse_group tree to IR.
+
+        Args:
+            builder: The IR builder.
+
+        Returns:
+            The IR value representing the reuse_group.
+        """
+        # Collect IR values for elements
+        ir_elements = []
+        for elem in self._args:
+            if isinstance(elem, reuse_group):
+                # Recursively lower nested reuse_group
+                ir_elements.append(elem.to_ir(builder))
+            elif isinstance(elem, buffered_tensor):
+                # Get the memdesc handle from the buffered_tensor
+                ir_elements.append(elem.handle)
+            else:
+                raise TypeError(f"reuse_group element must be buffered_tensor or reuse_group, "
+                                f"got {type(elem).__name__}")
+
+        # Create the reuse_group IR operation
+        group_kind = self._group_type.value  # "shared" or "distinct"
+        return builder.create_reuse_group(ir_elements, group_kind)
+
+    def __repr__(self):
+        return f"reuse_group({self._args}, group_type={self._group_type.value})"
+
+
+class reuse_group_ir_type(tl.base_type):
+    """
+    Type for reuse group specifications in MLIR.
+
+    This type represents the MLIR ReuseGroupType and carries
+    the group kind (shared/distinct).
+    The storage kind is inferred from the elements and not stored in the type.
+    """
+
+    def __init__(
+        self,
+        group_kind: reuse_group_type,
+    ):
+        self._group_kind = group_kind
+
+    @property
+    def group_kind(self) -> reuse_group_type:
+        """The group kind (shared/distinct) (read-only)."""
+        return self._group_kind
+
+    def __eq__(self, other):
+        return (isinstance(other, reuse_group_ir_type) and self._group_kind == other._group_kind)
+
+    def __repr__(self) -> str:
+        return f"reuse_group_ir_type(group_kind={self._group_kind.value})"
+
+    def mangle(self) -> str:
+        return f"reuse_group_{self._group_kind.value}"
+
+
 class storage_alias_spec(tl.base_value):
     """
     Definition of a storage alias specification.
@@ -358,6 +567,61 @@ class storage_alias_spec(tl.base_value):
     def buffer_size_bytes(self) -> Optional[int]:
         """The explicit buffer size in bytes, or None if unsized (read-only)."""
         return self._buffer_size_bytes
+
+    @tl.builtin
+    def set_buffer_overlap(self, overlap_def: "reuse_group", _semantic=None) -> None:
+        """
+        Define the buffer overlap scheme for allocations using this storage alias spec.
+
+        This method specifies how buffers should be laid out in memory relative to
+        each other. The overlap_def is a reuse_group tree that defines:
+        - **shared**: Elements logically occupy the same memory region
+        - **distinct**: Elements must be in non-overlapping memory regions
+
+        This function lowers to an IR operation that links the storage alias spec
+        to its defined overlap scheme. The compiler will use this information to
+        compute buffer offsets in subsequent passes.
+
+        Note: This method should be called after all allocations using this
+        storage_alias_spec have been created, and the reuse_group should contain
+        all relevant buffered_tensor objects.
+
+        Args:
+            overlap_def: A reuse_group defining the buffer overlap relationships.
+            _semantic: Internal semantic parameter (passed automatically in JIT context).
+
+        Raises:
+            TypeError: If overlap_def is not a reuse_group.
+
+        Example:
+            ```python
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers
+            qk_tiles = tlx.local_alloc(..., reuse=spec)
+            p_tiles = tlx.local_alloc(..., reuse=spec)
+            alpha = tlx.local_alloc(..., reuse=spec)
+
+            # Define overlap scheme: QK shares with (P and alpha which are distinct)
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
+                    group_type=tlx.reuse_group_type.shared,
+                )
+            )
+            ```
+        """
+        overlap_def = tl._unwrap_if_constexpr(overlap_def)
+        # Validate input type
+        if not isinstance(overlap_def, reuse_group):
+            raise TypeError(f"overlap_def must be a reuse_group, got {type(overlap_def).__name__}")
+
+        # Recursively lower the reuse_group tree to IR
+        overlap_def_ir = overlap_def.to_ir(_semantic.builder)
+
+        # Create the set_buffer_overlap IR operation
+        _semantic.builder.create_set_buffer_overlap(self._handle, overlap_def_ir)
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self._handle)

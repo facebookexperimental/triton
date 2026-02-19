@@ -19,6 +19,28 @@ def TLX_StorageKindAttr : I32EnumAttr<
 }
 
 //===----------------------------------------------------------------------===//
+// Reuse Group Kind Enum
+//===----------------------------------------------------------------------===//
+
+def TLX_ReuseGroupKind_Shared : I32EnumAttrCase<"shared", 0, "shared">;
+def TLX_ReuseGroupKind_Distinct : I32EnumAttrCase<"distinct", 1, "distinct">;
+
+def TLX_ReuseGroupKindAttr : I32EnumAttr<
+    "ReuseGroupKind", "TLX reuse group kind for buffer overlap definitions",
+    [TLX_ReuseGroupKind_Shared, TLX_ReuseGroupKind_Distinct]> {
+  let cppNamespace = "::mlir::triton::tlx";
+  let description = [{
+    Defines the relationship between elements in a reuse group:
+
+    - **shared**: Elements must logically occupy the same region in memory.
+      There is no cross-index overlap, and elements share the memory at each
+      buffer index. Useful when buffers are used at different times.
+    - **distinct**: Elements must be placed into non-overlapping regions of
+      memory. Elements can be accessed simultaneously without conflicts.
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // TLX Type Base Class
 //===----------------------------------------------------------------------===//
 
@@ -65,6 +87,54 @@ def TLX_StorageAliasSpecType : TLXTypeDef<"StorageAliasSpec", "storage_alias_spe
   );
 
   let assemblyFormat = "`<` $storage (`,` $bufferSizeBytes^)? `>`";
+
+  let genVerifyDecl = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Reuse Group Type
+//===----------------------------------------------------------------------===//
+
+def TLX_ReuseGroupType : TLXTypeDef<"ReuseGroup", "reuse_group", []> {
+  let summary = "A reuse group type for buffer overlap definitions";
+
+  let description = [{
+    Represents a reuse group that defines buffer overlap relationships for
+    shared memory allocations. A reuse group organizes multiple buffers
+    (or nested groups) with a specific relationship type:
+
+    - **shared**: Elements logically occupy the same memory region at each
+      buffer index. Useful when buffers are used at different times.
+    - **distinct**: Elements must be in non-overlapping memory regions.
+      Useful when buffers need to be accessed simultaneously.
+
+    The reuse group forms a tree structure where leaf nodes are memory
+    allocations and internal nodes are nested reuse groups.
+
+    Constraints:
+    - All elements must have the same buffer count (num).
+    - All elements must use the same storage kind (smem or tmem).
+      The storage kind is inferred from the elements and not stored in the type.
+
+    Example:
+    ```mlir
+    // A and B share the same memory (used at different times)
+    %group = tlx.reuse_group(%a, %b) {group_type = shared}
+             : (!ttg.memdesc<...>, !ttg.memdesc<...>) -> !tlx.reuse_group<shared, 2>
+
+    // Nested groups for complex sharing schemes
+    %inner = tlx.reuse_group(%c, %d, %e) {group_type = distinct}
+             : (...) -> !tlx.reuse_group<distinct, 2>
+    %outer = tlx.reuse_group(%a, %inner) {group_type = shared}
+             : (...) -> !tlx.reuse_group<shared, 2>
+    ```
+  }];
+
+  let parameters = (ins
+    EnumParameter<TLX_ReuseGroupKindAttr>:$groupKind
+  );
+
+  let assemblyFormat = "`<` $groupKind `>`";
 
   let genVerifyDecl = 1;
 }

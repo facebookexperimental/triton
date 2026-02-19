@@ -110,3 +110,264 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// Reuse Group Tests
+//===----------------------------------------------------------------------===//
+
+// Test basic reuse_group with shared group_kind and smem storage
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reuse_group_shared_smem
+  tt.func @reuse_group_shared_smem() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[B:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[GROUP:.*]] = tlx.reuse_group(%[[A]], %[[B]]) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %3 = tlx.reuse_group(%1, %2) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    tt.return
+  }
+}
+
+// -----
+
+// Test reuse_group with distinct group_kind
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reuse_group_distinct_smem
+  tt.func @reuse_group_distinct_smem() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[B:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[GROUP:.*]] = tlx.reuse_group(%[[A]], %[[B]]) group_kind = distinct : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %3 = tlx.reuse_group(%1, %2) group_kind = distinct : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    tt.return
+  }
+}
+
+// -----
+
+// Test nested reuse_group (shared containing distinct)
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @nested_reuse_group_shared_distinct
+  tt.func @nested_reuse_group_shared_distinct() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[QK:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[P:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[ALPHA:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[INNER:.*]] = tlx.reuse_group(%[[P]], %[[ALPHA]]) group_kind = distinct : (!ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    // CHECK: %[[OUTER:.*]] = tlx.reuse_group(%[[QK]], %[[INNER]]) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %3 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %4 = tlx.reuse_group(%2, %3) group_kind = distinct : (!ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    %5 = tlx.reuse_group(%1, %4) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
+    tt.return
+  }
+}
+
+// -----
+
+// Test deeply nested reuse_group (3 levels)
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @deeply_nested_reuse_group
+  tt.func @deeply_nested_reuse_group() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[B:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[C:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[D:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[INNER:.*]] = tlx.reuse_group(%[[C]], %[[D]]) group_kind = shared : (!ttg.memdesc<2x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    // CHECK: %[[MIDDLE:.*]] = tlx.reuse_group(%[[B]], %[[INNER]]) group_kind = distinct : (!ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !tlx.reuse_group<shared>) -> !tlx.reuse_group<distinct>
+    // CHECK: %[[OUTER:.*]] = tlx.reuse_group(%[[A]], %[[MIDDLE]]) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %3 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %4 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %5 = tlx.reuse_group(%3, %4) group_kind = shared : (!ttg.memdesc<2x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    %6 = tlx.reuse_group(%2, %5) group_kind = distinct : (!ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !tlx.reuse_group<shared>) -> !tlx.reuse_group<distinct>
+    %7 = tlx.reuse_group(%1, %6) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
+    tt.return
+  }
+}
+
+// -----
+
+// Test reuse_group with single element
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reuse_group_single_element
+  tt.func @reuse_group_single_element() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[GROUP:.*]] = tlx.reuse_group(%[[A]]) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.reuse_group(%1) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    tt.return
+  }
+}
+
+// -----
+
+// Test reuse_group with multiple elements (more than 2)
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reuse_group_multiple_elements
+  tt.func @reuse_group_multiple_elements() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[B:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[C:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[D:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[GROUP:.*]] = tlx.reuse_group(%[[A]], %[[B]], %[[C]], %[[D]]) group_kind = distinct : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %3 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %4 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %5 = tlx.reuse_group(%1, %2, %3, %4) group_kind = distinct : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    tt.return
+  }
+}
+
+// -----
+
+// Test reuse_group with tmem storage
+// Note: #tmem binds to tensor_memory_encoding, memory space is #ttng.tensor_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reuse_group_shared_tmem
+  tt.func @reuse_group_shared_tmem() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = tmem : !tlx.storage_alias_spec<tmem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<2x64x64xf32, #tmem, #ttng.tensor_memory, mutable>
+    // CHECK: %[[B:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<2x64x64xf16, #tmem, #ttng.tensor_memory, mutable>
+    // CHECK: %[[GROUP:.*]] = tlx.reuse_group(%[[A]], %[[B]]) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x64x64xf16, #tmem, #ttng.tensor_memory, mutable>) -> !tlx.reuse_group<shared>
+    %0 = tlx.storage_alias_spec storage = tmem : !tlx.storage_alias_spec<tmem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<2x64x64xf32, #tmem, #ttng.tensor_memory, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<2x64x64xf16, #tmem, #ttng.tensor_memory, mutable>
+    %3 = tlx.reuse_group(%1, %2) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x64x64xf16, #tmem, #ttng.tensor_memory, mutable>) -> !tlx.reuse_group<shared>
+    tt.return
+  }
+}
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// set_buffer_overlap Tests
+//===----------------------------------------------------------------------===//
+
+// Test basic set_buffer_overlap with smem storage
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @set_buffer_overlap_basic
+  tt.func @set_buffer_overlap_basic() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[A:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    // CHECK: %[[B:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]] : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[GROUP:.*]] = tlx.reuse_group(%[[A]], %[[B]]) group_kind = shared
+    // CHECK: tlx.set_buffer_overlap(%[[ALIAS]], %[[GROUP]])
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %3 = tlx.reuse_group(%1, %2) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>) -> !tlx.reuse_group<shared>
+    tlx.set_buffer_overlap(%0, %3) : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Test set_buffer_overlap with nested reuse_group
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @set_buffer_overlap_nested
+  tt.func @set_buffer_overlap_nested() {
+    // CHECK: %[[ALIAS:.*]] = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    // CHECK: %[[QK:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]]
+    // CHECK: %[[P:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]]
+    // CHECK: %[[ALPHA:.*]] = tlx.storage_alias_local_alloc %[[ALIAS]]
+    // CHECK: %[[INNER:.*]] = tlx.reuse_group(%[[P]], %[[ALPHA]]) group_kind = distinct
+    // CHECK: %[[OUTER:.*]] = tlx.reuse_group(%[[QK]], %[[INNER]]) group_kind = shared
+    // CHECK: tlx.set_buffer_overlap(%[[ALIAS]], %[[OUTER]])
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %3 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %4 = tlx.reuse_group(%2, %3) group_kind = distinct : (!ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
+    %5 = tlx.reuse_group(%1, %4) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
+    tlx.set_buffer_overlap(%0, %5) : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// Buffer Layout Attribute Tests
+//===----------------------------------------------------------------------===//
+
+// Test storage_alias_local_alloc with explicit buffer_offset = 0 (valid default)
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @buffer_offset_zero
+  tt.func @buffer_offset_zero() {
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64}
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 {buffer_offset = 0 : i64} : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test storage_alias_local_alloc with explicit bytes_between_buffers = allocation size (valid default)
+// Allocation is 2x64x64xf32, so per-buffer size = 64*64*4 = 16384 bytes
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @bytes_between_buffers_default
+  tt.func @bytes_between_buffers_default() {
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {bytes_between_buffers = 16384 : i64}
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 {bytes_between_buffers = 16384 : i64} : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test storage_alias_local_alloc with both attributes set to valid defaults
+// Allocation is 2x64x64xf16, so per-buffer size = 64*64*2 = 8192 bytes
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @both_layout_attrs_default
+  tt.func @both_layout_attrs_default() {
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 8192 : i64}
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 {buffer_offset = 0 : i64, bytes_between_buffers = 8192 : i64} : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}

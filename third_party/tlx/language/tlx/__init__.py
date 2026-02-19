@@ -55,6 +55,9 @@ from .types import (
     mbarrier,
     mbarrier_type,
     nv_mma_shared_layout_encoding,
+    reuse_group,
+    reuse_group_ir_type,
+    reuse_group_type,
     storage_alias_spec as storage_alias_spec_type_class,
     storage_alias_spec_type,
     shared_layout_encoding,
@@ -74,6 +77,9 @@ from .utility import (
     stoch_round,
     thread_id,
 )
+from .mxfp8_utils import _to_mxfp8_block
+from .warp_ops import (
+    vote_ballot_sync, )
 
 __all__ = [
     # async_tasks
@@ -91,6 +97,8 @@ __all__ = [
     "storage_alias_spec",
     "storage_alias_spec_type",
     "storage_alias_spec_type_class",
+    "reuse_group",
+    "reuse_group_type",
     "mbarrier",
     "mbarrier_type",
     "clc_response",
@@ -152,4 +160,8 @@ __all__ = [
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
+    # MXFP8
+    "_to_mxfp8_block",
+    # warp_ops
+    "vote_ballot_sync",
 ]
