@@ -293,7 +293,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   }
   assert((elemBitWidth == 16 || elemBitWidth == 32) &&
          "TMEM Layout don't support fp8");
-  auto unpacked = elemBitWidth != 16;
+  unsigned colStride = 32 / elemBitWidth;
   // TODO(njriasan): Do we need to handle the ScaleDotElemType::E2M1 && transA
   // case at all from TCGen5MMAScaledOp::getBlockM?
   size_t CTASplitM;
@@ -312,8 +312,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
     assert(false && "Unsupported encoding");
   }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      context, blockM, blockN,
-      /*unpacked=*/unpacked, CTASplitM, CTASplitN);
+      context, blockM, blockN, colStride, CTASplitM, CTASplitN);
   if (highShape > 0) {
     llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};
     llvm::ArrayRef<int64_t> shape(shapeVec);
