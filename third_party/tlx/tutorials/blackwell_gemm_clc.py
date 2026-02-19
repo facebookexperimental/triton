@@ -72,8 +72,8 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                                        EPILOGUE_SUBTILE: tl.constexpr,  #
                                        ):
     # allocate NUM_SMEM_BUFFERS buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_SMEM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_SMEM_BUFFERS)
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
     # use multiple TMEM buffers to overlap MMA and epilogue
     tmem_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
 
@@ -125,16 +125,16 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                     # We load/store the result half by half to reduce SMEM pressure
                     acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_SIZE_N // 2)
                     result = tlx.local_load(acc_tmem_subslice1)
-                    c = result.to(tl.float16)
+                    c = result.to(tlx.dtype_of(c_desc))
                     c_desc.store([offs_am, offs_bn], c)
 
                     acc_tmem_subslice2 = tlx.subslice(acc_tmem, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
                     result = tlx.local_load(acc_tmem_subslice2)
-                    c = result.to(tl.float16)
+                    c = result.to(tlx.dtype_of(c_desc))
                     c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c)
                 else:
                     result = tlx.local_load(acc_tmem)
-                    c = result.to(tl.float16)
+                    c = result.to(tlx.dtype_of(c_desc))
                     c_desc.store([offs_am, offs_bn], c)
 
                 # done storing this buffer, signal MMA consumer to resume writing to it
@@ -249,7 +249,7 @@ def matmul(a, b, config=None):
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     # A dummy block value that will be overwritten when we have the real block size
     dummy_block = [1, 1]

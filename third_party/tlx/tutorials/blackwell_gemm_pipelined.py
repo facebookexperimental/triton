@@ -68,8 +68,8 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
     )
 
     # allocate NUM_STAGES buffers
-    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_STAGES)
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tl.float16, NUM_STAGES)
+    buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_STAGES)
+    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(b_ptr), NUM_STAGES)
     # allocate barriers
     dot_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
     load_bars = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
@@ -138,10 +138,10 @@ def matmul_kernel_tma_pipelined_blackwell(a_ptr, b_ptr, c_ptr, M, N, K, stride_a
 
     # load the result from TMEM to registers
     result = tlx.local_load(acc_tmem)
-    c = result.to(tl.float16)
+    c = result.to(tlx.dtype_of(c_ptr))
 
     # store the result to SMEM to prepare for TMA store (TMEM -> GMEM)
-    c_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float16, tl.constexpr(1))
+    c_buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tlx.dtype_of(c_ptr), tl.constexpr(1))
     c_smem = tlx.local_view(c_buffers, 0)
     tlx.local_store(c_smem, c)
     tlx.async_descriptor_store(desc_c, c_smem, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N])
@@ -155,7 +155,7 @@ def matmul(a, b, config=None):
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     # Initialize TMA descriptor storgae allocator
     triton.set_allocator(alloc_fn)

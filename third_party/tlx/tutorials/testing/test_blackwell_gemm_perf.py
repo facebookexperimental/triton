@@ -34,9 +34,10 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 """
 
 
-def create_benchmark(versions):
+def create_benchmark(versions, dtype=torch.float16):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
+    dtype_name = {torch.float16: "fp16", torch.bfloat16: "bf16"}[dtype]
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -46,12 +47,12 @@ def create_benchmark(versions):
             line_vals=line_vals,
             line_names=line_names,
             ylabel="TFLOPS",
-            plot_name="matmul-performance-fp16",
+            plot_name=f"matmul-performance-{dtype_name}",
             args={},
         ))
     def benchmark(M, N, K, provider):
-        a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-        b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+        a = torch.randn((M, K), device=DEVICE, dtype=dtype)
+        b = torch.randn((K, N), device=DEVICE, dtype=dtype)
         quantiles = [0.5, 0.2, 0.8]
         if provider == ref_lib.lower():
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=2000,
@@ -75,12 +76,21 @@ if __name__ == "__main__":
         choices=list(MATMUL_METHODS.keys()),
         help=f"Run only the specified version. Choices: {list(MATMUL_METHODS.keys())}",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="fp16",
+        choices=["fp16", "bf16"],
+        help="Data type for the benchmark (default: fp16)",
+    )
     args = parser.parse_args()
+
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
 
     if is_blackwell():
         versions = [args.version] if args.version else list(MATMUL_METHODS.keys())
-        print(f"Running benchmarks for: {versions}")
-        benchmark = create_benchmark(versions)
+        print(f"Running benchmarks for: {versions} (dtype={args.dtype})")
+        benchmark = create_benchmark(versions, dtype=dtype)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")
