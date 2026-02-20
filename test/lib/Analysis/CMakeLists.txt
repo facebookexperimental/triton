@@ -4,6 +4,7 @@ add_mlir_library(TritonTestAnalysis
   TestAllocation.cpp
   TestMembar.cpp
   TestPrintNesting.cpp
+  TestProgramIdAddress.cpp
 
   LINK_LIBS PUBLIC
   MLIRPass
