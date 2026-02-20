@@ -46,7 +46,8 @@ void AutomaticWarpSpecialization::runOnOperation() {
     return;
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
-  pm.addPass(createNVWSInsertAref());
+  // TODO: re-enable once the regression is fixed.
+  // pm.addPass(createNVWSInsertAref());
   pm.addPass(createTritonGPULoadMMASpecialization({numStages}));
   pm.addPass(createTritonGPURewritePartitionDependencies());
   // `int-range-optimizations` and SCCP are good at cleaning up loop arithmetic.
