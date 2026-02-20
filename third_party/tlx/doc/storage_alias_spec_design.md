@@ -1406,10 +1406,11 @@ Note: The storage_alias_spec is NOT passed to reuse_group directly in Python.
         - Nested reuse_groups must have different group_type than the parent.
     """
 
-    def __init__(
+      def __init__(
         self,
         *args: "buffered_tensor | reuse_group",
-        group_type: reuse_group_type,
+        group_type: Optional[reuse_group_type] = None,
+        group_size: int = 1,
     ):
         """
         Initialize a reuse group.
@@ -1419,10 +1420,25 @@ Note: The storage_alias_spec is NOT passed to reuse_group directly in Python.
             group_type: The relationship type for elements in this group.
                 - shared: Elements occupy the same logical memory region.
                 - distinct: Elements must be in non-overlapping regions.
+                Defaults to shared for groups with multiple elements.
+                For size-1 groups (single element), group_type can be omitted
+                and the group acts as a pure subtiling wrapper.
+            group_size: Multiplier for buffer grouping (subtiling). Defaults to 1.
+                When > 1, K consecutive buffers are treated as a single
+                logical group for offset calculation. This enables subtiling where
+                a logical buffer is divided into smaller chunks to minimize waiting
+                on data transfer.
+
+                For example, with group_size=2 on a tensor with 4 buffers:
+                - Buffers [0,1] are treated as logical group 0
+                - Buffers [2,3] are treated as logical group 1
+
+                This changes buffer count validation: after dividing by group_size,
+                all elements at each level must have identical effective buffer counts.
 
         Raises:
             ValueError: If args is empty.
-            ValueError: If a nested reuse_group has the same group_type as this group.
+            ValueError: If group_size is not a positive integer.
             TypeError: If any element is not a buffered_tensor or reuse_group.
         """
         ...
@@ -1435,6 +1451,15 @@ Note: The storage_alias_spec is NOT passed to reuse_group directly in Python.
     @property
     def group_type(self) -> reuse_group_type:
         """The relationship type for this group (read-only)."""
+        ...
+
+    @property
+    def group_size(self) -> int:
+        """The buffer grouping multiplier for subtiling (read-only).
+
+        Defaults to 1 (no grouping). When > 1, K consecutive buffers are
+        treated as a single logical group for offset calculation purposes.
+        ""
         ...
 ```
 
@@ -1916,7 +1941,7 @@ Phase 4 delivers the JIT interface for defining buffer overlap schemes:
 
 # Phase 5: Buffer Offset Calculation Pass
 
-This phase implements the `ReusedBufferOffsetCalculationPass`, which computes the `initial_offset` and `bytes_between_buffers` for each allocation based on the reuse group definitions. This pass processes `SetBufferOverlapOp` operations and assigns memory layout attributes to allocations.
+This phase implements the `ReusedBufferOffsetCalculationPass`, which computes the `initial_offset` and `bytes_between_buffer_groups` for each allocation based on the reuse group definitions. This pass processes `SetBufferOverlapOp` operations and assigns memory layout attributes to allocations.
 
 ---
 
@@ -1924,7 +1949,7 @@ This phase implements the `ReusedBufferOffsetCalculationPass`, which computes th
 
 This phase covers:
 - Buffer offset calculation logic integrated into `TLXStorageAliasLowering` pass
-- In-memory mapping from `LocalAliasOp` results to `(buffer_offset, bytes_between_buffers)` pairs
+- In-memory mapping from `LocalAliasOp` results to `(buffer_offset, bytes_between_buffer_groups)` pairs
 - Elimination of `SetBufferOverlapOp` after processing
 - Error handling for insufficient space and duplicate `set_buffer_overlap` calls
 
@@ -1943,21 +1968,21 @@ This phase covers:
 Each `storage_alias_local_alloc` produces a multi-buffered allocation with shape `[num, ...]`. The memory layout for a single allocation is:
 
 ```
-|<------ bytes_between_buffers ----->|
-|                                    |
-v                                    v
-|<--- buffer 0 --->|<--- padding --->|<--- buffer 1 --->|<--- padding --->|...
+|<------ bytes_between_buffer_groups ----->|
+|                                          |
+v                                          v
+|<--- buffer group 0 --->|<--- padding --->|<--- buffer group 1 --->|<--- padding --->|...
 ^
 buffer_offset
 ```
 
 Where:
-- **`buffer_offset`**: The starting offset (in bytes) from the base of the storage alias spec for buffer index 0
-- **`bytes_between_buffers`**: The stride (in bytes) between the **starting points** of consecutive buffer indices. This is the distance from the start of buffer N to the start of buffer N+1.
+- **`buffer_offset`**: The starting offset (in bytes) from the base of the storage alias spec for buffer group 0
+- **`bytes_between_buffer_groups`**: The stride (in bytes) between the **starting points** of consecutive buffer groups. This is the distance from the start of group K to the start of group K+1. When `group_size=1`, this is the distance between individual buffers. When `group_size=K`, members of the same group are placed contiguously.
 
 For a simple allocation without overlap:
 - `buffer_offset = 0`
-- `bytes_between_buffers = ceil(element_size * product(shape[1:]))` (i.e., the allocation size per buffer)
+- `bytes_between_buffer_groups = ceil(element_size * product(shape[1:]))` (i.e., the allocation size per buffer group)
 
 ### Reuse Group Offset Calculation
 
@@ -1967,58 +1992,167 @@ The reuse group tree defines how allocations are laid out relative to each other
 
 2. **distinct**: Elements are placed sequentially in memory. Each element's `buffer_offset` is computed as `parent_offset + sum(sizes of preceding elements)`. The group's size is the sum of all element sizes.
 
+### Group Size for Subtiling (Mixed Buffer Counts)
+
+The `group_size` attribute on `reuse_group` enables **subtiling**, where a single logical buffer is divided into smaller chunks to minimize waiting on data transfer. This is a notable performance optimization in kernels like Flash Attention.
+
+When `group_size=K` is specified on a reuse_group containing a single tensor:
+- K consecutive buffer indices are treated as a single **logical group**
+- The tensor's `bytes_between_buffer_groups` is the distance from the start of one K-buffer group to the start of the next K-buffer group
+- Members of the same group are placed contiguously
+- Buffer indices `[0, K-1]` map to logical group 0, `[K, 2K-1]` to logical group 1, etc.
+
+**Buffer Count Validation with group_size:**
+
+At each level of a reuse group, the **effective buffer count** must be identical across all elements. The effective buffer count is:
+
+```
+effective_num_buffers = num_buffers / group_size
+```
+
+Where `group_size` defaults to 1 (no grouping).
+
+**Example:** Consider a reuse group where QK has 2 buffers and P has 4 buffers with `group_size=2`:
+
+```python
+buffer_sharing = reuse_group(
+    qk_tiles,  # num=2
+    reuse_group(p_tiles, group_size=2),  # num=4, effective=2
+    group_type=shared
+)
+```
+
+- `qk_tiles`: effective_num_buffers = 2 / 1 = 2
+- `p_tiles`: effective_num_buffers = 4 / 2 = 2
+
+The effective counts match, so validation passes.
+
+**Offset Calculation with group_size:**
+
+For a tensor with `group_size=K`:
+
+```cpp
+int64_t element_bytes = getAllocationBytesPerBuffer(allocOp);
+int64_t group_bytes = element_bytes;  // Size per buffer is unchanged
+// bytes_between_buffer_groups for this allocation is scaled:
+int64_t alloc_bytes_between = bytesBetweenBufferGroups / groupSize;
+```
+
+**Memory Layout Example:**
+
+Consider `qk_tiles` (2 buffers, 128 bytes each) shared with `p_tiles` (4 buffers, 64 bytes each, `group_size=2`):
+
+```
+|<-------- 128 bytes -------->|<-------- 128 bytes -------->|
+|       qk_tiles[0]           |       qk_tiles[1]           |
+|  p_tiles[0] |  p_tiles[1]   |  p_tiles[2] |  p_tiles[3]   |
+|<-- 64 b -->|<-- 64 b -->    |<-- 64 b -->|<-- 64 b -->    |
+```
+
+For `qk_tiles`: `bytes_between_buffer_groups = 128`
+For `p_tiles`: `bytes_between_buffer_groups = 64` (128 / group_size=2)
+
+### Size-1 Reuse Groups for Subtiling
+
+When a reuse_group contains only a single element, the `group_type` parameter can be omitted. This simplifies the API for the common subtiling case:
+
+```python
+# Full form (verbose):
+reuse_group(p_tiles, group_type=shared, group_size=NUM_MMA_SLICES)
+
+# Simplified form (size-1 groups only):
+reuse_group(p_tiles, group_size=NUM_MMA_SLICES)
+```
+
+**Default behavior for group_type:**
+
+- For groups with **multiple elements**: `group_type` defaults to `shared`
+- For groups with **single element**: `group_type` can be omitted (no relationship to enforce)
+
+**Semantics of size-1 reuse groups:**
+
+When a reuse_group contains exactly one element:
+1. The group acts as a **subtiling wrapper** - it applies `group_size` scaling
+2. The element inherits offset calculation from its parent context
+3. No overlap relationship is enforced (there are no siblings to relate to)
+
+**Flash Attention Example:**
+
+```python
+buffer_sharing = reuse_group(
+    qk_tiles,
+    reuse_group(
+        reuse_group(p_tiles, group_size=NUM_MMA_SLICES),  # Subtiling wrapper
+        alpha,
+        l,
+        m,
+        group_type=distinct
+    ),
+    group_type=shared
+)
+```
+
+Here, `reuse_group(p_tiles, group_size=NUM_MMA_SLICES)` is a size-1 group that:
+- Applies subtiling (K=NUM_MMA_SLICES) to `p_tiles`
+- Participates as a single element in the outer `distinct` group
+- The `distinct` relationship is between the subtiled p_tiles and alpha/l/m
+
 ---
 
 ## Algorithm
 
-### Step 1: Calculate bytes_between_buffers (Static)
+### Step 1: Calculate bytes_between_buffer_groups (Static)
 
-The `bytes_between_buffers` is computed once for the entire `storage_alias_spec` and is the same for all allocations:
+The `bytes_between_buffer_groups` is computed once for the entire `storage_alias_spec` and is the same for all allocations at the root level:
 
 ```cpp
 int64_t totalBytes = specOp.getBufferSizeBytes();
 int64_t numBuffers = getNumBuffersForSpec(spec);  // From first allocation's shape[0]
-int64_t bytesBetweenBuffers = totalBytes / numBuffers;
+int64_t bytesBetweenBufferGroups = totalBytes / numBuffers;
 ```
 
-This value is static and represents the stride between buffer indices for all allocations sharing this spec.
+This value is static and represents the stride between buffer groups for all allocations sharing this spec. For children of shared groups with `group_size > 1`, this value is divided by the group_size.
 
 ### Step 2: Assign Offsets Recursively
 
-The algorithm recursively walks the reuse group tree, assigning `buffer_offset` to each allocation in the in-memory map. The `bytes_between_buffers` remains constant throughout.
+The algorithm recursively walks the reuse group tree, assigning `buffer_offset` to each allocation in the in-memory map. The `bytes_between_buffer_groups` is propagated down, and divided by `group_size` for shared groups with subtiling.
 
 ```cpp
 LogicalResult assignOffsets(Value element, int64_t currentOffset,
-                            int64_t bytesBetweenBuffers,
+                            int64_t bytesBetweenBufferGroups,
                             DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
     // Store the offset information in the map (NOT as IR attributes)
-    offsetMap[allocOp.getResult()] = {currentOffset, bytesBetweenBuffers};
+    offsetMap[allocOp.getResult()] = {currentOffset, bytesBetweenBufferGroups};
     return success();
   }
 
   if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
+    int64_t groupSize = reuseGroupOp.getGroupSize();
+
     if (reuseGroupOp.getGroupKind() == ReuseGroupKind::shared) {
+      // For subtiling: divide bytesBetweenBufferGroups by group_size
+      int64_t childBytesBetween = bytesBetweenBufferGroups / groupSize;
       // All children start at the same offset
       for (auto child : reuseGroupOp.getElements()) {
-        if (failed(assignOffsets(child, currentOffset, bytesBetweenBuffers, builder)))
+        if (failed(assignOffsets(child, currentOffset, childBytesBetween, offsetMap)))
           return failure();
       }
     } else {  // distinct
       // Children are placed sequentially
       int64_t runningOffset = currentOffset;
       for (auto child : reuseGroupOp.getElements()) {
-        if (failed(assignOffsets(child, runningOffset, bytesBetweenBuffers, builder)))
+        if (failed(assignOffsets(child, runningOffset, bytesBetweenBufferGroups, offsetMap)))
           return failure();
         runningOffset += getElementSize(child);
       }
 
       // Verify we have enough space
       int64_t totalSize = runningOffset - currentOffset;
-      if (totalSize > bytesBetweenBuffers) {
+      if (totalSize > bytesBetweenBufferGroups) {
         return reuseGroupOp.emitError()
             << "not enough space for distinct allocations: need "
-            << totalSize << " bytes, have " << bytesBetweenBuffers << " bytes";
+            << totalSize << " bytes, have " << bytesBetweenBufferGroups << " bytes";
       }
     }
     return success();
@@ -2028,7 +2162,7 @@ LogicalResult assignOffsets(Value element, int64_t currentOffset,
 }
 ```
 
-**Key insight**: The `bytes_between_buffers` is the available space per buffer index. For `distinct` groups, we verify that the sum of all allocation sizes fits within this space.
+**Key insight**: The `bytes_between_buffer_groups` is the available space per buffer group. For `distinct` groups, we verify that the sum of all allocation sizes fits within this space. For `shared` groups with `group_size > 1`, the spacing is divided to place K consecutive buffers contiguously within each logical group.
 
 ### Step 4: Eliminate SetBufferOverlapOp
 
@@ -2049,17 +2183,17 @@ After all `SetBufferOverlapOp` operations are processed:
 
 ### In-Memory Offset Mapping
 
-Instead of storing `buffer_offset` and `bytes_between_buffers` as IR attributes on `LocalAliasOp`, the offset information is kept in an in-memory data structure. This is passed through the lowering pass steps:
+Instead of storing `buffer_offset` and `bytes_between_buffer_groups` as IR attributes on `LocalAliasOp`, the offset information is kept in an in-memory data structure. This is passed through the lowering pass steps:
 
 ```cpp
 // In StorageAliasLowering.cpp
 DenseMap<Value, std::pair<int64_t, int64_t>> localAliasOffsetMap;
-// Maps: LocalAliasOp result -> (buffer_offset, bytes_between_buffers)
+// Maps: LocalAliasOp result -> (buffer_offset, bytes_between_buffer_groups)
 ```
 
 Where:
-- **`buffer_offset`**: The starting offset (in bytes) from the base of the storage alias spec for buffer index 0
-- **`bytes_between_buffers`**: The stride (in bytes) between the **starting points** of consecutive buffer indices
+- **`buffer_offset`**: The starting offset (in bytes) from the base of the storage alias spec for buffer group 0
+- **`bytes_between_buffer_groups`**: The stride (in bytes) between the **starting points** of consecutive buffer groups. When `group_size=K`, K consecutive buffers are placed contiguously within each group.
 
 This approach has several advantages:
 1. **Simpler IR**: `LocalAliasOp` remains a pure aliasing operation without additional attributes
@@ -2096,7 +2230,7 @@ The main entry point `processBufferOverlapOps` does the following:
 1. Collects all `SetBufferOverlapOp` operations
 2. For each operation:
    - Check for duplicate `set_buffer_overlap` on the same spec (error if found)
-   - Compute `bytes_between_buffers = totalBytes / numBuffers`
+   - Compute `bytes_between_buffer_groups = totalBytes / numBuffers`
    - Recursively assign offsets to all allocations in the reuse group tree
    - Erase the `SetBufferOverlapOp`
 3. Verify no unprocessed `SetBufferOverlapOp` remains
@@ -2104,18 +2238,18 @@ The main entry point `processBufferOverlapOps` does the following:
 
 ```cpp
 mlir::LogicalResult assignOffsets(mlir::Value element, int64_t currentOffset,
-                                  int64_t bytesBetweenBuffers,
+                                  int64_t bytesBetweenBufferGroups,
                                   mlir::OpBuilder &builder) {
   if (auto allocOp = element.getDefiningOp<tlx::StorageAliasLocalAllocOp>()) {
     // Error if attributes are already set (may have been manually specified)
-    if (allocOp.getBufferOffset() || allocOp.getBytesBetweenBuffers()) {
+    if (allocOp.getBufferOffset() || allocOp.getBytesBetweenBufferGroups()) {
       return allocOp.emitError("buffer layout attributes already set; "
                                "cannot process set_buffer_overlap");
     }
 
     // Set the offset attributes
     allocOp.setBufferOffsetAttr(builder.getI64IntegerAttr(currentOffset));
-    allocOp.setBytesBetweenBuffersAttr(builder.getI64IntegerAttr(bytesBetweenBuffers));
+    allocOp.setBytesBetweenBufferGroupsAttr(builder.getI64IntegerAttr(bytesBetweenBufferGroups));
     return mlir::success();
   }
 
@@ -2123,24 +2257,24 @@ mlir::LogicalResult assignOffsets(mlir::Value element, int64_t currentOffset,
     if (reuseGroupOp.getGroupKind() == tlx::ReuseGroupKind::shared) {
       // All children start at the same offset
       for (auto child : reuseGroupOp.getElements()) {
-        if (mlir::failed(assignOffsets(child, currentOffset, bytesBetweenBuffers, builder)))
+        if (mlir::failed(assignOffsets(child, currentOffset, bytesBetweenBufferGroups, builder)))
           return mlir::failure();
       }
     } else {  // distinct
       // Children are placed sequentially
       int64_t runningOffset = currentOffset;
       for (auto child : reuseGroupOp.getElements()) {
-        if (mlir::failed(assignOffsets(child, runningOffset, bytesBetweenBuffers, builder)))
+        if (mlir::failed(assignOffsets(child, runningOffset, bytesBetweenBufferGroups, builder)))
           return mlir::failure();
         runningOffset += getElementSize(child);
       }
 
       // Verify we have enough space
       int64_t totalSize = runningOffset - currentOffset;
-      if (totalSize > bytesBetweenBuffers) {
+      if (totalSize > bytesBetweenBufferGroups) {
         return reuseGroupOp.emitError()
             << "not enough space for distinct allocations: need "
-            << totalSize << " bytes, have " << bytesBetweenBuffers << " bytes";
+            << totalSize << " bytes, have " << bytesBetweenBufferGroups << " bytes";
       }
     }
     return mlir::success();
@@ -2151,7 +2285,7 @@ mlir::LogicalResult assignOffsets(mlir::Value element, int64_t currentOffset,
 ```
 
 **Key behavior**:
-- If `buffer_offset` or `bytes_between_buffers` is already set on an allocation, it's an error
+- If `buffer_offset` or `bytes_between_buffer_groups` is already set on an allocation, it's an error
 - For `shared` groups: all children get the same offset
 - For `distinct` groups: children are placed sequentially, with size validation
 
@@ -2196,7 +2330,7 @@ tt.func @kernel() {
   %spec = tlx.storage_alias_spec storage = smem, size = 32768 : !tlx.storage_alias_spec<smem, 32768>
 
   // space_per_buffer = 32768 / 2 = 16384 bytes
-  // bytes_between_buffers = 16384 (stored in offsetMap, not as attributes)
+    // bytes_between_buffer_groups = 16384 (stored in offsetMap, not as attributes)
 
   // QK: offset = 0 (shared group starts at 0)
   %qk = tlx.storage_alias_local_alloc %spec
@@ -2211,10 +2345,10 @@ tt.func @kernel() {
            : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
 
   // SetBufferOverlapOp and ReuseGroupOps are eliminated
-  // offsetMap contains:
-  //   %qk -> (buffer_offset=0, bytes_between_buffers=16384)
-  //   %p -> (buffer_offset=0, bytes_between_buffers=16384)
-  //   %alpha -> (buffer_offset=8192, bytes_between_buffers=16384)
+    // offsetMap contains:
+    //   %qk -> (buffer_offset=0, bytes_between_buffer_groups=16384)
+    //   %p -> (buffer_offset=0, bytes_between_buffer_groups=16384)
+  //   %alpha -> (buffer_offset=8192, bytes_between_buffer_groups=16384)
 
   tt.return
 }
@@ -2306,7 +2440,7 @@ error: 'tlx.set_buffer_overlap' op set_buffer_overlap was not processed by Reuse
    - Duplicate `set_buffer_overlap` on same spec
    - Unprocessed `set_buffer_overlap` remaining after pass
 
-4. **bytes_between_buffers tests**
+4. **bytes_between_buffer_groups tests**
    - Verify correct stride calculation
    - Different num values
 
@@ -2322,9 +2456,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @test_shared_offset
   tt.func @test_shared_offset() {
     %spec = tlx.storage_alias_spec storage = smem, size = 32768 : !tlx.storage_alias_spec<smem, 32768>
-    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 16384 : i64}
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffer_groups = 16384 : i64}
     %a = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
-    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 16384 : i64}
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffer_groups = 16384 : i64}
     %b = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem, 32768> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
 
     %group = tlx.reuse_group(%a, %b) group_kind = shared : (...) -> !tlx.reuse_group<shared>
@@ -2343,9 +2477,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @test_distinct_offset
   tt.func @test_distinct_offset() {
     %spec = tlx.storage_alias_spec storage = smem, size = 65536 : !tlx.storage_alias_spec<smem, 65536>
-    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 32768 : i64}
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffer_groups = 32768 : i64}
     %a = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
-    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 16384 : i64, bytes_between_buffers = 32768 : i64}
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 16384 : i64, bytes_between_buffer_groups = 32768 : i64}
     %b = tlx.storage_alias_local_alloc %spec : ... -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
 
     %group = tlx.reuse_group(%a, %b) group_kind = distinct : (...) -> !tlx.reuse_group<distinct>
@@ -2433,7 +2567,7 @@ Phase 5 delivers the buffer offset calculation based on reuse group definitions:
 | Component | Description |
 |-----------|-------------|
 | `buffer_offset` attribute | Starting offset for buffer index 0 |
-| `bytes_between_buffers` attribute | Stride between buffer indices |
+| `bytes_between_buffer_groups` attribute | Stride between buffer indices |
 | `ReusedBufferOffsetCalculationPass` | Computes offsets from reuse group tree |
 | Verifier update | Ensures attributes are zero until pass runs |
 | Error handling | Insufficient space and duplicate overlap errors |
@@ -2454,13 +2588,13 @@ Phase 5 delivers the buffer offset calculation based on reuse group definitions:
 
 # Phase 6: LLVM Lowering for Buffer Padding via Shape Transformation
 
-This phase addresses how the `buffer_offset` and `bytes_between_buffers` values computed in Phase 5 are used during lowering. These values are stored in an in-memory hashmap (not as IR attributes) and used to transform accesses.
+This phase addresses how the `buffer_offset` and `bytes_between_buffer_groups` values computed in Phase 5 are used during lowering. These values are stored in an in-memory hashmap (not as IR attributes) and used to transform accesses.
 
 ## Alternatives Considered
 
 Two alternative approaches were considered but rejected:
 
-1. **Extend `MemDescReinterpretOp` and `MemDescIndexOp`**: Add optional `buffer_offset` and `bytes_between_buffers` attributes to the existing TritonGPU operations and update their LLVM lowering to use these values.
+1. **Extend `MemDescReinterpretOp` and `MemDescIndexOp`**: Add optional `buffer_offset` and `bytes_between_buffer_groups` attributes to the existing TritonGPU operations and update their LLVM lowering to use these values.
 
 2. **Introduce custom IR nodes**: Create new TLX-specific operations (`PaddedMemDescReinterpretOp`, `PaddedMemDescIndexOp`) that explicitly carry offset/stride information.
 
@@ -2483,7 +2617,7 @@ Padding between buffers can be represented as an expanded buffer dimension:
 ```
 Original:
   Shape: 2 x 4 x 8 (2 buffers, each 4x8 = 32 elements = 64 bytes for fp16)
-  bytes_between_buffers: 128 bytes (64 bytes padding per buffer)
+  bytes_between_buffer_groups: 128 bytes (64 bytes padding per buffer)
   buffer_offset: 0
 
 Transformed:
@@ -2502,7 +2636,7 @@ Physical layout:
 ```
 Original:
   Shape: 2 x 4 x 8 (2 buffers)
-  bytes_between_buffers: 128 bytes
+  bytes_between_buffer_groups: 128 bytes
   buffer_offset: 64 bytes (starts at second "slot")
 
 Transformed:
@@ -2520,13 +2654,13 @@ Physical layout:
 
 Given:
 - `original_buffer_size`: size of one buffer in bytes = `product(shape[1:]) * element_size`
-- `bytes_between_buffers`: stride between buffer starts in bytes
+- `bytes_between_buffer_groups`: stride between buffer starts in bytes
 - `buffer_offset`: offset of buffer 0 from allocation base in bytes
 - `num_buffers`: original shape[0]
 
 Compute:
 ```
-scale_factor = bytes_between_buffers / original_buffer_size
+scale_factor = bytes_between_buffer_groups / original_buffer_size
 offset_slots = buffer_offset / original_buffer_size
 
 new_buffer_dim = num_buffers * scale_factor + offset_slots
@@ -2537,7 +2671,7 @@ physical_index = scale_factor * i + offset_slots
 ```
 
 **Constraints**:
-- `bytes_between_buffers` must be an integer multiple of `original_buffer_size`
+- `bytes_between_buffer_groups` must be an integer multiple of `original_buffer_size`
 - `buffer_offset` must be an integer multiple of `original_buffer_size`
 
 ### Implementation: Integrated into `TLXStorageAliasLowering` Pass
@@ -2592,7 +2726,7 @@ public:
 
     // Step 4: Transform padded accesses (NEW)
     // This rewrites MemDescIndexOp indices to account for buffer_offset
-    // and bytes_between_buffers by applying the formula:
+    // and bytes_between_buffer_groups by applying the formula:
     //   physical_index = scale_factor * logical_index + offset_slots
     LDBG("Step 4: Transforming padded accesses");
     if (failed(transformPaddedAccesses(m))) {
@@ -2640,7 +2774,7 @@ LogicalResult transformPaddedAccesses(
     // Validate constraints
     if (bytesPerBuffer % bufferBytes != 0) {
       return aliasOp.emitError(
-          "bytes_between_buffers must be multiple of buffer size");
+          "bytes_between_buffer_groups must be multiple of buffer size");
     }
     if (bufferOffset % bufferBytes != 0) {
       return aliasOp.emitError(
@@ -2713,7 +2847,7 @@ The primary challenge is correctly identifying all `MemDescIndexOp` operations t
 #### Direct Access Pattern
 
 ```mlir
-%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffers = 128}
+%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffer_groups = 128}
 %view = ttg.memdesc_index %alias[%i]  // Direct user - easy to find
 ```
 
@@ -2722,7 +2856,7 @@ The primary challenge is correctly identifying all `MemDescIndexOp` operations t
 #### Access Through Reinterpret
 
 ```mlir
-%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffers = 128}
+%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffer_groups = 128}
 %reinterp = ttg.memdesc_reinterpret %alias : !type1 -> !type2
 %view = ttg.memdesc_index %reinterp[%i]  // Indirect user
 ```
@@ -2732,7 +2866,7 @@ The primary challenge is correctly identifying all `MemDescIndexOp` operations t
 #### Access Through Control Flow
 
 ```mlir
-%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffers = 128}
+%alias = tlx.local_alias %alloc {buffer_offset = 64, bytes_between_buffer_groups = 128}
 scf.if %cond {
   scf.yield %alias
 } else {
@@ -2753,7 +2887,7 @@ scf.if %cond {
 
 %alias = tlx.local_alias %alloc {
   buffer_offset = 64,          // 32 elements
-  bytes_between_buffers = 128  // 64 elements
+  bytes_between_buffer_groups = 128  // 64 elements
 } : !ttg.memdesc<4x4x8xf16> -> !ttg.memdesc<2x4x8xf16>
 
 // Access buffer 0: should access physical slot 1 (offset by 1)
@@ -2827,13 +2961,13 @@ void addTLXPasses(OpPassManager &pm) {
 
 This integrated approach has several advantages:
 
-1. **Correct ordering**: The transformation runs immediately after `LocalAliasOp` is created (Step 3), while the `buffer_offset` and `bytes_between_buffers` attributes are still available.
+1. **Correct ordering**: The transformation runs immediately after `LocalAliasOp` is created (Step 3), while the `buffer_offset` and `bytes_between_buffer_groups` attributes are still available.
 2. **Single combined pass**: All storage alias lowering logic is in one place, making it easier to understand and maintain.
 3. **No pass ordering issues**: The transformation is guaranteed to run before any subsequent passes that might modify the IR.
 
 ### Constraints and Limitations
 
-1. **Alignment requirement**: `bytes_between_buffers` and `buffer_offset` must be integer multiples of `buffer_size`. Non-aligned padding is not supported.
+1. **Alignment requirement**: `bytes_between_buffer_groups` and `buffer_offset` must be integer multiples of `buffer_size`. Non-aligned padding is not supported.
 
 2. **Memory overhead**: The expanded shape includes unused "padding slots" which waste memory.
 

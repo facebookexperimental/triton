@@ -22,28 +22,40 @@ namespace triton {
 namespace tlx {
 
 // Recursively collect offsets for StorageAliasLocalAllocOp values
-static LogicalResult
-collectOffsets(Value element, int64_t currentOffset,
-               int64_t bytesBetweenBuffers, int64_t alignment,
-               DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap) {
+// The offsetMap stores (buffer_offset, bytes_between_buffer_groups, group_size)
+// tuples
+static LogicalResult collectOffsets(
+    Value element, int64_t currentOffset, int64_t bytesBetweenBufferGroups,
+    int64_t alignment, int64_t currentGroupSize,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
     LDBG("  Recording buffer_offset="
-         << currentOffset << ", bytes_between_buffers=" << bytesBetweenBuffers
+         << currentOffset << ", bytes_between_buffer_groups="
+         << bytesBetweenBufferGroups << ", group_size=" << currentGroupSize
          << " for StorageAliasLocalAllocOp");
-    offsetMap[element] = {currentOffset, bytesBetweenBuffers};
+    offsetMap[element] = std::make_tuple(
+        currentOffset, bytesBetweenBufferGroups, currentGroupSize);
     return success();
   }
 
   if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
     auto groupKind = reuseGroupOp.getGroupKind();
     auto elements = reuseGroupOp.getElements();
+    int64_t groupSize = reuseGroupOp.getGroupSize();
 
     if (groupKind == ReuseGroupKind::shared) {
-      LDBG("  Processing shared group at offset " << currentOffset);
+      LDBG("  Processing shared group at offset "
+           << currentOffset << " with group_size=" << groupSize);
+      // For subtiling: divide bytesBetweenBufferGroups by group_size
+      // This means each subtile buffer gets bytesBetweenBufferGroups/groupSize
+      // spacing
+      int64_t childBytesBetween = bytesBetweenBufferGroups / groupSize;
+      // Multiply the group_size to propagate to children
+      int64_t childGroupSize = currentGroupSize * groupSize;
       // All children start at the same offset
       for (auto child : elements) {
-        if (failed(collectOffsets(child, currentOffset, bytesBetweenBuffers,
-                                  alignment, offsetMap)))
+        if (failed(collectOffsets(child, currentOffset, childBytesBetween,
+                                  alignment, childGroupSize, offsetMap)))
           return failure();
       }
     } else { // distinct
@@ -52,8 +64,9 @@ collectOffsets(Value element, int64_t currentOffset,
       int64_t runningOffset = currentOffset;
       for (auto child : elements) {
         runningOffset = alignUp(runningOffset, alignment);
-        if (failed(collectOffsets(child, runningOffset, bytesBetweenBuffers,
-                                  alignment, offsetMap)))
+        if (failed(collectOffsets(child, runningOffset,
+                                  bytesBetweenBufferGroups, alignment,
+                                  currentGroupSize, offsetMap)))
           return failure();
         int64_t childSize = getElementSize(child, alignment);
         LDBG("    Child size: " << childSize << ", next offset: "
@@ -63,10 +76,10 @@ collectOffsets(Value element, int64_t currentOffset,
 
       // Verify we have enough space
       int64_t totalSize = runningOffset - currentOffset;
-      if (totalSize > bytesBetweenBuffers) {
+      if (totalSize > bytesBetweenBufferGroups) {
         return reuseGroupOp.emitError()
                << "not enough space for distinct allocations: need "
-               << totalSize << " bytes, have " << bytesBetweenBuffers
+               << totalSize << " bytes, have " << bytesBetweenBufferGroups
                << " bytes";
       }
     }
@@ -97,7 +110,8 @@ static void cleanupReuseGroupOps(ModuleOp module) {
 }
 
 LogicalResult processBufferOverlapOps(
-    ModuleOp module, DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap) {
+    ModuleOp module,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap) {
   LDBG("processBufferOverlapOps");
 
   // Track which storage_alias_specs have been processed
@@ -150,16 +164,18 @@ LogicalResult processBufferOverlapOps(
     int64_t alignment = getElementAlignment(overlapDef);
 
     // Compute total size from the reuse group tree
-    int64_t sizePerBuffer = getElementSize(overlapDef, alignment);
-    int64_t bytesBetweenBuffers = alignUp(sizePerBuffer, alignment);
+    int64_t sizePerBufferGroup = getElementSize(overlapDef, alignment);
+    int64_t bytesBetweenBufferGroups = alignUp(sizePerBufferGroup, alignment);
 
-    LDBG("  numBuffers=" << numBuffers << ", sizePerBuffer=" << sizePerBuffer
-                         << ", bytesBetweenBuffers=" << bytesBetweenBuffers
+    LDBG("  numBuffers=" << numBuffers << ", sizePerBufferGroup="
+                         << sizePerBufferGroup << ", bytesBetweenBufferGroups="
+                         << bytesBetweenBufferGroups
                          << ", alignment=" << alignment);
 
-    // Recursively collect offsets starting at offset 0
+    // Recursively collect offsets starting at offset 0 with group_size 1
     if (failed(collectOffsets(overlapDef, /*currentOffset=*/0,
-                              bytesBetweenBuffers, alignment, offsetMap))) {
+                              bytesBetweenBufferGroups, alignment,
+                              /*currentGroupSize=*/1, offsetMap))) {
       return failure();
     }
 
