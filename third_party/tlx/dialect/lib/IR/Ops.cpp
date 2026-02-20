@@ -92,6 +92,13 @@ LogicalResult ReuseGroupOp::verify() {
     return emitOpError("reuse_group requires at least one element");
   }
 
+  // Verify group_size is positive
+  int64_t groupSize = getGroupSize();
+  if (groupSize < 1) {
+    return emitOpError("group_size must be a positive integer, got ")
+           << groupSize;
+  }
+
   // Get result type properties
   auto resultType = cast<ReuseGroupType>(getResult().getType());
   auto expectedGroupKind = resultType.getGroupKind();

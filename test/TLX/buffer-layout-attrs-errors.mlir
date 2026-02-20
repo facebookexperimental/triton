@@ -15,7 +15,7 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   tt.func @bytes_between_not_divisible_error() {
     %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
-    // expected-error @+1 {{bytes_between_buffers (24576) must be a multiple of the original buffer size (16384)}}
+    // expected-error @+1 {{bytes_between_buffer_groups (24576) must be a multiple of the original buffer size (16384)}}
     %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
     %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x32xf32, #shared, #smem, mutable>
     %3 = tlx.reuse_group(%1, %2) group_kind = distinct : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x32xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
@@ -36,7 +36,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   tt.func @bytes_between_not_divisible_error_2() {
     %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
-    // expected-error @+1 {{bytes_between_buffers (49152) must be a multiple of the original buffer size (32768)}}
+    // expected-error @+1 {{bytes_between_buffer_groups (49152) must be a multiple of the original buffer size (32768)}}
     %1 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x128x64xf32, #shared, #smem, mutable>
     %2 = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
     %3 = tlx.reuse_group(%1, %2) group_kind = distinct : (!ttg.memdesc<2x128x64xf32, #shared, #smem, mutable>, !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
