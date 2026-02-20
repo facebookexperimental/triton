@@ -142,20 +142,12 @@ public:
     }
 
     if (pingpongAutoWS) {
-      doPingPongPrep(funcOp, numWarpGroups, capability);
-      if (dumpIntermediateSteps) {
-        llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
-            << moduleOp << "\n\n\n";
-      }
-    }
-
-    if (pingpongAutoWS) {
       doPingPongPrep(funcOp, numWarpGroups, capability, defaultNumStages);
       if (dumpIntermediateSteps) {
         llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
-            << moduleOp << "\n\n\n";
+            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
       }
     }
 
