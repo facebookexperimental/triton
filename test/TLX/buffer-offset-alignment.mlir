@@ -17,21 +17,21 @@
 // sizePerBuffer = 264, bytesBetweenBuffers = alignUp(264, 128) = 384
 // totalSizeBytes = 384 * 4 = 1536
 //
-// Offsets:
-//   A: offset=0,   bytesBetweenBuffers=384 → scale=48, offSlots=0  → [192, 2]
-//   B: offset=0,   bytesBetweenBuffers=384 → scale=48, offSlots=0  → [192, 2]
-//   C: offset=128, bytesBetweenBuffers=384 → scale=192, offSlots=64 → [256, 1]
-//   D: offset=256, bytesBetweenBuffers=384 → scale=48, offSlots=32 → [224, 2]
+// Offsets (using new formula: newBufferDim = scale * lastIdx + offset + 1):
+//   A: offset=0,   bytesBetweenBuffers=384 → scale=48, offSlots=0  → [48*3+0+1, 2] = [145, 2]
+//   B: offset=0,   bytesBetweenBuffers=384 → scale=48, offSlots=0  → [48*3+0+1, 2] = [145, 2]
+//   C: offset=128, bytesBetweenBuffers=384 → scale=192, offSlots=64 → [192*0+64+1, 1] = [65, 1]
+//   D: offset=256, bytesBetweenBuffers=384 → scale=48, offSlots=32 → [48*3+32+1, 2] = [177, 2]
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @smem_distinct_shared_distinct_alignment
   tt.func @smem_distinct_shared_distinct_alignment() {
     // CHECK: ttg.local_alloc : () -> !ttg.memdesc<1536xi8
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<192x2xf32
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<192x2xf32
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<256x1xbf16
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<224x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<145x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<145x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<65x1xbf16
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<177x2xf32
     %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
     %A = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<4x2xf32, #shared, #smem, mutable>
     %B = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<4x2xf32, #shared, #smem, mutable>
@@ -64,21 +64,21 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // sizePerBuffer = 72, bytesBetweenBuffers = alignUp(72, 32) = 96
 // totalSizeBytes = 96 * 4 = 384
 //
-// Offsets:
-//   A: offset=0,  bytesBetweenBuffers=96 → scale=12, offSlots=0  → [48, 2]
-//   B: offset=0,  bytesBetweenBuffers=96 → scale=12, offSlots=0  → [48, 2]
-//   C: offset=32, bytesBetweenBuffers=96 → scale=48, offSlots=16 → [64, 1]
-//   D: offset=64, bytesBetweenBuffers=96 → scale=12, offSlots=8  → [56, 2]
+// Offsets (using new formula: newBufferDim = scale * lastIdx + offset + 1):
+//   A: offset=0,  bytesBetweenBuffers=96 → scale=12, offSlots=0  → [12*3+0+1, 2] = [37, 2]
+//   B: offset=0,  bytesBetweenBuffers=96 → scale=12, offSlots=0  → [12*3+0+1, 2] = [37, 2]
+//   C: offset=32, bytesBetweenBuffers=96 → scale=48, offSlots=16 → [48*0+16+1, 1] = [17, 1]
+//   D: offset=64, bytesBetweenBuffers=96 → scale=12, offSlots=8  → [12*3+8+1, 2] = [45, 2]
 #dummy_tmem_layout = #tlx.dummy_tmem_layout<>
 #tmem = #ttng.tensor_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @tmem_distinct_shared_distinct_alignment
   tt.func @tmem_distinct_shared_distinct_alignment() {
     // CHECK: ttng.tmem_alloc
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<48x2xf32
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<48x2xf32
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<64x1xbf16
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<56x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<37x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<37x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<17x1xbf16
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<45x2xf32
     %0 = tlx.storage_alias_spec storage = tmem : !tlx.storage_alias_spec<tmem>
     %A = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>
     %B = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>

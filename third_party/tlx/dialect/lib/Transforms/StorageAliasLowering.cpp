@@ -27,10 +27,13 @@ namespace tlx {
 // Forward declarations of functions from the individual passes
 LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m);
 LogicalResult processBufferOverlapOps(
-    ModuleOp m, DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap);
+    ModuleOp m,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap);
 LogicalResult materializeStorageAliasAllocations(
-    ModuleOp m, const DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap,
-    DenseMap<Value, std::pair<int64_t, int64_t>> &localAliasOffsetMap);
+    ModuleOp m,
+    const DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>>
+        &localAliasOffsetMap);
 
 struct TLXStorageAliasLoweringPass
     : public impl::TLXStorageAliasLoweringBase<TLXStorageAliasLoweringPass> {
@@ -57,7 +60,7 @@ public:
     // The computed offsets are returned in a map to be applied during
     // materialization.
     LDBG("Step 2: Processing buffer overlap operations");
-    DenseMap<Value, std::pair<int64_t, int64_t>> offsetMap;
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> offsetMap;
     if (failed(processBufferOverlapOps(m, offsetMap))) {
       signalPassFailure();
       return;
@@ -67,7 +70,7 @@ public:
     // This creates LocalAllocOp/TMEMAllocOp and LocalAliasOp.
     // The computed offsets are stored in localAliasOffsetMap for later use.
     LDBG("Step 3: Materializing storage alias allocations");
-    DenseMap<Value, std::pair<int64_t, int64_t>> localAliasOffsetMap;
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> localAliasOffsetMap;
     if (failed(materializeStorageAliasAllocations(m, offsetMap,
                                                   localAliasOffsetMap))) {
       signalPassFailure();

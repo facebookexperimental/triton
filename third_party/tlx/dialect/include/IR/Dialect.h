@@ -107,13 +107,15 @@ inline int64_t getElementSize(Value element, int64_t alignment) {
   if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
     auto groupKind = reuseGroupOp.getGroupKind();
     auto elements = reuseGroupOp.getElements();
+    int64_t groupSize = reuseGroupOp.getGroupSize();
 
     if (groupKind == ReuseGroupKind::shared) {
       int64_t maxSize = 0;
       for (auto child : elements) {
         maxSize = std::max(maxSize, getElementSize(child, alignment));
       }
-      return maxSize;
+      // Multiply by group_size for subtiling
+      return maxSize * groupSize;
     } else { // distinct
       int64_t totalSize = 0;
       for (auto child : elements) {

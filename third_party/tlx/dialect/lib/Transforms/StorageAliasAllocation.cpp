@@ -74,8 +74,10 @@ collectMemDescIndexOps(Value memDesc,
 }
 
 LogicalResult materializeStorageAliasAllocations(
-    ModuleOp m, const DenseMap<Value, std::pair<int64_t, int64_t>> &offsetMap,
-    DenseMap<Value, std::pair<int64_t, int64_t>> &localAliasOffsetMap) {
+    ModuleOp m,
+    const DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>>
+        &localAliasOffsetMap) {
   LDBG("materializeStorageAliasAllocations");
 
   OpBuilder builder(m.getContext());
@@ -188,11 +190,12 @@ LogicalResult materializeStorageAliasAllocations(
     auto offsetIt = offsetMap.find(allocOp.getResult());
 
     // Determine the result type - may be expanded based on
-    // bytes_between_buffers
+    // bytes_between_buffer_groups
     ttg::MemDescType resultType = originalResultType;
     if (offsetIt != offsetMap.end()) {
-      int64_t bufferOffset = offsetIt->second.first;
-      int64_t bytesBetweenBuffers = offsetIt->second.second;
+      int64_t bufferOffset = std::get<0>(offsetIt->second);
+      int64_t bytesBetweenBufferGroups = std::get<1>(offsetIt->second);
+      int64_t groupSize = std::get<2>(offsetIt->second);
 
       // Compute original buffer size (shape[0] is num_buffers, rest is
       // per-buffer)
@@ -204,10 +207,11 @@ LogicalResult materializeStorageAliasAllocations(
       }
       int64_t originalBufferBytes = (bufferElements * elemBits) / 8;
 
-      // Check if bytes_between_buffers divides evenly by original buffer size
-      if (bytesBetweenBuffers % originalBufferBytes != 0) {
-        allocOp.emitError("bytes_between_buffers (")
-            << bytesBetweenBuffers
+      // Check if bytes_between_buffer_groups divides evenly by original buffer
+      // size
+      if (bytesBetweenBufferGroups % originalBufferBytes != 0) {
+        allocOp.emitError("bytes_between_buffer_groups (")
+            << bytesBetweenBufferGroups
             << ") must be a multiple of the original buffer size ("
             << originalBufferBytes << ")";
         return failure();
@@ -222,15 +226,23 @@ LogicalResult materializeStorageAliasAllocations(
         return failure();
       }
 
-      int64_t scaleFactor = bytesBetweenBuffers / originalBufferBytes;
+      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferBytes;
       int64_t offsetSlots = bufferOffset / originalBufferBytes;
 
       // If there's padding or offset, expand the shape
       if (scaleFactor > 1 || offsetSlots > 0) {
-        // Compute expanded shape:
-        // new_buffer_dim = num_buffers * scale_factor + offset_slots
+        // Compute expanded shape: the first dimension must be large enough to
+        // hold the maximum transformed index + 1. The index transformation is:
+        //   newIndex = scaleFactor * originalIndex + offsetSlots
+        //             + (originalIndex % groupSize)
+        // The maximum originalIndex is numBuffers - 1, so:
+        //   maxNewIndex = scaleFactor * (numBuffers - 1) + offsetSlots
+        //               + ((numBuffers - 1) % groupSize)
+        //   newBufferDim = maxNewIndex + 1
         int64_t numBuffers = shape[0];
-        int64_t newBufferDim = numBuffers * scaleFactor + offsetSlots;
+        int64_t lastIdx = numBuffers - 1;
+        int64_t newBufferDim =
+            scaleFactor * lastIdx + offsetSlots + (lastIdx % groupSize) + 1;
 
         SmallVector<int64_t> expandedShape;
         expandedShape.push_back(newBufferDim);
@@ -269,10 +281,11 @@ LogicalResult materializeStorageAliasAllocations(
     }
 
     // If the shape was expanded, rewrite MemDescIndexOp indices to account
-    // for the scale factor and offset
+    // for the scale factor, offset, and group_size
     if (offsetIt != offsetMap.end()) {
-      int64_t bufferOffset = offsetIt->second.first;
-      int64_t bytesBetweenBuffers = offsetIt->second.second;
+      int64_t bufferOffset = std::get<0>(offsetIt->second);
+      int64_t bytesBetweenBufferGroups = std::get<1>(offsetIt->second);
+      int64_t groupSize = std::get<2>(offsetIt->second);
 
       // Recompute scale factor and offset slots
       auto shape = originalResultType.getShape();
@@ -282,7 +295,7 @@ LogicalResult materializeStorageAliasAllocations(
         bufferElements *= shape[i];
       }
       int64_t originalBufferBytes = (bufferElements * elemBits) / 8;
-      int64_t scaleFactor = bytesBetweenBuffers / originalBufferBytes;
+      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferBytes;
       int64_t offsetSlots = bufferOffset / originalBufferBytes;
 
       // Only rewrite if there's actual scaling or offset
@@ -300,7 +313,8 @@ LogicalResult materializeStorageAliasAllocations(
           Location loc = indexOp.getLoc();
           Value originalIndex = indexOp.getIndex();
 
-          // Compute: newIndex = scaleFactor * originalIndex + offsetSlots
+          // Compute: newIndex = scaleFactor * originalIndex + offsetSlots +
+          // (originalIndex % groupSize)
           Value newIndex = originalIndex;
 
           if (scaleFactor > 1) {
@@ -314,6 +328,15 @@ LogicalResult materializeStorageAliasAllocations(
             Value offsetVal = builder.create<arith::ConstantOp>(
                 loc, builder.getI32IntegerAttr(offsetSlots));
             newIndex = builder.create<arith::AddIOp>(loc, newIndex, offsetVal);
+          }
+
+          // Add (originalIndex % groupSize) for subtiling
+          if (groupSize > 1) {
+            Value groupSizeVal = builder.create<arith::ConstantOp>(
+                loc, builder.getI32IntegerAttr(groupSize));
+            Value modVal = builder.create<arith::RemSIOp>(loc, originalIndex,
+                                                          groupSizeVal);
+            newIndex = builder.create<arith::AddIOp>(loc, newIndex, modVal);
           }
 
           // Update the index operand
