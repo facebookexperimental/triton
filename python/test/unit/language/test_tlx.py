@@ -948,6 +948,75 @@ def test_local_reinterpret(device):
     torch.testing.assert_close(x16, y16)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_local_reinterpret_swizzled(device):
+
+    @triton.jit
+    def local_reinterpret_swizzled_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (tl.arange(0, BLOCK_M // 2)[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        a_ptrs2 = a_ptr + (tl.arange(BLOCK_M // 2, BLOCK_M)[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M // 2, BLOCK_K), tl.float16, tl.constexpr(2))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+        # load half of a each time
+        tlx.async_load(a_ptrs, buf_alloc_a[0])
+        tlx.async_load(a_ptrs2, buf_alloc_a[1])
+        tlx.async_load(b_ptrs, b_smem)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(buffers, 0)
+
+        # reinterpret a into one big tensor
+        a_reinterpreted = tlx.local_reinterpret(buf_alloc_a, tl.float16, [BLOCK_M, BLOCK_K])
+        # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
+        tlx.async_dot(a_reinterpreted, b_smem, acc_tmem, use_acc=False, mBarriers=[], out_dtype=OUT_DTYPE)
+
+        result = tlx.local_load(acc_tmem)
+
+        c = result.to(tl.float16)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
+    kernel = local_reinterpret_swizzled_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z,
+                                                       z.stride(0), z.stride(1), **kern_kwargs)
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttg.memdesc_reinterpret") == 1
+
+    ref_out = torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
+
+
 @pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
 def test_async_dot(device):
 
