@@ -682,7 +682,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 )
 
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
-                q_tmem_base = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
+                if SHARE_SCALE_BUFFERS:
+                    q0_tmem = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
+                    q1_tmem = q0_tmem + 1
+                else:
+                    # With 2 buffers we always swap index 1/0
+                    q0_tmem = 1
+                    q1_tmem = 0
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
@@ -701,14 +707,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
                 tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
                 # Explicit SMEM->TMEM scale transfer
-                tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q_tmem_base])
+                tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
                 tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
                 tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
                 tlx.async_dot_scaled(
                     q_tiles[0],
                     k_tile,
                     qk_tiles[0],
-                    q_scale_tmem[q_tmem_base],
+                    q_scale_tmem[q0_tmem],
                     Q_FP8_FORMAT,
                     k_scale_tmem[kv_tmem_idx],
                     K_FP8_FORMAT,
@@ -722,13 +728,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Wait for Q1 scale
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
                 # Explicit SMEM->TMEM scale transfer
-                tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q_tmem_base + 1])
+                tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
                 tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.async_dot_scaled(
                     q_tiles[1],
                     k_tile,
                     qk_tiles[1],
-                    q_scale_tmem[q_tmem_base + 1],
+                    q_scale_tmem[q1_tmem],
                     Q_FP8_FORMAT,
                     k_scale_tmem[kv_tmem_idx],
                     K_FP8_FORMAT,
@@ -789,7 +795,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         q_tiles[0],
                         k_tile,
                         qk_tiles[0],
-                        q_scale_tmem[q_tmem_base],
+                        q_scale_tmem[q0_tmem],
                         Q_FP8_FORMAT,
                         k_scale_tmem[kv_tmem_idx],
                         K_FP8_FORMAT,
@@ -820,7 +826,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         q_tiles[1],
                         k_tile,
                         qk_tiles[1],
-                        q_scale_tmem[q_tmem_base + 1],
+                        q_scale_tmem[q1_tmem],
                         Q_FP8_FORMAT,
                         k_scale_tmem[kv_tmem_idx],
                         K_FP8_FORMAT,
