@@ -165,7 +165,10 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
            "number of warp groups for warp specialization">,
     Option<"capability", "capability",
            "int32_t", /*default*/"10",
-           "NVIDIA compute capability">
+           "NVIDIA compute capability">,
+    Option<"numStages", "num-stages",
+           "int32_t", /*default*/"3",
+           "number of stages for software pipelining">,
   ];
 }
 

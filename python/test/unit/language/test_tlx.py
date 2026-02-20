@@ -5379,32 +5379,6 @@ class TestReuseGroup:
         with pytest.raises(ValueError, match="at least one element"):
             tlx.reuse_group(group_type=tlx.reuse_group_type.shared, )
 
-    def test_reuse_group_nested_same_type_shared_raises_error(self):
-        """Test that nesting shared inside shared raises an error."""
-        elem = _make_test_buffered_tensor()
-        inner = tlx.reuse_group(
-            elem,
-            group_type=tlx.reuse_group_type.shared,
-        )
-        with pytest.raises(ValueError, match="same group_type"):
-            tlx.reuse_group(
-                inner,
-                group_type=tlx.reuse_group_type.shared,
-            )
-
-    def test_reuse_group_nested_same_type_distinct_raises_error(self):
-        """Test that nesting distinct inside distinct raises an error."""
-        elem = _make_test_buffered_tensor()
-        inner = tlx.reuse_group(
-            elem,
-            group_type=tlx.reuse_group_type.distinct,
-        )
-        with pytest.raises(ValueError, match="same group_type"):
-            tlx.reuse_group(
-                inner,
-                group_type=tlx.reuse_group_type.distinct,
-            )
-
     def test_reuse_group_invalid_element_type_raises_error(self):
         """Test that invalid element types raise TypeError."""
         with pytest.raises(TypeError, match="must be buffered_tensor or reuse_group"):
@@ -5666,6 +5640,98 @@ class TestSetBufferOverlap:
         expected = torch.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
         expected[:, :BLOCK_SIZE // 2] = 1.0
         torch.testing.assert_close(out, expected)
+
+    def test_reuse_group_with_group_size(self):
+        """Test reuse_group with group_size for subtiling.
+
+        This test verifies that group_size works correctly for subtiling scenarios.
+        We have two allocations:
+        - qk: 2 buffers of (64, 64) float32
+        - p: 4 buffers of (64, 64) float16 with group_size=2
+
+        With group_size=2, p's 4 buffers are grouped into 2 logical groups:
+        - p[0], p[1] form logical group 0 (shares with qk[0])
+        - p[2], p[3] form logical group 1 (shares with qk[1])
+
+        The index computation should map:
+        - p[0] -> physical index 0 (group 0, offset 0)
+        - p[1] -> physical index 1 (group 0, offset 1)
+        - p[2] -> physical index 2 (group 1, offset 0)
+        - p[3] -> physical index 3 (group 1, offset 1)
+        """
+
+        @triton.jit
+        def group_size_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate qk: 2 buffers
+            qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                 reuse=spec)
+            # Allocate p: 4 buffers with group_size=2
+            # This means p[0],p[1] share with qk[0] and p[2],p[3] share with qk[1]
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(4), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap with group_size=2 for p
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk,
+                    tlx.reuse_group(p, group_size=2),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
+
+            # Write different values to qk[0] and qk[1]
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+
+            # Write 1.0 to qk[0]
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(qk[0], ones)
+
+            # Write 2.0 to qk[1]
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float32)
+            tlx.local_store(qk[1], twos)
+
+            # Read from p buffers - they should see the qk data reinterpreted as float16
+            # p[0] and p[1] should see qk[0]'s data
+            # p[2] and p[3] should see qk[1]'s data
+            p0_data = tlx.local_load(p[0])
+            p1_data = tlx.local_load(p[1])
+            p2_data = tlx.local_load(p[2])
+            p3_data = tlx.local_load(p[3])
+
+            # Output layout: 4 blocks of (BLOCK_SIZE, BLOCK_SIZE)
+            out_offsets_0 = out_ptr + 0 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_1 = out_ptr + 1 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_2 = out_ptr + 2 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_3 = out_ptr + 3 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+
+            tl.store(out_offsets_0, p0_data)
+            tl.store(out_offsets_1, p1_data)
+            tl.store(out_offsets_2, p2_data)
+            tl.store(out_offsets_3, p3_data)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((4 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        group_size_kernel[grid](out, BLOCK_SIZE)
+
+        # p[0] and p[1] should have the same data (from qk[0])
+        # p[2] and p[3] should have the same data (from qk[1])
+        # The data should be non-zero since qk was written with 1.0 and 2.0
+        p0_out = out[:BLOCK_SIZE, :]
+        p1_out = out[BLOCK_SIZE:2 * BLOCK_SIZE, :]
+        p2_out = out[2 * BLOCK_SIZE:3 * BLOCK_SIZE, :]
+        p3_out = out[3 * BLOCK_SIZE:, :]
+
+        # p[0] and p[1] should be equal (both alias qk[0])
+        torch.testing.assert_close(p0_out, p1_out)
+        # p[2] and p[3] should be equal (both alias qk[1])
+        torch.testing.assert_close(p2_out, p3_out)
+        # p[0] and p[2] should be different (different qk buffers)
+        assert not torch.allclose(p0_out, p2_out), "p[0] and p[2] should have different data"
 
     def test_basic_shared_buffer_overlap(self):
         """Test that allocating two identical buffers with shared overlap works.
