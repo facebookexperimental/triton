@@ -61,7 +61,8 @@ class Gemm:
             "NUM_TMEM_BUFFERS": 2,
             "NUM_MMA_GROUPS": 1,
             "EPILOGUE_SUBTILE": 1,
-            "PAIR_CTA": False,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
         },
         "blackwell_gemm_clc": {
             "BLOCK_SIZE_M": 128,
