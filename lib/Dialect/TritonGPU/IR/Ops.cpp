@@ -625,6 +625,46 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   return success();
 }
 
+LogicalResult MemDescReinterpretOp::verify() {
+  auto oldType = getSrc().getType();
+  auto newType = getType();
+
+  if (oldType.getMemorySpace() != newType.getMemorySpace())
+    return emitError("source and destination memory space must match");
+
+  auto newShape = newType.getShape();
+  auto newEncoding = oldType.getEncoding();
+
+  if (!oldType.getShape().equals(newShape)) {
+    if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(newEncoding)) {
+      auto contigDimSize =
+          mmaEncoding.getTransposed() ? newShape.front() : newShape.back();
+      // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
+      // swizzling, the swizzling/contig dim has to be a multiple of it
+      if ((contigDimSize * mmaEncoding.getElementBitWidth()) %
+          (8 * mmaEncoding.getSwizzlingByteWidth() != 0)) {
+        return emitError(
+            "New shape causes insufficient elements for swizzling");
+      }
+    } else if (auto swizzledEncoding =
+                   dyn_cast<SwizzledSharedEncodingAttr>(newEncoding)) {
+      auto contigDim = swizzledEncoding.getOrder()[0];
+      if (newShape.size() <= contigDim) {
+        return emitError("New shape incompatible with encoding");
+      }
+      // conservatively reject cases where swizzling might be interfered
+      // new shape swizzling dim must be a multiple of getVec(), the basic
+      // swizzling unit
+      if (newShape[contigDim] % swizzledEncoding.getVec() != 0) {
+        return emitError(
+            "New shape causes insufficient elements for swizzling");
+      }
+    }
+  }
+
+  return success();
+}
+
 OpFoldResult MemDescReinterpretOp::fold(FoldAdaptor adaptor) {
   if (getType() == getSrc().getType())
     return getSrc();
