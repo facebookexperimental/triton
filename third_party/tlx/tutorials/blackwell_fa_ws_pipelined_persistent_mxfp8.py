@@ -298,6 +298,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
 
+    # Define if we need to do buffer sharing for the scales.
+    SHARE_SCALE_BUFFERS: tl.constexpr = (HEAD_DIM == 128) and (BLOCK_N == 128)
+
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
 
     # Compute p_dtype from V descriptor
@@ -354,13 +357,17 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q buffers for q_scale
     q_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_tiles = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
-    p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
-                                    tlx.storage_kind.tmem)
 
     q_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     q_scale_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     kv_scale_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+
+    p_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BLOCK_N),
+        tlx.dtype_of(desc_v),
+        NUM_MMA_GROUPS,
+    )
 
     # Calculate scale bytes for barrier expect
     Q_SCALE_BYTES: tl.constexpr = REP_M * REP_HEAD * 2 * 256
@@ -371,37 +378,132 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     Q_SCALE_TMEM_COLS: tl.constexpr = Q_SCALE_BYTES // BLOCK_M_SPLIT
     K_SCALE_TMEM_COLS: tl.constexpr = K_SCALE_BYTES // BLOCK_N
     V_SCALE_TMEM_COLS: tl.constexpr = V_SCALE_BYTES // HEAD_DIM
-    q_scale_tmem = tlx.local_alloc((BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS), tl.uint8, 2 * NUM_Q_SCALE_TMEM_BUFFERS,
-                                   tlx.storage_kind.tmem)
-    k_scale_tmem = tlx.local_alloc((BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
-                                   tlx.storage_kind.tmem)
-    v_scale_tmem = tlx.local_alloc((HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
-                                   tlx.storage_kind.tmem)
+    if SHARE_SCALE_BUFFERS:
+        # We don't have enough TMEM space to hold the scale transfer. We need to have a creative
+        # reuse strategy that so QK[0] can share space with Q_SCALES
+        tl.static_assert(NUM_Q_SCALE_TMEM_BUFFERS == 1)
+        tl.static_assert(NUM_KV_SCALE_TMEM_BUFFERS == 2)
+        # Define the shared buffer.
+        qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+        qk_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N),
+            qk_dtype,
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        p_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N),
+            tlx.dtype_of(desc_v),
+            NUM_MMA_GROUPS,
+            reuse=qk_storage_alias,
+        )
+        alpha_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        l_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        m_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        q_scale_tmem = tlx.local_alloc(
+            (BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS),
+            tl.uint8,
+            2 * NUM_Q_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        k_scale_tmem = tlx.local_alloc(
+            (BLOCK_N, K_SCALE_TMEM_COLS),
+            tl.uint8,
+            NUM_KV_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        v_scale_tmem = tlx.local_alloc(
+            (HEAD_DIM, V_SCALE_TMEM_COLS),
+            tl.uint8,
+            NUM_KV_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        p_scale_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE),
+            tl.uint8,
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        # Define the reuse strategy.
+        # Here we share 1 buffer of QK with all other buffers. However,
+        # because Q_SCALES is needed to compute QK we must store the opposite
+        # scale index.
+        # QK[0] : |                              BLK_M/2 * BLOCK_N * fp32                                       |
+        # Alpha[0]: |BLK_M/2*1*fp32|
+        # L[0]:                    |BLK_M/2*1*fp32|
+        # M[0]:                                   |BLK_M/2*1*fp32|
+        # Q_SCALES[1]:                                           |512*uint8|
+        # K_SCALES[1]:                                                     |512*uint8|
+        # V_SCALES[0]:                                                               |512*uint8|
+        # P_SCALES[0]:                                                                         |BLK_M/2*32*uint8|
+        qk_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(
+                    alpha_tiles,
+                    l_tiles,
+                    m_tiles,
+                    q_scale_tmem,
+                    v_scale_tmem,
+                    k_scale_tmem,
+                    p_scale_tiles,
+                    group_type=tlx.reuse_group_type.distinct,
+                ),
+                group_type=tlx.reuse_group_type.shared,
+            ))
 
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
-    p_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_N),
-        tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS,
-    )
-    alpha_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-    )
-    l_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-    )
-    m_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-    )
+    else:
+        # We have enough TMEM space to isolate every buffer.
+        qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
+        alpha_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+        )
+        l_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+        )
+        m_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+        )
+        q_scale_tmem = tlx.local_alloc((BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS), tl.uint8, 2 * NUM_Q_SCALE_TMEM_BUFFERS,
+                                       tlx.storage_kind.tmem)
+        k_scale_tmem = tlx.local_alloc((BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
+                                       tlx.storage_kind.tmem)
+        v_scale_tmem = tlx.local_alloc((HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
+                                       tlx.storage_kind.tmem)
+        p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
+                                        tlx.storage_kind.tmem)
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
