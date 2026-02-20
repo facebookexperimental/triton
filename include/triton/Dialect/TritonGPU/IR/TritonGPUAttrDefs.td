@@ -533,6 +533,11 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
     https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout
     When the memdesc has more than 2 dimensions the tiling is applied to 8 rows even if the first outer dimension is smaller than 8.
     In this case `transposed` means that the contiguous dimension is the most outer dimension of the memdesc.
+
+    Note: `transposed` does not mean the same thing as transposeA or transposeB flags of MMAv3/v5 instruction descriptors. Here
+    for a 2d matrix MxN, `transposed == false` just means N is the contiguous dimension. The implication is that if we
+    have a tensor KxN as operand B of MMA, `transposed == false` means B is N-major, meaning we set transposeB as TRUE
+    in the MMA instruction descriptors. https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-layout-swizzling
   }];
 
 
