@@ -24,24 +24,14 @@ def _host_descriptor_pre_hook(nargs):
 configs = [
     triton.Config(
         {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": kv,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": grp_n,
-            "RESCALE_OPT": rescale_opt,
-            "USE_WHERE": where,  # used when RESCALE_OPT is True
+            "BLOCK_M": 256, "BLOCK_N": 128, "NUM_BUFFERS_Q": 1, "NUM_BUFFERS_KV": kv, "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2, "NUM_MMA_SLICES": 2, "GROUP_SIZE_N": grp_n, "RESCALE_OPT": rescale_opt, "USE_WHERE":
+            where,  # used when RESCALE_OPT is True
         },
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    )
-    for kv in [3, 6]
-    for grp_n in [1, 4]
-    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
+    ) for kv in [3, 6] for grp_n in [1, 4] for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
 ]
 
 
