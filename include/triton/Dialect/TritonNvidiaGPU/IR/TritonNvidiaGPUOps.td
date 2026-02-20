@@ -334,7 +334,8 @@ def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
 
   let description = [{
     Extract CTA ID from CLC response if try_cancel was successful.
-    Otherwise, returns -1.
+    Returns all three dimensions of the cluster CTA ID (x, y, z).
+    If try_cancel was not successful, returns (-1, -1, -1).
 
     https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-query-cancel
   }];
@@ -343,9 +344,9 @@ def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc
   );
 
-  let results = (outs I32:$ctaId);
+  let results = (outs I32:$ctaIdX, I32:$ctaIdY, I32:$ctaIdZ);
 
-  let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $ctaId)";
+  let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, results)";
 }
 
 def TTNG_VoteBallotSyncOp : TTNG_Op<"vote_ballot_sync", [Pure]> {
