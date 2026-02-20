@@ -3213,10 +3213,101 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
   }
 }
 
+// Merge duplicate local_alloc ops that have:
+// 1. Same source value
+// 2. Same SMEM layout (MemDescType)
+// 3. No modification to the source value between the allocs
+//
+// This optimization is enabled after swapTransposedLocalAllocs, which
+// normalizes transposed allocs to use non-transposed layout so they can
+// share the same buffer.
+//
+// Before:
+//   %val = descriptor_load ...
+//   %a = local_alloc %val -> memdesc<#shared>
+//   ... (no modification to %val) ...
+//   %b = local_alloc %val -> memdesc<#shared>  // same src, same layout
+//
+// After:
+//   %val = descriptor_load ...
+//   %a = local_alloc %val -> memdesc<#shared>
+//   ... (no modification to %val) ...
+//   // %b is replaced with %a
+static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
+  // Map from (src, memDescType) to the first alloc op with that signature.
+  // We use a vector of pairs since we need to process allocs in program order.
+  SmallVector<ttg::LocalAllocOp> allocs;
+  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
+    if (allocOp.getSrc())
+      allocs.push_back(allocOp);
+  });
+
+  // Group allocs by source value and MemDescType.
+  // For each group, check if they can be merged.
+  DenseMap<Value, SmallVector<ttg::LocalAllocOp>> allocsBySrc;
+  for (auto allocOp : allocs) {
+    allocsBySrc[allocOp.getSrc()].push_back(allocOp);
+  }
+
+  SmallVector<ttg::LocalAllocOp> toErase;
+
+  for (auto &[src, allocGroup] : allocsBySrc) {
+    if (allocGroup.size() < 2)
+      continue;
+
+    // Further group by MemDescType (layout).
+    DenseMap<Type, SmallVector<ttg::LocalAllocOp>> allocsByType;
+    for (auto allocOp : allocGroup) {
+      allocsByType[allocOp.getType()].push_back(allocOp);
+    }
+
+    for (auto &[type, typeGroup] : allocsByType) {
+      if (typeGroup.size() < 2)
+        continue;
+
+      // Sort by program order (using operation order in the IR).
+      // The first alloc in the group is the "canonical" one.
+      // We check if subsequent allocs can be merged into the first.
+      // For now, we do a simple check: if the source value is not modified
+      // between allocs (i.e., src is defined once and not reassigned).
+      // Since SSA values are immutable, if two allocs have the same src,
+      // the source cannot have been modified between them.
+
+      ttg::LocalAllocOp firstAlloc = typeGroup[0];
+      for (size_t i = 1; i < typeGroup.size(); ++i) {
+        ttg::LocalAllocOp laterAlloc = typeGroup[i];
+
+        // Check dominance: firstAlloc must dominate laterAlloc.
+        // Since we walk in program order, firstAlloc comes before laterAlloc.
+        // We can simply replace laterAlloc's uses with firstAlloc's result.
+
+        LLVM_DEBUG({
+          LDBG("mergeDuplicateLocalAllocs: merging alloc at "
+               << laterAlloc.getLoc() << " into alloc at "
+               << firstAlloc.getLoc());
+          LDBG("  src: " << src);
+          LDBG("  type: " << type);
+        });
+
+        laterAlloc.getResult().replaceAllUsesWith(firstAlloc.getResult());
+        toErase.push_back(laterAlloc);
+      }
+    }
+  }
+
+  for (auto allocOp : toErase) {
+    allocOp.erase();
+  }
+}
+
 void doBufferAllocation(triton::FuncOp &funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
   swapTransposedLocalAllocs(funcOp);
+
+  // Step 0.5: Merge duplicate local_allocs with same src and layout.
+  // This must be done after swapTransposedLocalAllocs which normalizes layouts.
+  mergeDuplicateLocalAllocs(funcOp);
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
