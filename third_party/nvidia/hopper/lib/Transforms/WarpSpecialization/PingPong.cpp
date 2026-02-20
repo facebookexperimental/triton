@@ -33,9 +33,9 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include <unordered_set>
 
 #define DEBUG_TYPE "nvgpu-ping-pong-sync"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -217,37 +217,33 @@ bool areControlFlowEquivalent(Operation *op1, Operation *op2) {
 
 /// Dump memory effects of an operation for debugging
 void dumpMemoryEffects(Operation *op) {
-  auto memInterface = dyn_cast<MemoryEffectOpInterface>(op);
-  if (!memInterface) {
-    LDBG("  Op '" << op->getName()
-                  << "' does not implement MemoryEffectOpInterface");
-    return;
-  }
+  if (auto memInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+    LDBG("  Op '" << op->getName() << "' implements MemoryEffectOpInterface.");
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    memInterface.getEffects(effects);
+    if (effects.empty()) {
+      LDBG("  Op '" << op->getName() << "' has no memory effects.");
+      return;
+    }
+    for (const auto &effect : effects) {
+      llvm::StringRef effectType;
+      if (isa<MemoryEffects::Read>(effect.getEffect()))
+        effectType = "Read";
+      else if (isa<MemoryEffects::Write>(effect.getEffect()))
+        effectType = "Write";
+      else if (isa<MemoryEffects::Allocate>(effect.getEffect()))
+        effectType = "Allocate";
+      else if (isa<MemoryEffects::Free>(effect.getEffect()))
+        effectType = "Free";
+      else
+        effectType = "Unknown";
 
-  SmallVector<MemoryEffects::EffectInstance> effects;
-  memInterface.getEffects(effects);
-
-  if (effects.empty()) {
-    LDBG("  Op '" << op->getName() << "' has no memory effects");
-    return;
-  }
-
-  for (const auto &effect : effects) {
-    llvm::StringRef effectType;
-    if (isa<MemoryEffects::Read>(effect.getEffect()))
-      effectType = "Read";
-    else if (isa<MemoryEffects::Write>(effect.getEffect()))
-      effectType = "Write";
-    else if (isa<MemoryEffects::Allocate>(effect.getEffect()))
-      effectType = "Allocate";
-    else if (isa<MemoryEffects::Free>(effect.getEffect()))
-      effectType = "Free";
-    else
-      effectType = "Unknown";
-
-    llvm::StringRef resourceName = effect.getResource()->getName();
-    LDBG("  Op '" << op->getName() << "' has effect: " << effectType
-                  << " on resource: " << resourceName);
+      llvm::StringRef resourceName = effect.getResource()->getName();
+      LDBG("  Op '" << op->getName() << "' has effect: " << effectType
+                    << " on resource: " << resourceName);
+    }
+  } else if (!op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
+    LDBG("  Op '" << op->getName() << "' may have recursive memory effects.");
   }
 }
 
@@ -274,7 +270,7 @@ Operation *findEndOp(CriticalRegionManager &crManager, Operation *keyOp,
       return nullptr;
     }
     if (!isMemoryEffectFree(curOp)) {
-      LDBG("Found op with memory effects:");
+      LDBG("Found op with memory effects: " << curOp->getName());
       dumpMemoryEffects(curOp);
       return curOp;
     }
@@ -327,35 +323,81 @@ Operation *lastOpInBlock(llvm::ArrayRef<Operation *> endOps) {
   return *it;
 }
 
-/// Returns the partition ID that contains the keyOp that occurs first.
-/// Ordering is determined by:
-///   1. Stage number (lower stage executes first)
-///   2. Cluster number (lower cluster executes first if same stage)
-///   3. Program order (isBeforeInBlock if same stage and cluster)
-int arrivesFirst(llvm::ArrayRef<Operation *> keyOps) {
-  assert(llvm::all_of(
-             keyOps, [&](Operation *op) { return ttg::getStageCluster(op); }) &&
-         "Loop stage and cluster not found for all key ops");
+/// Validate that critical ops alternate between partitions in contiguous blocks
+/// and return the partition ID that arrives first. Returns -1 if the schedule
+/// is invalid (ops have interleaved schedule order or don't alternate
+/// properly).
+///
+/// Uses the linearized schedule to walk from the first critical op and verify
+/// the pattern:
+///   [partition A ops] [partition B ops] [partition A ops] [partition B ops]
+///   ...
+int arrivesFirst(
+    scf::ForOp forOp, const triton::CoarseSchedule &schedule,
+    const llvm::DenseMap<int, SmallVector<Operation *>> &partitionOps) {
+  // Collect all critical ops across partitions
+  llvm::SmallDenseSet<Operation *, 8> criticalOps;
+  for (auto &[partitionId, ops] : partitionOps) {
+    criticalOps.insert(ops.begin(), ops.end());
+  }
 
-  auto it = llvm::min_element(keyOps, [](Operation *a, Operation *b) {
-    auto scA = ttg::getStageCluster(a);
-    auto scB = ttg::getStageCluster(b);
+  assert(
+      llvm::all_of(criticalOps,
+                   [&](Operation *op) { return ttg::getStageCluster(op); }) &&
+      "Loop stage and cluster not found for all key ops");
 
-    int stageA = scA->first;
-    int stageB = scB->first;
-    int clusterA = scA->second;
-    int clusterB = scB->second;
-    if (stageA == stageB) {
-      if (clusterA == clusterB) {
-        return a->isBeforeInBlock(b);
-      } else {
-        return clusterA < clusterB;
+  // Step 1: Find the earliest critical op by linearizing from the start of the
+  // loop
+  auto linearized = schedule.linearized(
+      forOp, &*forOp.getBody()->without_terminator().begin());
+  auto firstCriticalOp = linearized.findNext(
+      [&](Operation *op) { return criticalOps.contains(op); });
+  if (!firstCriticalOp) {
+    LDBG("Failed to find the earliest critical op in the schedule");
+    return -1;
+  }
+  Operation *firstOp = *firstCriticalOp;
+
+  // Step 2: Validate that the schedule alternates between partitions
+  //         - Correct alternation means: after all ops in one partition
+  //         execute, the next scheduled op must be in the other partition
+  //         - Check correct alternation until we reach the end of linearized
+  //         schedule
+  int curPartitionId = getSingleTaskId(firstOp);
+  int curSeenOps = 1;
+
+  while (auto nextOp = linearized.findNext(
+             [&](Operation *op) { return criticalOps.contains(op); })) {
+    int nextPartitionId = getSingleTaskId(*nextOp);
+    if (nextPartitionId == curPartitionId) {
+      // Check if operations in the same partition get scheduled consecutively
+      // more than once
+      curSeenOps++;
+      if (curSeenOps > partitionOps.lookup(curPartitionId).size()) {
+        LDBG("Partition " << curPartitionId << " have scheduled " << curSeenOps
+                          << " ops consecutively, not alternating.");
+        return -1;
       }
     } else {
-      return stageA < stageB;
+      // Check if operations in the other partition get scheduled after ALL
+      // operations in the current partition are scheduled
+      if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
+        LDBG("Partition " << curPartitionId << " scheduled " << curSeenOps
+                          << " before the next partition, not alternating.");
+        return -1;
+      }
+      curSeenOps = 1;
     }
-  });
-  return getSingleTaskId(*it);
+    curPartitionId = nextPartitionId;
+  }
+
+  if (curSeenOps != partitionOps.lookup(curPartitionId).size()) {
+    LDBG("Partition " << curPartitionId << " scheduled " << curSeenOps
+                      << " before the next partition, not alternating.");
+    return -1;
+  }
+
+  return getSingleTaskId(firstOp);
 }
 
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
@@ -438,6 +480,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 
     // Find the start and end ops for each key operation in the pingpong region
     bool foundNullEndOp = false;
+    int arrivesFirstPartitionId = -1;
     for (auto &keyOp : keyOps) {
       int partitionId = getSingleTaskId(keyOp);
       if (partitionId != -1) {
@@ -455,19 +498,26 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
           LDBG("numWarps of " << partitionId << " is "
                               << numWarps[partitionId]);
         }
+        // Get the first partition id from the attribute
+        if (auto attr = keyOp->getAttrOfType<IntegerAttr>(
+                "pingpong_first_partition_id")) {
+          arrivesFirstPartitionId = attr.getInt();
+        }
       }
     }
     if (foundNullEndOp)
       continue;
 
+    if (arrivesFirstPartitionId == -1) {
+      LDBG("pingpong_first_partition_id attribute not found");
+      continue;
+    }
+    LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
+
     if (startOps.size() != 2 || endOps.size() != 2 || numWarps.size() != 2) {
       LDBG("pingpong ops are not in two partitions");
       continue;
     }
-
-    // Find which partition arrives first
-    int arrivesFirstPartitionId = arrivesFirst(keyOps);
-    LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
 
     int numberOfThreads = 0;
     for (auto [partitionId, startOp] : startOps) {
@@ -476,7 +526,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
       Operation *unionStartOp = firstOpInBlock(startOp);
       Operation *unionEndOp = lastOpInBlock(endOps[partitionId]);
 
-      // The pong partition is the partition that arrives first
+      // The pong partition goes first and ping waits
       if (partitionId != arrivesFirstPartitionId) {
         crManager.pingpongIdToPingBoundaryOps[pingpongId].push_back(
             unionStartOp);
@@ -583,8 +633,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability) {
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  capability = getNVIDIAComputeCapability(moduleOp);
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &bodyOp : block.getOperations()) {
       Operation *op = &bodyOp;
@@ -597,9 +645,7 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 
 /// doPingPongPrep pass: Group expensive ops into pingpong regions
 void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
-                    int capability) {
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  capability = getNVIDIAComputeCapability(moduleOp);
+                    int capability, int defaultNumStages) {
 
   // Initialize the critical region manager
   CriticalRegionManager crManager;
@@ -608,7 +654,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   // Each group contains ops at the same pingpong region.
   llvm::SmallVector<llvm::SmallVector<Operation *, 4>> expensiveOps;
 
-  // Scan all operations in the function to find expensive ops
+  // Step 1: Group find expensive ops into pingpong regions
   funcOp.walk([&](Operation *op) {
     if (!crManager.isExpensiveOp(op, capability))
       return;
@@ -664,26 +710,63 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
   // pingpong region ID
   unsigned pingpongID = 0;
 
-  // Assign pingpong region IDs to groups
+  // Step 2: Assign pingpong region ID to each group
   for (auto &group : expensiveOps) {
-    // Count the number of distinct partitions in the group
-    llvm::SmallDenseSet<int, 4> partitionIds;
+    // Categorize ops into ping and pong partitions
+    llvm::DenseMap<int, SmallVector<Operation *>> partitionOps;
+    // The parent scf::ForOp for the critical ops
+    scf::ForOp forOp = nullptr;
     for (auto *op : group) {
       int taskId = getSingleTaskId(op);
       if (taskId != -1)
-        partitionIds.insert(taskId);
+        partitionOps[taskId].push_back(op);
+      // ops share control flow, so taking the last parent ForOp is safe
+      if (auto parentFor = op->getParentOfType<scf::ForOp>())
+        forOp = parentFor;
     }
 
     // Only handle pingpong for the case of 2 different partitions
-    if (partitionIds.size() != 2)
+    if (partitionOps.size() != 2)
       continue;
+
+    // Only handle pingpong when inside loops
+    if (!forOp) {
+      LDBG("No parent ForOp found, skipping this critical region.");
+      continue;
+    }
+
+    // Ensure the schedule is available for this loop. scheduleLoops is a no-op
+    // if the schedule is already complete.
+    auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    int numStages = triton::getNumStagesOrDefault(forOp, defaultNumStages);
+    triton::gpu::scheduleLoops(moduleOp, numStages, /*useMetaWS=*/true);
+
+    triton::CoarseSchedule schedule;
+    if (failed(schedule.deSerialize(forOp))) {
+      LDBG("Failed to deserialize schedule, skipping");
+      continue;
+    }
+
+    // Find which partition arrives first and validate alternation pattern.
+    // Returns -1 if the schedule is invalid (ops interleave or don't
+    // alternate).
+    int arrivesFirstPartitionId = arrivesFirst(forOp, schedule, partitionOps);
+    if (arrivesFirstPartitionId == -1) {
+      LDBG("Skipping group due to invalid pingpong schedule pattern");
+      continue;
+    }
 
     for (auto *op : group) {
       op->setAttr(
           "pingpong_id",
           IntegerAttr::get(IntegerType::get(op->getContext(), 32), pingpongID));
+      op->setAttr("pingpong_first_partition_id",
+                  IntegerAttr::get(IntegerType::get(op->getContext(), 32),
+                                   arrivesFirstPartitionId));
       LDBG("Assign pingpong_id " << pingpongID << " to op '" << op->getName()
-                                 << "' with task_id " << getSingleTaskId(op));
+                                 << "' with task_id " << getSingleTaskId(op)
+                                 << ", first_partition_id "
+                                 << arrivesFirstPartitionId);
     }
     pingpongID++;
   }
@@ -699,7 +782,7 @@ public:
       NVGPUTestPingPongPrepPass>::NVGPUTestPingPongPrepBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    doPingPongPrep(funcOp, numWarpGroups, capability);
+    doPingPongPrep(funcOp, numWarpGroups, capability, numStages);
   }
 
   void runOnOperation() override {
