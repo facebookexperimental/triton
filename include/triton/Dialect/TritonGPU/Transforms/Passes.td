@@ -190,6 +190,7 @@ def TritonGPUPartitionScheduling : Pass<"tritongpu-partition-scheduling", "mlir:
   ];
 }
 
+
 def TritonGPULoadMMASpecialization : Pass<"tritongpu-load-mma-specialization", "mlir::ModuleOp"> {
   let summary = "load MMA specialization";
 

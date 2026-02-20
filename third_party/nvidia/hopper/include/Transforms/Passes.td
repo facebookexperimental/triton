@@ -152,4 +152,22 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
+  let summary = "Meta warp specialization partitioning pass";
+
+  let description = [{
+    The `nvgpu-partition-scheduling-meta` is Meta's version of the partition
+    scheduling pass. It analyzes the loads, MMAs, and other operations in a loop
+    that is meant to be warp specialized and determines which partitions to
+    assign to each operation.
+  }];
+
+  let options = [
+    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue stores into the computation partition "
+           "instead of creating a separate epilogue partition">
+  ];
+}
+
 #endif // NV_TRANSFORMS_PASSES
