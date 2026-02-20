@@ -1,23 +1,34 @@
-// RUN: triton-opt %s --tritongpu-hoist-tmem-alloc --tritongpu-partition-scheduling -allow-unregistered-dialect | FileCheck %s
+// RUN: triton-opt %s --tritongpu-hoist-tmem-alloc
+// --tritongpu-partition-scheduling -allow-unregistered-dialect | FileCheck %s
 
-#blocked = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#load_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked = #ttg.blocked <                                                      \
+           {sizePerThread = [1, 64],                                           \
+                             threadsPerWarp = [32, 1],                         \
+                                               warpsPerCTA = [4, 1],           \
+                                                              order = [0,      \
+                                                                       1] }>
+#load_blocked =                                                                \
+    #ttg.blocked <                                                             \
+    {sizePerThread = [1, 1],                                                   \
+                      threadsPerWarp = [1, 32],                                \
+                                        warpsPerCTA = [2, 2],                  \
+                                                       order = [1, 0] }>
 
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
-#shared_T = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#shared = #ttg.nvmma_shared < {swizzlingByteWidth = 128, transposed = false,   \
+                              elementBitWidth = 16 }>
+#shared_T = #ttg.nvmma_shared < {swizzlingByteWidth = 128, transposed = true,  \
+                                elementBitWidth = 16 }>
 
 #smem = #ttg.shared_memory
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
-module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+#tmem = #ttng.tensor_memory_encoding < blockM = 128, blockN = 64, colStride = 1>
+module attributes{"ttg.num-warps" = 4 :i32, ttg.target = "cuda:100"} {
 
-// CHECK-LABEL: @attention_forward
-tt.func public @attention_forward(
-  %Q_shared: !ttg.memdesc<256x64xf16, #shared, #smem>,
-  %K_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
-  %V_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
-  %qk_scale: f32,
-  %n_tiles: i32
-) {
+  // CHECK-LABEL: @attention_forward
+  tt.func public
+      @attention_forward(% Q_shared : !ttg.memdesc<256x64xf16, #shared, #smem>,
+                         % K_desc : !tt.tensordesc<tensor<64x64xf16, #shared>>,
+                         % V_desc : !tt.tensordesc<tensor<64x64xf16, #shared>>,
+                         % qk_scale : f32, % n_tiles : i32) {
   %true = arith.constant true
   %false = arith.constant false
   %c0_i32 = arith.constant 0 : i32
@@ -85,21 +96,25 @@ tt.func public @attention_forward(
     %O, %O_tok = ttng.tmem_load %acc_tmem[%PV_mma_tok] : !ttg.memdesc<256x64xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<256x64xf32, #blocked>
 
     scf.yield %next_l_i, %O, %row_max, %next_e_i : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256x64xf32, #blocked>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
-  } {tt.warp_specialize}
+  } {
+    tt.warp_specialize
+  }
 
-  "use"(%loop_outs#0, %loop_outs#1, %loop_outs#2) : (tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256x64xf32, #blocked>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>) -> ()
+  "use"(% loop_outs #0, % loop_outs #1, % loop_outs #2)
+      : (tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+         tensor<256x64xf32, #blocked>,
+         tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>)
+            ->()
 
-  tt.return
-}
+                tt.return
+  }
 
-// CHECK-LABEL: @mma_operand_view
-tt.func public @mma_operand_view(
-  %Q_shared: !ttg.memdesc<256x64xf16, #shared, #smem>,
-  %K_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
-  %V_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
-  %qk_scale: f32,
-  %n_tiles: i32
-) {
+  // CHECK-LABEL: @mma_operand_view
+  tt.func public
+      @mma_operand_view(% Q_shared : !ttg.memdesc<256x64xf16, #shared, #smem>,
+                        % K_desc : !tt.tensordesc<tensor<64x64xf16, #shared>>,
+                        % V_desc : !tt.tensordesc<tensor<64x64xf16, #shared>>,
+                        % qk_scale : f32, % n_tiles : i32) {
   %true = arith.constant true
   %false = arith.constant false
   %c0_i32 = arith.constant 0 : i32
@@ -113,19 +128,19 @@ tt.func public @mma_operand_view(
 
   scf.for %i = %c0_i32 to %n_tiles step %c64_i32 : i32 {
     %K = tt.descriptor_load %K_desc[%i, %c0_i32] : !tt.tensordesc<tensor<64x64xf16, #shared>> -> tensor<64x64xf16, #load_blocked>
-    // CHECK: [[K_SHARED:%.*]] = ttg.local_alloc {{.*}}partition = 2
+    // CHECK: [[K_SHARED:%.*]] = ttg.local_alloc {{.*}}partition = array<i32: 2>
     %K_shared = ttg.local_alloc %K : (tensor<64x64xf16, #load_blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
 
-    // CHECK-DAG: [[TRANS_MMA:%.*]] = ttg.memdesc_trans [[K_SHARED]] {{.*}}partition = 1
-    // CHECK-DAG: [[K_VIEW:%.*]] = ttg.memdesc_subslice [[TRANS_MMA]]{{.*}}partition = 1
-    // CHECK-DAG: [[TRANS_USER:%.*]] = ttg.memdesc_trans [[K_SHARED]] {{.*}}partition = 0
+    // CHECK-DAG: [[TRANS_MMA:%.*]] = ttg.memdesc_trans [[K_SHARED]] {{.*}}partition = array<i32: 1>
+    // CHECK-DAG: [[K_VIEW:%.*]] = ttg.memdesc_subslice [[TRANS_MMA]]{{.*}}partition = array<i32: 1>
+    // CHECK-DAG: [[TRANS_USER:%.*]] = ttg.memdesc_trans [[K_SHARED]] {{.*}}partition = array<i32: 0>
     %K_trans = ttg.memdesc_trans %K_shared {order = array<i32: 1, 0>} : !ttg.memdesc<64x64xf16, #shared, #smem> -> !ttg.memdesc<64x64xf16, #shared_T, #smem>
     %K_view = ttg.memdesc_subslice %K_trans [0, 0]  : !ttg.memdesc<64x64xf16, #shared_T, #smem> -> !ttg.memdesc<64x64xf16, #shared_T, #smem>
 
-    // CHECK: ttng.tc_gen5_mma %arg0, [[K_VIEW]]{{.*}}partition = 1
+    // CHECK: ttng.tc_gen5_mma %arg0, [[K_VIEW]]{{.*}}partition = array<i32: 1>
     %QK_mma_tok = ttng.tc_gen5_mma %Q_shared, %K_view, %QK_tmem[%QK_tok], %false, %true : !ttg.memdesc<256x64xf16, #shared, #smem>, !ttg.memdesc<64x64xf16, #shared_T, #smem>, !ttg.memdesc<256x64xf32, #tmem, #ttng.tensor_memory, mutable>
 
-    // CHECK: local_load [[TRANS_USER]] {{.*}}partition = 0
+    // CHECK: local_load [[TRANS_USER]] {{.*}}partition = array<i32: 0>
     %x = ttg.local_load %K_trans : !ttg.memdesc<64x64xf16, #shared_T, #smem> -> tensor<64x64xf16, #load_blocked>
 
     // CHECK: tmem_load {{.*}}partition = 4
@@ -135,30 +150,29 @@ tt.func public @mma_operand_view(
   } {tt.warp_specialize}
 
   tt.return
-}
+  }
 
-// CHECK-LABEL: @optimize_broadcast
-tt.func @optimize_broadcast(%arg0: i32) {
+  // CHECK-LABEL: @optimize_broadcast
+  tt.func @optimize_broadcast(% arg0 : i32) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
   // CHECK: scf.for
   scf.for %i = %c0_i32 to %arg0 step %c1_i32 : i32 {
-    // CHECK: [[X:%.*]] = "producer"{{.*}}partition = 0
-    %x = "producer"() {ttg.partition = 0 : i32} : () -> tensor<128xf32>
+    // CHECK: [[X:%.*]] = "producer"{{.*}}partition = array<i32: 0>
+    %x = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128xf32>
 
-    // CHECK-DAG: [[X0_P0:%.*]] = tt.expand_dims [[X]] {{.*}}partition = 0
-    // CHECK-DAG: [[X0_P1:%.*]] = tt.expand_dims [[X]] {{.*}}partition = 1
-    %x0 = tt.expand_dims %x {axis = 0 : i32} : tensor<128xf32> -> tensor<1x128xf32>
-    // CHECK-DAG: [[X1_P0:%.*]] = tt.broadcast [[X0_P0]] {{.*}}partition = 0
-    // CHECK-DAG: [[X1_P1:%.*]] = tt.broadcast [[X0_P1]] {{.*}}partition = 1
-    %x1 = tt.broadcast %x0 : tensor<1x128xf32> -> tensor<128x128xf32>
+    // CHECK-DAG: [[X0_P0:%.*]] = tt.expand_dims [[X]] {{.*}}partition = array<i32: 0>
+    // CHECK-DAG: [[X0_P1:%.*]] = tt.expand_dims [[X]] {{.*}}partition = array<i32: 1>
+    %x0 = tt.expand_dims %x {axis = 0 : i32, ttg.partition = array<i32: 0, 1>} : tensor<128xf32> -> tensor<1x128xf32>
+    // CHECK-DAG: [[X1_P0:%.*]] = tt.broadcast [[X0_P0]] {{.*}}partition = array<i32: 0>
+    // CHECK-DAG: [[X1_P1:%.*]] = tt.broadcast [[X0_P1]] {{.*}}partition = array<i32: 1>
+    %x1 = tt.broadcast %x0 {ttg.partition = array<i32: 0, 1>} : tensor<1x128xf32> -> tensor<128x128xf32>
 
-    // CHECK: "use"([[X1_P0]]) {{.*}}partition = 0
-    "use"(%x1) {ttg.partition = 0 : i32} : (tensor<128x128xf32>) -> ()
-    // CHECK: "use"([[X1_P1]]) {{.*}}partition = 1
-    "use"(%x1) {ttg.partition = 1 : i32} : (tensor<128x128xf32>) -> ()
+    // CHECK: "use"([[X1_P0]]) {{.*}}partition = array<i32: 0>
+    "use"(%x1) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32>) -> ()
+    // CHECK: "use"([[X1_P1]]) {{.*}}partition = array<i32: 1>
+    "use"(%x1) {ttg.partition = array<i32: 1>} : (tensor<128x128xf32>) -> ()
   } {tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
   tt.return
-}
-
+  }
 }
