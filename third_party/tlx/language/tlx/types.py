@@ -108,11 +108,11 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
 
-    def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):
+    def __init__(self, blockM, blockN, colStride, CTASplitM, CTASplitN):
         super().__init__()
         self.blockM = blockM
         self.blockN = blockN
-        self.unpacked = unpacked
+        self.colStride = colStride
         self.CTASplitM = CTASplitM
         self.CTASplitN = CTASplitN
 
@@ -125,7 +125,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         return cls(
             blockM=shape[0],
             blockN=shape[1],
-            unpacked=True,
+            colStride=1,
             CTASplitM=1,
             CTASplitN=1,
         )
@@ -134,7 +134,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         return builder.make_tensor_memory_encoding_attr(
             self.blockM,
             self.blockN,
-            self.unpacked,
+            self.colStride,
             self.CTASplitM,
             self.CTASplitN,
         )
@@ -359,6 +359,8 @@ class reuse_group:
         qk_tiles = tlx.local_alloc(..., reuse=spec)
         p_tiles = tlx.local_alloc(..., reuse=spec)
         alpha = tlx.local_alloc(..., reuse=spec)
+        l = tlx.local_alloc(..., reuse=spec)
+        m = tlx.local_alloc(..., reuse=spec)
 
         # QK and (P, alpha) share the same memory region
         # P and alpha are placed in distinct (non-overlapping) regions
@@ -366,20 +368,43 @@ class reuse_group:
         spec.set_buffer_overlap(
             tlx.reuse_group(
                 qk_tiles,
-                tlx.reuse_group(p_tiles, alpha, group_type=tlx.reuse_group_type.distinct),
-                group_type=tlx.reuse_group_type.shared,
+                tlx.reuse_group(
+                    p_tiles,
+                    alpha,
+                    l,
+                    m,
+                    group_type=tlx.reuse_group_type.distinct
+                ),
             )
         )
         ```
 
-    Constraints:
-        - Nested reuse_groups must have different group_type than the parent.
+    Example - Subtiling with group_size:
+        ```python
+        # P has 2 * NUM_SLICES buffers, QK has 2 buffers.
+        # We need to be able to access NUM_SLICES buffers at once as logically
+        # this subtiled buffer is a single iteration.
+        # With NUM_SLICES=2, P's buffers [0,1] map to QK[0], [2,3] map to QK[1]
+        spec.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(
+                    tlx.reuse_group(p_tiles, group_size=NUM_SLICES),  # Subtiling wrapper
+                    alpha,
+                    l,
+                    m,
+                    group_type=tlx.reuse_group_type.distinct,
+                ),
+            )
+        )
+        ```
     """
 
     def __init__(
         self,
         *args: "buffered_tensor | reuse_group",
-        group_type: reuse_group_type,
+        group_type: "reuse_group_type" = reuse_group_type.shared,
+        group_size: int = 1,
     ):
         """
         Initialize a reuse group.
@@ -389,30 +414,42 @@ class reuse_group:
             group_type: The relationship type for elements in this group.
                 - shared: Elements occupy the same logical memory region.
                 - distinct: Elements must be in non-overlapping regions.
+                Defaults to shared.
+            group_size: Multiplier for buffer grouping (subtiling). Defaults to 1.
+                When > 1, K consecutive buffers are treated as a single logical
+                group for offset calculation. This enables subtiling where a
+                logical buffer is divided into smaller chunks.
+
+                For example, with group_size=2 on a tensor with 4 buffers:
+                - Buffers [0,1] are treated as logical group 0
+                - Buffers [2,3] are treated as logical group 1
+
+                This changes buffer count validation: after dividing by group_size,
+                all elements at each level must have identical effective buffer counts.
 
         Raises:
             ValueError: If args is empty.
-            ValueError: If a nested reuse_group has the same group_type as this group.
+            ValueError: If group_size is not a positive integer.
             TypeError: If any element is not a buffered_tensor or reuse_group.
         """
         if len(args) == 0:
             raise ValueError("reuse_group requires at least one element")
 
-        # Validate element types and check for nested same group_type
+        # Validate group_size
+        group_size = tl._unwrap_if_constexpr(group_size)
+        if not isinstance(group_size, int) or group_size < 1:
+            raise ValueError(f"group_size must be a positive integer, got {group_size}")
+
+        # Validate element types
         args = tuple(tl._unwrap_if_constexpr(elem) for elem in args)
         for elem in args:
-            if isinstance(elem, reuse_group):
-                if elem.group_type == group_type:
-                    raise ValueError(f"Cannot nest reuse_group with the same group_type ({group_type.value}). "
-                                     f"Nested groups must alternate between 'shared' and 'distinct'.")
-            elif isinstance(elem, buffered_tensor):
-                pass  # Valid element type
-            else:
+            if not isinstance(elem, (reuse_group, buffered_tensor)):
                 raise TypeError(f"reuse_group elements must be buffered_tensor or reuse_group, "
                                 f"got {type(elem).__name__}")
 
         self._args = args
         self._group_type = group_type
+        self._group_size = group_size
 
     @property
     def args(self) -> tuple:
@@ -423,6 +460,15 @@ class reuse_group:
     def group_type(self) -> reuse_group_type:
         """The relationship type for this group (read-only)."""
         return self._group_type
+
+    @property
+    def group_size(self) -> int:
+        """The buffer grouping multiplier for subtiling (read-only).
+
+        Defaults to 1 (no grouping). When > 1, K consecutive buffers are
+        treated as a single logical group for offset calculation purposes.
+        """
+        return self._group_size
 
     def _flatten_ir(self, handles) -> None:
         """Recursively flatten IR handles from all elements in the group."""
@@ -454,10 +500,13 @@ class reuse_group:
 
         # Create the reuse_group IR operation
         group_kind = self._group_type.value  # "shared" or "distinct"
-        return builder.create_reuse_group(ir_elements, group_kind)
+        return builder.create_reuse_group(ir_elements, group_kind, self._group_size)
 
     def __repr__(self):
-        return f"reuse_group({self._args}, group_type={self._group_type.value})"
+        if self._group_size == 1:
+            return f"reuse_group({self._args}, group_type={self._group_type.value})"
+        else:
+            return f"reuse_group({self._args}, group_type={self._group_type.value}, group_size={self._group_size})"
 
 
 class reuse_group_ir_type(tl.base_type):

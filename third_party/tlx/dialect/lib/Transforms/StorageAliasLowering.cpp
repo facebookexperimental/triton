@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tlx-storage-alias-lowering"
@@ -25,7 +26,14 @@ namespace tlx {
 
 // Forward declarations of functions from the individual passes
 LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m);
-LogicalResult materializeStorageAliasAllocations(ModuleOp m);
+LogicalResult processBufferOverlapOps(
+    ModuleOp m,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap);
+LogicalResult materializeStorageAliasAllocations(
+    ModuleOp m,
+    const DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap,
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>>
+        &localAliasOffsetMap);
 
 struct TLXStorageAliasLoweringPass
     : public impl::TLXStorageAliasLoweringBase<TLXStorageAliasLoweringPass> {
@@ -45,12 +53,33 @@ public:
       return;
     }
 
-    // Step 2: Materialize storage alias allocations
-    LDBG("Step 2: Materializing storage alias allocations");
-    if (failed(materializeStorageAliasAllocations(m))) {
+    // Step 2: Process buffer overlap operations (compute offsets)
+    // This must run BEFORE materialization because:
+    // - SetBufferOverlapOp uses StorageAliasSpecOp
+    // - Materialization erases StorageAliasSpecOp
+    // The computed offsets are returned in a map to be applied during
+    // materialization.
+    LDBG("Step 2: Processing buffer overlap operations");
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> offsetMap;
+    if (failed(processBufferOverlapOps(m, offsetMap))) {
       signalPassFailure();
       return;
     }
+
+    // Step 3: Materialize storage alias allocations
+    // This creates LocalAllocOp/TMEMAllocOp and LocalAliasOp.
+    // The computed offsets are stored in localAliasOffsetMap for later use.
+    LDBG("Step 3: Materializing storage alias allocations");
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> localAliasOffsetMap;
+    if (failed(materializeStorageAliasAllocations(m, offsetMap,
+                                                  localAliasOffsetMap))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Note: localAliasOffsetMap contains the buffer layout information for
+    // LocalAliasOps that have custom offsets (from set_buffer_overlap).
+    // This can be used in a future Step 4 for Phase 6 implementation.
 
     LDBG("TLXStorageAliasLowering completed successfully");
   }

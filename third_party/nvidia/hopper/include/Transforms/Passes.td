@@ -152,4 +152,24 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> {
+  let summary = "test ping pong preprocessing";
+
+  let description = "This pass groups expensive operations into ping-pong regions.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"numWarpGroups", "num-warp-groups",
+           "int32_t", /*default*/"0",
+           "number of warp groups for warp specialization">,
+    Option<"capability", "capability",
+           "int32_t", /*default*/"10",
+           "NVIDIA compute capability">,
+    Option<"numStages", "num-stages",
+           "int32_t", /*default*/"3",
+           "number of stages for software pipelining">,
+  ];
+}
+
 #endif // NV_TRANSFORMS_PASSES

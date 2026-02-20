@@ -160,8 +160,9 @@ public:
 
 class AssignMMALatencies {
 public:
-  AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency)
-      : forOp(forOp), opLatency(opLatency) {};
+  AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency,
+                     bool useMetaWS)
+      : forOp(forOp), opLatency(opLatency), useMetaWS(useMetaWS) {};
 
   void run() {
     DenseMap<Operation *, int> mmaSelfLatency;
@@ -194,9 +195,20 @@ public:
           // Only update the MMA latency if it wasn't set to 0 by the user.
           // TODO: Support values other than 0.
           if (!opLatency.count(&op)) {
-            if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
-                (ttng::isAccMultibufferingPossible(mma, forOp) &&
-                 !getDisallowAccMultiBuffer(forOp))) {
+            // Check if all users of the MMA results are loop-carried
+            // outputs (yield) or outside the loop body.
+            bool allUsersAreLoopCarried =
+                llvm::all_of(op.getUsers(), [&](Operation *user) {
+                  return isa<scf::YieldOp>(user) || !forOp->isAncestor(user);
+                });
+            if (useMetaWS && allUsersAreLoopCarried) {
+              // All users are loop-carried outputs, so we don't need to
+              // push users to a later stage.
+              opLatency[&op] = 0;
+              continue;
+            } else if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
+                       (ttng::isAccMultibufferingPossible(mma, forOp) &&
+                        !getDisallowAccMultiBuffer(forOp))) {
               // MMA's users can be pushed to the next stage
               opLatency[&op] = 1;
             }
@@ -223,6 +235,7 @@ public:
 private:
   scf::ForOp forOp;
   DenseMap<Operation *, int> &opLatency;
+  bool useMetaWS;
 
   bool hasSyncDots(scf::ForOp forOp) {
     for (auto &op : forOp.getBody()->without_terminator()) {
@@ -240,7 +253,7 @@ private:
 // requested number of stages assign the latencies in a way that cover all the
 // stages with the sum of latencies in the chain from the first load to the
 // final dot op.
-void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
+void assignLatencies(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) {
     // Bail out for loops with num_stage <= 1.
@@ -262,7 +275,7 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
     AssignLoadLatencies(forOp, numStages, opLatency).run();
-    AssignMMALatencies(forOp, opLatency).run();
+    AssignMMALatencies(forOp, opLatency, useMetaWS).run();
   }
   serializeLatencies(moduleOp, opLatency);
 }
@@ -373,7 +386,9 @@ struct AssignLatencies
     : public impl::TritonGPUAssignLatenciesBase<AssignLatencies> {
   using TritonGPUAssignLatenciesBase::TritonGPUAssignLatenciesBase;
 
-  void runOnOperation() override { assignLatencies(getOperation(), numStages); }
+  void runOnOperation() override {
+    assignLatencies(getOperation(), numStages, useMetaWS);
+  }
 };
 
 } // namespace mlir::triton::gpu

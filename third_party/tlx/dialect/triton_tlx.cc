@@ -142,10 +142,10 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
-              bool unpacked, unsigned CTASplitM, unsigned CTASplitN) {
+              unsigned colStride, unsigned CTASplitM, unsigned CTASplitN) {
              auto context = self.getBuilder().getContext();
              return mlir::cast<Attribute>(ttng::TensorMemoryEncodingAttr::get(
-                 context, blockM, blockN, unpacked, CTASplitM, CTASplitN));
+                 context, blockM, blockN, colStride, CTASplitM, CTASplitN));
            })
       .def("make_tensor_memory_scales_encoding_attr",
            [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {
@@ -543,7 +543,7 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_reuse_group",
            [](TritonOpBuilder &self, const std::vector<mlir::Value> &elements,
-              const std::string &groupKind) -> mlir::Value {
+              const std::string &groupKind, int64_t groupSize) -> mlir::Value {
              auto context = self.getBuilder().getContext();
 
              // Parse group kind
@@ -557,6 +557,13 @@ void init_triton_tlx_ir(py::module &&m) {
                                            ", expected 'shared' or 'distinct'");
              }
 
+             // Validate group_size
+             if (groupSize < 1) {
+               throw std::invalid_argument(
+                   "group_size must be a positive integer, got " +
+                   std::to_string(groupSize));
+             }
+
              // Create the result type
              auto resultType = tlx::ReuseGroupType::get(context, groupKindEnum);
 
@@ -564,10 +571,14 @@ void init_triton_tlx_ir(py::module &&m) {
              auto groupKindAttr =
                  tlx::ReuseGroupKindAttr::get(context, groupKindEnum);
 
+             // Create the group_size attribute
+             auto groupSizeAttr =
+                 self.getBuilder().getI64IntegerAttr(groupSize);
+
              // Create the operation (no storage_alias_spec - that's handled by
              // set_buffer_overlap)
-             return self.create<tlx::ReuseGroupOp>(resultType, elements,
-                                                   groupKindAttr);
+             return self.create<tlx::ReuseGroupOp>(
+                 resultType, elements, groupKindAttr, groupSizeAttr);
            })
       .def("create_set_buffer_overlap",
            [](TritonOpBuilder &self, mlir::Value storageAliasSpec,

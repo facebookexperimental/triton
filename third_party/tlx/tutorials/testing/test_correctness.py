@@ -59,8 +59,10 @@ class Gemm:
             "GROUP_SIZE_M": 8,
             "NUM_SMEM_BUFFERS": 2,
             "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1,
             "EPILOGUE_SUBTILE": 1,
-            "PAIR_CTA": False,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
         },
         "blackwell_gemm_clc": {
             "BLOCK_SIZE_M": 128,
@@ -99,14 +101,14 @@ class Gemm:
     }
 
     @staticmethod
-    def run_test(matmul_fn, config, shapes=None):
+    def run_test(matmul_fn, config, shapes=None, dtype=torch.float16):
         if shapes is None:
             shapes = Gemm.SHAPES
         for shape in shapes:
             M, N, K = shape
             torch.manual_seed(0)
-            a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-            b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+            a = torch.randn((M, K), device=DEVICE, dtype=dtype)
+            b = torch.randn((K, N), device=DEVICE, dtype=dtype)
             torch_output = torch.matmul(a, b)
             triton_output = matmul_fn(a, b, config=config)
             torch.testing.assert_close(triton_output, torch_output)
@@ -216,24 +218,28 @@ class FlashAttention:
 # =============================================================================
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_gemm_ws():
-    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"])
+def test_blackwell_gemm_ws(dtype):
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_gemm_clc():
-    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc"])
+def test_blackwell_gemm_clc(dtype):
+    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc"], dtype=dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_gemm_pipelined():
-    Gemm.run_test(_blackwell_gemm_pipelined, Gemm.CONFIGS["blackwell_gemm_pipelined"])
+def test_blackwell_gemm_pipelined(dtype):
+    Gemm.run_test(_blackwell_gemm_pipelined, Gemm.CONFIGS["blackwell_gemm_pipelined"], dtype=dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_gemm_2cta():
-    Gemm.run_test(_blackwell_gemm_2cta, Gemm.CONFIGS["blackwell_gemm_2cta"])
+def test_blackwell_gemm_2cta(dtype):
+    Gemm.run_test(_blackwell_gemm_2cta, Gemm.CONFIGS["blackwell_gemm_2cta"], dtype=dtype)
 
 
 # =============================================================================

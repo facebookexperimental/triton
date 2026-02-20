@@ -253,7 +253,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Test reuse_group with tmem storage
 // Note: #tmem binds to tensor_memory_encoding, memory space is #ttng.tensor_memory
-#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, unpacked = true>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @reuse_group_shared_tmem
   tt.func @reuse_group_shared_tmem() {
@@ -317,6 +317,57 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %4 = tlx.reuse_group(%2, %3) group_kind = distinct : (!ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<2x64xf32, #shared, #smem, mutable>) -> !tlx.reuse_group<distinct>
     %5 = tlx.reuse_group(%1, %4) group_kind = shared : (!ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
     tlx.set_buffer_overlap(%0, %5) : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<shared>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// Buffer Layout Attribute Tests
+//===----------------------------------------------------------------------===//
+
+// Test storage_alias_local_alloc with explicit buffer_offset = 0 (valid default)
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @buffer_offset_zero
+  tt.func @buffer_offset_zero() {
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64}
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 {buffer_offset = 0 : i64} : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test storage_alias_local_alloc with explicit bytes_between_buffers = allocation size (valid default)
+// Allocation is 2x64x64xf32, so per-buffer size = 64*64*4 = 16384 bytes
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @bytes_between_buffers_default
+  tt.func @bytes_between_buffers_default() {
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {bytes_between_buffers = 16384 : i64}
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 {bytes_between_buffers = 16384 : i64} : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Test storage_alias_local_alloc with both attributes set to valid defaults
+// Allocation is 2x64x64xf16, so per-buffer size = 64*64*2 = 8192 bytes
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @both_layout_attrs_default
+  tt.func @both_layout_attrs_default() {
+    // CHECK: tlx.storage_alias_local_alloc %{{.*}} {buffer_offset = 0 : i64, bytes_between_buffers = 8192 : i64}
+    %0 = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %1 = tlx.storage_alias_local_alloc %0 {buffer_offset = 0 : i64, bytes_between_buffers = 8192 : i64} : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }

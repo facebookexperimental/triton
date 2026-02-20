@@ -1651,6 +1651,41 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     torch.testing.assert_close(z, ref_out)
 
 
+def _swizzle_scale_to_5d(scale, outer_chunks, k_chunks):
+    """Convert raw E8M0 scales to swizzled 5D format for TMA/async_dot_scaled.
+
+    Applies the cuBLAS block scaling layout within each 128x4 block.
+    dest[row%32 * 16 + row//32 * 4 + col] = src[row, col]
+
+    Args:
+        scale: Raw scale tensor of shape (batch, rows, K//32) in uint8.
+        outer_chunks: Number of 128-row chunks (rows // 128).
+        k_chunks: Number of 4-column chunks (K // 32 // 4).
+
+    Returns:
+        Swizzled 5D tensor of shape (batch, outer_chunks, k_chunks, 2, 256).
+    """
+    batch = scale.shape[0]
+    cols = scale.shape[2]
+    padded_cols = k_chunks * 4
+
+    if cols < padded_cols:
+        scale = torch.nn.functional.pad(scale, (0, padded_cols - cols))
+
+    blocks = (scale.reshape(batch, outer_chunks, 128, k_chunks,
+                            4).permute(0, 1, 3, 2, 4).reshape(batch, outer_chunks, k_chunks, 512))
+
+    _r = torch.arange(128)
+    _c = torch.arange(4)
+    _rg, _cg = torch.meshgrid(_r, _c, indexing="ij")
+    idx = ((_rg % 32) * 16 + (_rg // 32) * 4 + _cg).reshape(-1)
+    idx = idx.to(scale.device).expand_as(blocks)
+    output = torch.empty_like(blocks)
+    output.scatter_(-1, idx, blocks)
+
+    return output.reshape(batch, outer_chunks, k_chunks, 2, 256)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_scaled_2cta(device):
     """
@@ -1803,10 +1838,10 @@ def test_async_dot_scaled_2cta(device):
     b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    a_scale = torch.randint(10, 20, (M, K // 32), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // 32), dtype=torch.uint8, device=device)
-    a_scale_4d = a_scale.reshape(a_scale.shape[0] // 128, a_scale.shape[1] // 4, 2, 2 * 128)
-    b_scale_4d = b_scale.reshape(b_scale.shape[0] // 128, b_scale.shape[1] // 4, 2, 2 * 128)
+    a_scale = torch.randint(124, 130, (M, K // 32), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // 32), dtype=torch.uint8, device=device)
+    a_scale_4d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // 32), M // 128, K // 32 // 4).squeeze(0)
+    b_scale_4d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4).squeeze(0)
 
     BLOCK_M = M // 2  # 128 per CTA
     BLOCK_N = N  # 256 total, 128 per CTA for B data
@@ -1950,13 +1985,12 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
     # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
-    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
-    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(124, 130, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -1988,9 +2022,9 @@ def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     # Repeats each scale value VEC_SIZE times along dimension 1.
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -2087,12 +2121,12 @@ def test_async_dot_scaled_tmem_scales(device):
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
     # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
-    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(124, 130, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -2127,9 +2161,9 @@ def test_async_dot_scaled_tmem_scales(device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
@@ -3416,6 +3450,114 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert torch.count_nonzero(output) == size
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("CLUSTER_SIZE", [2, 4])
+def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
+    """
+    Test CLC with 2-CTA clusters (multi_ctas=True).
+
+    Verifies that:
+    1. Both CTAs call barrier_expect_bytes (unpredicated) on their own local bar_full,
+       because try_cancel with multicast::cluster::all signals each CTA's mbarrier.
+    2. Both CTAs call barrier_wait (unpredicated) on their own local bar_full
+       before reading the CLC response.
+    3. The kernel produces correct results with persistent multi-CTA CLC scheduling.
+    """
+
+    @triton.jit
+    def mul2_clc_multi_cta(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        CLUSTER_SIZE: tl.constexpr,
+    ):
+        # Each CTA in the cluster handles half the block
+        tile_id = tl.program_id(axis=0)
+
+        # CLC Init — num_consumers=CLUSTER_SIZE because all CTAs in the cluster
+        # arrive at CTA 0's bar_empty in clc_consumer
+        clc_phase_producer = 1
+        clc_phase_consumer = 0
+        clc_context = tlx.clc_create_context(CLUSTER_SIZE)
+
+        while tile_id != -1:
+            # CLC producer
+            tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=True)
+            clc_phase_producer ^= 1
+
+            block_start = tile_id * BLOCK_SIZE
+
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            output = x + y
+            tl.store(z_ptr + offsets, output, mask=mask)
+
+            # CLC consumer
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
+            clc_phase_consumer ^= 1
+
+    torch.manual_seed(0)
+    BLOCK_SIZE = 1024
+    size = BLOCK_SIZE * CLUSTER_SIZE
+    x = torch.ones(size, device=device)
+    y = torch.ones(size, device=device)
+
+    output = torch.zeros_like(x)
+    ref_out = x + y
+
+    n_elements = output.numel()
+    # Grid: each logical tile is handled by 2 CTAs, so total CTAs = 2 * num_tiles
+    num_tiles = triton.cdiv(n_elements, BLOCK_SIZE)
+    # Pad to multiple of 2 for 2-CTA clusters
+    num_tiles = (num_tiles + 1) // CLUSTER_SIZE * CLUSTER_SIZE
+    grid = (num_tiles, )
+    kernel = mul2_clc_multi_cta[grid](
+        x,
+        y,
+        output,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        CLUSTER_SIZE=CLUSTER_SIZE,
+        launch_cluster=True,
+        ctas_per_cga=(CLUSTER_SIZE, 1, 1),
+    )
+
+    ptx = kernel.asm["ptx"]
+
+    # CLC instructions are present
+    assert re.search(r"clusterlaunchcontrol.try_cancel", ptx, flags=re.DOTALL)
+    assert re.search(r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128", ptx, flags=re.DOTALL)
+    assert re.search(r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128", ptx, flags=re.DOTALL)
+
+    # Multicast is used (2-CTA cluster)
+    assert re.search(r"multicast::cluster::all", ptx, flags=re.DOTALL)
+
+    # mapa.shared::cluster for remote barrier arrive (consumer signals CTA 0's bar_empty)
+    assert "mapa.shared::cluster" in ptx
+
+    # Verify barrier_expect_bytes is NOT predicated by cluster_ctaid check.
+    # Both CTAs must initialize their own bar_full because try_cancel with
+    # multicast::cluster::all signals the mbarrier on each CTA's shared memory.
+    # Look for expect_tx lines and ensure none are guarded by cluster_ctaid predicates.
+    expect_tx_lines = [line.strip() for line in ptx.split("\n") if "expect_tx" in line]
+    assert len(expect_tx_lines) > 0, "Expected mbarrier.arrive.expect_tx in PTX"
+
+    # The mbarrier.try_wait for the CLC response should NOT be skipped by rank-1.
+    # In the buggy version, rank-1 would branch past the try_wait with:
+    #   @!pred_cta0 bra skipWait
+    # After the fix, all CTAs should hit mbarrier.try_wait unconditionally.
+    try_wait_lines = [line.strip() for line in ptx.split("\n") if "mbarrier.try_wait" in line]
+    assert len(try_wait_lines) > 0, "Expected mbarrier.try_wait in PTX"
+
+    # Verify correctness
+    torch.testing.assert_close(output, ref_out)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_async_tasks_region_error(device):
 
@@ -3573,9 +3715,9 @@ def test_async_dot_scaled_mxfp4(device):
     a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
     b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -3605,9 +3747,9 @@ def test_async_dot_scaled_mxfp4(device):
         scale = scale.view(torch.float32)
         return scale
 
-    # print(a_scale_5d[0][0][0][0][0].item())
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     # Repeat each scale value VEC_SIZE times along dim 1
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -3758,9 +3900,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
     a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
     b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA (cuBLAS block scaling layout)
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
     b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
@@ -3807,9 +3949,9 @@ def test_async_dot_scaled_mixed_mxfp8_mxfp4(A_format, B_format, device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    # Compute reference (use original 2D scales, not swizzled 5D)
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     # Repeat each scale value VEC_SIZE times along dim 1
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
@@ -4279,12 +4421,12 @@ def test_make_tensor_descriptor_mxfp8(device):
 
     # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
     # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
-    a_scale = torch.randint(10, 20, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(10, 20, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(124, 130, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    b_scale = torch.randint(124, 130, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
 
-    # Reshape to 5D format for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = a_scale.reshape(1, M // 128, K // VEC_SIZE // 4, 2, 2 * 128)
-    b_scale_5d = b_scale.reshape(1, N // 128, K // VEC_SIZE // 4, 2, 2 * 128)
+    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
+    a_scale_5d = _swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
+    b_scale_5d = _swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
 
     kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N, "M": M, "N": N, "K": K}
     kernel = mxfp8_scaled_kernel[(1, 1)](
@@ -4325,8 +4467,8 @@ def test_make_tensor_descriptor_mxfp8(device):
         scale = scale.view(torch.float32)
         return scale
 
-    a_scale_f32 = fp8e8m0_to_float32(a_scale_5d.reshape(M, K // VEC_SIZE))
-    b_scale_f32 = fp8e8m0_to_float32(b_scale_5d.reshape(N, K // VEC_SIZE))
+    a_scale_f32 = fp8e8m0_to_float32(a_scale)
+    b_scale_f32 = fp8e8m0_to_float32(b_scale)
     a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
@@ -5237,32 +5379,6 @@ class TestReuseGroup:
         with pytest.raises(ValueError, match="at least one element"):
             tlx.reuse_group(group_type=tlx.reuse_group_type.shared, )
 
-    def test_reuse_group_nested_same_type_shared_raises_error(self):
-        """Test that nesting shared inside shared raises an error."""
-        elem = _make_test_buffered_tensor()
-        inner = tlx.reuse_group(
-            elem,
-            group_type=tlx.reuse_group_type.shared,
-        )
-        with pytest.raises(ValueError, match="same group_type"):
-            tlx.reuse_group(
-                inner,
-                group_type=tlx.reuse_group_type.shared,
-            )
-
-    def test_reuse_group_nested_same_type_distinct_raises_error(self):
-        """Test that nesting distinct inside distinct raises an error."""
-        elem = _make_test_buffered_tensor()
-        inner = tlx.reuse_group(
-            elem,
-            group_type=tlx.reuse_group_type.distinct,
-        )
-        with pytest.raises(ValueError, match="same group_type"):
-            tlx.reuse_group(
-                inner,
-                group_type=tlx.reuse_group_type.distinct,
-            )
-
     def test_reuse_group_invalid_element_type_raises_error(self):
         """Test that invalid element types raise TypeError."""
         with pytest.raises(TypeError, match="must be buffered_tensor or reuse_group"):
@@ -5391,58 +5507,107 @@ class TestToMxfp8:
         assert torch.equal(scale_out.cpu(), ref_scale.reshape(-1))
 
 
+@pytest.mark.skipif(is_hip(), reason="Not supported on AMD")
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 class TestSetBufferOverlap:
     """Tests for tlx.set_buffer_overlap and storage_alias_spec.set_buffer_overlap method."""
 
-    def test_set_buffer_overlap_compiles_to_ir(self):
-        """Test that set_buffer_overlap compiles to IR but fails during lowering.
+    def test_set_buffer_overlap_shared_different_sizes(self):
+        """Test shared overlap with different sized allocations (f32 vs bf16).
 
-        This test verifies that the JIT API works correctly - the code should
-        successfully lower to MLIR IR but is expected to fail in later lowering
-        passes because offset calculation is not yet implemented.
+        When allocations of different sizes share memory, the smaller allocation's
+        shape is expanded to account for the larger allocation's buffer spacing.
+        This test verifies that shape expansion and index rewriting work correctly.
         """
 
         @triton.jit
-        def set_buffer_overlap_kernel(BLOCK_SIZE: tl.constexpr):
+        def set_buffer_overlap_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
             # Create a storage alias spec
             spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
 
             # Allocate buffers using the spec
+            # a: 2 x BLOCK_SIZE x BLOCK_SIZE x f32 = 2 x 64 x 64 x 4 = 32768 bytes
+            # b: 2 x BLOCK_SIZE x BLOCK_SIZE x bf16 = 2 x 64 x 64 x 2 = 16384 bytes
             a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
                                 reuse=spec)
             b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
                                 reuse=spec)
 
             # Define overlap scheme: a and b share the same memory region
+            # bytes_between_buffers = max(16384, 8192) = 16384
+            # For b (8192 bytes): scale = 16384/8192 = 2
+            # b's shape expands from 2 to 4 buffers
             spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float32)
+
+            # Initialize all 4 output regions to 0
+            for i in tl.static_range(4):
+                out_offsets = out_ptr + i * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+                tl.store(out_offsets, zeros)
+
+            # Write 1.0 to a[0] (16384 bytes per buffer)
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(a[0], ones)
+
+            # Write 2.0 to a[1]
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float32)
+            tlx.local_store(a[1], twos)
+
+            # Since b shares memory with a and has scale=2:
+            # b[0] maps to physical slot 0 (same as a[0])
+            # b[1] maps to physical slot 2 (same as a[1]'s start, since a's buffer is 2x size of b's)
+            # So reading b[0] should give us the first half of a[0]'s data (reinterpreted as bf16)
+
+            # Read from b[0] and b[1] and store to output
+            b0_data = tlx.local_load(b[0])
+            b0_as_f32 = b0_data.to(tl.float32)
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, b0_as_f32)
+
+            b1_data = tlx.local_load(b[1])
+            b1_as_f32 = b1_data.to(tl.float32)
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_1, b1_as_f32)
 
         grid = lambda meta: (1, )
 
-        # The kernel should compile to IR but fail during lowering
-        # (offset calculation not implemented yet)
-        with pytest.raises(RuntimeError):
-            set_buffer_overlap_kernel[grid](BLOCK_SIZE=64)
+        BLOCK_SIZE = 64
+        out = torch.zeros((2 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        set_buffer_overlap_kernel[grid](out, BLOCK_SIZE)
 
-    def test_set_buffer_overlap_nested_compiles_to_ir(self):
-        """Test that nested reuse_group in set_buffer_overlap compiles to IR.
+        # The values stored as f32 and read back as bf16->f32 will have precision loss
+        # but should be non-zero (proving the memory is shared)
+        # b[0] should contain data from a[0] reinterpreted as bf16
+        # b[1] should contain data from a[1] reinterpreted as bf16
+        assert out[:BLOCK_SIZE, :].abs().sum() > 0, "b[0] should have non-zero data from a[0]"
+        assert out[BLOCK_SIZE:, :].abs().sum() > 0, "b[1] should have non-zero data from a[1]"
 
-        This test verifies Flash Attention-style nested overlap schemes work
-        at the JIT level.
+    def test_set_buffer_overlap_nested_shared_distinct(self):
+        """Test nested reuse_group: shared(qk, distinct(p, alpha)).
+
+        This test verifies Flash Attention-style nested overlap schemes work.
+        The distinct group places p and alpha at different offsets within the
+        shared region with qk.
         """
 
         @triton.jit
-        def set_buffer_overlap_nested_kernel(BLOCK_SIZE: tl.constexpr):
+        def set_buffer_overlap_nested_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
             # Create a storage alias spec
             spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
 
-            # Allocate buffers (Flash Attention pattern)
+            # Allocate buffers (Flash Attention like pattern)
             qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
                                  reuse=spec)
-            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.bfloat16, tl.constexpr(2), tlx.storage_kind.smem,
                                 reuse=spec)
-            alpha = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, tl.constexpr(2), tlx.storage_kind.smem, reuse=spec)
+            # alpha: 2 x 64 x f32 = 512 bytes (256 per buffer)
+            alpha = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE // 2), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                    reuse=spec)
 
-            # Define overlap scheme: QK shares with (P distinct from alpha)
             spec.set_buffer_overlap(
                 tlx.reuse_group(
                     qk,
@@ -5450,11 +5615,345 @@ class TestSetBufferOverlap:
                     group_type=tlx.reuse_group_type.shared,
                 ))
 
+            # Write 1.0 to qk[0]
+            data = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(qk[0], data)
+
+            # Read from alpha[0] (should alias with half of qk[0] since they share)
+            alpha0_data = tlx.local_load(alpha[0])
+
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n_half = tl.arange(0, BLOCK_SIZE // 2)
+
+            # Write alpha[0] to the first half of output columns
+            offs_n_half = tl.arange(0, BLOCK_SIZE // 2)
+            out_offsets_first_half = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n_half[None, :])
+            tl.store(out_offsets_first_half, alpha0_data)
+
         grid = lambda meta: (1, )
 
-        # The kernel should compile to IR but fail during lowering
-        with pytest.raises(RuntimeError):
-            set_buffer_overlap_nested_kernel[grid](BLOCK_SIZE=64)
+        BLOCK_SIZE = 64
+        out = torch.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        set_buffer_overlap_nested_kernel[grid](out, BLOCK_SIZE)
+        # alpha[0] should have half of qk[0]'s data (1s)
+        # Output should be 1s for the first half of columns, 0s for the second half
+        expected = torch.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        expected[:, :BLOCK_SIZE // 2] = 1.0
+        torch.testing.assert_close(out, expected)
+
+    def test_reuse_group_with_group_size(self):
+        """Test reuse_group with group_size for subtiling.
+
+        This test verifies that group_size works correctly for subtiling scenarios.
+        We have two allocations:
+        - qk: 2 buffers of (64, 64) float32
+        - p: 4 buffers of (64, 64) float16 with group_size=2
+
+        With group_size=2, p's 4 buffers are grouped into 2 logical groups:
+        - p[0], p[1] form logical group 0 (shares with qk[0])
+        - p[2], p[3] form logical group 1 (shares with qk[1])
+
+        The index computation should map:
+        - p[0] -> physical index 0 (group 0, offset 0)
+        - p[1] -> physical index 1 (group 0, offset 1)
+        - p[2] -> physical index 2 (group 1, offset 0)
+        - p[3] -> physical index 3 (group 1, offset 1)
+        """
+
+        @triton.jit
+        def group_size_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate qk: 2 buffers
+            qk = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                 reuse=spec)
+            # Allocate p: 4 buffers with group_size=2
+            # This means p[0],p[1] share with qk[0] and p[2],p[3] share with qk[1]
+            p = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(4), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap with group_size=2 for p
+            spec.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk,
+                    tlx.reuse_group(p, group_size=2),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
+
+            # Write different values to qk[0] and qk[1]
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+
+            # Write 1.0 to qk[0]
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(qk[0], ones)
+
+            # Write 2.0 to qk[1]
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float32)
+            tlx.local_store(qk[1], twos)
+
+            # Read from p buffers - they should see the qk data reinterpreted as float16
+            # p[0] and p[1] should see qk[0]'s data
+            # p[2] and p[3] should see qk[1]'s data
+            p0_data = tlx.local_load(p[0])
+            p1_data = tlx.local_load(p[1])
+            p2_data = tlx.local_load(p[2])
+            p3_data = tlx.local_load(p[3])
+
+            # Output layout: 4 blocks of (BLOCK_SIZE, BLOCK_SIZE)
+            out_offsets_0 = out_ptr + 0 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_1 = out_ptr + 1 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_2 = out_ptr + 2 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_3 = out_ptr + 3 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+
+            tl.store(out_offsets_0, p0_data)
+            tl.store(out_offsets_1, p1_data)
+            tl.store(out_offsets_2, p2_data)
+            tl.store(out_offsets_3, p3_data)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((4 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        group_size_kernel[grid](out, BLOCK_SIZE)
+
+        # p[0] and p[1] should have the same data (from qk[0])
+        # p[2] and p[3] should have the same data (from qk[1])
+        # The data should be non-zero since qk was written with 1.0 and 2.0
+        p0_out = out[:BLOCK_SIZE, :]
+        p1_out = out[BLOCK_SIZE:2 * BLOCK_SIZE, :]
+        p2_out = out[2 * BLOCK_SIZE:3 * BLOCK_SIZE, :]
+        p3_out = out[3 * BLOCK_SIZE:, :]
+
+        # p[0] and p[1] should be equal (both alias qk[0])
+        torch.testing.assert_close(p0_out, p1_out)
+        # p[2] and p[3] should be equal (both alias qk[1])
+        torch.testing.assert_close(p2_out, p3_out)
+        # p[0] and p[2] should be different (different qk buffers)
+        assert not torch.allclose(p0_out, p2_out), "p[0] and p[2] should have different data"
+
+    def test_basic_shared_buffer_overlap(self):
+        """Test that allocating two identical buffers with shared overlap works.
+
+        Both buffers have the same type and size, so scale=1 and offset=0 for both.
+        No shape expansion or index rewriting is needed.
+        """
+
+        @triton.jit
+        def set_buffer_overlap_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate buffers using the spec (same type and size)
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b share the same memory region
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.shared))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float16)
+
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, zeros)
+            tl.store(out_offsets_1, zeros)
+
+            # Write all 1s to a[0]
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float16)
+            tlx.local_store(a[0], ones)
+
+            # Write all 2s to b[1]
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float16)
+            tlx.local_store(b[1], twos)
+
+            # Since a and b share the same memory, b[0] should equal a[0] (all 1s)
+            # and a[1] should equal b[1] (all 2s)
+
+            # Write b[0] to out_ptr (should be all 1s)
+            b0_data = tlx.local_load(b[0])
+            tl.store(out_offsets_0, b0_data)
+
+            # Write a[1] to out_ptr + BLOCK_SIZE*BLOCK_SIZE (should be all 2s)
+            a1_data = tlx.local_load(a[1])
+            tl.store(out_offsets_1, a1_data)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((2 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        set_buffer_overlap_kernel[grid](out, BLOCK_SIZE)
+
+        # First half should be all 1s (from b[0] which shares memory with a[0])
+        expected_ones = torch.ones((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        # Second half should be all 2s (from a[1] which shares memory with b[1])
+        expected_twos = torch.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, dtype=torch.float16, device="cuda")
+
+        torch.testing.assert_close(out[:BLOCK_SIZE, :], expected_ones)
+        torch.testing.assert_close(out[BLOCK_SIZE:, :], expected_twos)
+
+    def test_distinct_buffer_overlap(self):
+        """Test distinct overlap where buffers are placed at different offsets.
+
+        Two identical allocations in a distinct group:
+        - a at offset 0
+        - b at offset = a's buffer size
+        Shape expansion: both get scale=2 (since bytes_between_buffers = 2 * buffer_size)
+        Index rewriting:
+        - a[i] -> physical slot 2*i
+        - b[i] -> physical slot 2*i + 1
+        """
+
+        @triton.jit
+        def distinct_buffer_overlap_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate two identical buffers
+            # Each: 2 x 64 x 64 x f16 = 2 x 8192 bytes = 16384 total
+            a = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+            b = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                reuse=spec)
+
+            # Define overlap scheme: a and b are distinct (placed sequentially)
+            # bytes_between_buffers = 8192 + 8192 = 16384
+            # For a: scale = 16384/8192 = 2, offset = 0
+            # For b: scale = 16384/8192 = 2, offset_slots = 8192/8192 = 1
+            # Shape expansion: a: 2 -> 4, b: 2 -> 5 (2*2 + 1)
+            spec.set_buffer_overlap(tlx.reuse_group(a, b, group_type=tlx.reuse_group_type.distinct))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float16)
+
+            for i in tl.static_range(4):
+                out_offsets = out_ptr + i * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+                tl.store(out_offsets, zeros)
+
+            # Write to a[0] - should go to physical slot 0
+            ones = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float16)
+            tlx.local_store(a[0], ones)
+
+            # Write to a[1] - should go to physical slot 2
+            twos = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float16)
+            tlx.local_store(a[1], twos)
+
+            # Write to b[0] - should go to physical slot 1
+            threes = tl.full((BLOCK_SIZE, BLOCK_SIZE), 3.0, tl.float16)
+            tlx.local_store(b[0], threes)
+
+            # Write to b[1] - should go to physical slot 3
+            fours = tl.full((BLOCK_SIZE, BLOCK_SIZE), 4.0, tl.float16)
+            tlx.local_store(b[1], fours)
+
+            # Read back and verify distinct memory regions
+            # Reading a[0] should give 1s (not overwritten by b)
+            a0_data = tlx.local_load(a[0])
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, a0_data)
+
+            # Reading b[0] should give 3s (distinct from a)
+            b0_data = tlx.local_load(b[0])
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_1, b0_data)
+
+            # Reading a[1] should give 2s
+            a1_data = tlx.local_load(a[1])
+            out_offsets_2 = out_ptr + 2 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_2, a1_data)
+
+            # Reading b[1] should give 4s
+            b1_data = tlx.local_load(b[1])
+            out_offsets_3 = out_ptr + 3 * BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_3, b1_data)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((4 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        distinct_buffer_overlap_kernel[grid](out, BLOCK_SIZE)
+
+        # Verify each region has the expected value
+        expected_ones = torch.ones((BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float16, device="cuda")
+        expected_twos = torch.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, dtype=torch.float16, device="cuda")
+        expected_threes = torch.full((BLOCK_SIZE, BLOCK_SIZE), 3.0, dtype=torch.float16, device="cuda")
+        expected_fours = torch.full((BLOCK_SIZE, BLOCK_SIZE), 4.0, dtype=torch.float16, device="cuda")
+
+        torch.testing.assert_close(out[:BLOCK_SIZE, :], expected_ones)
+        torch.testing.assert_close(out[BLOCK_SIZE:2 * BLOCK_SIZE, :], expected_threes)
+        torch.testing.assert_close(out[2 * BLOCK_SIZE:3 * BLOCK_SIZE, :], expected_twos)
+        torch.testing.assert_close(out[3 * BLOCK_SIZE:, :], expected_fours)
+
+    def test_shared_different_element_sizes(self):
+        """Test shared overlap with different element types (f32 vs f16).
+
+        When f32 and f16 buffers share memory:
+        - f32: 2 x 64 x 64 x 4 bytes = 32768 bytes (16384 per buffer)
+        - f16: 2 x 64 x 64 x 2 bytes = 16384 bytes (8192 per buffer)
+        - bytes_between_buffers = max(16384, 8192) = 16384
+        - For f16: scale = 16384/8192 = 2, shape expands 2 -> 4
+        - Index rewriting: f16[i] -> physical slot 2*i
+        """
+
+        @triton.jit
+        def shared_different_sizes_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+            # Create a storage alias spec
+            spec = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+
+            # Allocate f32 and f16 buffers
+            a_f32 = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float32, tl.constexpr(2), tlx.storage_kind.smem,
+                                    reuse=spec)
+            b_f16 = tlx.local_alloc((BLOCK_SIZE, BLOCK_SIZE), tl.float16, tl.constexpr(2), tlx.storage_kind.smem,
+                                    reuse=spec)
+
+            # Define shared overlap
+            spec.set_buffer_overlap(tlx.reuse_group(a_f32, b_f16, group_type=tlx.reuse_group_type.shared))
+
+            # Initialize output to zeros
+            offs_m = tl.arange(0, BLOCK_SIZE)
+            offs_n = tl.arange(0, BLOCK_SIZE)
+            zeros_f32 = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), tl.float32)
+
+            out_offsets_0 = out_ptr + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            out_offsets_1 = out_ptr + BLOCK_SIZE * BLOCK_SIZE + (offs_m[:, None] * BLOCK_SIZE + offs_n[None, :])
+            tl.store(out_offsets_0, zeros_f32)
+            tl.store(out_offsets_1, zeros_f32)
+
+            # Write to a_f32[0]
+            ones_f32 = tl.full((BLOCK_SIZE, BLOCK_SIZE), 1.0, tl.float32)
+            tlx.local_store(a_f32[0], ones_f32)
+
+            # Write to a_f32[1]
+            twos_f32 = tl.full((BLOCK_SIZE, BLOCK_SIZE), 2.0, tl.float32)
+            tlx.local_store(a_f32[1], twos_f32)
+
+            # Read b_f16[0] and b_f16[1] - these should contain data from a_f32
+            # (reinterpreted as f16, so values will be different but non-zero)
+            b0_data = tlx.local_load(b_f16[0])
+            b0_as_f32 = b0_data.to(tl.float32)
+            tl.store(out_offsets_0, b0_as_f32)
+
+            b1_data = tlx.local_load(b_f16[1])
+            b1_as_f32 = b1_data.to(tl.float32)
+            tl.store(out_offsets_1, b1_as_f32)
+
+        grid = lambda meta: (1, )
+
+        BLOCK_SIZE = 64
+        out = torch.zeros((2 * BLOCK_SIZE, BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        shared_different_sizes_kernel[grid](out, BLOCK_SIZE)
+
+        # The f16 reinterpretation of f32 data will produce non-zero values
+        # We can't predict exact values due to bit reinterpretation, but they should be non-zero
+        assert out[:BLOCK_SIZE, :].abs().sum() > 0, "b_f16[0] should have non-zero data from a_f32[0]"
+        assert out[BLOCK_SIZE:, :].abs().sum() > 0, "b_f16[1] should have non-zero data from a_f32[1]"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
