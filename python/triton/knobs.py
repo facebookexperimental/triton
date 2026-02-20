@@ -521,6 +521,10 @@ class proton_knobs(base_knobs):
     cupti_dir: env_opt_str = env_opt_str("TRITON_CUPTI_LIB_PATH")
 
 
+class tlx_knobs(base_knobs):
+    mbar_wait_timeout_sec: env_opt_str = env_opt_str("TRITON_MBAR_WAIT_TIMEOUT_SEC")
+
+
 build = build_knobs()
 redis = redis_knobs()
 cache = cache_knobs()
@@ -531,6 +535,7 @@ language = language_knobs()
 nvidia = nvidia_knobs()
 amd = amd_knobs()
 proton = proton_knobs()
+tlx = tlx_knobs()
 
 
 def refresh_knobs():
