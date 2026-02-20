@@ -56,6 +56,85 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Slice a `M x N` tensor at a `m x n` offset.
 
+#### Buffer Reuse
+
+TLX provides you the ability to reuse the same allocated buffer across multiple disjoint steps in your kernel. This is
+useful to allow additional pipelining when you may not have enough isolated SMEM or TMEM.
+
+- `tlx.storage_alias_spec(storage=storage_kind)`
+
+    Defines a buffer that you will want to share across multiple aliases. The storage
+    can be either SMEM or TMEM. To use this in an allocation you the spec in the `reuse`
+    argument for `local_alloc`. Here is the example from the FA kernel.
+
+```
+# Create the storage alias spec for all shared buffers. Cannot be directly
+# indexed.
+qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+
+# Allocate all buffers referencing the same spec
+qk_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+p_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES), tlx.dtype_of(desc_v),
+    NUM_MMA_GROUPS * NUM_MMA_SLICES, tlx.storage_kind.tmem,
+    reuse=qk_storage_alias,
+)
+alpha_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+l_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+m_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+```
+
+- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)`
+
+    A reuse group expresses how you intend to access the shared buffer.
+    There are two types: Shared or Distinct. A shared buffer wants to occupy the same memory
+    and each index should not be accessed at the same time. A distinct buffer will be accessible
+    at the same index at the same time. The compiler will isolate buffer locations and potentially
+    expand the buffer allocation to enforce this guarantee, which is helpful with buffers of unequal
+    sizes.
+
+    The group_size is used to enable subtiling a buffer. This creates ensures that for every 1 index
+    of a buffer that SUBTILE_SIZE indices of this other buffer/group can be accessed.  Reuse groups
+    can be nested to allow expressing more complex relationships. Currently a reuse group
+    is not applied unless you assign it to a buffer with `spec.set_buffer_overlap`.
+
+    Here is the example implementation for Flash Attention. In this kernel as the comment suggests,
+    QK is shared with P, l, m, and alpha, and P is potentially subtiling.
+
+```
+# Define the buffer overlap strategy:
+#   QK : |                                                   BLK_M/2 * BLOCK_N * fp32                         |
+#   P:   |  BLK_M/(2*SLICES) * fp16| BLK_M/(2*SLICES) * fp16|...
+# Alpha:                                                        |BLK_M/2*1*fp32|
+#   l  :                                                                        |BLK_M/2*1*fp32|
+#   m  :                                                                                       |BLK_M/2*1*fp32|
+qk_storage_alias.set_buffer_overlap(
+    tlx.reuse_group(
+        qk_tiles,
+        tlx.reuse_group(
+            tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
+            alpha_tiles, l_tiles, m_tiles,
+            group_type=tlx.reuse_group_type.distinct,
+        ),
+        group_type=tlx.reuse_group_type.shared,
+    )
+)
+```
+
+
+
 ### Remote buffer operations
 
 - `buffer = tlx.remote_view(buffer, remote_cta_rank)`
