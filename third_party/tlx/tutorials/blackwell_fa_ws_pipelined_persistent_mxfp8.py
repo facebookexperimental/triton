@@ -923,6 +923,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(p_fulls[1], qk_phase)
                 if SHARE_SCALE_BUFFERS:
                     v1_tmem = 1
+                    tlx.tmem_copy(kv_scale_tiles[v_bufIdx], k_scale_tmem[v1_tmem])
                 else:
                     # Use the previous value of the buffer index
                     v1_tmem = v0_tmem
