@@ -419,11 +419,11 @@ def _attn_fwd_ws(sm_scale, M,  #
     # QK is shared by (P, alpha, l, and m)
     #   - First half  : stores P
     #   - Second half  : stores Alpha, l, and m
-    #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
-    #     P:   |  BLK_M/2 * BLOCK_N * fp16 |
-    #  Alpha :                             |BLK_M/2*1*fp32|
-    #     l :                                             |BLK_M/2*1*fp32|
-    #     m :                                                            |BLK_M/2*1*fp32|
+    #   QK : |                                                   BLK_M/2 * BLOCK_N * fp32                         |
+    #   P:   |  BLK_M/(2*SLICES) * fp16| BLK_M/(2*SLICES) * fp16|...
+    # Alpha:                                                        |BLK_M/2*1*fp32|
+    #   l  :                                                                        |BLK_M/2*1*fp32|
+    #   m  :                                                                                       |BLK_M/2*1*fp32|
     qk_storage_alias.set_buffer_overlap(
         tlx.reuse_group(
             qk_tiles,
