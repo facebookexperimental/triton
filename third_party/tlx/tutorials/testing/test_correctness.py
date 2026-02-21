@@ -300,8 +300,6 @@ def test_blackwell_fa_ws_pipelined_persistent():
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_mxfp8"]
-    if HEAD_DIM == 128:
-        pytest.skip("HEAD_DIM=128 not supported yet")
     sm_scale = 0.5
     dtype = torch.float8_e4m3fn
     shapes = [(8, 16, 1024)]
@@ -316,9 +314,21 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
                                                               config=config)
         tri_out = tri_out.to(ref_out.dtype)
         if causal:
-            atol = 0.1
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.09375
+                atol = 0.1
+            else:
+                # Max atol measured was 0.10986328125
+                assert HEAD_DIM == 128
+                atol = 0.11
         else:
-            atol = 0.03
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.029296875
+                atol = 0.03
+            else:
+                # Max atol measured was 0.0625
+                assert HEAD_DIM == 128
+                atol = 0.07
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 

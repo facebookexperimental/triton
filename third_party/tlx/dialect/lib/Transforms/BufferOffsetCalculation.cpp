@@ -22,12 +22,13 @@ namespace triton {
 namespace tlx {
 
 // Recursively collect offsets for StorageAliasLocalAllocOp values
-// The offsetMap stores (buffer_offset, bytes_between_buffer_groups, group_size)
-// tuples
+// The offsetMap stores (buffer_offset, units_between_buffer_groups, group_size)
+// tuples. Units are bytes for SMEM, or TMEM columns when useTmemColumns=true.
 static LogicalResult collectOffsets(
     Value element, int64_t currentOffset, int64_t bytesBetweenBufferGroups,
     int64_t alignment, int64_t currentGroupSize,
-    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap) {
+    DenseMap<Value, std::tuple<int64_t, int64_t, int64_t>> &offsetMap,
+    bool useTmemColumns = false) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
     LDBG("  Recording buffer_offset="
          << currentOffset << ", bytes_between_buffer_groups="
@@ -55,7 +56,8 @@ static LogicalResult collectOffsets(
       // All children start at the same offset
       for (auto child : elements) {
         if (failed(collectOffsets(child, currentOffset, childBytesBetween,
-                                  alignment, childGroupSize, offsetMap)))
+                                  alignment, childGroupSize, offsetMap,
+                                  useTmemColumns)))
           return failure();
       }
     } else { // distinct
@@ -63,12 +65,16 @@ static LogicalResult collectOffsets(
       // Children are placed sequentially, each aligned
       int64_t runningOffset = currentOffset;
       for (auto child : elements) {
-        runningOffset = alignUp(runningOffset, alignment);
+        // For TMEM columns, align each child to its own column count
+        // to ensure offsets are divisible by each buffer's column width.
+        int64_t childAlignment =
+            useTmemColumns ? getElementAlignment(child, true) : alignment;
+        runningOffset = alignUp(runningOffset, childAlignment);
         if (failed(collectOffsets(child, runningOffset,
                                   bytesBetweenBufferGroups, alignment,
-                                  currentGroupSize, offsetMap)))
+                                  currentGroupSize, offsetMap, useTmemColumns)))
           return failure();
-        int64_t childSize = getElementSize(child, alignment);
+        int64_t childSize = getElementSize(child, alignment, useTmemColumns);
         LDBG("    Child size: " << childSize << ", next offset: "
                                 << runningOffset + childSize);
         runningOffset += childSize;
@@ -160,11 +166,19 @@ LogicalResult processBufferOverlapOps(
           "could not find StorageAliasLocalAllocOp in overlap definition");
     }
 
-    // Compute alignment from the reuse group tree
-    int64_t alignment = getElementAlignment(overlapDef);
+    // Check if this overlap group uses TMEM storage. For TMEM, we compute
+    // sizes in column units instead of bytes, because memdesc_index lowering
+    // multiplies the index by numCols (from getTmemAllocSizes), and different
+    // TMEM buffer types have different bytes-per-column ratios.
+    bool isTmem = containsTmemAllocation(overlapDef);
 
-    // Compute total size from the reuse group tree
-    int64_t sizePerBufferGroup = getElementSize(overlapDef, alignment);
+    // Compute alignment from the reuse group tree.
+    // For TMEM, alignment is 1 column (columns are the atomic unit).
+    int64_t alignment = getElementAlignment(overlapDef, isTmem);
+
+    // Compute total size from the reuse group tree.
+    // For TMEM, sizes are in column units; for SMEM, in bytes.
+    int64_t sizePerBufferGroup = getElementSize(overlapDef, alignment, isTmem);
     int64_t bytesBetweenBufferGroups = alignUp(sizePerBufferGroup, alignment);
 
     LDBG("  numBuffers=" << numBuffers << ", sizePerBufferGroup="
@@ -175,7 +189,7 @@ LogicalResult processBufferOverlapOps(
     // Recursively collect offsets starting at offset 0 with group_size 1
     if (failed(collectOffsets(overlapDef, /*currentOffset=*/0,
                               bytesBetweenBufferGroups, alignment,
-                              /*currentGroupSize=*/1, offsetMap))) {
+                              /*currentGroupSize=*/1, offsetMap, isTmem))) {
       return failure();
     }
 

@@ -192,42 +192,51 @@ LogicalResult materializeStorageAliasAllocations(
     // Determine the result type - may be expanded based on
     // bytes_between_buffer_groups
     ttg::MemDescType resultType = originalResultType;
+    bool isTmem = isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
+        originalResultType.getMemorySpace());
     if (offsetIt != offsetMap.end()) {
       int64_t bufferOffset = std::get<0>(offsetIt->second);
       int64_t bytesBetweenBufferGroups = std::get<1>(offsetIt->second);
       int64_t groupSize = std::get<2>(offsetIt->second);
 
-      // Compute original buffer size (shape[0] is num_buffers, rest is
-      // per-buffer)
+      // Compute original buffer size. For TMEM, use column units (from
+      // getTmemAllocSizes) since memdesc_index lowering multiplies the index
+      // by numCols and different TMEM buffer types have different
+      // bytes-per-column ratios. For SMEM, use bytes.
       auto shape = originalResultType.getShape();
-      int64_t elemBits = originalResultType.getElementTypeBitWidth();
-      int64_t bufferElements = 1;
-      for (size_t i = 1; i < shape.size(); ++i) {
-        bufferElements *= shape[i];
+      int64_t originalBufferSize;
+      if (isTmem) {
+        originalBufferSize = getAllocationColumnsPerBuffer(originalResultType);
+      } else {
+        int64_t elemBits = originalResultType.getElementTypeBitWidth();
+        int64_t bufferElements = 1;
+        for (size_t i = 1; i < shape.size(); ++i) {
+          bufferElements *= shape[i];
+        }
+        originalBufferSize = (bufferElements * elemBits) / 8;
       }
-      int64_t originalBufferBytes = (bufferElements * elemBits) / 8;
 
-      // Check if bytes_between_buffer_groups divides evenly by original buffer
-      // size
-      if (bytesBetweenBufferGroups % originalBufferBytes != 0) {
-        allocOp.emitError("bytes_between_buffer_groups (")
+      // Check if units_between_buffer_groups divides evenly by original
+      // buffer size
+      if (bytesBetweenBufferGroups % originalBufferSize != 0) {
+        allocOp.emitError("units_between_buffer_groups (")
             << bytesBetweenBufferGroups
             << ") must be a multiple of the original buffer size ("
-            << originalBufferBytes << ")";
+            << originalBufferSize << ")";
         return failure();
       }
 
       // Check if buffer_offset divides evenly by original buffer size
-      if (bufferOffset % originalBufferBytes != 0) {
+      if (bufferOffset % originalBufferSize != 0) {
         allocOp.emitError("buffer_offset (")
             << bufferOffset
             << ") must be a multiple of the original buffer size ("
-            << originalBufferBytes << ")";
+            << originalBufferSize << ")";
         return failure();
       }
 
-      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferBytes;
-      int64_t offsetSlots = bufferOffset / originalBufferBytes;
+      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferSize;
+      int64_t offsetSlots = bufferOffset / originalBufferSize;
 
       // If there's padding or offset, expand the shape
       if (scaleFactor > 1 || offsetSlots > 0) {
@@ -287,16 +296,22 @@ LogicalResult materializeStorageAliasAllocations(
       int64_t bytesBetweenBufferGroups = std::get<1>(offsetIt->second);
       int64_t groupSize = std::get<2>(offsetIt->second);
 
-      // Recompute scale factor and offset slots
-      auto shape = originalResultType.getShape();
-      int64_t elemBits = originalResultType.getElementTypeBitWidth();
-      int64_t bufferElements = 1;
-      for (size_t i = 1; i < shape.size(); ++i) {
-        bufferElements *= shape[i];
+      // Recompute scale factor and offset slots (in column units for TMEM,
+      // bytes for SMEM)
+      int64_t originalBufferSize2;
+      if (isTmem) {
+        originalBufferSize2 = getAllocationColumnsPerBuffer(originalResultType);
+      } else {
+        auto shape = originalResultType.getShape();
+        int64_t elemBits = originalResultType.getElementTypeBitWidth();
+        int64_t bufferElements = 1;
+        for (size_t i = 1; i < shape.size(); ++i) {
+          bufferElements *= shape[i];
+        }
+        originalBufferSize2 = (bufferElements * elemBits) / 8;
       }
-      int64_t originalBufferBytes = (bufferElements * elemBits) / 8;
-      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferBytes;
-      int64_t offsetSlots = bufferOffset / originalBufferBytes;
+      int64_t scaleFactor = bytesBetweenBufferGroups / originalBufferSize2;
+      int64_t offsetSlots = bufferOffset / originalBufferSize2;
 
       // Only rewrite if there's actual scaling or offset
       if (scaleFactor > 1 || offsetSlots > 0) {

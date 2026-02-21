@@ -49,6 +49,54 @@ getAllocationSizePerBuffer(triton::gpu::MemDescType memDescType) {
   return totalBytes / memDescType.getShape()[0];
 }
 
+// Compute the number of TMEM columns for one buffer in a multi-buffered
+// allocation. For a shape like [numBuf, d1, d2, ...], strips the leading
+// dimension and computes the per-buffer TMEM column count.
+inline int64_t
+getAllocationColumnsPerBuffer(triton::gpu::MemDescType memDescType) {
+  auto shape = memDescType.getShape();
+  assert(shape.size() >= 2 && "TMEM allocation must be at least 2D");
+  auto encoding = memDescType.getEncoding();
+
+  // Strip leading num_buffers dimension
+  SmallVector<int64_t> perBufferShape(shape.begin() + 1, shape.end());
+
+  if (isa<DummyTMEMLayoutAttr>(encoding)) {
+    // DummyTMEMLayoutAttr is a placeholder for sub-16-bit types that will
+    // resolve to TensorMemoryScalesEncodingAttr after layout propagation.
+    // Use the shared scales column helper since getTmemAllocSizes doesn't
+    // handle placeholder encodings.
+    int64_t m = perBufferShape[perBufferShape.size() - 2];
+    int64_t k = perBufferShape[perBufferShape.size() - 1];
+    return triton::nvidia_gpu::getTmemScalesColumnsPerBuffer(m, k);
+  }
+
+  // For resolved encodings (TensorMemoryEncodingAttr,
+  // TensorMemoryScalesEncodingAttr), delegate to getTmemAllocSizes.
+  auto perBufferType = triton::gpu::MemDescType::get(
+      perBufferShape, memDescType.getElementType(), encoding,
+      memDescType.getMemorySpace(), memDescType.getMutableMemory());
+  auto tmemAlloc = triton::nvidia_gpu::getTmemAllocSizes(perBufferType);
+  return tmemAlloc.numCols;
+}
+
+// Check if an element in the reuse group tree contains TMEM allocations.
+inline bool containsTmemAllocation(Value element) {
+  if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
+    auto memDescType =
+        cast<triton::gpu::MemDescType>(allocOp.getResult().getType());
+    return isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
+        memDescType.getMemorySpace());
+  }
+  if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
+    for (auto child : reuseGroupOp.getElements()) {
+      if (containsTmemAllocation(child))
+        return true;
+    }
+  }
+  return false;
+}
+
 // TODO: We currently force data to be 128-byte aligned for SMEM (TMA) and
 // 32-byte aligned for TMEM, but we may want to consider relaxing this in the
 // future by examining the full IR.
@@ -75,17 +123,23 @@ inline int64_t getAllocAlignment(triton::gpu::MemDescType memDescType) {
 // reuse group tree. For allocations: alignment is determined by the memory
 // space and element type. For groups (both shared and distinct): alignment
 // is the max of all children's alignments.
-inline int64_t getElementAlignment(Value element) {
+// When useTmemColumns is true, returns the buffer's column count for leaf
+// allocations (ensures offsets within distinct groups are divisible by
+// each buffer's column width).
+inline int64_t getElementAlignment(Value element, bool useTmemColumns = false) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
     auto memDescType =
         cast<triton::gpu::MemDescType>(allocOp.getResult().getType());
+    if (useTmemColumns)
+      return getAllocationColumnsPerBuffer(memDescType);
     return getAllocAlignment(memDescType);
   }
 
   if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
     int64_t maxAlignment = 1;
     for (auto child : reuseGroupOp.getElements()) {
-      maxAlignment = std::max(maxAlignment, getElementAlignment(child));
+      maxAlignment =
+          std::max(maxAlignment, getElementAlignment(child, useTmemColumns));
     }
     return maxAlignment;
   }
@@ -94,13 +148,17 @@ inline int64_t getElementAlignment(Value element) {
 }
 
 // Recursively compute the size of an element in the reuse group tree.
-// For allocations: size is the per-buffer allocation size.
+// For allocations: size is the per-buffer allocation size (in bytes, or in
+// TMEM columns when useTmemColumns is true).
 // For shared groups: size is the max of children.
 // For distinct groups: size is the sum of children (with alignment padding).
-inline int64_t getElementSize(Value element, int64_t alignment) {
+inline int64_t getElementSize(Value element, int64_t alignment,
+                              bool useTmemColumns = false) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
     auto memDescType =
         cast<triton::gpu::MemDescType>(allocOp.getResult().getType());
+    if (useTmemColumns)
+      return getAllocationColumnsPerBuffer(memDescType);
     return getAllocationSizePerBuffer(memDescType);
   }
 
@@ -112,15 +170,20 @@ inline int64_t getElementSize(Value element, int64_t alignment) {
     if (groupKind == ReuseGroupKind::shared) {
       int64_t maxSize = 0;
       for (auto child : elements) {
-        maxSize = std::max(maxSize, getElementSize(child, alignment));
+        maxSize =
+            std::max(maxSize, getElementSize(child, alignment, useTmemColumns));
       }
       // Multiply by group_size for subtiling
       return maxSize * groupSize;
     } else { // distinct
       int64_t totalSize = 0;
       for (auto child : elements) {
-        totalSize = alignUp(totalSize, alignment);
-        totalSize += getElementSize(child, alignment);
+        // For TMEM columns, align each child to its own column count
+        // to ensure offsets are divisible by each buffer's column width.
+        int64_t childAlignment =
+            useTmemColumns ? getElementAlignment(child, true) : alignment;
+        totalSize = alignUp(totalSize, childAlignment);
+        totalSize += getElementSize(child, alignment, useTmemColumns);
       }
       return totalSize;
     }
