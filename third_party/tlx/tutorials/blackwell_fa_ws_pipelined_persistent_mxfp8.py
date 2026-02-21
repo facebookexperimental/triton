@@ -751,7 +751,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
                     # with qk[0], so we must wait for the previous qk[0] to be
                     # done.
-                    tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
+                    tlx.barrier_wait(qk_empties[0], qk_phase)
 
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
