@@ -392,12 +392,6 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
             tlx.storage_kind.tmem,
             reuse=qk_storage_alias,
         )
-        p_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, BLOCK_N),
-            tlx.dtype_of(desc_v),
-            NUM_MMA_GROUPS,
-            reuse=qk_storage_alias,
-        )
         alpha_tiles = tlx.local_alloc(
             (BLOCK_M_SPLIT, 1),
             tl.float32,
