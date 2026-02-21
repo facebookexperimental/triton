@@ -677,12 +677,12 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
                 if SHARE_SCALE_BUFFERS:
-                    q0_tmem = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
-                    q1_tmem = q0_tmem + 1
-                else:
                     # With 2 buffers we always swap index 1/0
                     q0_tmem = 1
                     q1_tmem = 0
+                else:
+                    q0_tmem = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
+                    q1_tmem = q0_tmem + 1
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
