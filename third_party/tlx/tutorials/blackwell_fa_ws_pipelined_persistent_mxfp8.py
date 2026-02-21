@@ -837,14 +837,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     # Wait for K scale to be loaded by the load group
                     tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+
+                    _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
                     if SHARE_SCALE_BUFFERS:
                         # If we share scale buffers q_scale_tmem[q0_tmem] overlaps
                         # with qk[1], so we must wait for the previous qk[1] to be
                         # done.
-                        tlx.barrier_wait(qk_empties[1], qk_phase)
+                        tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                         tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
-
-                    _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
 
                     # Explicit SMEM->TMEM scale transfer
                     tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k0_tmem])
@@ -947,7 +947,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(p_fulls[1], qk_phase)
                 if SHARE_SCALE_BUFFERS:
                     v1_tmem = 1
-                    tlx.tmem_copy(kv_scale_tiles[v_bufIdx], k_scale_tmem[v1_tmem])
+                    tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[v1_tmem])
                 else:
                     # Use the previous value of the buffer index
                     v1_tmem = v0_tmem
