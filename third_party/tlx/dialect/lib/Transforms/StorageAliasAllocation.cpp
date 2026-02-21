@@ -192,6 +192,8 @@ LogicalResult materializeStorageAliasAllocations(
     // Determine the result type - may be expanded based on
     // bytes_between_buffer_groups
     ttg::MemDescType resultType = originalResultType;
+    bool isTmem = isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
+        originalResultType.getMemorySpace());
     if (offsetIt != offsetMap.end()) {
       int64_t bufferOffset = std::get<0>(offsetIt->second);
       int64_t bytesBetweenBufferGroups = std::get<1>(offsetIt->second);
@@ -202,7 +204,6 @@ LogicalResult materializeStorageAliasAllocations(
       // by numCols and different TMEM buffer types have different
       // bytes-per-column ratios. For SMEM, use bytes.
       auto shape = originalResultType.getShape();
-      bool isTmem = isTmemMemDesc(originalResultType);
       int64_t originalBufferSize;
       if (isTmem) {
         originalBufferSize = getAllocationColumnsPerBuffer(originalResultType);
@@ -298,7 +299,7 @@ LogicalResult materializeStorageAliasAllocations(
       // Recompute scale factor and offset slots (in column units for TMEM,
       // bytes for SMEM)
       int64_t originalBufferSize2;
-      if (isTmemMemDesc(originalResultType)) {
+      if (isTmem) {
         originalBufferSize2 = getAllocationColumnsPerBuffer(originalResultType);
       } else {
         auto shape = originalResultType.getShape();

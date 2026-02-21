@@ -63,6 +63,10 @@ struct TMemAllocation {
 
 TMemAllocation getTmemAllocSizes(gpu::MemDescType memDescType);
 
+// Compute the number of TMEM columns for a single buffer of MMA scales
+// given per-CTA M and K dimensions.
+int getTmemScalesColumnsPerBuffer(int m, int k);
+
 gpu::DistributedEncodingTrait getTmemCompatibleLayout(unsigned M, unsigned N,
                                                       RankedTensorType oltType,
                                                       unsigned numWarps);
