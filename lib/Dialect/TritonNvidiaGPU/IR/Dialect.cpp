@@ -50,6 +50,10 @@ namespace nvidia_gpu {
 
 static constexpr int numTmemRows = 128;
 
+int getTmemScalesColumnsPerBuffer(int m, int k) {
+  return ceil<int>(m, 32) * ceil<int>(k, 4);
+}
+
 TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
   const int rowSizeInBytes = 4;
   auto shapePerCTA = triton::gpu::getShapePerCTA(memDescType);
@@ -62,7 +66,7 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
     int k = shapePerCTA.back();
     int m = shapePerCTA[shapePerCTA.size() - 2];
     int numBuffers = shape.size() == 3 ? shape[0] : 1;
-    int numColumn = ceil<int>(m, 32) * ceil<int>(k, 4) * numBuffers;
+    int numColumn = getTmemScalesColumnsPerBuffer(m, k) * numBuffers;
     return TMemAllocation(numColumn, numTmemRows);
   }
   assert(isa<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
