@@ -124,6 +124,57 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<tensor<256x64xf16, #shared>>
 
 // -----
 
+// Verify that init_barrier followed by inval_barrier on *different* constant
+// indices of the same barrier array does NOT insert a spurious gpu.barrier.
+// The canSkipBarSync filter does NOT skip init_barrier + inval_barrier pairs,
+// so this exercises the narrowIntervalForSubview fix: without it the membar
+// analysis tracks at parent-buffer granularity and would see a false WAW.
+
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
+// CHECK-LABEL: @no_barrier_between_different_index_init_inval
+tt.func @no_barrier_between_different_index_init_inval() {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable>
+  %bar0 = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+  %bar1 = ttg.memdesc_index %bars[%c1] : !ttg.memdesc<2xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+  //      CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.inval_barrier
+  //  CHECK-NOT: gpu.barrier
+  //      CHECK: tt.return
+  ttng.init_barrier %bar0, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+  ttng.inval_barrier %bar1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
+  tt.return
+}
+}
+
+// -----
+
+// Verify that init_barrier followed by inval_barrier on the SAME index
+// correctly inserts a barrier (true WAW hazard).
+
+#shared_bar_same = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
+// CHECK-LABEL: @barrier_between_same_index_init_inval
+tt.func @barrier_between_same_index_init_inval() {
+  %c0 = arith.constant 0 : i32
+  %bars = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared_bar_same, #ttg.shared_memory, mutable>
+  %bar0a = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar_same, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
+  %bar0b = ttg.memdesc_index %bars[%c0] : !ttg.memdesc<2xi64, #shared_bar_same, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
+  //      CHECK: ttng.init_barrier
+  // CHECK-NEXT: gpu.barrier
+  // CHECK-NEXT: ttng.inval_barrier
+  ttng.init_barrier %bar0a, 1 : !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
+  ttng.inval_barrier %bar0b : !ttg.memdesc<1xi64, #shared_bar_same, #ttg.shared_memory, mutable>
+  tt.return
+}
+}
+
+// -----
+
 // CHECK-LABEL: tmem_copy_after_alloc
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
