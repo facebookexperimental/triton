@@ -708,7 +708,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
-                tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
+                if not SHARE_SCALE_BUFFERS:
+                    # If we have isolated TMEM buffers we can transfer the Q scale once.
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
                 tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
                 tlx.async_dot_scaled(
                     q_tiles[0],
@@ -727,9 +729,18 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                 # Wait for Q1 scale
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
+
+                if SHARE_SCALE_BUFFERS:
+                    # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
+                    # with qk[0], so we must wait for the previous qk[0] to be
+                    # done.
+                    tlx.barrier_wait(qk_empties[0], qk_phase)
+
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
-                tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
+                if not SHARE_SCALE_BUFFERS:
+                    # If we have isolated TMEM buffers we can transfer the Q scale once.
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.async_dot_scaled(
                     q_tiles[1],
                     k_tile,
@@ -788,6 +799,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     # Wait for K scale to be loaded by the load group
                     tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+                    if SHARE_SCALE_BUFFERS:
+                        # If we share scale buffers q_scale_tmem[0_tmem] overlaps
+                        # with qk[0], so we must wait for the previous qk[1] to be
+                        # done.
+                        tlx.barrier_wait(qk_empties[1], qk_phase)
+                        tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
+
                     # Explicit SMEM->TMEM scale transfer
                     tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
                     tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
@@ -821,6 +839,13 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     acc1_init = True
 
                     # -- compute q1 @ k ----
+                    if SHARE_SCALE_BUFFERS:
+                        # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
+                        # with qk[0], so we must wait for the previous qk[0] to be
+                        # done.
+                        tlx.barrier_wait(qk_empties[0], qk_phase)
+                        tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
+
                     tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                     tlx.async_dot_scaled(
                         q_tiles[1],
@@ -858,6 +883,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
+                if SHARE_SCALE_BUFFERS:
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
 
                 # -- compute p1 @ v ----
