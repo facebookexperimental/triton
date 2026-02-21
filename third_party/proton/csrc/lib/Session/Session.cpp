@@ -122,8 +122,8 @@ void SessionManager::activateSessionImpl(size_t sessionId) {
   throwIfSessionNotInitialized(sessions, sessionId);
   if (sessionActive[sessionId])
     return;
-  sessionActive[sessionId] = true;
   sessions[sessionId]->activate();
+  sessionActive[sessionId] = true;
   registerInterface<ScopeInterface>(sessionId, scopeInterfaceCounts);
   registerInterface<OpInterface>(sessionId, opInterfaceCounts);
   registerInterface<InstrumentationInterface>(sessionId,

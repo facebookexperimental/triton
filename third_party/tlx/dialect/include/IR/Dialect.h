@@ -49,12 +49,6 @@ getAllocationSizePerBuffer(triton::gpu::MemDescType memDescType) {
   return totalBytes / memDescType.getShape()[0];
 }
 
-// Check if a MemDescType uses TMEM storage.
-inline bool isTmemMemDesc(triton::gpu::MemDescType memDescType) {
-  return isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
-      memDescType.getMemorySpace());
-}
-
 // Compute the number of TMEM columns for one buffer in a multi-buffered
 // allocation. For a shape like [numBuf, d1, d2, ...], strips the leading
 // dimension and computes the per-buffer TMEM column count.
@@ -70,11 +64,11 @@ getAllocationColumnsPerBuffer(triton::gpu::MemDescType memDescType) {
   if (isa<DummyTMEMLayoutAttr>(encoding)) {
     // DummyTMEMLayoutAttr is a placeholder for sub-16-bit types that will
     // resolve to TensorMemoryScalesEncodingAttr after layout propagation.
-    // Compute columns using the scales formula directly since
-    // getTmemAllocSizes doesn't handle placeholder encodings.
+    // Use the shared scales column helper since getTmemAllocSizes doesn't
+    // handle placeholder encodings.
     int64_t m = perBufferShape[perBufferShape.size() - 2];
     int64_t k = perBufferShape[perBufferShape.size() - 1];
-    return ((m + 31) / 32) * ((k + 3) / 4);
+    return triton::nvidia_gpu::getTmemScalesColumnsPerBuffer(m, k);
   }
 
   // For resolved encodings (TensorMemoryEncodingAttr,
@@ -91,7 +85,8 @@ inline bool containsTmemAllocation(Value element) {
   if (auto allocOp = element.getDefiningOp<StorageAliasLocalAllocOp>()) {
     auto memDescType =
         cast<triton::gpu::MemDescType>(allocOp.getResult().getType());
-    return isTmemMemDesc(memDescType);
+    return isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
+        memDescType.getMemorySpace());
   }
   if (auto reuseGroupOp = element.getDefiningOp<ReuseGroupOp>()) {
     for (auto child : reuseGroupOp.getElements()) {
