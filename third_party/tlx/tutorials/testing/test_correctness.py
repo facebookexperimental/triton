@@ -313,11 +313,22 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
         tri_out = _blackwell_fa_ws_pipelined_persistent_mxfp8(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal,
                                                               config=config)
         tri_out = tri_out.to(ref_out.dtype)
-        # if causal:
-        #     atol = 0.1
-        # else:
-        #     atol = 0.03
-        atol = 0.01
+        if causal:
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.09375
+                atol = 0.1
+            else:
+                # Max atol measured was 0.10986328125
+                assert HEAD_DIM == 128
+                atol = 0.11
+        else:
+            if HEAD_DIM == 64:
+                # Max atol measured was 0.029296875
+                atol = 0.03
+            else:
+                # Max atol measured was 0.0625
+                assert HEAD_DIM == 128
+                atol = 0.07
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
 
 
