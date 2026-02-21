@@ -651,8 +651,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # prepare l_i for the epilog
                 _, phase = _get_bufidx_phase(i, 1)
-                if not SHARE_SCALE_BUFFERS:
-                    tlx.barrier_wait(l_empties[cid], phase ^ 1)
+                # TODO: Update this barrier when shared.
+                tlx.barrier_wait(l_empties[cid], phase ^ 1)
                 tlx.local_store(l_tiles[cid], l_i[:, None])
                 tlx.local_store(m_tiles[cid], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
@@ -715,7 +715,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # with qk[1], so we must wait for the previous qk[1] to be
                     # done.
                     tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
-                    tlx.barrier_wait(l_empties[0], qk_phase ^ 1)
+                    # TODO: Insert a barrier here indicating alpha/l/m + p_scales is done.
                 else:
                     tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
 
@@ -747,7 +747,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # with qk[0], so we must wait for the previous qk[0] to be
                     # done.
                     tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
-                    tlx.barrier_wait(l_empties[1], qk_phase ^ 1)
+                    # TODO: Insert a barrier here indicating alpha/l/m + p_scales is done.
                 else:
                     tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
 
@@ -833,7 +833,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         # done.
                         tlx.barrier_wait(qk_empties[1], qk_phase)
                         tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
-                        tlx.barrier_wait(l_empties[0], qk_phase)
+                        # TODO: Insert a barrier here indicating P_SCALES is done.
                     else:
                         tlx.barrier_wait(qk_empties[0], qk_phase)
 
@@ -882,7 +882,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
                         # Copy k into the new buffer space
                         tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k1_tmem])
-                        tlx.barrier_wait(l_empties[1], qk_phase ^ 1)
+                        # TODO: Insert a barrier here indicating P_SCALES is done.
                     else:
                         tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
 
