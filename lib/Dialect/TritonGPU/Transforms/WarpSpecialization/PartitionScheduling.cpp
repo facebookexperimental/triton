@@ -639,6 +639,7 @@ void optimizeSchedule(scf::ForOp loop, WarpSchedule &schedule) {
 //===----------------------------------------------------------------------===//
 
 namespace mlir::triton::gpu {
+#define GEN_PASS_DECL_TRITONGPUPARTITIONSCHEDULING
 #define GEN_PASS_DEF_TRITONGPUPARTITIONSCHEDULING
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 } // namespace mlir::triton::gpu
