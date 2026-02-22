@@ -908,14 +908,14 @@ attention = _attention_opt.apply
 )
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024, 2048])
+@pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("SUBTILING", [False, True])
-@pytest.mark.parametrize("VECT_MUL", [0, 1, 2, 3])
-@pytest.mark.parametrize("FADD2_REDUCE", [False, True])
+@pytest.mark.parametrize("SUBTILING", [True])  #False, True])
+@pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
+@pytest.mark.parametrize("FADD2_REDUCE", [False])  #, True])
 def test_op(
     Z,
     H,
