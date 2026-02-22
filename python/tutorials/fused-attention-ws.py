@@ -913,7 +913,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("SUBTILING", [True])  #False, True])
+@pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])  #, True])
 def test_op(

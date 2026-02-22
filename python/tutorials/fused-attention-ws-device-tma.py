@@ -145,7 +145,7 @@ def _attn_fwd_inner_oss_dp(
             hi,
             BLOCK_N,
             warp_specialize=warp_specialize,
-            disallow_acc_multi_buffer=True,
+            # disallow_acc_multi_buffer=True,
             data_partition_factor=DP_FACTOR,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -374,7 +374,7 @@ def _attn_fwd_tma_dp(
             DP_FACTOR,
         )
     if STAGE & 2:
-        acc0, acc1, l_i0_0, l_i0_1, l_i1, m_i0, m_i1 = _attn_fwd_inner_oss_dp(
+        acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
             acc0,
             l_i0_0,
             l_i0_1,
@@ -442,6 +442,32 @@ def _attn_fwd(
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
+    y_dim = Z * H * N_CTX
+    desc_q = _maybe_make_tensor_desc(
+        desc_q,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM],
+    )
+    desc_v = _maybe_make_tensor_desc(
+        desc_v,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM],
+    )
+    desc_k = _maybe_make_tensor_desc(
+        desc_k,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM],
+    )
+    desc_o = _maybe_make_tensor_desc(
+        desc_o,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM],
+    )
+
     _attn_fwd_tma_dp(
         sm_scale,
         M,
@@ -534,7 +560,12 @@ def _attn_fwd_persist(
     )
 
     # inner loop warpspec vs. outer loop warpspec
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=warp_specialize and OUTER_LOOP):
+    for _ in tl.range(
+            0,
+            tiles_per_sm,
+            warp_specialize=warp_specialize and OUTER_LOOP,
+            data_partition_factor=DP_FACTOR,
+    ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
         _attn_fwd_tma_dp(
@@ -1087,7 +1118,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("SUBTILING", [True])  #False, True])
+@pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, SUBTILING, VECT_MUL, FADD2_REDUCE, dtype=torch.float16):
