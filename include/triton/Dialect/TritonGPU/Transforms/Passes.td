@@ -183,7 +183,15 @@ def TritonGPUPartitionScheduling : Pass<"tritongpu-partition-scheduling", "mlir:
     operations in a loop that is meant to be warp specialized and determines
     which partitions to assign to each operation.
   }];
+
+  let options = [
+    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue stores into the computation partition "
+           "instead of creating a separate epilogue partition">
+  ];
 }
+
 
 def TritonGPULoadMMASpecialization : Pass<"tritongpu-load-mma-specialization", "mlir::ModuleOp"> {
   let summary = "load MMA specialization";

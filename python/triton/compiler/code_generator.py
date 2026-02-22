@@ -1195,6 +1195,7 @@ class CodeGenerator(ast.NodeVisitor):
         loop_unroll_factor = None
         disallow_acc_multi_buffer = False
         data_partition_factor = None
+        merge_epilogue = False
         flatten = False
         warp_specialize = False
         disable_licm = False
@@ -1210,6 +1211,7 @@ class CodeGenerator(ast.NodeVisitor):
             loop_unroll_factor = iterator.loop_unroll_factor
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
             data_partition_factor = iterator.data_partition_factor
+            merge_epilogue = iterator.merge_epilogue
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
@@ -1271,6 +1273,8 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
+            if merge_epilogue:
+                for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
             if disable_licm:
                 for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
 

@@ -3271,7 +3271,7 @@ class range(base_value):
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
                  disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
-                 data_partition_factor=None):
+                 data_partition_factor=None, merge_epilogue=False):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -3286,6 +3286,7 @@ class range(base_value):
         self.loop_unroll_factor = loop_unroll_factor
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.data_partition_factor = data_partition_factor
+        self.merge_epilogue = merge_epilogue
         self.flatten = flatten
         self.warp_specialize = warp_specialize
         self.disable_licm = disable_licm
