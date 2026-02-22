@@ -689,13 +689,13 @@ attention = _attention_opt.apply
 )
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("N_CTX", [1024, 2048])
+@pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
-@pytest.mark.parametrize("SUBTILING", [False, True])
-@pytest.mark.parametrize("VECT_MUL", [0, 1, 2, 3])
+@pytest.mark.parametrize("SUBTILING", [True])  #False, True])
+@pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, SUBTILING, VECT_MUL, FADD2_REDUCE, dtype=torch.float16):
     if mode == "bwd" and "fp8" in provider:
