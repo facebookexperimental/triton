@@ -6,8 +6,10 @@ import pytest
 
 from triton._internal_testing import is_cuda, is_hip, is_hip_cdna2
 
+
 def unsupport_amd():
     return is_hip_cdna2()
+
 
 def test_override(tmp_path: pathlib.Path):
     if unsupport_amd():
