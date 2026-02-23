@@ -1,9 +1,13 @@
 import math
+import os
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+import triton.profiler as proton
+import triton.profiler.language as pl
+from triton._internal_testing import is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.language.extra.tlx.mxfp8_utils import _to_mxfp8_block
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
@@ -200,18 +204,25 @@ def _softmax_inner_loop(
     start_m,
     N_CTX,
     out_dtype,
+    outer_i,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_MMA_GROUPS: tl.constexpr,
     VEC_SIZE: tl.constexpr,
     STAGE: tl.constexpr,
+    ENABLE_PROTON: tl.constexpr,
+    PROTON_TILE: tl.constexpr,
 ):
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.enter_scope("softmax_wait_qk")
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.exit_scope("softmax_wait_qk")
         qk = tlx.local_load(tlx.local_view(qk_tiles, cid))
         tlx.barrier_arrive(tlx.local_view(qk_empties, cid))
 
@@ -224,7 +235,11 @@ def _softmax_inner_loop(
 
         # -- compute correction factor
         alpha = tl.math.exp2(m_i - m_ij)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.enter_scope("softmax_wait_alpha_empty")
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.exit_scope("softmax_wait_alpha_empty")
         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
@@ -270,6 +285,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                       NUM_Q_SCALE_TMEM_BUFFERS: tl.constexpr,  #
                       NUM_KV_SCALE_TMEM_BUFFERS: tl.constexpr,  #
                       GROUP_SIZE_N: tl.constexpr,  #
+                      ENABLE_PROTON: tl.constexpr,  #
+                      PROTON_TILE: tl.constexpr,  #
                       ):
     """
     This kernel is adapted from the Blackwell FA kernel for MXFP8.
@@ -438,7 +455,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     _, phase = _get_bufidx_phase(accum_cnt, 1)
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
                         # -- update output accumulator --
+                        if ENABLE_PROTON and i == PROTON_TILE:
+                            pl.enter_scope("default_wait_alpha")
                         tlx.barrier_wait(alpha_fulls[cid], phase)
+                        if ENABLE_PROTON and i == PROTON_TILE:
+                            pl.exit_scope("default_wait_alpha")
                         # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
                         alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
@@ -451,7 +472,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("default_wait_l")
                     tlx.barrier_wait(l_fulls[cid], phase)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("default_wait_l")
                     l = tlx.local_load(l_tiles[cid])
                     m = tlx.local_load(m_tiles[cid])
                     tlx.barrier_arrive(l_empties[cid])
@@ -460,8 +485,16 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("default_wait_acc_empty")
                     tlx.barrier_wait(acc_empties[cid], phase)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("default_wait_acc_empty")
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("default_wait_o_empty")
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("default_wait_o_empty")
                     scale = 1 / l
                     acc = tlx.local_load(acc_tiles[cid])
                     acc = _mul_f32x2(acc, scale)
@@ -516,12 +549,15 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         start_m,
                         N_CTX,
                         p_dtype,
+                        i,
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM,
                         NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=4 - STAGE,
+                        ENABLE_PROTON=ENABLE_PROTON,
+                        PROTON_TILE=PROTON_TILE,
                     )
 
                 if STAGE & 2:
@@ -545,17 +581,24 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         start_m,
                         N_CTX,
                         p_dtype,
+                        i,
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM,
                         NUM_MMA_GROUPS,
                         VEC_SIZE,
                         STAGE=2,
+                        ENABLE_PROTON=ENABLE_PROTON,
+                        PROTON_TILE=PROTON_TILE,
                     )
 
                 # prepare l_i for the epilog
                 _, phase = _get_bufidx_phase(i, 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("softmax_wait_l_empty")
                 tlx.barrier_wait(l_empties[cid], phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("softmax_wait_l_empty")
                 tlx.local_store(l_tiles[cid], l_i[:, None])
                 tlx.local_store(m_tiles[cid], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
@@ -567,6 +610,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
             accum_cnt_qk = 0
 
             for j in range(0, tiles_per_sm):
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_tile")
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_idx,
@@ -585,10 +630,18 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
                 # wait for the K buffer to be populated by the producer
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_k")
                 tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_k")
 
                 # wait for the Q buffer to be populated by the producer
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_q")
                 tlx.barrier_wait(q_fulls[q_bufIdx], q_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_q")
 
                 # -- compute q0 @ k ----
                 k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
@@ -596,12 +649,22 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 kv_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
                 tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
                 # Wait for Q and K scales to be loaded by the load group
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_q_scale")
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_q_scale")
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_kv_scale")
                 tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_kv_scale")
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q_tmem_base])
                 tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
                 tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_dot_q0k")
                 tlx.async_dot_scaled(
                     q_tiles[0],
                     k_tile,
@@ -613,6 +676,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     use_acc=False,
                     mBarriers=[qk_fulls[0]],
                 )
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_dot_q0k")
 
                 # -- compute q1 @ k ----
                 tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
@@ -622,6 +687,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q_tmem_base + 1])
                 tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_dot_q1k")
                 tlx.async_dot_scaled(
                     q_tiles[1],
                     k_tile,
@@ -637,16 +704,36 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         kv_scale_empties[k_bufIdx],
                     ],
                 )
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_dot_q1k")
 
                 # -- compute p0 @ v ----
                 # wait for the V buffer to be populated by the producer
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_v")
                 tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_v")
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_acc")
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_acc")
                 # Wait for V scale
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_kv_scale")
                 tlx.barrier_wait(kv_scale_fulls[v_bufIdx], v_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_kv_scale")
                 # Explicit SMEM->TMEM scale transfer
                 tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[kv_tmem_idx])
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_p")
                 tlx.barrier_wait(p_fulls[0], qk_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_p")
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_dot_pv")
                 tlx.async_dot_scaled(
                     p_tiles[0],
                     kv_tiles[v_bufIdx],
@@ -658,6 +745,8 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     use_acc=False,
                     mBarriers=[p_empties[0]],
                 )
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_dot_pv")
 
                 acc1_init = False
 
@@ -674,15 +763,25 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                     # -- compute q0 @ k ----
                     # wait for the K buffer to be populated by the producer
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_k")
                     tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_k")
                     k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
                     _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
 
                     # Wait for K scale to be loaded by the load group
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_kv_scale")
                     tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_kv_scale")
                     # Explicit SMEM->TMEM scale transfer
                     tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
                     tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_q0k")
                     tlx.async_dot_scaled(
                         q_tiles[0],
                         k_tile,
@@ -694,10 +793,22 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         use_acc=False,
                         mBarriers=[qk_fulls[0]],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_q0k")
 
                     # -- compute p1 @ v from the previous iteration----
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_acc")
                     tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_acc")
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_p")
                     tlx.barrier_wait(p_fulls[1], qk_phase_prev)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_p")
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_pv")
                     tlx.async_dot_scaled(
                         p_tiles[1],
                         kv_tiles[v_bufIdx_prev],
@@ -709,11 +820,15 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         use_acc=acc1_init,
                         mBarriers=[kv_empties[v_bufIdx_prev], kv_scale_empties[v_bufIdx_prev], p_empties[1]],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_pv")
 
                     acc1_init = True
 
                     # -- compute q1 @ k ----
                     tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_q1k")
                     tlx.async_dot_scaled(
                         q_tiles[1],
                         k_tile,
@@ -725,17 +840,37 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         use_acc=False,
                         mBarriers=[qk_fulls[1], kv_empties[k_bufIdx], kv_scale_empties[k_bufIdx]],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_q1k")
 
                     # -- compute p0 @ v ----
                     # wait for the V buffer to be populated by the producer
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_v")
                     tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_v")
 
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_acc")
                     tlx.barrier_wait(acc_fulls[0], qk_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_acc")
                     # Wait for V scale
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_kv_scale")
                     tlx.barrier_wait(kv_scale_fulls[v_bufIdx], v_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_kv_scale")
                     # Explicit SMEM->TMEM scale transfer
                     tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[kv_tmem_idx])
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_p")
                     tlx.barrier_wait(p_fulls[0], qk_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_p")
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_pv")
                     tlx.async_dot_scaled(
                         p_tiles[0],
                         kv_tiles[v_bufIdx],
@@ -747,14 +882,26 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         use_acc=True,
                         mBarriers=[p_empties[0]],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_pv")
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
 
                 # -- compute p1 @ v ----
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_acc")
                 tlx.barrier_wait(acc_fulls[1], qk_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_acc")
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_p")
                 tlx.barrier_wait(p_fulls[1], qk_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_p")
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_dot_pv")
                 tlx.async_dot_scaled(
                     p_tiles[1],
                     kv_tiles[v_bufIdx],
@@ -766,10 +913,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     use_acc=acc1_init,
                     mBarriers=[acc_empties[1], kv_empties[v_bufIdx], kv_scale_empties[v_bufIdx], p_empties[1]],
                 )
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_dot_pv")
 
                 accum_cnt_qk += 1
                 accum_cnt_kv += 2
                 tile_idx += num_progs
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_tile")
 
         # load
         with tlx.async_task(num_warps=1, registers=24):
@@ -801,13 +952,21 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_q_empty")
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_q_empty")
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                 qo_offset_y_split = qo_offset_y
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
 
                 # Use q_scale buffer index 0 for group 0 (q0)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_q_scale_empty")
                 tlx.barrier_wait(q_scale_empties[0], q_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_q_scale_empty")
                 tlx.barrier_expect_bytes(q_scale_fulls[0], Q_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, m_offset, head_offset, 0, 0]
                 # off_hz is the combined batch*H + head index
@@ -822,7 +981,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 # wait for the K buffer to be released by the consumer
                 k_empty = tlx.local_view(kv_empties, k_bufIdx)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_k_empty")
                 tlx.barrier_wait(k_empty, k_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_k_empty")
 
                 # load K
                 k_full = tlx.local_view(kv_fulls, k_bufIdx)
@@ -831,7 +994,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
 
                 # Load K scale - k_bufIdx is always 0, use explicit buffer 0
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_kv_scale_empty")
                 tlx.barrier_wait(kv_scale_empties[k_bufIdx], k_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_kv_scale_empty")
                 tlx.barrier_expect_bytes(kv_scale_fulls[k_bufIdx], K_SCALE_BYTES)
                 # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                 tlx.async_descriptor_load(
@@ -862,7 +1029,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                 # wait for the V buffer to be released by the consumer
                 v_empty = tlx.local_view(kv_empties, v_bufIdx)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_v_empty")
                 tlx.barrier_wait(v_empty, v_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_v_empty")
                 # load V
                 v_full = tlx.local_view(kv_fulls, v_bufIdx)
                 v_tile = tlx.local_view(kv_tiles, v_bufIdx)
@@ -870,7 +1041,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
 
                 # Load V scale - v_bufIdx is always 1, use explicit buffer
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_kv_scale_empty")
                 tlx.barrier_wait(kv_scale_empties[v_bufIdx], v_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_kv_scale_empty")
                 tlx.barrier_expect_bytes(kv_scale_fulls[v_bufIdx], V_SCALE_BYTES)
                 # V_scale 5D TMA offset: [batch_head, head_offset, n_offset, 0, 0]
                 # V_scale has shape [B*H, HEAD_DIM//128, N//128, 2, 256] (swapped vs K_scale)
@@ -889,7 +1064,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     # wait for the K buffer to be released by the consumer
                     k_empty = tlx.local_view(kv_empties, k_bufIdx)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("load_wait_k_empty")
                     tlx.barrier_wait(k_empty, k_phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("load_wait_k_empty")
                     # load K
                     k_full = tlx.local_view(kv_fulls, k_bufIdx)
                     k_tile = tlx.local_view(kv_tiles, k_bufIdx)
@@ -897,7 +1076,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
 
                     # Load K scale - k_bufIdx is always 0, use explicit buffer 0
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("load_wait_kv_scale_empty")
                     tlx.barrier_wait(kv_scale_empties[k_bufIdx], k_phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("load_wait_kv_scale_empty")
                     tlx.barrier_expect_bytes(kv_scale_fulls[k_bufIdx], K_SCALE_BYTES)
                     # 5D TMA offset: [batch_head, n_offset, head_offset, 0, 0]
                     # Compute offset based on relative position within this batch-head's N range
@@ -912,7 +1095,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     # wait for the V buffer to be released by the consumer
                     v_empty = tlx.local_view(kv_empties, v_bufIdx)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("load_wait_v_empty")
                     tlx.barrier_wait(v_empty, v_phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("load_wait_v_empty")
                     # load V
                     v_full = tlx.local_view(kv_fulls, v_bufIdx)
                     v_tile = tlx.local_view(kv_tiles, v_bufIdx)
@@ -920,7 +1107,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
 
                     # Load V scale - v_bufIdx is always 1, use explicit buffer
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("load_wait_kv_scale_empty")
                     tlx.barrier_wait(kv_scale_empties[v_bufIdx], v_phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("load_wait_kv_scale_empty")
                     tlx.barrier_expect_bytes(kv_scale_fulls[v_bufIdx], V_SCALE_BYTES)
                     # V_scale 5D TMA offset: [batch_head, head_offset, n_offset, 0, 0]
                     # V_scale has shape [B*H, HEAD_DIM//128, N//128, 2, 256] (swapped vs K_scale)
@@ -954,7 +1145,11 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 )
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("epilog_wait_o")
                     tlx.barrier_wait(o_fulls[cid], phase)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("epilog_wait_o")
                     tlx.fence_async_shared()
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
@@ -1031,6 +1226,7 @@ class _attention(torch.autograd.Function):
             )
 
         ctx.grid = grid
+        enable_proton = os.getenv("ENABLE_PROTON") == "1"
         _attn_fwd_mxf8_ws[grid](
             sm_scale,
             m_tensor,  #
@@ -1046,6 +1242,8 @@ class _attention(torch.autograd.Function):
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
+            ENABLE_PROTON=enable_proton,
+            PROTON_TILE=10,
             **extra_kern_args,
         )
 
@@ -1249,6 +1447,7 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     grid = (min(NUM_SMS, triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
+    enable_proton = os.getenv("ENABLE_PROTON") == "1"
     _attn_fwd_mxf8_ws.fn[grid](
         sm_scale,
         m_tensor,
@@ -1264,6 +1463,54 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
+        ENABLE_PROTON=enable_proton,
+        PROTON_TILE=10,
         **config,
     )
     return o
+
+
+def profile_attention(Z, H, N_CTX, HEAD_DIM, causal, warp_sampling=True):
+    dtype = torch.float8_e4m3fn
+    shape = (Z, H, N_CTX, HEAD_DIM)
+    (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = generate_attention_inputs(shape, "cuda", dtype)
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
+
+    fn = lambda: attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
+
+    if warp_sampling:
+        mode = proton.mode.Default(
+            metric_type="cycle",
+            optimizations="clock32,time_shift",
+            sampling_strategy="selective",
+            sampling_options="8, 9",
+        )
+    else:
+        mode = proton.mode.Default(metric_type="cycle", optimizations="clock32,time_shift")
+
+    proton.start("blackwell_fa_ws_pipelined_persistent_mxfp8", data="trace", backend="instrumentation", mode=mode)
+    print(fn())
+    proton.finalize()
+
+
+if __name__ == "__main__":
+    if is_blackwell():
+        torch.manual_seed(0)
+        Z, H, N_CTX, HEAD_DIM = 4, 32, 4096, 64
+        causal = False
+
+        if os.getenv("ENABLE_PROTON") == "1":
+            print("proton intra kernel profiling")
+            profile_attention(Z, H, N_CTX, HEAD_DIM, causal)
+        else:
+            print("benchmarking blackwell FA ws pipelined persistent mxfp8")
+            dtype = torch.float8_e4m3fn
+            shape = (Z, H, N_CTX, HEAD_DIM)
+            (q, q_scale, _), (k, k_scale, _), (v, v_scale, _) = generate_attention_inputs(shape, "cuda", dtype)
+            sm_scale = 1.0 / (HEAD_DIM**0.5)
+            fn = lambda: attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
+            ms = triton.testing.do_bench(fn)
+            print(f"{Z=} {H=} {N_CTX=} {HEAD_DIM=} {causal=}")
+            print(f"FA WS Pipelined Persistent MXFP8: {ms} ms")
+    else:
+        print("Skipping benchmarks")
