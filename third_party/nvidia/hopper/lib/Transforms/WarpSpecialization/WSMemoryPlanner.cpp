@@ -1416,16 +1416,25 @@ public:
     return false;
   }
 
-  /// Check if src and dst are along a dependency chain (same partition).
-  /// Reverted to simple parent logic - checks if dst's producer partition
-  /// matches src's consumer partition.
+  /// Check if src and dst are along a dependency chain.
+  /// Uses bidirectional data dependency check OR partition matching.
+  /// This ensures buffers that share space are related in the computation flow.
   bool alongDependencyChain(Operation *src, Operation *dst,
                             unsigned depChainCondition) {
     auto *srcCh = allocToChannel[src];
     auto *dstCh = allocToChannel[dst];
+    // Check bidirectional data dependency:
+    // 1. src → dst: src's consumer leads to dst's producer
+    // 2. dst → src: dst's consumer leads to src's producer
+    if (isDataDependent(srcCh->getDstOp(), dstCh->getSrcOp()) ||
+        isDataDependent(dstCh->getDstOp(), srcCh->getSrcOp()))
+      return true;
+    // Fallback: partition matching (same partition implies related data flow)
+#if 0
     if (getAsyncTaskIds(dstCh->getSrcOp()) ==
         getAsyncTaskIds(srcCh->getDstOp()))
       return true;
+#endif
     return false;
   }
 
@@ -1630,17 +1639,41 @@ public:
     auto findReuseSpace = [&](BufferT *cand, BufferT *reuseOwner,
                               unsigned depChainCondition) -> size_t {
       size_t maxColOffset = 0;
-      // Try to find the colOffset in this reuseOwner. If there is already a
-      // reuse in the same loop, move up colOffset.
+      // First pass: compute maxColOffset from buffers with overlapping
+      // liveness. These buffers force the candidate to use a higher column
+      // offset.
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
-          if (sameLoop(alloc) ||
-              bufferRange[alloc].intersects(bufferRange[cand]))
+          if (bufferRange[alloc].intersects(bufferRange[cand]))
             maxColOffset =
                 std::max(alloc->colOffset + alloc->colSize, maxColOffset);
         }
       }
       LDBG("findReuseSpace first pass maxColOffset " << maxColOffset);
+      // Second pass: check dependency with buffers that have BOTH overlapping
+      // liveness AND overlapping column range. If livenesses don't overlap,
+      // buffers can share the same columns at different times without needing
+      // dependency.
+      size_t candColStart = maxColOffset;
+      size_t candColEnd = maxColOffset + cand->colSize;
+      for (auto *alloc : buffers) {
+        if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
+          // Skip if livenesses don't overlap - they use space at different
+          // times
+          if (!bufferRange[alloc].intersects(bufferRange[cand]))
+            continue;
+          size_t allocColStart = alloc->colOffset;
+          size_t allocColEnd = alloc->colOffset + alloc->colSize;
+          // Check if column ranges overlap
+          bool colOverlap =
+              (candColStart < allocColEnd) && (allocColStart < candColEnd);
+          if (colOverlap) {
+            if (!alongDependencyChain(alloc->owner, cand->owner,
+                                      depChainCondition))
+              return std::numeric_limits<size_t>::max();
+          }
+        }
+      }
       if (maxColOffset + cand->colSize <= reuseOwner->colSize)
         return maxColOffset;
       if (!sameLoop(reuseOwner)) {
@@ -1733,6 +1766,41 @@ public:
     DenseMap<Operation *, Interval<size_t>> bufferSet;
     Operation *candidateAlloc = nullptr;
     SmallVector<Operation *> allocOrder;
+
+    // Debug: dump allocation order and liveness
+    LLVM_DEBUG({
+      llvm::dbgs() << "\n=== TMEM Buffer Allocation Order and Liveness ===\n";
+      size_t idx = 0;
+      for (auto alloc : allocs) {
+        auto *buf = getBuffer(alloc.getOperation());
+        auto *ch = allocToChannel[alloc.getOperation()];
+        llvm::dbgs() << "  [" << idx++ << "] liveness=["
+                     << bufferRange[buf].start() << "-"
+                     << bufferRange[buf].end() << ") size=" << buf->rowSize
+                     << "x" << buf->colSize << "\n";
+      }
+      llvm::dbgs()
+          << "\n=== alongDependencyChain Results (only showing TRUE) ===\n";
+      llvm::dbgs() << "Format: [src_liveness] -> [dst_liveness] = TRUE\n";
+      for (auto alloc_i : allocs) {
+        for (auto alloc_j : allocs) {
+          if (alloc_i.getOperation() != alloc_j.getOperation()) {
+            bool dep = alongDependencyChain(alloc_i.getOperation(),
+                                            alloc_j.getOperation(), 1);
+            if (dep) {
+              auto *buf_i = getBuffer(alloc_i.getOperation());
+              auto *buf_j = getBuffer(alloc_j.getOperation());
+              llvm::dbgs() << "  [" << bufferRange[buf_i].start() << "-"
+                           << bufferRange[buf_i].end() << ") -> ["
+                           << bufferRange[buf_j].start() << "-"
+                           << bufferRange[buf_j].end() << ") = TRUE\n";
+            }
+          }
+        }
+      }
+      llvm::dbgs() << "=== End Debug ===\n\n";
+    });
+
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       ttng::TMEMAllocOp alloc = *it;
       auto *candBuf = getBuffer(alloc.getOperation());
