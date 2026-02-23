@@ -21,6 +21,7 @@ namespace mlir {
 static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   OpPrintingFlags flags;
   flags.enableDebugInfo();
+  flags.printNameLocAsPrefix(true);
   return flags;
 }
 
@@ -143,22 +144,22 @@ public:
 
     if (pingpongAutoWS) {
       doPingPongPrep(funcOp, numWarpGroups, capability);
-      if (dumpIntermediateSteps) {
-        llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
-            << moduleOp << "\n\n\n";
-      }
+      // if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n"
+          << moduleOp << "\n\n\n";
+      // }
     }
 
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     doBufferAllocation(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    // if (dumpIntermediateSteps) {
+    llvm::dbgs()
+        << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
+    moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+    llvm::dbgs() << "\n\n\n";
+    // }
 
     if (failed(doMemoryPlanner(funcOp, numStages))) {
       signalPassFailure();
