@@ -1,6 +1,5 @@
 import json
 import pathlib
-
 from typing import NamedTuple
 import triton.profiler as proton
 
