@@ -1,7 +1,12 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+import triton.profiler as proton
+import triton.profiler.language as pl
+from triton._internal_testing import is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -21,68 +26,88 @@ def _host_descriptor_pre_hook(nargs):
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
 
 
-configs = [
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 6,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 4,
-        },
-        num_stages=0,
-        num_warps=4,
-        pre_hook=_host_descriptor_pre_hook,
-    ),
-]
+def get_configs():
+    if os.getenv("ENABLE_PROTON") == "1":
+        return [
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 128,
+                    "NUM_BUFFERS_Q": 1,
+                    "NUM_BUFFERS_KV": 3,
+                    "NUM_BUFFERS_QK": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "NUM_MMA_SLICES": 2,
+                    "GROUP_SIZE_N": 1,
+                },
+                num_stages=0,
+                num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
+            ),
+        ]
+    else:
+        return [
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 128,
+                    "NUM_BUFFERS_Q": 1,
+                    "NUM_BUFFERS_KV": 3,
+                    "NUM_BUFFERS_QK": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "NUM_MMA_SLICES": 2,
+                    "GROUP_SIZE_N": 1,
+                },
+                num_stages=0,
+                num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
+            ),
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 128,
+                    "NUM_BUFFERS_Q": 1,
+                    "NUM_BUFFERS_KV": 3,
+                    "NUM_BUFFERS_QK": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "NUM_MMA_SLICES": 2,
+                    "GROUP_SIZE_N": 4,
+                },
+                num_stages=0,
+                num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
+            ),
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 128,
+                    "NUM_BUFFERS_Q": 1,
+                    "NUM_BUFFERS_KV": 6,
+                    "NUM_BUFFERS_QK": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "NUM_MMA_SLICES": 2,
+                    "GROUP_SIZE_N": 1,
+                },
+                num_stages=0,
+                num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
+            ),
+            triton.Config(
+                {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 128,
+                    "NUM_BUFFERS_Q": 1,
+                    "NUM_BUFFERS_KV": 6,
+                    "NUM_BUFFERS_QK": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "NUM_MMA_SLICES": 2,
+                    "GROUP_SIZE_N": 4,
+                },
+                num_stages=0,
+                num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
+            ),
+        ]
 
 
 def prune_configs_by_hdim(configs, named_args, **kwargs):
@@ -278,16 +303,23 @@ def _softmax_inner_loop(
     start_m,
     N_CTX,
     out_dtype,
+    outer_i,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_MMA_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
+    ENABLE_PROTON: tl.constexpr,
+    PROTON_TILE: tl.constexpr,
 ):
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.enter_scope("softmax_wait_qk")
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.exit_scope("softmax_wait_qk")
         qk = tlx.local_load(tlx.local_view(qk_tiles, cid))
 
         if STAGE == 2:
@@ -299,7 +331,11 @@ def _softmax_inner_loop(
 
         # -- compute correction factor
         alpha = tl.math.exp2(m_i - m_ij)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.enter_scope("softmax_wait_alpha_empty")
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
+        if ENABLE_PROTON and outer_i == PROTON_TILE:
+            pl.exit_scope("softmax_wait_alpha_empty")
         tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
@@ -324,7 +360,7 @@ def _softmax_inner_loop(
 
 
 @triton.autotune(
-    configs=configs,
+    configs=get_configs(),
     key=["N_CTX", "HEAD_DIM", "STAGE"],
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
@@ -341,6 +377,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
                  NUM_MMA_SLICES: tl.constexpr,  #
                  GROUP_SIZE_N: tl.constexpr,  #
+                 ENABLE_PROTON: tl.constexpr,  #
+                 PROTON_TILE: tl.constexpr,  #
                  ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -465,7 +503,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                     _, phase = _get_bufidx_phase(accum_cnt, 1)
                     for cid in tl.static_range(0, NUM_MMA_GROUPS):
                         # -- update output accumulator --
+                        if ENABLE_PROTON and i == PROTON_TILE:
+                            pl.enter_scope("default_wait_alpha")
                         tlx.barrier_wait(alpha_fulls[cid], phase)
+                        if ENABLE_PROTON and i == PROTON_TILE:
+                            pl.exit_scope("default_wait_alpha")
                         alpha_1 = tlx.local_load(alpha_tiles[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
                         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
@@ -484,7 +526,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     # epilogue
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("default_wait_l")
                     tlx.barrier_wait(l_fulls[cid], phase)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("default_wait_l")
                     l = tlx.local_load(l_tiles[cid])
                     m = tlx.local_load(m_tiles[cid])
                     # Signal qk_empties after both l and m loads complete,
@@ -495,8 +541,16 @@ def _attn_fwd_ws(sm_scale, M,  #
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("default_wait_acc_empty")
                     tlx.barrier_wait(acc_empties[cid], phase)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("default_wait_acc_empty")
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("default_wait_o_empty")
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("default_wait_o_empty")
                     scale = 1 / l
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         subslice = tlx.subslice(
@@ -560,10 +614,13 @@ def _attn_fwd_ws(sm_scale, M,  #
                         start_m,
                         N_CTX,
                         p_dtype,
+                        i,
                         BLOCK_M,
                         BLOCK_N,
                         NUM_MMA_SLICES,
                         STAGE=4 - STAGE,
+                        ENABLE_PROTON=ENABLE_PROTON,
+                        PROTON_TILE=PROTON_TILE,
                     )
 
                 if STAGE & 2:
@@ -584,10 +641,13 @@ def _attn_fwd_ws(sm_scale, M,  #
                         start_m,
                         N_CTX,
                         p_dtype,
+                        i,
                         BLOCK_M,
                         BLOCK_N,
                         NUM_MMA_SLICES,
                         STAGE=2,
+                        ENABLE_PROTON=ENABLE_PROTON,
+                        PROTON_TILE=PROTON_TILE,
                     )
 
                 # prepare l_i for the epilog
@@ -602,6 +662,8 @@ def _attn_fwd_ws(sm_scale, M,  #
             accum_cnt_qk = 0
 
             for j in range(0, tiles_per_sm):
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_tile")
                 # initialize offsets
                 _, _, lo, hi, _, _ = _compute_offsets(
                     tile_idx,
@@ -619,14 +681,24 @@ def _attn_fwd_ws(sm_scale, M,  #
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
                 # wait for the K buffer to be populated by the producer
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_k")
                 tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_k")
 
                 # wait for the Q buffer to be populated by the producer
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_q")
                 tlx.barrier_wait(q_fulls[q_bufIdx], q_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_q")
 
                 # -- compute q0 @ k ----
                 k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
                 tlx.barrier_wait(qk_empties[0], q_phase ^ 1)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_dot_q0k")
                 tlx.async_dot(
                     q_tiles[0],
                     k_tile,
@@ -634,10 +706,14 @@ def _attn_fwd_ws(sm_scale, M,  #
                     use_acc=False,
                     mBarriers=[qk_fulls[0]],
                 )
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_dot_q0k")
 
                 # -- compute q1 @ k ----
                 tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
                 tlx.barrier_wait(qk_empties[1], q_phase ^ 1)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_dot_q1k")
                 tlx.async_dot(
                     q_tiles[1],
                     k_tile,
@@ -645,21 +721,37 @@ def _attn_fwd_ws(sm_scale, M,  #
                     use_acc=False,
                     mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
                 )
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_dot_q1k")
 
                 _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
 
                 # -- compute p0 @ v ----
                 # wait for the V buffer to be populated by the producer
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_v")
                 tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_v")
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_acc")
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_acc")
                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                     p_bufIdx = slice_id
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_p")
                     tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_p")
                     kv_slice = tlx.local_slice(
                         kv_tiles[v_bufIdx],
                         [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                         [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_pv")
                     tlx.async_dot(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -667,6 +759,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                         use_acc=slice_id > 0,
                         force_async=True,
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_pv")
 
                 acc1_init = False
 
@@ -681,10 +775,16 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                     # -- compute q0 @ k ----
                     # wait for the K buffer to be populated by the producer
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_k")
                     tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_k")
                     k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
                     _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
 
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_q0k")
                     tlx.async_dot(
                         q_tiles[0],
                         k_tile,
@@ -692,12 +792,22 @@ def _attn_fwd_ws(sm_scale, M,  #
                         use_acc=False,
                         mBarriers=[qk_fulls[0]],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_q0k")
 
                     # -- compute p1 @ v from the previous iteration----
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_acc")
                     tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_acc")
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         p_bufIdx = slice_id + NUM_MMA_SLICES
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.enter_scope("mma_wait_p")
                         tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase_prev)
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.exit_scope("mma_wait_p")
                         kv_slice = tlx.local_slice(
                             kv_tiles[v_bufIdx_prev],
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
@@ -705,6 +815,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                         )
                         use_acc = acc1_init if slice_id == 0 else True
                         mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.enter_scope("mma_dot_pv")
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -712,10 +824,14 @@ def _attn_fwd_ws(sm_scale, M,  #
                             use_acc=use_acc,
                             mBarriers=mBarriers,
                         )
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.exit_scope("mma_dot_pv")
 
                     acc1_init = True
 
                     # -- compute q1 @ k ----
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_q1k")
                     tlx.async_dot(
                         q_tiles[1],
                         k_tile,
@@ -723,20 +839,36 @@ def _attn_fwd_ws(sm_scale, M,  #
                         use_acc=False,
                         mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_q1k")
 
                     # -- compute p0 @ v ----
                     # wait for the V buffer to be populated by the producer
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_v")
                     tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_v")
 
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_acc")
                     tlx.barrier_wait(acc_fulls[0], qk_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_acc")
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         p_bufIdx = slice_id
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.enter_scope("mma_wait_p")
                         tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.exit_scope("mma_wait_p")
                         kv_slice = tlx.local_slice(
                             kv_tiles[v_bufIdx],
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                             [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM],
                         )
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.enter_scope("mma_dot_pv")
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
                             kv_slice,
@@ -744,16 +876,26 @@ def _attn_fwd_ws(sm_scale, M,  #
                             use_acc=True,
                             force_async=True,
                         )
+                        if ENABLE_PROTON and j == PROTON_TILE:
+                            pl.exit_scope("mma_dot_pv")
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
 
                 # -- compute p1 @ v ----
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.enter_scope("mma_wait_acc")
                 tlx.barrier_wait(acc_fulls[1], qk_phase)
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_wait_acc")
                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                     p_bufIdx = slice_id + NUM_MMA_SLICES
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_wait_p")
                     tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_wait_p")
                     kv_slice = tlx.local_slice(
                         kv_tiles[v_bufIdx],
                         [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
@@ -761,6 +903,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                     )
                     use_acc = acc1_init if slice_id == 0 else True
                     mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.enter_scope("mma_dot_pv")
                     tlx.async_dot(
                         p_tiles[p_bufIdx],
                         kv_slice,
@@ -768,10 +912,14 @@ def _attn_fwd_ws(sm_scale, M,  #
                         use_acc=use_acc,
                         mBarriers=mBarriers,
                     )
+                    if ENABLE_PROTON and j == PROTON_TILE:
+                        pl.exit_scope("mma_dot_pv")
 
                 accum_cnt_qk += 1
                 accum_cnt_kv += 2
                 tile_idx += num_progs
+                if ENABLE_PROTON and j == PROTON_TILE:
+                    pl.exit_scope("mma_tile")
 
         # load
         with tlx.async_task(num_warps=1, registers=24):
@@ -791,7 +939,11 @@ def _attn_fwd_ws(sm_scale, M,  #
 
                 # load q0
                 q_bufIdx, q_phase = _get_bufidx_phase(i, NUM_BUFFERS_Q)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_q_empty")
                 tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_q_empty")
                 tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                 qo_offset_y_split = qo_offset_y
                 tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
@@ -800,7 +952,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 # wait for the K buffer to be released by the consumer
                 k_empty = tlx.local_view(kv_empties, k_bufIdx)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_k_empty")
                 tlx.barrier_wait(k_empty, k_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_k_empty")
 
                 # load K
                 k_full = tlx.local_view(kv_fulls, k_bufIdx)
@@ -818,7 +974,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                 # wait for the V buffer to be released by the consumer
                 v_empty = tlx.local_view(kv_empties, v_bufIdx)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.enter_scope("load_wait_v_empty")
                 tlx.barrier_wait(v_empty, v_phase ^ 1)
+                if ENABLE_PROTON and i == PROTON_TILE:
+                    pl.exit_scope("load_wait_v_empty")
                 # load V
                 v_full = tlx.local_view(kv_fulls, v_bufIdx)
                 v_tile = tlx.local_view(kv_tiles, v_bufIdx)
@@ -832,7 +992,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     # wait for the K buffer to be released by the consumer
                     k_empty = tlx.local_view(kv_empties, k_bufIdx)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("load_wait_k_empty")
                     tlx.barrier_wait(k_empty, k_phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("load_wait_k_empty")
                     # load K
                     k_full = tlx.local_view(kv_fulls, k_bufIdx)
                     k_tile = tlx.local_view(kv_tiles, k_bufIdx)
@@ -842,7 +1006,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     # wait for the V buffer to be released by the consumer
                     v_empty = tlx.local_view(kv_empties, v_bufIdx)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("load_wait_v_empty")
                     tlx.barrier_wait(v_empty, v_phase ^ 1)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("load_wait_v_empty")
                     # load V
                     v_full = tlx.local_view(kv_fulls, v_bufIdx)
                     v_tile = tlx.local_view(kv_tiles, v_bufIdx)
@@ -871,7 +1039,11 @@ def _attn_fwd_ws(sm_scale, M,  #
                 )
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.enter_scope("epilog_wait_o")
                     tlx.barrier_wait(o_fulls[cid], phase)
+                    if ENABLE_PROTON and i == PROTON_TILE:
+                        pl.exit_scope("epilog_wait_o")
                     tlx.fence_async_shared()
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
@@ -1684,6 +1856,7 @@ class _attention(torch.autograd.Function):
             )
 
         ctx.grid = grid
+        enable_proton = os.getenv("ENABLE_PROTON") == "1"
         _attn_fwd_ws[grid](
             sm_scale,
             M,  #
@@ -1696,6 +1869,8 @@ class _attention(torch.autograd.Function):
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
+            ENABLE_PROTON=enable_proton,
+            PROTON_TILE=10,
             **extra_kern_args,
         )
 
@@ -1844,6 +2019,7 @@ def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M, config=None
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     grid = (min(NUM_SMS, triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
+    enable_proton = os.getenv("ENABLE_PROTON") == "1"
     _attn_fwd_ws.fn[grid](
         sm_scale,
         M,
@@ -1856,6 +2032,55 @@ def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M, config=None
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
+        ENABLE_PROTON=enable_proton,
+        PROTON_TILE=10,
         **config,
     )
     return o
+
+
+def profile_attention(Z, H, N_CTX, HEAD_DIM, causal, warp_sampling=True):
+    dtype = torch.bfloat16
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5)
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5)
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5)
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
+
+    fn = lambda: attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1=64, GROUP_SIZE_M=1)
+
+    if warp_sampling:
+        mode = proton.mode.Default(
+            metric_type="cycle",
+            optimizations="clock32,time_shift",
+            sampling_strategy="selective",
+            sampling_options="8, 9",
+        )
+    else:
+        mode = proton.mode.Default(metric_type="cycle", optimizations="clock32,time_shift")
+
+    proton.start("blackwell_fa_ws_pipelined_persistent", data="trace", backend="instrumentation", mode=mode)
+    print(fn())
+    proton.finalize()
+
+
+if __name__ == "__main__":
+    if is_blackwell():
+        torch.manual_seed(0)
+        Z, H, N_CTX, HEAD_DIM = 4, 32, 4096, 64
+        causal = False
+
+        if os.getenv("ENABLE_PROTON") == "1":
+            print("proton intra kernel profiling")
+            profile_attention(Z, H, N_CTX, HEAD_DIM, causal)
+        else:
+            print("benchmarking blackwell FA ws pipelined persistent")
+            q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=torch.bfloat16, device="cuda").normal_(mean=0.0, std=0.5)
+            k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=torch.bfloat16, device="cuda").normal_(mean=0.0, std=0.5)
+            v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=torch.bfloat16, device="cuda").normal_(mean=0.0, std=0.5)
+            sm_scale = 1.0 / (HEAD_DIM**0.5)
+            fn = lambda: attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1=64, GROUP_SIZE_M=1)
+            ms = triton.testing.do_bench(fn)
+            print(f"{Z=} {H=} {N_CTX=} {HEAD_DIM=} {causal=}")
+            print(f"FA WS Pipelined Persistent: {ms} ms")
+    else:
+        print("Skipping benchmarks")
