@@ -124,7 +124,8 @@ static void scheduleDependencies(scf::ForOp loop, PartitionSet &partitions,
 
     Operation *defOp =
         loop.getBody()->findAncestorOpInBlock(*dep.getDefiningOp());
-    if (!defOp || !hasDefPartition(loop, defOp, partitions) ||
+    if (!defOp || isa<scf::ForOp>(defOp) ||
+        !hasDefPartition(loop, defOp, partitions) ||
         !trySetPartition(defOp, partition))
       continue;
     llvm::append_range(deps, getNestedOperands(defOp));
@@ -149,6 +150,9 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
         uses.push_back(&use);
       continue;
     }
+
+    if (isa<scf::ForOp>(user))
+      continue;
 
     if (hasPartition(user))
       continue;
@@ -505,6 +509,8 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     });
     // Check the users of the operation.
     iterateUsers(loop, op, [&](Operation *user) {
+      if (isa<scf::ForOp>(user))
+        return;
       if (auto partitionIds = getPartitionIds(user)) {
         // If the user is already assigned to a partition, add that partition as
         // one of the sink partitions.
