@@ -458,8 +458,6 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     // already assigned to a partition.
     auto useCallback = [&](OpResult result, OpOperand &use, unsigned distance) {
       Operation *user = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
-      if (isa<scf::ForOp>(user))
-        return;
       if (!hasPartition(user)) {
         // Add the current partition as a def to the cluster.
         opClusters.getOrCreate(user)->defPartitions.insert(&partition);
