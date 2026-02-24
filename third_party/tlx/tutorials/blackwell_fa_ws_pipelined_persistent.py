@@ -33,7 +33,7 @@ configs = [
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 1,
         },
-        num_stages=0,
+        num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
@@ -48,7 +48,7 @@ configs = [
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 4,
         },
-        num_stages=0,
+        num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
@@ -63,7 +63,7 @@ configs = [
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 1,
         },
-        num_stages=0,
+        num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
@@ -78,7 +78,7 @@ configs = [
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 4,
         },
-        num_stages=0,
+        num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
@@ -427,8 +427,13 @@ def _attn_fwd_ws(sm_scale, M,  #
     qk_storage_alias.set_buffer_overlap(
         tlx.reuse_group(
             qk_tiles,
-            tlx.reuse_group(tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES), alpha_tiles, l_tiles, m_tiles,
-                            group_type=tlx.reuse_group_type.distinct),
+            tlx.reuse_group(
+                tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
+                alpha_tiles,
+                l_tiles,
+                m_tiles,
+                group_type=tlx.reuse_group_type.distinct,
+            ),
             group_type=tlx.reuse_group_type.shared,
         ))
 
