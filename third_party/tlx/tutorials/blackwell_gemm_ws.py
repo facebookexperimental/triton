@@ -15,7 +15,7 @@ def get_cuda_autotune_config():
                 "BLOCK_SIZE_M": BM,
                 "BLOCK_SIZE_N": BN,
                 "BLOCK_SIZE_K": BK,
-                "GROUP_SIZE_M": 8,
+                "GROUP_SIZE_M": g,
                 "NUM_SMEM_BUFFERS": s,
                 "NUM_TMEM_BUFFERS": t,
                 "NUM_MMA_GROUPS": m,
@@ -37,6 +37,7 @@ def get_cuda_autotune_config():
         for subtile in [1, 2, 4, 8]
         for num_ctas in [1, 2]
         for split_k in [1, 4]
+        for g in [1, 8, 64]
     ]
 
 
@@ -153,6 +154,25 @@ def preprocess_configs(configs, named_args, **kwargs):
             pruned_configs = [c for c in pruned_configs if _total_tiles(c) >= NUM_SMS]
         else:
             pruned_configs = [c for c in pruned_configs if _total_tiles(c) == max_tiles]
+
+    # --- Golden Rule: sweep the large dimension, fix the small one ---
+    # A[M,K] changes with M; B[K,N] changes with N.
+    # GROUP_SIZE_M controls how many M-tiles are grouped before advancing N.
+    #   GROUP_SIZE_M = 1  → sweep M first (column-major), B (small-N side) reused
+    #   GROUP_SIZE_M = large → sweep N first (row-major), A (small-M side) reused
+    # When M >> N: prefer small GROUP_SIZE_M (sweep M, fix B for reuse)
+    # When N >> M: prefer large GROUP_SIZE_M (sweep N, fix A for reuse)
+    if pruned_configs:
+        IMBALANCE_THRESHOLD = 10  # ratio at which we enforce the rule
+        if M > N * IMBALANCE_THRESHOLD:
+            # M >> N: keep only small GROUP_SIZE_M to sweep M
+            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] == 1]
+        elif N > M * IMBALANCE_THRESHOLD:
+            # N >> M: keep only large GROUP_SIZE_M to sweep N
+            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] >= 32]
+        else:
+            # Balanced M ≈ N: keep moderate GROUP_SIZE_M for L2 locality
+            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] == 8]
 
     # Pareto-optimal filtering on (NUM_SMEM_BUFFERS, NUM_TMEM_BUFFERS,
     # NUM_MMA_GROUPS): these are independent resource dimensions where more
