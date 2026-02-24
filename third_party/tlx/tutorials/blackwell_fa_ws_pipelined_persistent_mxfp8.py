@@ -47,7 +47,7 @@ mxfp8_configs = [
             "NUM_KV_SCALE_TMEM_BUFFERS": 2,
             "GROUP_SIZE_N": 1,
         },
-        num_stages=0,
+        num_stages=1,
         num_warps=4,
         pre_hook=_mxf8_host_descriptor_pre_hook,
     ),
