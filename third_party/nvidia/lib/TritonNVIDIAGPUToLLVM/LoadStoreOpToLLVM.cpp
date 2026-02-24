@@ -1370,6 +1370,23 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
+
+    // For host-side TMA descriptors (passed as kernel arguments), the block
+    // shape is set by user code at runtime. If the inner dimension exceeds the
+    // swizzle width, the compiler clamps it and emits split copies -- but the
+    // host descriptor still uses the original (unclamped) block shape, so each
+    // split copy loads a full tile instead of a sub-tile, overflowing shared
+    // memory. Device-side descriptors (from tl.make_tensor_descriptor) are
+    // fine because createTMADesc applies the same clamping.
+    if (numCopies > 1 && isa<BlockArgument>(op.getDesc())) {
+      return op.emitError(
+          "Host-side TMA descriptor block shape inner dimension exceeds the "
+          "swizzle byte width, requiring copy splitting that cannot be "
+          "reflected in the host descriptor. Use tl.make_tensor_descriptor "
+          "for device-side descriptor creation, or reduce the inner block "
+          "dimension to fit within the swizzle width.");
+    }
+
     auto zero = b.i32_val(0);
     auto ctaId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
 

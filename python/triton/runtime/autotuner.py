@@ -136,7 +136,7 @@ class Autotuner(KernelInterface):
         return self._do_bench
 
     def _bench(self, *args, config, **meta):
-        from ..compiler.errors import CompileTimeAssertionFailure
+        from ..compiler.errors import CompilationError
 
         verbose = knobs.autotuning.print
         if verbose:
@@ -172,10 +172,16 @@ class Autotuner(KernelInterface):
 
         try:
             return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
-        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
+        except (OutOfResources, CompilationError, PTXASError) as e:
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
+        except RuntimeError as e:
+            if "PassManager::run failed" in str(e):
+                if verbose:
+                    print(f"Autotuning failed with {e}")
+                return [float("inf"), float("inf"), float("inf")]
+            raise
 
     def check_disk_cache(self, tuning_key, configs, bench_fn):
         # We can't serialize prehooks, so just give up and run the benchmarks.
