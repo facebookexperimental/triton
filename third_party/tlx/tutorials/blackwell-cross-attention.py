@@ -97,7 +97,7 @@ def get_fwd_pipeline_configs() -> List[triton.Config]:
                 "NUM_MMA_GROUPS": 2,
                 "NUM_BUFFERS_KV": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook,
         ),
@@ -108,7 +108,7 @@ def get_fwd_pipeline_configs() -> List[triton.Config]:
                 "NUM_MMA_GROUPS": 2,
                 "NUM_BUFFERS_KV": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook,
         ),
@@ -119,7 +119,7 @@ def get_fwd_pipeline_configs() -> List[triton.Config]:
                 "NUM_MMA_GROUPS": 2,
                 "NUM_BUFFERS_KV": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook,
         ),
@@ -196,7 +196,7 @@ def get_fwd_triton_single() -> List[triton.Config]:
                 "TRANS": trans,
                 "NUM_STAGES": ns,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=nw,
             pre_hook=_host_descriptor_pre_hook,
         )
@@ -205,9 +205,9 @@ def get_fwd_triton_single() -> List[triton.Config]:
         for nw in [4]  # 2, 4, 8]
         for ns in [2]  # 2
         for off in [False]
-        for mask in [True]  #True]
+        for mask in [True]  # True]
         for tma in [False]  # False]
-        for trans in [True]  #True]
+        for trans in [True]  # True]
     ]
     return configs
 
@@ -225,7 +225,7 @@ def get_fwd_triton_configs() -> List[triton.Config]:
                 "TRANS": tma_trans[1],
                 "NUM_STAGES": ns,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=nw,
             pre_hook=_host_descriptor_pre_hook,
         )
@@ -509,7 +509,7 @@ def get_fwd_triton_spec_single() -> List[triton.Config]:
                 "NUM_STAGES": 2,
                 "NUM_STAGES1": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_spec,
         )
@@ -533,7 +533,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                 "NUM_STAGES": ns,
                 "NUM_STAGES1": ns1,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=nw,
             pre_hook=_host_descriptor_pre_hook_spec,
         )
@@ -690,7 +690,7 @@ def get_fwd_single() -> List[triton.Config]:
                 "NUM_BUFFERS_KV": 3,
                 "NUM_MMA_GROUPS": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_ws,
         ),
@@ -707,7 +707,7 @@ def get_fwd_configs() -> List[triton.Config]:
                 "NUM_BUFFERS_KV": 3,
                 "NUM_MMA_GROUPS": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_ws,
         ),
@@ -718,7 +718,7 @@ def get_fwd_configs() -> List[triton.Config]:
                 "NUM_BUFFERS_KV": 3,
                 "NUM_MMA_GROUPS": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_ws,
         ),
@@ -729,7 +729,7 @@ def get_fwd_configs() -> List[triton.Config]:
                 "NUM_BUFFERS_KV": 3,
                 "NUM_MMA_GROUPS": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_ws,
         ),
@@ -740,7 +740,7 @@ def get_fwd_configs() -> List[triton.Config]:
                 "NUM_BUFFERS_KV": 2,
                 "NUM_MMA_GROUPS": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_ws,
         ),
@@ -751,7 +751,7 @@ def get_fwd_configs() -> List[triton.Config]:
                 "NUM_BUFFERS_KV": 3,
                 "NUM_MMA_GROUPS": 2,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook_ws,
         ),
@@ -936,8 +936,8 @@ def _attn_fwd_single_q(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
         # load
         with tlx.async_task(num_warps=1, registers=24):
             # initialize offsets
-            start_m, off_h, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (_compute_offsets(
-                H, BLOCK_M, seq_offsets_q, seq_offsets))
+            start_m, off_h, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = _compute_offsets(
+                H, BLOCK_M, seq_offsets_q, seq_offsets)
             if start_m < seq_len_q:
                 # load q: it will stay in SRAM throughout
                 tlx.barrier_expect_bytes(q_fulls[0], 2 * BLOCK_M * HEAD_DIM)  # float16
@@ -1059,8 +1059,8 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
         # correction group
         with tlx.async_task("default"):
             # initialize offsets
-            start_m, off_h, kv_offset_y, seq_len_kv, seq_start_q, seq_len_q = (_compute_offsets(
-                H, BLOCK_M, seq_offsets_q, seq_offsets))
+            start_m, off_h, kv_offset_y, seq_len_kv, seq_start_q, seq_len_q = _compute_offsets(
+                H, BLOCK_M, seq_offsets_q, seq_offsets)
             if start_m < seq_len_q:
                 for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     tlx.barrier_wait(acc_empties[cid], 0)
@@ -1076,8 +1076,8 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
         # silu groups
         with tlx.async_task(num_warps=4, registers=152, replicate=NUM_MMA_GROUPS):
             # initialize offsets
-            start_m, off_h, kv_offset_y, seq_len_kv, seq_start_q, seq_len_q = (_compute_offsets(
-                H, BLOCK_M, seq_offsets_q, seq_offsets))
+            start_m, off_h, kv_offset_y, seq_len_kv, seq_start_q, seq_len_q = _compute_offsets(
+                H, BLOCK_M, seq_offsets_q, seq_offsets)
             if start_m < seq_len_q:
                 accum_cnt_qk = 0
                 cid = tlx.async_task_replica_id()
@@ -1105,8 +1105,8 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                     accum_cnt_qk += 1
         # mma group
         with tlx.async_task(num_warps=1, registers=32):
-            start_m, off_h, kv_offset_y, seq_len_kv, seq_start_q, seq_len_q = (_compute_offsets(
-                H, BLOCK_M, seq_offsets_q, seq_offsets))
+            start_m, off_h, kv_offset_y, seq_len_kv, seq_start_q, seq_len_q = _compute_offsets(
+                H, BLOCK_M, seq_offsets_q, seq_offsets)
             if start_m < seq_len_q:
                 # compute q0 @ k
                 # wait for the Q buffer to be populated by the producer
@@ -1204,8 +1204,8 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
         # load
         with tlx.async_task(num_warps=1, registers=24):
             # initialize offsets
-            start_m, off_h, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (_compute_offsets(
-                H, BLOCK_M, seq_offsets_q, seq_offsets))
+            start_m, off_h, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = _compute_offsets(
+                H, BLOCK_M, seq_offsets_q, seq_offsets)
             if start_m < seq_len_q:
                 # load q: it will stay in SRAM throughout
                 # load Q0
@@ -1361,7 +1361,7 @@ def triton_hstu_cross_attn_fwd(
         triton.cdiv(max_q_len, meta["BLOCK_M"]),
         Z * H,
     )
-    #variant = "triton"  # "triton", "tlx_single_q", "triton_dyn_spec", "tlx_pipeline"
+    # variant = "triton"  # "triton", "tlx_single_q", "triton_dyn_spec", "tlx_pipeline"
     if variant == "triton":
         _attn_fwd_triton[grid](
             alpha=alpha,
@@ -1733,7 +1733,7 @@ configs: List[triton.testing.Benchmark] = [
             "hidden_dim": hidden_dim,
             "dtype": dtype,
             "sparsity": seq_sparsity,
-            "bench_backward": False,  #bench_backward,
+            "bench_backward": False,  # bench_backward,
             "max_uih_len_q": max_uih_len_q,
             "max_targets": max_targets,
         },
@@ -1767,8 +1767,8 @@ def bench_cross_attention(
     has_targets: bool = True,
 ) -> float:
     assert mode in ["fwd", "bwd"]
-    warmup = 25  #2000 25
-    rep = 1000  #2000 1000
+    warmup = 25  # 2000 25
+    rep = 1000  # 2000 1000
     torch.manual_seed(1001)  # for reproducibility
 
     alpha = 1.0 / (attn_dim**0.5)
