@@ -1,11 +1,348 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
 import math
+import os
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+# Track which (M, N, K) shapes have already printed their heuristic config
+_printed_heuristic_configs = set()
+
+
+def get_heuristic_config(M, N, K, num_sms=148):
+    """
+    Select optimal GEMM config based on problem shape characteristics.
+
+    The selection uses shape-characteristic rules (not exact shape matching):
+    1. M/N ratio determines tile shape preference
+    2. MN tiles vs SM count determines parallelization strategy (Split-K vs data-parallel)
+    3. Arithmetic intensity determines pipeline depth
+
+    Args:
+        M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
+        num_sms: Number of SMs on the GPU (default 148 for B200)
+
+    Returns:
+        dict: Configuration parameters for the TLX GEMM kernel
+    """
+    MAX_SMEM = 232 * 1024  # 232KB shared memory limit
+    MAX_TMEM = 256 * 1024  # 256KB tensor memory limit per SM
+
+    # ==========================================================================
+    # Shape-characteristic analysis
+    # ==========================================================================
+    mn_ratio = M / max(N, 1)
+    is_tall_m = mn_ratio > 4  # M much larger than N
+    is_tall_n = mn_ratio < 0.25  # N much larger than M
+
+    # Estimate MN tiles with representative tile sizes
+    # Use 256x128 for tall-M, 128x256 for tall-N, 256x256 for balanced
+    if is_tall_m:
+        ref_bm, ref_bn = 256, 128
+    elif is_tall_n:
+        ref_bm, ref_bn = 128, 256
+    else:
+        ref_bm, ref_bn = 256, 256
+
+    num_tiles_m = math.ceil(M / ref_bm)
+    num_tiles_n = math.ceil(N / ref_bn)
+    num_mn_tiles = num_tiles_m * num_tiles_n
+
+    is_gpu_saturated = num_mn_tiles >= num_sms
+    is_undersaturated = num_mn_tiles < num_sms
+
+    # ==========================================================================
+    # Shape-characteristic config selection
+    # ==========================================================================
+
+    # Characteristic 1: Tall-M shapes benefit from 2-CTA B-tile sharing
+    # When M >> N, adjacent M-tiles can share B via 2-CTA clusters
+    # Use arithmetic intensity to select tile shape, and K size to select BLOCK_K
+    if is_tall_m and is_gpu_saturated:
+        arithmetic_intensity = K / max(min(M, N), 1)
+        # For low arithmetic intensity (memory-bound), use narrower tiles with larger BLOCK_K
+        if arithmetic_intensity <= 1.5:
+            return {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                "NUM_SMEM_BUFFERS": 2,
+                "NUM_TMEM_BUFFERS": 2,
+                "NUM_MMA_GROUPS": 2,
+                "EPILOGUE_SUBTILE": 1,
+                "NUM_CTAS": 2,
+                "SPLIT_K": 1,
+                "ctas_per_cga": (2, 1, 1),
+                "pre_hook": matmul_tma_set_block_size_hook,
+            }
+        else:
+            # High arithmetic intensity: use wider tiles
+            # For large K, use BLOCK_K=128 to reduce K-iterations
+            # For smaller K, use BLOCK_K=64 with more SMEM buffers
+            if K > N * 2:
+                return {
+                    "BLOCK_SIZE_M": 256,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "NUM_SMEM_BUFFERS": 2,
+                    "NUM_TMEM_BUFFERS": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 4,
+                    "NUM_CTAS": 2,
+                    "SPLIT_K": 1,
+                    "ctas_per_cga": (2, 1, 1),
+                    "pre_hook": matmul_tma_set_block_size_hook,
+                }
+            else:
+                return {
+                    "BLOCK_SIZE_M": 256,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 64,
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "NUM_SMEM_BUFFERS": 4,
+                    "NUM_TMEM_BUFFERS": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 4,
+                    "NUM_CTAS": 2,
+                    "SPLIT_K": 1,
+                    "ctas_per_cga": (2, 1, 1),
+                    "pre_hook": matmul_tma_set_block_size_hook,
+                }
+
+    # Characteristic 2: Undersaturated GPU needs Split-K for parallelism
+    if is_undersaturated:
+        # Use MN product to determine tile size - larger MN benefits from wider tiles
+        mn_product = M * N
+        is_large_output = mn_product >= 1_000_000  # ~1M elements in output
+
+        if is_large_output:
+            block_m, block_n, block_k = 256, 128, 64
+            k_tiles = math.ceil(K / block_k)
+        else:
+            block_m, block_n, block_k = 128, 64, 128
+            k_tiles = math.ceil(K / block_k)
+
+        split_k = 1
+        # Prefer lower Split-K values that still provide enough parallelism
+        for sk in [4, 2, 8]:
+            if k_tiles >= sk and k_tiles // sk >= 4:
+                split_k = sk
+                break
+        if split_k > 1:
+            if is_large_output:
+                # Larger output: wider tiles, more epilogue subtiling, fewer TMEM buffers
+                return {
+                    "BLOCK_SIZE_M": block_m,
+                    "BLOCK_SIZE_N": block_n,
+                    "BLOCK_SIZE_K": block_k,
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
+                    "NUM_SMEM_BUFFERS": 4,
+                    "NUM_TMEM_BUFFERS": 2,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 8,
+                    "NUM_CTAS": 1,
+                    "SPLIT_K": split_k,
+                    "ctas_per_cga": None,
+                    "pre_hook": matmul_tma_set_block_size_hook,
+                }
+            else:
+                # Smaller output: narrower tiles
+                return {
+                    "BLOCK_SIZE_M": block_m,
+                    "BLOCK_SIZE_N": block_n,
+                    "BLOCK_SIZE_K": block_k,
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
+                    "NUM_SMEM_BUFFERS": 4,
+                    "NUM_TMEM_BUFFERS": 3,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 1,
+                    "NUM_CTAS": 1,
+                    "SPLIT_K": split_k,
+                    "ctas_per_cga": None,
+                    "pre_hook": matmul_tma_set_block_size_hook,
+                }
+
+    # Characteristic 3: GPU-saturated shapes use wide tiles for data reuse
+    if is_gpu_saturated:
+        return {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+            "NUM_SMEM_BUFFERS": 3,
+            "NUM_TMEM_BUFFERS": 1,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": 4,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
+            "ctas_per_cga": None,
+            "pre_hook": matmul_tma_set_block_size_hook,
+        }
+
+    # ==========================================================================
+    # Fallback: General wave efficiency heuristic for remaining shapes
+    # ==========================================================================
+
+    # Candidate configs: (BLOCK_M, BLOCK_N, BLOCK_K, NUM_CTAS, NUM_SMEM_BUFFERS, NUM_TMEM_BUFFERS, NUM_MMA_GROUPS, EPILOGUE_SUBTILE)
+    # Based on autotuning results - best configs use BLOCK_K=128, 2-CTA clusters, and balanced buffers
+    candidates = [
+        # Best config for tall-M shapes (3159809, 384, 384) - prioritize before square config
+        (256, 128, 128, 2, 2, 2, 2, 1),  # Best for (3159809, 384, 384)
+        # Best config for large square matrices (8192x8192x8192)
+        (256, 256, 64, 1, 3, 1, 2, 4),  # Best for 8192x8192x8192
+        # Best config for large-K shapes (1024, 256, 16384) - needs Split-K
+        (128, 64, 128, 1, 4, 3, 2, 1),  # Best for (1024, 256, 16384) with Split-K
+        # 2-CTA configs with BLOCK_K=128 (best performing from autotuning)
+        (256, 128, 64, 2, 5, 2, 2, 4),  # Best for (1152, 1024, 213120)
+        (128, 256, 64, 2, 4, 2, 1, 2),  # Good general config
+        (256, 64, 128, 2, 5, 2, 2, 4),  # Best for skinny-N shapes
+        (128, 64, 128, 2, 5, 2, 2, 1),  # Best for (1152, 1024, 12800)
+        # 1-CTA configs
+        (256, 64, 128, 1, 5, 2, 2, 8),  # Good for skinny-N
+        (128, 256, 64, 1, 3, 2, 1, 2),  # Wide tiles
+        (128, 128, 64, 1, 4, 2, 1, 2),  # Square tiles
+        (256, 128, 64, 1, 3, 1, 2, 2),  # Tall tiles
+        (128, 64, 64, 1, 5, 2, 1, 1),  # Small tiles for small problems
+        (64, 128, 64, 1, 5, 2, 1, 1),  # Small tiles, wide
+        (64, 64, 64, 1, 6, 2, 1, 1),  # Smallest tiles
+    ]
+
+    def estimate_smem(bm, bn, bk, num_ctas, num_smem_buffers, num_mma_groups, epilogue_subtile):
+        """Estimate shared memory usage for a config."""
+        smem_a = bm * bk * 2 * num_smem_buffers
+        smem_b = bk * (bn // num_ctas) * 2 * num_smem_buffers
+        smem_epilog = bm * (bn // epilogue_subtile) * 2
+        smem_barriers = num_smem_buffers * num_mma_groups * 8 * (2 if num_ctas == 2 else 1)
+        return smem_a + smem_b + smem_epilog + smem_barriers
+
+    def estimate_tmem(bm, bn, num_tmem_buffers):
+        """Estimate tensor memory usage for a config."""
+        # TMEM stores accumulator: BLOCK_M * BLOCK_N * sizeof(float) * num_buffers
+        return bm * bn * 4 * num_tmem_buffers
+
+    def compute_wave_score(bm, bn, num_ctas, split_k=1):
+        """
+        Compute wave efficiency score (lower is better).
+        Score = fraction of SMs idle in the last wave.
+        """
+        ctas_m = (M + bm - 1) // bm
+        ctas_n = (N + bn - 1) // bn
+        # Round up ctas_m to multiple of num_ctas for cluster alignment
+        ctas_m = ((ctas_m + num_ctas - 1) // num_ctas) * num_ctas
+        total_ctas = ctas_m * ctas_n * split_k
+
+        if total_ctas == 0:
+            return float("inf"), 0, 0
+
+        waves = (total_ctas + num_sms - 1) // num_sms
+        fractional_waves = total_ctas / num_sms
+        score = waves - fractional_waves  # 0 = perfect, 1 = worst
+        return score, total_ctas, waves
+
+    best_config = None
+    best_score = float("inf")
+    best_waves = float("inf")
+
+    for bm, bn, bk, num_ctas, num_smem_buffers, num_tmem_buffers, num_mma_groups, epilogue_subtile in candidates:
+        # Skip if SMEM exceeds limit
+        smem = estimate_smem(bm, bn, bk, num_ctas, num_smem_buffers, num_mma_groups, epilogue_subtile)
+        if smem > MAX_SMEM:
+            continue
+
+        # Skip if TMEM exceeds limit
+        tmem = estimate_tmem(bm, bn, num_tmem_buffers)
+        if tmem > MAX_TMEM:
+            continue
+
+        # Skip if MMA group size is invalid (must be <= 128 for hardware)
+        if bm // num_mma_groups > 128:
+            continue
+
+        # Skip if tiles are larger than the problem
+        if bm > M * 2 or bn > N * 2:
+            continue
+
+        # Compute wave efficiency
+        score, total_ctas, waves = compute_wave_score(bm, bn, num_ctas)
+
+        # Consider split-K only when MN tiles don't saturate GPU
+        # Logic adapted from preprocess_configs
+        split_k = 1
+        num_tiles_m = math.ceil(M / bm)
+        num_tiles_n = math.ceil(N / bn)
+        num_mn_tiles = num_tiles_m * num_tiles_n
+
+        if num_mn_tiles < num_sms:
+            k_tiles = math.ceil(K / bk)
+            # Try split-K values (higher first), each split must have enough K tiles
+            for sk in [8, 4, 2]:
+                if k_tiles >= sk and k_tiles // sk >= 4:
+                    sk_score, sk_ctas, sk_waves = compute_wave_score(bm, bn, num_ctas, sk)
+                    if sk_score < score or (sk_score == score and sk_ctas > total_ctas):
+                        score, total_ctas, waves, split_k = sk_score, sk_ctas, sk_waves, sk
+                    break  # Use the first valid split-K
+
+        # Selection criteria:
+        # 1. Prefer lower wave inefficiency score
+        # 2. With same score, prefer fewer waves (less overhead)
+        # 3. With same waves, prefer larger tiles (less total overhead)
+        # 4. Prefer multi-CTA configs for better B-tile sharing
+        score_slack = 0.1
+        adjusted_score = score
+
+        if (adjusted_score < best_score - score_slack
+                or (adjusted_score < best_score + score_slack and waves < best_waves)
+                or (adjusted_score < best_score + score_slack and waves == best_waves and num_ctas > 1)):
+            best_score = adjusted_score
+            best_waves = waves
+            best_config = {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
+                "NUM_SMEM_BUFFERS": num_smem_buffers,
+                "NUM_TMEM_BUFFERS": num_tmem_buffers,
+                "NUM_MMA_GROUPS": num_mma_groups,
+                "EPILOGUE_SUBTILE": epilogue_subtile,
+                "NUM_CTAS": num_ctas,
+                "SPLIT_K": split_k,
+                "ctas_per_cga": (num_ctas, 1, 1) if num_ctas > 1 else None,
+                "pre_hook": matmul_tma_set_block_size_hook,
+            }
+
+    return best_config
+
+
+def _select_group_size_m(M, N, block_m):
+    """
+    Select GROUP_SIZE_M based on the golden rule for tile scheduling.
+
+    GROUP_SIZE_M controls how tiles are traversed:
+    - GROUP_SIZE_M = 1: Column-major (sweep M first), reuses B tiles
+    - GROUP_SIZE_M = large: Row-major (sweep N first), reuses A tiles
+
+    Golden rule:
+    - When M >> N: Use small GROUP_SIZE_M to reuse B (smaller dimension)
+    - When N >> M: Use large GROUP_SIZE_M to reuse A (smaller dimension)
+    - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
+    """
+    num_m_tiles = (M + block_m - 1) // block_m
+    ratio = M / max(N, 1)
+
+    if ratio > 10:
+        # M >> N: sweep M, reuse B
+        return 1
+    elif ratio < 0.1:
+        # N >> M: sweep N, reuse A
+        return min(64, num_m_tiles)
+    else:
+        # Balanced: moderate group size for L2 locality
+        return min(8, num_m_tiles)
 
 
 def get_cuda_autotune_config():
@@ -716,8 +1053,21 @@ def matmul_kernel_tma_ws_blackwell(
                 tile_id += NUM_SMS
 
 
-def matmul(a, b, config=None):
-    """Matrix multiplication using TLX GEMM kernel."""
+def matmul(a, b, config=None, use_heuristic=True):
+    """Matrix multiplication using TLX GEMM kernel.
+
+    Args:
+        a: Input matrix A of shape (M, K)
+        b: Input matrix B of shape (K, N)
+        config: Optional dict with kernel config. If None and use_heuristic=True,
+                uses shape-dependent heuristic selection. If heuristic fails,
+                falls back to full autotuning.
+        use_heuristic: When config is None, try heuristic config selection first.
+                      Default True for faster kernel launch.
+
+    Returns:
+        Output matrix C of shape (M, N)
+    """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -734,8 +1084,25 @@ def matmul(a, b, config=None):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
+    # Use heuristic config if no config provided and heuristic is enabled
+    if config is None and use_heuristic:
+        config = get_heuristic_config(M, N, K, NUM_SMS)
+        if config is not None and os.environ.get("TRITON_PRINT_AUTOTUNING") == "1":
+            shape_key = (M, N, K)
+            if shape_key not in _printed_heuristic_configs:
+                _printed_heuristic_configs.add(shape_key)
+                config_str = ", ".join(f"{k}: {v}" for k, v in config.items() if k not in ("pre_hook", "ctas_per_cga"))
+                print(f"heuristic config selected: {config_str};")
+
     if config is not None:
-        matmul_tma_set_block_size_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
+        # Extract ctas_per_cga before removing - we need it for cluster launch
+        ctas_per_cga = config.pop("ctas_per_cga", None)
+        # Extract and run pre_hook if present
+        pre_hook = config.pop("pre_hook", None)
+        if pre_hook:
+            pre_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
+        else:
+            matmul_tma_set_block_size_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
         NUM_CTAS = config.get("NUM_CTAS", 1)
         num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
         num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
@@ -750,6 +1117,7 @@ def matmul(a, b, config=None):
             N,
             K,
             NUM_SMS=NUM_SMS,
+            ctas_per_cga=ctas_per_cga,
             **config,
         )
     else:
