@@ -324,7 +324,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_oai_swp_schedule
+        use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
