@@ -254,8 +254,6 @@ public:
         if (numWarpGroups == 0)
           op->removeAttr("async_task_id");
       }
-      if (op->hasAttr(kPartitionAttrName))
-        anchorOps.insert(op);
     });
     if (numWarpGroups == 0 || anchorOps.empty())
       return;
