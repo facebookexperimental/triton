@@ -1912,6 +1912,97 @@ struct AsyncCommitGroupOpConversion
   }
 };
 
+struct AsyncBulkCopyGlobalToLocalOpConversion
+    : public ConvertOpToLLVMPattern<
+          triton::nvidia_gpu::AsyncBulkCopyGlobalToLocalOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::AsyncBulkCopyGlobalToLocalOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto voidTy = void_ty(op->getContext());
+
+    // Get shared memory pointers for dst and barrier
+    auto dstTy = op.getDst().getType();
+    Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
+    auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getDst(), llvmElemTy, rewriter);
+    Value dstBase = dstMemObj.getBase();
+
+    auto barrierMemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getBarrier(),
+        typeConverter->convertType(op.getBarrier().getType().getElementType()),
+        rewriter);
+
+    Value pred = adaptor.getPred();
+    Value srcPtr = adaptor.getSrc();
+    Value size = adaptor.getSize();
+    Value barrierPtr = barrierMemObj.getBase();
+
+    // @pred cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes
+    //   [$1], [$2], $3, [$4];
+    ::mlir::triton::PTXBuilder ptxBuilder;
+    auto &bulkCopy = *ptxBuilder.create<>(
+        "@$0 cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+        "[$1], [$2], $3, [$4];");
+    bulkCopy(
+        {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstBase, "r"),
+         ptxBuilder.newOperand(srcPtr, "l"), ptxBuilder.newOperand(size, "r"),
+         ptxBuilder.newOperand(barrierPtr, "r")},
+        /*onlyAttachMLIRArgs=*/true);
+    ptxBuilder.launch(rewriter, loc, voidTy);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct AsyncBulkCopyLocalToGlobalOpConversion
+    : public ConvertOpToLLVMPattern<
+          triton::nvidia_gpu::AsyncBulkCopyLocalToGlobalOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::AsyncBulkCopyLocalToGlobalOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto voidTy = void_ty(op->getContext());
+
+    // Get shared memory pointer for src
+    auto srcTy = op.getSrc().getType();
+    Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());
+    auto srcMemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getSrc(), llvmElemTy, rewriter);
+    Value srcBase = srcMemObj.getBase();
+
+    Value pred = adaptor.getPred();
+    Value dstPtr = adaptor.getDst();
+    Value size = adaptor.getSize();
+
+    // @pred cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], $3;
+    ::mlir::triton::PTXBuilder ptxBuilder;
+    auto &bulkCopy =
+        *ptxBuilder.create<>("@$0 cp.async.bulk.global.shared::cta.bulk_group "
+                             "[$1], [$2], $3;");
+    bulkCopy(
+        {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstPtr, "l"),
+         ptxBuilder.newOperand(srcBase, "r"), ptxBuilder.newOperand(size, "r")},
+        /*onlyAttachMLIRArgs=*/true);
+    ptxBuilder.launch(rewriter, loc, voidTy);
+
+    // Emit commit group so completion can be tracked via wait_group
+    rewriter.create<NVVM::CpAsyncBulkCommitGroupOp>(loc);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct TMAStoreWaitOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::TMAStoreWaitOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -1945,6 +2036,7 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
   patterns.add<AsyncTMACopyLocalToGlobalOpConversion>(
       typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMAReduceOpConversion, AsyncTMAGatherOpConversion,
-               AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion>(
-      typeConverter, benefit);
+               AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion,
+               AsyncBulkCopyGlobalToLocalOpConversion,
+               AsyncBulkCopyLocalToGlobalOpConversion>(typeConverter, benefit);
 }
