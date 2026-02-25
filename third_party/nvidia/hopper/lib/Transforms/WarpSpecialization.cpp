@@ -17,6 +17,13 @@
 
 namespace mlir {
 
+// Helper to get printing flags with location info enabled
+static OpPrintingFlags getOpPrintingFlagsWithLoc() {
+  OpPrintingFlags flags;
+  flags.enableDebugInfo();
+  return flags;
+}
+
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
@@ -27,6 +34,8 @@ void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
+void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
+                    int capability, int defaultNumStages);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
 
@@ -89,9 +98,10 @@ public:
         // Partition key ops into multiple async tasks.
         doTaskPartition(funcOp, numWarpGroups);
         if (dumpIntermediateSteps) {
-          llvm::dbgs()
-              << "// -----// WarpSpec internal IR Dump After: doTaskPartition\n"
-              << moduleOp << "\n\n\n";
+          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                          "doTaskPartition\n";
+          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+          llvm::dbgs() << "\n\n\n";
         }
         // Propagate taskId.
         int retCode = doTaskIdPropagate(funcOp);
@@ -99,16 +109,18 @@ public:
           continue;
         if (dumpIntermediateSteps) {
           llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                          "doTaskIdPropagate\n"
-                       << moduleOp << "\n\n\n";
+                          "doTaskIdPropagate\n";
+          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+          llvm::dbgs() << "\n\n\n";
         }
 
         // Partition ops into parallel sub ops.
         if (doDataPartition(funcOp, numWarpGroups - 1)) {
           if (dumpIntermediateSteps) {
             llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                            "doDataPartition\n"
-                         << moduleOp << "\n\n\n";
+                            "doDataPartition\n";
+            moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+            llvm::dbgs() << "\n\n\n";
           }
           success = true;
           break;
@@ -123,8 +135,19 @@ public:
         signalPassFailure();
       if (dumpIntermediateSteps) {
         llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                        "doTaskIdPropagate\n"
-                     << moduleOp << "\n\n\n";
+                        "doTaskIdPropagate\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
+      }
+    }
+
+    if (pingpongAutoWS) {
+      doPingPongPrep(funcOp, numWarpGroups, capability, defaultNumStages);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs()
+            << "// -----// WarpSpec internal IR Dump After: doPingPongPrep\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
       }
     }
 
@@ -133,8 +156,9 @@ public:
     doBufferAllocation(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     if (failed(doMemoryPlanner(funcOp, numStages))) {
@@ -143,44 +167,50 @@ public:
     }
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     doCodePartitionPost(funcOp, numStages);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
         llvm::dbgs()
-            << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n"
-            << moduleOp << "\n\n\n";
+            << "// -----// WarpSpec internal IR Dump After: doPingPongSync\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
       }
     }
 
     doTokenLowering(funcOp, numWarpGroups - 1);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n"
-          << moduleOp << "\n\n\n";
+          << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
 
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedulePreprocessing\n"
-                   << moduleOp << "\n\n\n";
+                      "doLoopSchedulePreprocessing\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
     triton::gpu::scheduleLoops(moduleOp, defaultNumStages, true);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doLoopSchedule\n"
-                   << moduleOp << "\n\n\n";
+                      "doLoopSchedule\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
     }
   }
 

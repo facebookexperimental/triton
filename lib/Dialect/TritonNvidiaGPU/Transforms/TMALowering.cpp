@@ -152,7 +152,7 @@ struct TMAStoreLowering : public OpRewritePattern<DescriptorStoreOp> {
           rewriter, op.getLoc(),
           op.getDesc().getType().getBlockType().getEncoding(), op.getIndices());
       rewriter.create<triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(
-          op.getLoc(), tmaPtr, indices, alloc);
+          op.getLoc(), tmaPtr, indices, alloc, triton::EvictionPolicy::NORMAL);
     };
     lowerTMAStore(op, op.getSrc(), op.getDesc(), createStore, rewriter);
     return success();

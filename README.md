@@ -56,6 +56,85 @@ While this approach places more responsibility on the user, it reduces the compi
 
     Slice a `M x N` tensor at a `m x n` offset.
 
+#### Buffer Reuse
+
+TLX provides you the ability to reuse the same allocated buffer across multiple disjoint steps in your kernel. This is
+useful to allow additional pipelining when you may not have enough isolated SMEM or TMEM.
+
+- `tlx.storage_alias_spec(storage=storage_kind)`
+
+    Defines a buffer that you will want to share across multiple aliases. The storage
+    can be either SMEM or TMEM. To use this in an allocation you the spec in the `reuse`
+    argument for `local_alloc`. Here is the example from the FA kernel.
+
+```
+# Create the storage alias spec for all shared buffers. Cannot be directly
+# indexed.
+qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+
+# Allocate all buffers referencing the same spec
+qk_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+p_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES), tlx.dtype_of(desc_v),
+    NUM_MMA_GROUPS * NUM_MMA_SLICES, tlx.storage_kind.tmem,
+    reuse=qk_storage_alias,
+)
+alpha_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+l_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+m_tiles = tlx.local_alloc(
+    (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+    tlx.storage_kind.tmem, reuse=qk_storage_alias,
+)
+```
+
+- `tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)`
+
+    A reuse group expresses how you intend to access the shared buffer.
+    There are two types: Shared or Distinct. A shared buffer wants to occupy the same memory
+    and each index should not be accessed at the same time. A distinct buffer will be accessible
+    at the same index at the same time. The compiler will isolate buffer locations and potentially
+    expand the buffer allocation to enforce this guarantee, which is helpful with buffers of unequal
+    sizes.
+
+    The group_size is used to enable subtiling a buffer. This creates ensures that for every 1 index
+    of a buffer that SUBTILE_SIZE indices of this other buffer/group can be accessed.  Reuse groups
+    can be nested to allow expressing more complex relationships. Currently a reuse group
+    is not applied unless you assign it to a buffer with `spec.set_buffer_overlap`.
+
+    Here is the example implementation for Flash Attention. In this kernel as the comment suggests,
+    QK is shared with P, l, m, and alpha, and P is potentially subtiling.
+
+```
+# Define the buffer overlap strategy:
+#   QK : |                                                   BLK_M/2 * BLOCK_N * fp32                         |
+#   P:   |  BLK_M/(2*SLICES) * fp16| BLK_M/(2*SLICES) * fp16|...
+# Alpha:                                                        |BLK_M/2*1*fp32|
+#   l  :                                                                        |BLK_M/2*1*fp32|
+#   m  :                                                                                       |BLK_M/2*1*fp32|
+qk_storage_alias.set_buffer_overlap(
+    tlx.reuse_group(
+        qk_tiles,
+        tlx.reuse_group(
+            tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
+            alpha_tiles, l_tiles, m_tiles,
+            group_type=tlx.reuse_group_type.distinct,
+        ),
+        group_type=tlx.reuse_group_type.shared,
+    )
+)
+```
+
+
+
 ### Remote buffer operations
 
 - `buffer = tlx.remote_view(buffer, remote_cta_rank)`
@@ -397,31 +476,28 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
 
 #### CLC API
 
-- `context = tlx.clc_create_context(num_stages, num_consumers)`
+- `context = tlx.clc_create_context(num_consumers=num_consumers)`
 
     Create a CLC pipeline context with the specified number of stages and expected consumer count.
 
     **Parameters:**
-    - `num_stages`: Number of pipeline stages for double/multi-buffering
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, k, phase, multi_ctas=False)`
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)`
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
-    - `k`: Pipeline stage index (for multi-buffering)
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, k, phase, multi_ctas=False)`
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)`
 
     Decode the tile ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
-    - `k`: Pipeline stage index
     - `phase`: Current barrier phase
     - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
 
@@ -476,7 +552,7 @@ In multi-CTA mode (`multi_ctas=True`), multiple CTAs in a cluster work together 
 @triton.jit
 def matmul_kernel(..., PAIR_CTA: tl.constexpr):
     # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
-    clc_context = tlx.clc_create_context(1, 6 if PAIR_CTA else 3)
+    clc_context = tlx.clc_create_context(num_consumers= 6 if PAIR_CTA else 3)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # Epilogue consumer
@@ -486,13 +562,13 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
 
             while tile_id != -1:
                 # Producer: acquire next tile
-                tlx.clc_producer(clc_context, 0, clc_phase_producer, multi_ctas=PAIR_CTA)
+                tlx.clc_producer(clc_context, p_producer=clc_phase_producer, multi_ctas=PAIR_CTA)
                 clc_phase_producer ^= 1
 
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             clc_phase_consumer = 0
@@ -502,7 +578,7 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             clc_phase_consumer = 0
@@ -512,7 +588,7 @@ def matmul_kernel(..., PAIR_CTA: tl.constexpr):
                 # ... process tile ...
 
                 # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, 0, clc_phase_consumer, multi_ctas=PAIR_CTA)
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
                 clc_phase_consumer ^= 1
 
 ```
@@ -725,6 +801,14 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
     ```
 
+- `tlx.vote_ballot_sync(mask, pred)`
+
+    Collects a predicate from each thread in the warp and returns a 32-bit
+    mask where each bit represents the predicate value from the corresponding
+    lane. Only threads specified by `mask` participate in the vote.
+    ```
+        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+    ```
 
 ## Kernels Implemented with TLX
 
@@ -769,18 +853,26 @@ python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py
 
 To run Blackwell GEMM tutorial kernels, you can use the following command:
 
-Correctness test:
-```
-[TLX_GEMM_VERSION={ws|clc|pipelined|2cta}] pytest third_party/tlx/tutorials/correctness_test.py
-```
+## Change 2: One correctness test script
 
-Performance test:
-```
-third_party/tlx/denoise.sh third_party/tlx/tutorials/blackwell_gemm_perf_test.py [--version {ws|clc|pipelined|2cta}]
-```
+`[TLX_VERSION=<kernel_name>] pytest third_party/tlx/tutorials/testing/test_correctness.py`
+
+By default only one autotune config will be used by correctness test.
+
+## Change 3: One performance test script for each op {gemm, matmul} x {hopper, blackwell}
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]`
+
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
 
 ## More reading materials
 
 [Barrier Support in TLX](third_party/tlx/doc/tlx_barriers.md  )
 
 [TLX talk in 2025 Triton Developer Conference](third_party/tlx/doc/TLX-triton-conference.pdf)
+
+[TLX talk in 2026 GPU Mode](third_party/tlx/doc/PerformanceOptimizationWithTLX.pdf)

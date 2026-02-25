@@ -82,6 +82,119 @@ LogicalResult StorageAliasLocalAllocOp::verify() {
   return success();
 }
 
+//-- ReuseGroupOp --
+
+LogicalResult ReuseGroupOp::verify() {
+  auto elements = getElements();
+
+  // Must have at least one element
+  if (elements.empty()) {
+    return emitOpError("reuse_group requires at least one element");
+  }
+
+  // Verify group_size is positive
+  int64_t groupSize = getGroupSize();
+  if (groupSize < 1) {
+    return emitOpError("group_size must be a positive integer, got ")
+           << groupSize;
+  }
+
+  // Get result type properties
+  auto resultType = cast<ReuseGroupType>(getResult().getType());
+  auto expectedGroupKind = resultType.getGroupKind();
+
+  // Verify group_kind attribute matches result type
+  if (getGroupKind() != expectedGroupKind) {
+    return emitOpError("group_kind attribute (")
+           << stringifyReuseGroupKind(getGroupKind())
+           << ") doesn't match result type group kind ("
+           << stringifyReuseGroupKind(expectedGroupKind) << ")";
+  }
+
+  // Note: Validation that all elements reference the same storage_alias_spec
+  // is performed by the SetBufferOverlapOp verifier when the overlap scheme
+  // is defined. This allows reuse_group to be spec-agnostic.
+
+  return success();
+}
+
+//-- SetBufferOverlapOp --
+
+// Helper function to collect all leaf memdesc values from a reuse_group tree
+static void
+collectReuseGroupLeaves(mlir::Value value,
+                        llvm::SmallVectorImpl<mlir::Value> &leaves) {
+  // Check if this is a ReuseGroupOp result (nested reuse_group)
+  if (auto reuseGroupOp = value.getDefiningOp<ReuseGroupOp>()) {
+    // Recursively collect leaves from all elements
+    for (auto element : reuseGroupOp.getElements()) {
+      collectReuseGroupLeaves(element, leaves);
+    }
+  } else {
+    // This is a leaf (memdesc from local_alloc)
+    leaves.push_back(value);
+  }
+}
+
+LogicalResult SetBufferOverlapOp::verify() {
+  // Get the storage_alias_spec
+  auto storageAliasSpec = getStorageAliasSpec();
+
+  // Get the overlap_def (reuse_group)
+  auto overlapDef = getOverlapDef();
+
+  if (!storageAliasSpec) {
+    return emitOpError("requires a valid storage_alias_spec");
+  }
+
+  if (!overlapDef) {
+    return emitOpError("requires a valid overlap_def (reuse_group)");
+  }
+
+  // Get the ReuseGroupOp that defines the overlap_def
+  auto reuseGroupOp = overlapDef.getDefiningOp<ReuseGroupOp>();
+  if (!reuseGroupOp) {
+    return emitOpError("overlap_def must be defined by a tlx.reuse_group op");
+  }
+
+  // Collect all leaf memdesc values from the reuse_group tree
+  llvm::SmallVector<mlir::Value, 8> leaves;
+  collectReuseGroupLeaves(overlapDef, leaves);
+
+  if (leaves.empty()) {
+    return emitOpError("reuse_group tree must contain at least one allocation");
+  }
+
+  // Check for duplicate elements in the reuse_group tree
+  llvm::SmallDenseSet<mlir::Value, 8> seenElements;
+  for (auto leaf : leaves) {
+    if (!seenElements.insert(leaf).second) {
+      return emitOpError("reuse_group tree contains duplicate elements; "
+                         "each allocation can only appear once in the tree");
+    }
+  }
+
+  // Verify that all leaves were allocated from the same storage_alias_spec
+  for (auto leaf : leaves) {
+    // Each leaf should be a memdesc produced by StorageAliasLocalAllocOp
+    auto allocOp = leaf.getDefiningOp<StorageAliasLocalAllocOp>();
+    if (!allocOp) {
+      return emitOpError("all elements in the reuse_group tree must be "
+                         "allocated via tlx.storage_alias_local_alloc, but "
+                         "found an element that is not");
+    }
+
+    // Check that this allocation uses the same storage_alias_spec
+    if (allocOp.getStorageAlias() != storageAliasSpec) {
+      return emitOpError("all allocations in the reuse_group must reference "
+                         "the same storage_alias_spec, but found an allocation "
+                         "that uses a different spec");
+    }
+  }
+
+  return success();
+}
+
 } // namespace tlx
 } // namespace triton
 } // namespace mlir

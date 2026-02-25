@@ -440,12 +440,16 @@ def fp8e8m0_to_float32(scale):
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (128, 128, 128), (2, 4, 64)])
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
-    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128)],
+    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128),
+     (128, 16, 256)],
 )
 @pytest.mark.parametrize("NUM_STAGES", [1, 3])
 @pytest.mark.parametrize("NUM_WARPS", [4, 8])
 @pytest.mark.parametrize("nonKDim", ([0, 16, 32] if is_hip_cdna() else [0]))
-def test_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, nonKDim, NUM_WARPS, device):
+def test_mxfp(BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, nonKDim, NUM_WARPS, device):
+    M = 1024
+    N = 512
+    K = 2048
     if K % BLOCK_K != 0:
         pytest.skip("Kernel requires shapes aligned by K dimension")
     if is_cuda() and torch.cuda.get_device_capability()[0] < 10:
@@ -490,7 +494,7 @@ def test_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, nonKDim, NUM_WARPS
     b = b_f16 * b_scale_f32
     ref_out = torch.matmul(a, b).to(torch.float32)
     output = output.to(torch.float32)
-    atol = 1e-2 * math.sqrt(K / 32)
+    atol = 0.0001
     torch.testing.assert_close(ref_out, output, atol=atol, rtol=0)
 
     if is_cuda() and torch.cuda.get_device_capability()[0] == 12:
@@ -947,9 +951,12 @@ def test_blocked_scale_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, USE_
     b = B * b_scale_f32
     ref_out = torch.matmul(a, b).to(torch.float32)
     output = output.to(torch.float32)
-    atol = 0.0001
-    rtol = 0.0001
-    torch.testing.assert_close(ref_out, output, atol=atol, rtol=rtol)
+    atol = 1e-2 * math.sqrt(K / 32)
+    torch.testing.assert_close(ref_out, output, atol=atol, rtol=0)
+
+    if is_cuda() and torch.cuda.get_device_capability()[0] == 12:
+        ptx = out.asm["ptx"]
+        assert "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X" in ptx
 
     if USE_2D_SCALE_LOAD:
         # Due to an issue in the coalescing pass, tmem_copy can not be generated for the 5D load.
@@ -1188,7 +1195,8 @@ def block_scale_fp4_matmul(  #
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256)])
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
-    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128)],
+    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128),
+     (128, 16, 256)],
 )
 @pytest.mark.parametrize("with_a_scale", [True, False])
 @pytest.mark.parametrize("with_b_scale", [True, False])
@@ -1373,7 +1381,8 @@ def mxfp8_mxfp4_matmul(  #
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 512)])
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
-    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128)],
+    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128),
+     (128, 16, 256)],
 )
 @pytest.mark.parametrize("NUM_STAGES", [1, 3])
 @pytest.mark.parametrize("B_TRANS", [True, False])

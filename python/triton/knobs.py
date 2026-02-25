@@ -371,6 +371,9 @@ class compilation_knobs(base_knobs):
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
+    dump_best_config_ir: env_bool = env_bool("TRITON_KERNEL_DUMP_BEST_CONFIG")
+    warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
+    rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
 
 
 class LaunchHook(Protocol):
@@ -515,7 +518,8 @@ class amd_knobs(base_knobs):
 
 
 class proton_knobs(base_knobs):
-    cupti_dir: env_opt_str = env_opt_str("TRITON_CUPTI_LIB_PATH")
+    cupti_lib_dir: env_opt_str = env_opt_str("TRITON_CUPTI_LIB_PATH")
+    enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
 
 
 build = build_knobs()

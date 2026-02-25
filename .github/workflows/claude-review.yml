@@ -1,0 +1,70 @@
+name: Claude PR Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/claude review')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Get PR diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.issue.number }}"
+          gh pr diff "$PR_NUMBER" > /tmp/pr-diff.patch
+
+      - name: Run reviewers
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REVIEW_MODE: plain
+        run: |
+          chmod +x .claude/reviewers/run-review.sh
+          .claude/reviewers/run-review.sh /tmp/pr-diff.patch > /tmp/review-output.txt 2>&1
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.issue.number }}"
+          # Truncate if too long for a GH comment (max ~65536 chars)
+          head -c 60000 /tmp/review-output.txt > /tmp/review-truncated.txt
+          # Build comment body
+          {
+            echo '## Claude PR Review'
+            echo ''
+            echo '<details>'
+            echo '<summary>Review results (click to expand)</summary>'
+            echo ''
+            echo '```'
+            cat /tmp/review-truncated.txt
+            echo '```'
+            echo ''
+            echo '</details>'
+            echo ''
+            echo '*Triggered by `/claude review` — running in plain mode (no GPU).*'
+          } > /tmp/review-comment.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/review-comment.md

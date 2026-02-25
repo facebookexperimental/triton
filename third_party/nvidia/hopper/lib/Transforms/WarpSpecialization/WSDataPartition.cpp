@@ -876,7 +876,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                 triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
                     builder.getContext(), tmem.getBlockM(),
                     dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
-                    tmem.getUnpacked(), tmem.getCTASplitM(),
+                    tmem.getColStride(), tmem.getCTASplitM(),
                     tmem.getCTASplitN());
             auto newType = MemDescType::get(shape, type.getElementType(),
                                             accEncoding, type.getMemorySpace(),
@@ -1031,7 +1031,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       auto accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
           builder.getContext(), tmem.getBlockM(),
           dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
-          tmem.getUnpacked(), tmem.getCTASplitM(), tmem.getCTASplitN());
+          tmem.getColStride(), tmem.getCTASplitM(), tmem.getCTASplitN());
       auto newType = MemDescType::get(shape, retType.getElementType(),
                                       accEncoding, retType.getMemorySpace(),
                                       retType.getMutableMemory());
