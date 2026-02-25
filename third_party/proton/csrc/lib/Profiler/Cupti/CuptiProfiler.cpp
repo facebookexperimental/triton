@@ -449,8 +449,10 @@ void CuptiProfiler::CuptiProfilerPimpl::doStop() {
   setGraphCallbacks(subscriber, /*enable=*/false);
   setRuntimeCallbacks(subscriber, /*enable=*/false);
   setDriverCallbacks(subscriber, /*enable=*/false);
-  nvtx::disable();
-  setNvtxCallbacks(subscriber, /*enable=*/false);
+  if (getBoolEnv("TRITON_ENABLE_NVTX", true)) {
+    nvtx::disable();
+    setNvtxCallbacks(subscriber, /*enable=*/false);
+  }
   cupti::unsubscribe<true>(subscriber);
   cupti::finalize<true>();
 }
