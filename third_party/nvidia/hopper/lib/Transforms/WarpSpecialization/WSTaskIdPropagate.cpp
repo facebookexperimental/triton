@@ -6,6 +6,7 @@
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -100,31 +101,19 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
       if (forOp->isProperAncestor(storeOp) || !appearsBefore(storeOp, forOp))
         continue;
 
-      // Verify that the current MMA is the earliest user in program order,
-      // or that any earlier user has the same async task IDs.
-      // Track the earliest user with matching task IDs.
+      // Find the earliest user with an async task ID to use as the source.
       Operation *taskIdSource = mmaOp;
-      bool validUser = true;
       for (auto otherUser : tmemAllocOp.getResult().getUsers()) {
-        if (otherUser == storeOp || otherUser == mmaOp)
+        if (otherUser == storeOp || otherUser == taskIdSource)
           continue;
-        // Check if otherUser appears before mmaOp in program order
-        if (appearsBefore(otherUser, mmaOp)) {
-          // Earlier user must have the same task IDs
-          auto otherTaskIds = getAsyncTaskIds(otherUser);
-          if (otherTaskIds.empty() || otherTaskIds != mmaTaskIds) {
-            LDBG(
-                "Earlier user has different task_id, skipping: " << *otherUser);
-            validUser = false;
-            break;
-          } else {
-            // Update to use the earliest matching user
-            taskIdSource = otherUser;
-          }
+        auto otherTaskIds = getAsyncTaskIds(otherUser);
+        if (otherTaskIds.empty())
+          continue;
+        // Check if this user is earlier than the current taskIdSource
+        if (!taskIdSource || appearsBefore(otherUser, taskIdSource)) {
+          taskIdSource = otherUser;
         }
       }
-      if (!validUser)
-        continue;
 
       // Step 4: Check if the TMEMStoreOp already has a task_id
       auto storeTaskIds = getAsyncTaskIds(storeOp);
@@ -229,8 +218,19 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     }
     // TODO(Arda): Ideally front-end should not allow constant ops to be
     // annotated. Anchor constants cause problems.
+    bool isScalarArithOrMath =
+        isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
+        llvm::none_of(op->getResultTypes(),
+                      [](Type t) { return isa<RankedTensorType>(t); });
+    bool isAnchor = !isScalarArithOrMath && op->hasAttr("async_task_id");
     if (!taskIds.isUninitialized() &&
-        (isa<arith::ConstantOp>(op) || !op->hasAttr("async_task_id"))) {
+        (isa<arith::ConstantOp>(op) || !isAnchor)) {
+      // For non-anchor ops with existing annotations, merge the lattice
+      // value with the annotation to preserve the original task assignment.
+      if (auto existing =
+              op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
+        taskIds = ttg::TaskId::meet(taskIds, ttg::TaskId(existing));
+      }
       op->setAttr("async_task_id", taskIds.getTaskIds());
     }
   });

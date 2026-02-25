@@ -36,15 +36,15 @@ def require_dot_operand_layout(opnd: tl.tensor, opIdx, parent_layout, _builder=N
     return _builder.create_require_layout(opnd.handle, layout_handle)
 
 
-def require_tmem_layout_unpacked(src: tlx.buffered_tensor, unpacked: bool, _builder=None):
-    assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem and isinstance(
-        src.type.layout, tlx.tensor_memory_layout_encoding), "input must be a TMEM tensor"
+def require_tmem_layout_col_stride(src: tlx.buffered_tensor, col_stride: int, _builder=None):
+    assert (isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem
+            and isinstance(src.type.layout, tlx.tensor_memory_layout_encoding)), "input must be a TMEM tensor"
     old_layout = src.type.layout
-    if old_layout.unpacked != unpacked:
+    if old_layout.colStride != col_stride:
         layout_handle = _builder.make_tensor_memory_encoding_attr(
             old_layout.blockM,
             old_layout.blockN,
-            unpacked,
+            col_stride,
             old_layout.CTASplitM,
             old_layout.CTASplitN,
         )
@@ -120,21 +120,21 @@ def async_dot(
         assert cuda_compute_capability < 100, "register operand is not supported on Blackwell"
         A_handle = A.handle
     else:
-        # set unpacked to False for A
-        A_handle = require_tmem_layout_unpacked(A, False, _semantic.builder)
+        # set colStride to 1 (packed) for A
+        A_handle = require_tmem_layout_col_stride(A, 1, _semantic.builder)
 
     B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder)
 
     if version == 5:
         assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
-        # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
-        acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
+        # D needs colStride = 32 / bitwidth, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
+        acc_handle = require_tmem_layout_col_stride(acc, 1, _semantic.builder)
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
         use_acc_handle = None
         if use_acc is not None:
             assert isinstance(use_acc, tl.tensor) or isinstance(
-                use_acc, tl.constexpr), f"use_acc must be a tensor or constexpr, but got {type(use_acc)}"
+                use_acc, tl.constexpr), (f"use_acc must be a tensor or constexpr, but got {type(use_acc)}")
             if isinstance(use_acc, tl.tensor):
                 use_acc_handle = use_acc.handle
             else:
@@ -288,8 +288,8 @@ def async_dot_scaled(
         assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be in SMEM or TMEM"
         B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)
 
-    # D needs to have `unpacked` set to True, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
-    acc_handle = require_tmem_layout_unpacked(acc, True, _semantic.builder)
+    # D needs colStride = 32 / bitwidth, see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats
+    acc_handle = require_tmem_layout_col_stride(acc, 1, _semantic.builder)
     bar_handles = [t.handle for t in mBarriers]
     is_async = force_async or len(bar_handles) > 0
     use_acc_handle = None

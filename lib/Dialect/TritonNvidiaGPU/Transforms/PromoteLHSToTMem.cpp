@@ -49,6 +49,31 @@ public:
     if (localAllocOp->getParentRegion() != tcGen5MMAOp->getParentRegion())
       return failure();
     Value src = localAllocOp.getSrc();
+    // If the same source value is also allocated and transposed for use as
+    // operand A of another gen5 MMA, skip promotion. The transposed path
+    // cannot be promoted to tmem, so keeping both in smem avoids a redundant
+    // tmem allocation and copy for the same data. This covers both:
+    //   1. Same local_alloc used directly + through memdesc_trans
+    //   2. Separate local_allocs from the same src, one transposed
+    for (Operation *srcUser : src.getUsers()) {
+      auto otherAlloc = dyn_cast<ttg::LocalAllocOp>(srcUser);
+      if (!otherAlloc)
+        continue;
+      for (Operation *allocUser : otherAlloc->getResult(0).getUsers()) {
+        if (auto transOp = dyn_cast<ttg::MemDescTransOp>(allocUser)) {
+          for (Operation *transUser : transOp->getResult(0).getUsers()) {
+            if (auto mmaOp = dyn_cast<TCGen5MMAOp>(transUser)) {
+              if (mmaOp.getA() == transOp->getResult(0))
+                return failure();
+            } else if (auto mmaScaledOp =
+                           dyn_cast<TCGen5MMAScaledOp>(transUser)) {
+              if (mmaScaledOp.getA() == transOp->getResult(0))
+                return failure();
+            }
+          }
+        }
+      }
+    }
     auto srcType = cast<RankedTensorType>(src.getType());
     auto srcLayout = srcType.getEncoding();
     auto accTMemEncoding = dyn_cast<TensorMemoryEncodingAttr>(
@@ -63,10 +88,10 @@ public:
     if (elemBitWidth != 16 && elemBitWidth != 32) {
       return failure();
     }
-    bool unpacked = elemBitWidth != 16;
+    const unsigned colStride = 1;
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
         context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        /*unpacked=*/unpacked, CTASplitNum[0], CTASplitNum[1]);
+        colStride, CTASplitNum[0], CTASplitNum[1]);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     ttg::MemDescType lhsMemDescType = ttg::MemDescType::get(

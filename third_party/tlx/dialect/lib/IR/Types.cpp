@@ -32,6 +32,15 @@ StorageAliasSpecType::verify(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
+//-- ReuseGroupType --
+
+LogicalResult
+ReuseGroupType::verify(function_ref<InFlightDiagnostic()> emitError,
+                       ReuseGroupKind groupKind) {
+  // No additional verification needed - groupKind is validated by the enum
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // TLX Dialect
 //===----------------------------------------------------------------------===//

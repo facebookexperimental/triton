@@ -12,13 +12,28 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 def alloc_fn(size: int, align: int, stream: Optional[int]):
     assert align == 128
     assert stream == 0
-    return torch.empty(size, dtype=torch.int8, device='cuda')
+    return torch.empty(size, dtype=torch.int8, device="cuda")
 
 
 @triton.jit
-def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                              OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+def tcgen5_dot_kernel2cta_tma(
+    a_ptr,
+    stride_am,
+    stride_ak,
+    b_ptr,
+    stride_bk,
+    stride_bn,
+    c_ptr,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -47,8 +62,8 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
     )
 
     # async load a and b into SMEM
-    buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
-    buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float16, tl.constexpr(1))  # 2cta specific
+    buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), tl.constexpr(1))
+    buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tlx.dtype_of(b_ptr), tl.constexpr(1))  # 2cta specific
     a_smem = tlx.local_view(buf_alloc_a, 0)
     b_smem = tlx.local_view(buf_alloc_b, 0)
 
@@ -95,12 +110,13 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
 
     result = tlx.local_load(acc_tmem)
 
-    c = result.to(tl.float16)
+    c = result.to(tlx.dtype_of(c_ptr))
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c)
 
 
-def matmul(a, b):
+def matmul(a, b, config=None):
+    """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -108,15 +124,22 @@ def matmul(a, b):
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     triton.set_allocator(alloc_fn)
 
     BLOCK_M, BLOCK_N, BLOCK_K = (128, 128, 128)
 
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'num_stages': 0, 'ctas_per_cga': (4, 2, 1)
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "OUT_DTYPE": tl.float32,
+        "M": M,
+        "N": N,
+        "K": K,
+        "num_stages": 1,
+        "ctas_per_cga": (4, 2, 1),
     }
     _ = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](a, a.stride(0), a.stride(1), b, b.stride(0),
                                                                 b.stride(1), c, c.stride(0), c.stride(1), **kern_kwargs)

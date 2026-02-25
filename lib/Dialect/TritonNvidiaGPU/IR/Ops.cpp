@@ -26,6 +26,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -125,6 +126,16 @@ LogicalResult WarpGroupDotOp::verify() {
     return emitOpError("Cannot use F32 as the accumulator element type when "
                        "the max_num_imprecise_acc is less than 32");
   }
+
+  if (auto aTensorTy = dyn_cast<RankedTensorType>(getA().getType())) {
+    auto aDotOpEnc = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
+    unsigned kWidth = 32 / aTensorTy.getElementTypeBitWidth();
+    if (aDotOpEnc.getKWidth() != kWidth) {
+      return emitOpError("in-register LHS operand must have a kWidth of ")
+             << kWidth << " but got " << aDotOpEnc.getKWidth();
+    }
+  }
+
   return success();
 }
 
@@ -209,6 +220,62 @@ LogicalResult ArriveBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  return success();
+}
+
+// -- VoteBallotSyncOp --
+LogicalResult VoteBallotSyncOp::verify() {
+  Type predType = getPred().getType();
+  Type resultType = getResult().getType();
+
+  bool predIsTensor = isa<RankedTensorType>(predType);
+  bool resultIsTensor = isa<RankedTensorType>(resultType);
+
+  // Both must be scalars or both must be tensors
+  if (predIsTensor != resultIsTensor) {
+    return emitOpError("predicate and result must both be scalars or both be "
+                       "tensors, got pred=")
+           << predType << " and result=" << resultType;
+  }
+
+  if (predIsTensor) {
+    auto predTensorType = cast<RankedTensorType>(predType);
+    auto resultTensorType = cast<RankedTensorType>(resultType);
+
+    // Check element types
+    if (!predTensorType.getElementType().isInteger(1)) {
+      return emitOpError("tensor predicate must have i1 element type, got ")
+             << predTensorType.getElementType();
+    }
+    if (!resultTensorType.getElementType().isInteger(32)) {
+      return emitOpError("tensor result must have i32 element type, got ")
+             << resultTensorType.getElementType();
+    }
+
+    // Shapes must match
+    if (predTensorType.getShape() != resultTensorType.getShape()) {
+      return emitOpError("predicate and result tensor shapes must match, got ")
+             << predTensorType.getShape() << " vs "
+             << resultTensorType.getShape();
+    }
+
+    // Encodings must match (if present)
+    if (predTensorType.getEncoding() != resultTensorType.getEncoding()) {
+      return emitOpError(
+                 "predicate and result tensor encodings must match, got ")
+             << predTensorType.getEncoding() << " vs "
+             << resultTensorType.getEncoding();
+    }
+  } else {
+    // Scalar case
+    if (!predType.isInteger(1)) {
+      return emitOpError("scalar predicate must be i1, got ") << predType;
+    }
+    if (!resultType.isInteger(32)) {
+      return emitOpError("scalar result must be i32, got ") << resultType;
+    }
+  }
+
   return success();
 }
 
@@ -636,6 +703,9 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
   if (type.getRank() != 2)
     return op->emitOpError(regName) << " must be a 2D tensor";
+  // Skip verification for placeholder layouts - they will be resolved later
+  if (isa<triton::tlx::DummyTMEMLayoutAttr>(memdesc.getEncoding()))
+    return success();
   if (type.getEncoding()) {
     // Skip verification for placeholder layouts - they will be resolved later
     if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
@@ -666,7 +736,8 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
 
 LogicalResult TMEMStoreOp::verify() {
   if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
-           TensorMemoryScalesEncodingAttr>(getDst().getType().getEncoding()))
+           TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMEMLayoutAttr>(
+          getDst().getType().getEncoding()))
     return emitOpError("should use tensor memory encoding.");
   if (!getDst().getType().getMutableMemory()) {
     return emitOpError("Cannot store into an immutable alloc");
@@ -737,17 +808,30 @@ LogicalResult TMEMCopyOp::verify() {
   }
   auto srcTy = cast<triton::gpu::MemDescType>(getSrc().getType());
   auto sharedEnc =
+      dyn_cast<triton::gpu::SharedEncodingTrait>(srcTy.getEncoding());
+  if (sharedEnc.getAlignment() < 16) {
+    return emitOpError("Source must have at least 16-byte alignment to be "
+                       "representable in a matrix descriptor.");
+  }
+
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  unsigned numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  if (numCTAs != 1)
+    return emitOpError("NYI: Only one CTA is supported for now.");
+
+  auto nvmmaEnc =
       dyn_cast<triton::gpu::NVMMASharedEncodingAttr>(srcTy.getEncoding());
-  if (!sharedEnc) {
+  if (!nvmmaEnc) {
     return emitOpError("Source must have nvmma layout.");
   }
-  if (sharedEnc.getTransposed() || sharedEnc.getFp4Padded())
-    return emitOpError("The source should not be transposed or passed");
+  // Fp4 we could lift if we needed
+  if (nvmmaEnc.getTransposed() || nvmmaEnc.getFp4Padded())
+    return emitOpError("The source should not be transposed or padded");
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(getDst().getType().getEncoding())) {
     return success();
   } else if (isa<TensorMemoryScalesEncodingAttr>(
                  getDst().getType().getEncoding())) {
-    if (sharedEnc.getSwizzlingByteWidth() != 0) {
+    if (nvmmaEnc.getSwizzlingByteWidth() != 0) {
       return emitOpError("The source should not be swizzled for now");
     }
     if (!triton::gpu::isInnermostContiguous(srcTy, 512)) {
@@ -766,9 +850,10 @@ LogicalResult TMEMCopyOp::verify() {
     if (tmemEnc.getBlockM() != 128) {
       return emitOpError("Tmem layout ahouls have M=128.");
     }
-    if (sharedEnc.getSwizzlingByteWidth() == 0) {
+    if (nvmmaEnc.getSwizzlingByteWidth() == 0) {
       return emitOpError("Source layout should be swizzled.");
     }
+    // When we lift this, we should make sure we handle unpacked cleanly
     if (srcTy.getElementType().getIntOrFloatBitWidth() != 32) {
       return emitOpError("Source element type should be 32-bit.");
     }
@@ -799,7 +884,7 @@ LogicalResult TMEMSubSliceOp::verify() {
   if (dstEncoding.getBlockM() != encoding.getBlockM() ||
       dstEncoding.getCTASplitM() != encoding.getCTASplitM() ||
       dstEncoding.getCTASplitN() != encoding.getCTASplitN() ||
-      dstEncoding.getUnpacked() != encoding.getUnpacked())
+      dstEncoding.getColStride() != encoding.getColStride())
     return emitOpError("The destination must have the same block size and "
                        "CTASplit size as the source.");
   return mlir::success();
@@ -815,7 +900,8 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
   auto newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
       builder.getContext(), encoding.getBlockM(), newBlockN,
-      encoding.getUnpacked(), encoding.getCTASplitM(), encoding.getCTASplitN());
+      encoding.getColStride(), encoding.getCTASplitM(),
+      encoding.getCTASplitN());
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),
       allocTy.getMutableMemory(), allocTy.getAllocShape());

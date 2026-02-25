@@ -1,6 +1,7 @@
 #ifndef NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 #define NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 
+#include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -254,6 +255,39 @@ Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                          triton::FuncOp &funcOp);
+
+/// Generate a combined DOT graph showing key ops and channels side by side.
+/// Left subgraph: Key operations with control flow structure.
+/// Right subgraph: Channel connections between partitions.
+/// Output can be rendered with Graphviz: dot -Tpng graph.dot -o graph.png
+void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
+                       triton::FuncOp funcOp, llvm::raw_ostream &os);
+
+/// Generate a buffer liveness visualization for TMEM allocations using
+/// pre-calculated liveness intervals from the memory planner.
+/// @param allocs List of TMEM allocation operations
+/// @param allocToIntervals Map from alloc operation to liveness interval
+/// @param allocToChannel Map from alloc operation to associated channel
+/// @param channels List of all channels (for finding all channels per alloc)
+/// @param os Output stream for DOT format
+void dumpTmemBufferLiveness(
+    SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
+    DenseMap<Operation *, Interval<size_t>> &allocToIntervals,
+    DenseMap<Operation *, triton::nvidia_gpu::TMemAllocation> &allocToSize,
+    DenseMap<Operation *, triton::nvidia_gpu::TmemDataChannelPost *>
+        &allocToChannel,
+    SmallVector<Channel *> &channels, llvm::raw_ostream &os);
+
+/// Generate a buffer liveness visualization for SMEM allocations using
+/// pre-calculated liveness intervals from the memory planner.
+/// @param bufferRange Map from buffer to liveness interval
+/// @param channels List of all channels (for finding associated channels)
+/// @param os Output stream for DOT format
+void dumpSmemBufferLiveness(
+    llvm::MapVector<Allocation::BufferId, std::pair<Interval<size_t>, size_t>>
+        &bufferInfo,
+    DenseMap<Allocation::BufferId, Operation *> &bufferOwners,
+    SmallVector<Channel *> &channels, llvm::raw_ostream &os);
 
 Operation *getSameLevelOp(Operation *p, Operation *c);
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp);

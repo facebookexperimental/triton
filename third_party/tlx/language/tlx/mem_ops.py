@@ -186,18 +186,14 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
             # For 8-bit element types (uint8/int8), use a dummy TMEM layout that will
             # be resolved during layout propagation. This is used for scales in
             # scaled MMA operations where the final layout depends on usage context.
-            if dtype == tl.uint8 or dtype == tl.int8:
-                layout = None  # Will be resolved by layout propagation
-                layout_handle = _semantic.builder.make_dummy_tmem_layout_attr()
+            if dtype.primitive_bitwidth < 16:
+                if dtype == tl.uint8 or dtype == tl.int8:
+                    layout = tlx.DummyTMEMLayoutEncoding()
+                else:
+                    raise NotImplementedError(f"TMEM Layouts not supported for {dtype} yet")
             else:
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
-                layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
-                    layout.blockM,
-                    layout.blockN,
-                    layout.unpacked,
-                    layout.CTASplitM,
-                    layout.CTASplitN,
-                )
+            layout_handle = layout.to_ir(_semantic.builder)
     else:
         raise NotImplementedError("User-specified layout encoding not yet implemented.")
 
@@ -217,8 +213,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                                  f"doesn't match local_alloc storage ({storage.value})")
             shared_buffer_handle = reuse.handle
         else:
-            raise ValueError(f"reuse must be a buffered_tensor or storage_alias_spec, "
-                             f"got {type(reuse)}")
+            raise ValueError(f"reuse must be a buffered_tensor or storage_alias_spec, got {type(reuse)}")
 
     if storage == tlx.storage_kind.smem:
         tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle, alias_handle,
@@ -333,7 +328,7 @@ def remote_view(
     a cluster of shape [2, 4] a valid unique ID could be 0~7, including the executing CTA itself
     :returns: a remote view of the buffer, located at the same relative location, but just in a possibly different CTA
     """
-    assert isinstance(local_allocated_buffer, tlx.mbarrier), ("remote_view only supports barrier for now")
+    assert isinstance(local_allocated_buffer, tlx.mbarrier), "remote_view only supports barrier for now"
     assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     remote_buf_handle = _semantic.builder.create_map_to_remote_buffer(local_allocated_buffer.handle,
@@ -702,6 +697,8 @@ def async_descriptor_load(
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), \
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
@@ -731,14 +728,24 @@ def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
     offsets: list[tl.tensor],
+    eviction_policy: str = "",
     _semantic=None,
 ) -> None:
     assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), (
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
+    from triton._C.libtriton import ir
+
+    evict = ir.EVICTION_POLICY.NORMAL
+    if eviction_policy == "evict_first":
+        evict = ir.EVICTION_POLICY.EVICT_FIRST
+    elif eviction_policy == "evict_last":
+        evict = ir.EVICTION_POLICY.EVICT_LAST
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle)
+    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
 
 
 @tl.builtin
