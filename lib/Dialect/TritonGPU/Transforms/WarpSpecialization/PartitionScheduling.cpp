@@ -141,12 +141,25 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
     uses.push_back(&use);
   while (!uses.empty()) {
     OpOperand *use = uses.pop_back_val();
-    Operation *user = loop.getBody()->findAncestorOpInBlock(*use->getOwner());
+    Operation *user = use->getOwner();
 
-    if (user == loop.getBody()->getTerminator()) {
-      for (OpOperand &use :
-           loop.getRegionIterArg(use->getOperandNumber()).getUses())
-        uses.push_back(&use);
+    // Handle yield ops by following values through to their parent op's
+    // results or to the loop's iteration arguments.
+    if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+      Operation *parent = yieldOp->getParentOp();
+      if (parent == loop.getOperation()) {
+        // Yield at the loop level - follow to next iteration's block args.
+        for (OpOperand &nextUse :
+             loop.getRegionIterArg(use->getOperandNumber()).getUses())
+          uses.push_back(&nextUse);
+      } else {
+        // Yield inside a nested op (e.g. scf.if) - follow to parent results.
+        unsigned resultIdx = use->getOperandNumber();
+        if (resultIdx < parent->getNumResults()) {
+          for (OpOperand &parentUse : parent->getResult(resultIdx).getUses())
+            uses.push_back(&parentUse);
+        }
+      }
       continue;
     }
 
