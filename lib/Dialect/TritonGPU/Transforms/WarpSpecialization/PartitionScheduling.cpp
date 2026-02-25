@@ -252,9 +252,10 @@ static std::optional<PartitionSet> getInitialSchedule(scf::ForOp mainLoop) {
   // Ensure the epilogue stores are in a separate partition.
   auto epiloguePartition = schedule.addPartition(/* stage is unused */ 0);
   for (auto loop : loops)
-    for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
+    loop.walk([&](DescriptorStoreOp op) {
       if (!hasPartition(op))
         setPartition(op, epiloguePartition);
+    });
 
   // Find MMAs to pipeline.
   SmallVector<ttng::MMAv5OpInterface> mmas;
