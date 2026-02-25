@@ -6014,3 +6014,52 @@ def test_vote_ballot_sync_ir_emission(device):
     llir = kernel.asm["llir"]
     assert "nvvm.vote.ballot.sync" in llir or "vote.sync.ballot" in llir, (
         "Expected nvvm.vote.ballot.sync or vote.sync.ballot in LLVM IR")
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
+    """Test gmem->smem->gmem roundtrip using 1D async bulk copy."""
+
+    @triton.jit
+    def bulk_copy_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        tid = tlx.thread_id(0)
+        pred = (tid == 0)
+
+        # gmem -> smem
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_bulk_copy_gmem_to_smem(src_ptr, buf, CHUNK_SIZE, bar, pred)
+        tlx.barrier_wait(bar, 0)
+
+        # smem -> gmem
+        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE, pred)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_copy_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR contains the new ops
+    ttgir = kernel.asm["ttgir"]
+    assert "ttng.async_bulk_copy_global_to_local" in ttgir, ("Expected async_bulk_copy_global_to_local in TTGIR")
+    assert "ttng.async_bulk_copy_local_to_global" in ttgir, ("Expected async_bulk_copy_local_to_global in TTGIR")
+
+    # Verify PTX contains the bulk copy instructions
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+        "Expected cp.async.bulk gmem->smem in PTX")
+    assert "cp.async.bulk.global.shared::cta.bulk_group" in ptx, ("Expected cp.async.bulk smem->gmem in PTX")
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)

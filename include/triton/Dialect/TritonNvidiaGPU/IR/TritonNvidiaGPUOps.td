@@ -932,7 +932,7 @@ def TTNG_AsyncBulkCopyGlobalToLocalOp : TTNG_Op<"async_bulk_copy_global_to_local
     This is the 1D address-based variant — no TMA descriptor required.
   }];
   let arguments = (ins
-    TT_Ptr:$src,
+    Arg<TT_Ptr, "", [MemRead<GlobalMemory>]>:$src,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
     I32:$size,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
@@ -954,7 +954,7 @@ def TTNG_AsyncBulkCopyLocalToGlobalOp : TTNG_Op<"async_bulk_copy_local_to_global
   }];
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    TT_Ptr:$dst,
+    Arg<TT_Ptr, "", [MemWrite<GlobalMemory>]>:$dst,
     I32:$size,
     I1:$pred
   );
