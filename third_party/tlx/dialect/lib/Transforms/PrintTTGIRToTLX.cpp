@@ -64,6 +64,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -251,17 +252,49 @@ llvm::StringMap<StringRef> buildOpNameMap() {
 // values
 std::string
 getValueName(Value v,
-             const DenseMap<Value, Value> *argSubstitutionMap = nullptr) {
+             const DenseMap<Value, Value> *argSubstitutionMap = nullptr,
+             bool inlineConstants = true) {
   // Check if this value should be substituted
   if (argSubstitutionMap) {
     auto it = argSubstitutionMap->find(v);
     if (it != argSubstitutionMap->end()) {
       // Recursively get the name of the substituted value (without
       // substitution)
-      return getValueName(it->second, nullptr);
+      return getValueName(it->second, nullptr, inlineConstants);
     }
   }
 
+  // Inline constants: if this value is defined by arith.constant, return the
+  // literal value
+  if (inlineConstants) {
+    if (Operation *defOp = v.getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "arith.constant") {
+        if (auto valueAttr = defOp->getAttr("value")) {
+          std::string result;
+          llvm::raw_string_ostream os(result);
+          if (auto intAttr = dyn_cast<IntegerAttr>(valueAttr)) {
+            if (intAttr.getType().isInteger(1)) {
+              os << (intAttr.getValue().getBoolValue() ? "True" : "False");
+            } else {
+              os << intAttr.getValue();
+            }
+          } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
+            SmallString<16> str;
+            floatAttr.getValue().toString(str);
+            os << str;
+          } else {
+            // Fall through to normal name handling for unsupported constant
+            // types
+            goto normal_name;
+          }
+          os.flush();
+          return result;
+        }
+      }
+    }
+  }
+
+normal_name:
   std::string name;
   llvm::raw_string_ostream os(name);
   v.printAsOperand(os, OpPrintingFlags());
@@ -420,29 +453,29 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
 }
 
 // Check if an operation should be skipped because it's folded into
-// a barrier alloc
+// a barrier alloc or not meaningful in TLX output
 bool shouldSkipOp(Operation *op,
                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
                   llvm::DenseSet<Operation *> &skippedOps) {
   StringRef opName = op->getName().getStringRef();
 
-  // Skip init_barrier - it's folded into alloc_barriers
-  if (opName == "ttng.init_barrier") {
-    return true;
-  }
-
-  // Skip warp_return - it's implicit in the with block structure
-  if (opName == "ttg.warp_return") {
-    return true;
-  }
-
-  // Skip warp_yield - it's implicit in the with block structure
-  if (opName == "ttg.warp_yield") {
-    return true;
-  }
-
-  // Skip warp_specialize.partitions - it's not meaningful in TLX format
-  if (opName == "ttg.warp_specialize.partitions") {
+  // Operations to skip in TLX output:
+  // - ttng.init_barrier: folded into alloc_barriers
+  // - ttg.warp_return/warp_yield: implicit in with block structure
+  // - ttg.warp_specialize.partitions: not meaningful in TLX format
+  // - gpu.barrier: not needed in TLX
+  // - arith.constant: values are inlined at use sites
+  // - ttg.convert_layout: internal layout conversion
+  // - tt.return: function terminator
+  // - tt.reduce.return: internal to reduce operation
+  static const llvm::StringSet<> opsToSkip = {
+      "ttng.init_barrier",  "ttg.warp_return",
+      "ttg.warp_yield",     "ttg.warp_specialize.partitions",
+      "gpu.barrier",        "arith.constant",
+      "ttg.convert_layout", "tt.return",
+      "tt.reduce.return",
+  };
+  if (opsToSkip.contains(opName)) {
     return true;
   }
 
@@ -599,6 +632,25 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
   }
 }
 
+// Helper to check if a region has meaningful operations (not just skipped ops)
+bool regionHasMeaningfulOps(
+    Region &region, const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps) {
+  for (Block &block : region) {
+    for (Operation &op : block) {
+      // Skip operations that would be filtered out
+      if (shouldSkipOp(&op, allocInfoMap, skippedOps))
+        continue;
+      // Skip scf.yield as it's handled specially
+      if (op.getName().getStringRef() == "scf.yield")
+        continue;
+      // Found a meaningful operation
+      return true;
+    }
+  }
+  return false;
+}
+
 // Print warp_specialize operation in TLX async_tasks format
 void printWarpSpecialize(
     Operation *op, llvm::raw_ostream &os,
@@ -647,6 +699,12 @@ void printWarpSpecialize(
               "ttg.warp_specialize.partitions") {
             // Each region in warp_specialize.partitions is a partition
             for (Region &partitionRegion : innerOp.getRegions()) {
+              // Skip empty partitions (only contain skipped ops)
+              if (!regionHasMeaningfulOps(partitionRegion, allocInfoMap,
+                                          skippedOps)) {
+                continue;
+              }
+
               // Build substitution map for this partition
               DenseMap<Value, Value> argSubstitutionMap;
               if (!partitionRegion.empty()) {
