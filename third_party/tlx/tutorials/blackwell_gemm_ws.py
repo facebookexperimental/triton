@@ -601,6 +601,7 @@ def _process_tile_epilogue_inner(
     NUM_TMEM_BUFFERS,
     SPLIT_K,
     c_desc,
+    c_smem_buffers,
     tmem_buffers,
     tmem_full_bars,
     tmem_empty_bars,
@@ -635,13 +636,20 @@ def _process_tile_epilogue_inner(
             tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
             c = result.to(tlx.dtype_of(c_desc))
             if SPLIT_K == 1:
-                c_desc.store([offs_am, offs_bn + slice_id * slice_size], c)
+                # Store to SMEM then use async TMA store to global
+                c_smem = c_smem_buffers[group_id]
+                tlx.async_descriptor_store_wait(0)
+                tlx.local_store(c_smem, c)
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(c_desc, c_smem, [offs_am, offs_bn + slice_id * slice_size])
             else:
                 c_desc.store(
                     [offs_am, offs_bn + slice_id * slice_size],
                     c,
                     store_reduce="add",
                 )
+    # Wait for all TMA stores to complete
+    tlx.async_descriptor_store_wait(0)
 
 
 @triton.jit
@@ -867,6 +875,14 @@ def matmul_kernel_tma_ws_blackwell(
         tlx.storage_kind.tmem,
     )
 
+    # Allocate SMEM buffer for epilogue TMA store (one per MMA group)
+    slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    c_smem_buffers = tlx.local_alloc(
+        (BLOCK_M_SPLIT, slice_size),
+        tlx.dtype_of(c_desc),
+        NUM_MMA_GROUPS,
+    )
+
     # CTA pairs are placed along M dim
     if NUM_CTAS == 2:
         cluster_cta_rank = tlx.cluster_cta_rank()
@@ -928,6 +944,7 @@ def matmul_kernel_tma_ws_blackwell(
                     NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
                     SPLIT_K=SPLIT_K,
                     c_desc=c_desc,
+                    c_smem_buffers=c_smem_buffers,
                     tmem_buffers=tmem_buffers,
                     tmem_full_bars=tmem_full_bars,
                     tmem_empty_bars=tmem_empty_bars,
