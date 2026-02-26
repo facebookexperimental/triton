@@ -13,6 +13,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -145,8 +146,9 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // Compute the min partition to normalize to 0
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
-    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
-      int64_t idx = attr.getInt();
+    if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+      assert(attr.size() == 1 && "expected exactly 1 partition element");
+      int64_t idx = attr[0];
       assert(idx >= 0);
       minPartition = std::min(idx, minPartition);
     }
@@ -154,12 +156,13 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   DenseSet<AsyncTaskId> totalTaskIds;
   // Convert ttg.partition to async_task_id
   funcOp.walk([&](mlir::Operation *op) {
-    if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
-      int64_t idx = attr.getInt() - minPartition;
+    if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+      assert(attr.size() == 1 && "expected exactly 1 partition element");
+      int64_t idx = attr[0] - minPartition;
       totalTaskIds.insert(idx);
       assert(idx >= 0);
       setAsyncTaskIds(op, idx);
-      op->removeAttr("ttg.partition");
+      op->removeAttr(kPartitionAttrName);
     }
   });
 
