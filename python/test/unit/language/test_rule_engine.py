@@ -18,6 +18,7 @@ _TLX_DIR = str(_REPO_ROOT / "third_party" / "tlx")
 if _TLX_DIR not in sys.path:
     sys.path.insert(0, _TLX_DIR)
 from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
+from rule_engine.expr import validate_expr  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Original implementation (verbatim copy for comparison)
@@ -350,3 +351,60 @@ def test_equivalence(M, N, K):
                                     f"old={old_val}, new={new_val}\n"
                                     f"  old config: { {k: old[k] for k in _CONFIG_KEYS} }\n"
                                     f"  new config: { {k: new[k] for k in _CONFIG_KEYS} }")
+
+
+# ---------------------------------------------------------------------------
+# Expression validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateExpr:
+    """Tests for load-time AST validation of expressions."""
+
+    def test_valid_arithmetic(self):
+        validate_expr("M / max(N, 1)", {"M", "N"})
+
+    def test_valid_boolean(self):
+        validate_expr("M > 4 and N < 256", {"M", "N"})
+
+    def test_valid_select(self):
+        validate_expr("select(M > N, 256, 128)", {"M", "N"})
+
+    def test_valid_nested_builtins(self):
+        validate_expr("ceil(M / max(N, 1)) * floor(abs(K))", {"M", "N", "K"})
+
+    def test_reject_unknown_name(self):
+        with pytest.raises(ValueError, match="unknown name 'arithemtic_intensity'"):
+            validate_expr("arithemtic_intensity > 1.5", {"arithmetic_intensity"})
+
+    def test_reject_attribute_access(self):
+        with pytest.raises(ValueError, match="disallowed construct Attribute"):
+            validate_expr("M.__class__", {"M"})
+
+    def test_reject_subscript(self):
+        with pytest.raises(ValueError, match="disallowed construct Subscript"):
+            validate_expr("M[0]", {"M"})
+
+    def test_reject_lambda(self):
+        with pytest.raises(ValueError, match="disallowed construct Lambda"):
+            validate_expr("(lambda: 1)", {"M"})
+
+    def test_reject_list_comp(self):
+        with pytest.raises(ValueError, match="disallowed construct ListComp"):
+            validate_expr("[x for x in M]", {"M"})
+
+    def test_reject_non_builtin_function(self):
+        with pytest.raises(ValueError, match="function 'eval' is not a builtin"):
+            validate_expr('eval("1")', {"M"})
+
+    def test_reject_method_call(self):
+        with pytest.raises(ValueError, match="only direct function calls"):
+            validate_expr("M.bit_length()", {"M"})
+
+    def test_reject_import_expression(self):
+        with pytest.raises(ValueError, match="not a builtin|only direct function calls"):
+            validate_expr("__import__('os').system('ls')", {"M"})
+
+    def test_context_in_error_message(self):
+        with pytest.raises(ValueError, match="feature 'foo'"):
+            validate_expr("bad_name", set(), context="feature 'foo'")
