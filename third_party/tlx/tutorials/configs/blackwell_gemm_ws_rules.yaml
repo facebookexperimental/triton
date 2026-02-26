@@ -1,0 +1,137 @@
+version: 1
+
+inputs: [M, N, K, num_sms]
+
+# Derived features, evaluated top-to-bottom.
+# Expression language: arithmetic (+,-,*,/,//,%), comparisons (>,<,>=,<=,==,!=),
+# boolean (and, or, not), builtins: min, max, ceil, floor, abs,
+# select(cond, if_true, if_false)
+features:
+  mn_ratio:             "M / max(N, 1)"
+  is_tall_m:            "mn_ratio > 4"
+  is_tall_n:            "mn_ratio < 0.25"
+  ref_bm:               "select(is_tall_m, 256, select(is_tall_n, 128, 256))"
+  ref_bn:               "select(is_tall_m, 128, select(is_tall_n, 256, 256))"
+  num_mn_tiles:         "ceil(M / ref_bm) * ceil(N / ref_bn)"
+  gpu_saturated:        "num_mn_tiles >= num_sms"
+  undersaturated:       "num_mn_tiles < num_sms"
+  arithmetic_intensity: "K / max(min(M, N), 1)"
+  mn_product:           "M * N"
+  is_large_output:      "mn_product >= 1000000"
+
+  # Split-K feature computation for undersaturated shapes.
+  # The original code tries [4, 2, 8] in order; large_output uses bk=64, small uses bk=128.
+  large_k_tiles:        "ceil(K / 64)"
+  small_k_tiles:        "ceil(K / 128)"
+
+  # For large-output undersaturated: bk=64, try [4, 2, 8]
+  large_sk4_ok:         "large_k_tiles >= 4 and large_k_tiles // 4 >= 4"
+  large_sk2_ok:         "large_k_tiles >= 2 and large_k_tiles // 2 >= 4"
+  large_sk8_ok:         "large_k_tiles >= 8 and large_k_tiles // 8 >= 4"
+  large_split_k:        "select(large_sk4_ok, 4, select(large_sk2_ok, 2, select(large_sk8_ok, 8, 1)))"
+
+  # For small-output undersaturated: bk=128, try [4, 2, 8]
+  small_sk4_ok:         "small_k_tiles >= 4 and small_k_tiles // 4 >= 4"
+  small_sk2_ok:         "small_k_tiles >= 2 and small_k_tiles // 2 >= 4"
+  small_sk8_ok:         "small_k_tiles >= 8 and small_k_tiles // 8 >= 4"
+  small_split_k:        "select(small_sk4_ok, 4, select(small_sk2_ok, 2, select(small_sk8_ok, 8, 1)))"
+
+# Ordered rules, first match wins.
+rules:
+  # ---- Characteristic 1: Tall-M saturated shapes ----
+  - name: tall_m_saturated_low_intensity
+    when:
+      - "is_tall_m"
+      - "gpu_saturated"
+      - "arithmetic_intensity <= 1.5"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 128
+      NUM_SMEM_BUFFERS: 2
+      NUM_TMEM_BUFFERS: 2
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 1
+      NUM_CTAS: 2
+      SPLIT_K: 1
+
+  - name: tall_m_saturated_high_intensity_large_k
+    when:
+      - "is_tall_m"
+      - "gpu_saturated"
+      - "arithmetic_intensity > 1.5"
+      - "K > N * 2"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 256
+      BLOCK_SIZE_K: 128
+      NUM_SMEM_BUFFERS: 2
+      NUM_TMEM_BUFFERS: 1
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 4
+      NUM_CTAS: 2
+      SPLIT_K: 1
+
+  - name: tall_m_saturated_high_intensity_small_k
+    when:
+      - "is_tall_m"
+      - "gpu_saturated"
+      - "arithmetic_intensity > 1.5"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 256
+      BLOCK_SIZE_K: 64
+      NUM_SMEM_BUFFERS: 4
+      NUM_TMEM_BUFFERS: 1
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 4
+      NUM_CTAS: 2
+      SPLIT_K: 1
+
+  # ---- Characteristic 2: Undersaturated shapes needing Split-K ----
+  - name: undersaturated_large_output_split_k
+    when:
+      - "undersaturated"
+      - "is_large_output"
+      - "large_split_k > 1"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 64
+      NUM_SMEM_BUFFERS: 4
+      NUM_TMEM_BUFFERS: 2
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 8
+      NUM_CTAS: 1
+      SPLIT_K: "$large_split_k"
+
+  - name: undersaturated_small_output_split_k
+    when:
+      - "undersaturated"
+      - "not is_large_output"
+      - "small_split_k > 1"
+    config:
+      BLOCK_SIZE_M: 128
+      BLOCK_SIZE_N: 64
+      BLOCK_SIZE_K: 128
+      NUM_SMEM_BUFFERS: 4
+      NUM_TMEM_BUFFERS: 3
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 1
+      NUM_CTAS: 1
+      SPLIT_K: "$small_split_k"
+
+  # ---- Characteristic 3: GPU-saturated (non-tall-M) ----
+  - name: saturated_balanced
+    when:
+      - "gpu_saturated"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 256
+      BLOCK_SIZE_K: 64
+      NUM_SMEM_BUFFERS: 3
+      NUM_TMEM_BUFFERS: 1
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 4
+      NUM_CTAS: 1
+      SPLIT_K: 1

@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import torch
 
@@ -33,8 +34,13 @@ It's recommended to run with `third_party/tlx/denoise.sh third_party/tlx/tutoria
 Facebook: If you are developing in fbsource, use tritonbench instead to collect perf numbers.
 """
 
+DEFAULT_SHAPES = [(2048, 2048, 2048), (4096, 4096, 4096), (8192, 8192, 8192)]
 
-def create_benchmark(versions, dtype=torch.float16):
+
+def create_benchmark(versions, dtype=torch.float16, shapes=None):
+    if shapes is None:
+        shapes = DEFAULT_SHAPES
+
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
     dtype_name = {torch.float16: "fp16", torch.bfloat16: "bf16"}[dtype]
@@ -42,7 +48,7 @@ def create_benchmark(versions, dtype=torch.float16):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],
-            x_vals=[2048, 4096, 8192],
+            x_vals=[list(s) for s in shapes],
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -83,14 +89,21 @@ if __name__ == "__main__":
         choices=["fp16", "bf16"],
         help="Data type for the benchmark (default: fp16)",
     )
+    parser.add_argument(
+        "--shapes",
+        type=str,
+        default=None,
+        help='JSON list of [M,N,K] triples, e.g. \'[[4096,4096,4096],[1024,256,16384]]\'',
+    )
     args = parser.parse_args()
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+    shapes = [tuple(s) for s in json.loads(args.shapes)] if args.shapes else None
 
     if is_blackwell():
         versions = [args.version] if args.version else list(MATMUL_METHODS.keys())
         print(f"Running benchmarks for: {versions} (dtype={args.dtype})")
-        benchmark = create_benchmark(versions, dtype=dtype)
+        benchmark = create_benchmark(versions, dtype=dtype, shapes=shapes)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")
