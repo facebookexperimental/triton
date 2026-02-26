@@ -13,6 +13,7 @@ Supported operations:
   - Ternary: select(cond, if_true, if_false)
 """
 
+import ast
 import math
 
 
@@ -37,6 +38,101 @@ _BUILTINS = {
     "True": True,
     "False": False,
 }
+
+_BUILTIN_NAMES = frozenset(_BUILTINS)
+
+# AST node types that are allowed in expressions.  Anything not in this
+# set is rejected at load time, ensuring the expression language stays
+# portable to non-Python evaluators.
+_ALLOWED_NODES = frozenset({
+    # structural
+    ast.Expression,
+    ast.Module,
+    # literals
+    ast.Constant,
+    # variables
+    ast.Name,
+    ast.Load,
+    # arithmetic & comparisons
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Compare,
+    ast.BoolOp,
+    # operators
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.USub,
+    ast.UAdd,
+    ast.Not,
+    ast.And,
+    ast.Or,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    # function calls (only to whitelisted builtins — checked separately)
+    ast.Call,
+})
+
+
+def validate_expr(expr, valid_names, context=""):
+    """Validate an expression at load time.
+
+    Checks:
+    1. The expression parses as valid Python.
+    2. Only whitelisted AST node types are used (no attribute access,
+       subscripts, lambdas, comprehensions, imports, etc.).
+    3. All referenced names are in *valid_names* or builtins.
+    4. Function calls are only to whitelisted builtins.
+
+    Args:
+        expr: Expression string to validate.
+        valid_names: Set of names that are allowed (inputs + features
+                     defined before this expression).
+        context: Human-readable location for error messages
+                 (e.g. "feature 'mn_ratio'").
+
+    Raises:
+        ValueError: If validation fails.
+    """
+    prefix = f"{context}: " if context else ""
+
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"{prefix}invalid syntax in expression: {expr!r}: {e}") from None
+
+    all_valid = valid_names | _BUILTIN_NAMES
+
+    for node in ast.walk(tree):
+        # Check node type whitelist.
+        if type(node) not in _ALLOWED_NODES:
+            raise ValueError(f"{prefix}disallowed construct {type(node).__name__} "
+                             f"in expression: {expr!r}")
+
+        # Check name references.
+        if isinstance(node, ast.Name) and node.id not in all_valid:
+            raise ValueError(f"{prefix}unknown name {node.id!r} in expression: {expr!r}. "
+                             f"Valid names: {sorted(all_valid)}")
+
+        # Check function calls are only to builtins.
+        if isinstance(node, ast.Call):
+            func = node.func
+            if not isinstance(func, ast.Name):
+                raise ValueError(f"{prefix}only direct function calls are allowed "
+                                 f"(no method calls or computed callables) in: {expr!r}")
+            if func.id not in _BUILTIN_NAMES:
+                raise ValueError(
+                    f"{prefix}function {func.id!r} is not a builtin "
+                    f"in expression: {expr!r}. "
+                    f"Allowed functions: {sorted(n for n in _BUILTIN_NAMES if callable(_BUILTINS.get(n)))}")
 
 
 def make_namespace(variables):

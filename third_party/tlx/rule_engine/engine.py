@@ -16,7 +16,7 @@ from pathlib import Path
 
 import yaml
 
-from .expr import eval_expr
+from .expr import eval_expr, validate_expr
 
 
 class RuleEngine:
@@ -36,6 +36,31 @@ class RuleEngine:
         # guarantee), so later features can reference earlier ones.
         self.features: dict[str, str] = spec.get("features", {})
         self.rules: list[dict] = spec["rules"]
+
+        self._validate(path)
+
+    def _validate(self, path: Path) -> None:
+        """Validate all expressions at load time."""
+        # Names accumulate as features are defined top-to-bottom.
+        known_names = set(self.inputs)
+
+        for name, expr in self.features.items():
+            validate_expr(expr, known_names, context=f"{path}: feature '{name}'")
+            known_names.add(name)
+
+        for rule in self.rules:
+            rule_name = rule.get("name", "<unnamed>")
+            for i, cond in enumerate(rule["when"]):
+                validate_expr(cond, known_names, context=f"{path}: rule '{rule_name}' when[{i}]")
+
+            # Validate $variable references in config values.
+            for key, val in rule.get("config", {}).items():
+                if isinstance(val, str) and val.startswith("$"):
+                    ref = val[1:]
+                    if ref not in known_names:
+                        raise ValueError(f"{path}: rule '{rule_name}' config.{key}: "
+                                         f"unknown variable reference '${ref}'. "
+                                         f"Valid names: {sorted(known_names)}")
 
     def evaluate(self, **kwargs) -> dict | None:
         """Evaluate features, then return the first matching rule's config.
