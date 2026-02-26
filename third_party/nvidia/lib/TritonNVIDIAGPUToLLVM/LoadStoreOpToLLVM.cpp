@@ -1964,54 +1964,6 @@ struct AsyncCommitGroupOpConversion
   }
 };
 
-struct AsyncBulkCopyGlobalToLocalOpConversion
-    : public ConvertOpToLLVMPattern<
-          triton::nvidia_gpu::AsyncBulkCopyGlobalToLocalOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::AsyncBulkCopyGlobalToLocalOp op,
-                  OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto voidTy = void_ty(op->getContext());
-
-    // Get shared memory pointers for dst and barrier
-    auto dstTy = op.getDst().getType();
-    Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
-    auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
-        loc, adaptor.getDst(), llvmElemTy, rewriter);
-    Value dstBase = dstMemObj.getBase();
-
-    auto barrierMemObj = LLVM::getSharedMemoryObjectFromStruct(
-        loc, adaptor.getBarrier(),
-        typeConverter->convertType(op.getBarrier().getType().getElementType()),
-        rewriter);
-
-    Value pred = adaptor.getPred();
-    Value srcPtr = adaptor.getSrc();
-    Value size = adaptor.getSize();
-    Value barrierPtr = barrierMemObj.getBase();
-
-    // @pred cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes
-    //   [$1], [$2], $3, [$4];
-    ::mlir::triton::PTXBuilder ptxBuilder;
-    auto &bulkCopy = *ptxBuilder.create<>(
-        "@$0 cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
-        "[$1], [$2], $3, [$4];");
-    bulkCopy(
-        {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstBase, "r"),
-         ptxBuilder.newOperand(srcPtr, "l"), ptxBuilder.newOperand(size, "r"),
-         ptxBuilder.newOperand(barrierPtr, "r")},
-        /*onlyAttachMLIRArgs=*/true);
-    ptxBuilder.launch(rewriter, loc, voidTy);
-
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
 struct AsyncBulkCopyLocalToGlobalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::nvidia_gpu::AsyncBulkCopyLocalToGlobalOp> {
@@ -2089,6 +2041,5 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
       typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMAReduceOpConversion, AsyncTMAGatherOpConversion,
                AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion,
-               AsyncBulkCopyGlobalToLocalOpConversion,
                AsyncBulkCopyLocalToGlobalOpConversion>(typeConverter, benefit);
 }

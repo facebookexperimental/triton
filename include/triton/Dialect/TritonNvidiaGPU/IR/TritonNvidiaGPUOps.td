@@ -924,27 +924,6 @@ def TTNG_TensormapCreateOp: TTNG_Op<
   let hasVerifier = 1;
 }
 
-def TTNG_AsyncBulkCopyGlobalToLocalOp : TTNG_Op<"async_bulk_copy_global_to_local"> {
-  let summary = "1D async bulk copy from global to shared memory";
-  let description = [{
-    Copies `size` bytes from global memory to shared memory using
-    cp.async.bulk.shared::cta.global with mbarrier completion tracking.
-    This is the 1D address-based variant — no TMA descriptor required.
-  }];
-  let arguments = (ins
-    Arg<TT_Ptr, "", [MemRead<GlobalMemory>]>:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-    I32:$size,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
-    I1:$pred
-  );
-
-  let assemblyFormat = [{
-    $src `,` $dst `,` $size `,` $barrier `,` $pred
-    attr-dict `:` qualified(type($src)) `,` qualified(type($dst)) `,` qualified(type($barrier))
-  }];
-}
-
 def TTNG_AsyncBulkCopyLocalToGlobalOp : TTNG_Op<"async_bulk_copy_local_to_global"> {
   let summary = "1D async bulk copy from shared to global memory";
   let description = [{

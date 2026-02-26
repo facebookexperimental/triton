@@ -5,26 +5,6 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: async_bulk_copy_global_to_local
-  // CHECK-LLVM-LABEL: llvm.func @async_bulk_copy_global_to_local
-  tt.func @async_bulk_copy_global_to_local(%src: !tt.ptr<i8>, %size: i32, %pred: i1) {
-    %dst = ttg.local_alloc : () -> !ttg.memdesc<1024xi8, #shared, #smem, mutable>
-    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    // CHECK: ttng.async_bulk_copy_global_to_local
-    // CHECK-SAME: !tt.ptr<i8>, !ttg.memdesc<1024xi8, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    // CHECK-LLVM: llvm.inline_asm has_side_effects asm_dialect = att
-    // CHECK-LLVM-SAME: cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes
-    ttng.async_bulk_copy_global_to_local %src, %dst, %size, %bar, %pred : !tt.ptr<i8>, !ttg.memdesc<1024xi8, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: async_bulk_copy_local_to_global
   // CHECK-LLVM-LABEL: llvm.func @async_bulk_copy_local_to_global
   tt.func @async_bulk_copy_local_to_global(%dst: !tt.ptr<i8>, %size: i32, %pred: i1) {

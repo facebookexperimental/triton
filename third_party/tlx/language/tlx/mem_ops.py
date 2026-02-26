@@ -816,41 +816,6 @@ def async_descriptor_store(
 
 
 @tl.builtin
-def async_bulk_copy_gmem_to_smem(
-    src_global_ptr: tl.tensor,
-    dst_smem: tlx.buffered_tensor,
-    size: tl.tensor,
-    barrier: tlx.mbarrier,
-    pred: tl.tensor = None,
-    _semantic=None,
-) -> None:
-    """
-    Asynchronously copies `size` bytes from global memory to shared memory using
-    cp.async.bulk.shared::cta.global with mbarrier completion tracking.
-    This is the 1D address-based variant — no TMA descriptor required.
-
-    Args:
-        src_global_ptr: Pointer to source data in global memory.
-        dst_smem: Shared memory buffer from local_alloc.
-        size: Number of bytes to copy (must be a multiple of 16).
-        barrier: mbarrier for tracking completion.
-        pred: Optional predicate (e.g., thread_id == 0). Defaults to True.
-    """
-    if pred is None:
-        pred_handle = _semantic.builder.get_int1(True)
-    else:
-        pred_handle = pred.handle
-    if isinstance(size, tl.constexpr):
-        size_handle = _semantic._convert_elem_to_ir_value(size.value, require_i64=False)
-    elif isinstance(size, tl.tensor):
-        size_handle = size.handle
-    else:
-        size_handle = _semantic._convert_elem_to_ir_value(size, require_i64=False)
-    _semantic.builder.create_async_bulk_copy_global_to_local(src_global_ptr.handle, dst_smem.handle, size_handle,
-                                                             barrier.handle, pred_handle)
-
-
-@tl.builtin
 def async_bulk_copy_smem_to_gmem(
     dst_global_ptr: tl.tensor,
     src_smem: tlx.buffered_tensor,

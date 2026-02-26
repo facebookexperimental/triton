@@ -684,12 +684,6 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, int pendings) {
              self.create<ttng::TMAStoreWaitOp>(pendings);
            })
-      .def("create_async_bulk_copy_global_to_local",
-           [](TritonOpBuilder &self, Value src, Value dst, Value size,
-              Value barrier, Value pred) -> void {
-             self.create<ttng::AsyncBulkCopyGlobalToLocalOp>(src, dst, size,
-                                                             barrier, pred);
-           })
       .def("create_async_bulk_copy_local_to_global",
            [](TritonOpBuilder &self, Value src, Value dst, Value size,
               Value pred) -> void {

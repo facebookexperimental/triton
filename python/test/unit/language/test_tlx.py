@@ -6018,7 +6018,7 @@ def test_vote_ballot_sync_ir_emission(device):
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
 def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
-    """Test gmem->smem->gmem roundtrip using 1D async bulk copy."""
+    """Test gmem->smem->gmem roundtrip using async_load(bulk=True) and async_bulk_copy_smem_to_gmem."""
 
     @triton.jit
     def bulk_copy_kernel(
@@ -6034,9 +6034,9 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
         tid = tlx.thread_id(0)
         pred = (tid == 0)
 
-        # gmem -> smem
+        # gmem -> smem (bulk async_load)
         tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
-        tlx.async_bulk_copy_gmem_to_smem(src_ptr, buf, CHUNK_SIZE, bar, pred)
+        tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
         tlx.barrier_wait(bar, 0)
 
         # smem -> gmem
@@ -6049,9 +6049,10 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
 
     kernel = bulk_copy_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
 
-    # Verify IR contains the new ops
+    # Verify IR uses async_copy_global_to_local with bulk mode
     ttgir = kernel.asm["ttgir"]
-    assert "ttng.async_bulk_copy_global_to_local" in ttgir, ("Expected async_bulk_copy_global_to_local in TTGIR")
+    assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
     assert "ttng.async_bulk_copy_local_to_global" in ttgir, ("Expected async_bulk_copy_local_to_global in TTGIR")
 
     # Verify PTX contains the bulk copy instructions
