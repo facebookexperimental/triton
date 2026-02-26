@@ -1795,6 +1795,8 @@ public:
       DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
       unsigned bufferId) {
 
+    LDBG("allocateTMemAllocs2: starting with " << allocs.size() << " allocs");
+
     // Debug: dump allocation order and liveness
     LLVM_DEBUG({
       llvm::dbgs()
