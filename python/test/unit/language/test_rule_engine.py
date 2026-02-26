@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 # Make rule_engine importable
-_TLX_DIR = str(Path(__file__).resolve().parent.parent.parent)
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_TLX_DIR = str(_REPO_ROOT / "third_party" / "tlx")
 if _TLX_DIR not in sys.path:
     sys.path.insert(0, _TLX_DIR)
 from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
@@ -273,7 +274,7 @@ def original_get_heuristic_config(M, N, K, num_sms=148):
 # New implementation (rule engine)
 # ---------------------------------------------------------------------------
 
-_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "tutorials" / "configs"
+_CONFIGS_DIR = _REPO_ROOT / "third_party" / "tlx" / "tutorials" / "configs"
 _rules = RuleEngine(_CONFIGS_DIR / "blackwell_gemm_ws_rules.yaml")
 _candidates = CandidateScorer(_CONFIGS_DIR / "blackwell_gemm_ws_candidates.yaml")
 
