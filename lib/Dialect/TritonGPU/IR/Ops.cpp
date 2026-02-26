@@ -641,8 +641,12 @@ LogicalResult MemDescReinterpretOp::verify() {
           mmaEncoding.getTransposed() ? newShape.front() : newShape.back();
       // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
       // swizzling, the swizzling/contig dim has to be a multiple of it
+      // if swizzling mode is None, we still conservatively require at least 128
+      // bits
+      auto basicUnitBitWidth =
+          std::max(128U, 8 * mmaEncoding.getSwizzlingByteWidth());
       if ((contigDimSize * mmaEncoding.getElementBitWidth()) %
-              (8 * mmaEncoding.getSwizzlingByteWidth()) !=
+              basicUnitBitWidth !=
           0) {
         return emitError(
             "New shape causes insufficient elements for swizzling");
@@ -652,6 +656,9 @@ LogicalResult MemDescReinterpretOp::verify() {
       auto contigDim = swizzledEncoding.getOrder()[0];
       if (newShape.size() <= contigDim) {
         return emitError("New shape incompatible with encoding");
+      }
+      if (swizzledEncoding.getVec() == 0) {
+        return emitError("Unexpected swizzled encoding with `vec` 0");
       }
       // conservatively reject cases where swizzling might be interfered
       // new shape swizzling dim must be a multiple of getVec(), the basic
