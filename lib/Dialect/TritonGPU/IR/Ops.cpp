@@ -642,7 +642,8 @@ LogicalResult MemDescReinterpretOp::verify() {
       // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
       // swizzling, the swizzling/contig dim has to be a multiple of it
       if ((contigDimSize * mmaEncoding.getElementBitWidth()) %
-          (8 * mmaEncoding.getSwizzlingByteWidth() != 0)) {
+              (8 * mmaEncoding.getSwizzlingByteWidth()) !=
+          0) {
         return emitError(
             "New shape causes insufficient elements for swizzling");
       }
