@@ -17,6 +17,8 @@ from pathlib import Path
 
 import yaml
 
+_SUPPORTED_VERSION = 1
+
 
 class CandidateScorer:
     """Scored candidate search driven by a YAML file."""
@@ -25,6 +27,11 @@ class CandidateScorer:
         path = Path(path)
         with open(path) as f:
             spec = yaml.safe_load(f)
+
+        version = spec.get("version")
+        if version != _SUPPORTED_VERSION:
+            raise ValueError(f"Unsupported candidates version {version!r} in {path} "
+                             f"(expected {_SUPPORTED_VERSION})")
 
         for key in ("inputs", "hardware", "configs"):
             if key not in spec:

@@ -5,12 +5,37 @@ math builtins and a select() ternary function. The expression language
 is simple enough that a C++ or Rust evaluator can be written as a
 ~200-line recursive descent parser when needed.
 
-Supported operations:
-  - Arithmetic: +, -, *, /, //, %
-  - Comparisons: >, <, >=, <=, ==, !=
-  - Boolean: and, or, not
-  - Builtins: min, max, ceil, floor, abs
-  - Ternary: select(cond, if_true, if_false)
+Expression Language Specification (v1)
+======================================
+
+This is the reference spec for all parsers (Python, C++, PyTorch, etc.).
+
+Operators (Python precedence):
+  - Arithmetic : ``+, -, *, /, //, %, **``
+  - Comparisons: ``>, <, >=, <=, ==, !=``
+  - Boolean    : ``and, or, not``
+
+Builtins (functions):
+  - ``min(a, b)``, ``max(a, b)``, ``abs(x)``
+  - ``ceil(x)``, ``floor(x)``
+  - ``select(cond, if_true, if_false)`` — ternary (see note below)
+
+Literals:
+  - Integer and float constants (``42``, ``3.14``)
+  - ``True``, ``False``
+
+Semantics:
+  - ``//`` is floor division (rounds toward negative infinity), matching
+    Python semantics.  ``-7 // 2 == -4``, not ``-3``.
+  - ``select()`` eagerly evaluates **both** branches (standard call
+    semantics).  Guard divisions with ``max(x, 1)`` instead of relying
+    on short-circuit.
+  - Operator precedence follows Python.
+
+Not supported:
+  - Attribute access (``x.y``), subscript (``x[0]``), method calls
+  - Lambda, comprehensions, imports, assignment
+  - Any function not in the builtins list above
 """
 
 import ast

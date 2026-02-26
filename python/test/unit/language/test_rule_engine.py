@@ -8,16 +8,19 @@ end-to-end via the new get_heuristic_config as well).
 
 import math
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 # Make rule_engine importable
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 _TLX_DIR = str(_REPO_ROOT / "third_party" / "tlx")
 if _TLX_DIR not in sys.path:
     sys.path.insert(0, _TLX_DIR)
-from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
+from rule_engine import CandidateScorer, RuleEngine, validate_rules_yaml  # noqa: E402
+from rule_engine.engine import _parse_features  # noqa: E402
 from rule_engine.expr import validate_expr  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -408,3 +411,137 @@ class TestValidateExpr:
     def test_context_in_error_message(self):
         with pytest.raises(ValueError, match="feature 'foo'"):
             validate_expr("bad_name", set(), context="feature 'foo'")
+
+
+# ---------------------------------------------------------------------------
+# Feature format tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseFeatures:
+    """Tests for the two supported feature formats."""
+
+    def test_list_of_pairs(self):
+        raw = [{"name": "a", "expr": "M + 1"}, {"name": "b", "expr": "a * 2"}]
+        result = _parse_features(raw)
+        assert result == [("a", "M + 1"), ("b", "a * 2")]
+
+    def test_legacy_mapping(self):
+        """Legacy dict format still works."""
+        raw = {"a": "M + 1", "b": "a * 2"}
+        result = _parse_features(raw)
+        assert result == [("a", "M + 1"), ("b", "a * 2")]
+
+    def test_none_features(self):
+        result = _parse_features(None)
+        assert result == []
+
+    def test_reject_bad_type(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            _parse_features("not a list or dict")
+
+    def test_reject_missing_keys(self):
+        with pytest.raises(ValueError, match="must have 'name' and 'expr'"):
+            _parse_features([{"name": "a"}])
+
+
+# ---------------------------------------------------------------------------
+# Version checking tests
+# ---------------------------------------------------------------------------
+
+
+class TestVersionChecking:
+    """Tests for version gating on load."""
+
+    def _write_yaml(self, spec):
+        """Write a YAML spec to a temp file and return the path."""
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        yaml.dump(spec, f)
+        f.close()
+        return Path(f.name)
+
+    def test_rules_rejects_missing_version(self):
+        path = self._write_yaml({"inputs": ["M"], "rules": []})
+        with pytest.raises(ValueError, match="Unsupported rules version"):
+            RuleEngine(path)
+
+    def test_rules_rejects_future_version(self):
+        path = self._write_yaml({"version": 99, "inputs": ["M"], "rules": []})
+        with pytest.raises(ValueError, match="Unsupported rules version"):
+            RuleEngine(path)
+
+    def test_validate_rejects_future_version(self):
+        path = self._write_yaml({"version": 99, "inputs": ["M"], "rules": []})
+        with pytest.raises(ValueError, match="Unsupported rules version"):
+            validate_rules_yaml(path)
+
+    def test_candidates_rejects_missing_version(self):
+        path = self._write_yaml({"inputs": ["M"], "hardware": {}, "configs": []})
+        with pytest.raises(ValueError, match="Unsupported candidates version"):
+            CandidateScorer(path)
+
+    def test_candidates_rejects_future_version(self):
+        path = self._write_yaml({"version": 2, "inputs": ["M"], "hardware": {}, "configs": []})
+        with pytest.raises(ValueError, match="Unsupported candidates version"):
+            CandidateScorer(path)
+
+
+# ---------------------------------------------------------------------------
+# Structural validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestStructuralValidation:
+    """Tests for structural validation of rule entries."""
+
+    def _write_yaml(self, spec):
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        yaml.dump(spec, f)
+        f.close()
+        return Path(f.name)
+
+    def test_when_must_be_list(self):
+        path = self._write_yaml({
+            "version": 1,
+            "inputs": ["M"],
+            "rules": [{"name": "bad", "when": "M > 0", "config": {"X": 1}}],
+        })
+        with pytest.raises(ValueError, match="'when' must be a list"):
+            RuleEngine(path)
+
+    def test_config_must_be_dict(self):
+        path = self._write_yaml({
+            "version": 1,
+            "inputs": ["M"],
+            "rules": [{"name": "bad", "when": ["M > 0"], "config": "not a dict"}],
+        })
+        with pytest.raises(ValueError, match="'config' must be a mapping"):
+            RuleEngine(path)
+
+    def test_missing_when(self):
+        path = self._write_yaml({
+            "version": 1,
+            "inputs": ["M"],
+            "rules": [{"name": "bad", "config": {"X": 1}}],
+        })
+        with pytest.raises(ValueError, match="missing required key 'when'"):
+            RuleEngine(path)
+
+    def test_missing_config(self):
+        path = self._write_yaml({
+            "version": 1,
+            "inputs": ["M"],
+            "rules": [{"name": "bad", "when": ["M > 0"]}],
+        })
+        with pytest.raises(ValueError, match="missing required key 'config'"):
+            RuleEngine(path)
+
+    def test_missing_input_in_evaluate(self):
+        path = self._write_yaml({
+            "version": 1,
+            "inputs": ["M", "N"],
+            "rules": [{"name": "r", "when": ["M > 0"], "config": {"X": 1}}],
+        })
+        engine = RuleEngine(path)
+        with pytest.raises(ValueError, match="Missing required inputs.*N"):
+            engine.evaluate(M=1)
