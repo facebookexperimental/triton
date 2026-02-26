@@ -13,8 +13,10 @@ from pathlib import Path
 import pytest
 
 # Make rule_engine importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from rule_engine import CandidateScorer, RuleEngine
+_TLX_DIR = str(Path(__file__).resolve().parent.parent.parent)
+if _TLX_DIR not in sys.path:
+    sys.path.insert(0, _TLX_DIR)
+from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Original implementation (verbatim copy for comparison)
@@ -60,31 +62,49 @@ def original_get_heuristic_config(M, N, K, num_sms=148):
         arithmetic_intensity = K / max(min(M, N), 1)
         if arithmetic_intensity <= 1.5:
             return {
-                "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
-                "NUM_SMEM_BUFFERS": 2, "NUM_TMEM_BUFFERS": 2,
-                "NUM_MMA_GROUPS": 2, "EPILOGUE_SUBTILE": 1,
-                "NUM_CTAS": 2, "SPLIT_K": 1,
-                "ctas_per_cga": (2, 1, 1), "pre_hook": _SENTINEL_HOOK,
+                "NUM_SMEM_BUFFERS": 2,
+                "NUM_TMEM_BUFFERS": 2,
+                "NUM_MMA_GROUPS": 2,
+                "EPILOGUE_SUBTILE": 1,
+                "NUM_CTAS": 2,
+                "SPLIT_K": 1,
+                "ctas_per_cga": (2, 1, 1),
+                "pre_hook": _SENTINEL_HOOK,
             }
         else:
             if K > N * 2:
                 return {
-                    "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+                    "BLOCK_SIZE_M": 256,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
-                    "NUM_SMEM_BUFFERS": 2, "NUM_TMEM_BUFFERS": 1,
-                    "NUM_MMA_GROUPS": 2, "EPILOGUE_SUBTILE": 4,
-                    "NUM_CTAS": 2, "SPLIT_K": 1,
-                    "ctas_per_cga": (2, 1, 1), "pre_hook": _SENTINEL_HOOK,
+                    "NUM_SMEM_BUFFERS": 2,
+                    "NUM_TMEM_BUFFERS": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 4,
+                    "NUM_CTAS": 2,
+                    "SPLIT_K": 1,
+                    "ctas_per_cga": (2, 1, 1),
+                    "pre_hook": _SENTINEL_HOOK,
                 }
             else:
                 return {
-                    "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+                    "BLOCK_SIZE_M": 256,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 64,
                     "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
-                    "NUM_SMEM_BUFFERS": 4, "NUM_TMEM_BUFFERS": 1,
-                    "NUM_MMA_GROUPS": 2, "EPILOGUE_SUBTILE": 4,
-                    "NUM_CTAS": 2, "SPLIT_K": 1,
-                    "ctas_per_cga": (2, 1, 1), "pre_hook": _SENTINEL_HOOK,
+                    "NUM_SMEM_BUFFERS": 4,
+                    "NUM_TMEM_BUFFERS": 1,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 4,
+                    "NUM_CTAS": 2,
+                    "SPLIT_K": 1,
+                    "ctas_per_cga": (2, 1, 1),
+                    "pre_hook": _SENTINEL_HOOK,
                 }
 
     if is_undersaturated:
@@ -106,33 +126,49 @@ def original_get_heuristic_config(M, N, K, num_sms=148):
         if split_k > 1:
             if is_large_output:
                 return {
-                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n,
+                    "BLOCK_SIZE_M": block_m,
+                    "BLOCK_SIZE_N": block_n,
                     "BLOCK_SIZE_K": block_k,
                     "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
-                    "NUM_SMEM_BUFFERS": 4, "NUM_TMEM_BUFFERS": 2,
-                    "NUM_MMA_GROUPS": 2, "EPILOGUE_SUBTILE": 8,
-                    "NUM_CTAS": 1, "SPLIT_K": split_k,
-                    "ctas_per_cga": None, "pre_hook": _SENTINEL_HOOK,
+                    "NUM_SMEM_BUFFERS": 4,
+                    "NUM_TMEM_BUFFERS": 2,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 8,
+                    "NUM_CTAS": 1,
+                    "SPLIT_K": split_k,
+                    "ctas_per_cga": None,
+                    "pre_hook": _SENTINEL_HOOK,
                 }
             else:
                 return {
-                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n,
+                    "BLOCK_SIZE_M": block_m,
+                    "BLOCK_SIZE_N": block_n,
                     "BLOCK_SIZE_K": block_k,
                     "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
-                    "NUM_SMEM_BUFFERS": 4, "NUM_TMEM_BUFFERS": 3,
-                    "NUM_MMA_GROUPS": 2, "EPILOGUE_SUBTILE": 1,
-                    "NUM_CTAS": 1, "SPLIT_K": split_k,
-                    "ctas_per_cga": None, "pre_hook": _SENTINEL_HOOK,
+                    "NUM_SMEM_BUFFERS": 4,
+                    "NUM_TMEM_BUFFERS": 3,
+                    "NUM_MMA_GROUPS": 2,
+                    "EPILOGUE_SUBTILE": 1,
+                    "NUM_CTAS": 1,
+                    "SPLIT_K": split_k,
+                    "ctas_per_cga": None,
+                    "pre_hook": _SENTINEL_HOOK,
                 }
 
     if is_gpu_saturated:
         return {
-            "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
-            "NUM_SMEM_BUFFERS": 3, "NUM_TMEM_BUFFERS": 1,
-            "NUM_MMA_GROUPS": 2, "EPILOGUE_SUBTILE": 4,
-            "NUM_CTAS": 1, "SPLIT_K": 1,
-            "ctas_per_cga": None, "pre_hook": _SENTINEL_HOOK,
+            "NUM_SMEM_BUFFERS": 3,
+            "NUM_TMEM_BUFFERS": 1,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": 4,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
+            "ctas_per_cga": None,
+            "pre_hook": _SENTINEL_HOOK,
         }
 
     # Fallback candidate scoring
@@ -216,13 +252,16 @@ def original_get_heuristic_config(M, N, K, num_sms=148):
             best_score = adjusted_score
             best_waves = waves
             best_config = {
-                "BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk,
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
                 "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
                 "EPILOGUE_SUBTILE": epilogue_subtile,
-                "NUM_CTAS": num_ctas, "SPLIT_K": split_k,
+                "NUM_CTAS": num_ctas,
+                "SPLIT_K": split_k,
                 "ctas_per_cga": (num_ctas, 1, 1) if num_ctas > 1 else None,
                 "pre_hook": _SENTINEL_HOOK,
             }
@@ -259,12 +298,18 @@ def new_get_heuristic_config(M, N, K, num_sms=148):
 # ---------------------------------------------------------------------------
 
 _CONFIG_KEYS = [
-    "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K",
-    "GROUP_SIZE_M", "NUM_SMEM_BUFFERS", "NUM_TMEM_BUFFERS",
-    "NUM_MMA_GROUPS", "EPILOGUE_SUBTILE", "NUM_CTAS", "SPLIT_K",
+    "BLOCK_SIZE_M",
+    "BLOCK_SIZE_N",
+    "BLOCK_SIZE_K",
+    "GROUP_SIZE_M",
+    "NUM_SMEM_BUFFERS",
+    "NUM_TMEM_BUFFERS",
+    "NUM_MMA_GROUPS",
+    "EPILOGUE_SUBTILE",
+    "NUM_CTAS",
+    "SPLIT_K",
     "ctas_per_cga",
 ]
-
 
 # ---------------------------------------------------------------------------
 # Test shapes: a representative grid
@@ -300,9 +345,7 @@ def test_equivalence(M, N, K):
     for key in _CONFIG_KEYS:
         old_val = old[key]
         new_val = new[key]
-        assert old_val == new_val, (
-            f"Shape ({M},{N},{K}): mismatch on {key}: "
-            f"old={old_val}, new={new_val}\n"
-            f"  old config: { {k: old[k] for k in _CONFIG_KEYS} }\n"
-            f"  new config: { {k: new[k] for k in _CONFIG_KEYS} }"
-        )
+        assert old_val == new_val, (f"Shape ({M},{N},{K}): mismatch on {key}: "
+                                    f"old={old_val}, new={new_val}\n"
+                                    f"  old config: { {k: old[k] for k in _CONFIG_KEYS} }\n"
+                                    f"  new config: { {k: new[k] for k in _CONFIG_KEYS} }")

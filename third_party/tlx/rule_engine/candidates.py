@@ -26,9 +26,14 @@ class CandidateScorer:
         with open(path) as f:
             spec = yaml.safe_load(f)
 
+        for key in ("inputs", "hardware", "configs"):
+            if key not in spec:
+                raise ValueError(f"Missing required key '{key}' in {path}")
+
         self.inputs: list[str] = spec["inputs"]
         self.hardware: dict[str, int] = spec["hardware"]
         self.configs: list[dict] = spec["configs"]
+        self.scoring: str = spec.get("scoring", "wave_efficiency")
 
     # ------------------------------------------------------------------
     # Resource estimation (mirrors the Python originals exactly)
@@ -129,9 +134,7 @@ class CandidateScorer:
                 k_tiles = math.ceil(K / bk)
                 for sk in [8, 4, 2]:
                     if k_tiles >= sk and k_tiles // sk >= 4:
-                        sk_score, sk_ctas, sk_waves = self._compute_wave_score(
-                            M, N, bm, bn, num_ctas, num_sms, sk
-                        )
+                        sk_score, sk_ctas, sk_waves = self._compute_wave_score(M, N, bm, bn, num_ctas, num_sms, sk)
                         if sk_score < score or (sk_score == score and sk_ctas > total_ctas):
                             score, total_ctas, waves, split_k = sk_score, sk_ctas, sk_waves, sk
                         break  # Use the first valid split-K
@@ -140,11 +143,9 @@ class CandidateScorer:
             score_slack = 0.1
             adjusted_score = score
 
-            if (
-                adjusted_score < best_score - score_slack
-                or (adjusted_score < best_score + score_slack and waves < best_waves)
-                or (adjusted_score < best_score + score_slack and waves == best_waves and num_ctas > 1)
-            ):
+            if (adjusted_score < best_score - score_slack
+                    or (adjusted_score < best_score + score_slack and waves < best_waves)
+                    or (adjusted_score < best_score + score_slack and waves == best_waves and num_ctas > 1)):
                 best_score = adjusted_score
                 best_waves = waves
                 best_config = dict(cfg)

@@ -27,7 +27,13 @@ class RuleEngine:
         with open(path) as f:
             spec = yaml.safe_load(f)
 
+        for key in ("inputs", "rules"):
+            if key not in spec:
+                raise ValueError(f"Missing required key '{key}' in {path}")
+
         self.inputs: list[str] = spec["inputs"]
+        # Features are evaluated in insertion order (Python 3.7+ / PyYAML
+        # guarantee), so later features can reference earlier ones.
         self.features: dict[str, str] = spec.get("features", {})
         self.rules: list[dict] = spec["rules"]
 

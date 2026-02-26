@@ -17,7 +17,12 @@ import math
 
 
 def select(cond, if_true, if_false):
-    """Ternary helper: returns if_true when cond is truthy, else if_false."""
+    """Ternary helper: returns if_true when cond is truthy, else if_false.
+
+    NOTE: Both branches are eagerly evaluated (standard Python call semantics).
+    Do not rely on short-circuit behaviour — e.g. ``select(N > 0, M / N, 0)``
+    will raise ZeroDivisionError when N == 0.  Guard with ``max(N, 1)`` instead.
+    """
     return if_true if cond else if_false
 
 

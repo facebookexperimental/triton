@@ -10,8 +10,10 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rule_engine import CandidateScorer, RuleEngine
+_TLX_DIR = str(Path(__file__).resolve().parent.parent)
+if _TLX_DIR not in sys.path:
+    sys.path.insert(0, _TLX_DIR)
+from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
 
 # Track which (M, N, K) shapes have already printed their heuristic config
 _printed_heuristic_configs = set()
@@ -19,16 +21,6 @@ _printed_heuristic_configs = set()
 _CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 _rules_engine = RuleEngine(_CONFIGS_DIR / "blackwell_gemm_ws_rules.yaml")
 _candidate_scorer = CandidateScorer(_CONFIGS_DIR / "blackwell_gemm_ws_candidates.yaml")
-
-
-def _gemm_post_process(config, M, N):
-    """Add Python-specific fields that don't belong in YAML."""
-    block_m = config["BLOCK_SIZE_M"]
-    num_ctas = config["NUM_CTAS"]
-    config["GROUP_SIZE_M"] = _select_group_size_m(M, N, block_m)
-    config["ctas_per_cga"] = (num_ctas, 1, 1) if num_ctas > 1 else None
-    config["pre_hook"] = matmul_tma_set_block_size_hook
-    return config
 
 
 def get_heuristic_config(M, N, K, num_sms=148):
@@ -130,6 +122,16 @@ def matmul_tma_set_block_size_hook(nargs):
     ]
     if nargs.get("SPLIT_K", 1) > 1:
         nargs["c_desc"].base.zero_()
+
+
+def _gemm_post_process(config, M, N):
+    """Add Python-specific fields that don't belong in YAML."""
+    block_m = config["BLOCK_SIZE_M"]
+    num_ctas = config["NUM_CTAS"]
+    config["GROUP_SIZE_M"] = _select_group_size_m(M, N, block_m)
+    config["ctas_per_cga"] = (num_ctas, 1, 1) if num_ctas > 1 else None
+    config["pre_hook"] = matmul_tma_set_block_size_hook
+    return config
 
 
 @triton.jit

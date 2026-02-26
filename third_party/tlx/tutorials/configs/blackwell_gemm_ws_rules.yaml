@@ -2,10 +2,13 @@ version: 1
 
 inputs: [M, N, K, num_sms]
 
-# Derived features, evaluated top-to-bottom.
+# Derived features, evaluated top-to-bottom (insertion order matters —
+# later features may reference earlier ones).
 # Expression language: arithmetic (+,-,*,/,//,%), comparisons (>,<,>=,<=,==,!=),
 # boolean (and, or, not), builtins: min, max, ceil, floor, abs,
-# select(cond, if_true, if_false)
+# select(cond, if_true, if_false)  — NOTE: select() eagerly evaluates both
+# branches, so guard divisions with max(x, 1) instead of relying on
+# short-circuit (e.g. select(N > 0, M / N, 0) will raise when N == 0).
 features:
   mn_ratio:             "M / max(N, 1)"
   is_tall_m:            "mn_ratio > 4"
