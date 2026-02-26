@@ -379,6 +379,15 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
+      // For barriers used in warp specialization (InitBarrierOp), extend
+      // liveness to the entire function. Barriers are initialized at the
+      // start and may be used across multiple sequential warp-specialized
+      // loops. Without this, two barriers in different loops could get the
+      // same allocation offset, causing corruption when both are initialized.
+      if (hasOpOfAnyTypeInForwardSlice<ttng::InitBarrierOp>(defOp)) {
+        minId = 0;
+        maxId = operationId.size();
+      }
       return Interval(minId, maxId);
     };
 

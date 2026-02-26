@@ -371,7 +371,23 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
   Operation *lookupPt = &rewriter.getInsertionBlock()->front();
   int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
   int numWarps = triton::gpu::lookupNumWarps(lookupPt);
+
+  // For the mask, use the total number of warps if available (for warp
+  // specialization). This ensures threads beyond the original numWarps are
+  // not incorrectly masked to lower thread IDs.
   int upperBound = numWarps * threadsPerWarp;
+  if (auto mod = lookupPt->getParentOfType<ModuleOp>()) {
+    if (auto totalNumWarps =
+            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {
+      upperBound = totalNumWarps.getInt() * threadsPerWarp;
+    }
+  }
+
+  // Round up to power of 2 for the mask (required for LLVM known bits
+  // analysis).
+  if (!llvm::isPowerOf2_32(upperBound)) {
+    upperBound = llvm::NextPowerOf2(upperBound);
+  }
 
   TritonLLVMOpBuilder b(loc, rewriter);
 
@@ -382,7 +398,6 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
     tid = rewriter.create<arith::SubIOp>(loc, tid, b.i32_val(*startId));
   }
 
-  assert(llvm::isPowerOf2_32(upperBound));
   // help LLVM's known bits analysis:
   tid = b.and_(tid, b.i32_val(upperBound - 1));
 
