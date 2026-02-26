@@ -1593,8 +1593,60 @@ void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
       edgeLabel += "\\n(SMEM)";
     }
 
+    // Mark cross-stage channels: source and destination in different
+    // pipeline stages.
+    auto srcStageAttr =
+        srcOp->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+    auto dstStageAttr =
+        dstOp->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+    if (srcStageAttr && dstStageAttr) {
+      int srcStage = srcStageAttr.getValue().getSExtValue();
+      int dstStage = dstStageAttr.getValue().getSExtValue();
+      if (srcStage != dstStage) {
+        edgeLabel += "\\n[CROSS-STAGE s" + std::to_string(srcStage) + "->s" +
+                     std::to_string(dstStage) + "]";
+        style = "dashed";
+        color = "purple";
+      }
+    }
+
     os << "  " << srcId << " -> " << dstId << " [label=\"" << edgeLabel
        << "\", color=" << color << ", style=" << style << "];\n";
+
+    // Draw additional edges for other destinations that are in a different
+    // stage from the source (cross-stage consumers not already shown).
+    if (srcOp) {
+      auto srcSA = srcOp->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+      if (srcSA) {
+        int srcS = srcSA.getValue().getSExtValue();
+        SmallVector<Operation *> allDsts;
+        bool canGetDsts = true;
+        if (ch->channelKind == DataChannelKind::TMEMPost) {
+          auto *tmCh = static_cast<ttng::TmemDataChannelPost *>(ch.get());
+          if (tmCh->isOperandD)
+            canGetDsts = false;
+        }
+        if (canGetDsts)
+          ch->getDstOps(allDsts);
+        for (Operation *extraDst : allDsts) {
+          if (extraDst == dstOp)
+            continue;
+          auto dstSA =
+              extraDst->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+          if (!dstSA)
+            continue;
+          int dstS = dstSA.getValue().getSExtValue();
+          if (srcS != dstS) {
+            std::string extraDstId = "op_" + getNodeId(extraDst);
+            std::string extraLabel =
+                "ch" + std::to_string(ch->uniqID) + "\\n[CROSS-STAGE s" +
+                std::to_string(srcS) + "->s" + std::to_string(dstS) + "]";
+            os << "  " << srcId << " -> " << extraDstId << " [label=\""
+               << extraLabel << "\", color=purple, style=dashed];\n";
+          }
+        }
+      }
+    }
   }
 
   os << "}\n";
