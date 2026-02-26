@@ -19,6 +19,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
@@ -378,8 +379,11 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
 static void logOpStillHasUsers(Operation *op) {
   LLVM_DEBUG({
     llvm::errs() << "Op still has users: " << op->getName();
-    if (auto partitionAttr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
-      llvm::errs() << " (partition: " << partitionAttr.getInt() << ")";
+    if (auto partitionAttr =
+            op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+      assert(partitionAttr.size() == 1 &&
+             "expected exactly 1 partition element");
+      llvm::errs() << " (partition: " << partitionAttr[0] << ")";
     }
     auto taskIds = getAsyncTaskIds(op);
     if (!taskIds.empty()) {
@@ -412,8 +416,10 @@ static void logOpStillHasUsers(Operation *op) {
         // llvm::errs() << "  Full IR: ";
         // user->print(llvm::errs());
         if (auto userPartitionAttr =
-                user->getAttrOfType<IntegerAttr>("ttg.partition")) {
-          llvm::errs() << " (partition: " << userPartitionAttr.getInt() << ")";
+                user->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+          assert(userPartitionAttr.size() == 1 &&
+                 "expected exactly 1 partition element");
+          llvm::errs() << " (partition " << userPartitionAttr[0] << ")";
         }
         auto userTaskIds = getAsyncTaskIds(user);
         if (!userTaskIds.empty()) {
