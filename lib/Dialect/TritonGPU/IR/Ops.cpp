@@ -763,6 +763,10 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("bulk mode does not support other");
     if (getResult().getType().getRank() != 1)
       return emitOpError("bulk mode requires 1D result memdesc");
+  } else {
+    if (!isa<RankedTensorType>(getSrc().getType()))
+      return emitOpError("non-bulk mode requires src to be a ranked tensor of "
+                         "pointers");
   }
   return success();
 }

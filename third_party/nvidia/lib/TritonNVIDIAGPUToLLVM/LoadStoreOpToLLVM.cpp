@@ -1122,9 +1122,15 @@ struct AsyncCopyGlobalToLocalOpConversion
       auto dstTy = op.getResult().getType();
       Type llvmElemTy = getTypeConverter()->convertType(dstTy.getElementType());
 
-      // Extract base pointer: first element of the unpacked src pointer tensor
-      auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-      Value basePtr = srcElems[0];
+      // Extract base pointer from src (scalar ptr or first element of ptr
+      // tensor)
+      Value basePtr;
+      if (isa<RankedTensorType>(op.getSrc().getType())) {
+        auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+        basePtr = srcElems[0];
+      } else {
+        basePtr = adaptor.getSrc();
+      }
 
       // Get shared memory destination base address
       auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
@@ -1172,7 +1178,7 @@ struct AsyncCopyGlobalToLocalOpConversion
     Value other = op.getOther();
     auto funcOp = op->getParentOfType<FunctionOpInterface>();
 
-    auto srcTy = op.getSrc().getType();
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
     auto dstTy = op.getResult().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
 
