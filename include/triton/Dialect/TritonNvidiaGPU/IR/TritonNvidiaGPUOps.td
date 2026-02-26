@@ -930,16 +930,16 @@ def TTNG_AsyncBulkCopyLocalToGlobalOp : TTNG_Op<"async_bulk_copy_local_to_global
     Copies `size` bytes from shared memory to global memory using
     cp.async.bulk.global.shared::cta.bulk_group. Completion tracked
     via cp.async.bulk.commit_group / cp.async.bulk.wait_group.
+    The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
   }];
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
     Arg<TT_Ptr, "", [MemWrite<GlobalMemory>]>:$dst,
-    I32:$size,
-    I1:$pred
+    I32:$size
   );
 
   let assemblyFormat = [{
-    $src `,` $dst `,` $size `,` $pred
+    $src `,` $dst `,` $size
     attr-dict `:` qualified(type($src)) `,` qualified(type($dst))
   }];
 }

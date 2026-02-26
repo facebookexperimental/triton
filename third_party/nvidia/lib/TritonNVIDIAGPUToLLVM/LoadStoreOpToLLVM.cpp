@@ -1984,9 +1984,12 @@ struct AsyncBulkCopyLocalToGlobalOpConversion
         loc, adaptor.getSrc(), llvmElemTy, rewriter);
     Value srcBase = srcMemObj.getBase();
 
-    Value pred = adaptor.getPred();
     Value dstPtr = adaptor.getDst();
     Value size = adaptor.getSize();
+
+    // Auto-generate predicate: threadIdx.x == 0
+    Value tid = getThreadId(rewriter, loc);
+    Value pred = b.icmp_eq(tid, b.i32_val(0));
 
     // @pred cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], $3;
     ::mlir::triton::PTXBuilder ptxBuilder;

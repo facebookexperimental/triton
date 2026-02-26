@@ -6031,16 +6031,13 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
         bar = bars[0]
         buf = smem[0]
 
-        tid = tlx.thread_id(0)
-        pred = (tid == 0)
-
         # gmem -> smem (bulk async_load)
         tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
         tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
         tlx.barrier_wait(bar, 0)
 
         # smem -> gmem
-        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE, pred)
+        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE)
         tlx.async_descriptor_store_wait(0)
 
     size = CHUNK_SIZE
@@ -6087,9 +6084,7 @@ def test_async_load_bulk(CHUNK_SIZE, device):
         tlx.barrier_wait(bar, 0)
 
         # Write back to gmem via smem->gmem bulk copy
-        tid = tlx.thread_id(0)
-        pred = (tid == 0)
-        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE, pred)
+        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE)
         tlx.async_descriptor_store_wait(0)
 
     size = CHUNK_SIZE
@@ -6135,9 +6130,7 @@ def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
         tlx.async_load(src_ptr, buf, bulk=True, bulk_size=CHUNK_SIZE, barrier=bar)
         tlx.barrier_wait(bar, 0)
 
-        tid = tlx.thread_id(0)
-        pred = (tid == 0)
-        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE, pred)
+        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE)
         tlx.async_descriptor_store_wait(0)
 
     size = CHUNK_SIZE
