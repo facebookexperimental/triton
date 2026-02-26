@@ -234,6 +234,17 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
       op->setAttr("async_task_id", taskIds.getTaskIds());
     }
   });
+  // Re-propagate allTasks to ForOp loop bounds after the solver. The solver
+  // may have overridden constants with a narrower set of tasks. We also do
+  // this before the solver in case the bounds are not constants.
+  funcOp.walk([&](scf::ForOp op) {
+    if (auto *defOp = op.getLowerBound().getDefiningOp())
+      addAsyncTaskIds(defOp, allTasks);
+    if (auto *defOp = op.getUpperBound().getDefiningOp())
+      addAsyncTaskIds(defOp, allTasks);
+    if (auto *defOp = op.getStep().getDefiningOp())
+      addAsyncTaskIds(defOp, allTasks);
+  });
   // The parent operations must have the union of their children's operations.
   // We do this in a separate walk to avoid having a parent operation treated
   // like an anchor op and skipped by the first walk.
