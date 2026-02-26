@@ -264,6 +264,8 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
+  if (isa<DescriptorOpInterface>(op))
+    return true;
   if (isa<LoadOp, StoreOp>(op))
     return isExpensiveLoadOrStore(op);
   // local_load is expensive as it reads from shared memory with specific layout

@@ -3573,8 +3573,7 @@ def test_async_tasks_region_error(device):
     with pytest.raises(triton.CompilationError) as e:
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
-    assert "ZeroDivisionError('division by zero')" in exc_msg, ("\n\nExpected ZeroDivisionError but got: \n\n" +
-                                                                exc_msg + "\n\n")
+    assert "division by zero" in exc_msg, ("\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

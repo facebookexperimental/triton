@@ -283,11 +283,14 @@ def test_blackwell_fa_ws_pipelined():
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent():
-    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"]
+def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE):
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"].copy()
+    config["RESCALE_OPT"] = RESCALE_OPT
+    config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
-    causal = True
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
