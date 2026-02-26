@@ -752,6 +752,18 @@ LogicalResult LocalLoadOp::verify() {
 LogicalResult AsyncCopyGlobalToLocalOp::verify() {
   if (!getResult().getType().getMutableMemory())
     return emitOpError("Cannot store into immutable memory");
+  if (getUseBulk()) {
+    if (!getBulkSize())
+      return emitOpError("bulk mode requires bulkSize");
+    if (!getBarrier())
+      return emitOpError("bulk mode requires barrier");
+    if (getMask())
+      return emitOpError("bulk mode does not support mask");
+    if (getOther())
+      return emitOpError("bulk mode does not support other");
+    if (getResult().getType().getRank() != 1)
+      return emitOpError("bulk mode requires 1D result memdesc");
+  }
   return success();
 }
 
