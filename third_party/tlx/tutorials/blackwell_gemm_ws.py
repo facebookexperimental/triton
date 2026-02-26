@@ -32,13 +32,19 @@ def get_heuristic_config(M, N, K, num_sms=148):
     2. MN tiles vs SM count determines parallelization strategy (Split-K vs data-parallel)
     3. Arithmetic intensity determines pipeline depth
 
+    Disabled by default.  Set ``TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG=1``
+    to enable the rule engine; otherwise falls through to Triton's autotuning.
+
     Args:
         M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
         num_sms: Number of SMs on the GPU (default 148 for B200)
 
     Returns:
-        dict: Configuration parameters for the TLX GEMM kernel
+        dict: Configuration parameters for the TLX GEMM kernel,
+        or ``None`` if disabled or no rule matches.
     """
+    if os.environ.get("TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG") != "1":
+        return None
     config = _rules_engine.evaluate(M=M, N=N, K=K, num_sms=num_sms)
     if config is None:
         config = _candidate_scorer.evaluate(M=M, N=N, K=K, num_sms=num_sms)
