@@ -36,7 +36,7 @@ configs = [
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
         },
-        num_stages=0,
+        num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     ),
@@ -298,7 +298,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                     m = tlx.local_load(m_tiles[cid * HEAD_DIM + 2])
                     tlx.barrier_arrive(qk_empties[cid])
                     m += tl.math.log2(l)
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
                     tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
 
@@ -628,8 +628,13 @@ def attention(q, k, v, sm_scale, causal, config=None):
 
     # Apply pre_hook to set block shapes
     nargs = {
-        **config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o,
-        "FP8_OUTPUT": q.dtype == torch.float8_e5m2
+        **config,
+        "HEAD_DIM": HEAD_DIM_K,
+        "desc_q": desc_q,
+        "desc_k": desc_k,
+        "desc_v": desc_v,
+        "desc_o": desc_o,
+        "FP8_OUTPUT": q.dtype == torch.float8_e5m2,
     }
     _host_descriptor_pre_hook(nargs)
 

@@ -6,6 +6,7 @@
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -220,8 +221,19 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     }
     // TODO(Arda): Ideally front-end should not allow constant ops to be
     // annotated. Anchor constants cause problems.
+    bool isScalarArithOrMath =
+        isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
+        llvm::none_of(op->getResultTypes(),
+                      [](Type t) { return isa<RankedTensorType>(t); });
+    bool isAnchor = !isScalarArithOrMath && op->hasAttr("async_task_id");
     if (!taskIds.isUninitialized() &&
-        (isa<arith::ConstantOp>(op) || !op->hasAttr("async_task_id"))) {
+        (isa<arith::ConstantOp>(op) || !isAnchor)) {
+      // For non-anchor ops with existing annotations, merge the lattice
+      // value with the annotation to preserve the original task assignment.
+      if (auto existing =
+              op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
+        taskIds = ttg::TaskId::meet(taskIds, ttg::TaskId(existing));
+      }
       op->setAttr("async_task_id", taskIds.getTaskIds());
     }
   });

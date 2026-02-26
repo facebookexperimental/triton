@@ -12,13 +12,28 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 def alloc_fn(size: int, align: int, stream: Optional[int]):
     assert align == 128
     assert stream == 0
-    return torch.empty(size, dtype=torch.int8, device='cuda')
+    return torch.empty(size, dtype=torch.int8, device="cuda")
 
 
 @triton.jit
-def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, stride_bn, c_ptr, stride_cm, stride_cn,
-                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                              OUT_DTYPE: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+def tcgen5_dot_kernel2cta_tma(
+    a_ptr,
+    stride_am,
+    stride_ak,
+    b_ptr,
+    stride_bk,
+    stride_bn,
+    c_ptr,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -116,8 +131,15 @@ def matmul(a, b, config=None):
     BLOCK_M, BLOCK_N, BLOCK_K = (128, 128, 128)
 
     kern_kwargs = {
-        'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'num_stages': 0, 'ctas_per_cga': (4, 2, 1)
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_K": BLOCK_K,
+        "BLOCK_N": BLOCK_N,
+        "OUT_DTYPE": tl.float32,
+        "M": M,
+        "N": N,
+        "K": K,
+        "num_stages": 1,
+        "ctas_per_cga": (4, 2, 1),
     }
     _ = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](a, a.stride(0), a.stride(1), b, b.stride(0),
                                                                 b.stride(1), c, c.stride(0), c.stride(1), **kern_kwargs)
