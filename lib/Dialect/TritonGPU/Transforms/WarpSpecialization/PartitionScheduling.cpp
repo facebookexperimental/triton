@@ -719,6 +719,7 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
 //===----------------------------------------------------------------------===//
 
 namespace mlir::triton::gpu {
+#define GEN_PASS_DECL_TRITONGPUPARTITIONSCHEDULING
 #define GEN_PASS_DEF_TRITONGPUPARTITIONSCHEDULING
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 } // namespace mlir::triton::gpu
