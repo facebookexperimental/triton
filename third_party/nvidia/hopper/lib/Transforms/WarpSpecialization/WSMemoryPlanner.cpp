@@ -951,6 +951,65 @@ public:
         return failure();
       bufferId = *result;
     }
+    // Post-processing: maximize TMEM utilization by increasing buffer.copy
+    // for TMEM allocs in round-robin until we approach the 512-column limit.
+    {
+      constexpr unsigned tmemColLimit = 512;
+
+      struct TMemAllocInfo {
+        ttng::TMEMAllocOp alloc;
+        unsigned baseCols;
+        unsigned copy;
+      };
+      SmallVector<TMemAllocInfo> allocInfos;
+
+      unsigned totalCols = 0;
+      for (auto alloc : allocs) {
+        ttng::TMemAllocation allocSize =
+            ttng::getTmemAllocSizes(alloc.getType());
+        unsigned baseCols = allocSize.numCols;
+        unsigned copy = 1;
+        if (auto copyAttr = alloc->getAttrOfType<IntegerAttr>("buffer.copy"))
+          copy = copyAttr.getInt();
+        allocInfos.push_back({alloc, baseCols, copy});
+        totalCols += baseCols * copy;
+      }
+
+      if (totalCols < tmemColLimit && !allocInfos.empty()) {
+        unsigned numAllocs = allocInfos.size();
+        unsigned consecutiveSkips = 0;
+        unsigned idx = 0;
+        while (consecutiveSkips < numAllocs) {
+          auto &info = allocInfos[idx];
+          if (totalCols + info.baseCols <= tmemColLimit) {
+            info.copy += 1;
+            totalCols += info.baseCols;
+            consecutiveSkips = 0;
+          } else {
+            consecutiveSkips++;
+          }
+          idx = (idx + 1) % numAllocs;
+        }
+      }
+
+      for (auto &info : allocInfos) {
+        info.alloc->setAttr(
+            "buffer.copy",
+            IntegerAttr::get(IntegerType::get(info.alloc->getContext(), 32),
+                             info.copy));
+      }
+
+      LLVM_DEBUG({
+        DBGS() << "TMEM multi-buffering post-processing: totalCols = "
+               << totalCols << " / " << tmemColLimit << "\n";
+        for (auto &info : allocInfos) {
+          DBGS() << "  baseCols=" << info.baseCols << " copy=" << info.copy
+                 << ": ";
+          info.alloc->dump();
+        }
+      });
+    }
+
     return success();
   }
 
@@ -1301,7 +1360,7 @@ public:
         alloc.getOperation()->dump();
       });
 
-      // FIXME: heuristics
+      // Initial buffer.copy = 1; post-processing in run() may increase this.
       alloc.getOperation()->setAttr(
           "buffer.copy",
           IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
