@@ -1,0 +1,175 @@
+version: 1
+
+inputs: [M, N, K, num_sms]
+
+# Derived features, evaluated in list order (each feature may reference
+# inputs and any feature defined above it).
+#
+# Expression language (spec version 1):
+#   Arithmetic : +, -, *, /, //, %, **
+#   Comparisons: >, <, >=, <=, ==, !=
+#   Boolean    : and, or, not
+#   Builtins   : min, max, ceil, floor, abs
+#   Literals   : True, False, integers, floats
+#   Ternary    : select(cond, if_true, if_false)
+#
+# NOTE: select() eagerly evaluates both branches (standard call semantics).
+# Guard divisions with max(x, 1) instead of relying on short-circuit
+# (e.g. select(N > 0, M / N, 0) will raise when N == 0).
+#
+# Integer division (//) is floor division (rounds toward negative infinity),
+# matching Python semantics.
+#
+# Config values starting with "$" are resolved as variable references
+# (e.g. SPLIT_K: "$large_split_k" resolves to the computed feature value).
+# Literal strings starting with "$" are not supported.
+features:
+  - name: mn_ratio
+    expr: "M / max(N, 1)"
+  - name: is_tall_m
+    expr: "mn_ratio > 4"
+  - name: is_tall_n
+    expr: "mn_ratio < 0.25"
+  - name: ref_bm
+    expr: "select(is_tall_m, 256, select(is_tall_n, 128, 256))"
+  - name: ref_bn
+    expr: "select(is_tall_m, 128, select(is_tall_n, 256, 256))"
+  - name: num_mn_tiles
+    expr: "ceil(M / ref_bm) * ceil(N / ref_bn)"
+  - name: gpu_saturated
+    expr: "num_mn_tiles >= num_sms"
+  - name: undersaturated
+    expr: "num_mn_tiles < num_sms"
+  - name: arithmetic_intensity
+    expr: "K / max(min(M, N), 1)"
+  - name: mn_product
+    expr: "M * N"
+  - name: is_large_output
+    expr: "mn_product >= 1000000"
+
+  # Split-K feature computation for undersaturated shapes.
+  # The original code tries [4, 2, 8] in order; large_output uses bk=64, small uses bk=128.
+  - name: large_k_tiles
+    expr: "ceil(K / 64)"
+  - name: small_k_tiles
+    expr: "ceil(K / 128)"
+
+  # For large-output undersaturated: bk=64, try [4, 2, 8]
+  - name: large_sk4_ok
+    expr: "large_k_tiles >= 4 and large_k_tiles // 4 >= 4"
+  - name: large_sk2_ok
+    expr: "large_k_tiles >= 2 and large_k_tiles // 2 >= 4"
+  - name: large_sk8_ok
+    expr: "large_k_tiles >= 8 and large_k_tiles // 8 >= 4"
+  - name: large_split_k
+    expr: "select(large_sk4_ok, 4, select(large_sk2_ok, 2, select(large_sk8_ok, 8, 1)))"
+
+  # For small-output undersaturated: bk=128, try [4, 2, 8]
+  - name: small_sk4_ok
+    expr: "small_k_tiles >= 4 and small_k_tiles // 4 >= 4"
+  - name: small_sk2_ok
+    expr: "small_k_tiles >= 2 and small_k_tiles // 2 >= 4"
+  - name: small_sk8_ok
+    expr: "small_k_tiles >= 8 and small_k_tiles // 8 >= 4"
+  - name: small_split_k
+    expr: "select(small_sk4_ok, 4, select(small_sk2_ok, 2, select(small_sk8_ok, 8, 1)))"
+
+# Ordered rules, first match wins.
+rules:
+  # ---- Characteristic 1: Tall-M saturated shapes ----
+  - name: tall_m_saturated_low_intensity
+    when:
+      - "is_tall_m"
+      - "gpu_saturated"
+      - "arithmetic_intensity <= 1.5"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 128
+      NUM_SMEM_BUFFERS: 2
+      NUM_TMEM_BUFFERS: 2
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 1
+      NUM_CTAS: 2
+      SPLIT_K: 1
+
+  - name: tall_m_saturated_high_intensity_large_k
+    when:
+      - "is_tall_m"
+      - "gpu_saturated"
+      - "arithmetic_intensity > 1.5"
+      - "K > N * 2"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 256
+      BLOCK_SIZE_K: 128
+      NUM_SMEM_BUFFERS: 2
+      NUM_TMEM_BUFFERS: 1
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 4
+      NUM_CTAS: 2
+      SPLIT_K: 1
+
+  - name: tall_m_saturated_high_intensity_small_k
+    when:
+      - "is_tall_m"
+      - "gpu_saturated"
+      - "arithmetic_intensity > 1.5"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 256
+      BLOCK_SIZE_K: 64
+      NUM_SMEM_BUFFERS: 4
+      NUM_TMEM_BUFFERS: 1
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 4
+      NUM_CTAS: 2
+      SPLIT_K: 1
+
+  # ---- Characteristic 2: Undersaturated shapes needing Split-K ----
+  - name: undersaturated_large_output_split_k
+    when:
+      - "undersaturated"
+      - "is_large_output"
+      - "large_split_k > 1"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 64
+      NUM_SMEM_BUFFERS: 4
+      NUM_TMEM_BUFFERS: 2
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 8
+      NUM_CTAS: 1
+      SPLIT_K: "$large_split_k"
+
+  - name: undersaturated_small_output_split_k
+    when:
+      - "undersaturated"
+      - "not is_large_output"
+      - "small_split_k > 1"
+    config:
+      BLOCK_SIZE_M: 128
+      BLOCK_SIZE_N: 64
+      BLOCK_SIZE_K: 128
+      NUM_SMEM_BUFFERS: 4
+      NUM_TMEM_BUFFERS: 3
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 1
+      NUM_CTAS: 1
+      SPLIT_K: "$small_split_k"
+
+  # ---- Characteristic 3: GPU-saturated (non-tall-M) ----
+  - name: saturated_balanced
+    when:
+      - "gpu_saturated"
+    config:
+      BLOCK_SIZE_M: 256
+      BLOCK_SIZE_N: 256
+      BLOCK_SIZE_K: 64
+      NUM_SMEM_BUFFERS: 3
+      NUM_TMEM_BUFFERS: 1
+      NUM_MMA_GROUPS: 2
+      EPILOGUE_SUBTILE: 4
+      NUM_CTAS: 1
+      SPLIT_K: 1
