@@ -1,6 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization | FileCheck %s --check-prefix=CHECK --check-prefix=BASE
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization -tritongpu-pipeline | FileCheck %s --check-prefix=CHECK --check-prefix=PIPELINE
-// XFAIL: *
 
 #indices_layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -36,14 +35,13 @@ tt.func @matmul_change_desc_in_prologue(
   // PIPELINE-COUNT-1: tc_gen5_mma
   // PIPELINE-NOT: tc_gen5_mma
   // CHECK-LABEL: partition1
-  // CHECK-SAME: num_warps(2)
+  // CHECK-SAME: num_warps(1)
   // BASE-COUNT-2: tt.make_tensor_descriptor
   // PIPELINE-COUNT-2: ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 512 : i32}
   // PIPELINE-COUNT-2: ttng.tensormap_create
   // PIPELINE-NOT: ttng.tensormap_create
   // PIPELINE-COUNT-2: async_tma_copy_global_to_local
   // PIPELINE-NOT: async_tma_copy_global_to_local
-  // CHECK-NOT: partition2
   scf.for %k = %c0_i32 to %k_tiles step %c1_i32 iter_args(%acc = %zero, %flag = %true, %a_desc = %a_desc_undef, %b_desc = %b_desc_undef) -> (tensor<128x128xf32, #acc_layout>, i1, !tt.tensordesc<tensor<128x64xf16, #shared>>, !tt.tensordesc<tensor<64x128xf16, #shared>>) : i32 {
     %do_prologue = "prologue_cond"(%k) : (i32) -> i1
     %cur_a_desc, %cur_b_desc = scf.if %do_prologue -> (!tt.tensordesc<tensor<128x64xf16, #shared>>, !tt.tensordesc<tensor<64x128xf16, #shared>>) {
@@ -94,7 +92,6 @@ tt.func @matmul_tma_acc_with_conditional_def_and_use(
   // CHECK-SAME: num_warps(2)
   // CHECK: [[INDICES:%.*]] = tt.splat %{{.*}} : i32 -> tensor<128xi32,
   // CHECK: ttng.async_tma_gather %{{.*}}[[[INDICES]],
-  // CHECK-NOT: partition2
   scf.for %k = %c0_i32 to %k_tiles step %c1_i32 iter_args(%acc = %zero, %flag = %true) -> (tensor<128x128xf32, #acc_layout>, i1) : i32 {
     %off_m, %off_n, %off_k = "get_offsets"(%k) : (i32) -> (i32, i32, i32)
     %indices = tt.splat %off_m : i32 -> tensor<128xi32, #indices_layout>
@@ -136,7 +133,6 @@ tt.func @matmul_tma_and_regular_load(
   // CHECK-SAME: num_warps(4)
   // CHECK: [[INDICES:%.*]] = tt.splat %{{.*}} : i32 -> tensor<128xi32,
   // CHECK: ttng.async_tma_gather %{{.*}}[[[INDICES]],
-  // CHECK-NOT: partition2
   scf.for %k = %c0_i32 to %k_tiles step %c1_i32 iter_args(%acc = %zero, %flag = %true, %b_ptr = %b_ptr_init) -> (tensor<128x128xf32, #acc_layout>, i1, tensor<64x128x!tt.ptr<f16>, #b_layout>) : i32 {
     %off_m, %offs_n, %off_k = "get_offsets"(%k) : (i32) -> (i32, tensor<64x128xi32, #b_layout>, i32)
     %indices = tt.splat %off_m : i32 -> tensor<128xi32, #indices_layout>
