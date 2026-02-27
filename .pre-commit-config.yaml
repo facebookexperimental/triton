@@ -1,7 +1,7 @@
 default_stages: [pre-commit, pre-push, manual]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-symlinks
       - id: destroyed-symlinks
@@ -18,7 +18,7 @@ repos:
       - id: debug-statements
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.1
+    rev: v0.13.0
     hooks:
       - id: ruff
         files: '(^python|^third_party/proton|^third_party/amd|^third_party/nvidia|^third_party/tlx|^test)/.*'
@@ -35,12 +35,12 @@ repos:
         args: ["-p", "-i"]
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v19.1.6
+    rev: v21.1.1
     hooks:
       - id: clang-format
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: "v1.15.0"
+    rev: "v1.18.1"
     hooks:
       - id: mypy
         pass_filenames: false
