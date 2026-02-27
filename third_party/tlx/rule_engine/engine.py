@@ -15,6 +15,7 @@ Typical usage::
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -168,13 +169,16 @@ def _codegen_evaluate(inputs, features, rules, path):
     input_args = ", ".join(inputs)
     lines.append(f"def _evaluate({input_args}, {builtin_defaults}):")
 
+    # Pre-compile patterns for renaming builtin calls to their _prefixed
+    # local versions (e.g. max( -> _max().  Word-boundary match avoids
+    # corrupting names like estimate_max or remax.
+    builtin_patterns = [(re.compile(rf"\b{name}\("), f"_{name}(") for name in callable_builtins]
+
     # Feature assignments — each becomes a local variable.
     for name, expr in features:
-        # Replace bare builtin calls with their _prefixed local versions
-        # (e.g. max -> _max) so they use the fast default-arg locals.
         local_expr = expr
-        for builtin_name in callable_builtins:
-            local_expr = local_expr.replace(f"{builtin_name}(", f"_{builtin_name}(")
+        for pattern, replacement in builtin_patterns:
+            local_expr = pattern.sub(replacement, local_expr)
         lines.append(f"    {name} = {local_expr}")
 
     # Rules as if/elif chain.
