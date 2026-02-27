@@ -177,11 +177,26 @@ def make_namespace(variables):
     return ns
 
 
-def eval_expr(expr, variables):
-    """Evaluate a single expression string in a restricted namespace.
+def compile_expr(expr):
+    """Compile an expression string to a code object for fast repeated eval.
+
+    Call this once at load time, then pass the result to ``eval_expr``.
 
     Args:
         expr: A Python expression string (e.g. "M / max(N, 1)").
+
+    Returns:
+        A compiled code object.
+    """
+    return compile(expr, f"<expr: {expr}>", "eval")
+
+
+def eval_expr(expr, variables):
+    """Evaluate an expression in a restricted namespace.
+
+    Args:
+        expr: A Python expression string or a pre-compiled code object
+              (from ``compile_expr``).
         variables: dict of names → values available to the expression.
 
     Returns:

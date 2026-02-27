@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from .expr import eval_expr, validate_expr
+from .expr import compile_expr, eval_expr, validate_expr
 
 _SUPPORTED_VERSION = 1
 
@@ -164,6 +164,14 @@ class RuleEngine:
 
         _validate_spec(self.inputs, self.features, self.rules, path)
 
+        # Pre-compile all expressions to bytecode so evaluate() only
+        # executes pre-compiled code objects (no per-call parsing).
+        self._compiled_features = [(name, compile_expr(expr)) for name, expr in self.features]
+        self._compiled_rules = [{
+            "when": [compile_expr(cond) for cond in rule["when"]],
+            "config": rule["config"],
+        } for rule in self.rules]
+
     def evaluate(self, **kwargs) -> dict | None:
         """Evaluate features, then return the first matching rule's config.
 
@@ -184,12 +192,12 @@ class RuleEngine:
 
         variables = {k: kwargs[k] for k in self.inputs}
 
-        # Compute derived features in list order.
-        for name, expr in self.features:
-            variables[name] = eval_expr(expr, variables)
+        # Compute derived features in list order (using pre-compiled code).
+        for name, code in self._compiled_features:
+            variables[name] = eval_expr(code, variables)
 
-        # First-match rule evaluation.
-        for rule in self.rules:
+        # First-match rule evaluation (using pre-compiled conditions).
+        for rule in self._compiled_rules:
             conditions = rule["when"]
             if all(eval_expr(cond, variables) for cond in conditions):
                 config = dict(rule["config"])
