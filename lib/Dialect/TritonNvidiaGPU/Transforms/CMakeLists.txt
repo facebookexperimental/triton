@@ -10,6 +10,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   RemoveTMEMTokens.cpp
   TensorMemoryAllocation.cpp
   TMALowering.cpp
+  TMAStoreBufferReuse.cpp
   TMAUtilities.cpp
   Utility.cpp
 
