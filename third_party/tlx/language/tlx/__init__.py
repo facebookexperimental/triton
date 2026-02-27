@@ -19,7 +19,7 @@ from .dynamic_launch import (
 )
 from .mem_ops import (
     allocate_tensor_descriptor,
-    async_bulk_copy_smem_to_gmem,
+    async_store,
     async_descriptor_load,
     async_descriptor_store,
     async_descriptor_store_wait,
@@ -109,7 +109,7 @@ __all__ = [
     "tensor_descriptor_ptr",
     "tensor_descriptor_ptr_type",
     # mem_ops
-    "async_bulk_copy_smem_to_gmem",
+    "async_store",
     "local_alloc",
     "local_view",
     "remote_view",

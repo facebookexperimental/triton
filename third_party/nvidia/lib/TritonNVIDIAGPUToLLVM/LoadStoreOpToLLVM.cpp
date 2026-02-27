@@ -1970,14 +1970,12 @@ struct AsyncCommitGroupOpConversion
   }
 };
 
-struct AsyncBulkCopyLocalToGlobalOpConversion
-    : public ConvertOpToLLVMPattern<
-          triton::nvidia_gpu::AsyncBulkCopyLocalToGlobalOp> {
+struct AsyncStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncStoreOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
   LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::AsyncBulkCopyLocalToGlobalOp op,
-                  OpAdaptor adaptor,
+  matchAndRewrite(triton::nvidia_gpu::AsyncStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -2050,5 +2048,5 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
       typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMAReduceOpConversion, AsyncTMAGatherOpConversion,
                AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion,
-               AsyncBulkCopyLocalToGlobalOpConversion>(typeConverter, benefit);
+               AsyncStoreOpConversion>(typeConverter, benefit);
 }

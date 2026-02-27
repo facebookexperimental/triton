@@ -6087,7 +6087,7 @@ def test_vote_ballot_sync_ir_emission(device):
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
 def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
-    """Test gmem->smem->gmem roundtrip using async_load(bulk=True) and async_bulk_copy_smem_to_gmem."""
+    """Test gmem->smem->gmem roundtrip using async_load(bulk=True) and async_store."""
 
     @triton.jit
     def bulk_copy_kernel(
@@ -6106,7 +6106,7 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
         tlx.barrier_wait(bar, 0)
 
         # smem -> gmem
-        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
         tlx.async_descriptor_store_wait(0)
 
     size = CHUNK_SIZE
@@ -6119,7 +6119,7 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
     ttgir = kernel.asm["ttgir"]
     assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
     assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
-    assert "ttng.async_bulk_copy_local_to_global" in ttgir, ("Expected async_bulk_copy_local_to_global in TTGIR")
+    assert "ttng.async_store" in ttgir, ("Expected async_store in TTGIR")
 
     # Verify PTX contains the bulk copy instructions
     ptx = kernel.asm["ptx"]
@@ -6153,7 +6153,7 @@ def test_async_load_bulk(CHUNK_SIZE, device):
         tlx.barrier_wait(bar, 0)
 
         # Write back to gmem via smem->gmem bulk copy
-        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
         tlx.async_descriptor_store_wait(0)
 
     size = CHUNK_SIZE
@@ -6199,7 +6199,7 @@ def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
         tlx.async_load(src_ptr, buf, bulk=True, bulk_size=CHUNK_SIZE, barrier=bar)
         tlx.barrier_wait(bar, 0)
 
-        tlx.async_bulk_copy_smem_to_gmem(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
         tlx.async_descriptor_store_wait(0)
 
     size = CHUNK_SIZE

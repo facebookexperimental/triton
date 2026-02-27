@@ -924,8 +924,8 @@ def TTNG_TensormapCreateOp: TTNG_Op<
   let hasVerifier = 1;
 }
 
-def TTNG_AsyncBulkCopyLocalToGlobalOp : TTNG_Op<"async_bulk_copy_local_to_global"> {
-  let summary = "1D async bulk copy from shared to global memory";
+def TTNG_AsyncStoreOp : TTNG_Op<"async_store"> {
+  let summary = "Async store from shared to global memory";
   let description = [{
     Copies `size` bytes from shared memory to global memory using
     cp.async.bulk.global.shared::cta.bulk_group. Completion tracked

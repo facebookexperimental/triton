@@ -816,7 +816,7 @@ def async_descriptor_store(
 
 
 @tl.builtin
-def async_bulk_copy_smem_to_gmem(
+def async_store(
     dst_global_ptr: tl.tensor,
     src_smem: tlx.buffered_tensor,
     size: tl.tensor,
@@ -841,7 +841,7 @@ def async_bulk_copy_smem_to_gmem(
         size_handle = size.handle
     else:
         size_handle = _semantic._convert_elem_to_ir_value(size, require_i64=False)
-    _semantic.builder.create_async_bulk_copy_local_to_global(src_smem.handle, dst_global_ptr.handle, size_handle)
+    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle)
 
 
 @tl.builtin
