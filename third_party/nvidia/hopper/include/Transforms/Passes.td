@@ -21,7 +21,7 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
            "int32_t", /*default*/"3",
            "number of buffers for warp specialization">,
     Option<"capability", "capability",
-           "int32_t", /*default*/"10",
+           "int32_t", /*default*/"100",
            "NVIDIA compute capability">,
     Option<"pingpongAutoWS", "pingpong-auto-ws",
            "bool", /*default*/"false",
