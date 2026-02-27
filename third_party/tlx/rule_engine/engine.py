@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from .expr import compile_expr, eval_expr, validate_expr
+from .expr import _BUILTINS, validate_expr
 
 _SUPPORTED_VERSION = 1
 
@@ -140,6 +140,72 @@ def _validate_spec(inputs, features, rules, path):
                                      f"Valid names: {sorted(known_names)}")
 
 
+def _codegen_evaluate(inputs, features, rules, path):
+    """Generate a Python function from features and rules.
+
+    Produces a single ``_evaluate(input1, input2, ...)`` function whose body
+    is equivalent to the original inline ``if/elif`` chain.  Compiled once
+    at ``RuleEngine.__init__`` time so that ``evaluate()`` runs at the same
+    speed as hand-written Python — no per-expression ``eval()`` calls, no
+    namespace dict construction, just pre-compiled bytecode with local
+    variable lookups.
+
+    Args:
+        inputs: List of input variable names.
+        features: List of (name, expr) tuples in evaluation order.
+        rules: List of rule dicts with 'when' and 'config' keys.
+        path: File path (used as the code object's filename for tracebacks).
+
+    Returns:
+        A callable ``(input1, input2, ...) -> dict | None``.
+    """
+    lines = []
+
+    # Function signature: inputs as positional args, builtins as default
+    # args for fast local lookup (avoids global/closure overhead).
+    callable_builtins = [name for name, val in _BUILTINS.items() if callable(val)]
+    builtin_defaults = ", ".join(f"_{name}={name}" for name in callable_builtins)
+    input_args = ", ".join(inputs)
+    lines.append(f"def _evaluate({input_args}, {builtin_defaults}):")
+
+    # Feature assignments — each becomes a local variable.
+    for name, expr in features:
+        # Replace bare builtin calls with their _prefixed local versions
+        # (e.g. max -> _max) so they use the fast default-arg locals.
+        local_expr = expr
+        for builtin_name in callable_builtins:
+            local_expr = local_expr.replace(f"{builtin_name}(", f"_{builtin_name}(")
+        lines.append(f"    {name} = {local_expr}")
+
+    # Rules as if/elif chain.
+    first = True
+    for rule in rules:
+        keyword = "if" if first else "elif"
+        first = False
+        condition = " and ".join(f"({c})" for c in rule["when"])
+        lines.append(f"    {keyword} {condition}:")
+
+        # Build the return dict.
+        config_parts = []
+        for key, val in rule["config"].items():
+            if isinstance(val, str) and val.startswith("$"):
+                # $variable reference — use the local variable directly.
+                config_parts.append(f"            {key!r}: {val[1:]},")
+            else:
+                config_parts.append(f"            {key!r}: {val!r},")
+        lines.append("        return {")
+        lines.extend(config_parts)
+        lines.append("        }")
+
+    lines.append("    return None")
+
+    source = "\n".join(lines)
+    code = compile(source, str(path), "exec")
+    namespace = dict(_BUILTINS)
+    exec(code, namespace)  # noqa: S102
+    return namespace["_evaluate"]
+
+
 class RuleEngine:
     """Declarative, first-match rule evaluator driven by a YAML file."""
 
@@ -164,13 +230,9 @@ class RuleEngine:
 
         _validate_spec(self.inputs, self.features, self.rules, path)
 
-        # Pre-compile all expressions to bytecode so evaluate() only
-        # executes pre-compiled code objects (no per-call parsing).
-        self._compiled_features = [(name, compile_expr(expr)) for name, expr in self.features]
-        self._compiled_rules = [{
-            "when": [compile_expr(cond) for cond in rule["when"]],
-            "config": rule["config"],
-        } for rule in self.rules]
+        # Generate and compile a single Python function from the YAML spec.
+        # This runs at the same speed as hand-written inline Python.
+        self._evaluate_fn = _codegen_evaluate(self.inputs, self.features, self.rules, path)
 
     def evaluate(self, **kwargs) -> dict | None:
         """Evaluate features, then return the first matching rule's config.
@@ -190,21 +252,4 @@ class RuleEngine:
             raise ValueError(f"Missing required inputs: {missing}. "
                              f"Expected: {self.inputs}")
 
-        variables = {k: kwargs[k] for k in self.inputs}
-
-        # Compute derived features in list order (using pre-compiled code).
-        for name, code in self._compiled_features:
-            variables[name] = eval_expr(code, variables)
-
-        # First-match rule evaluation (using pre-compiled conditions).
-        for rule in self._compiled_rules:
-            conditions = rule["when"]
-            if all(eval_expr(cond, variables) for cond in conditions):
-                config = dict(rule["config"])
-                # Resolve "$var_name" references in config values.
-                for key, val in config.items():
-                    if isinstance(val, str) and val.startswith("$"):
-                        config[key] = variables[val[1:]]
-                return config
-
-        return None
+        return self._evaluate_fn(**{k: kwargs[k] for k in self.inputs})
