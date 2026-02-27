@@ -10,7 +10,7 @@
 #shared_T = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 
 #smem = #ttg.shared_memory
-#tmem_acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, unpacked = true>
+#tmem_acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
@@ -18,7 +18,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // The partition scheduling pass should add ttg.partition.types attribute to the ForOp
 // CHECK-LABEL: @simple_gemm_partition_types
 // CHECK: scf.for
-// CHECK-SAME: ttg.partition.types
+// CHECK: ttg.partition.types
 tt.func public @simple_gemm_partition_types(
   %A_shared: !ttg.memdesc<128x64xf16, #shared, #smem>,
   %B_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
