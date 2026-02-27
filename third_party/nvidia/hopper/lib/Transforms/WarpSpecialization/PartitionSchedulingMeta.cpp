@@ -13,11 +13,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
-#include <fstream>
-#include <sstream>
 
 using namespace mlir;
 using namespace triton;
@@ -28,12 +25,6 @@ namespace ttng = triton::nvidia_gpu;
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 namespace {
-
-/// Check if DOT file dumping is enabled via environment variable.
-static bool shouldDumpDotFile() {
-  static bool enabled = std::getenv("TRITON_DUMP_PARTITION_DOT") != nullptr;
-  return enabled;
-}
 
 //===----------------------------------------------------------------------===//
 // Op Categories and Scheduling Template Infrastructure
@@ -105,52 +96,9 @@ collectMMABackwardSlice(scf::ForOp loop, ttng::MMAv5OpInterface mmaOp) {
   return slice;
 }
 
-/// Get color for an operation category.
-static StringRef getOpColorForCategory(OpCategory cat) {
-  switch (cat) {
-  case OpCategory::MMA:
-    return "lightgreen";
-  case OpCategory::Load:
-    return "lightblue";
-  case OpCategory::EpilogueStore:
-    return "lightyellow";
-  case OpCategory::LocalAlloc:
-  case OpCategory::MemDescView:
-    return "lightgray";
-  case OpCategory::DataPartition:
-    return "lightcyan";
-  case OpCategory::Correction:
-    return "lightpink";
-  case OpCategory::TMAReduction:
-    return "pink";
-  case OpCategory::Shared:
-  case OpCategory::Default:
-    return "white";
-  }
-  return "white";
-}
-
-/// Get color for an operation based on its type.
-static StringRef getOpColor(Operation *op) {
-  // Assign color based on operation type
-  if (isa<ttng::TCGen5MMAOp>(op))
-    return "lightgreen";
-  if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
-    return "lightblue";
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(op))
-    return "lightyellow";
-  if (isa<LocalAllocOp>(op))
-    return "lightgray";
-  if (isa<DescriptorStoreOp>(op))
-    return "orange";
-  if (isa<ttng::AsyncTMAReduceOp>(op))
-    return "pink";
-  return "white";
-}
-
 //===----------------------------------------------------------------------===//
-// DOT File Dumping for Partition Visualization
-//===----------------------------------------------------------------------===//
+// Debug Utilities
+//==-----------------------------------------------------------------====//
 
 /// Get the loop depth of an operation.
 static unsigned getLoopDepth(Operation *op) {
@@ -162,73 +110,6 @@ static unsigned getLoopDepth(Operation *op) {
     parent = parent->getParentOp();
   }
   return depth;
-}
-
-/// Check if an operation is a "key" operation for visualization.
-static bool isKeyOperation(Operation *op) {
-  // TMA loads
-  if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(op))
-    return true;
-  // MMAs
-  if (isa<ttng::TCGen5MMAOp>(op))
-    return true;
-  // TMA stores
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(op))
-    return true;
-  // MemDesc allocs
-  if (isa<LocalAllocOp>(op))
-    return true;
-  // Descriptor stores
-  if (isa<DescriptorStoreOp>(op))
-    return true;
-  // Descriptor reduces (TMA atomic reductions)
-  if (isa<DescriptorReduceOp>(op))
-    return true;
-  // Dot operations and local memory ops
-  if (isa<DotOp, LocalLoadOp, LocalStoreOp>(op))
-    return true;
-  return false;
-}
-
-/// Get a short label for an operation.
-static std::string getOpLabel(Operation *op) {
-  std::string label;
-  llvm::raw_string_ostream os(label);
-
-  // Get operation name without dialect prefix for brevity
-  StringRef opName = op->getName().getStringRef();
-  size_t dotPos = opName.rfind('.');
-  if (dotPos != StringRef::npos)
-    opName = opName.substr(dotPos + 1);
-
-  os << opName;
-
-  // Add tensor type info for loads
-  if (auto tmaLoad = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-    if (auto descType = tmaLoad.getDesc().getType()) {
-      os << "\\n";
-      // Print element type if available
-      if (auto ptrType = dyn_cast<PointerType>(descType)) {
-        if (auto tensorType =
-                dyn_cast<RankedTensorType>(ptrType.getPointeeType())) {
-          os << "[";
-          for (unsigned i = 0; i < tensorType.getRank(); i++) {
-            if (i > 0)
-              os << "x";
-            os << tensorType.getDimSize(i);
-          }
-          os << "]";
-        }
-      }
-    }
-  }
-
-  // Add shape info for MMA
-  if (auto mma = dyn_cast<ttng::TCGen5MMAOp>(op)) {
-    os << "\\n[MxNxK]";
-  }
-
-  return label;
 }
 
 /// Get a one-line pretty representation of an operation for debug printing.
@@ -286,7 +167,6 @@ static std::string prettyOp(Operation *op) {
   return result;
 }
 
-/// Get color for an operation based on its type.
 //===----------------------------------------------------------------------===//
 // Scheduling Templates (Unified Approach)
 //===----------------------------------------------------------------------===//
@@ -350,17 +230,8 @@ public:
   virtual Partition *getPartition(AbstractPartition absPart,
                                   unsigned dpId = 0) = 0;
 
-  /// Get the epilogue partition (for scheduling epilogue stores).
-  virtual Partition *getEpiloguePartition() = 0;
-
   /// Get the template name for debugging.
   virtual StringRef getName() const = 0;
-
-  /// Get template options.
-  virtual const TemplateOptions &getOptions() const = 0;
-
-  /// Get the abstract partition name for a physical partition (for debugging).
-  virtual std::string getPartitionName(Partition *partition) const = 0;
 };
 
 /// Unified Flash Attention template using general partition rules.
@@ -434,34 +305,7 @@ public:
     llvm_unreachable("Unknown abstract partition");
   }
 
-  Partition *getEpiloguePartition() override { return epiloguePartition; }
   StringRef getName() const override { return "UnifiedFA"; }
-  const TemplateOptions &getOptions() const override { return options; }
-
-  std::string getPartitionName(Partition *partition) const override {
-    if (partition == defaultPartition && defaultPartition != nullptr) {
-      // Default holds load users; if correction is merged here, show that
-      if (correctionPartition == defaultPartition)
-        return "default+correction";
-      return "default";
-    }
-    if (partition == gemmPartition)
-      return "gemm";
-    if (partition == loadPartition)
-      return "load";
-    if (partition == reductionPartition && options.hasReduction)
-      return "reduction";
-    if (partition == epiloguePartition)
-      return "epilogue";
-    for (unsigned i = 0; i < computationPartitions.size(); ++i) {
-      if (partition == computationPartitions[i]) {
-        if (computationPartitions.size() == 1)
-          return "computation";
-        return "computation[" + std::to_string(i) + "]";
-      }
-    }
-    return "dynamic";
-  }
 
 private:
   TemplateOptions options;
@@ -498,24 +342,7 @@ public:
     }
   }
 
-  Partition *getEpiloguePartition() override { return epiloguePartition; }
   StringRef getName() const override { return "GEMM"; }
-  const TemplateOptions &getOptions() const override {
-    static TemplateOptions defaultOpts;
-    return defaultOpts;
-  }
-
-  std::string getPartitionName(Partition *partition) const override {
-    if (partition == defaultPartition)
-      return "default";
-    if (partition == gemmPartition)
-      return "gemm";
-    if (partition == loadPartition)
-      return "load";
-    if (partition == epiloguePartition)
-      return "epilogue";
-    return "dynamic";
-  }
 
 private:
   Partition *defaultPartition = nullptr;
@@ -523,30 +350,6 @@ private:
   Partition *loadPartition = nullptr;
   Partition *epiloguePartition = nullptr;
 };
-
-/// Map from old OpCategory to new AbstractPartition.
-static AbstractPartition toAbstractPartition(OpCategory cat) {
-  switch (cat) {
-  case OpCategory::MMA:
-  case OpCategory::MemDescView:
-    return AbstractPartition::Gemm;
-  case OpCategory::Load:
-  case OpCategory::LocalAlloc:
-    return AbstractPartition::Load;
-  case OpCategory::EpilogueStore:
-    return AbstractPartition::Epilogue;
-  case OpCategory::Correction:
-    return AbstractPartition::Correction;
-  case OpCategory::TMAReduction:
-    return AbstractPartition::Reduction;
-  case OpCategory::DataPartition:
-    return AbstractPartition::Computation;
-  case OpCategory::Shared:
-  case OpCategory::Default:
-    return AbstractPartition::Default;
-  }
-  return AbstractPartition::Default;
-}
 
 //===----------------------------------------------------------------------===//
 // OpCategorizer - Categorizes operations for scheduling (Analysis Only)
@@ -589,23 +392,6 @@ public:
     categorizeCorrectionOps();
   }
 
-  /// Get the category for an operation.
-  OpCategory getCategory(Operation *op) const {
-    auto it = opCategories.find(op);
-    return it != opCategories.end() ? it->second.category : OpCategory::Default;
-  }
-
-  /// Get full categorization info for an operation.
-  const CategorizedOp *getCategorizedOp(Operation *op) const {
-    auto it = opCategories.find(op);
-    return it != opCategories.end() ? &it->second : nullptr;
-  }
-
-  /// Get all categorized operations.
-  const DenseMap<Operation *, CategorizedOp> &getAllOps() const {
-    return opCategories;
-  }
-
   /// Get operations in a specific category.
   SmallVector<CategorizedOp> getOpsInCategory(OpCategory cat) const {
     SmallVector<CategorizedOp> result;
@@ -621,45 +407,6 @@ public:
 
   /// Get all MMAs.
   ArrayRef<ttng::MMAv5OpInterface> getMMAs() const { return mmas; }
-
-  /// Get all loops (nested + main).
-  ArrayRef<scf::ForOp> getLoops() const { return loops; }
-
-  /// Get loads and their associated allocs.
-  ArrayRef<Operation *> getLoadsAndAllocs() const { return loadsAndAllocs; }
-
-  /// Get the data partition ID for a specific MMA operation.
-  /// Returns -1 if the MMA is not part of data partitioning.
-  int getDataPartitionIdForMMA(Operation *mma) const {
-    if (dataPartitionFactor <= 1)
-      return -1;
-
-    // Iterate through mmaToSlice to find the partition ID
-    unsigned partitionId = 0;
-    for (auto &[mmaOp, slice] : mmaToSlice) {
-      if (mmaOp == mma)
-        return partitionId;
-      partitionId++;
-    }
-    return -1;
-  }
-
-  /// Print categorization summary (counts only) for debugging.
-  void printSummary() const {
-    llvm::errs() << "[OpCategorizer] Summary:\n";
-    llvm::errs() << "  Loops: " << loops.size() << "\n";
-    llvm::errs() << "  MMAs: " << mmas.size() << "\n";
-    llvm::errs() << "  Data partition factor: " << dataPartitionFactor << "\n";
-
-    // Count ops per category
-    DenseMap<OpCategory, unsigned> counts;
-    for (auto &[op, catOp] : opCategories) {
-      counts[catOp.category]++;
-    }
-    for (auto &[cat, count] : counts) {
-      llvm::errs() << "  " << toString(cat) << ": " << count << "\n";
-    }
-  }
 
   /// Pretty-print all categorized ops grouped by category.
   void printCategorizedOps(llvm::raw_ostream &os) const {
@@ -943,245 +690,8 @@ private:
   DenseMap<Operation *, CategorizedOp> opCategories;
   DenseMap<Operation *, SetVector<Operation *>> mmaToSlice;
   DenseSet<Operation *> sharedOps;
-  SmallVector<Operation *> loadsAndAllocs;
   unsigned dataPartitionFactor = 1;
-  bool isBackwardPass = false;
 };
-
-/// Dump partitions to a DOT file for visualization.
-/// Uses OpCategorizer to get category and data partition information.
-static void dumpPartitionsToDot(const WarpSchedule &schedule, scf::ForOp loop,
-                                const OpCategorizer *categorizer,
-                                const SchedulingTemplate *tmpl,
-                                StringRef filename = "partitions.dot") {
-  std::error_code EC;
-  llvm::raw_fd_ostream file(filename, EC, llvm::sys::fs::OF_Text);
-  if (EC) {
-    llvm::errs() << "Error opening file " << filename << ": " << EC.message()
-                 << "\n";
-    return;
-  }
-
-  file << "digraph Partitions {\n";
-  file << "  rankdir=TB;\n";
-  file << "  node [shape=box, style=filled, fontsize=10];\n";
-  file << "  compound=true;\n";
-  file << "  newrank=true;\n\n";
-
-  // Assign a global program-order ID to every op in the schedule.
-  DenseMap<Operation *, unsigned> opOrder;
-  unsigned orderCounter = 0;
-
-  // Walk all ops in the function to assign order IDs.
-  Operation *loopOp = loop.getOperation();
-  for (Operation &op : *loopOp->getBlock()) {
-    if (&op == loopOp) {
-      // Walk ops inside the loop body (including nested regions).
-      loop.getBody()->walk(
-          [&](Operation *innerOp) { opOrder[innerOp] = orderCounter++; });
-      continue;
-    }
-    opOrder[&op] = orderCounter++;
-  }
-
-  // Collect ops per partition using partition.getOps() (same as
-  // printPartitionAssignments).
-  DenseMap<const Partition *, SmallVector<Operation *>> partitionOps;
-  for (const Partition &partition : schedule.getPartitions()) {
-    for (Operation *op : partition.getOps()) {
-      partitionOps[&partition].push_back(op);
-    }
-  }
-
-  // Partition fill colors (cycle through a palette).
-  const char *partColors[] = {"#e8f4fd", "#e8fde8", "#fde8e8", "#fdf8e8",
-                              "#f0e8fd", "#e8fdfa", "#fde8f0", "#eee8fd"};
-  const unsigned numColors = sizeof(partColors) / sizeof(partColors[0]);
-
-  unsigned nodeCounter = 0;
-
-  // Create clusters for each partition, all ops ordered vertically by opOrder.
-  for (const Partition &partition : schedule.getPartitions()) {
-    unsigned pIdx = partition.getIndex();
-    std::string partName;
-    if (tmpl)
-      partName = tmpl->getPartitionName(const_cast<Partition *>(&partition));
-    else
-      partName = "partition " + std::to_string(pIdx);
-
-    file << "  subgraph cluster_" << pIdx << " {\n";
-    file << "    label=\"P" << pIdx << " [" << partName << "] (stage "
-         << partition.getStage() << ")\";\n";
-    file << "    style=filled;\n";
-    file << "    color=\"#888888\";\n";
-    file << "    fillcolor=\"" << partColors[pIdx % numColors] << "\";\n";
-    file << "    fontsize=12;\n\n";
-
-    auto it = partitionOps.find(&partition);
-    if (it == partitionOps.end()) {
-      file << "    empty_" << pIdx
-           << " [label=\"(empty)\", fillcolor=white];\n";
-      file << "  }\n\n";
-      continue;
-    }
-
-    // Sort ops by program-order ID and filter out clutter ops.
-    SmallVector<Operation *> ops;
-    for (Operation *op : it->second) {
-      // Skip layout/shape manipulation ops and loop ops.
-      if (isa<BroadcastOp, ConvertLayoutOp, JoinOp, ReshapeOp, SplitOp,
-              scf::ForOp>(op))
-        continue;
-      // Always include key operations (MMA, Load, Store, etc.)
-      if (isKeyOperation(op)) {
-        ops.push_back(op);
-        continue;
-      }
-      // Skip scalar operations (ops that don't produce tensor/memdesc results).
-      bool isScalarOp = true;
-      for (Value result : op->getResults()) {
-        Type ty = result.getType();
-        if (isa<RankedTensorType, MemDescType>(ty)) {
-          isScalarOp = false;
-          break;
-        }
-      }
-      if (isScalarOp && op->getNumResults() > 0)
-        continue;
-      ops.push_back(op);
-    }
-    llvm::sort(ops, [&](Operation *a, Operation *b) {
-      return opOrder[a] < opOrder[b];
-    });
-
-    // Emit a node for every op, with invisible edges for vertical ordering.
-    SmallVector<std::string> nodeIds;
-    for (Operation *op : ops) {
-      std::string nodeId = "op_" + std::to_string(nodeCounter++);
-      nodeIds.push_back(nodeId);
-
-      unsigned id = opOrder[op];
-      unsigned depth = getLoopDepth(op);
-
-      // Short op name (after last '.')
-      StringRef opName = op->getName().getStringRef();
-      size_t dotPos = opName.rfind('.');
-      std::string shortName = (dotPos != StringRef::npos)
-                                  ? opName.substr(dotPos + 1).str()
-                                  : opName.str();
-
-      // Result shape info
-      std::string shapeStr;
-      if (op->getNumResults() > 0) {
-        Type ty = op->getResult(0).getType();
-        llvm::raw_string_ostream sos(shapeStr);
-        if (auto tensorTy = dyn_cast<RankedTensorType>(ty)) {
-          sos << "<";
-          for (unsigned d = 0; d < tensorTy.getRank(); d++) {
-            if (d > 0)
-              sos << "x";
-            sos << tensorTy.getDimSize(d);
-          }
-          sos << ">";
-        } else if (auto memDescTy = dyn_cast<MemDescType>(ty)) {
-          sos << "<md ";
-          for (unsigned d = 0; d < memDescTy.getRank(); d++) {
-            if (d > 0)
-              sos << "x";
-            sos << memDescTy.getShape()[d];
-          }
-          sos << ">";
-        }
-      }
-
-      // Category info
-      std::string categoryInfo;
-      if (categorizer) {
-        if (const auto *catOp = categorizer->getCategorizedOp(op)) {
-          categoryInfo = toString(catOp->category).str();
-          if (catOp->category == OpCategory::DataPartition)
-            categoryInfo += " dp=" + std::to_string(catOp->dataPartitionId);
-        }
-      }
-
-      // Node color: key ops get their special color, others are white.
-      StringRef color =
-          isKeyOperation(op) ? getOpColor(op) : StringRef("white");
-
-      // Label: "#ID shortName <shape> [category] (depth=N)"
-      file << "    " << nodeId << " [label=\"#" << id << " " << shortName;
-      if (!shapeStr.empty())
-        file << " " << shapeStr;
-      if (!categoryInfo.empty())
-        file << "\\n[" << categoryInfo << "]";
-      file << "\\n(depth=" << depth << ")\", fillcolor=" << color << "];\n";
-    }
-
-    // Invisible edges to enforce vertical ordering within the partition.
-    for (unsigned i = 1; i < nodeIds.size(); ++i) {
-      file << "    " << nodeIds[i - 1] << " -> " << nodeIds[i]
-           << " [style=invis];\n";
-    }
-
-    file << "  }\n\n";
-  }
-
-  file << "}\n";
-
-  llvm::errs() << "Dumped partition graph to " << filename << "\n";
-}
-
-/// Pretty-print partition assignments showing key ops in each partition.
-/// This gives a human-readable view of the scheduling result.
-static void printPartitionAssignments(const WarpSchedule &schedule,
-                                      scf::ForOp loop,
-                                      const OpCategorizer *categorizer,
-                                      const SchedulingTemplate *tmpl,
-                                      llvm::raw_ostream &os) {
-  os << "=== Partition Assignments ===\n";
-  os << "  Partitions: "
-     << std::distance(schedule.getPartitions().begin(),
-                      schedule.getPartitions().end())
-     << "\n";
-
-  for (const Partition &partition : schedule.getPartitions()) {
-    SmallVector<Operation *> keyOps;
-    unsigned otherCount = 0;
-
-    for (Operation *op : partition.getOps()) {
-      if (isKeyOperation(op))
-        keyOps.push_back(op);
-      else
-        otherCount++;
-    }
-
-    os << "  P" << partition.getIndex() << " (stage " << partition.getStage()
-       << ")";
-    // Print abstract partition name from the template
-    if (tmpl) {
-      std::string name =
-          tmpl->getPartitionName(const_cast<Partition *>(&partition));
-      os << " [" << name << "]";
-    }
-    if (keyOps.empty() && otherCount == 0) {
-      os << ": (empty)\n";
-      continue;
-    }
-    os << ":\n";
-
-    for (Operation *op : keyOps) {
-      os << "    " << prettyOp(op);
-      if (categorizer) {
-        auto it = categorizer->getAllOps().find(op);
-        if (it != categorizer->getAllOps().end())
-          os << " [" << toString(it->second.category) << "]";
-      }
-      os << "\n";
-    }
-    if (otherCount > 0)
-      os << "    (" << otherCount << " other ops)\n";
-  }
-}
 
 /// Select the appropriate scheduling template based on the categorized ops.
 /// Uses unified template approach - no forward/backward distinction needed.
@@ -1357,36 +867,6 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
   return false;
 }
 
-//===----------------------------------------------------------------------===//
-// Data Partition Detection
-// Recursively schedule the dependencies of an operation, stopping when
-// encountering an operation that is already assigned.
-static void scheduleDependencies(scf::ForOp loop, WarpSchedule &schedule,
-                                 Partition *partition, Operation *op) {
-  SmallVector<Value> deps;
-  for (Value value : getNestedOperands(op)) {
-    if (isa<RankedTensorType, MemDescType>(value.getType()))
-      deps.push_back(value);
-  }
-
-  while (!deps.empty()) {
-    Value dep = deps.pop_back_val();
-
-    if (auto arg = dyn_cast<BlockArgument>(dep)) {
-      if (arg.getOwner() == loop.getBody() && arg != loop.getInductionVar())
-        deps.push_back(loop.getYieldedValues()[arg.getArgNumber() - 1]);
-      continue;
-    }
-
-    Operation *defOp =
-        loop.getBody()->findAncestorOpInBlock(*dep.getDefiningOp());
-    if (!defOp || !hasDefPartition(loop, defOp, schedule) ||
-        !schedule.trySchedule(partition, defOp))
-      continue;
-    llvm::append_range(deps, getNestedOperands(defOp));
-  }
-}
-
 // Recursively schedule the users of an operation, stopping when
 // encountering an operation that is already assigned.
 // If \p partition is null, a new partition will be created if needed.
@@ -1494,10 +974,7 @@ getInitialSchedule(scf::ForOp mainLoop,
   OpCategorizer categorizer(mainLoop, mmas);
   categorizer.categorize();
 
-  // Print categorized ops if DOT dumping is enabled
-  if (shouldDumpDotFile()) {
-    categorizer.printCategorizedOps(llvm::errs());
-  }
+  LLVM_DEBUG(categorizer.printCategorizedOps(llvm::dbgs()));
 
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   llvm::errs() << "[tritongpu-partition-scheduling] Using template-based "
@@ -1817,18 +1294,6 @@ getInitialSchedule(scf::ForOp mainLoop,
     }
   }
 
-  // Print partition assignments if DOT dumping is enabled
-  if (shouldDumpDotFile()) {
-    printPartitionAssignments(schedule, loops.back(), &categorizer, tmpl.get(),
-                              llvm::errs());
-  }
-
-  // Dump partitions to DOT file if enabled
-  if (shouldDumpDotFile()) {
-    dumpPartitionsToDot(schedule, loops.back(), &categorizer, tmpl.get(),
-                        "/tmp/partition_scheduling.dot");
-  }
-
   // When epilogue is merged into computation, post-loop ops should be
   // assigned to the computation partition (not the default partition).
   // For bwd (dpFactor<=1), sharedComputePartition is the single computation
@@ -2060,27 +1525,6 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     }
     for (Operation *op : cluster.ops)
       schedule.insert(defPartition, op);
-  }
-}
-
-// Rematerialize chains of broadcasts where the user is in a different partition
-// than the broadcast to reduce the amount of data that needs to be transferred.
-void rematerializeBroadcasts(WarpSchedule &schedule, OpOperand *use) {
-  static_assert(
-      std::is_base_of_v<OpTrait::OneResult<BroadcastOp>, BroadcastOp> &&
-      std::is_base_of_v<OpTrait::OneResult<ExpandDimsOp>, ExpandDimsOp> &&
-      std::is_base_of_v<OpTrait::OneResult<ConvertLayoutOp>, ConvertLayoutOp>);
-
-  Operation *defOp = use->get().getDefiningOp();
-  while (isa_and_nonnull<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(defOp)) {
-    Operation *clone = OpBuilder(defOp).clone(*defOp);
-    Partition *userPartition = schedule.getPartition(use->getOwner());
-    assert(userPartition && "user not scheduled");
-    schedule.insert(userPartition, clone);
-    use->set(clone->getResult(0));
-
-    defOp = clone->getOperand(0).getDefiningOp();
-    use = &clone->getOpOperand(0);
   }
 }
 
