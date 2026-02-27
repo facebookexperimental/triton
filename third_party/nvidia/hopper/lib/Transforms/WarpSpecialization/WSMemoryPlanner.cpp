@@ -543,6 +543,7 @@ public:
 
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
+    int bufferIdInnermostSplit = -1;
 
     DenseMap<int, Type> idTypes;
     for (auto bufferIter : bufferRange) {
@@ -569,14 +570,25 @@ public:
           idTypes[bufferIdInnermost] = elemType;
           ++bufferId;
         }
-        // Buffers requiring TMA split copies get their own unique buffer.id
-        // to avoid sharing a barrier with other buffers. Each split copy
-        // emits a separate barrier_expect/arrive, so sharing would cause
-        // barrier over-arrival (UB per CUDA PTX spec).
+        // Buffers requiring TMA split copies must not share a barrier with
+        // non-split buffers: each split copy emits a separate
+        // barrier_expect/arrive, so sharing would cause barrier over-arrival
+        // (UB per CUDA PTX spec). However, split buffers CAN share a
+        // buffer.id with each other since they all use the same split
+        // barrier protocol.
         unsigned assignedId = bufferIdInnermost;
         if (requiresTMASplitCopies(allocDescType)) {
-          assignedId = bufferId;
-          ++bufferId;
+          if (bufferIdInnermostSplit < 0) {
+            bufferIdInnermostSplit = bufferId;
+            idTypes[bufferIdInnermostSplit] = elemType;
+            ++bufferId;
+          }
+          if (idTypes[bufferIdInnermostSplit] != elemType) {
+            bufferIdInnermostSplit = bufferId;
+            idTypes[bufferIdInnermostSplit] = elemType;
+            ++bufferId;
+          }
+          assignedId = bufferIdInnermostSplit;
         }
         owner->setAttr(
             "buffer.id",
