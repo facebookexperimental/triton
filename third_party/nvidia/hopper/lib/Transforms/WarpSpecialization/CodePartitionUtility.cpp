@@ -392,6 +392,36 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   return ctrlId;
 }
 
+// Check whether chB is the backward half of an operandD channel loop within
+// the given reuse group. A backward channel carries data from MMA back to
+// tmem_load, while its forward partner carries data from tmem_store to MMA.
+// The two form a cycle on the same TMEM allocation.
+static bool isBackwardOfChannelLoopInGroup(Channel *chB, ReuseGroup *group) {
+  if (chB->channelKind != DataChannelKind::TMEMPost)
+    return false;
+  auto *tmemChB = static_cast<ttng::TmemDataChannelPost *>(chB);
+  if (!tmemChB->isOperandD)
+    return false;
+  for (auto *ch : group->channels) {
+    if (ch == chB)
+      continue;
+    if (ch->channelKind != DataChannelKind::TMEMPost)
+      continue;
+    auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+    if (!tmemCh->isOperandD)
+      continue;
+    if (ch->getAllocOp() != chB->getAllocOp())
+      continue;
+    // ch is the candidate forward channel. Check:
+    // 1. Forward's dstOp == backward's srcOp (both point to MMA)
+    // 2. Backward's dstOp appears before forward's srcOp (backward direction)
+    if (ch->getDstOp() == chB->getSrcOp() &&
+        appearsBefore(chB->getDstOp(), ch->getSrcOp()))
+      return true;
+  }
+  return false;
+}
+
 // Find channels of reuse group that are inside regionOp. If the channel is
 // directly in regionOp, add the channel's DstOp, otherwise add the region Op
 // that is directly in regionOp and encloses the channel.
@@ -418,9 +448,11 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
         }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
-        // dstOp has the same enclosing parentOp.
+        // dstOp has the same enclosing parentOp. Skip backward channels of
+        // operandD channel loops so the counter increments once per iteration.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp()) {
+          if (&op == ch->getDstOp() &&
+              !isBackwardOfChannelLoopInGroup(ch, group)) {
             LLVM_DEBUG({
               LDBG("\nchannel with DstOp: ");
               op.dump();
@@ -441,9 +473,11 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
         }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
-        // dstOp has the same enclosing parentOp.
+        // dstOp has the same enclosing parentOp. Skip backward channels of
+        // operandD channel loops so the counter increments once per iteration.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp()) {
+          if (&op == ch->getDstOp() &&
+              !isBackwardOfChannelLoopInGroup(ch, group)) {
             LLVM_DEBUG({
               LDBG("\nchannel with DstOp: ");
               op.dump();
@@ -626,6 +660,37 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       break;
     }
     ++vecIdx;
+  }
+  // If not found, this may be a backward channel whose dstOp was excluded from
+  // chList. Find its forward partner and use that partner's position so both
+  // directions share the same buffer index within an iteration.
+  if (theIdx < 0) {
+    auto *group = config->getGroup(reuseGroupIdx);
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      if (tmemCh->isOperandD) {
+        for (auto *fwdCh : group->channels) {
+          if (fwdCh == ch || fwdCh->channelKind != DataChannelKind::TMEMPost)
+            continue;
+          auto *tmemFwd = static_cast<ttng::TmemDataChannelPost *>(fwdCh);
+          if (!tmemFwd->isOperandD || fwdCh->getAllocOp() != ch->getAllocOp())
+            continue;
+          if (fwdCh->getDstOp() == ch->getSrcOp() &&
+              appearsBefore(ch->getDstOp(), fwdCh->getSrcOp())) {
+            // Found forward partner, use its position in chList.
+            int fwdIdx = 0;
+            for (auto *tCh : chList) {
+              if (tCh == fwdCh->getDstOp()) {
+                theIdx = fwdIdx;
+                break;
+              }
+              ++fwdIdx;
+            }
+            break;
+          }
+        }
+      }
+    }
   }
   assert(theIdx >= 0);
   if (theIdx == 0) {
