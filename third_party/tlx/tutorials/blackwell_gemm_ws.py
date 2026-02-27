@@ -1,4 +1,5 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
+import functools
 import math
 import os
 import sys
@@ -22,6 +23,23 @@ _CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 _rules_engine = RuleEngine(_CONFIGS_DIR / "blackwell_gemm_ws_rules.yaml")
 _candidate_scorer = CandidateScorer(_CONFIGS_DIR / "blackwell_gemm_ws_candidates.yaml")
 
+# Sentinel to distinguish "no match" from "not cached" in lru_cache
+# (lru_cache cannot cache None returns separately from uncached misses).
+_NO_MATCH = object()
+
+
+@functools.lru_cache(maxsize=None)
+def _evaluate_heuristic(M, N, K, num_sms):
+    """Cached rule evaluation.  Returns a frozen tuple-of-pairs or _NO_MATCH."""
+    config = _rules_engine.evaluate(M=M, N=N, K=K, num_sms=num_sms)
+    if config is None:
+        config = _candidate_scorer.evaluate(M=M, N=N, K=K, num_sms=num_sms)
+    if config is None:
+        return _NO_MATCH
+    config = _gemm_post_process(config, M, N)
+    # Freeze as tuple-of-pairs so lru_cache stores an immutable value.
+    return tuple(config.items())
+
 
 def get_heuristic_config(M, N, K, num_sms=148):
     """
@@ -31,6 +49,9 @@ def get_heuristic_config(M, N, K, num_sms=148):
     1. M/N ratio determines tile shape preference
     2. MN tiles vs SM count determines parallelization strategy (Split-K vs data-parallel)
     3. Arithmetic intensity determines pipeline depth
+
+    Results are cached per (M, N, K, num_sms) tuple via ``lru_cache`` so the
+    rule engine evaluation cost is paid only once per shape.
 
     Disabled by default.  Set ``TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG=1``
     to enable the rule engine; otherwise falls through to Triton's autotuning.
@@ -45,12 +66,11 @@ def get_heuristic_config(M, N, K, num_sms=148):
     """
     if os.environ.get("TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG") != "1":
         return None
-    config = _rules_engine.evaluate(M=M, N=N, K=K, num_sms=num_sms)
-    if config is None:
-        config = _candidate_scorer.evaluate(M=M, N=N, K=K, num_sms=num_sms)
-    if config is None:
+
+    cached = _evaluate_heuristic(M, N, K, num_sms)
+    if cached is _NO_MATCH:
         return None
-    return _gemm_post_process(config, M, N)
+    return dict(cached)
 
 
 def _select_group_size_m(M, N, block_m):
