@@ -124,7 +124,10 @@ static void scheduleDependencies(scf::ForOp loop, PartitionSet &partitions,
 
     Operation *defOp =
         loop.getBody()->findAncestorOpInBlock(*dep.getDefiningOp());
-    if (!defOp || !hasDefPartition(loop, defOp, partitions) ||
+    // Skip partitioning a whole forOp. We don't assign whole loops to
+    // partitions in AutoWS.
+    if (!defOp || isa<scf::ForOp>(defOp) ||
+        !hasDefPartition(loop, defOp, partitions) ||
         !trySetPartition(defOp, partition))
       continue;
     llvm::append_range(deps, getNestedOperands(defOp));
@@ -149,6 +152,11 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
         uses.push_back(&use);
       continue;
     }
+
+    // Skip partitioning a whole forOp. We don't assign whole loops to
+    // partitions in AutoWS.
+    if (isa<scf::ForOp>(user))
+      continue;
 
     if (hasPartition(user))
       continue;
@@ -458,6 +466,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     // already assigned to a partition.
     auto useCallback = [&](OpResult result, OpOperand &use, unsigned distance) {
       Operation *user = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      // Skip partitioning a whole forOp. We don't assign whole loops to
+      // partitions in AutoWS.
+      if (isa<scf::ForOp>(user))
+        return;
       if (!hasPartition(user)) {
         // Add the current partition as a def to the cluster.
         opClusters.getOrCreate(user)->defPartitions.insert(&partition);
