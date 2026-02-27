@@ -291,23 +291,23 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
   return !enclosing(ifOp, pOp.getOperation());
 }
 
+static bool isBackwardOfChannelLoopInGroup(Channel *chB, ReuseGroup *group);
+
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
+  if (group->channels.size() <= 1)
+    return false;
   if (group->channels[0]->getNumBuffers() <= 1)
     return false;
-  // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
-  // see if it is inside ctrlOp.
   for (auto *ch : group->channels) {
+    if (isBackwardOfChannelLoopInGroup(ch, group))
+      continue;
     if (auto forOp = dyn_cast<scf::ForOp>(ctrlOp)) {
-      if (enclosing(forOp, ch->getSrcOp()))
-        return true;
       if (enclosing(forOp, ch->getDstOp()))
         return true;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(ctrlOp)) {
-      if (enclosing(ifOp, ch->getSrcOp()))
-        return true;
       if (enclosing(ifOp, ch->getDstOp()))
         return true;
     }
@@ -458,6 +458,7 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
               op.dump();
             });
             chList.push_back(&op);
+            break;
           }
         }
       }
@@ -483,6 +484,7 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
               op.dump();
             });
             chList.push_back(&op);
+            break;
           }
         }
       }
@@ -602,6 +604,22 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
   }
 
+  // For reuse groups, the immediate parent ForOp may not carry a reuse
+  // accumCnt (e.g., an inner K-loop whose dstOps are all outside it). Walk up
+  // to the enclosing ForOp that actually has the reuse accumCnt.
+  if (reuseGroupIdx >= 0 && config) {
+    while (parentForOp &&
+           !needAccumCntForReuse(parentForOp.getOperation(),
+                                 config->getGroup(reuseGroupIdx))) {
+      parentForOp = parentForOp->getParentOfType<scf::ForOp>();
+    }
+    if (!parentForOp) {
+      LDBG("getAccumCount: no enclosing ForOp with reuse accumCnt, returning "
+           "constant 0");
+      return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
+    }
+  }
+
   auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
@@ -650,6 +668,14 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
   auto parentForOp = op->getParentOfType<scf::ForOp>();
+  // Walk up to the ForOp that actually carries the reuse accumCnt, matching
+  // the same logic used in getAccumCount.
+  while (parentForOp &&
+         !needAccumCntForReuse(parentForOp.getOperation(),
+                               config->getGroup(reuseGroupIdx))) {
+    parentForOp = parentForOp->getParentOfType<scf::ForOp>();
+  }
+  assert(parentForOp && "no enclosing ForOp with reuse accumCnt");
   getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
