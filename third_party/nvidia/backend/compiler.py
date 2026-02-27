@@ -348,7 +348,7 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                passes.ttgpuir.add_partition_scheduling(pm)
+                nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
