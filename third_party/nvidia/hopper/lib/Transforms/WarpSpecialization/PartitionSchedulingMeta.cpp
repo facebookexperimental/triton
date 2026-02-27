@@ -373,27 +373,33 @@ public:
     // Build up partitions based on what's actually needed.
     // For fwd: default+correction / gemm / load / epilogue
     //   → MMA users create dynamic computation partitions
-    // For bwd: gemm / load / reduction
-    //   → MMA users create a single shared computation partition
-    //
-    // Empty partitions are NOT created — they waste TMEM channels.
+    // For bwd: reduction / gemm / load / computation
+    //   → reduction is at index 0 (default position) with num_warps=4
+    //   → MMA users create a single shared computation partition with
+    //   num_warps=8
 
-    // Default partition: needed when we have correction (load users and
-    // correction ops go here) or epilogue (pre-loop ops need a home).
-    bool needDefault = options.hasCorrection || options.hasEpilogue;
-    if (needDefault)
-      defaultPartition = schedule.addPartition(0);
-    else
-      defaultPartition = nullptr;
+    // For bwd (hasReduction): create reduction FIRST at index 0.
+    // This makes reduction the "default" partition in warp_specialize.
+    if (options.hasReduction) {
+      reductionPartition = schedule.addPartition(0);
+      reductionPartition->setType("reduction");
+      defaultPartition = nullptr; // No separate default for bwd
+    } else {
+      reductionPartition = nullptr;
+      // Default partition: needed when we have correction or epilogue.
+      bool needDefault = options.hasCorrection || options.hasEpilogue;
+      if (needDefault) {
+        defaultPartition = schedule.addPartition(0);
+        defaultPartition->setType("default");
+      } else {
+        defaultPartition = nullptr;
+      }
+    }
 
     gemmPartition = schedule.addPartition(1); // stage 1 for MMA
+    gemmPartition->setType("gemm");
     loadPartition = schedule.addPartition(0);
-
-    // Reduction partition (bwd only): separate.
-    if (options.hasReduction)
-      reductionPartition = schedule.addPartition(0);
-    else
-      reductionPartition = nullptr;
+    loadPartition->setType("load");
 
     // Correction: merge into default partition.
     if (options.hasCorrection)
@@ -403,10 +409,12 @@ public:
 
     // Epilogue: only if there are epilogue stores and not merged into
     // computation.
-    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation)
+    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation) {
       epiloguePartition = schedule.addPartition(0);
-    else
+      epiloguePartition->setType("epilogue");
+    } else {
       epiloguePartition = nullptr;
+    }
 
     // Note: computation partitions are NOT pre-allocated here.
     // They are created dynamically by scheduleUsers() in Phase 5.
@@ -479,9 +487,13 @@ class GEMMTemplate : public SchedulingTemplate {
 public:
   void createPartitions(WarpSchedule &schedule) override {
     defaultPartition = schedule.addPartition(0);
+    defaultPartition->setType("default");
     gemmPartition = schedule.addPartition(1);
+    gemmPartition->setType("gemm");
     loadPartition = schedule.addPartition(0);
+    loadPartition->setType("load");
     epiloguePartition = schedule.addPartition(0);
+    epiloguePartition->setType("epilogue");
   }
 
   Partition *getPartition(AbstractPartition absPart,
@@ -1408,8 +1420,10 @@ static Partition *scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
 
     if (schedule.isScheduled(user))
       continue;
-    if (!partition)
+    if (!partition) {
       partition = schedule.addPartition(/* stage is unused */ 0);
+      partition->setType("computation");
+    }
     schedule.trySchedule(partition, user);
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
@@ -2003,6 +2017,7 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     // Assign the whole cluster to its own partition.
     if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
       Partition *newPartition = schedule.addPartition(0);
+      newPartition->setType("computation");
       for (Operation *op : cluster.ops)
         schedule.insert(newPartition, op);
       continue;

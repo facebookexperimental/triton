@@ -5,6 +5,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 class Operation;
@@ -18,6 +19,7 @@ class ForOp;
 
 static constexpr char kPartitionAttrName[] = "ttg.partition";
 static constexpr char kPartitionStagesAttrName[] = "ttg.partition.stages";
+static constexpr char kPartitionTypesAttrName[] = "ttg.partition.types";
 static constexpr char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
 
 //===----------------------------------------------------------------------===//
@@ -35,6 +37,8 @@ public:
   int getIndex() const { return idx; }
   int getStage() const { return stage; }
   ArrayRef<Operation *> getOps() const { return ops; }
+  StringRef getType() const { return type; }
+  void setType(StringRef t) { type = t.str(); }
 
 private:
   void setIndex(int idx) { this->idx = idx; }
@@ -46,6 +50,8 @@ private:
   int stage;
   // The ops in the partition.
   SmallVector<Operation *> ops;
+  // The type of the partition (e.g., "gemm", "load", "reduction", "default").
+  std::string type;
 };
 
 // A warp schedule divides a loop into multiple partitions. Ops in a loop are

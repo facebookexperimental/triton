@@ -86,6 +86,7 @@ FailureOr<WarpSchedule> WarpSchedule::deserialize(scf::ForOp loop) {
 
 void WarpSchedule::serialize(scf::ForOp loop) const {
   SmallVector<Attribute> stages;
+  SmallVector<Attribute> types;
   Builder b(loop.getContext());
 
   // Serialize partition attributes for operations inside the loop.
@@ -115,9 +116,12 @@ void WarpSchedule::serialize(scf::ForOp loop) const {
     });
   }
 
-  for (Partition &partition : getPartitions())
+  for (Partition &partition : getPartitions()) {
     stages.push_back(b.getI32IntegerAttr(partition.getStage()));
+    types.push_back(b.getStringAttr(partition.getType()));
+  }
   loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
+  loop->setAttr(kPartitionTypesAttrName, b.getArrayAttr(types));
 }
 
 LogicalResult WarpSchedule::verify(scf::ForOp loop) const {
