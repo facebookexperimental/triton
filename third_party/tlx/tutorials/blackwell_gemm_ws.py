@@ -1,6 +1,5 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
 import math
-import sys
 from pathlib import Path
 
 import torch
@@ -10,10 +9,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-_TLX_DIR = str(Path(__file__).resolve().parent.parent)
-if _TLX_DIR not in sys.path:
-    sys.path.insert(0, _TLX_DIR)
-from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
+# Import from the rule_engine module via the tlx package symlink
+from triton.language.extra.tlx.rule_engine import CandidateScorer, RuleEngine
 
 # Track which (M, N, K) shapes have already printed their heuristic config
 _printed_heuristic_configs = set()
