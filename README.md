@@ -492,16 +492,19 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dyna
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
     - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False)`
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, return_3d=False)`
 
-    Decode the tile ID from a CLC response and signal completion.
+    Decode the cluster CTA ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase
     - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+    - `return_3d`: Set to `True` to return all three dimensions as a tuple.
 
-    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available.
+    **Returns:**
+    - If `return_3d=False` (default): Returns `tile_id_x` only (backwards compatible). The x dimension is automatically offset by `cluster_cta_rank()` for unique tile assignments. Returns `-1` if no work available.
+    - If `return_3d=True`: Returns a tuple of `(tile_id_x, tile_id_y, tile_id_z)` representing all three dimensions. Returns `(-1, -1, -1)` if no work available.
 
 #### How CLC Works
 

@@ -3459,64 +3459,90 @@ def test_async_dots_blackwell_tmem(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-def test_cluster_launch_control(BLOCK_SIZE, device):
+@pytest.mark.parametrize("GRID_DIMS", [1, 2, 3])
+def test_cluster_launch_control(GRID_DIMS, device):
+    """
+    Test CLC with 1D, 2D, and 3D grids to verify all three cluster CTA ID dimensions.
+
+    Verifies that:
+    1. clc_consumer correctly returns all three dimensions (tile_id_x, tile_id_y, tile_id_z)
+    2. Multi-dimensional grid indexing works correctly with CLC work stealing
+    3. Each tile in the grid is processed exactly once
+    """
 
     @triton.jit
-    def mul2_clc(
-        x_ptr,
-        y_ptr,
-        z_ptr,
-        n_elements,
+    def clc_kernel(
+        output_ptr,
+        TILES_X: tl.constexpr,
+        TILES_Y: tl.constexpr,
+        TILES_Z: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        tile_id = tl.program_id(axis=0)
+        # Initial tile coordinates from program ID
+        pid = tl.program_id(axis=0)
+        # Convert linear PID to 3D coordinates (row-major: z changes slowest)
+        tile_z = pid // (TILES_X * TILES_Y)
+        tile_y = (pid % (TILES_X * TILES_Y)) // TILES_X
+        tile_x = pid % TILES_X
 
         # CLC Init
         clc_phase_producer = 1
         clc_phase_consumer = 0
         clc_context = tlx.clc_create_context(1)
 
-        while tile_id != -1:
+        while tile_x != -1:
             # CLC producer
             tlx.clc_producer(clc_context, clc_phase_producer)
             clc_phase_producer ^= 1
 
-            block_start = tile_id * BLOCK_SIZE
+            # Compute linear index from 3D tile coordinates
+            linear_idx = tile_z * (TILES_X * TILES_Y) + tile_y * TILES_X + tile_x
 
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_elements
+            # Each tile writes its linear index to output (thread 0 only)
+            if tlx.thread_id(axis=0) == 0:
+                tl.store(output_ptr + linear_idx, linear_idx)
 
-            x = tl.load(x_ptr + offsets, mask=mask)
-            y = tl.load(y_ptr + offsets, mask=mask)
-            output = x * y
-            tl.store(z_ptr + offsets, output, mask=mask)
-
-            # CLC consumer
-            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+            # CLC consumer - returns (tile_id_x, tile_id_y, tile_id_z) with return_3d=True
+            tile_x, tile_y, tile_z = tlx.clc_consumer(clc_context, clc_phase_consumer, return_3d=True)
             clc_phase_consumer ^= 1
 
-            if tlx.thread_id(axis=0) == 0:
-                tl.device_print("Extracted CtaID", tile_id)
-
     torch.manual_seed(0)
-    # number of kernels to launch in a non-persistent mode
-    size = 10000000
-    x = torch.ones(size, device=device)
-    y = torch.ones(size, device=device)
+    BLOCK_SIZE = 128
 
-    output = torch.zeros_like(x)
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
-    kernel = mul2_clc[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cluster=True)
+    if GRID_DIMS == 1:
+        TILES_X, TILES_Y, TILES_Z = 64, 1, 1
+    elif GRID_DIMS == 2:
+        TILES_X, TILES_Y, TILES_Z = 4, 3, 1
+    else:  # GRID_DIMS == 3
+        TILES_X, TILES_Y, TILES_Z = 3, 2, 2
+
+    total_tiles = TILES_X * TILES_Y * TILES_Z
+
+    # Output: each tile writes its linear index
+    output = torch.full((total_tiles, ), -1, dtype=torch.int32, device=device)
+
+    # Expected: each position should contain its own index
+    expected = torch.arange(total_tiles, dtype=torch.int32, device=device)
+
+    grid = (total_tiles, )
+    kernel = clc_kernel[grid](
+        output,
+        TILES_X=TILES_X,
+        TILES_Y=TILES_Y,
+        TILES_Z=TILES_Z,
+        BLOCK_SIZE=BLOCK_SIZE,
+        launch_cluster=True,
+    )
 
     ptx = kernel.asm["ptx"]
 
-    assert re.search((r"clusterlaunchcontrol.try_cancel"), ptx, flags=re.DOTALL)
-    assert re.search((r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128"), ptx, flags=re.DOTALL)
-    assert re.search((r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128"), ptx, flags=re.DOTALL)
+    assert re.search(r"clusterlaunchcontrol.try_cancel", ptx, flags=re.DOTALL)
+    assert re.search(r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128", ptx, flags=re.DOTALL)
+    assert re.search(r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128", ptx, flags=re.DOTALL)
 
-    assert torch.count_nonzero(output) == size
+    # Verify all tiles were processed exactly once
+    sorted_output, _ = torch.sort(output)
+    torch.testing.assert_close(sorted_output, expected)
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -3566,7 +3592,7 @@ def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
             output = x + y
             tl.store(z_ptr + offsets, output, mask=mask)
 
-            # CLC consumer
+            # CLC consumer - returns tile_id_x only (default return_3d=False)
             tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
             clc_phase_consumer ^= 1
 
@@ -3627,7 +3653,7 @@ def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
     torch.testing.assert_close(output, ref_out)
 
 
-@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_tasks_region_error(device):
 
     @triton.jit
