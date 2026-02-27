@@ -22,6 +22,7 @@ namespace mlir {
 static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   OpPrintingFlags flags;
   flags.enableDebugInfo();
+  flags.printNameLocAsPrefix(true);
   return flags;
 }
 
