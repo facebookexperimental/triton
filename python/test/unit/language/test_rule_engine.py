@@ -278,7 +278,7 @@ def original_get_heuristic_config(M, N, K, num_sms=148):
 # New implementation (rule engine)
 # ---------------------------------------------------------------------------
 
-_CONFIGS_DIR = _REPO_ROOT / "third_party" / "tlx" / "tutorials" / "configs"
+_CONFIGS_DIR = _REPO_ROOT / "third_party" / "tlx" / "rule_engine" / "configs"
 _rules = RuleEngine(_CONFIGS_DIR / "blackwell_gemm_ws_rules.yaml")
 _candidates = CandidateScorer(_CONFIGS_DIR / "blackwell_gemm_ws_candidates.yaml")
 

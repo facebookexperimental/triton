@@ -1,11 +1,11 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
 import math
-import os
 import sys
 from pathlib import Path
 
 import torch
 import triton
+import triton.knobs as knobs
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -18,9 +18,12 @@ from rule_engine import CandidateScorer, RuleEngine  # noqa: E402
 # Track which (M, N, K) shapes have already printed their heuristic config
 _printed_heuristic_configs = set()
 
-_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
+_CONFIGS_DIR = Path(__file__).resolve().parent.parent / "rule_engine" / "configs"
 _rules_engine = RuleEngine(_CONFIGS_DIR / "blackwell_gemm_ws_rules.yaml")
 _candidate_scorer = CandidateScorer(_CONFIGS_DIR / "blackwell_gemm_ws_candidates.yaml")
+
+# Enable heuristic config by default for this kernel.
+knobs.autotuning.tlx_matmul_heuristic_config = True
 
 
 def get_heuristic_config(M, N, K, num_sms=148):
@@ -32,8 +35,9 @@ def get_heuristic_config(M, N, K, num_sms=148):
     2. MN tiles vs SM count determines parallelization strategy (Split-K vs data-parallel)
     3. Arithmetic intensity determines pipeline depth
 
-    Disabled by default.  Set ``TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG=1``
-    to enable the rule engine; otherwise falls through to Triton's autotuning.
+    Enabled by default for this kernel.  Set
+    ``TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG=0`` to disable and fall
+    through to Triton's autotuning.
 
     Args:
         M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
@@ -43,7 +47,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
         dict: Configuration parameters for the TLX GEMM kernel,
         or ``None`` if disabled or no rule matches.
     """
-    if os.environ.get("TRITON_ENABLE_TLX_MATMUL_HEURISTIC_CONFIG") != "1":
+    if not knobs.autotuning.tlx_matmul_heuristic_config:
         return None
 
     config = _rules_engine.evaluate(M=M, N=N, K=K, num_sms=num_sms)
@@ -850,7 +854,7 @@ def matmul(a, b, config=None, use_heuristic=True):
     # Use heuristic config if no config provided and heuristic is enabled
     if config is None and use_heuristic:
         config = get_heuristic_config(M, N, K, NUM_SMS)
-        if config is not None and os.environ.get("TRITON_PRINT_AUTOTUNING") == "1":
+        if config is not None and knobs.autotuning.print:
             shape_key = (M, N, K)
             if shape_key not in _printed_heuristic_configs:
                 _printed_heuristic_configs.add(shape_key)
