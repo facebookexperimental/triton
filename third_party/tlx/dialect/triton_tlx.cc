@@ -448,21 +448,6 @@ void init_triton_tlx_ir(py::module &&m) {
              auto oldType = cast<ttg::MemDescType>(src.getType());
              assert(oldType && "Expect MemDescType for src");
              auto encoding = oldType.getEncoding();
-             if (!oldType.getShape().equals(newShape)) {
-               // Only accept unswizzled encoding for now.
-               if (auto mmaEncoding =
-                       dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding)) {
-                 if (mmaEncoding.getSwizzlingByteWidth() != 0)
-                   llvm_unreachable("Only accept unswizzled encoding");
-               } else if (auto swizzledEncoding =
-                              dyn_cast<ttg::SwizzledSharedEncodingAttr>(
-                                  encoding)) {
-                 if (!(swizzledEncoding.getVec() == 1 &&
-                       swizzledEncoding.getPerPhase() == 1 &&
-                       swizzledEncoding.getMaxPhase() == 1))
-                   llvm_unreachable("Only accept unswizzled encoding");
-               }
-             }
 
              auto newType = ttg::MemDescType::get(
                  newShape, newElementType, encoding, oldType.getMemorySpace(),
