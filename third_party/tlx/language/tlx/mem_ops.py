@@ -729,23 +729,54 @@ def async_descriptor_store(
     source: tlx.buffered_tensor,
     offsets: list[tl.tensor],
     eviction_policy: str = "",
+    store_reduce: str = "",
     _semantic=None,
 ) -> None:
+    """
+    Asynchronously store data from shared memory to global memory using TMA.
+
+    Args:
+        desc: Tensor descriptor for the destination
+        source: Source buffer in shared memory
+        offsets: List of offsets for each dimension
+        eviction_policy: Cache eviction policy ("", "evict_first", "evict_last")
+        store_reduce: Atomic reduction kind ("", "add", "min", "max", "and", "or", "xor")
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
+    eviction_policy = tl._unwrap_if_constexpr(eviction_policy)
+    store_reduce = tl._unwrap_if_constexpr(store_reduce)
     assert eviction_policy in ("", "evict_first", "evict_last"), (
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
+    assert store_reduce in ("", "add", "min", "max", "and", "or", "xor"), (
+        f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', or 'xor', got '{store_reduce}'")
+    assert not (store_reduce != "" and eviction_policy != ""), "eviction_policy is not supported with store_reduce"
     from triton._C.libtriton import ir
 
-    evict = ir.EVICTION_POLICY.NORMAL
-    if eviction_policy == "evict_first":
-        evict = ir.EVICTION_POLICY.EVICT_FIRST
-    elif eviction_policy == "evict_last":
-        evict = ir.EVICTION_POLICY.EVICT_LAST
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
+
+    if store_reduce == "":
+        # Regular store
+        evict = ir.EVICTION_POLICY.NORMAL
+        if eviction_policy == "evict_first":
+            evict = ir.EVICTION_POLICY.EVICT_FIRST
+        elif eviction_policy == "evict_last":
+            evict = ir.EVICTION_POLICY.EVICT_LAST
+        _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
+    else:
+        # Atomic reduce store
+        reduce_kind_map = {
+            "add": ir.DESCRIPTOR_REDUCE_KIND.ADD,
+            "min": ir.DESCRIPTOR_REDUCE_KIND.MIN,
+            "max": ir.DESCRIPTOR_REDUCE_KIND.MAX,
+            "and": ir.DESCRIPTOR_REDUCE_KIND.AND,
+            "or": ir.DESCRIPTOR_REDUCE_KIND.OR,
+            "xor": ir.DESCRIPTOR_REDUCE_KIND.XOR,
+        }
+        reduce_kind = reduce_kind_map[store_reduce]
+        _semantic.builder.create_async_TMA_reduce(reduce_kind, desc.handle, offsets, source_handle)
 
 
 @tl.builtin

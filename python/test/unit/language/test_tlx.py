@@ -3029,6 +3029,88 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
     torch.testing.assert_close(x, y)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("store_reduce", ["add", "min", "max"])
+def test_descriptor_store_reduce(store_reduce, device):
+    """Test that TMA stores with atomic reduction generate correct IR and produce correct results."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_reduce_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        STORE_REDUCE: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int32, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 4)
+
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], store_reduce=STORE_REDUCE)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.randint(1, 10, (M, N), dtype=torch.int32, device=device)
+    if store_reduce == "add":
+        y = torch.ones((M, N), dtype=torch.int32, device=device)
+        expected = y + x
+    elif store_reduce == "min":
+        y = torch.full((M, N), 100, dtype=torch.int32, device=device)
+        expected = torch.minimum(y, x)
+    elif store_reduce == "max":
+        y = torch.zeros((M, N), dtype=torch.int32, device=device)
+        expected = torch.maximum(y, x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_reduce_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                                  STORE_REDUCE=store_reduce)
+
+    # Verify the TMA reduce is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert "async_tma_reduce" in ttgir
+
+    # Verify PTX output contains the reduce instruction
+    ptx = kernel.asm["ptx"]
+    assert "cp.reduce.async.bulk.tensor" in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(y, expected)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_descriptor_load_multicast(device):
 
@@ -3642,7 +3724,7 @@ def test_async_tasks_region_error(device):
     with pytest.raises(triton.CompilationError) as e:
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
-    assert "division by zero" in exc_msg, ("\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n")
+    assert "division by zero" in exc_msg, "\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
