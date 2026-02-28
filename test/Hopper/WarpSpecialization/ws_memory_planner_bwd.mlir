@@ -1,57 +1,52 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-alloc-algo=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
 // Test case: FA BWD pattern using allocateTMemAllocs2 backtracking algorithm.
-// This test verifies the TMEM buffer allocation for Flash Attention backward pass.
+// This test verifies the SMEM (WSBuffer-based) and TMEM buffer allocation for
+// Flash Attention backward pass.
 //
-// The key buffers in allocation order:
-//   [0] dk: liveness=[44-112) size=128x128 - accumulator, long-lived
-//   [1] dv: liveness=[45-110) size=128x128 - accumulator, long-lived
-//   [2] qkT: liveness=[56-61) size=128x128 - temp buffer, short-lived
-//   [3] dpT: liveness=[72-77) size=128x128 - temp buffer, short-lived
-//   [4] dq: liveness=[83-85) size=128x128 - output buffer, short-lived
-//   [5] dv_interm: liveness=[67-69) size=128x64 - intermediate, short-lived
+// SMEM WSBuffers (new algorithm, smem-alloc-algo=1):
+//   [0] dsT: 128x128 bf16 - innermost, non-TMA, non-cross-stage → P1, copy=1
+//   [1] do:  128x128 bf16 - innermost, TMA, cross-stage → P0, copy=2
+//   [2] q:   128x128 bf16 - innermost, TMA, cross-stage → P0, copy=2
+//   [3] k_42: 128x128 bf16 - not innermost → P2, copy=1
+//   [4] v_43: 128x128 bf16 - not innermost → P2, copy=1
 //
-// The hasPotentialReuse matrix (non-zero entries):
-//   hasPotentialReuse(qkT, dq) = 2  (exact size match, has dependency)
-//   hasPotentialReuse(qkT, dv_interm) = 1  (partial size, has dependency)
-//   hasPotentialReuse(dpT, dq) = 2  (exact size match, has dependency)
-//   hasPotentialReuse(dq, qkT) = 2  (bidirectional)
-//   hasPotentialReuse(dq, dpT) = 2  (bidirectional)
-//   NOTE: hasPotentialReuse(dpT, dv_interm) = 0 (NO dependency!)
-//
-// With backtracking search, the algorithm finds:
-//   - dq first tries qkT, but that blocks dv_interm → backtrack
-//   - dq then reuses dpT (buffer.id=6)
-//   - dv_interm reuses qkT (buffer.id=5)
+// TMEM key buffers (backtracking algorithm):
+//   [5] dk: accumulator, long-lived
+//   [6] dv_45: accumulator, long-lived
+//   [7] qkT: temp buffer, short-lived
+//   [8] dpT: temp buffer, short-lived
+//   dq reuses dpT (buffer.id=8) at offset 0
+//   dv (bf16) reuses qkT (buffer.id=7) at offset 0
 
 // CHECK-LABEL: tt.func public @_attn_bwd
 //
-// SMEM allocations: dsT, do, q share buffer 0, triple-buffered
+// SMEM allocations: each buffer gets its own buffer.id
 // CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 //
 // TMEM allocation: dv (bf16) reuses qkT's buffer at offset 0
-// CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32}
+// CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 //
-// SMEM allocations
-// CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32}
-// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32}
-// CHECK: %k_42 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32}
-// CHECK: %v_43 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+// SMEM allocations: do and q are cross-stage TMA, get copy=2
+// CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
+// CHECK: %k_42 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: %v_43 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 //
-// TMEM allocations: qkT owns buffer 5
-// CHECK: %qkT, %qkT_44 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
+// TMEM allocations: qkT owns buffer 7
+// CHECK: %qkT, %qkT_44 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
-// TMEM allocation: dv_45 (f32 accumulator) owns buffer 4
-// CHECK: %dv_45, %dv_46 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 4 : i32}
+// TMEM allocation: dv_45 (f32 accumulator) owns buffer 6
+// CHECK: %dv_45, %dv_46 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
 //
-// TMEM allocation: dpT owns buffer 6
-// CHECK: %dpT, %dpT_47 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
+// TMEM allocation: dpT owns buffer 8
+// CHECK: %dpT, %dpT_47 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
 //
-// TMEM allocation: dk owns buffer 3
-// CHECK: %dk, %dk_48 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// TMEM allocation: dk owns buffer 5
+// CHECK: %dk, %dk_48 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
-// TMEM allocation: dq reuses dpT (buffer.id=6, buffer.offset=0) — key verification
-// CHECK: %dq, %dq_49 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32, buffer.offset = 0 : i32}
+// TMEM allocation: dq reuses dpT (buffer.id=8, buffer.offset=0) — key verification
+// CHECK: %dq, %dq_49 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
