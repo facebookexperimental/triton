@@ -338,6 +338,36 @@ getValueName(Value v,
     }
   }
 
+  // Inline constants: if this value is defined by arith.constant, return the
+  // literal value
+  if (inlineConstants) {
+    if (Operation *defOp = v.getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "arith.constant") {
+        if (auto valueAttr = defOp->getAttr("value")) {
+          std::string result;
+          llvm::raw_string_ostream os(result);
+          if (auto intAttr = dyn_cast<IntegerAttr>(valueAttr)) {
+            if (intAttr.getType().isInteger(1)) {
+              os << (intAttr.getValue().getBoolValue() ? "True" : "False");
+            } else {
+              os << intAttr.getValue();
+            }
+          } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
+            SmallString<16> str;
+            floatAttr.getValue().toString(str);
+            os << str;
+          } else {
+            // Fall through to normal name handling for unsupported constant
+            // types
+            goto normal_name;
+          }
+          os.flush();
+          return result;
+        }
+      }
+    }
+  }
+
 normal_name:
   std::string name;
   llvm::raw_string_ostream os(name);
