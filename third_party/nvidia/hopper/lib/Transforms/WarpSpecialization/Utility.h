@@ -132,6 +132,23 @@ private:
 // where the dependency exists without a direct "user".
 void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp);
 
+// Append a suffix to the innermost NameLoc in a Location hierarchy.
+// Handles NameLoc, CallSiteLoc wrapping, and falls back to creating a new
+// NameLoc if no NameLoc is found.
+static Location appendToNameLoc(Location loc, StringRef suffix,
+                                MLIRContext *ctx) {
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    auto newName = (nameLoc.getName().getValue() + suffix).str();
+    return NameLoc::get(StringAttr::get(ctx, newName), nameLoc.getChildLoc());
+  }
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    auto newCallee = appendToNameLoc(callSiteLoc.getCallee(), suffix, ctx);
+    return CallSiteLoc::get(newCallee, callSiteLoc.getCaller());
+  }
+  // No NameLoc found — wrap with a new NameLoc.
+  return NameLoc::get(StringAttr::get(ctx, suffix), loc);
+}
+
 // Extract the outermost NameLoc name, unwrapping CallSiteLoc.
 static std::string getOutermostNameFromLoc(Location loc) {
   if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
