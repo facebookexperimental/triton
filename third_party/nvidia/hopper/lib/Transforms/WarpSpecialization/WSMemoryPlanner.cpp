@@ -744,6 +744,208 @@ private:
 };
 } // namespace triton
 
+//===----------------------------------------------------------------------===//
+// New SMEM Allocation — WSBuffer-based approach (Phases 1–3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Priority levels for SMEM multi-buffering candidates.
+enum class WSBufferPriority {
+  P0_InnermostTMA = 0, // innermost loop + TMA channel
+  P1_InnermostNonTMA,  // innermost loop, non-TMA
+  P2_Other,            // outside loop / non-innermost (never increased)
+};
+
+/// A wrapper around one ttg.local_alloc op for the new SMEM allocation.
+struct WSBuffer {
+  Operation *allocOp;
+  unsigned sizeBytes;
+  Interval<size_t> liveness;
+  bool isInnermost;
+  bool isTMA;
+  bool isCrossStage;
+  unsigned bufferId;
+  unsigned numCopies;
+  WSBufferPriority priority;
+};
+
+/// Check if all users of a channel are in the same innermost loop and the
+/// alloc type has at least 2 non-trivial dimensions.
+static bool isInnermostSmemChannel(Operation *alloc,
+                                   SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+  DenseSet<Operation *> users;
+  (void)getAllAcutalUsersForChannel(ch, users, alloc);
+  if (users.empty())
+    return false;
+  auto *first = *(users.begin());
+  for (auto *user : users) {
+    if (user->getBlock() != first->getBlock())
+      return false;
+  }
+  auto parentLoop = first->getParentOfType<scf::ForOp>();
+  if (!parentLoop)
+    return false;
+  if (!isInnermostLoop(parentLoop))
+    return false;
+
+  // Check 2D+ shape.
+  auto sAlloc = cast<ttg::LocalAllocOp>(alloc);
+  auto allocDescType = cast<ttg::MemDescType>(sAlloc.getType());
+  unsigned numD = 0;
+  for (int64_t shape : allocDescType.getShape()) {
+    if (shape > 1)
+      ++numD;
+  }
+  return numD >= 2;
+}
+
+/// Check if a channel's producer is a TMA operation.
+static bool isSmemTMAChannel(Operation *alloc,
+                             SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+  auto *chPost = static_cast<ChannelPost *>(ch);
+  Operation *srcOp = chPost->getSrcOp();
+  if (!srcOp)
+    return false;
+  if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
+    return true;
+  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
+    Value stored = storeOp.getSrc();
+    if (auto *defOp = stored.getDefiningOp())
+      return isa<tt::DescriptorLoadOp>(defOp);
+  }
+  return false;
+}
+
+/// Check if a channel's source and destination(s) are in different
+/// loop.stage values.
+static bool isSmemCrossStage(Operation *alloc,
+                             SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+  Operation *srcOp = ch->getSrcOp();
+  if (!srcOp)
+    return false;
+  int srcStage = getLoopStage(srcOp);
+  if (srcStage < 0)
+    return false;
+
+  SmallVector<Operation *> dstOps;
+  ch->getDstOps(dstOps);
+  if (dstOps.empty()) {
+    if (Operation *dst = ch->getDstOp())
+      dstOps.push_back(dst);
+  }
+  for (Operation *dstOp : dstOps) {
+    int dstStage = getLoopStage(dstOp);
+    if (dstStage >= 0 && dstStage != srcStage)
+      return true;
+  }
+  return false;
+}
+
+/// Compute the byte size for a local_alloc op.
+static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
+  auto allocType = alloc.getType();
+  int64_t numElems = 0;
+  if (auto paddedEnc =
+          dyn_cast<ttg::PaddedSharedEncodingAttr>(allocType.getEncoding())) {
+    SmallVector<int64_t> unpaddedShape = ttg::getShapePerCTA(allocType);
+    numElems = paddedEnc.getPaddedSize(unpaddedShape);
+  } else {
+    auto shapePerCTA = ttg::getAllocationShapePerCTA(allocType);
+    numElems = product<int64_t>(shapePerCTA);
+  }
+  return static_cast<unsigned>(numElems * allocType.getElementTypeBitWidth() /
+                               8);
+}
+
+/// New SMEM allocation: Phases 1–3.
+///
+/// Phase 1: Create one WSBuffer per local_alloc, all copy=1, unique IDs.
+/// Phase 2: Enforce cross-stage minimum (copy >= 2).
+/// Phase 3: Classify into priority levels P0/P1/P2.
+///
+/// Returns the next available buffer ID after the SMEM allocations.
+static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
+                                    SmallVector<Channel *> &channels,
+                                    unsigned numBuffers) {
+  // ── Phase 1: Create WSBuffers ───────────────────────────────────────
+  SmallVector<WSBuffer> wsBuffers;
+  unsigned nextBufferId = 0;
+
+  // Walk in deterministic order (PreOrder) to create WSBuffers.
+  funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
+    if (!alloc.isSharedMemoryAlloc())
+      return;
+
+    WSBuffer buf;
+    buf.allocOp = alloc;
+    buf.sizeBytes = getSmemAllocSizeBytes(alloc);
+    buf.isInnermost = isInnermostSmemChannel(alloc, channels);
+    buf.isTMA = buf.isInnermost && isSmemTMAChannel(alloc, channels);
+    buf.isCrossStage = isSmemCrossStage(alloc, channels);
+    buf.bufferId = nextBufferId++;
+    buf.numCopies = 1;
+    buf.priority = WSBufferPriority::P2_Other; // set in Phase 3
+
+    wsBuffers.push_back(buf);
+
+    LDBG("Phase 1: WSBuffer[" << buf.bufferId << "] "
+                              << buf.sizeBytes << " bytes"
+                              << " innermost=" << buf.isInnermost
+                              << " TMA=" << buf.isTMA
+                              << " crossStage=" << buf.isCrossStage);
+  });
+
+  if (wsBuffers.empty())
+    return nextBufferId;
+
+  // ── Phase 2: Enforce cross-stage minimum ────────────────────────────
+  for (auto &buf : wsBuffers) {
+    if (buf.isCrossStage && numBuffers >= 2) {
+      buf.numCopies = 2;
+      LDBG("Phase 2: WSBuffer[" << buf.bufferId
+                                << "] cross-stage → numCopies=2");
+    }
+  }
+
+  // ── Phase 3: Classify and prioritize ────────────────────────────────
+  for (auto &buf : wsBuffers) {
+    if (buf.isInnermost && buf.isTMA) {
+      buf.priority = WSBufferPriority::P0_InnermostTMA;
+    } else if (buf.isInnermost) {
+      buf.priority = WSBufferPriority::P1_InnermostNonTMA;
+    } else {
+      buf.priority = WSBufferPriority::P2_Other;
+    }
+    LDBG("Phase 3: WSBuffer[" << buf.bufferId << "] priority="
+                              << static_cast<int>(buf.priority));
+  }
+
+  // ── Emit buffer.id and buffer.copy attributes ───────────────────────
+  auto i32Type = IntegerType::get(funcOp.getContext(), 32);
+  for (auto &buf : wsBuffers) {
+    buf.allocOp->setAttr("buffer.id",
+                         IntegerAttr::get(i32Type, buf.bufferId));
+    buf.allocOp->setAttr("buffer.copy",
+                         IntegerAttr::get(i32Type, buf.numCopies));
+    LDBG("Emit: WSBuffer[" << buf.bufferId << "] buffer.id=" << buf.bufferId
+                           << " buffer.copy=" << buf.numCopies);
+  }
+
+  return nextBufferId;
+}
+
+} // anonymous namespace
+
 /// Collect all users of a TMEM allocation from its channel.
 /// For operand D allocations (accumulator), collects all direct users.
 /// For other allocations, delegates to getAllAcutalUsersForChannel.
