@@ -36,6 +36,9 @@ struct ClipAsyncCopySizePerThread
 
   LogicalResult matchAndRewrite(AsyncCopyGlobalToLocalOp copyOp,
                                 PatternRewriter &rewriter) const override {
+    // Bulk copies use a single instruction; coalescing is not applicable.
+    if (copyOp.getUseBulk())
+      return rewriter.notifyMatchFailure(copyOp, "bulk copy, skip");
     Value src = copyOp.getSrc();
     Value mask = copyOp.getMask();
     Value other = copyOp.getOther();
