@@ -501,11 +501,75 @@ def async_load(
     cache_modifier: str = "",
     eviction_policy: str = "",
     is_volatile: bool = False,
+    bulk: bool = False,
+    bulk_size: Optional = None,
+    barrier: tlx.mbarrier = None,
     _semantic=None,
 ) -> tlx.async_token:
     """
     Loads buffer from global to local memory asynchronously.
+
+    When ``bulk=True``, emits a single ``cp.async.bulk`` instruction instead of
+    per-thread ``cp.async`` copies. Requirements for bulk mode:
+
+    - ``result`` must be 1-D
+    - ``barrier`` (an ``mbarrier``) is required for completion tracking
+    - ``mask`` and ``other`` must not be set
+    - ``bulk_size`` specifies the number of bytes to copy; if omitted it is
+      computed from the result buffer shape and element type
     """
+    bulk = tl._unwrap_if_constexpr(bulk)
+
+    if bulk:
+        assert len(result.type.shape) == 1, "bulk async_load requires a 1D result buffer"
+        assert barrier is not None, "bulk async_load requires a barrier"
+        assert mask is None, "bulk async_load does not support mask"
+        assert other is None, "bulk async_load does not support other"
+
+        # Compute destination buffer size in bytes
+        dest_bytes = result.type.shape[0] * (result.type.element_ty.primitive_bitwidth // 8)
+
+        # Compute bulk_size if not provided
+        if bulk_size is None:
+            bulk_size = dest_bytes
+
+        # Validate constant bulk_size does not exceed the destination buffer
+        const_bulk_size = None
+        if isinstance(bulk_size, tl.constexpr):
+            const_bulk_size = bulk_size.value
+        elif not isinstance(bulk_size, tl.tensor):
+            const_bulk_size = int(bulk_size)
+        if const_bulk_size is not None:
+            assert const_bulk_size <= dest_bytes, (
+                f"bulk_size ({const_bulk_size}) exceeds destination buffer size ({dest_bytes} bytes)")
+
+        # Convert bulk_size to an i32 IR value
+        if isinstance(bulk_size, tl.constexpr):
+            bulk_size_handle = _semantic.builder.get_int32(bulk_size.value)
+        elif isinstance(bulk_size, tl.tensor):
+            bulk_size_handle = bulk_size.handle
+        else:
+            bulk_size_handle = _semantic.builder.get_int32(int(bulk_size))
+
+        cache = _semantic._str_to_load_cache_modifier(cache_modifier)
+        eviction = _semantic._str_to_eviction_policy(eviction_policy)
+        return tlx.async_token(
+            _semantic.builder.create_async_load(
+                src.handle,
+                result.handle,
+                None,
+                None,
+                cache,
+                eviction,
+                is_volatile,
+                bulk_size_handle,
+                barrier.handle,
+                True,
+            ))
+
+    assert bulk_size is None, "bulk_size requires bulk=True"
+    assert barrier is None, "barrier requires bulk=True"
+
     # Unwrap constexpr and convert to tensor (same as tl.load)
     mask = tl._unwrap_if_constexpr(mask)
     other = tl._unwrap_if_constexpr(other)
@@ -533,6 +597,9 @@ def async_load(
             cache,
             eviction,
             is_volatile,
+            None,
+            None,
+            False,
         ))
 
 
@@ -746,6 +813,35 @@ def async_descriptor_store(
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
     _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
+
+
+@tl.builtin
+def async_store(
+    dst_global_ptr: tl.tensor,
+    src_smem: tlx.buffered_tensor,
+    size: tl.tensor,
+    _semantic=None,
+) -> None:
+    """
+    Asynchronously copies `size` bytes from shared memory to global memory using
+    cp.async.bulk.global.shared::cta.bulk_group. Completion is tracked via
+    cp.async.bulk.commit_group / cp.async.bulk.wait_group (use
+    async_descriptor_store_wait to wait).
+
+    The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
+
+    Args:
+        dst_global_ptr: Pointer to destination in global memory.
+        src_smem: Shared memory buffer.
+        size: Number of bytes to copy (must be a multiple of 16).
+    """
+    if isinstance(size, tl.constexpr):
+        size_handle = _semantic._convert_elem_to_ir_value(size.value, require_i64=False)
+    elif isinstance(size, tl.tensor):
+        size_handle = size.handle
+    else:
+        size_handle = _semantic._convert_elem_to_ir_value(size, require_i64=False)
+    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle)
 
 
 @tl.builtin

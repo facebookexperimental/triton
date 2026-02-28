@@ -6082,3 +6082,136 @@ def test_vote_ballot_sync_ir_emission(device):
     llir = kernel.asm["llir"]
     assert "nvvm.vote.ballot.sync" in llir or "vote.sync.ballot" in llir, (
         "Expected nvvm.vote.ballot.sync or vote.sync.ballot in LLVM IR")
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
+    """Test gmem->smem->gmem roundtrip using async_load(bulk=True) and async_store."""
+
+    @triton.jit
+    def bulk_copy_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        # gmem -> smem (bulk async_load)
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+
+        # smem -> gmem
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_copy_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR uses async_copy_global_to_local with bulk mode
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
+    assert "ttng.async_store" in ttgir, ("Expected async_store in TTGIR")
+
+    # Verify PTX contains the bulk copy instructions
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+        "Expected cp.async.bulk gmem->smem in PTX")
+    assert "cp.async.bulk.global.shared::cta.bulk_group" in ptx, ("Expected cp.async.bulk smem->gmem in PTX")
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_load_bulk(CHUNK_SIZE, device):
+    """Test async_load with bulk=True (1D bulk copy via mbarrier)."""
+
+    @triton.jit
+    def bulk_load_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        # Bulk async_load: no explicit pred needed (auto-generated in lowering)
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+
+        # Write back to gmem via smem->gmem bulk copy
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_load_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR: should use async_copy_global_to_local with useBulk/bulk_size/barrier
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
+    assert "bulk_size" in ttgir, "Expected bulk_size operand in TTGIR"
+    assert "barrier" in ttgir, "Expected barrier operand in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
+
+    # Verify PTX contains the bulk copy instruction
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+        "Expected cp.async.bulk gmem->smem in PTX")
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
+    """Test async_load bulk=True with explicit bulk_size parameter."""
+
+    @triton.jit
+    def bulk_load_explicit_size_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        # Pass explicit bulk_size
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_load(src_ptr, buf, bulk=True, bulk_size=CHUNK_SIZE, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_load_explicit_size_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR uses the bulk path
+    ttgir = kernel.asm["ttgir"]
+    assert "bulk_size" in ttgir, "Expected bulk_size operand in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)
