@@ -1764,7 +1764,15 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     if (channel->channelKind == DataChannelKind::TMEM) {
       // Move TMEM alloc to the beginning of the function.
       if (auto oldAlloc = dyn_cast<ttng::TMEMAllocOp>(srcOp)) {
+        // Save the source tensor's defining op before hoisting erases oldAlloc.
+        Operation *srcDefOp =
+            oldAlloc.getSrc() ? oldAlloc.getSrc().getDefiningOp() : nullptr;
         buffer = hoistLocalAlloc(builder, oldAlloc);
+        // For TMEM allocs with a source value, replace the alloc's underlying
+        // file location with the source tensor's, keeping the alloc's name.
+        if (srcDefOp) {
+          buffer.getDefiningOp()->setLoc(srcDefOp->getLoc());
+        }
       } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(srcOp)) {
         auto oldAlloc = mmaOp.getAccumulator().getDefiningOp();
         buffer = hoistLocalAlloc(builder, oldAlloc);
@@ -1814,6 +1822,26 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       }
     }
   }
+  // Deduplicate namelocs for allocs created from the same source expression.
+  SmallPtrSet<Operation *, 16> seenAllocs;
+  DenseMap<Location, SmallVector<Operation *>> locToAllocs;
+  for (auto &[channel, buffer] : bufferMap) {
+    if (auto *defOp = buffer.getDefiningOp()) {
+      if (isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(defOp) &&
+          seenAllocs.insert(defOp).second) {
+        locToAllocs[defOp->getLoc()].push_back(defOp);
+      }
+    }
+  }
+  auto *ctx = funcOp.getContext();
+  for (auto &[loc, allocs] : locToAllocs) {
+    if (allocs.size() > 1) {
+      for (unsigned i = 0; i < allocs.size(); i++) {
+        allocs[i]->setLoc(appendToNameLoc(loc, "_" + std::to_string(i), ctx));
+      }
+    }
+  }
+
   return bufferMap;
 }
 
