@@ -28,9 +28,13 @@ def _host_descriptor_pre_hook(nargs):
 
 configs = [
     # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS_KV': 3, 'NUM_BUFFERS_QK': 1, 'NUM_MMA_GROUPS': 1},
-    #               num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
-    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'NUM_BUFFERS_KV': 3, 'NUM_BUFFERS_QK': 1, 'NUM_MMA_GROUPS': 2},
-                  num_stages=0, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    #               num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config(
+        {"BLOCK_M": 256, "BLOCK_N": 128, "NUM_BUFFERS_KV": 3, "NUM_BUFFERS_QK": 1, "NUM_MMA_GROUPS": 2},
+        num_stages=1,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
 ]
 
 
@@ -82,14 +86,34 @@ def _attn_fwd_ws(sm_scale, M,  #
                                tlx.storage_kind.tmem)
     # Shared buffer for QK, P and Alpha, l, and m.
     # Alpha/l/m lives in the lower half of qk_buf, and P lives in the upper half.
-    p_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_v), NUM_MMA_GROUPS * NUM_BUFFERS_QK * 2,
-                              tlx.storage_kind.tmem, reuse=qk_tiles)
-    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-                                  tlx.storage_kind.tmem, reuse=qk_tiles)
-    l_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-                              tlx.storage_kind.tmem, reuse=qk_tiles)
-    m_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-                              tlx.storage_kind.tmem, reuse=qk_tiles)
+    p_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, HEAD_DIM),
+        tlx.dtype_of(desc_v),
+        NUM_MMA_GROUPS * NUM_BUFFERS_QK * 2,
+        tlx.storage_kind.tmem,
+        reuse=qk_tiles,
+    )
+    alpha_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, 1),
+        tl.float32,
+        HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        tlx.storage_kind.tmem,
+        reuse=qk_tiles,
+    )
+    l_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, 1),
+        tl.float32,
+        HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        tlx.storage_kind.tmem,
+        reuse=qk_tiles,
+    )
+    m_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, 1),
+        tl.float32,
+        HEAD_DIM * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        tlx.storage_kind.tmem,
+        reuse=qk_tiles,
+    )
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
                                 tlx.storage_kind.tmem)
@@ -343,13 +367,19 @@ class _attention(torch.autograd.Function):
 
         ctx.grid = grid
         _attn_fwd_ws[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
+            sm_scale,
+            M,  #
+            q.shape[0],
+            q.shape[1],  #
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            **extra_kern_args)
+            **extra_kern_args,
+        )
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
@@ -378,8 +408,13 @@ def attention(q, k, v, sm_scale, config=None):
 
     # Apply pre_hook to set block shapes
     nargs = {
-        **config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o,
-        "FP8_OUTPUT": q.dtype == torch.float8_e5m2
+        **config,
+        "HEAD_DIM": HEAD_DIM_K,
+        "desc_q": desc_q,
+        "desc_k": desc_k,
+        "desc_v": desc_v,
+        "desc_o": desc_o,
+        "FP8_OUTPUT": q.dtype == torch.float8_e5m2,
     }
     _host_descriptor_pre_hook(nargs)
 

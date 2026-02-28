@@ -4,6 +4,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
@@ -53,7 +54,7 @@ public:
     funcOp->walk([&](Operation *op) {
       if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
         enabled = true;
-      if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition"))
+      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName))
         enabled = true;
     });
     if (!enabled) {

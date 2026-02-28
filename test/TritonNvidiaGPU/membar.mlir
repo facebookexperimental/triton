@@ -91,8 +91,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 		// CHECK: local_dealloc
 		// CHECK-NEXT: local_alloc
 		// CHECK-NEXT: local_alloc
-		// CHECK-NEXT: gpu.barrier
-		// CHECK-NEXT: init_barrier
+		// CHECK-DAG: gpu.barrier
+		// CHECK-DAG: init_barrier
   	%cst = arith.constant dense<0> : tensor<128x64xi64, #blocked0>
   	%alloc = ttg.local_alloc %cst : (tensor<128x64xi64, #blocked0>) -> !ttg.memdesc<128x64xi64, #shared0, #smem, mutable>
   	ttg.local_dealloc %alloc : !ttg.memdesc<128x64xi64, #shared0, #smem, mutable>

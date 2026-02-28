@@ -47,47 +47,83 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // -----
 
-// Test TMEM alignment (32-byte) with nested reuse group tree:
+// Test TMEM alignment (column-based) with nested reuse group tree:
 //   distinct(shared(A, distinct(B, C)), D)
-// where A, B, D are f32 [4,2] and C is bf16 [1,1]
+// where A, B, D are f32 [4,32,8] and C is bf16 [1,32,4]
 //
-// Per-buffer sizes:
-//   A = 2*4 = 8 bytes, B = 2*4 = 8 bytes, C = 1*2 = 2 bytes, D = 2*4 = 8 bytes
+// Per-buffer TMEM columns (DummyTMEMLayout: ceil(m/32)*ceil(k/4)):
+//   A = ceil(32/32)*ceil(8/4) = 2, B = 2, C = ceil(32/32)*ceil(4/4) = 1, D = 2
 //
-// Alignment = max(32, max_elem_bytes) = 32 for all (TMEM)
+// Alignment (useTmemColumns): max of all leaf column counts = 2
 //
-// getElementSize (alignment=32):
-//   distinct(B, C):    alignUp(0,32) + 8 = 8;  alignUp(8,32) + 2 = 34
-//   shared(A, distinct(B,C)):  max(8, 34) = 34
-//   distinct(shared(..), D):   alignUp(0,32) + 34 = 34;  alignUp(34,32) + 8 = 72
+// getElementSize (useTmemColumns=true):
+//   distinct(B, C):    alignUp(0,2) + 2 = 2;  alignUp(2,1) + 1 = 3
+//   shared(A, distinct(B,C)):  max(2, 3) = 3
+//   distinct(shared(..), D):   alignUp(0,2) + 3 = 3;  alignUp(3,2) + 2 = 6
 //
-// sizePerBuffer = 72, bytesBetweenBuffers = alignUp(72, 32) = 96
-// totalSizeBytes = 96 * 4 = 384
+// columnsPerBufferGroup = 6, columnsBetweenBufferGroups = alignUp(6, 2) = 6
 //
-// Offsets (using new formula: newBufferDim = scale * lastIdx + offset + 1):
-//   A: offset=0,  bytesBetweenBuffers=96 → scale=12, offSlots=0  → [12*3+0+1, 2] = [37, 2]
-//   B: offset=0,  bytesBetweenBuffers=96 → scale=12, offSlots=0  → [12*3+0+1, 2] = [37, 2]
-//   C: offset=32, bytesBetweenBuffers=96 → scale=48, offSlots=16 → [48*0+16+1, 1] = [17, 1]
-//   D: offset=64, bytesBetweenBuffers=96 → scale=12, offSlots=8  → [12*3+8+1, 2] = [45, 2]
+// Offsets (using formula: newBufferDim = scale * lastIdx + offset + 1):
+//   A: offset=0, colsBetween=6 → scale=6/2=3, offSlots=0  → [3*3+0+1, 32, 8] = [10, 32, 8]
+//   B: offset=0, colsBetween=6 → scale=6/2=3, offSlots=0  → [3*3+0+1, 32, 8] = [10, 32, 8]
+//   C: offset=2, colsBetween=6 → scale=6/1=6, offSlots=2  → [6*0+2+1, 32, 4] = [3, 32, 4]
+//   D: offset=4, colsBetween=6 → scale=6/2=3, offSlots=2  → [3*3+2+1, 32, 8] = [12, 32, 8]
 #dummy_tmem_layout = #tlx.dummy_tmem_layout<>
 #tmem = #ttng.tensor_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @tmem_distinct_shared_distinct_alignment
   tt.func @tmem_distinct_shared_distinct_alignment() {
     // CHECK: ttng.tmem_alloc
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<37x2xf32
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<37x2xf32
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<17x1xbf16
-    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<45x2xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<10x32x8xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<10x32x8xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<3x32x4xbf16
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<12x32x8xf32
     %0 = tlx.storage_alias_spec storage = tmem : !tlx.storage_alias_spec<tmem>
-    %A = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>
-    %B = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>
-    %C = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<1x1xbf16, #dummy_tmem_layout, #tmem, mutable>
-    %D = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>
-    %inner_distinct = tlx.reuse_group(%B, %C) group_kind = distinct : (!ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>, !ttg.memdesc<1x1xbf16, #dummy_tmem_layout, #tmem, mutable>) -> !tlx.reuse_group<distinct>
-    %inner_shared = tlx.reuse_group(%A, %inner_distinct) group_kind = shared : (!ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
-    %outer_distinct = tlx.reuse_group(%inner_shared, %D) group_kind = distinct : (!tlx.reuse_group<shared>, !ttg.memdesc<4x2xf32, #dummy_tmem_layout, #tmem, mutable>) -> !tlx.reuse_group<distinct>
+    %A = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>
+    %B = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>
+    %C = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<1x32x4xbf16, #dummy_tmem_layout, #tmem, mutable>
+    %D = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>
+    %inner_distinct = tlx.reuse_group(%B, %C) group_kind = distinct : (!ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>, !ttg.memdesc<1x32x4xbf16, #dummy_tmem_layout, #tmem, mutable>) -> !tlx.reuse_group<distinct>
+    %inner_shared = tlx.reuse_group(%A, %inner_distinct) group_kind = shared : (!ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>, !tlx.reuse_group<distinct>) -> !tlx.reuse_group<shared>
+    %outer_distinct = tlx.reuse_group(%inner_shared, %D) group_kind = distinct : (!tlx.reuse_group<shared>, !ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>) -> !tlx.reuse_group<distinct>
     tlx.set_buffer_overlap(%0, %outer_distinct) : (!tlx.storage_alias_spec<tmem>, !tlx.reuse_group<distinct>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Test TMEM distinct reuse between f32 and i8 buffers (different
+// bytes-per-column ratios). This is the key case where column-based reuse
+// differs from byte-based reuse.
+//   distinct(A, B) where A is f32 [4,32,8] and B is i8 [4,32,4]
+//
+// Per-buffer TMEM columns (DummyTMEMLayout: ceil(m/32)*ceil(k/4)):
+//   A = ceil(32/32)*ceil(8/4) = 2, B = ceil(32/32)*ceil(4/4) = 1
+//
+// Alignment (useTmemColumns): max(2, 1) = 2
+//
+// getElementSize (useTmemColumns=true):
+//   distinct(A, B):  alignUp(0,2) + 2 = 2;  alignUp(2,1) + 1 = 3
+//
+// columnsPerBufferGroup = 3, columnsBetweenBufferGroups = alignUp(3, 2) = 4
+//
+// Offsets (using formula: newBufferDim = scale * lastIdx + offset + 1):
+//   A: offset=0, colsBetween=4 → scale=4/2=2, offSlots=0  → [2*3+0+1, 32, 8] = [7, 32, 8]
+//   B: offset=2, colsBetween=4 → scale=4/1=4, offSlots=2  → [4*3+2+1, 32, 4] = [15, 32, 4]
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#tmem = #ttng.tensor_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tmem_distinct_f32_i8
+  tt.func @tmem_distinct_f32_i8() {
+    // CHECK: ttng.tmem_alloc
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<7x32x8xf32
+    // CHECK: tlx.local_alias {{.*}} -> !ttg.memdesc<15x32x4xi8
+    %0 = tlx.storage_alias_spec storage = tmem : !tlx.storage_alias_spec<tmem>
+    %A = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>
+    %B = tlx.storage_alias_local_alloc %0 : !tlx.storage_alias_spec<tmem> -> !ttg.memdesc<4x32x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %distinct = tlx.reuse_group(%A, %B) group_kind = distinct : (!ttg.memdesc<4x32x8xf32, #dummy_tmem_layout, #tmem, mutable>, !ttg.memdesc<4x32x4xi8, #dummy_tmem_layout, #tmem, mutable>) -> !tlx.reuse_group<distinct>
+    tlx.set_buffer_overlap(%0, %distinct) : (!tlx.storage_alias_spec<tmem>, !tlx.reuse_group<distinct>) -> ()
     tt.return
   }
 }
