@@ -1696,6 +1696,7 @@ class TritonSemantic(Generic[TensorTy]):
 
         M = lhs.type.shape[-2]
         if tlx_paired_ctas:
+            assert M == 128, f"Currently only supports M=128 per CTA for pair-CTA mma, but got M={M}"
             N = 2 * rhs.type.shape[-1]  # rhs is actually [K, N/2] in two_ctas mode so we scale it back
         else:
             N = rhs.type.shape[-1]
