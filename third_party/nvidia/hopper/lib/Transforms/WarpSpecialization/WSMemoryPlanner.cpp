@@ -2803,12 +2803,34 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   // Step 2: figure out smem/tmem sizes and liveness.
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
   // otherwise, the liveness can't overlap.
+
+  // Check for per-loop SMEM allocation attributes on the WS ForOp.
+  // These override the pass-level defaults, following the same pattern
+  // as tt.tmem_alloc_algo.
+  int effectiveSmemAllocAlgo = smemAllocAlgo;
+  unsigned effectiveSmemBudget = smemBudget;
+  bool effectiveSmemCircularReuse = smemCircularReuse;
+  funcOp->walk([&](scf::ForOp forOp) {
+    if (!forOp->hasAttr("tt.warp_specialize"))
+      return;
+    if (auto attr =
+            forOp->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+      effectiveSmemAllocAlgo = attr.getInt();
+    if (auto attr = forOp->getAttrOfType<IntegerAttr>("tt.smem_budget"))
+      effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
+    if (auto attr = forOp->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+      effectiveSmemCircularReuse = attr.getValue();
+  });
+
   unsigned bufferId;
-  if (smemAllocAlgo == 1) {
+  if (effectiveSmemAllocAlgo == 1) {
     // New WSBuffer-based SMEM allocation (Phases 1-5).
-    LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)");
-    bufferId = allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
-                                   smemCircularReuse);
+    LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)"
+         << " smemBudget=" << effectiveSmemBudget
+         << " smemCircularReuse=" << effectiveSmemCircularReuse);
+    bufferId = allocateSmemBuffers(funcOp, channels, numBuffers,
+                                   effectiveSmemBudget,
+                                   effectiveSmemCircularReuse);
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");

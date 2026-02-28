@@ -1193,6 +1193,9 @@ class CodeGenerator(ast.NodeVisitor):
         data_partition_factor = None
         merge_epilogue = False
         tmem_alloc_algo = None
+        smem_alloc_algo = None
+        smem_budget = None
+        smem_circular_reuse = None
         flatten = False
         warp_specialize = False
         disable_licm = False
@@ -1210,6 +1213,9 @@ class CodeGenerator(ast.NodeVisitor):
             data_partition_factor = iterator.data_partition_factor
             merge_epilogue = iterator.merge_epilogue
             tmem_alloc_algo = iterator.tmem_alloc_algo
+            smem_alloc_algo = iterator.smem_alloc_algo
+            smem_budget = iterator.smem_budget
+            smem_circular_reuse = iterator.smem_circular_reuse
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
@@ -1275,6 +1281,12 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
             if tmem_alloc_algo is not None:
                 for_op.set_attr("tt.tmem_alloc_algo", self.builder.get_int32_attr(tmem_alloc_algo))
+            if smem_alloc_algo is not None:
+                for_op.set_attr("tt.smem_alloc_algo", self.builder.get_int32_attr(smem_alloc_algo))
+            if smem_budget is not None:
+                for_op.set_attr("tt.smem_budget", self.builder.get_int32_attr(smem_budget))
+            if smem_circular_reuse is not None:
+                for_op.set_attr("tt.smem_circular_reuse", self.builder.get_bool_attr(smem_circular_reuse))
             if disable_licm:
                 for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
 
