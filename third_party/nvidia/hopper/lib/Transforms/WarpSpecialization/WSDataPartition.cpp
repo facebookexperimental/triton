@@ -103,6 +103,9 @@ struct DataPartitionScheme {
   DenseMap<Operation *, SetVector<unsigned>> rematerializedOps;
   // Ops should not be partitioned due to rematerialization.
   DenseSet<Operation *> opsToSkip;
+  // Function arguments (TensorDescType) that need their block type sliced.
+  // Maps argument index -> partition dimension (in descriptor space).
+  DenseMap<unsigned, unsigned> funcArgPartitionDims;
 
   // op with noOpPartitionDim will be duplicated instead of partitioned.
   // Use -2 to avoid conflict with Empty/Tombstone value.
@@ -119,6 +122,12 @@ struct DataPartitionScheme {
       rematerializedOps.insert(op);
     for (auto op : other.opsToSkip)
       opsToSkip.insert(op);
+    for (auto &[argIndex, dim] : other.funcArgPartitionDims) {
+      auto it = funcArgPartitionDims.find(argIndex);
+      assert((it == funcArgPartitionDims.end() || it->second == dim) &&
+             "funcArgPartitionDims conflict during append");
+      funcArgPartitionDims[argIndex] = dim;
+    }
   }
 
   bool partitionIsCompatible() { return true; }
@@ -178,6 +187,14 @@ struct DataPartitionScheme {
       LDBG(" ops to skip\n");
       for (auto &op : opsToSkip)
         op->dump();
+      LDBG("\n");
+    }
+
+    if (!funcArgPartitionDims.empty()) {
+      LDBG(" func arg partition dims:");
+      for (auto &[argIndex, dim] : funcArgPartitionDims) {
+        LDBG("  arg " << argIndex << " -> dim " << dim);
+      }
       LDBG("\n");
     }
 
@@ -392,6 +409,18 @@ static bool getBackwardSliceToPartition(Value v,
       auto yieldArg = forOp.getYieldedValues()[bbArg.getArgNumber() - 1];
       if (!getBackwardSliceToPartition(yieldArg, partitionScheme, currentDim))
         return false;
+    } else if (isa<triton::FuncOp>(bbAargOwner)) {
+      if (isa<TensorDescType>(bbArg.getType())) {
+        unsigned argIndex = bbArg.getArgNumber();
+        auto it = partitionScheme.funcArgPartitionDims.find(argIndex);
+        if (it != partitionScheme.funcArgPartitionDims.end()) {
+          // Same arg reached again; must agree on dimension.
+          if (it->second != currentDim)
+            return false;
+        } else {
+          partitionScheme.funcArgPartitionDims[argIndex] = currentDim;
+        }
+      }
     }
   }
 
@@ -562,6 +591,10 @@ static bool getSliceToPartition(Value root,
         return false;
       if (!getBackwardSliceToPartition(descStoreOp.getSrc(), partitionScheme,
                                        remappedDim))
+        return false;
+    } else if (auto tmemStoreOp = dyn_cast<nvidia_gpu::TMEMStoreOp>(op)) {
+      if (!getBackwardSliceToPartition(tmemStoreOp.getSrc(), partitionScheme,
+                                       currentDim))
         return false;
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<StoreOp, AtomicRMWOp>(op)) {
@@ -1007,6 +1040,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // TODO: Retype the source operand with a tmem compatible layout, and
     // replace the dependency, recursively
     auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
+    assert(newSrc && "TMEMStoreOp src not found in mappings; was it "
+                     "backward-sliced in getSliceToPartition?");
     newSrc.setType(newSrcType);
     newOp = cloneAndSetResultType(op);
   } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
@@ -1363,6 +1398,10 @@ static Operation *sliceOp(Value v, int offset, IRMapping &mappings,
     assert(isa<BlockArgument>(v) && "value is not an operation or block ");
     auto bbArg = cast<BlockArgument>(v);
     Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
+    if (isa<triton::FuncOp>(bbAargOwner)) {
+      // Host-side TMA func arg: type updated in post-processing.
+      return bbAargOwner;
+    }
     return sliceOp(bbAargOwner, offset, mappings, reverseMappings,
                    partitionScheme);
   }
@@ -1449,6 +1488,25 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     return true;
   }
 
+  // Bail out if a TensorDescType func arg is used as a ForOp init arg.
+  // This case requires extra handling to update ForOp iter arg types
+  // consistently, deferred to a follow-up.
+  for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
+    auto bbArg = funcOp.getArgument(argIndex);
+    for (Operation *user : bbArg.getUsers()) {
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        for (Value initArg : forOp.getInitArgs()) {
+          if (initArg == bbArg) {
+            LDBG("TensorDescType func arg " << argIndex
+                                            << " used as ForOp init arg; "
+                                               "not supported yet");
+            return false;
+          }
+        }
+      }
+    }
+  }
+
   // Rewrite the rematerialized ops.
   LDBG("Rewriting rematerialized Ops");
   rewriteRematerializedOps(funcOp, partitionScheme);
@@ -1505,6 +1563,26 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   });
 
   fixTaskId(funcOp);
+
+  // Update function argument types for host-side TMA descriptors.
+  if (!partitionScheme.funcArgPartitionDims.empty()) {
+    auto &entryBlock = funcOp.getBlocks().front();
+    for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
+      auto bbArg = entryBlock.getArgument(argIndex);
+      auto descType = cast<TensorDescType>(bbArg.getType());
+      auto blockType = descType.getBlockType();
+      SmallVector<int64_t> shape(blockType.getShape());
+      shape[dim] /= partitionScheme.numPartitions;
+      auto newBlockType = RankedTensorType::get(
+          shape, blockType.getElementType(), blockType.getEncoding());
+      bbArg.setType(TensorDescType::get(funcOp.getContext(), newBlockType));
+    }
+    // Update FuncOp signature to match.
+    SmallVector<Type> argTys(entryBlock.getArgumentTypes());
+    funcOp.setFunctionType(FunctionType::get(
+        funcOp.getContext(), argTys, funcOp.getFunctionType().getResults()));
+  }
+
   return true;
 }
 
