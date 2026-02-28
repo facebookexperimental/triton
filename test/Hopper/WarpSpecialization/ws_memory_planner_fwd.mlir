@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=3 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=3 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
 // Test case: FA FWD pattern using allocateTMemAllocs2 algorithm.
 // This test verifies the TMEM buffer allocation for Flash Attention forward pass.
@@ -20,8 +20,40 @@
 //   - offsetkv_y buffers reuse qk0/qk1 at cols 64-67
 
 // CHECK-LABEL: tt.func public @_attn_fwd
-// Verify that the pass completes successfully (no errors)
-// CHECK-NOT: error
+//
+// SMEM allocations
+// CHECK: ttg.local_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// CHECK: ttg.local_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 1 : i32}
+//
+// TMEM allocations: acc reuses qk's buffer (id=8 and id=7) at offset 0
+// CHECK: %acc = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// CHECK: %acc_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
+//
+// TMEM allocations: alpha reuses qk's buffer at offset 64
+// CHECK: %alpha, %alpha_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 64 : i32}
+// CHECK: %alpha_2, %alpha_3 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 64 : i32}
+//
+// TMEM allocations: qk owns buffer 8 and 7
+// CHECK: %qk, %qk_4 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: %qk_5, %qk_6 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
+//
+// SMEM allocations: v and k share buffer 2, triple-buffered
+// CHECK: %v = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32}
+// CHECK: %k = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32}
+//
+// TMEM allocations: offsetkv_y reuses qk's buffers at offset 65-66
+// CHECK: %offsetkv_y, %offsetkv_y_7 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 65 : i32}
+// CHECK: %offsetkv_y_8, %offsetkv_y_9 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 66 : i32}
+// CHECK: %offsetkv_y_10, %offsetkv_y_11 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 65 : i32}
+// CHECK: %offsetkv_y_12, %offsetkv_y_13 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 66 : i32}
+//
+// TMEM allocations: loop accumulators own buffer 6 and 5
+// CHECK: %acc_14, %acc_15 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32}
+// CHECK: %acc_16, %acc_17 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
+//
+// SMEM allocations: q0 buffers
+// CHECK: %q0 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: %q0_18 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
