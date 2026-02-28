@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=3 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
 // Test case: FA BWD pattern using allocateTMemAllocs2 backtracking algorithm.
 // This test verifies the TMEM buffer allocation for Flash Attention backward pass.
@@ -25,9 +25,33 @@
 //   - dv_interm reuses qkT (buffer.id=5)
 
 // CHECK-LABEL: tt.func public @_attn_bwd
-// The key verification: dq reuses dpT (same buffer.id=6, with buffer.offset=0)
-// CHECK: ttng.tmem_alloc {async_task_id = array<i32: 0, 3>, buffer.copy = 1 : i32, buffer.id = 6 : i32}
-// CHECK: ttng.tmem_alloc {async_task_id = array<i32: 0, 2>, buffer.copy = 1 : i32, buffer.id = 6 : i32, buffer.offset = 0 : i32}
+//
+// SMEM allocations: dsT, do, q share buffer 0, triple-buffered
+// CHECK: %dsT = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32}
+//
+// TMEM allocation: dv (bf16) reuses qkT's buffer at offset 0
+// CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32}
+//
+// SMEM allocations
+// CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32}
+// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32}
+// CHECK: %k_42 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32}
+// CHECK: %v_43 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+//
+// TMEM allocations: qkT owns buffer 5
+// CHECK: %qkT, %qkT_44 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
+//
+// TMEM allocation: dv_45 (f32 accumulator) owns buffer 4
+// CHECK: %dv_45, %dv_46 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 4 : i32}
+//
+// TMEM allocation: dpT owns buffer 6
+// CHECK: %dpT, %dpT_47 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
+//
+// TMEM allocation: dk owns buffer 3
+// CHECK: %dk, %dk_48 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 3 : i32}
+//
+// TMEM allocation: dq reuses dpT (buffer.id=6, buffer.offset=0) — key verification
+// CHECK: %dq, %dq_49 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32, buffer.offset = 0 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -174,7 +198,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.descriptor_reduce add, %desc_dq[%q_90, %c0_i32], %dqN_140 {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !tt.tensordesc<tensor<128x32xf32, #shared1>>, tensor<128x32xf32, #blocked9> loc(#loc132)
       %curr_m_141 = arith.addi %arg45, %c128_i32 {async_task_id = array<i32: 1, 2, 3>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : i32 loc(#loc167)
       scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %curr_m_141, %true, %qkT_100, %dv_105, %dpT_114, %dk_118, %dq_122 : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token loc(#loc134)
-    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32} loc(#loc203)
+    } {async_task_id = array<i32: 0, 1, 2, 3>, "tt.tmem_alloc_algo" = 2 : i32, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32} loc(#loc203)
     %dv_52, %dv_53 = ttng.tmem_load %dv_45[%curr_m#3] {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1> loc(#loc139)
     %dvs = tt.reshape %dv_52 {async_task_id = array<i32: 3>} : tensor<128x128xf32, #blocked1> -> tensor<128x2x64xf32, #blocked4> loc(#loc168)
     %dk_54, %dk_55 = ttng.tmem_load %dk[%curr_m#5] {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1> loc(#loc147)
