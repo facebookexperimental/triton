@@ -1608,8 +1608,21 @@ public:
     if (bufferRange[owner].intersects(bufferRange[candidate]))
       return 0;
 
-    // Dependency check with owner
-    if (!alongDependencyChain(owner->owner, candidate->owner, 1))
+    // Bidirectional data dependency check via channels.
+    // Check bidirectional data dependency:
+    // 1. src → dst: src's consumer leads to dst's producer
+    // 2. dst → src: dst's consumer leads to src's producer
+    auto *srcCh = allocToChannel[owner->owner];
+    auto *dstCh = allocToChannel[candidate->owner];
+    auto hasDependency = [&]() -> bool {
+      if (!srcCh || !dstCh)
+        return false;
+      if (isDataDependent(srcCh->getDstOp(), dstCh->getSrcOp()) ||
+          isDataDependent(dstCh->getDstOp(), srcCh->getSrcOp()))
+        return true;
+      return false;
+    };
+    if (!hasDependency())
       return 0;
 
     // Priority: prefer exact size matches
@@ -1619,44 +1632,33 @@ public:
   }
 
   /// Compute column offset for candidate in owner's reuse group.
-  /// Returns INVALID (max size_t) if can't fit or dependency check fails.
+  /// Returns INVALID (max size_t) if can't fit.
+  /// Uses hasPotentialReuse to determine if buffers can share columns.
   size_t computeColOffset(BufferT *candidate, BufferT *owner,
                           const AllocationState &state) {
     size_t maxColOffset = 0;
 
-    // Find offset based on overlapping liveness with existing reusers
+    // Check compatibility with existing reusers using hasPotentialReuse.
+    // If hasPotentialReuse returns > 0 in either direction, they can share
+    // the same column space. Otherwise, they need different columns.
     for (auto &[reuser, assignment] : state.assignment) {
       auto [reuseOwner, reuserColOffset] = assignment;
       if (reuseOwner != owner)
         continue;
-      if (bufferRange[reuser].intersects(bufferRange[candidate]))
+
+      // Check if reuser and candidate can share columns
+      bool canShareColumns = (hasPotentialReuse(reuser, candidate) > 0 ||
+                              hasPotentialReuse(candidate, reuser) > 0);
+      if (!canShareColumns) {
+        // They can't share - place candidate after reuser's column range
         maxColOffset =
             std::max(maxColOffset, reuserColOffset + reuser->colSize);
+      }
     }
 
     // Check if candidate fits
     if (maxColOffset + candidate->colSize > owner->colSize)
       return std::numeric_limits<size_t>::max();
-
-    // Check dependency with reusers that have overlapping columns
-    size_t candColStart = maxColOffset;
-    size_t candColEnd = maxColOffset + candidate->colSize;
-    for (auto &[reuser, assignment] : state.assignment) {
-      auto [reuseOwner, reuserColOffset] = assignment;
-      if (reuseOwner != owner)
-        continue;
-      // Skip if livenesses don't overlap
-      if (!bufferRange[reuser].intersects(bufferRange[candidate]))
-        continue;
-      // Check column overlap
-      size_t reuserColEnd = reuserColOffset + reuser->colSize;
-      bool colOverlap =
-          (candColStart < reuserColEnd) && (reuserColOffset < candColEnd);
-      if (colOverlap) {
-        if (!alongDependencyChain(reuser->owner, candidate->owner, 1))
-          return std::numeric_limits<size_t>::max(); // Conflict
-      }
-    }
 
     return maxColOffset;
   }
