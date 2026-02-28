@@ -976,19 +976,12 @@ public:
       }
 
       if (totalCols < tmemColLimit && !allocInfos.empty()) {
-        unsigned numAllocs = allocInfos.size();
-        unsigned consecutiveSkips = 0;
-        unsigned idx = 0;
-        while (consecutiveSkips < numAllocs) {
+        for (unsigned idx = 0; idx < allocInfos.size(); idx++) {
           auto &info = allocInfos[idx];
           if (totalCols + info.baseCols <= tmemColLimit) {
             info.copy += 1;
             totalCols += info.baseCols;
-            consecutiveSkips = 0;
-          } else {
-            consecutiveSkips++;
           }
-          idx = (idx + 1) % numAllocs;
         }
       }
 
