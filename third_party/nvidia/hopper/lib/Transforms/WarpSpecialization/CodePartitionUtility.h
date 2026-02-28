@@ -69,6 +69,7 @@ public:
   unsigned _numBuffers;
   DataChannelKind channelKind = DataChannelKind::SMEM;
   unsigned uniqID;
+  std::string srcName; // Producer name captured at channel creation
 };
 
 // A few assumptions, a channel can have multiple consumers, but the consumers
