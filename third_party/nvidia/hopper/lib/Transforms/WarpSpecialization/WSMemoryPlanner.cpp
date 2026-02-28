@@ -798,7 +798,7 @@ public:
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
-           ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
+           ttng::TMemAllocation(allocSize.numRows, allocSize.numCols)});
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
@@ -1066,31 +1066,29 @@ public:
             alloc != buf &&
             (sameLoop(alloc) ||
              bufferRange[alloc].intersects(bufferRange[cand]))) {
-          // colOffset is an N-dimension (TMEM row) position, so we advance
-          // by rowSize (N-dimension extent), not colSize (M-dimension extent).
           maxColOffset =
-              std::max(maxColOffset, alloc->colOffset + alloc->rowSize);
+              std::max(maxColOffset, alloc->colOffset + alloc->colSize);
         }
       }
       return maxColOffset;
     };
     // Make sure we can place cand at colOffset in the buffer owned by
-    // reuseOwner. colOffset is an N-dimension (TMEM row) position.
+    // reuseOwner.
     auto checkOtherReuses = [&](BufferT *cand, BufferT *reuseOwner,
                                 size_t colOffset) -> bool {
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
           // Use rowSize for the N-dimension extent, since colOffset is an
           // N-dimension position.
-          Interval candSizeRange = {colOffset, colOffset + cand->rowSize};
+          Interval candSizeRange = {colOffset, colOffset + cand->colSize};
           Interval allocSizeRange = {alloc->colOffset,
-                                     alloc->colOffset + alloc->rowSize};
+                                     alloc->colOffset + alloc->colSize};
           if (bufferRange[alloc].intersects(bufferRange[cand]) &&
               allocSizeRange.intersects(candSizeRange)) {
             LLVM_DEBUG({
               LDBG("checkOtherReuses conflict "
                    << colOffset << " " << alloc->colOffset << " "
-                   << cand->rowSize << " " << alloc->rowSize);
+                   << cand->colSize << " " << alloc->colSize);
               alloc->owner->dump();
             });
             return false;
@@ -1103,23 +1101,17 @@ public:
                               unsigned depChainCondition) -> size_t {
       size_t maxColOffset = 0;
       // Try to find the colOffset in this reuseOwner. If there is already a
-      // reuse whose liveness overlaps with cand, move up colOffset.
-      // Note: we only count allocs with overlapping liveness, not all
-      // same-loop allocs, because checkOtherReuses already validates
-      // that same-loop allocs with non-overlapping liveness can share
-      // column space safely.
-      // colOffset is an N-dimension (TMEM row) position, so we advance
-      // by rowSize (N-dimension extent), not colSize (M-dimension extent).
+      // reuse in the same loop, move up colOffset.
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
           if (sameLoop(alloc) ||
               bufferRange[alloc].intersects(bufferRange[cand]))
             maxColOffset =
-                std::max(alloc->colOffset + alloc->rowSize, maxColOffset);
+                std::max(alloc->colOffset + alloc->colSize, maxColOffset);
         }
       }
       LDBG("findReuseSpace first pass maxColOffset " << maxColOffset);
-      if (maxColOffset + cand->rowSize <= reuseOwner->rowSize)
+      if (maxColOffset + cand->colSize <= reuseOwner->colSize)
         return maxColOffset;
       if (!sameLoop(reuseOwner)) {
         // owner is not live in this ctrlOp
@@ -1136,7 +1128,7 @@ public:
               LDBG("findUsesInCtrlOp returns " << tOffset);
               alloc->owner->dump();
             });
-            if (tOffset + cand->rowSize <= alloc->rowSize)
+            if (tOffset + cand->colSize <= alloc->colSize)
               return tOffset;
           }
         }
