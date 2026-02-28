@@ -2713,7 +2713,10 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
 
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "") {
+                              StringRef writeDecisionFile = "",
+                              int smemAllocAlgo = 0,
+                              unsigned smemBudget = 232448,
+                              bool smemCircularReuse = false) {
 
   // Step 0: reorder ops within pipelined loops so that within each stage,
   // ops with smaller cluster IDs appear before ops with larger cluster IDs.
@@ -2800,13 +2803,23 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   // Step 2: figure out smem/tmem sizes and liveness.
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
   // otherwise, the liveness can't overlap.
-  Allocation allocation;
-  triton::MemoryPlanner planner(funcOp, &allocation, &channels);
-  if (failed(planner.run(numBuffers)))
-    return failure();
-  unsigned bufferId = planner.getLastBufferId();
-  LLVM_DEBUG(funcOp.dump());
-  LLVM_DEBUG(planner.dumpBuffers());
+  unsigned bufferId;
+  if (smemAllocAlgo == 1) {
+    // New WSBuffer-based SMEM allocation (Phases 1-5).
+    LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)");
+    bufferId = allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
+                                   smemCircularReuse);
+  } else {
+    // Original SMEM allocation.
+    LDBG("using SMEM allocation algorithm 0 (original)");
+    Allocation allocation;
+    triton::MemoryPlanner planner(funcOp, &allocation, &channels);
+    if (failed(planner.run(numBuffers)))
+      return failure();
+    bufferId = planner.getLastBufferId();
+    LLVM_DEBUG(funcOp.dump());
+    LLVM_DEBUG(planner.dumpBuffers());
+  }
 
   // Dump combined key ops + channel graph (side by side visualization)
   // Note: Placed before MemoryPlannerTmem to visualize state even if TMEM
@@ -2882,7 +2895,8 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
       if (failed(doMemoryPlanner(funcOp, numBuffers, readDecisionFile,
-                                 writeDecisionFile)))
+                                 writeDecisionFile, smemAllocAlgo,
+                                 smemBudget, smemCircularReuse)))
         signalPassFailure();
     }
   }
