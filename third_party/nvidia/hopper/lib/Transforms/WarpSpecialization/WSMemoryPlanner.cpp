@@ -1063,7 +1063,9 @@ public:
       size_t maxColOffset = 0;
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == buf->reuseOwner &&
-            alloc != buf && bufferRange[alloc].intersects(bufferRange[cand])) {
+            alloc != buf &&
+            (sameLoop(alloc) ||
+             bufferRange[alloc].intersects(bufferRange[cand]))) {
           // colOffset is an N-dimension (TMEM row) position, so we advance
           // by rowSize (N-dimension extent), not colSize (M-dimension extent).
           maxColOffset =
@@ -1110,19 +1112,10 @@ public:
       // by rowSize (N-dimension extent), not colSize (M-dimension extent).
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
-          if (bufferRange[alloc].intersects(bufferRange[cand])) {
-            LLVM_DEBUG({
-              LDBG("findReuseSpace counting alloc col "
-                   << alloc->colOffset << "+" << alloc->rowSize << " liveness ["
-                   << bufferRange[alloc].start() << ","
-                   << bufferRange[alloc].end() << "] vs cand ["
-                   << bufferRange[cand].start() << ","
-                   << bufferRange[cand].end() << "]");
-              alloc->owner->dump();
-            });
+          if (sameLoop(alloc) ||
+              bufferRange[alloc].intersects(bufferRange[cand]))
             maxColOffset =
                 std::max(alloc->colOffset + alloc->rowSize, maxColOffset);
-          }
         }
       }
       LDBG("findReuseSpace first pass maxColOffset " << maxColOffset);
