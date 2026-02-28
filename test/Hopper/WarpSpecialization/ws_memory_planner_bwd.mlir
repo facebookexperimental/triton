@@ -1,35 +1,27 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
-// Test case: FA BWD pattern using allocateTMemAllocs2 backtracking algorithm.
-// This test verifies the SMEM (WSBuffer-based) and TMEM buffer allocation for
-// Flash Attention backward pass.
+// Test case: FA BWD pattern with budget-aware SMEM allocation (algo=1).
+// With smem_budget=200000, only one of the two cross-stage TMA buffers
+// (do, q) can get copy=2 before exceeding budget. The other stays at copy=1.
 //
-// SMEM WSBuffers (new algorithm, smem-alloc-algo=1):
-//   [0] dsT: 128x128 bf16 - innermost, non-TMA, non-cross-stage → P1, copy=1
+// SMEM WSBuffers:
+//   [0] dsT: 128x128 bf16 - innermost, non-TMA → P1, copy=1
 //   [1] do:  128x128 bf16 - innermost, TMA, cross-stage → P0, copy=2
-//   [2] q:   128x128 bf16 - innermost, TMA, cross-stage → P0, copy=2
+//   [2] q:   128x128 bf16 - innermost, TMA, cross-stage → P0, copy=1 (budget)
 //   [3] k_42: 128x128 bf16 - not innermost → P2, copy=1
 //   [4] v_43: 128x128 bf16 - not innermost → P2, copy=1
-//
-// TMEM key buffers (backtracking algorithm):
-//   [5] dk: accumulator, long-lived
-//   [6] dv_45: accumulator, long-lived
-//   [7] qkT: temp buffer, short-lived
-//   [8] dpT: temp buffer, short-lived
-//   dq reuses dpT (buffer.id=8) at offset 0
-//   dv (bf16) reuses qkT (buffer.id=7) at offset 0
 
 // CHECK-LABEL: tt.func public @_attn_bwd
 //
-// SMEM allocations: each buffer gets its own buffer.id
+// SMEM allocations: each buffer gets its own buffer.id, budget-constrained
 // CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 //
 // TMEM allocation: dv (bf16) reuses qkT's buffer at offset 0
 // CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 //
-// SMEM allocations: do and q are cross-stage TMA, get copy=2
+// SMEM allocations: do gets copy=2 (cross-stage, fits budget), q stays at copy=1
 // CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
-// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
+// CHECK: %q = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
 // CHECK: %k_42 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
 // CHECK: %v_43 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 //
@@ -45,7 +37,7 @@
 // TMEM allocation: dk owns buffer 5
 // CHECK: %dk, %dk_48 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
-// TMEM allocation: dq reuses dpT (buffer.id=8, buffer.offset=0) — key verification
+// TMEM allocation: dq reuses dpT (buffer.id=8, buffer.offset=0)
 // CHECK: %dq, %dq_49 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
@@ -193,7 +185,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.descriptor_reduce add, %desc_dq[%q_90, %c0_i32], %dqN_140 {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !tt.tensordesc<tensor<128x32xf32, #shared1>>, tensor<128x32xf32, #blocked9> loc(#loc132)
       %curr_m_141 = arith.addi %arg45, %c128_i32 {async_task_id = array<i32: 1, 2, 3>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : i32 loc(#loc167)
       scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %curr_m_141, %true, %qkT_100, %dv_105, %dpT_114, %dk_118, %dq_122 : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token loc(#loc134)
-    } {async_task_id = array<i32: 0, 1, 2, 3>, "tt.smem_alloc_algo" = 1 : i32, "tt.tmem_alloc_algo" = 2 : i32, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32} loc(#loc203)
+    } {async_task_id = array<i32: 0, 1, 2, 3>, "tt.smem_alloc_algo" = 1 : i32, "tt.smem_budget" = 200000 : i32, "tt.tmem_alloc_algo" = 2 : i32, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32} loc(#loc203)
     %dv_52, %dv_53 = ttng.tmem_load %dv_45[%curr_m#3] {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1> loc(#loc139)
     %dvs = tt.reshape %dv_52 {async_task_id = array<i32: 3>} : tensor<128x128xf32, #blocked1> -> tensor<128x2x64xf32, #blocked4> loc(#loc168)
     %dk_54, %dk_55 = ttng.tmem_load %dk[%curr_m#5] {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1> loc(#loc147)

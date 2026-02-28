@@ -932,11 +932,23 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     return nextBufferId;
 
   // ── Phase 2: Enforce cross-stage minimum ────────────────────────────
+  // Budget-aware: only set copy=2 if the total SMEM stays within budget.
   for (auto &buf : wsBuffers) {
     if (buf.isCrossStage && numBuffers >= 2) {
+      unsigned saved = buf.numCopies;
       buf.numCopies = 2;
-      LDBG("Phase 2: WSBuffer[" << buf.bufferId
-                                << "] cross-stage → numCopies=2");
+      unsigned totalSmem = computeTotalSmem(wsBuffers);
+      if (totalSmem <= smemBudget) {
+        LDBG("Phase 2: WSBuffer[" << buf.bufferId
+                                  << "] cross-stage → numCopies=2"
+                                  << " (totalSmem=" << totalSmem << ")");
+      } else {
+        buf.numCopies = saved;
+        LDBG("Phase 2: WSBuffer[" << buf.bufferId
+                                  << "] cross-stage copy=2 skipped"
+                                  << " (would exceed budget: " << totalSmem
+                                  << " > " << smemBudget << ")");
+      }
     }
   }
 
@@ -991,6 +1003,10 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
       if (maxCrossStageMin >= 2)
         groupStart = maxCrossStageMin * 2 - 1; // e.g., 3
 
+      // Clamp to num_buffers.
+      if (groupStart > numBuffers)
+        groupStart = numBuffers;
+
       bufA.numCopies = groupStart;
       bufB.numCopies = groupStart;
 
@@ -1004,7 +1020,12 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     if (isReuseGroup) {
       currentGroupCopies = wsBuffers[candidateIndices[0]].numCopies;
     } else {
-      currentGroupCopies = 1;
+      // Start at the minimum numCopies across candidates (may be > 1
+      // after Phase 2 cross-stage enforcement).
+      currentGroupCopies = numBuffers; // will be lowered
+      for (unsigned idx : candidateIndices)
+        currentGroupCopies =
+            std::min(currentGroupCopies, wsBuffers[idx].numCopies);
     }
 
     bool foundValidSolution = false;
