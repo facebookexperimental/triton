@@ -13,16 +13,14 @@
 module attributes {ttg.target = "cuda:100", "ttg.num-warps" = 8 : i32} {
 
 // Test 1: bwd FA pattern - reduction at index 0 gets 4 warps
-// When partition has "reduction" type at index 0, it gets 4 warps (bwd FA default)
 // CHECK-LABEL: @bwd_fa_reduction_at_index_zero
 tt.func @bwd_fa_reduction_at_index_zero(%arg0: i32) {
-  // The partition types attribute marks partition index 0 as "reduction" (bwd FA pattern)
   ttg.warp_specialize(%arg0) attributes {"ttg.partition.types" = ["reduction", "gemm"]}
   default {
     ttg.warp_yield
   }
   // CHECK: partition0({{.*}}) num_warps(4)
-  // Reduction at index 0 in bwd FA pattern gets 4 warps
+  // Reduction at index 0 gets 4 warps
   partition0(%arg1: i32) num_warps(8) {
     %0 = arith.addi %arg1, %arg1 : i32
     ttg.warp_return
@@ -124,8 +122,7 @@ tt.func @bwd_fa_mixed_with_tensor_ops(%arg0: i32) {
   tt.return
 }
 
-// Test 5: Partition types with different number of partitions (not 4)
-// The "last partition = 8 warps" rule only applies to exactly 4 partitions.
+// Test 5: Without "reduction" type, no bwd FA overrides apply
 // CHECK-LABEL: @three_partitions_no_special_last
 tt.func @three_partitions_no_special_last(%arg0: i32) {
   ttg.warp_specialize(%arg0) attributes {"ttg.partition.types" = ["gemm", "load", "computation"]}
@@ -143,7 +140,7 @@ tt.func @three_partitions_no_special_last(%arg0: i32) {
     ttg.warp_return
   }
   // CHECK: partition2({{.*}}) num_warps(1)
-  // With 3 partitions (not 4), the last partition does NOT get special treatment
+  // Without reduction, no bwd FA overrides apply
   partition2(%arg1: i32) num_warps(4) {
     %0 = arith.subi %arg1, %arg1 : i32
     ttg.warp_return
