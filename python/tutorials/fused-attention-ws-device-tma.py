@@ -1096,7 +1096,8 @@ def _attn_bwd_persist(
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
 
-    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1, smem_budget=200000):
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1,
+                      smem_budget=200000):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1336,7 +1337,7 @@ class _attention_opt(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
-        if True: #False: #ctx.persistent:
+        if True:  #False: #ctx.persistent:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
             def grid_persist_bwd(meta):
@@ -1491,7 +1492,7 @@ for HEAD_DIM in [128]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[2**i for i in range(12, 13)], #0, 15)],
+            x_vals=[2**i for i in range(12, 13)],  #0, 15)],
             line_arg="provider",
             line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
             line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),

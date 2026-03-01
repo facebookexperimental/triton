@@ -1442,12 +1442,24 @@ public:
            << ctrlInt.end());
       for (auto t : allocsForThisLoop)
         LLVM_DEBUG(t.getOperation()->dump());
-      // Check for per-loop tt.tmem_alloc_algo attribute on the forOp.
+      // Check for per-loop tt.tmem_alloc_algo attribute on the forOp
+      // or its parent ForOps (e.g., the WS loop wrapping the innermost
+      // scheduled loop in persistent kernels).
       // 1 = greedy (allocateTMemAllocs), 2 = backtracking
       // (allocateTMemAllocs2). Default is 1 (greedy).
       int tmemAllocAlgo = 1;
       if (auto attr = ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
         tmemAllocAlgo = attr.getInt();
+      // Walk parent ForOps: outermost sets the default, innermost wins.
+      for (auto parent = ctrlOp->getParentOfType<scf::ForOp>(); parent;
+           parent = parent->getParentOfType<scf::ForOp>()) {
+        if (auto attr =
+                parent->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo")) {
+          // Only override if the innermost (ctrlOp) didn't set it.
+          if (!ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
+            tmemAllocAlgo = attr.getInt();
+        }
+      }
 
       FailureOr<unsigned> result;
       if (tmemAllocAlgo == 1) {
@@ -2025,7 +2037,11 @@ public:
 
   /// Check if candidate can potentially reuse owner's space.
   /// Returns priority: 0 = cannot reuse, 1 = can reuse, 2 = exact size match.
-  int hasPotentialReuse(BufferT *owner, BufferT *candidate) {
+  /// Uses bidirectional data dependency via SSA def-use chain walk (primary),
+  /// with samePartition fallback for cross-loop buffers where SSA chains may
+  /// be broken by loop-carried values.
+  int hasPotentialReuse(BufferT *owner, BufferT *candidate,
+                        Operation *ctrlOp) {
     // Size check: candidate must fit in owner's columns
     if (candidate->colSize > owner->colSize)
       return 0;
@@ -2034,10 +2050,7 @@ public:
     if (bufferRange[owner].intersects(bufferRange[candidate]))
       return 0;
 
-    // Bidirectional data dependency check via channels.
-    // Check bidirectional data dependency:
-    // 1. src → dst: src's consumer leads to dst's producer
-    // 2. dst → src: dst's consumer leads to src's producer
+    // Bidirectional data dependency check via channels (SSA def-use walk).
     auto *srcCh = allocToChannel[owner->owner];
     auto *dstCh = allocToChannel[candidate->owner];
     auto hasDependency = [&]() -> bool {
@@ -2048,8 +2061,19 @@ public:
         return true;
       return false;
     };
-    if (!hasDependency())
-      return 0;
+
+    if (!hasDependency()) {
+      // SSA walk didn't find a dependency. For cross-loop buffers, fall
+      // back to partition matching (async task ID comparison) since
+      // loop-carried values break SSA chains.
+      if (!isInSameLoop(owner, ctrlOp)) {
+        if (!samePartition(owner, candidate, 2) &&
+            !samePartition(owner, candidate, 1))
+          return 0;
+      } else {
+        return 0;
+      }
+    }
 
     // Priority: prefer exact size matches
     if (candidate->colSize == owner->colSize)
@@ -2061,7 +2085,7 @@ public:
   /// Returns INVALID (max size_t) if can't fit.
   /// Uses hasPotentialReuse to determine if buffers can share columns.
   size_t computeColOffset(BufferT *candidate, BufferT *owner,
-                          const AllocationState &state) {
+                          const AllocationState &state, Operation *ctrlOp) {
     size_t maxColOffset = 0;
 
     // Check compatibility with existing reusers using hasPotentialReuse.
@@ -2073,8 +2097,9 @@ public:
         continue;
 
       // Check if reuser and candidate can share columns
-      bool canShareColumns = (hasPotentialReuse(reuser, candidate) > 0 ||
-                              hasPotentialReuse(candidate, reuser) > 0);
+      bool canShareColumns =
+          (hasPotentialReuse(reuser, candidate, ctrlOp) > 0 ||
+           hasPotentialReuse(candidate, reuser, ctrlOp) > 0);
       if (!canShareColumns) {
         // They can't share - place candidate after reuser's column range
         maxColOffset =
@@ -2091,7 +2116,8 @@ public:
 
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
-                   AllocationState &state, size_t maxRows) {
+                   AllocationState &state, size_t maxRows,
+                   Operation *ctrlOp) {
     // Base case: all buffers allocated
     if (idx == allocs.size())
       return true;
@@ -2101,7 +2127,7 @@ public:
     // Collect reuse candidates sorted by priority (descending)
     SmallVector<std::pair<BufferT *, int>> candidates;
     for (BufferT *owner : state.owners) {
-      int priority = hasPotentialReuse(owner, buf);
+      int priority = hasPotentialReuse(owner, buf, ctrlOp);
       if (priority > 0)
         candidates.push_back({owner, priority});
     }
@@ -2112,7 +2138,7 @@ public:
 
     // Try each reuse candidate
     for (auto &[owner, priority] : candidates) {
-      size_t colOffset = computeColOffset(buf, owner, state);
+      size_t colOffset = computeColOffset(buf, owner, state, ctrlOp);
       if (colOffset == std::numeric_limits<size_t>::max())
         continue; // Can't fit or dependency check failed
 
@@ -2128,7 +2154,7 @@ public:
       });
 
       // Recurse
-      if (tryAllocate(allocs, idx + 1, newState, maxRows)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
         state = newState;
         return true;
       }
@@ -2153,7 +2179,7 @@ public:
              << ") at row " << state.usedRows);
       });
 
-      if (tryAllocate(allocs, idx + 1, newState, maxRows)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
         state = newState;
         return true;
       }
@@ -2243,7 +2269,7 @@ public:
           if (alloc_i.getOperation() != alloc_j.getOperation()) {
             auto *buf_i = getBuffer(alloc_i.getOperation());
             auto *buf_j = getBuffer(alloc_j.getOperation());
-            int priority = hasPotentialReuse(buf_i, buf_j);
+            int priority = hasPotentialReuse(buf_i, buf_j, ctrlOp);
             if (priority > 0) {
               llvm::dbgs() << "  hasPotentialReuse(["
                            << bufferRange[buf_i].start() << "-"
@@ -2262,7 +2288,7 @@ public:
     AllocationState state;
     constexpr size_t maxRows = 512; // TMEM has 512 rows
 
-    if (!tryAllocate(allocs, 0, state, maxRows)) {
+    if (!tryAllocate(allocs, 0, state, maxRows, ctrlOp)) {
       return allocs[0].emitError(
           "allocateTMemAllocs2: failed to allocate TMEM buffers");
     }
