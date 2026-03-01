@@ -270,33 +270,25 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // Apply type-aware warp assignment overrides BEFORE relayout.
   // This ensures layouts are computed with the correct warp counts.
   //
-  // For bwd FA: reduction / gemm / load / computation
-  //   - reduction (index 0) gets 4 warps
-  //   - computation (last partition) gets 8 warps
+  // For bwd FA (has reduction): computation partition gets 8 warps.
+  // With reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
+  // total = 14, within the 16 warp budget.
+  //
+  // Note: the types array comes from the scheduler and may be longer than
+  // partitionNumWarps (the WarpSpecializeOp may have fewer regions). We scan
+  // the full types array to detect the BWD pattern, then apply the override
+  // to the last partition (which is computation in BWD).
   bool hasReduction = false;
-  size_t computationIdx = SIZE_MAX;
-  for (size_t i = 0; i < partitionNumWarps.size() && i < partitionTypes.size();
-       ++i) {
-    StringRef type = partitionTypes[i];
-    if (type == "reduction") {
+  bool hasComputation = false;
+  for (StringRef type : partitionTypes) {
+    if (type == "reduction")
       hasReduction = true;
-    }
-    if (type == "computation") {
-      computationIdx = i;
-    }
+    if (type == "computation")
+      hasComputation = true;
   }
 
-  // For bwd FA (has reduction): set reduction (index 0) to 4 warps
-  // and computation to 8 warps
-  if (hasReduction) {
-    // Reduction at index 0 gets 4 warps
-    if (!partitionTypes.empty() && partitionTypes[0] == "reduction") {
-      partitionNumWarps[0] = 4;
-    }
-    // Computation partition gets 8 warps
-    if (computationIdx != SIZE_MAX) {
-      partitionNumWarps[computationIdx] = 8;
-    }
+  if (hasReduction && hasComputation && !partitionNumWarps.empty()) {
+    partitionNumWarps.back() = 8;
   }
 
   // Read the attribute from the module

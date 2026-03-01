@@ -19,6 +19,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
@@ -528,6 +529,15 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   impB.setInsertionPoint(returnOp);
   auto wsOp = impB.create<ttg::WarpSpecializeOp>(dummyTypes, partitionNumWarps,
                                                  nTaskIds.size() - 1);
+
+  // Copy partition types attribute from the loop to the WarpSpecializeOp.
+  // This is needed by OptimizePartitionWarps for type-aware warp assignment.
+  funcOp.walk([&](scf::ForOp forOp) {
+    if (auto typesAttr =
+            forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+      wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
+    }
+  });
 
   // Clone all operations into the corresponding if blocks. If the operation
   // has multiple taskIds, it will be cloned for multiple if blocks.
