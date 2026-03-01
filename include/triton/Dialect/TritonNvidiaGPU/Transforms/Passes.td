@@ -125,6 +125,15 @@ def TritonNvidiaGPUPromoteLHSToTMemPass : Pass<"tritongpu-promote-lhs-to-tmem", 
     Promote LHS operand of MMAv5 op to Tensor Memory.
   }];
 
+  let options = [
+    Option<"promoteLhsTransSibling", "promote-lhs-trans-sibling",
+           "bool", /*default=*/"false",
+           "When true, promote LHS to tmem even when a transposed sibling "
+           "allocation of the same source is used as operand A of another MMA. "
+           "By default (false), both stay in smem to avoid a redundant tmem "
+           "allocation for the same data.">
+  ];
+
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::triton::TritonDialect"];

@@ -35,7 +35,9 @@ Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, RankedTensorType srcType) {
 
 template <class MMAOpTy> class LHSToTMem : public OpRewritePattern<MMAOpTy> {
 public:
-  using OpRewritePattern<MMAOpTy>::OpRewritePattern;
+  LHSToTMem(MLIRContext *context, bool promoteLhsTransSibling)
+      : OpRewritePattern<MMAOpTy>(context),
+        promoteLhsTransSibling(promoteLhsTransSibling) {}
 
   LogicalResult matchAndRewrite(MMAOpTy tcGen5MMAOp,
                                 PatternRewriter &rewriter) const override {
@@ -50,25 +52,28 @@ public:
       return failure();
     Value src = localAllocOp.getSrc();
     // If the same source value is also allocated and transposed for use as
-    // operand A of another gen5 MMA, skip promotion. The transposed path
-    // cannot be promoted to tmem, so keeping both in smem avoids a redundant
-    // tmem allocation and copy for the same data. This covers both:
+    // operand A of another gen5 MMA, skip promotion unless
+    // promoteLhsTransSibling is set. The transposed path cannot be promoted
+    // to tmem, so keeping both in smem avoids a redundant tmem allocation
+    // and copy for the same data. This covers both:
     //   1. Same local_alloc used directly + through memdesc_trans
     //   2. Separate local_allocs from the same src, one transposed
-    for (Operation *srcUser : src.getUsers()) {
-      auto otherAlloc = dyn_cast<ttg::LocalAllocOp>(srcUser);
-      if (!otherAlloc)
-        continue;
-      for (Operation *allocUser : otherAlloc->getResult(0).getUsers()) {
-        if (auto transOp = dyn_cast<ttg::MemDescTransOp>(allocUser)) {
-          for (Operation *transUser : transOp->getResult(0).getUsers()) {
-            if (auto mmaOp = dyn_cast<TCGen5MMAOp>(transUser)) {
-              if (mmaOp.getA() == transOp->getResult(0))
-                return failure();
-            } else if (auto mmaScaledOp =
-                           dyn_cast<TCGen5MMAScaledOp>(transUser)) {
-              if (mmaScaledOp.getA() == transOp->getResult(0))
-                return failure();
+    if (!promoteLhsTransSibling) {
+      for (Operation *srcUser : src.getUsers()) {
+        auto otherAlloc = dyn_cast<ttg::LocalAllocOp>(srcUser);
+        if (!otherAlloc)
+          continue;
+        for (Operation *allocUser : otherAlloc->getResult(0).getUsers()) {
+          if (auto transOp = dyn_cast<ttg::MemDescTransOp>(allocUser)) {
+            for (Operation *transUser : transOp->getResult(0).getUsers()) {
+              if (auto mmaOp = dyn_cast<TCGen5MMAOp>(transUser)) {
+                if (mmaOp.getA() == transOp->getResult(0))
+                  return failure();
+              } else if (auto mmaScaledOp =
+                             dyn_cast<TCGen5MMAScaledOp>(transUser)) {
+                if (mmaScaledOp.getA() == transOp->getResult(0))
+                  return failure();
+              }
             }
           }
         }
@@ -119,6 +124,9 @@ public:
     tcGen5MMAOp.getAMutable().assign(tMemAlloc);
     return success();
   }
+
+private:
+  bool promoteLhsTransSibling;
 };
 } // namespace
 
@@ -135,8 +143,8 @@ public:
     ModuleOp m = getOperation();
 
     RewritePatternSet patterns(context);
-    patterns.add<LHSToTMem<TCGen5MMAOp>>(context);
-    patterns.add<LHSToTMem<TCGen5MMAScaledOp>>(context);
+    patterns.add<LHSToTMem<TCGen5MMAOp>>(context, promoteLhsTransSibling);
+    patterns.add<LHSToTMem<TCGen5MMAScaledOp>>(context, promoteLhsTransSibling);
     if (applyPatternsGreedily(m, std::move(patterns)).failed()) {
       signalPassFailure();
     }
