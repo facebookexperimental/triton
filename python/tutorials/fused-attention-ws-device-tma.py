@@ -1337,7 +1337,7 @@ class _attention_opt(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
-        if True:  #False: #ctx.persistent:
+        if ctx.persistent:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
             def grid_persist_bwd(meta):
@@ -1416,11 +1416,13 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
+@pytest.mark.parametrize("baseVariant", ["ws", "ws_persistent"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, SUBTILING, VECT_MUL, FADD2_REDUCE, dtype=torch.float16):
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILING, VECT_MUL, FADD2_REDUCE,
+            dtype=torch.float16):
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)
@@ -1456,7 +1458,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, provider, SUBTILING, VECT_MUL, 
         v = v.permute(0, 1, 3, 2).contiguous()
         v = v.permute(0, 1, 3, 2)
         v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, "ws_persistent", SUBTILING, VECT_MUL, FADD2_REDUCE).half()
+    tri_out = attention(q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE).half()
     if mode == "fwd":
         atol = 3 if "fp8" in provider else 1e-2
         torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
@@ -1488,28 +1490,31 @@ TORCH_HAS_FP8 = False
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [128]:
-    configs.append(
-        triton.testing.Benchmark(
-            x_names=["N_CTX"],
-            x_vals=[2**i for i in range(12, 13)],  #0, 15)],
-            line_arg="provider",
-            line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-            line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
-            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-            ylabel="TFLOPS",
-            plot_name=f"fused-attention-ws-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
-            args={
-                "H": N_HEADS,
-                "BATCH": BATCH,
-                "HEAD_DIM": HEAD_DIM,
-                "mode": "bwd",
-            },
-        ))
+for HEAD_DIM in [64, 128]:
+    for baseVariant in ["ws", "ws_persistent"]:
+        for mode in ["fwd", "bwd"]:
+            configs.append(
+                triton.testing.Benchmark(
+                    x_names=["N_CTX"],
+                    x_vals=[2**i for i in range(10, 15)],
+                    line_arg="provider",
+                    line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+                    line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
+                    styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+                    ylabel="TFLOPS",
+                    plot_name=f"fused-attention-{baseVariant}-{mode}-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+                    args={
+                        "H": N_HEADS,
+                        "BATCH": BATCH,
+                        "HEAD_DIM": HEAD_DIM,
+                        "mode": mode,
+                        "baseVariant": baseVariant,
+                    },
+                ))
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVICE):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
     if "triton" in provider:
@@ -1526,7 +1531,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, provider, device=DEVI
         SUBTILING = True
         VECT_MUL = 1
         FADD2_REDUCE = False
-        fn = lambda: attention(q, k, v, False, sm_scale, "ws_persistent", SUBTILING, VECT_MUL, FADD2_REDUCE)
+        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
