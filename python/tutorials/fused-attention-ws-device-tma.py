@@ -1096,7 +1096,8 @@ def _attn_bwd_persist(
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
 
-    for _ in tl.range(0, tiles_per_sm, num_stages=1):
+    for _ in tl.range(0, tiles_per_sm, num_stages=1,
+                      smem_alloc_algo=1, smem_budget=200000):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1336,29 +1337,68 @@ class _attention_opt(torch.autograd.Function):
                 BATCH * N_HEAD,
             )  # batch*heads
 
-        _attn_bwd[grid](
-            desc_q,
-            desc_k,
-            desc_v,
-            ctx.sm_scale,
-            desc_do,
-            desc_dq,
-            desc_dk,
-            desc_dv,  #
-            M,
-            delta,  #
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),  #
-            BATCH,
-            N_HEAD,
-            N_CTX,  #
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM,  #
-            dtype=torch_dtype_to_triton(q.dtype),
-            warp_specialize=warp_specialize,
-        )
+        if ctx.persistent:
+            NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+            def grid_persist_bwd(meta):
+                return (
+                    min(
+                        NUM_SMS,
+                        triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD,
+                    ),
+                    1,
+                    1,
+                )
+
+            # Persistent BWD constructs device-side descriptors internally,
+            # so pass raw pointers instead of host TensorDescriptors.
+            _attn_bwd_persist[grid_persist_bwd](
+                q,
+                arg_k,
+                v,
+                ctx.sm_scale,
+                do,
+                dq,
+                dk,
+                dv,  #
+                M,
+                delta,  #
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),  #
+                BATCH,
+                N_HEAD,
+                N_CTX,  #
+                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                HEAD_DIM=ctx.HEAD_DIM,  #
+                dtype=torch_dtype_to_triton(q.dtype),
+                warp_specialize=warp_specialize,
+            )
+        else:
+            _attn_bwd[grid](
+                desc_q,
+                desc_k,
+                desc_v,
+                ctx.sm_scale,
+                desc_do,
+                desc_dq,
+                desc_dk,
+                desc_dv,  #
+                M,
+                delta,  #
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),  #
+                BATCH,
+                N_HEAD,
+                N_CTX,  #
+                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                HEAD_DIM=ctx.HEAD_DIM,  #
+                dtype=torch_dtype_to_triton(q.dtype),
+                warp_specialize=warp_specialize,
+            )
 
         return dq, dk, dv, None, None, None, None, None, None
 

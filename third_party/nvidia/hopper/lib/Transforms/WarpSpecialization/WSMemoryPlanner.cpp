@@ -2825,22 +2825,38 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
   // otherwise, the liveness can't overlap.
 
-  // Check for per-loop SMEM allocation attributes on the WS ForOp.
-  // These override the pass-level defaults, following the same pattern
-  // as tt.tmem_alloc_algo.
+  // Check for per-loop SMEM allocation attributes on the WS ForOp or
+  // its parent ForOps (e.g., the outer persistent loop). Attributes on
+  // parent loops override pass-level defaults, and the WS ForOp itself
+  // takes highest priority. This supports the persistent kernel pattern
+  // where the outer loop carries the resource budget and the inner WS
+  // loop carries the allocation strategy.
   int effectiveSmemAllocAlgo = smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = smemCircularReuse;
   funcOp->walk([&](scf::ForOp forOp) {
     if (!forOp->hasAttr("tt.warp_specialize"))
       return;
-    if (auto attr =
-            forOp->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
-      effectiveSmemAllocAlgo = attr.getInt();
-    if (auto attr = forOp->getAttrOfType<IntegerAttr>("tt.smem_budget"))
-      effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
-    if (auto attr = forOp->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
-      effectiveSmemCircularReuse = attr.getValue();
+    // Walk from the WS ForOp up through parent ForOps, collecting
+    // attributes. The innermost (WS) loop has highest priority.
+    SmallVector<scf::ForOp> loopChain;
+    loopChain.push_back(forOp);
+    for (auto parent = forOp->getParentOfType<scf::ForOp>(); parent;
+         parent = parent->getParentOfType<scf::ForOp>()) {
+      loopChain.push_back(parent);
+    }
+    // Apply from outermost to innermost (innermost wins).
+    for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
+      auto loop = *it;
+      if (auto attr =
+              loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+        effectiveSmemAllocAlgo = attr.getInt();
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
+        effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
+      if (auto attr =
+              loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+        effectiveSmemCircularReuse = attr.getValue();
+    }
   });
 
   unsigned bufferId;
