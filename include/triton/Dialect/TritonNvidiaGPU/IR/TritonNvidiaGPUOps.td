@@ -885,6 +885,26 @@ def TTNG_TensormapCreateOp: TTNG_Op<
   let hasVerifier = 1;
 }
 
+def TTNG_AsyncStoreOp : TTNG_Op<"async_store"> {
+  let summary = "Async store from shared to global memory";
+  let description = [{
+    Copies `size` bytes from shared memory to global memory using
+    cp.async.bulk.global.shared::cta.bulk_group. Completion tracked
+    via cp.async.bulk.commit_group / cp.async.bulk.wait_group.
+    The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Arg<TT_Ptr, "", [MemWrite<GlobalMemory>]>:$dst,
+    I32:$size
+  );
+
+  let assemblyFormat = [{
+    $src `,` $dst `,` $size
+    attr-dict `:` qualified(type($src)) `,` qualified(type($dst))
+  }];
+}
+
 def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   "tensormap_fenceproxy_acquire",
   [MemoryEffects<[MemWrite<GlobalMemory>]>]

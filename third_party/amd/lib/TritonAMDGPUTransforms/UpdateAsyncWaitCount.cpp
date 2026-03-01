@@ -59,8 +59,9 @@ int getNumberOfLoadInstructions(Operation *op) {
       if (!defOp)
         continue;
       if (auto copyOp = llvm::dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(defOp)) {
-        count += getNumberOfLoadInstructions(copyOp.getSrc().getType(),
-                                             copyOp.getResult().getType());
+        count += getNumberOfLoadInstructions(
+            cast<RankedTensorType>(copyOp.getSrc().getType()),
+            copyOp.getResult().getType());
       } else if (auto copyOp =
                      llvm::dyn_cast<amdgpu::BufferLoadToLocalOp>(defOp)) {
         auto srcTy = cast<RankedTensorType>(LLVM::AMD::getPointerTypeWithShape(
