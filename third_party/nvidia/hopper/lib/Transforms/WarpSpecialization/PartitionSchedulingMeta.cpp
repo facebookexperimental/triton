@@ -2040,6 +2040,26 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     // If there are multiple def or sink partitions, don't know what to do.
     // Assign the whole cluster to its own partition.
     if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
+      // For BWD-like kernels (has reduction partition, no epilogue partition),
+      // avoid creating extra partitions which can split pointer-typed ops
+      // across partitions and crash createLocalAlloc. Reuse the existing
+      // computation partition instead.
+      Partition *existingComputation = nullptr;
+      bool hasReduction = false;
+      bool hasEpilogue = false;
+      for (Partition &p : schedule.getPartitions()) {
+        if (p.getType() == "reduction")
+          hasReduction = true;
+        if (p.getType() == "epilogue")
+          hasEpilogue = true;
+        if (p.getType() == "computation")
+          existingComputation = &p;
+      }
+      if (hasReduction && !hasEpilogue && existingComputation) {
+        for (Operation *op : cluster.ops)
+          schedule.insert(existingComputation, op);
+        continue;
+      }
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
       for (Operation *op : cluster.ops)

@@ -2373,7 +2373,13 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       return;
     }
 
-    producerOp = producers[0];
+    producerOp = producers.empty() ? nullptr : producers[0];
+    if (producers.empty()) {
+      // TMEM alloc with a source tensor (e.g., ttng.tmem_alloc %tensor) is
+      // self-contained — the data is embedded at allocation time. No
+      // separate producer channel is needed; skip channel creation.
+      return;
+    }
     if (producers.size() > 1) {
       assert(consumers.size() == 1);
       producerOp = nullptr;
