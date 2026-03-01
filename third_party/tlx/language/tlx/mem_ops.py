@@ -896,6 +896,28 @@ def fence_async_shared(_semantic=None, ) -> None:
 
 
 @tl.builtin
+def threadfence(_semantic=None) -> None:
+    """
+    GPU-scope memory fence. Orders all prior memory writes (global and shared)
+    to be visible to all threads on the GPU before subsequent memory operations.
+
+    PTX equivalent: fence.acq_rel.gpu
+    """
+    _semantic.builder.create_threadfence("gpu")
+
+
+@tl.builtin
+def threadfence_system(_semantic=None) -> None:
+    """
+    System-scope memory fence. Orders all prior memory writes to be visible
+    to all threads on the GPU and to the host CPU.
+
+    PTX equivalent: fence.acq_rel.sys
+    """
+    _semantic.builder.create_threadfence("sys")
+
+
+@tl.builtin
 def allocate_tensor_descriptor(
     num: tl.constexpr,
     _semantic=None,

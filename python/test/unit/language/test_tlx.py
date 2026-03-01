@@ -6297,3 +6297,53 @@ def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
 
     # Verify correctness
     torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_threadfence(device):
+
+    @triton.jit
+    def threadfence_kernel(ptr):
+        tl.atomic_add(ptr, 1)
+        tlx.threadfence()
+        tl.atomic_add(ptr + 1, 1)
+
+    x = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = threadfence_kernel[(1, )](x, num_warps=1)
+
+    # Verify TTGIR contains the threadfence op with gpu scope
+    ttgir = kernel.asm["ttgir"]
+    assert 'ttng.threadfence {scope = "gpu"}' in ttgir
+
+    # Verify PTX contains the correct fence instruction
+    ptx = kernel.asm["ptx"]
+    assert "fence.acq_rel.gpu" in ptx
+
+    # Verify correctness
+    assert x[0].item() == 1
+    assert x[1].item() == 1
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_threadfence_system(device):
+
+    @triton.jit
+    def threadfence_system_kernel(ptr):
+        tl.atomic_add(ptr, 1)
+        tlx.threadfence_system()
+        tl.atomic_add(ptr + 1, 1)
+
+    x = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = threadfence_system_kernel[(1, )](x, num_warps=1)
+
+    # Verify TTGIR contains the threadfence op with sys scope
+    ttgir = kernel.asm["ttgir"]
+    assert 'ttng.threadfence {scope = "sys"}' in ttgir
+
+    # Verify PTX contains the correct fence instruction
+    ptx = kernel.asm["ptx"]
+    assert "fence.acq_rel.sys" in ptx
+
+    # Verify correctness
+    assert x[0].item() == 1
+    assert x[1].item() == 1
