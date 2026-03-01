@@ -618,6 +618,10 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, int pendings) {
              self.create<ttng::TMAStoreWaitOp>(pendings);
            })
+      .def("create_async_store",
+           [](TritonOpBuilder &self, Value src, Value dst, Value size) -> void {
+             self.create<ttng::AsyncStoreOp>(src, dst, size);
+           })
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
@@ -651,11 +655,13 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value ptrTensor, Value result,
               std::optional<Value> mask, std::optional<Value> other,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> mlir::Value {
+              bool isVolatile, std::optional<Value> bulkSize,
+              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
              return self.create<ttg::AsyncCopyGlobalToLocalOp>(
                  ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile);
+                 other.value_or(Value()), bulkSize.value_or(Value()),
+                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                 isVolatile, useBulk);
            })
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
