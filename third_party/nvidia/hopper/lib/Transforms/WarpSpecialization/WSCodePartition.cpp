@@ -3326,6 +3326,27 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       config.groups.push_back(group);
     }
   }
+  // Merge consumer groups for channels in the same reuse group.
+  // All channels in a reuse group share a barrier, so they must be processed
+  // together in insertAsyncComm to produce a single barrier_expect + wait.
+  DenseSet<Channel *> mergedChannels;
+  for (auto &group : config.groups) {
+    if (group.channels.size() <= 1)
+      continue;
+    Channel *rep = group.channels[0];
+    for (size_t i = 1; i < group.channels.size(); i++) {
+      Channel *ch = group.channels[i];
+      if (ch->relation.second != rep->relation.second)
+        continue;
+      channelsGroupedByConsumers[rep].push_back(ch);
+      channelsGroupedByConsumers.erase(ch);
+      mergedChannels.insert(ch);
+    }
+  }
+  orderedChannels.erase(
+      llvm::remove_if(orderedChannels,
+                      [&](Channel *ch) { return mergedChannels.count(ch); }),
+      orderedChannels.end());
   appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
                         &config);
   LLVM_DEBUG({
