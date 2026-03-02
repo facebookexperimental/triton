@@ -2864,7 +2864,86 @@ def test_descriptor_load(use_prefetch, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-@pytest.mark.parametrize("eviction_policy", ["evict_first", "evict_last", ""])
+def test_descriptor_load_prefetch_ws(device):
+    """Test TMA prefetch in a warp-specialized kernel.
+
+    Group 0 (consumer): arrives on smem_empty barrier, pretending it consumed the buffer.
+    Group 1 (producer): prefetches the TMA tensor, waits for smem_empty, then issues the TMA load.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def prefetch_ws_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        smem_full = tlx.alloc_barriers(tl.constexpr(1))
+        smem_full_bar = tlx.local_view(smem_full, 0)
+        smem_empty = tlx.alloc_barriers(tl.constexpr(1))
+        smem_empty_bar = tlx.local_view(smem_empty, 0)
+
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                # Consumer: pretend we consumed the buffer (e.g. through MMA), release smem_empty
+                tlx.barrier_arrive(smem_empty_bar)
+
+                # Wait for producer to fill the buffer
+                tlx.barrier_wait(bar=smem_full_bar, phase=0)
+                tlx.fence_async_shared()
+
+                # Store the result back
+                tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+                tlx.async_descriptor_store_wait(0)
+
+            with tlx.async_task(num_warps=1):
+                # Producer: prefetch, then wait for consumer to release buffer, then load
+                # the descriptor and offsets should be identical to the actual async_descriptor_load
+                tlx.async_descriptor_prefetch_tensor(desc_in, [off_m, off_n])
+
+                tlx.barrier_wait(bar=smem_empty_bar, phase=0)
+
+                tlx.barrier_expect_bytes(smem_full_bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+                tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], smem_full_bar)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = prefetch_ws_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_prefetch") == 1
+    assert ttgir.count("ttng.async_tma_copy_global_to_local") == 1
+    assert kernel.asm["ptx"].count("cp.async.bulk.prefetch.tensor") == 1
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_descriptor_load_l2_cache_hint(eviction_policy, device):
     """Test that TMA loads can use L2 cache hints via eviction_policy parameter."""
 
