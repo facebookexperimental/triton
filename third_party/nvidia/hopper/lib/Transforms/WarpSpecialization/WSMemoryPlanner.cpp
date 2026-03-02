@@ -929,9 +929,23 @@ public:
            << ctrlInt.end());
       for (auto t : allocsForThisLoop)
         LLVM_DEBUG(t.getOperation()->dump());
-      auto result = allocateTMemAllocs(
-          allocsForThisLoop, buffers, // allocToIntervals,
-          /*allocToSize,*/ allocToChannel, operationId, ctrlOp, bufferId);
+      // Check for per-loop tt.tmem_alloc_algo attribute on the forOp.
+      // 1 = greedy (allocateTMemAllocs), 2 = backtracking
+      // (allocateTMemAllocs2). Default is 1 (greedy).
+      int tmemAllocAlgo = 1;
+      if (auto attr = ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
+        tmemAllocAlgo = attr.getInt();
+
+      FailureOr<unsigned> result;
+      if (tmemAllocAlgo == 1) {
+        LDBG("using tmem allocation algorithm 1 (greedy)");
+        result = allocateTMemAllocs(allocsForThisLoop, buffers, allocToChannel,
+                                    operationId, ctrlOp, bufferId);
+      } else {
+        LDBG("using tmem allocation algorithm 2 (backtracking)");
+        result = allocateTMemAllocs2(allocsForThisLoop, buffers, allocToChannel,
+                                     operationId, ctrlOp, bufferId);
+      }
       if (failed(result))
         return failure();
       bufferId = *result;
