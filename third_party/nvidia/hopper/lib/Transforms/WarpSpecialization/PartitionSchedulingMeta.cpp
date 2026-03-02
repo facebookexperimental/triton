@@ -217,7 +217,7 @@ public:
   virtual ~SchedulingTemplate() = default;
 
   /// Create the partitions for this template in the schedule.
-  virtual void createPartitions(WarpSchedule &schedule) = 0;
+  virtual void createPartitions(PartitionSet &schedule) = 0;
 
   /// Get the partition for a given abstract partition type and data partition
   /// ID.
@@ -234,7 +234,7 @@ class UnifiedFATemplate : public SchedulingTemplate {
 public:
   explicit UnifiedFATemplate(TemplateOptions opts) : options(std::move(opts)) {}
 
-  void createPartitions(WarpSchedule &schedule) override {
+  void createPartitions(PartitionSet &schedule) override {
     // Build up partitions based on what's actually needed.
     // For fwd: default+correction / gemm / load / epilogue
     //   → MMA users create dynamic computation partitions
@@ -318,7 +318,7 @@ private:
 /// Simple GEMM template (no data partitioning).
 class GEMMTemplate : public SchedulingTemplate {
 public:
-  void createPartitions(WarpSchedule &schedule) override {
+  void createPartitions(PartitionSet &schedule) override {
     defaultPartition = schedule.addPartition(0);
     gemmPartition = schedule.addPartition(1);
     loadPartition = schedule.addPartition(0);
@@ -840,17 +840,24 @@ static void iterateUsers(scf::ForOp loop, Operation *op,
   }
 }
 
+// Helper: schedule an operation to a partition if it is not already scheduled.
+static bool tryScheduleOp(Partition *partition, Operation *op) {
+  if (hasPartition(op))
+    return false;
+  setPartition(op, partition);
+  return true;
+}
+
 // Check if any of the inputs to `op` are reachable from a non-null partition.
 static bool hasDefPartition(scf::ForOp loop, Operation *op,
-                            WarpSchedule &schedule) {
+                            PartitionSet &schedule) {
   SmallVector<Operation *> worklist{op};
   DenseSet<Operation *> seen;
   while (!worklist.empty()) {
     Operation *op = worklist.pop_back_val();
     if (!seen.insert(op).second)
       continue;
-    Partition *p = schedule.getPartition(op);
-    if (p && p != schedule.getRootPartition())
+    if (hasPartition(op))
       return true;
     iterateDefs(loop, op,
                 [&](OpResult def) { worklist.push_back(def.getDefiningOp()); });
@@ -861,7 +868,7 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
 // Recursively schedule the users of an operation, stopping when
 // encountering an operation that is already assigned.
 // If \p partition is null, a new partition will be created if needed.
-static Partition *scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
+static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
                                 Partition *partition, Operation *op) {
   SmallVector<OpOperand *> uses;
   for (OpOperand &use : op->getUses())
@@ -877,11 +884,11 @@ static Partition *scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
       continue;
     }
 
-    if (schedule.isScheduled(user))
+    if (hasPartition(user))
       continue;
     if (!partition)
       partition = schedule.addPartition(/* stage is unused */ 0);
-    schedule.trySchedule(partition, user);
+    tryScheduleOp(partition, user);
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
   }
@@ -891,7 +898,7 @@ static Partition *scheduleUsers(scf::ForOp loop, WarpSchedule &schedule,
 // Schedule post-loop operations (operations outside and after the loop) into
 // the epilogue partition. This recursively schedules operations that consume
 // loop results and their transitive users.
-static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
+static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
                                 Partition *epiloguePartition) {
   if (!epiloguePartition)
     return;
@@ -911,7 +918,7 @@ static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
     Operation *user = use->getOwner();
 
     // Skip if already visited or scheduled.
-    if (!visited.insert(user).second || schedule.isScheduled(user))
+    if (!visited.insert(user).second || hasPartition(user))
       continue;
 
     // Only schedule operations that are outside the loop.
@@ -919,7 +926,7 @@ static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
       continue;
 
     // Schedule this post-loop operation to the epilogue partition.
-    schedule.trySchedule(epiloguePartition, user);
+    tryScheduleOp(epiloguePartition, user);
 
     // Add all users of this operation to process transitively.
     for (OpResult result : user->getResults())
@@ -931,7 +938,7 @@ static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
 // Result of getInitialSchedule, including the schedule and the epilogue
 // partition pointer (may be null if merged into computation).
 struct ScheduleResult {
-  WarpSchedule schedule;
+  PartitionSet schedule;
   Partition *epiloguePartition = nullptr;
 };
 
@@ -942,7 +949,7 @@ static std::optional<ScheduleResult>
 getInitialSchedule(scf::ForOp mainLoop,
                    bool mergeEpilogueIntoComputation = false) {
   // Check for an existing schedule.
-  if (FailureOr<WarpSchedule> scheduleOr = WarpSchedule::deserialize(mainLoop);
+  if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
       succeeded(scheduleOr))
     // Deserialized schedule: epilogue partition is unknown, use null.
     return ScheduleResult{std::move(*scheduleOr),
@@ -982,7 +989,7 @@ getInitialSchedule(scf::ForOp mainLoop,
       llvm::dbgs() << "[tritongpu-partition-scheduling] Selected template: "
                    << tmpl->getName() << "\n");
 
-  WarpSchedule schedule;
+  PartitionSet schedule;
   tmpl->createPartitions(schedule);
 
   // Get partition references from template using AbstractPartition
@@ -1017,18 +1024,18 @@ getInitialSchedule(scf::ForOp mainLoop,
         break; // Stop at the loop itself.
       if (!isa<DescriptorLoadOp, DescriptorGatherOp>(op))
         continue;
-      schedule.trySchedule(loadPartition, &op);
+      tryScheduleOp(loadPartition, &op);
       loadsAndAllocs.push_back(&op);
       // Local alloc users of the load with matching encoding
       SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
       for (Operation *user : op.getUsers()) {
         if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
           if (sharedEnc == alloc.getType().getEncoding()) {
-            schedule.trySchedule(loadPartition, alloc);
+            tryScheduleOp(loadPartition, alloc);
             loadsAndAllocs.push_back(alloc);
           }
         } else if (isa<ttng::TMEMAllocOp>(user)) {
-          schedule.trySchedule(loadPartition, user);
+          tryScheduleOp(loadPartition, user);
           loadsAndAllocs.push_back(user);
         }
       }
@@ -1059,7 +1066,7 @@ getInitialSchedule(scf::ForOp mainLoop,
     for (Operation &op : loop.getOps()) {
       if (!isa<DescriptorLoadOp, DescriptorGatherOp>(op))
         continue;
-      schedule.trySchedule(loadPartition, &op);
+      tryScheduleOp(loadPartition, &op);
       loadsAndAllocs.push_back(&op);
 
       // Local alloc users of the load with matching encoding
@@ -1067,11 +1074,11 @@ getInitialSchedule(scf::ForOp mainLoop,
       for (Operation *user : op.getUsers()) {
         if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
           if (sharedEnc == alloc.getType().getEncoding()) {
-            schedule.trySchedule(loadPartition, alloc);
+            tryScheduleOp(loadPartition, alloc);
             loadsAndAllocs.push_back(alloc);
           }
         } else if (isa<ttng::TMEMAllocOp>(user)) {
-          schedule.trySchedule(loadPartition, user);
+          tryScheduleOp(loadPartition, user);
           loadsAndAllocs.push_back(user);
         }
       }
@@ -1085,14 +1092,14 @@ getInitialSchedule(scf::ForOp mainLoop,
     // Stores inside loops
     for (auto loop : loops)
       for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
-        schedule.trySchedule(epiloguePartition, op);
+        tryScheduleOp(epiloguePartition, op);
 
     // Also schedule categorized epilogue stores (includes post-loop stores for
     // bwd) and their backward slice (tmem_load, truncf that feed into them)
     auto epilogueStoreOps =
         categorizer.getOpsInCategory(OpCategory::EpilogueStore);
     for (const auto &catOp : epilogueStoreOps) {
-      schedule.trySchedule(epiloguePartition, catOp.op);
+      tryScheduleOp(epiloguePartition, catOp.op);
 
       // Only schedule backward slice for post-loop stores (not inside any loop)
       // This captures ops like tmem_load, truncf that prepare data for storing
@@ -1112,7 +1119,7 @@ getInitialSchedule(scf::ForOp mainLoop,
           if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(op))
             return false;
           // Skip ops that are already scheduled
-          if (schedule.isScheduled(op))
+          if (hasPartition(op))
             return false;
           return true;
         };
@@ -1121,7 +1128,7 @@ getInitialSchedule(scf::ForOp mainLoop,
           // Skip constants - they can be shared across partitions
           if (isa<arith::ConstantOp>(op))
             continue;
-          schedule.trySchedule(epiloguePartition, op);
+          tryScheduleOp(epiloguePartition, op);
         }
       }
     }
@@ -1130,7 +1137,7 @@ getInitialSchedule(scf::ForOp mainLoop,
   // Schedule MMAs and their associated stores
   for (auto loop : loops) {
     for (auto mmaOp : loop.getOps<ttng::MMAv5OpInterface>()) {
-      schedule.trySchedule(mmaPartition, mmaOp);
+      tryScheduleOp(mmaPartition, mmaOp);
 
       // If the store is unrelated to the use of the MMA, place in MMA
       // partition. Exception: in BWD (hasReduction), keep TMEMStoreOp out of
@@ -1141,7 +1148,7 @@ getInitialSchedule(scf::ForOp mainLoop,
       if (reductionPartition == nullptr &&
           !ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
           loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
-        schedule.trySchedule(mmaPartition, storeOp);
+        tryScheduleOp(mmaPartition, storeOp);
     }
   }
 
@@ -1169,7 +1176,7 @@ getInitialSchedule(scf::ForOp mainLoop,
           op = newOp;
         }
 
-        schedule.trySchedule(mmaPartition, op);
+        tryScheduleOp(mmaPartition, op);
         if (Operation *defOp = op->getOperand(0).getDefiningOp())
           operandViews.push_back(defOp);
       }
@@ -1211,7 +1218,7 @@ getInitialSchedule(scf::ForOp mainLoop,
           continue;
         for (OpOperand &use :
              loop.getRegionIterArg(use.getOperandNumber()).getUses()) {
-          schedule.trySchedule(corrDest, use.getOwner());
+          tryScheduleOp(corrDest, use.getOwner());
           scheduleUsers(loop, schedule, corrDest, use.getOwner());
         }
         break;
@@ -1225,7 +1232,7 @@ getInitialSchedule(scf::ForOp mainLoop,
       reductionPartition ? reductionPartition : defaultPartition;
   auto tmaReductionOps = categorizer.getOpsInCategory(OpCategory::TMAReduction);
   for (const auto &catOp : tmaReductionOps) {
-    schedule.trySchedule(reductionDest, catOp.op);
+    tryScheduleOp(reductionDest, catOp.op);
     // Also schedule the backward slice (producers) of the reduction value.
     // The reduction op typically has operands: descriptor, indices, value.
     // We want to schedule the ops that produce the value being reduced.
@@ -1241,12 +1248,12 @@ getInitialSchedule(scf::ForOp mainLoop,
             continue;
           // Skip ops that are already scheduled to a different partition
           // (like MMA ops in gemm partition).
-          if (schedule.getPartition(op) != nullptr)
+          if (hasPartition(op))
             continue;
           // Skip ops outside the loop.
           if (!op->getParentOfType<scf::ForOp>())
             continue;
-          schedule.trySchedule(reductionDest, op);
+          tryScheduleOp(reductionDest, op);
           // Add operand definitions to worklist.
           for (Value opnd : op->getOperands()) {
             if (Operation *def = opnd.getDefiningOp())
@@ -1383,7 +1390,7 @@ namespace {
 // operation in a partition. This function propagates partitions by first
 // forming contiguous clusters from the unassigned operations and then deciding
 // what to do with the operations in that cluster.
-void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
+void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
   OpClusters opClusters;
 
   for (Partition &partition : schedule.getPartitions()) {
@@ -1391,24 +1398,24 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     // another partition and spawn a single cluster at that operation.
     auto defCallback = [&](OpResult result, unsigned distance) {
       Operation *defOp = result.getDefiningOp();
-      if (!schedule.isScheduled(defOp) &&
+      if (!hasPartition(defOp) &&
           hasDefPartition(loop, defOp, schedule)) {
         // Add the current partition as a sink to the cluster.
         opClusters.getOrCreate(defOp)->sinkPartitions.insert(&partition);
       }
     };
-    schedule.iterateDefs(loop, &partition, defCallback);
+    partition.iterateDefs(loop, defCallback);
 
     // For each partition, place users of its outputs in a cluster if it is not
     // already assigned to a partition.
     auto useCallback = [&](OpResult result, OpOperand &use, unsigned distance) {
       Operation *user = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
-      if (!schedule.isScheduled(user)) {
+      if (!hasPartition(user)) {
         // Add the current partition as a def to the cluster.
         opClusters.getOrCreate(user)->defPartitions.insert(&partition);
       }
     };
-    schedule.iterateUses(loop, &partition, useCallback);
+    partition.iterateUses(loop, useCallback);
   }
 
   // Now we have a pile of single-operation clusters directly adjacent to the
@@ -1423,7 +1430,7 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     // Look at the definitions directly feeding into this operation.
     iterateDefs(loop, op, [&](OpResult def) {
       Operation *defOp = def.getDefiningOp();
-      if (schedule.isScheduled(defOp)) {
+      if (hasPartition(defOp)) {
         // The input originates from an operation already assigned to a
         // partition. Add this as a def partition.
         cluster->defPartitions.insert(schedule.getPartition(defOp));
@@ -1448,7 +1455,7 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     });
     // Check the users of the operation.
     iterateUsers(loop, op, [&](Operation *user) {
-      if (schedule.isScheduled(user)) {
+      if (hasPartition(user)) {
         // If the user is already assigned to a partition, add that partition as
         // one of the sink partitions.
         Partition *userPartition = schedule.getPartition(user);
@@ -1478,14 +1485,14 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
       continue;
     assert(!cluster.defPartitions.empty());
     assert(llvm::all_of(
-        cluster.ops, [&](Operation *op) { return !schedule.isScheduled(op); }));
+        cluster.ops, [&](Operation *op) { return !hasPartition(op); }));
 
     // If there are multiple def or sink partitions, don't know what to do.
     // Assign the whole cluster to its own partition.
     if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
       Partition *newPartition = schedule.addPartition(0);
       for (Operation *op : cluster.ops)
-        schedule.insert(newPartition, op);
+        setPartition(op, newPartition);
       continue;
     }
 
@@ -1494,7 +1501,7 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     Partition *defPartition = cluster.defPartitions.front();
     if (cluster.sinkPartitions.empty()) {
       for (Operation *op : cluster.ops)
-        schedule.insert(defPartition, op);
+        setPartition(op, defPartition);
       continue;
     }
 
@@ -1507,7 +1514,7 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
       if (opsInCluster.contains(defOp))
         critPath.insert(defOp);
     };
-    schedule.iterateDefs(loop, sinkPartition, callback);
+    sinkPartition->iterateDefs(loop, callback);
     for (unsigned i = 0; i < critPath.size(); ++i) {
       Operation *op = critPath[i];
       iterateDefs(loop, op, [&](OpResult def) {
@@ -1520,7 +1527,7 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
     // If all ops are on the critical path, assign them to the def partition.
     if (critPath.size() == cluster.ops.size()) {
       for (Operation *op : cluster.ops)
-        schedule.insert(defPartition, op);
+        setPartition(op, defPartition);
       continue;
     }
 
@@ -1537,17 +1544,17 @@ void propagatePartitions(scf::ForOp loop, WarpSchedule &schedule) {
         return sinkOps.contains(use.getOwner());
       });
       sinkOps.insert(clone);
-      schedule.insert(sinkPartition, clone);
+      setPartition(clone, sinkPartition);
     }
     for (Operation *op : cluster.ops)
-      schedule.insert(defPartition, op);
+      setPartition(op, defPartition);
   }
 }
 
 /// Walk over \p loop and clone Broadcast/ExpandDims/ConvertLayout ops into each
 /// partition that they have users in. This reduces the amount of data that
 /// needs to be transferred through memory.
-void optimizeSchedule(scf::ForOp loop, WarpSchedule &schedule) {
+void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // Walk everything in reverse so that operations are visited before their
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
@@ -1570,7 +1577,7 @@ void optimizeSchedule(scf::ForOp loop, WarpSchedule &schedule) {
     for (auto *userPartition : userPartitions) {
       // Clone the instruction into each user partition.
       Operation *clone = OpBuilder(op).clone(*op);
-      schedule.insert(userPartition, clone);
+      setPartition(clone, userPartition);
       // Replace all users in that partition with the clone.
       op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
         return schedule.getPartition(otherUse.getOwner()) == userPartition;
@@ -1615,7 +1622,7 @@ void PartitionSchedulingMeta::runOnOperation() {
 
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, mergeEpilogue)) {
-      WarpSchedule &schedule = result->schedule;
+      PartitionSet &schedule = result->schedule;
       propagatePartitions(loop, schedule);
 
       // Schedule post-loop operations into the epilogue partition after
