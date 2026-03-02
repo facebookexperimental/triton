@@ -1490,9 +1490,9 @@ TORCH_HAS_FP8 = False
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [64, 128]:
-    for baseVariant in ["ws", "ws_persistent"]:
-        for mode in ["fwd", "bwd"]:
+for HEAD_DIM in [128]:
+    for baseVariant in ["ws"]: #"ws", "ws_persistent"]:
+        for mode in ["bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],

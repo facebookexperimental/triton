@@ -930,8 +930,14 @@ static void schedulePostLoopOps(scf::ForOp loop, WarpSchedule &schedule,
     if (loop->isAncestor(user))
       continue;
 
-    // Schedule this post-loop operation to the epilogue partition.
-    schedule.trySchedule(epiloguePartition, user);
+    // Only schedule descriptor_store and its direct convert_layout/truncf
+    // chain into epilogue. Heavy computation (tmem_load, log2, addf, divf)
+    // stays unscheduled for propagatePartitions to assign to root,
+    // matching persistent FWD behavior.
+    if (isa<DescriptorStoreOp>(user))
+      schedule.trySchedule(epiloguePartition, user);
+    else
+      schedule.trySchedule(schedule.getRootPartition(), user);
 
     // Add all users of this operation to process transitively.
     for (OpResult result : user->getResults())

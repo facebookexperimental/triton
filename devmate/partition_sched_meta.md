@@ -58,7 +58,10 @@ The template creates **abstract partitions** (`Gemm`, `Load`, `Correction`, `Com
 `Epilogue`, `Reduction`, `Default`) that map to physical `WarpSchedule` partitions. Scheduling
 then proceeds in sub-phases:
 
-1. **Schedule core ops** — Loads → load partition, MMAs → gemm partition, stores → epilogue partition
+1. **Schedule core ops** — Loads → load partition, MMAs → gemm partition, stores → epilogue partition.
+   **Backward slice for post-loop epilogue stores** is restricted to only `DescriptorStoreOp`
+   in the filter, preventing heavy computation (tmem_load, log2, divf, truncf) from being
+   pulled into the epilogue partition.
 2. **Propagate users** — Load users → default, MMA cross-iteration users → correction partition
 3. **Schedule reductions** — TMA reductions → reduction partition
 4. **Create per-MMA partitions** — MMA users → computation partitions (data partitioning)
@@ -102,14 +105,24 @@ The partition creation order in `UnifiedFATemplate::createPartitions()` matches 
 original `FAForwardTemplate` ordering, which is critical for correctness:
 
 ```
-P0: default (stage 0)
-P1: gemm    (stage 1)    ← MMA partition must be stage 1
-P2: load    (stage 0)
-P3..P(3+N): computation[0..N-1] (stage 0)
-P(next): correction      (only if hasCorrection)
-P(next): reduction       (only if hasReduction, or merged into computation)
-P(last): epilogue        (must be last — schedulePostLoopOps relies on this)
+BWD:
+P0: reduction (stage 0)   ← only for BWD (hasReduction)
+P1: gemm     (stage 1)    ← MMA partition must be stage 1
+P2: load     (stage 0)
+P3: computation            ← MMA users (shared, single partition for BWD)
+
+FWD:
+P0: default  (stage 0)    ← root partition (base warps, no extra warps)
+P1: gemm     (stage 1)
+P2: load     (stage 0)
+P3: epilogue (stage 0)    ← only descriptor_store (1 warp, lightweight)
+P4..P5: computation[0..1]  ← per-MMA-group computation (dpFactor=2)
 ```
+
+**Important:** For non-persistent FWD, the epilogue partition must only contain
+`DescriptorStoreOp`. Post-loop computation (tmem_load, log2, addf, divf, truncf,
+tt.store) goes to the root/default partition. This ensures the epilogue gets assigned
+1 warp, keeping total thread count within the 512-thread hardware limit.
 
 ### Dependency-Based Data Partition Detection
 

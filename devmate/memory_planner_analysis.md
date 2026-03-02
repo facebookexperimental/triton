@@ -162,25 +162,25 @@ This is a closure-heavy function with several key lambdas:
 ```
 for each alloc (in priority order):
   candBuf = getBuffer(alloc)
-  
+
   if allInterfere(candBuf):
     // No existing buffer is non-overlapping → must allocate new space
     allocateNewSpace(candBuf, allocate=true)
     if out of space: ERROR
-    
+
   else:
     // Try reuse with strict partition matching first
     reuseBuf = findReuseChannel(cand, partitionCondition=2, depChainCondition=1)
     if !reuseBuf:
       // Relax to less strict matching
       reuseBuf = findReuseChannel(cand, partitionCondition=1, depChainCondition=1)
-    
+
     if reuseBuf:
       set buffer.id = reuseBuf's buffer.id
       set buffer.offset = colOffset
     else:
       allocateNewSpace(candBuf)  // fallback
-  
+
   set buffer.copy = 1  // always single-copy for TMEM
 ```
 
