@@ -458,11 +458,13 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
     TT_DescriptorReduceKindAttr:$kind,
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$coord,
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
   );
 
   let assemblyFormat = [{
     $kind `,` $desc `[` $coord `]` $src
+    oilist(`evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
   }];
 }

@@ -204,6 +204,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
 
 // -----
 
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: async_tma_reduce
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group [$1, {$2, $3}], [$4];", "b,l,r,r,r" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>) -> !llvm.void
+  // CHECK-NOT: cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @async_tma_reduce(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:90"} {
+  // CHECK-LABEL: async_tma_reduce_l2_evict_first
+  // CHECK: createpolicy.fractional.L2::evict_first.b64
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @async_tma_reduce_l2_evict_first(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:90"} {
+  // CHECK-LABEL: async_tma_reduce_l2_evict_last
+  // CHECK: createpolicy.fractional.L2::evict_last.b64
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @async_tma_reduce_l2_evict_last(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<tensor<128x128xf32, #shared1>>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: async_tma_store_wait
   // CHECK: nvvm.cp.async.bulk.wait_group 0 {read}
