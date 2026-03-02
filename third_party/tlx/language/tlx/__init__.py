@@ -125,7 +125,7 @@ __all__ = [
     "local_reinterpret",
     "allocate_tensor_descriptor",
     "async_descriptor_load",
-    "async_descriptor_prefetch",
+    "async_descriptor_prefetch_tensor",
     "async_descriptor_store",
     "async_descriptor_store_wait",
     "fence_async_shared",
