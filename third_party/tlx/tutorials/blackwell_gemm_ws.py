@@ -640,7 +640,7 @@ def _process_tile_epilogue_inner(
                 c_smem = c_smem_buffers[group_id]
                 tlx.async_descriptor_store_wait(0)
                 tlx.local_store(c_smem, c)
-                tlx.fence_async_shared()
+                tlx.fence("async_shared")
                 tlx.async_descriptor_store(c_desc, c_smem, [offs_am, offs_bn + slice_id * slice_size])
             else:
                 c_desc.store(

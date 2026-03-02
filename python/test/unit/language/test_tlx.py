@@ -2836,7 +2836,7 @@ def test_descriptor_load(device):
 
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -2905,7 +2905,7 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
         # Use eviction_policy parameter for L2 cache hint
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, eviction_policy=EVICTION_POLICY)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -2992,7 +2992,7 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
         # Load without cache hint
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         # Store with eviction policy
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], eviction_policy=EVICTION_POLICY)
         tlx.async_descriptor_store_wait(0)
@@ -3077,7 +3077,7 @@ def test_descriptor_store_reduce(store_reduce, device):
 
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], store_reduce=STORE_REDUCE)
         tlx.async_descriptor_store_wait(0)
 
@@ -3164,7 +3164,7 @@ def test_descriptor_load_multicast(device):
             tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
                                       multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -4805,7 +4805,7 @@ def test_dummy_layout_function_inlining(device):
         # Load from TMEM to registers, then store to SMEM
         reg_data = tlx.local_load(tmem_buffer)
         tlx.local_store(smem_buffer, reg_data)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc, smem_buffer, [offset_m, offset_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -6300,16 +6300,16 @@ def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-def test_threadfence(device):
+def test_fence_gpu(device):
 
     @triton.jit
-    def threadfence_kernel(ptr):
+    def fence_gpu_kernel(ptr):
         tl.atomic_add(ptr, 1)
-        tlx.threadfence()
+        tlx.fence("gpu")
         tl.atomic_add(ptr + 1, 1)
 
     x = torch.zeros(2, dtype=torch.int32, device=device)
-    kernel = threadfence_kernel[(1, )](x, num_warps=1)
+    kernel = fence_gpu_kernel[(1, )](x, num_warps=1)
 
     # Verify TTGIR contains the threadfence op with gpu scope
     ttgir = kernel.asm["ttgir"]
@@ -6325,16 +6325,16 @@ def test_threadfence(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-def test_threadfence_system(device):
+def test_fence_sys(device):
 
     @triton.jit
-    def threadfence_system_kernel(ptr):
+    def fence_sys_kernel(ptr):
         tl.atomic_add(ptr, 1)
-        tlx.threadfence_system()
+        tlx.fence(scope="sys")
         tl.atomic_add(ptr + 1, 1)
 
     x = torch.zeros(2, dtype=torch.int32, device=device)
-    kernel = threadfence_system_kernel[(1, )](x, num_warps=1)
+    kernel = fence_sys_kernel[(1, )](x, num_warps=1)
 
     # Verify TTGIR contains the threadfence op with sys scope
     ttgir = kernel.asm["ttgir"]
