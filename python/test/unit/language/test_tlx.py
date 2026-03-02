@@ -2798,7 +2798,7 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-@pytest.mark.parametrize("use_prefetch", [True])
+@pytest.mark.parametrize("use_prefetch", [False, True])
 def test_descriptor_load(use_prefetch, device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
