@@ -133,6 +133,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttg.async_wait", "tlx.async_load_wait_group",
      "Wait for async load completion"},
 
+    // Async store (non-TMA bulk copy)
+    {"ttng.async_store", "tlx.async_store",
+     "Async store from shared to global memory"},
+
     // TMA operations
     {"ttng.async_tma_copy_global_to_local", "tlx.async_descriptor_load",
      "TMA load from global to shared memory"},
