@@ -910,9 +910,7 @@ def fence(scope: tl.constexpr, _semantic=None) -> None:
     elif scope in ("gpu", "sys"):
         _semantic.builder.create_threadfence(scope)
     else:
-        raise ValueError(
-            f"fence scope must be 'gpu', 'sys', or 'async_shared', got '{scope}'"
-        )
+        raise ValueError(f"fence scope must be 'gpu', 'sys', or 'async_shared', got '{scope}'")
 
 
 @tl.builtin
