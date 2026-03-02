@@ -373,27 +373,29 @@ public:
     // Build up partitions based on what's actually needed.
     // For fwd: default+correction / gemm / load / epilogue
     //   → MMA users create dynamic computation partitions
-    // For bwd: gemm / load / reduction
-    //   → MMA users create a single shared computation partition
-    //
-    // Empty partitions are NOT created — they waste TMEM channels.
+    // For bwd: reduction / gemm / load / computation
+    //   → reduction is at index 0 (default position) with num_warps=4
+    //   → MMA users create a single shared computation partition with
+    //   num_warps=8
 
-    // Default partition: needed when we have correction (load users and
-    // correction ops go here) or epilogue (pre-loop ops need a home).
-    bool needDefault = options.hasCorrection || options.hasEpilogue;
-    if (needDefault)
-      defaultPartition = schedule.addPartition(0);
-    else
-      defaultPartition = nullptr;
+    // For bwd (hasReduction): create reduction FIRST at index 0.
+    // This makes reduction the "default" partition in warp_specialize.
+    if (options.hasReduction) {
+      reductionPartition = schedule.addPartition(0);
+      defaultPartition = nullptr; // No separate default for bwd
+    } else {
+      reductionPartition = nullptr;
+      // Default partition: needed when we have correction or epilogue.
+      bool needDefault = options.hasCorrection || options.hasEpilogue;
+      if (needDefault) {
+        defaultPartition = schedule.addPartition(0);
+      } else {
+        defaultPartition = nullptr;
+      }
+    }
 
     gemmPartition = schedule.addPartition(1); // stage 1 for MMA
     loadPartition = schedule.addPartition(0);
-
-    // Reduction partition (bwd only): separate.
-    if (options.hasReduction)
-      reductionPartition = schedule.addPartition(0);
-    else
-      reductionPartition = nullptr;
 
     // Correction: merge into default partition.
     if (options.hasCorrection)
