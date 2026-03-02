@@ -4,7 +4,8 @@ from .types import (layout_encoding, shared_layout_encoding, swizzled_shared_lay
                     buffered_tensor_type, mbarrier, mbarrier_type, async_token)
 from .mem_ops import (local_alloc, local_view, local_slice, subslice, async_load, async_load_commit_group,
                       async_load_wait_group, local_load, local_store, local_trans, local_reinterpret,
-                      async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, fence_async_shared)
+                      async_descriptor_load, async_descriptor_store, async_descriptor_store_wait, async_store,
+                      fence_async_shared)
 from .barrier import (
     alloc_barriers,
     barrier_expect_bytes,
@@ -48,6 +49,7 @@ __all__ = [
     "mbarrier_type",
     "async_token",
     # mem_ops
+    "async_store",
     "local_alloc",
     "local_view",
     "local_slice",

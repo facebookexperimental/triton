@@ -1867,11 +1867,13 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value ptrTensor, Value result,
               std::optional<Value> mask, std::optional<Value> other,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> mlir::Value {
+              bool isVolatile, std::optional<Value> bulkSize,
+              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
              return self.create<ttg::AsyncCopyGlobalToLocalOp>(
                  ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile);
+                 other.value_or(Value()), bulkSize.value_or(Value()),
+                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                 isVolatile, useBulk);
            })
       .def("create_thread_id",
            [](TritonOpBuilder &self, unsigned axis) -> mlir::Value {
