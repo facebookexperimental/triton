@@ -669,6 +669,51 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   });
 }
 
+// TODO: Implement a mutually-recursive traversal that can handle
+//       nested control flow structures (if/reduce/for operations).
+//       While we don't currently have use cases requiring this,
+//       implementing it would prepare for when it is needed.
+void assignRootPartition(scf::ForOp loop, PartitionSet &partitions) {
+  auto ctx = loop.getContext();
+  Builder b(ctx);
+  SetVector<Partition *> root;
+  for (int i = 0; i < partitions.getNumPartitions(); ++i) {
+    root.insert(partitions.getPartition(i));
+  }
+
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    if (!hasPartition(&op)) {
+      setPartition(&op, root);
+    }
+  }
+}
+
+void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
+  loop->walk([&](Operation *op) {
+    if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
+      return WalkResult::advance();
+
+    auto parentOp = loop.getBody()->findAncestorOpInBlock(*op);
+    if (auto partitionIds = triton::gpu::getPartitionIds(parentOp)) {
+      SetVector<Partition *> parentPartitions;
+      for (auto id : *partitionIds) {
+        parentPartitions.insert(partitions.getPartition(id));
+      }
+      setPartition(op, parentPartitions);
+    }
+    return WalkResult::advance();
+  });
+
+  loop->walk([&](Operation *op) {
+    // remove partition attribute in ops that have regions
+    // such op's partition set will be inferred from regions
+    // in partition-loops pass
+    if (!isa<scf::ForOp>(op) && hasPartition(op) && op->getNumRegions() > 0) {
+      op->removeAttr(kPartitionAttrName);
+    }
+  });
+}
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -708,6 +753,8 @@ void PartitionScheduling::runOnOperation() {
       }
 
       optimizeSchedule(loop, *schedule);
+      assignRootPartition(loop, *schedule);
+      assignRegionBodyPartition(loop, *schedule);
       schedule->serialize(loop);
       loop->setAttr(
           kWarpSpecializeTagAttrName,

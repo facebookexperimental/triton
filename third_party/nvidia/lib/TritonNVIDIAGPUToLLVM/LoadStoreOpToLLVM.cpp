@@ -1115,12 +1115,70 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto ctx = getContext();
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    // === Bulk copy path ===
+    if (op.getUseBulk()) {
+      auto voidTy = void_ty(ctx);
+      auto dstTy = op.getResult().getType();
+      Type llvmElemTy = getTypeConverter()->convertType(dstTy.getElementType());
+
+      // Extract base pointer from src (scalar ptr or first element of ptr
+      // tensor)
+      Value basePtr;
+      if (isa<RankedTensorType>(op.getSrc().getType())) {
+        auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+        basePtr = srcElems[0];
+      } else {
+        basePtr = adaptor.getSrc();
+      }
+
+      // Get shared memory destination base address
+      auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getResult(), llvmElemTy, rewriter);
+      Value dstBase = dstMemObj.getBase();
+
+      // Get barrier shared memory address
+      auto barrierMemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getBarrier(),
+          getTypeConverter()->convertType(
+              op.getBarrier().getType().getElementType()),
+          rewriter);
+      Value barrierPtr = barrierMemObj.getBase();
+
+      // Get bulk_size
+      Value size = adaptor.getBulkSize();
+
+      // Compute predicate: threadIdx.x == 0
+      Value tid = getThreadId(rewriter, loc);
+      Value pred = b.icmp_eq(tid, b.i32_val(0));
+
+      // Emit cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes
+      ::mlir::triton::PTXBuilder ptxBuilder;
+      auto &bulkCopy = *ptxBuilder.create<>(
+          "@$0 cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+          "[$1], [$2], $3, [$4];");
+      bulkCopy({ptxBuilder.newOperand(pred, "b"),
+                ptxBuilder.newOperand(dstBase, "r"),
+                ptxBuilder.newOperand(basePtr, "l"),
+                ptxBuilder.newOperand(size, "r"),
+                ptxBuilder.newOperand(barrierPtr, "r")},
+               /*onlyAttachMLIRArgs=*/true);
+      ptxBuilder.launch(rewriter, loc, voidTy);
+
+      // Replace op with dummy token (same as non-bulk path)
+      Value zero = rewriter.create<LLVM::ConstantOp>(
+          loc, IntegerType::get(ctx, 32), rewriter.getI32IntegerAttr(0));
+      rewriter.replaceOp(op, zero);
+      return success();
+    }
+
+    // === Existing per-thread cp.async path ===
     Value res = op.getResult();
     Value mask = op.getMask();
     Value other = op.getOther();
     auto funcOp = op->getParentOfType<FunctionOpInterface>();
 
-    auto srcTy = op.getSrc().getType();
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
     auto dstTy = op.getResult().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
 
@@ -1912,6 +1970,50 @@ struct AsyncCommitGroupOpConversion
   }
 };
 
+struct AsyncStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncStoreOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::AsyncStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto voidTy = void_ty(op->getContext());
+
+    // Get shared memory pointer for src
+    auto srcTy = op.getSrc().getType();
+    Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());
+    auto srcMemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getSrc(), llvmElemTy, rewriter);
+    Value srcBase = srcMemObj.getBase();
+
+    Value dstPtr = adaptor.getDst();
+    Value size = adaptor.getSize();
+
+    // Auto-generate predicate: threadIdx.x == 0
+    Value tid = getThreadId(rewriter, loc);
+    Value pred = b.icmp_eq(tid, b.i32_val(0));
+
+    // @pred cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], $3;
+    ::mlir::triton::PTXBuilder ptxBuilder;
+    auto &bulkCopy =
+        *ptxBuilder.create<>("@$0 cp.async.bulk.global.shared::cta.bulk_group "
+                             "[$1], [$2], $3;");
+    bulkCopy(
+        {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstPtr, "l"),
+         ptxBuilder.newOperand(srcBase, "r"), ptxBuilder.newOperand(size, "r")},
+        /*onlyAttachMLIRArgs=*/true);
+    ptxBuilder.launch(rewriter, loc, voidTy);
+
+    // Emit commit group so completion can be tracked via wait_group
+    rewriter.create<NVVM::CpAsyncBulkCommitGroupOp>(loc);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct TMAStoreWaitOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::TMAStoreWaitOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -1945,6 +2047,6 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
   patterns.add<AsyncTMACopyLocalToGlobalOpConversion>(
       typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMAReduceOpConversion, AsyncTMAGatherOpConversion,
-               AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion>(
-      typeConverter, benefit);
+               AsyncTMAScatterOpConversion, TMAStoreWaitOpConversion,
+               AsyncStoreOpConversion>(typeConverter, benefit);
 }

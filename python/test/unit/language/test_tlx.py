@@ -948,6 +948,75 @@ def test_local_reinterpret(device):
     torch.testing.assert_close(x16, y16)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_local_reinterpret_swizzled(device):
+
+    @triton.jit
+    def local_reinterpret_swizzled_kernel(
+        a_ptr,
+        stride_am,
+        stride_ak,
+        b_ptr,
+        stride_bk,
+        stride_bn,
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+    ):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (tl.arange(0, BLOCK_M // 2)[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        a_ptrs2 = a_ptr + (tl.arange(BLOCK_M // 2, BLOCK_M)[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        # async load a and b into SMEM
+        buf_alloc_a = tlx.local_alloc((BLOCK_M // 2, BLOCK_K), tl.float16, tl.constexpr(2))
+        buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, tl.constexpr(1))
+        b_smem = tlx.local_view(buf_alloc_b, 0)
+        # load half of a each time
+        tlx.async_load(a_ptrs, buf_alloc_a[0])
+        tlx.async_load(a_ptrs2, buf_alloc_a[1])
+        tlx.async_load(b_ptrs, b_smem)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_tmem = tlx.local_view(buffers, 0)
+
+        # reinterpret a into one big tensor
+        a_reinterpreted = tlx.local_reinterpret(buf_alloc_a, tl.float16, [BLOCK_M, BLOCK_K])
+        # no barrier, tcgen5 mma synchronous semantic, compiler auto inserts barrier and wait
+        tlx.async_dot(a_reinterpreted, b_smem, acc_tmem, use_acc=False, mBarriers=[], out_dtype=OUT_DTYPE)
+
+        result = tlx.local_load(acc_tmem)
+
+        c = result.to(tl.float16)
+        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    kern_kwargs = {"BLOCK_M": M, "BLOCK_K": K, "BLOCK_N": N, "OUT_DTYPE": tl.float32}
+    kernel = local_reinterpret_swizzled_kernel[(1, 1)](x, x.stride(0), x.stride(1), y, y.stride(0), y.stride(1), z,
+                                                       z.stride(0), z.stride(1), **kern_kwargs)
+
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttg.memdesc_reinterpret") == 1
+
+    ref_out = torch.matmul(x, y)
+    torch.testing.assert_close(z, ref_out)
+
+
 @pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
 def test_async_dot(device):
 
@@ -2960,6 +3029,88 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
     torch.testing.assert_close(x, y)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("store_reduce", ["add", "min", "max"])
+def test_descriptor_store_reduce(store_reduce, device):
+    """Test that TMA stores with atomic reduction generate correct IR and produce correct results."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_reduce_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        STORE_REDUCE: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int32, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 4)
+
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], store_reduce=STORE_REDUCE)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.randint(1, 10, (M, N), dtype=torch.int32, device=device)
+    if store_reduce == "add":
+        y = torch.ones((M, N), dtype=torch.int32, device=device)
+        expected = y + x
+    elif store_reduce == "min":
+        y = torch.full((M, N), 100, dtype=torch.int32, device=device)
+        expected = torch.minimum(y, x)
+    elif store_reduce == "max":
+        y = torch.zeros((M, N), dtype=torch.int32, device=device)
+        expected = torch.maximum(y, x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_reduce_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                                  STORE_REDUCE=store_reduce)
+
+    # Verify the TMA reduce is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert "async_tma_reduce" in ttgir
+
+    # Verify PTX output contains the reduce instruction
+    ptx = kernel.asm["ptx"]
+    assert "cp.reduce.async.bulk.tensor" in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(y, expected)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_descriptor_load_multicast(device):
 
@@ -3573,8 +3724,7 @@ def test_async_tasks_region_error(device):
     with pytest.raises(triton.CompilationError) as e:
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
-    assert "ZeroDivisionError('division by zero')" in exc_msg, ("\n\nExpected ZeroDivisionError but got: \n\n" +
-                                                                exc_msg + "\n\n")
+    assert "division by zero" in exc_msg, "\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -6014,3 +6164,136 @@ def test_vote_ballot_sync_ir_emission(device):
     llir = kernel.asm["llir"]
     assert "nvvm.vote.ballot.sync" in llir or "vote.sync.ballot" in llir, (
         "Expected nvvm.vote.ballot.sync or vote.sync.ballot in LLVM IR")
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
+    """Test gmem->smem->gmem roundtrip using async_load(bulk=True) and async_store."""
+
+    @triton.jit
+    def bulk_copy_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        # gmem -> smem (bulk async_load)
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+
+        # smem -> gmem
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_copy_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR uses async_copy_global_to_local with bulk mode
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
+    assert "ttng.async_store" in ttgir, ("Expected async_store in TTGIR")
+
+    # Verify PTX contains the bulk copy instructions
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+        "Expected cp.async.bulk gmem->smem in PTX")
+    assert "cp.async.bulk.global.shared::cta.bulk_group" in ptx, ("Expected cp.async.bulk smem->gmem in PTX")
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_load_bulk(CHUNK_SIZE, device):
+    """Test async_load with bulk=True (1D bulk copy via mbarrier)."""
+
+    @triton.jit
+    def bulk_load_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        # Bulk async_load: no explicit pred needed (auto-generated in lowering)
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_load(src_ptr, buf, bulk=True, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+
+        # Write back to gmem via smem->gmem bulk copy
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_load_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR: should use async_copy_global_to_local with useBulk/bulk_size/barrier
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
+    assert "bulk_size" in ttgir, "Expected bulk_size operand in TTGIR"
+    assert "barrier" in ttgir, "Expected barrier operand in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
+
+    # Verify PTX contains the bulk copy instruction
+    ptx = kernel.asm["ptx"]
+    assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
+        "Expected cp.async.bulk gmem->smem in PTX")
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("CHUNK_SIZE", [256, 1024])
+def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
+    """Test async_load bulk=True with explicit bulk_size parameter."""
+
+    @triton.jit
+    def bulk_load_explicit_size_kernel(
+        src_ptr,
+        dst_ptr,
+        CHUNK_SIZE: tl.constexpr,
+    ):
+        smem = tlx.local_alloc((CHUNK_SIZE, ), tl.uint8, num=1)
+        bars = tlx.alloc_barriers(1, arrive_count=1)
+        bar = bars[0]
+        buf = smem[0]
+
+        # Pass explicit bulk_size
+        tlx.barrier_expect_bytes(bar, CHUNK_SIZE)
+        tlx.async_load(src_ptr, buf, bulk=True, bulk_size=CHUNK_SIZE, barrier=bar)
+        tlx.barrier_wait(bar, 0)
+
+        tlx.async_store(dst_ptr, buf, CHUNK_SIZE)
+        tlx.async_descriptor_store_wait(0)
+
+    size = CHUNK_SIZE
+    src = torch.randint(0, 256, (size, ), dtype=torch.uint8, device=device)
+    dst = torch.zeros(size, dtype=torch.uint8, device=device)
+
+    kernel = bulk_load_explicit_size_kernel[(1, )](src, dst, CHUNK_SIZE, num_warps=1)
+
+    # Verify IR uses the bulk path
+    ttgir = kernel.asm["ttgir"]
+    assert "bulk_size" in ttgir, "Expected bulk_size operand in TTGIR"
+    assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
+
+    # Verify correctness
+    torch.testing.assert_close(src, dst)

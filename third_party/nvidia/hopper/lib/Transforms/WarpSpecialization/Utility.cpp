@@ -21,10 +21,11 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
           asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
         asyncTaskIds.push_back(asyncTaskId);
     }
-  } else if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition")) {
-    int64_t idx = attr.getInt();
-    if (idx >= 0)
-      asyncTaskIds.push_back(idx);
+  } else if (auto attr =
+                 op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
+      asyncTaskIds.push_back(asyncTaskId);
+    }
   }
   return asyncTaskIds;
 }

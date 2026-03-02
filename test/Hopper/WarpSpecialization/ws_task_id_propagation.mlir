@@ -86,18 +86,53 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // Inner loop: only tasks 1 (loads) and 2 (dot/alloc) are present.
       // Bounds %c0 and %c1 are constants defined at function scope.
       %inner:2 = scf.for %k = %c0 to %arg5 step %c1 iter_args(%acc = %cst, %off = %c0) -> (tensor<128x256xf32, #mma1>, i32) : i32 {
-        %a = tt.descriptor_load %arg0[%tile, %off] {"ttg.partition" = 1 : i32, async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked2>
-        %a_alloc = ttg.local_alloc %a {"ttg.partition" = 2 : i32, async_task_id = array<i32: 2>} : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared2, #smem1>
-        %b = tt.descriptor_load %arg1[%off, %tile] {"ttg.partition" = 1 : i32, async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<64x256xf16>> -> tensor<64x256xf16, #blocked3>
-        %b_alloc = ttg.local_alloc %b {"ttg.partition" = 2 : i32, async_task_id = array<i32: 2>} : (tensor<64x256xf16, #blocked3>) -> !ttg.memdesc<64x256xf16, #shared2, #smem1>
-        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {"ttg.partition" = 2 : i32, async_task_id = array<i32: 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared2, #smem1> * !ttg.memdesc<64x256xf16, #shared2, #smem1> -> tensor<128x256xf32, #mma1>
-        %new_off = arith.addi %off, %c64 {"ttg.partition" = 1 : i32, async_task_id = array<i32: 1>} : i32
+        %a = tt.descriptor_load %arg0[%tile, %off] {"ttg.partition" = array<i32: 1>, async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked2>
+        %a_alloc = ttg.local_alloc %a {"ttg.partition" = array<i32: 2>, async_task_id = array<i32: 2>} : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared2, #smem1>
+        %b = tt.descriptor_load %arg1[%off, %tile] {"ttg.partition" = array<i32: 1>, async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<64x256xf16>> -> tensor<64x256xf16, #blocked3>
+        %b_alloc = ttg.local_alloc %b {"ttg.partition" = array<i32: 2>, async_task_id = array<i32: 2>} : (tensor<64x256xf16, #blocked3>) -> !ttg.memdesc<64x256xf16, #shared2, #smem1>
+        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {"ttg.partition" = array<i32: 2>, async_task_id = array<i32: 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared2, #smem1> * !ttg.memdesc<64x256xf16, #shared2, #smem1> -> tensor<128x256xf32, #mma1>
+        %new_off = arith.addi %off, %c64 {"ttg.partition" = array<i32: 1>, async_task_id = array<i32: 1>} : i32
         scf.yield %dot, %new_off : tensor<128x256xf32, #mma1>, i32
       }
       // Epilogue: only task 0 ops. This task has no ops inside the inner loop.
-      %trunc = arith.truncf %inner#0 {"ttg.partition" = 0 : i32, async_task_id = array<i32: 0>} : tensor<128x256xf32, #mma1> to tensor<128x256xf16, #mma1>
-      %cvt = ttg.convert_layout %trunc {"ttg.partition" = 0 : i32, async_task_id = array<i32: 0>} : tensor<128x256xf16, #mma1> -> tensor<128x256xf16, #blocked3>
-      tt.descriptor_store %arg2[%tile, %tile], %cvt {"ttg.partition" = 0 : i32, async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<128x256xf16>>, tensor<128x256xf16, #blocked3>
+      %trunc = arith.truncf %inner#0 {"ttg.partition" = array<i32: 0>, async_task_id = array<i32: 0>} : tensor<128x256xf32, #mma1> to tensor<128x256xf16, #mma1>
+      %cvt = ttg.convert_layout %trunc {"ttg.partition" = array<i32: 0>, async_task_id = array<i32: 0>} : tensor<128x256xf16, #mma1> -> tensor<128x256xf16, #blocked3>
+      tt.descriptor_store %arg2[%tile, %tile], %cvt {"ttg.partition" = array<i32: 0>, async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<128x256xf16>>, tensor<128x256xf16, #blocked3>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @tmem_init_store_mixed_task_ids
+  // CHECK: ttng.tmem_store {{.*}} {async_task_id = array<i32: 0>}
+  // CHECK: ttng.tmem_load {{.*}} {async_task_id = array<i32: 0>}
+  // CHECK: ttng.tc_gen5_mma {{.*}} {async_task_id = array<i32: 1>}
+
+  tt.func @tmem_init_store_mixed_task_ids(%a: !ttg.memdesc<128x64xf16, #shared, #smem>, %b: !ttg.memdesc<64x128xf16, #shared1, #smem>, %n_tiles: i32) {
+    %true = arith.constant true
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // Allocate tmem accumulator
+    %acc, %acc_token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    // Initialize accumulator with zeros (no task ID — should get {0} from earliest user)
+    %init_token = ttng.tmem_store %cst, %acc[%acc_token], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // Loop with tmem_load (task 0) and tc_gen5_mma (task 1) — mixed task IDs
+    %result = scf.for %iv = %c0 to %n_tiles step %c1 iter_args(%dep = %init_token) -> (!ttg.async.token) : i32 {
+      // tmem_load for rescale (task 0) — earliest annotated user of %acc
+      %loaded, %load_token = ttng.tmem_load %acc[%dep] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      // MMA accumulation (task 1) — later annotated user of %acc
+      %mma_token = ttng.tc_gen5_mma %a, %b, %acc[%load_token], %true, %true {async_task_id = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield %mma_token : !ttg.async.token
     }
     tt.return
   }

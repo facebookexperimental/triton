@@ -846,6 +846,10 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     builder.setInsertionPoint(op);
     auto newOp = builder.clone(*op, mappings);
     setAsyncTaskIds(newOp, sliceTaskIds);
+    if (numOfPartitions > 1 && isa<LocalAllocOp, ttng::TMEMAllocOp>(newOp)) {
+      newOp->setLoc(appendToNameLoc(
+          newOp->getLoc(), "_" + std::to_string(offset), op->getContext()));
+    }
     mappings.map(op, newOp);
     reverseMappings.map(newOp, op);
     // set result shape
