@@ -798,6 +798,9 @@ def async_descriptor_prefetch_tensor(
     eviction_policy: str = "",
     _semantic=None,
 ) -> None:
+    """
+    Hint the hardware to prefetch a tensor tile from global memory into L2 cache using TMA.
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
