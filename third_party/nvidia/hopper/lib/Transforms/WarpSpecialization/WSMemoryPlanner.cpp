@@ -1078,8 +1078,6 @@ public:
                                 size_t colOffset) -> bool {
       for (auto *alloc : buffers) {
         if (!alloc->isOwnerOfSpace && alloc->reuseOwner == reuseOwner) {
-          // Use rowSize for the N-dimension extent, since colOffset is an
-          // N-dimension position.
           Interval candSizeRange = {colOffset, colOffset + cand->colSize};
           Interval allocSizeRange = {alloc->colOffset,
                                      alloc->colOffset + alloc->colSize};
