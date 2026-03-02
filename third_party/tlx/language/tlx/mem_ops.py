@@ -791,7 +791,7 @@ def async_descriptor_load(
 
 
 @tl.builtin
-def async_descriptor_prefetch(
+def async_descriptor_prefetch_tensor(
     desc: tl.tensor_descriptor_base,
     offsets: list[tl.tensor],
     pred: tl.tensor = None,

@@ -21,7 +21,7 @@ from .mem_ops import (
     allocate_tensor_descriptor,
     async_store,
     async_descriptor_load,
-    async_descriptor_prefetch,
+    async_descriptor_prefetch_tensor,
     async_descriptor_store,
     async_descriptor_store_wait,
     async_load,

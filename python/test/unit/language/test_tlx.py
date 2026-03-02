@@ -2837,7 +2837,7 @@ def test_descriptor_load(use_prefetch, device):
         off_n = pid_n * BLOCK_SIZE_N
 
         if USE_PREFETCH:
-            tlx.async_descriptor_prefetch(desc_in, [off_m, off_n])
+            tlx.async_descriptor_prefetch_tensor(desc_in, [off_m, off_n])
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
         tlx.fence_async_shared()
