@@ -68,6 +68,90 @@ static void pickDescriptorLoadStoreLayout(
 }
 
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
+
+  void
+  emitLowPerThreadRemarksOnAxisInfo(ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                    Operation *op, Value memoryAccessPtr) {
+    auto mainError = op->emitRemark()
+                     << "When computing coalesced encoding, only one element "
+                        "per thread is assigned with information from axis "
+                        "info analysis. Performance may be suboptimal.";
+
+    llvm::SetVector<Operation *> backwardSlice;
+    BackwardSliceOptions opt;
+    opt.omitBlockArguments = false;
+    opt.filter = [&axisInfoAnalysis](Operation *op) {
+      bool allDivisibilityOne = true;
+      // check if results are all with divisibility 1
+      for (auto result : op->getResults()) {
+        auto axisInfo = axisInfoAnalysis.getAxisInfo(result);
+        auto divisibility = axisInfo->getDivisibility();
+        auto divisibilityIsOne = product<int64_t>(divisibility) == 1;
+        allDivisibilityOne = allDivisibilityOne && divisibilityIsOne;
+      }
+      return allDivisibilityOne;
+    };
+    getBackwardSlice(op, &backwardSlice, opt);
+
+    auto divisibility =
+        axisInfoAnalysis.getAxisInfo(memoryAccessPtr)->getDivisibility();
+    auto contiguity =
+        axisInfoAnalysis.getAxisInfo(memoryAccessPtr)->getContiguity();
+    // check if divisibility in all dimensions is 1
+    auto divisibilityIsOne = product<int64_t>(divisibility) == 1;
+
+    auto contiguityIsOne = product<int64_t>(contiguity) == 1;
+
+    if (divisibilityIsOne) {
+      mainError.attachNote()
+          << "The divisibility of the pointer is 1 in all dimensions. ";
+      for (auto sliceOp : backwardSlice) {
+        bool operandWithDivisibilityOne = false;
+        for (auto operand : sliceOp->getOperands()) {
+          auto axisInfo = axisInfoAnalysis.getAxisInfo(operand);
+          if (product<int64_t>(axisInfo->getDivisibility()) == 1) {
+            operandWithDivisibilityOne = true;
+            break;
+          }
+        }
+        bool resultWithDivisibilityOne = false;
+        if (sliceOp->getNumResults() > 0) {
+          auto lhsValue = sliceOp->getResult(0);
+          auto axisInfo = axisInfoAnalysis.getAxisInfo(lhsValue);
+          resultWithDivisibilityOne =
+              product<int64_t>(axisInfo->getDivisibility()) == 1;
+        }
+        if (!operandWithDivisibilityOne && resultWithDivisibilityOne) {
+          // ignore certain ops
+          if (isa<triton::GetProgramIdOp>(sliceOp) ||
+              isa<arith::ConstantOp>(sliceOp)) {
+            continue;
+          }
+          mainError.attachNote(sliceOp->getLoc())
+              << "Divisibility of 1 first introduced here: " << *sliceOp;
+          if (isa<triton::LoadOp>(sliceOp)) {
+            mainError.attachNote(sliceOp->getLoc())
+                << "tt.load resets divisibility. Consider add "
+                   "`tt.multiple_of` if you believe it is correct for the "
+                   "data.";
+          } else if (isa<arith::DivUIOp>(sliceOp) ||
+                     isa<arith::DivSIOp>(sliceOp)) {
+            mainError.attachNote(sliceOp->getLoc())
+                << "Division resets divisibility. Consider add "
+                   "`tt.multiple_of` if you believe it is correct for the "
+                   "data.";
+          }
+          // TODO: we can add more ops here. Still looking for examples for
+          // converging to 1 with GCD and multiplications.
+        }
+      }
+    }
+    if (contiguityIsOne) {
+      mainError.attachNote()
+          << "The contiguity of the pointer is 1 in all dimensions.";
+    }
+  }
+
   // Set coalesced encoding for memory operations.
   // For local_load, we assume full contiguity since shared memory has known
   // layout. For other ops, we use axis info analysis to determine contiguity.
@@ -163,7 +247,16 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         perThread = std::max(perThread, currPerThread);
       }
 
-      perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));
+      LDBG("perThread after max: " << perThread);
+      LDBG("numElems: " << numElems);
+      LDBG("numThreads: " << numThreads);
+      auto perThreadFromExecutionConfig = std::max(numElems / numThreads, 1);
+      auto perThreadFromAxisInfo = perThread;
+      if (perThreadFromAxisInfo == 1) {
+        emitLowPerThreadRemarksOnAxisInfo(axisInfoAnalysis, op, ptr);
+      }
+      perThread =
+          std::min<int>(perThreadFromAxisInfo, perThreadFromExecutionConfig);
       LDBG("perThread: " << perThread);
 
       if (!dyn_cast<triton::LoadOp>(op)) {
