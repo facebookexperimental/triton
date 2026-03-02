@@ -375,6 +375,7 @@ public:
     //   → MMA users create dynamic computation partitions
     // For bwd: reduction / gemm / load / computation
     //   → reduction is at index 0 (default position) with num_warps=4
+    //   → gemm gets num_warps=1
     //   → MMA users create a single shared computation partition with
     //   num_warps=8
 
@@ -1565,6 +1566,25 @@ getInitialSchedule(scf::ForOp mainLoop,
         }
       }
     }
+
+    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
+    // partition index. These ops initialize accumulators (e.g., zeroing dK/dV)
+    // before the loop. Without explicit assignment, they would get pulled
+    // into the gemm partition via token chains to the in-loop MMA, causing
+    // gemm to require >=4 warps (TMEM ops need 4 warps).
+    // We set the attribute directly rather than using schedule.trySchedule
+    // because pre-loop ops must not be added to the partition's ops list
+    // (optimizeSchedule only handles in-loop ops).
+    if (tmpl->getOptions().hasReduction && reductionPartition) {
+      Builder b(loopOp->getContext());
+      for (Operation &op : *loopOp->getBlock()) {
+        if (&op == loopOp)
+          break;
+        if (isa<ttng::TMEMStoreOp>(op))
+          op.setAttr(kPartitionAttrName,
+                     b.getI32IntegerAttr(reductionPartition->getIndex()));
+      }
+    }
   }
 
   // In-loop loads
@@ -1645,10 +1665,14 @@ getInitialSchedule(scf::ForOp mainLoop,
     for (auto mmaOp : loop.getOps<ttng::MMAv5OpInterface>()) {
       schedule.trySchedule(mmaPartition, mmaOp);
 
-      // If the store is unrelated to the use of the MMA, place in MMA partition
+      // If the store is unrelated to the use of the MMA, place in MMA
+      // partition. Exception: in BWD (hasReduction), keep TMEMStoreOp out of
+      // the gemm partition so that gemm can run with fewer warps (TMEM ops
+      // require >=4).
       auto storeOp = dyn_cast_or_null<ttng::TMEMStoreOp>(
           findDefOpInLoop(loop, mmaOp.getAccDep()));
-      if (!ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
+      if (!tmpl->getOptions().hasReduction &&
+          !ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
           loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
         schedule.trySchedule(mmaPartition, storeOp);
     }
