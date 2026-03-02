@@ -133,6 +133,15 @@ qk_storage_alias.set_buffer_overlap(
 )
 ```
 
+**Compiler Pipeline Inspection Steps**
+To introspect the pipeline `add_stages`, before running your kernels, simply set
+the add_stages_inspection_hook like so:
+
+```python
+def inspect_stages(_self, stages, options, language, capability):
+    # inspect or modify add_stages here
+triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
+```
 
 
 ### Remote buffer operations
