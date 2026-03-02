@@ -791,6 +791,33 @@ def async_descriptor_load(
 
 
 @tl.builtin
+def async_descriptor_prefetch(
+    desc: tl.tensor_descriptor_base,
+    offsets: list[tl.tensor],
+    pred: tl.tensor = None,
+    eviction_policy: str = "",
+    _semantic=None,
+) -> None:
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), \
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    eviction = _semantic._str_to_eviction_policy(eviction_policy)
+    if pred is None:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        pred_handle = pred.handle
+    _semantic.builder.create_async_TMA_prefetch(
+        desc.handle,
+        offsets,
+        pred_handle,
+        eviction,
+    )
+
+
+@tl.builtin
 def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,

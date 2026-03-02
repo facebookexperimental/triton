@@ -419,6 +419,31 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
   }];
 }
 
+def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "prefetch data based on descriptor from global memory to L2 cache asynchronously";
+
+  let description = [{
+    This operation prefetches data from global memory into L2 cache
+    asynchronously using TMA.  Unlike `async_tma_copy_global_to_local`, this does
+    not copy data to shared memory and does not use an mbarrier.  It issues a
+    `cp.async.bulk.prefetch.tensor` instruction which is a performance hint to
+    warm the L2 cache before a subsequent TMA load.
+  }];
+
+  let arguments = (ins
+    Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
+    Variadic<I32>:$coord,
+    I1:$pred,
+    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
+  );
+
+  let assemblyFormat = [{
+    $desc `[` $coord `]` `,` $pred
+    oilist(`evictionPolicy` `=` $evict)
+    attr-dict `:` qualified(type($desc))
+  }];
+}
+
 def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
   let summary = "copy data based on descriptor from local memory to global memory asynchronously";
 

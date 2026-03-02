@@ -2798,7 +2798,8 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-def test_descriptor_load(device):
+@pytest.mark.parametrize("use_prefetch", [True])
+def test_descriptor_load(use_prefetch, device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
@@ -2806,7 +2807,8 @@ def test_descriptor_load(device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                               USE_PREFETCH: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -2834,6 +2836,8 @@ def test_descriptor_load(device):
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
 
+        if USE_PREFETCH:
+            tlx.async_descriptor_prefetch(desc_in, [off_m, off_n])
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
         tlx.fence_async_shared()
@@ -2847,11 +2851,15 @@ def test_descriptor_load(device):
     y = torch.empty_like(x)
     grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
-    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                          USE_PREFETCH=use_prefetch)
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_store_wait") == 1
     assert kernel.asm["ttgir"].count("ttng.fence_async_shared") == 1
+    if use_prefetch:
+        assert kernel.asm["ttgir"].count("ttng.async_tma_prefetch") == 1
+        assert kernel.asm["ptx"].count("cp.async.bulk.prefetch.tensor") == 1
     torch.testing.assert_close(x, y)
 
 
