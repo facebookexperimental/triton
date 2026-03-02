@@ -427,7 +427,7 @@ def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemW
     asynchronously using TMA.  Unlike `async_tma_copy_global_to_local`, this does
     not copy data to shared memory and does not use an mbarrier.  It issues a
     `cp.async.bulk.prefetch.tensor` instruction which is a performance hint to
-    warm the L2 cache before a subsequent TMA load.
+    fill the L2 cache before a subsequent TMA load.
   }];
 
   let arguments = (ins
