@@ -147,24 +147,21 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
-      for (int32_t val : attr.asArrayRef()) {
-        assert(val >= 0);
-        minPartition = std::min(static_cast<int64_t>(val), minPartition);
-      }
+      assert(attr.size() == 1 && "expected exactly 1 partition element");
+      int64_t idx = attr[0];
+      assert(idx >= 0);
+      minPartition = std::min(idx, minPartition);
     }
   });
   DenseSet<AsyncTaskId> totalTaskIds;
   // Convert ttg.partition to async_task_id
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
-      SmallVector<AsyncTaskId> taskIds;
-      for (int32_t val : attr.asArrayRef()) {
-        int64_t idx = val - minPartition;
-        assert(idx >= 0);
-        totalTaskIds.insert(idx);
-        taskIds.push_back(idx);
-      }
-      setAsyncTaskIds(op, taskIds);
+      assert(attr.size() == 1 && "expected exactly 1 partition element");
+      int64_t idx = attr[0] - minPartition;
+      totalTaskIds.insert(idx);
+      assert(idx >= 0);
+      setAsyncTaskIds(op, idx);
       op->removeAttr(kPartitionAttrName);
     }
   });
