@@ -714,6 +714,53 @@ private:
 
   BufferRangeMapT bufferRange;
 
+  SmallVector<BufferT *> buffers;
+  DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
+
+  /// Check whether dstOp is in the forward SSA slice of srcOp,
+  /// i.e. dstOp transitively uses a result of srcOp.  Also follows
+  /// memory dependencies (local_store, tmem_store).
+  static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
+    SmallVector<Operation *, 16> worklist;
+    DenseSet<Operation *> visited;
+    auto enqueueUsers = [&](Operation *op) {
+      for (Value result : op->getResults()) {
+        for (Operation *user : result.getUsers()) {
+          if (visited.insert(user).second)
+            worklist.push_back(user);
+        }
+      }
+      if (isa<triton::gpu::LocalStoreOp>(op) ||
+          isa<triton::nvidia_gpu::TMEMStoreOp>(op)) {
+        for (Value operand : op->getOperands()) {
+          if (isa<triton::gpu::MemDescType>(operand.getType())) {
+            for (Operation *user : operand.getUsers()) {
+              if (user != op && visited.insert(user).second)
+                worklist.push_back(user);
+            }
+          }
+        }
+      }
+    };
+    enqueueUsers(srcOp);
+    while (!worklist.empty()) {
+      Operation *op = worklist.pop_back_val();
+      if (op == dstOp)
+        return true;
+      enqueueUsers(op);
+    }
+    return false;
+  }
+
+  /// Look up the BufferT for a given alloc operation.
+  BufferT *getBuffer(Operation *candAlloc) {
+    for (auto *alloc : buffers) {
+      if (alloc->owner == candAlloc)
+        return alloc;
+    }
+    return nullptr;
+  }
+
   Interval<size_t> getLiveIntervals(Value value, Liveness &liveness,
                                     DenseMap<Operation *, size_t> &opId,
                                     SmallVector<Channel *> &chans) {
@@ -766,7 +813,7 @@ public:
     Liveness liveness(parentOp);
     DenseMap<Operation *, Interval<size_t>> allocToIntervals;
     DenseMap<Operation *, ttng::TMemAllocation> allocToSize;
-    DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
+    allocToChannel.clear();
     for (auto it = allocs.begin(), e = allocs.end(); it != e; ++it) {
       ttng::TMEMAllocOp alloc = *it;
       Interval<size_t> liveInterval =
@@ -846,7 +893,7 @@ public:
              (iter2->second.numRows * iter2->second.numCols);
     });
     Allocation allocation;
-    SmallVector<BufferT *> buffers;
+    this->buffers.clear();
     for (auto alloc : allocs) {
       // size is 0, alignment is default, offset is default
       allocation.addBuffer<BufferT::BufferKind::Explicit>(alloc, 0);
