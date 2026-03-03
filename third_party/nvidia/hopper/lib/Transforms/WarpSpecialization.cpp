@@ -29,7 +29,10 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "");
+                              StringRef writeDecisionFile = "",
+                              int smemAllocAlgo = 0,
+                              unsigned smemBudget = 232448,
+                              bool smemCircularReuse = false);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
