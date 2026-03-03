@@ -703,6 +703,12 @@ static bool isSmemTMAChannel(Operation *alloc,
   return false;
 }
 
+/// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
+static int getLoopStage(Operation *op) {
+  auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  return attr ? attr.getValue().getSExtValue() : -1;
+}
+
 /// Check if a channel's source and destination(s) are in different
 /// loop.stage values.
 static bool isSmemCrossStage(Operation *alloc,
