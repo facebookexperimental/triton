@@ -139,6 +139,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: tma_prefetch
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.async.bulk.prefetch.tensor.2d.L2.global [$1, {$2, $3}];", "b,l,r,r"
+  // CHECK: return
+  tt.func @tma_prefetch(%tma: !tt.tensordesc<tensor<128x128xf32>>, %x: i32, %y: i32, %pred: i1) {
+    ttng.async_tma_prefetch %tma[%x, %y], %pred : !tt.tensordesc<tensor<128x128xf32>>
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
 #smem = #ttg.shared_memory

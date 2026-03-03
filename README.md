@@ -167,6 +167,10 @@ qk_storage_alias.set_buffer_overlap(
 
    Load a chunk of data from global memory into a local memory buffer. The global address, strides, and buffer size are defined by the memory descriptor. A barrier object is provided and signaled upon completion of the operation.
 
+- `tlx.async_descriptor_prefetch_tensor(memdesc, [offsets], pred, eviction_policy)`
+
+   Hint hardware to load a chunk of data from global memory into a L2 cache to prepare for upcoming `async_descriptor_load` operations.
+
 
 - `tlx.async_descriptor_store(memdesc, buffer, [offsets])`
 
