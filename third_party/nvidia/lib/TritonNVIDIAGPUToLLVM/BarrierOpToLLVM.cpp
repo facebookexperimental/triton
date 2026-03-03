@@ -55,13 +55,13 @@ struct FenceAsyncSharedOpConversion
   }
 };
 
-struct ThreadfenceOpConversion
-    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ThreadfenceOp> {
+struct FenceOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::FenceOp> {
   using ConvertOpToLLVMPattern<
-      triton::nvidia_gpu::ThreadfenceOp>::ConvertOpToLLVMPattern;
+      triton::nvidia_gpu::FenceOp>::ConvertOpToLLVMPattern;
 
   LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::ThreadfenceOp op, OpAdaptor adaptor,
+  matchAndRewrite(triton::nvidia_gpu::FenceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto ctx = rewriter.getContext();
     auto scope = op.getScope();
@@ -498,7 +498,7 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit, NVIDIA::TargetInfo &targetInfo) {
   patterns.add<FenceAsyncSharedOpConversion>(typeConverter, benefit);
-  patterns.add<ThreadfenceOpConversion>(typeConverter, benefit);
+  patterns.add<FenceOpConversion>(typeConverter, benefit);
   patterns.add<InitBarrierOpConversion, InvalBarrierOpConversion>(typeConverter,
                                                                   benefit);
   patterns.add<WaitBarrierOpConversion>(typeConverter, benefit, targetInfo);

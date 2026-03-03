@@ -61,7 +61,7 @@ def TTNG_FenceAsyncSharedOp : TTNG_Op<"fence_async_shared"> {
   }];
 }
 
-def TTNG_ThreadfenceOp : TTNG_Op<"threadfence"> {
+def TTNG_FenceOp : TTNG_Op<"fence"> {
   let arguments = (ins StrAttr:$scope);
 
   let summary = "GPU or system scope memory fence";

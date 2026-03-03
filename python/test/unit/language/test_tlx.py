@@ -6318,9 +6318,9 @@ def test_fence_gpu(device):
     x = torch.zeros(2, dtype=torch.int32, device=device)
     kernel = fence_gpu_kernel[(1, )](x, num_warps=1)
 
-    # Verify TTGIR contains the threadfence op with gpu scope
+    # Verify TTGIR contains the fence op with gpu scope
     ttgir = kernel.asm["ttgir"]
-    assert 'ttng.threadfence {scope = "gpu"}' in ttgir
+    assert 'ttng.fence {scope = "gpu"}' in ttgir
 
     # Verify PTX contains the correct fence instruction
     ptx = kernel.asm["ptx"]
@@ -6343,9 +6343,9 @@ def test_fence_sys(device):
     x = torch.zeros(2, dtype=torch.int32, device=device)
     kernel = fence_sys_kernel[(1, )](x, num_warps=1)
 
-    # Verify TTGIR contains the threadfence op with sys scope
+    # Verify TTGIR contains the fence op with sys scope
     ttgir = kernel.asm["ttgir"]
-    assert 'ttng.threadfence {scope = "sys"}' in ttgir
+    assert 'ttng.fence {scope = "sys"}' in ttgir
 
     # Verify PTX contains the correct fence instruction
     ptx = kernel.asm["ptx"]
