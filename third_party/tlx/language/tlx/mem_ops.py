@@ -846,7 +846,6 @@ def async_descriptor_store(
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
     assert store_reduce in ("", "add", "min", "max", "and", "or", "xor"), (
         f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', or 'xor', got '{store_reduce}'")
-    assert not (store_reduce != "" and eviction_policy != ""), "eviction_policy is not supported with store_reduce"
     from triton._C.libtriton import ir
 
     ndim = len(desc.block_shape)
@@ -854,13 +853,14 @@ def async_descriptor_store(
     source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
 
+    evict = ir.EVICTION_POLICY.NORMAL
+    if eviction_policy == "evict_first":
+        evict = ir.EVICTION_POLICY.EVICT_FIRST
+    elif eviction_policy == "evict_last":
+        evict = ir.EVICTION_POLICY.EVICT_LAST
+
     if store_reduce == "":
         # Regular store
-        evict = ir.EVICTION_POLICY.NORMAL
-        if eviction_policy == "evict_first":
-            evict = ir.EVICTION_POLICY.EVICT_FIRST
-        elif eviction_policy == "evict_last":
-            evict = ir.EVICTION_POLICY.EVICT_LAST
         _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
     else:
         # Atomic reduce store
@@ -873,7 +873,7 @@ def async_descriptor_store(
             "xor": ir.DESCRIPTOR_REDUCE_KIND.XOR,
         }
         reduce_kind = reduce_kind_map[store_reduce]
-        _semantic.builder.create_async_TMA_reduce(reduce_kind, desc.handle, offsets, source_handle)
+        _semantic.builder.create_async_TMA_reduce(reduce_kind, desc.handle, offsets, source_handle, evict)
 
 
 @tl.builtin
