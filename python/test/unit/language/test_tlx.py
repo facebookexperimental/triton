@@ -2944,6 +2944,7 @@ def test_descriptor_load_prefetch_ws(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("eviction_policy", ["evict_first", "evict_last", ""])
 def test_descriptor_load_l2_cache_hint(eviction_policy, device):
     """Test that TMA loads can use L2 cache hints via eviction_policy parameter."""
 
