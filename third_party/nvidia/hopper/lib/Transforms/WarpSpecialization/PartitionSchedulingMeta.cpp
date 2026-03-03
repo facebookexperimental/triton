@@ -248,6 +248,7 @@ public:
     // This makes reduction the "default" partition in warp_specialize.
     if (options.hasReduction) {
       reductionPartition = schedule.addPartition(0);
+      reductionPartition->setType("reduction");
       defaultPartition = nullptr; // No separate default for bwd
     } else {
       reductionPartition = nullptr;
@@ -255,13 +256,16 @@ public:
       bool needDefault = options.hasCorrection || options.hasEpilogue;
       if (needDefault) {
         defaultPartition = schedule.addPartition(0);
+        defaultPartition->setType("default");
       } else {
         defaultPartition = nullptr;
       }
     }
 
     gemmPartition = schedule.addPartition(1); // stage 1 for MMA
+    gemmPartition->setType("gemm");
     loadPartition = schedule.addPartition(0);
+    loadPartition->setType("load");
 
     // Correction: merge into default partition.
     if (options.hasCorrection)
@@ -271,10 +275,12 @@ public:
 
     // Epilogue: only if there are epilogue stores and not merged into
     // computation.
-    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation)
+    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation) {
       epiloguePartition = schedule.addPartition(0);
-    else
+      epiloguePartition->setType("epilogue");
+    } else {
       epiloguePartition = nullptr;
+    }
 
     // Note: computation partitions are NOT pre-allocated here.
     // They are created dynamically by scheduleUsers() in Phase 5.
@@ -320,9 +326,13 @@ class GEMMTemplate : public SchedulingTemplate {
 public:
   void createPartitions(PartitionSet &schedule) override {
     defaultPartition = schedule.addPartition(0);
+    defaultPartition->setType("default");
     gemmPartition = schedule.addPartition(1);
+    gemmPartition->setType("gemm");
     loadPartition = schedule.addPartition(0);
+    loadPartition->setType("load");
     epiloguePartition = schedule.addPartition(0);
+    epiloguePartition->setType("epilogue");
   }
 
   Partition *getPartition(AbstractPartition absPart,
@@ -887,8 +897,10 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 
     if (hasPartition(user))
       continue;
-    if (!partition)
+    if (!partition) {
       partition = schedule.addPartition(/* stage is unused */ 0);
+      partition->setType("computation");
+    }
     tryScheduleOp(partition, user);
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
@@ -1267,6 +1279,25 @@ getInitialSchedule(scf::ForOp mainLoop,
         }
       }
     }
+
+    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
+    // partition index. These ops initialize accumulators (e.g., zeroing dK/dV)
+    // before the loop. Without explicit assignment, they would get pulled
+    // into the gemm partition via token chains to the in-loop MMA, causing
+    // gemm to require >=4 warps (TMEM ops need 4 warps).
+    // We set the attribute directly rather than using schedule.trySchedule
+    // because pre-loop ops must not be added to the partition's ops list
+    // (optimizeSchedule only handles in-loop ops).
+    if (reductionPartition) {
+      Builder b(mainLoop->getContext());
+      for (Operation &op : *mainLoop->getBlock()) {
+        if (&op == mainLoop)
+          break;
+        if (isa<ttng::TMEMStoreOp>(op))
+          op.setAttr(kPartitionAttrName,
+                     b.getI32IntegerAttr(reductionPartition->getIndex()));
+      }
+    }
   }
 
   //===--------------------------------------------------------------------===//
@@ -1498,6 +1529,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // Assign the whole cluster to its own partition.
     if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
       Partition *newPartition = schedule.addPartition(0);
+      newPartition->setType("computation");
       for (Operation *op : cluster.ops)
         setPartition(op, newPartition);
       continue;
