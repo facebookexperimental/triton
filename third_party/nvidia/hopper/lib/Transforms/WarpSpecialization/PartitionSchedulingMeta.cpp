@@ -1398,8 +1398,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // another partition and spawn a single cluster at that operation.
     auto defCallback = [&](OpResult result, unsigned distance) {
       Operation *defOp = result.getDefiningOp();
-      if (!hasPartition(defOp) &&
-          hasDefPartition(loop, defOp, schedule)) {
+      if (!hasPartition(defOp) && hasDefPartition(loop, defOp, schedule)) {
         // Add the current partition as a sink to the cluster.
         opClusters.getOrCreate(defOp)->sinkPartitions.insert(&partition);
       }
@@ -1484,8 +1483,8 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     if (cluster.ops.empty())
       continue;
     assert(!cluster.defPartitions.empty());
-    assert(llvm::all_of(
-        cluster.ops, [&](Operation *op) { return !hasPartition(op); }));
+    assert(llvm::all_of(cluster.ops,
+                        [&](Operation *op) { return !hasPartition(op); }));
 
     // If there are multiple def or sink partitions, don't know what to do.
     // Assign the whole cluster to its own partition.
