@@ -3158,7 +3158,6 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
     builder.setLoopScheduleInfoFromOp(allocOp);
     auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
         allocOp.getLoc(), allocOp.getSrc(), newAlloc);
-    storeOp->moveBefore(allocOp);
 
     mlir::triton::replaceUsesAndPropagateType(builder, allocOp,
                                               newAlloc.getResult());

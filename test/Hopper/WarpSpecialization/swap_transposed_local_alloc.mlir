@@ -8,21 +8,21 @@
 
 // CHECK-LABEL: @swap_transposed_alloc
 //
-// After buffer allocation, both dsT and dq allocs should have non-transposed
-// #shared layout. The two separated local_alloc ops (hoisted above the loop)
-// should both be non-transposed:
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
+// After buffer allocation, the dsT alloc is swapped to non-transposed #shared
+// layout and hoisted above the loop.
+// CHECK: %[[B0:.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
 //
 // Inside the loop, memdesc_trans goes from #shared (non-transposed) to #shared1
 // (transposed), confirming the swap happened:
-// CHECK: ttg.memdesc_trans {{.*}} !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
+// CHECK: gen5_mma %[[B0]]
+// CHECK: %[[T0:.*]] = ttg.memdesc_trans %[[B0]]{{.*}} !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
+// CHECK: gen5_mma %[[T0]]
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared_T = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @swap_transposed_alloc(%desc_k: !tt.tensordesc<tensor<128x128xbf16, #shared>>, %desc_q: !tt.tensordesc<tensor<128x128xbf16, #shared>>) {
     %true = arith.constant true
@@ -66,7 +66,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared_2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared_T_2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem_2 = #ttg.shared_memory
-#tmem_2 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
+#tmem_2 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @no_swap_operand_b(%desc_k: !tt.tensordesc<tensor<128x128xbf16, #shared_2>>) {
     %true = arith.constant true
