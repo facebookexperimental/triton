@@ -5,6 +5,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 class Operation;
@@ -19,6 +20,7 @@ class ForOp;
 static constexpr char kPartitionAttrName[] = "ttg.partition";
 static constexpr char kPartitionOutputsAttrName[] = "ttg.partition.outputs";
 static constexpr char kPartitionStagesAttrName[] = "ttg.partition.stages";
+static constexpr char kPartitionTypesAttrName[] = "ttg.partition.types";
 static constexpr char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
 
 //===----------------------------------------------------------------------===//
@@ -40,6 +42,8 @@ public:
   ArrayRef<Operation *> getOps() const { return ops; }
   void addOp(Operation *op) { ops.push_back(op); }
   bool hasOp(Operation *op) const;
+  StringRef getType() const { return type; }
+  void setType(StringRef t) { type = t.str(); }
 
   // Iterate the inputs of the partition. Input values are those that originate
   // from a different partition or a previous iteration of the current
@@ -73,6 +77,8 @@ private:
   int stage;
   // The ops in the partition.
   SmallVector<Operation *> ops;
+  // The type of the partition (e.g., "gemm", "load", "reduction", "default").
+  std::string type;
 };
 
 // A partition set divides a loop into multiple partitions. Ops in a loop are

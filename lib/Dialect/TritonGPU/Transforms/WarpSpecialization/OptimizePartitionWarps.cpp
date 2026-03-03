@@ -6,6 +6,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -253,6 +254,50 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
       }
     }
   } while (changed);
+
+  // Read partition types if available for type-aware warp assignment.
+  SmallVector<StringRef> partitionTypes;
+  if (auto typesAttr =
+          wsOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+    for (Attribute attr : typesAttr) {
+      if (auto strAttr = dyn_cast<StringAttr>(attr))
+        partitionTypes.push_back(strAttr.getValue());
+      else
+        partitionTypes.push_back("");
+    }
+  }
+
+  // Apply type-aware warp assignment overrides BEFORE relayout.
+  // This ensures layouts are computed with the correct warp counts.
+  //
+  // For bwd FA: reduction / gemm / load / computation
+  //   - reduction (index 0) gets 4 warps
+  //   - computation (last partition) gets 8 warps
+  bool hasReduction = false;
+  size_t computationIdx = SIZE_MAX;
+  for (size_t i = 0; i < partitionNumWarps.size() && i < partitionTypes.size();
+       ++i) {
+    StringRef type = partitionTypes[i];
+    if (type == "reduction") {
+      hasReduction = true;
+    }
+    if (type == "computation") {
+      computationIdx = i;
+    }
+  }
+
+  // For bwd FA (has reduction): set reduction (index 0) to 4 warps
+  // and computation to 8 warps
+  if (hasReduction) {
+    // Reduction at index 0 gets 4 warps
+    if (!partitionTypes.empty() && partitionTypes[0] == "reduction") {
+      partitionNumWarps[0] = 4;
+    }
+    // Computation partition gets 8 warps
+    if (computationIdx != SIZE_MAX) {
+      partitionNumWarps[computationIdx] = 8;
+    }
+  }
 
   // Read the attribute from the module
   ModuleOp mod = axisInfo.getModuleOp();
