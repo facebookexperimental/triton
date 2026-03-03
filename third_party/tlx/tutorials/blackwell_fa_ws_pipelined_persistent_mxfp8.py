@@ -240,7 +240,7 @@ def _softmax_inner_loop(
             VEC_SIZE,
             out_dtype,
         )
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
         l_ij = tl.sum(p_i, 1)
@@ -955,7 +955,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
-                    tlx.fence_async_shared()
+                    tlx.fence("async_shared")
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
                     tlx.async_descriptor_store_wait(0)

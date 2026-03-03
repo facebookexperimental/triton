@@ -918,10 +918,34 @@ def async_descriptor_store_wait(
 
 
 @tl.builtin
-def fence_async_shared(_semantic=None, ) -> None:
+def fence(scope: tl.constexpr, _semantic=None) -> None:
     """
-    Order memory operations that go through the shared memory.
+    Memory fence with the specified scope.
+
+    Args:
+        scope: "gpu" for device-scope fence ordering global/shared
+                   memory writes visible to all GPU threads.
+               "sys" for system-scope fence also visible to host CPU.
+               "async_shared" for proxy fence ordering async shared memory
+                   operations (e.g. between local_store and TMA store).
+
+    PTX equivalents:
+        scope="gpu"          → fence.acq_rel.gpu
+        scope="sys"          → fence.acq_rel.sys
+        scope="async_shared" → fence.proxy.async.shared::cta
     """
+    scope = tl._unwrap_if_constexpr(scope)
+    if scope == "async_shared":
+        _semantic.builder.create_fence_async_shared(False)
+    elif scope in ("gpu", "sys"):
+        _semantic.builder.create_threadfence(scope)
+    else:
+        raise ValueError(f"fence scope must be 'gpu', 'sys', or 'async_shared', got '{scope}'")
+
+
+@tl.builtin
+def fence_async_shared(_semantic=None) -> None:
+    """Deprecated: use ``fence("async_shared")`` instead."""
     _semantic.builder.create_fence_async_shared(False)
 
 

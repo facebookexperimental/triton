@@ -2847,7 +2847,7 @@ def test_descriptor_load(use_prefetch, device):
             tlx.async_descriptor_prefetch_tensor(desc_in, [off_m, off_n])
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -3000,7 +3000,7 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
         # Use eviction_policy parameter for L2 cache hint
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, eviction_policy=EVICTION_POLICY)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -3087,7 +3087,7 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
         # Load without cache hint
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         # Store with eviction policy
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], eviction_policy=EVICTION_POLICY)
         tlx.async_descriptor_store_wait(0)
@@ -3172,7 +3172,7 @@ def test_descriptor_store_reduce(store_reduce, device):
 
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], store_reduce=STORE_REDUCE)
         tlx.async_descriptor_store_wait(0)
 
@@ -3345,7 +3345,7 @@ def test_descriptor_load_multicast(device):
             tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
                                       multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -4986,7 +4986,7 @@ def test_dummy_layout_function_inlining(device):
         # Load from TMEM to registers, then store to SMEM
         reg_data = tlx.local_load(tmem_buffer)
         tlx.local_store(smem_buffer, reg_data)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc, smem_buffer, [offset_m, offset_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -6478,3 +6478,53 @@ def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
 
     # Verify correctness
     torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_fence_gpu(device):
+
+    @triton.jit
+    def fence_gpu_kernel(ptr):
+        tl.atomic_add(ptr, 1)
+        tlx.fence("gpu")
+        tl.atomic_add(ptr + 1, 1)
+
+    x = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = fence_gpu_kernel[(1, )](x, num_warps=1)
+
+    # Verify TTGIR contains the fence op with gpu scope
+    ttgir = kernel.asm["ttgir"]
+    assert 'ttng.fence {scope = "gpu"}' in ttgir
+
+    # Verify PTX contains the correct fence instruction
+    ptx = kernel.asm["ptx"]
+    assert "fence.acq_rel.gpu" in ptx
+
+    # Verify correctness
+    assert x[0].item() == 1
+    assert x[1].item() == 1
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_fence_sys(device):
+
+    @triton.jit
+    def fence_sys_kernel(ptr):
+        tl.atomic_add(ptr, 1)
+        tlx.fence(scope="sys")
+        tl.atomic_add(ptr + 1, 1)
+
+    x = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = fence_sys_kernel[(1, )](x, num_warps=1)
+
+    # Verify TTGIR contains the fence op with sys scope
+    ttgir = kernel.asm["ttgir"]
+    assert 'ttng.fence {scope = "sys"}' in ttgir
+
+    # Verify PTX contains the correct fence instruction
+    ptx = kernel.asm["ptx"]
+    assert "fence.acq_rel.sys" in ptx
+
+    # Verify correctness
+    assert x[0].item() == 1
+    assert x[1].item() == 1

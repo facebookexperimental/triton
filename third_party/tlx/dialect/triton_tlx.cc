@@ -689,6 +689,11 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
+           })
+      .def("create_threadfence",
+           [](TritonOpBuilder &self, const std::string &scope) -> void {
+             self.create<ttng::FenceOp>(
+                 StringAttr::get(self.getContext(), scope));
            }) // Warp specialize ops
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
