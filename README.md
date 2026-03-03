@@ -172,18 +172,46 @@ triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
 ### Async memory access
 
 
-- `tlx.async_descriptor_load(memdesc, buffer, [offsets], barrier, cache_modifier, eviction_policy, is_volatile)`
+- `tlx.async_descriptor_load(desc, buffer, offsets, barrier, pred=None, cache_modifier="", eviction_policy="", multicast_targets=[])`
 
-   Load a chunk of data from global memory into a local memory buffer. The global address, strides, and buffer size are defined by the memory descriptor. A barrier object is provided and signaled upon completion of the operation.
+   Load a chunk of data from global memory into a local memory buffer using TMA. The global address, strides, and buffer size are defined by the tensor descriptor. A barrier object is provided and signaled upon completion of the operation.
+
+   **Parameters:**
+   - `desc`: Tensor descriptor for the source
+   - `buffer`: Destination buffer in shared memory
+   - `offsets`: List of offsets for each dimension
+   - `barrier`: mbarrier to signal upon completion
+   - `pred`: Optional predicate to guard the load
+   - `cache_modifier`: Cache modifier hint (e.g., `""`, `"evict_first"`)
+   - `eviction_policy`: L2 cache eviction policy (`""`, `"evict_first"`, `"evict_last"`)
+   - `multicast_targets`: Optional list of multicast targets for cluster-wide loads
 
 - `tlx.async_descriptor_prefetch_tensor(memdesc, [offsets], pred, eviction_policy)`
 
    Hint hardware to load a chunk of data from global memory into a L2 cache to prepare for upcoming `async_descriptor_load` operations.
 
+- `tlx.async_descriptor_store(desc, source, offsets, eviction_policy="", store_reduce="")`
 
-- `tlx.async_descriptor_store(memdesc, buffer, [offsets])`
+   Store a chunk of data from shared memory into global memory using TMA. The global address, strides, and buffer size are defined by the tensor descriptor.
 
-   Store a chunk of data from local memory into global memory buffer. The global address, strides, and buffer size are defined by the memory descriptor.
+   Supports optional atomic reduction (`store_reduce`) and L2 cache eviction hints (`eviction_policy`). Both regular stores and atomic reduce stores support cache eviction policies.
+
+   **Parameters:**
+   - `desc`: Tensor descriptor for the destination
+   - `source`: Source buffer in shared memory
+   - `offsets`: List of offsets for each dimension
+   - `eviction_policy`: L2 cache eviction policy (`""`, `"evict_first"`, `"evict_last"`)
+   - `store_reduce`: Atomic reduction kind (`""`, `"add"`, `"min"`, `"max"`, `"and"`, `"or"`, `"xor"`)
+
+   **Example:**
+   ```python
+   # Regular TMA store with L2 evict_first hint
+   tlx.async_descriptor_store(desc_c, c_buf[0], [offs_m, offs_n], eviction_policy="evict_first")
+
+   # TMA atomic reduce-add with L2 evict_first hint
+   tlx.async_descriptor_store(desc_c, c_buf[0], [offs_m, offs_n],
+                              eviction_policy="evict_first", store_reduce="add")
+   ```
 
 
 - `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)`
