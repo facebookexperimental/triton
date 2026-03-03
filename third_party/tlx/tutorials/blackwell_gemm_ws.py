@@ -675,7 +675,7 @@ def _process_tile_epilogue_inner(
             c_smem = c_smem_buffers[0]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
-            tlx.fence_async_shared()
+            tlx.fence("async_shared")
             tlx.async_descriptor_store(c_desc, c_smem, [offs_am_0, offs_bn + slice_id * slice_size])
 
             # Group 1
@@ -686,7 +686,7 @@ def _process_tile_epilogue_inner(
             c_smem = c_smem_buffers[1]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
-            tlx.fence_async_shared()
+            tlx.fence("async_shared")
             tlx.async_descriptor_store(c_desc, c_smem, [offs_am_1, offs_bn + slice_id * slice_size])
     else:
         for group_id in tl.static_range(NUM_MMA_GROUPS):

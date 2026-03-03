@@ -165,7 +165,9 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Commit tcgen05 operations to barrier (Blackwell)"},
 
     // Fence operations
-    {"ttng.fence_async_shared", "tlx.fence_async_shared",
+    {"ttng.fence", "tlx.fence(\"gpu\"|\"sys\")",
+     "GPU or system scope memory fence"},
+    {"ttng.fence_async_shared", "tlx.fence(\"async_shared\")",
      "Memory fence for shared memory ordering"},
 
     // Remote memory operations
