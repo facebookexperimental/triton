@@ -466,6 +466,38 @@ static Value joinLastMemoryUses(OpBuilder &b, Value token) {
       "FIXME: can't hoist TMEM alloc with multiple or conditional uses");
 }
 
+// Walk the SSA def-use chain from `src` to find a BlockArgument of the loop
+// body that carries a multi-dimensional tensor (the accumulator iter_arg).
+// This handles rescaling computation chains where the src goes through
+// convert_layout, reshape, join, mul, split, etc. before reaching the
+// iter_arg.
+static BlockArgument findAccBlockArg(Value src, scf::ForOp forOp) {
+  if (!src)
+    return {};
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  worklist.push_back(src);
+  while (!worklist.empty()) {
+    Value val = worklist.pop_back_val();
+    if (!visited.insert(val).second)
+      continue;
+    if (auto arg = dyn_cast<BlockArgument>(val)) {
+      if (arg.getOwner() == forOp.getBody()) {
+        auto tensorType = dyn_cast<RankedTensorType>(arg.getType());
+        if (tensorType && tensorType.getRank() > 1)
+          return arg;
+      }
+      continue;
+    }
+    Operation *defOp = val.getDefiningOp();
+    if (!defOp || defOp->getParentOp() != forOp)
+      continue;
+    for (Value operand : defOp->getOperands())
+      worklist.push_back(operand);
+  }
+  return {};
+}
+
 ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   OpBuilder builder(alloc);
   builder.setInsertionPoint(forOp);
@@ -492,6 +524,36 @@ ttng::TMEMAllocOp hoistTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp) {
   alloc.erase();
 
   return newAlloc;
+}
+
+// Reuse an existing hoisted TMEM alloc for a consecutive loop that shares
+// the same accumulator. Instead of creating a new TMEM alloc, this carries
+// the existing alloc's token through the new loop and stores the rescaled
+// accumulator into the existing buffer.
+static void reuseHoistedTMEMAlloc(TMEMTokenAllocOp alloc, scf::ForOp &forOp,
+                                  ttng::TMEMAllocOp existingAlloc,
+                                  Value existingToken) {
+  OpBuilder builder(alloc);
+  auto tokType = builder.getType<AsyncTokenType>();
+  auto src = alloc.getSrc();
+
+  // Add existingToken as a new loop-carried iter_arg to carry the TMEM
+  // dependency token from the existing alloc through this loop.
+  builder.setInsertionPoint(forOp);
+  forOp = addIterArgsToLoop(builder, forOp, existingToken);
+  Value newTok = forOp.getRegionIterArgs().back();
+  appendToForOpYield(forOp, joinLastMemoryUses(builder, alloc.getToken()));
+
+  if (src != nullptr) {
+    builder.setInsertionPoint(alloc);
+    Value vTrue = builder.create<arith::ConstantIntOp>(alloc.getLoc(), 1, 1);
+    auto storeOp = builder.create<ttng::TMEMStoreOp>(
+        alloc.getLoc(), tokType, existingAlloc.getResult(), newTok, src, vTrue);
+    newTok = storeOp.getToken();
+  }
+
+  alloc.replaceAllUsesWith(ValueRange{existingAlloc.getResult(), newTok});
+  alloc.erase();
 }
 
 // Hoist invariant tmem_alloc. This could technically be done as general LICM
@@ -541,6 +603,13 @@ struct HoistTMEMAlloc
     if (!hoistOutOfIf) {
       SmallVector<ttng::MMAv5OpInterface> mmaOps;
       m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });
+
+      // Map from a ForOp tensor result to its hoisted TMEM alloc and the
+      // index of the token result in that ForOp. This allows reusing TMEM
+      // allocs across consecutive loops that share accumulators (e.g., the
+      // under-diagonal and diagonal loops in causal Flash Attention).
+      DenseMap<Value, std::pair<ttng::TMEMAllocOp, int>> resultToAlloc;
+
       for (auto mmaOp : mmaOps) {
         auto forOp = dyn_cast<scf::ForOp>(mmaOp->getParentOp());
         if (!forOp) {
@@ -554,7 +623,53 @@ struct HoistTMEMAlloc
         if (!alloc || alloc->getParentRegion() != mmaOp->getParentRegion()) {
           continue;
         }
-        hoistTMEMAlloc(alloc, forOp);
+
+        // Check if we can reuse an existing TMEM alloc from a previous loop.
+        BlockArgument accArg = findAccBlockArg(alloc.getSrc(), forOp);
+        ttng::TMEMAllocOp existingAlloc;
+        Value existingToken;
+        if (accArg) {
+          int argIdx = accArg.getArgNumber() - 1;
+          Value initVal = forOp.getInitArgs()[argIdx];
+          auto it = resultToAlloc.find(initVal);
+          if (it != resultToAlloc.end()) {
+            existingAlloc = it->second.first;
+            int tokIdx = it->second.second;
+            existingToken = initVal.getDefiningOp()->getResult(tokIdx);
+          }
+        }
+
+        // Save and remove any existing map entries for this ForOp's results,
+        // since hoisting replaces the ForOp (invalidating old result Values).
+        SmallVector<std::pair<unsigned, std::pair<ttng::TMEMAllocOp, int>>>
+            savedEntries;
+        for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
+          auto it = resultToAlloc.find(forOp.getResult(i));
+          if (it != resultToAlloc.end()) {
+            savedEntries.push_back({i, it->second});
+            resultToAlloc.erase(it);
+          }
+        }
+
+        ttng::TMEMAllocOp hoistedAlloc;
+        if (existingAlloc) {
+          reuseHoistedTMEMAlloc(alloc, forOp, existingAlloc, existingToken);
+          hoistedAlloc = existingAlloc;
+        } else {
+          hoistedAlloc = hoistTMEMAlloc(alloc, forOp);
+        }
+
+        // Restore saved map entries with the new ForOp's results.
+        for (auto &[resultNum, val] : savedEntries) {
+          resultToAlloc[forOp.getResult(resultNum)] = val;
+        }
+
+        // Record mapping for this accumulator so future loops can reuse it.
+        if (accArg) {
+          int argIdx = accArg.getArgNumber() - 1;
+          int tokResultIdx = forOp.getNumResults() - 1;
+          resultToAlloc[forOp.getResult(argIdx)] = {hoistedAlloc, tokResultIdx};
+        }
       }
     }
 
