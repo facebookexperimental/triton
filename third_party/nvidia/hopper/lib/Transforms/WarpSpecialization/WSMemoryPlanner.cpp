@@ -543,6 +543,12 @@ public:
 
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
+    // Track whether the innermost reuse group requires TMA split copies.
+    // Buffers can share a reuse group only if they all agree on split-copy
+    // status.  Two buffers that both need split copies generate the same
+    // number of barrier arrivals per slot, so sharing is safe.  A mismatch
+    // (one needs split, the other doesn't) would cause over-arrival.
+    bool innermostNeedsSplitCopy = false;
 
     DenseMap<int, Type> idTypes;
     for (auto bufferIter : bufferRange) {
@@ -557,8 +563,10 @@ public:
           ++numD;
       }
       if (usersInInnermostLoop(owner) && numD >= 2) {
+        bool needsSplit = requiresTMASplitCopies(allocDescType);
         if (bufferIdInnermost < 0) {
           bufferIdInnermost = bufferId;
+          innermostNeedsSplitCopy = needsSplit;
           ++bufferId;
         }
         if (idTypes.count(bufferIdInnermost) == 0) {
@@ -566,15 +574,17 @@ public:
         }
         if (idTypes[bufferIdInnermost] != elemType) {
           bufferIdInnermost = bufferId;
+          innermostNeedsSplitCopy = needsSplit;
           idTypes[bufferIdInnermost] = elemType;
           ++bufferId;
         }
         // Buffers requiring TMA split copies get their own unique buffer.id
-        // to avoid sharing a barrier with other buffers. Each split copy
-        // emits a separate barrier_expect/arrive, so sharing would cause
-        // barrier over-arrival (UB per CUDA PTX spec).
+        // ONLY when the existing reuse group has a different split-copy
+        // status.  If both the group and this buffer agree (both need split
+        // or both don't), they can safely share a barrier — each slot sees
+        // the same number of arrivals regardless of which buffer occupies it.
         unsigned assignedId = bufferIdInnermost;
-        if (requiresTMASplitCopies(allocDescType)) {
+        if (needsSplit != innermostNeedsSplitCopy) {
           assignedId = bufferId;
           ++bufferId;
         }
@@ -1230,7 +1240,7 @@ public:
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
-           ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
+           ttng::TMemAllocation(allocSize.numRows, allocSize.numCols)});
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
@@ -1714,6 +1724,8 @@ public:
       // consumer partition of srcAllc vs. producer partition of dstAlloc
       auto *srcCh = allocToChannel[src];
       auto *dstCh = allocToChannel[dst];
+      if (!srcCh || !dstCh)
+        return false;
       if (getAsyncTaskIds(dstCh->getSrcOp()) ==
           getAsyncTaskIds(srcCh->getDstOp()))
         return true;
@@ -1765,6 +1777,8 @@ public:
         // Check dstPartition of alloc with srcPartiton of cand
         auto *srcCh = allocToChannel[alloc->owner];
         auto *dstCh = allocToChannel[cand->owner];
+        if (!srcCh || !dstCh)
+          return false;
         auto dstChPart = getAsyncTaskIds(dstCh->getSrcOp());
         auto srcChPart = getAsyncTaskIds(srcCh->getDstOp());
         LLVM_DEBUG(llvm::dbgs() << "Check partitions\n");
