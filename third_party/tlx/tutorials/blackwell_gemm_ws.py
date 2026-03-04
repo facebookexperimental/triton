@@ -150,7 +150,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "EPILOGUE_SUBTILE": 8,
                     "NUM_CTAS": 1,
                     "SPLIT_K": split_k,
-                    "INTERLEAVE_EPILOGUE": 0,
+                    "INTERLEAVE_EPILOGUE": 1,
                     "ctas_per_cga": None,
                     "pre_hook": matmul_tma_set_block_size_hook,
                 }
@@ -167,7 +167,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "EPILOGUE_SUBTILE": 1,
                     "NUM_CTAS": 1,
                     "SPLIT_K": split_k,
-                    "INTERLEAVE_EPILOGUE": 0,
+                    "INTERLEAVE_EPILOGUE": 1,
                     "ctas_per_cga": None,
                     "pre_hook": matmul_tma_set_block_size_hook,
                 }
@@ -447,8 +447,8 @@ def preprocess_configs(configs, named_args, **kwargs):
         if BLOCK_N % EPILOGUE_SUBTILE != 0:
             continue
 
-        # Interleaved epilogue requires NUM_MMA_GROUPS == 2 and SPLIT_K == 1
-        if INTERLEAVE_EPILOGUE and (NUM_MMA_GROUPS != 2 or SPLIT_K != 1):
+        # Interleaved epilogue requires NUM_MMA_GROUPS == 2
+        if INTERLEAVE_EPILOGUE and NUM_MMA_GROUPS != 2:
             continue
 
         num_tiles_m = math.ceil(M / BLOCK_M)
@@ -631,6 +631,7 @@ def _process_tile_epilogue_inner(
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
 
     slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    STORE_REDUCE: tl.constexpr = "add" if SPLIT_K > 1 else ""
 
     if INTERLEAVE_EPILOGUE:
         # Interleaved TMA stores across two groups to improve memory throughput.
@@ -652,7 +653,13 @@ def _process_tile_epilogue_inner(
         c_smem = c_smem_buffers[0]
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
-        tlx.async_descriptor_store(c_desc, c_smem, [offs_am_0, offs_bn + 0 * slice_size])
+        tlx.async_descriptor_store(
+            c_desc,
+            c_smem,
+            [offs_am_0, offs_bn + 0 * slice_size],
+            store_reduce=STORE_REDUCE,
+            eviction_policy="evict_first",
+        )
 
         # --- Wait for group 1, store group 1 slice 0 ---
         tlx.barrier_wait(tmem_full_bars[buf_idx_1], tmem_read_phase)
@@ -663,7 +670,13 @@ def _process_tile_epilogue_inner(
         c_smem = c_smem_buffers[1]
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
-        tlx.async_descriptor_store(c_desc, c_smem, [offs_am_1, offs_bn + 0 * slice_size])
+        tlx.async_descriptor_store(
+            c_desc,
+            c_smem,
+            [offs_am_1, offs_bn + 0 * slice_size],
+            store_reduce=STORE_REDUCE,
+            eviction_policy="evict_first",
+        )
 
         # --- Slices 1-3: alternate group 0, group 1 ---
         for slice_id in tl.static_range(1, EPILOGUE_SUBTILE):
@@ -676,7 +689,13 @@ def _process_tile_epilogue_inner(
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
             tlx.fence("async_shared")
-            tlx.async_descriptor_store(c_desc, c_smem, [offs_am_0, offs_bn + slice_id * slice_size])
+            tlx.async_descriptor_store(
+                c_desc,
+                c_smem,
+                [offs_am_0, offs_bn + slice_id * slice_size],
+                store_reduce=STORE_REDUCE,
+                eviction_policy="evict_first",
+            )
 
             # Group 1
             acc_sub = tlx.local_slice(acc_tmem_1, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
@@ -687,7 +706,13 @@ def _process_tile_epilogue_inner(
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
             tlx.fence("async_shared")
-            tlx.async_descriptor_store(c_desc, c_smem, [offs_am_1, offs_bn + slice_id * slice_size])
+            tlx.async_descriptor_store(
+                c_desc,
+                c_smem,
+                [offs_am_1, offs_bn + slice_id * slice_size],
+                store_reduce=STORE_REDUCE,
+                eviction_policy="evict_first",
+            )
     else:
         for group_id in tl.static_range(NUM_MMA_GROUPS):
             # Wait for TMEM to be filled
@@ -708,19 +733,17 @@ def _process_tile_epilogue_inner(
                 # Signal MMA consumer after each slice
                 tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
                 c = result.to(tlx.dtype_of(c_desc))
-                if SPLIT_K == 1:
-                    # Store to SMEM then use async TMA store to global
-                    c_smem = c_smem_buffers[group_id]
-                    tlx.async_descriptor_store_wait(0)
-                    tlx.local_store(c_smem, c)
-                    tlx.fence_async_shared()
-                    tlx.async_descriptor_store(c_desc, c_smem, [offs_am, offs_bn + slice_id * slice_size])
-                else:
-                    c_desc.store(
-                        [offs_am, offs_bn + slice_id * slice_size],
-                        c,
-                        store_reduce="add",
-                    )
+                c_smem = c_smem_buffers[group_id]
+                tlx.async_descriptor_store_wait(0)
+                tlx.local_store(c_smem, c)
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(
+                    c_desc,
+                    c_smem,
+                    [offs_am, offs_bn + slice_id * slice_size],
+                    store_reduce=STORE_REDUCE,
+                    eviction_policy="evict_first",
+                )
 
     # Wait for all TMA stores to complete
     tlx.async_descriptor_store_wait(0)
@@ -881,13 +904,15 @@ def _process_tile_producer_inner(
         tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
         offs_am = pid_m * BLOCK_SIZE_M
         tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
-        tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf])
+        tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                  eviction_policy="evict_last")
 
         # Load B once per K iteration (shared across all subtiles)
         last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
         tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
         tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf])
+        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                  eviction_policy="evict_last")
 
         # Load all remaining A subtiles for this K iteration
         for group_id in tl.static_range(1, NUM_MMA_GROUPS):
@@ -898,7 +923,8 @@ def _process_tile_producer_inner(
             offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
 
             tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
-            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf])
+            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                      eviction_policy="evict_last")
 
         smem_accum_cnt += 1
 
