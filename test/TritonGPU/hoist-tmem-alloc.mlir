@@ -393,3 +393,62 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %result1, %token2 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token
   }
 }
+
+// -----
+
+// Test that two consecutive loops sharing an accumulator reuse the same TMEM
+// allocation. This models causal Flash Attention where the under-diagonal loop
+// and diagonal loop share accumulator state with a rescaling step in between.
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @consecutive_loops_reuse_tmem
+  // Only one tmem_alloc should exist (reused across both loops).
+  // CHECK: %[[ACC_TM:.*]], %{{.*}} = ttng.tmem_alloc : ()
+  // CHECK-NOT: ttng.tmem_alloc
+  // Loop 1
+  // CHECK: scf.for
+  // CHECK:   ttng.tc_gen5_mma {{.*}}, {{.*}}, %[[ACC_TM]]
+  // CHECK: }
+  // Loop 2 reuses the same TMEM buffer, no new alloc.
+  // CHECK-NOT: ttng.tmem_alloc
+  // CHECK: scf.for
+  // CHECK:   ttng.tc_gen5_mma {{.*}}, {{.*}}, %[[ACC_TM]]
+  // CHECK: }
+  // CHECK-NOT: ttng.tmem_alloc
+  tt.func public @consecutive_loops_reuse_tmem(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %arg3: i32) -> tensor<128x128xf16, #blocked> {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %cst2 = arith.constant dense<2.000000e+00> : tensor<128x128xf32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    // Loop 1: accumulates into TMEM, yields rescaled acc.
+    %res1 = scf.for %i = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked>)  : i32 {
+      %A = tt.load %A_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %A_sh = ttg.local_alloc %A : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B = tt.load %B_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %B_sh = ttg.local_alloc %B : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc_tm, %acc_tok = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %mma_tok = ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm[%acc_tok], %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_res, %load_tok = ttng.tmem_load %acc_tm[%mma_tok] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      %acc_rescaled = arith.mulf %acc_res, %cst2 : tensor<128x128xf32, #blocked>
+      scf.yield %acc_rescaled : tensor<128x128xf32, #blocked>
+    } {tt.scheduled_max_stage = 3 : i32}
+    // Loop 2: takes loop 1's result as initial acc, accumulates further.
+    %res2 = scf.for %j = %c0_i32 to %arg3 step %c1_i32 iter_args(%acc2 = %res1) -> (tensor<128x128xf32, #blocked>)  : i32 {
+      %A2 = tt.load %A_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %A2_sh = ttg.local_alloc %A2 : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %B2 = tt.load %B_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
+      %B2_sh = ttg.local_alloc %B2 : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
+      %acc2_tm, %acc2_tok = ttng.tmem_alloc %acc2 : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %mma2_tok = ttng.tc_gen5_mma %A2_sh, %B2_sh, %acc2_tm[%acc2_tok], %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc2_res, %load2_tok = ttng.tmem_load %acc2_tm[%mma2_tok] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      %acc2_rescaled = arith.mulf %acc2_res, %cst2 : tensor<128x128xf32, #blocked>
+      scf.yield %acc2_rescaled : tensor<128x128xf32, #blocked>
+    } {tt.scheduled_max_stage = 3 : i32}
+    %res_f16 = arith.truncf %res2 : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
+    tt.return %res_f16 : tensor<128x128xf16, #blocked>
+  }
+}
