@@ -1274,6 +1274,25 @@ getInitialSchedule(scf::ForOp mainLoop,
         }
       }
     }
+
+    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
+    // partition index. These ops initialize accumulators (e.g., zeroing dK/dV)
+    // before the loop. Without explicit assignment, they would get pulled
+    // into the gemm partition via token chains to the in-loop MMA, causing
+    // gemm to require >=4 warps (TMEM ops need 4 warps).
+    // We set the attribute directly rather than using schedule.trySchedule
+    // because pre-loop ops must not be added to the partition's ops list
+    // (optimizeSchedule only handles in-loop ops).
+    if (tmpl->getOptions().hasReduction && reductionPartition) {
+      Builder b(loopOp->getContext());
+      for (Operation &op : *loopOp->getBlock()) {
+        if (&op == loopOp)
+          break;
+        if (isa<ttng::TMEMStoreOp>(op))
+          op.setAttr(kPartitionAttrName,
+                     b.getI32IntegerAttr(reductionPartition->getIndex()));
+      }
+    }
   }
 
   //===--------------------------------------------------------------------===//
