@@ -1283,10 +1283,10 @@ getInitialSchedule(scf::ForOp mainLoop,
     // We set the attribute directly rather than using schedule.trySchedule
     // because pre-loop ops must not be added to the partition's ops list
     // (optimizeSchedule only handles in-loop ops).
-    if (tmpl->getOptions().hasReduction && reductionPartition) {
-      Builder b(loopOp->getContext());
-      for (Operation &op : *loopOp->getBlock()) {
-        if (&op == loopOp)
+    if (reductionPartition) {
+      Builder b(mainLoop->getContext());
+      for (Operation &op : *mainLoop->getBlock()) {
+        if (&op == mainLoop)
           break;
         if (isa<ttng::TMEMStoreOp>(op))
           op.setAttr(kPartitionAttrName,
