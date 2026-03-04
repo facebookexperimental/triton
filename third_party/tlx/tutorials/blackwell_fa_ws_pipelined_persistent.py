@@ -907,7 +907,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                 _, phase = _get_bufidx_phase(i, 1)
                 for cid in tl.static_range(0, NUM_MMA_GROUPS):
                     tlx.barrier_wait(o_fulls[cid], phase)
-                    tlx.fence_async_shared()
+                    tlx.fence("async_shared")
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
                     tlx.async_descriptor_store_wait(0)
@@ -1066,7 +1066,7 @@ def _bwd_compute_inner_loop(
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
         curr_m += step_m
         blk_idx += 1

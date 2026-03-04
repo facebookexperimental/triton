@@ -349,7 +349,10 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                passes.ttgpuir.add_partition_scheduling(pm)
+                if knobs.nvidia.use_meta_partition:
+                    nvidia.passes.hopper.add_partition_scheduling_meta(pm)
+                else:
+                    passes.ttgpuir.add_partition_scheduling(pm)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
@@ -617,6 +620,8 @@ please share the reproducer above with Triton project.
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
         stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
         stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
+        if knobs.runtime.add_stages_inspection_hook is not None:
+            knobs.runtime.add_stages_inspection_hook(self, stages, options, language, capability)
 
     @functools.lru_cache()
     def hash(self):

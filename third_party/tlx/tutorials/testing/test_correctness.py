@@ -63,6 +63,7 @@ class Gemm:
             "EPILOGUE_SUBTILE": 1,
             "NUM_CTAS": 1,
             "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 0,
         },
         "blackwell_gemm_clc": {
             "BLOCK_SIZE_M": 128,

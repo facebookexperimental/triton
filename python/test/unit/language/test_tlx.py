@@ -1294,11 +1294,18 @@ def test_async_dot_blackwell_not_use_d(device):
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma(device):
-    run_async_dot_blackwell_2cta_tma(device, False)  # A in SMEM
-    run_async_dot_blackwell_2cta_tma(device, True)  # A in TMEM
+    run_async_dot_blackwell_2cta_tma(device, False, 256)  # A in SMEM
+    run_async_dot_blackwell_2cta_tma(device, True, 256)  # A in TMEM
+
+    # M=64 per CTA, explicitly unsupported for now
+    # should throw a compilation error for users, but not NE assertion error
+    with pytest.raises(Exception) as e:
+        run_async_dot_blackwell_2cta_tma(device, False, 128)
+    assert isinstance(e.value, triton.CompilationError), "expecting a compilation error"
+    assert 'only supports M=128 per CTA for pair-CTA mma' in e.value.error_message
 
 
-def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
+def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
     """
     Test 2cta collective D = A*B for 1 tile.
     """
@@ -1389,7 +1396,7 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM):
 
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
-    M, N, K = (256, 128, 128)
+    M, N, K = (SAMPLE_M, 128, 128)
     x = torch.randn((M, K), device=device, dtype=torch.float16)
     y = torch.randn((K, N), device=device, dtype=torch.float16)
     z = torch.zeros((M, N), device=device, dtype=torch.float16)
@@ -2798,7 +2805,8 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-def test_descriptor_load(device):
+@pytest.mark.parametrize("use_prefetch", [False, True])
+def test_descriptor_load(use_prefetch, device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
@@ -2806,7 +2814,8 @@ def test_descriptor_load(device):
         return torch.empty(size, dtype=torch.int8, device=device)
 
     @triton.jit
-    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                               USE_PREFETCH: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -2834,9 +2843,11 @@ def test_descriptor_load(device):
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
 
+        if USE_PREFETCH:
+            tlx.async_descriptor_prefetch_tensor(desc_in, [off_m, off_n])
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -2847,11 +2858,95 @@ def test_descriptor_load(device):
     y = torch.empty_like(x)
     grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
-    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                          USE_PREFETCH=use_prefetch)
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_store_wait") == 1
     assert kernel.asm["ttgir"].count("ttng.fence_async_shared") == 1
+    if use_prefetch:
+        assert kernel.asm["ttgir"].count("ttng.async_tma_prefetch") == 1
+        assert kernel.asm["ptx"].count("cp.async.bulk.prefetch.tensor") == 1
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_descriptor_load_prefetch_ws(device):
+    """Test TMA prefetch in a warp-specialized kernel.
+
+    Group 0 (consumer): arrives on smem_empty barrier, pretending it consumed the buffer.
+    Group 1 (producer): prefetches the TMA tensor, waits for smem_empty, then issues the TMA load.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def prefetch_ws_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        smem_full = tlx.alloc_barriers(tl.constexpr(1))
+        smem_full_bar = tlx.local_view(smem_full, 0)
+        smem_empty = tlx.alloc_barriers(tl.constexpr(1))
+        smem_empty_bar = tlx.local_view(smem_empty, 0)
+
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                # Consumer: pretend we consumed the buffer (e.g. through MMA), release smem_empty
+                tlx.barrier_arrive(smem_empty_bar)
+
+                # Wait for producer to fill the buffer
+                tlx.barrier_wait(bar=smem_full_bar, phase=0)
+                tlx.fence_async_shared()
+
+                # Store the result back
+                tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+                tlx.async_descriptor_store_wait(0)
+
+            with tlx.async_task(num_warps=1):
+                # Producer: prefetch, then wait for consumer to release buffer, then load
+                # the descriptor and offsets should be identical to the actual async_descriptor_load
+                tlx.async_descriptor_prefetch_tensor(desc_in, [off_m, off_n])
+
+                tlx.barrier_wait(bar=smem_empty_bar, phase=0)
+
+                tlx.barrier_expect_bytes(smem_full_bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+                tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], smem_full_bar)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = prefetch_ws_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    ttgir = kernel.asm["ttgir"]
+    assert ttgir.count("ttng.async_tma_prefetch") == 1
+    assert ttgir.count("ttng.async_tma_copy_global_to_local") == 1
+    assert kernel.asm["ptx"].count("cp.async.bulk.prefetch.tensor") == 1
     torch.testing.assert_close(x, y)
 
 
@@ -2905,7 +3000,7 @@ def test_descriptor_load_l2_cache_hint(eviction_policy, device):
         # Use eviction_policy parameter for L2 cache hint
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, eviction_policy=EVICTION_POLICY)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -2992,7 +3087,7 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
         # Load without cache hint
         tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         # Store with eviction policy
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], eviction_policy=EVICTION_POLICY)
         tlx.async_descriptor_store_wait(0)
@@ -3027,6 +3122,174 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
 
     # Verify correctness
     torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("store_reduce", ["add", "min", "max"])
+def test_descriptor_store_reduce(store_reduce, device):
+    """Test that TMA stores with atomic reduction generate correct IR and produce correct results."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_reduce_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        STORE_REDUCE: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int32, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 4)
+
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence("async_shared")
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], store_reduce=STORE_REDUCE)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.randint(1, 10, (M, N), dtype=torch.int32, device=device)
+    if store_reduce == "add":
+        y = torch.ones((M, N), dtype=torch.int32, device=device)
+        expected = y + x
+    elif store_reduce == "min":
+        y = torch.full((M, N), 100, dtype=torch.int32, device=device)
+        expected = torch.minimum(y, x)
+    elif store_reduce == "max":
+        y = torch.zeros((M, N), dtype=torch.int32, device=device)
+        expected = torch.maximum(y, x)
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_reduce_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                                  STORE_REDUCE=store_reduce)
+
+    # Verify the TMA reduce is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert "async_tma_reduce" in ttgir
+
+    # Verify PTX output contains the reduce instruction
+    ptx = kernel.asm["ptx"]
+    assert "cp.reduce.async.bulk.tensor" in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(y, expected)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("eviction_policy", ["", "evict_first", "evict_last"])
+def test_descriptor_store_reduce_l2_cache_hint(eviction_policy, device):
+    """Test that TMA store-reduce with L2 cache hint generates correct PTX and produces correct results."""
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_store_reduce_l2_kernel(
+        input_ptr,
+        output_ptr,
+        M,
+        N,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        EVICTION_POLICY: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int32, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 4)
+
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence_async_shared()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n], store_reduce="add",
+                                   eviction_policy=EVICTION_POLICY)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.randint(1, 10, (M, N), dtype=torch.int32, device=device)
+    y = torch.ones((M, N), dtype=torch.int32, device=device)
+    expected = y + x
+    grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    kernel = descriptor_store_reduce_l2_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                                     EVICTION_POLICY=eviction_policy)
+
+    # Verify the TMA reduce is present in IR
+    ttgir = kernel.asm["ttgir"]
+    assert "async_tma_reduce" in ttgir
+    if eviction_policy:
+        assert f"evictionPolicy = {eviction_policy}" in ttgir
+
+    # Verify PTX output
+    ptx = kernel.asm["ptx"]
+    assert "cp.reduce.async.bulk.tensor" in ptx
+    if eviction_policy in ("evict_first", "evict_last"):
+        # Should have L2 cache hint in PTX
+        assert "createpolicy.fractional.L2" in ptx
+        assert "L2::cache_hint" in ptx
+    else:
+        # Normal/default policy should NOT have L2 cache hint
+        assert "createpolicy.fractional.L2" not in ptx
+        assert "L2::cache_hint" not in ptx
+
+    # Verify correctness
+    torch.testing.assert_close(y, expected)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -3082,7 +3345,7 @@ def test_descriptor_load_multicast(device):
             tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
                                       multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
         tlx.barrier_wait(bar=bar, phase=0)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -3642,7 +3905,7 @@ def test_async_tasks_region_error(device):
     with pytest.raises(triton.CompilationError) as e:
         ws_error_kernel[grid]()
     exc_msg = str(e.value)
-    assert "division by zero" in exc_msg, ("\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n")
+    assert "division by zero" in exc_msg, "\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -4723,7 +4986,7 @@ def test_dummy_layout_function_inlining(device):
         # Load from TMEM to registers, then store to SMEM
         reg_data = tlx.local_load(tmem_buffer)
         tlx.local_store(smem_buffer, reg_data)
-        tlx.fence_async_shared()
+        tlx.fence("async_shared")
         tlx.async_descriptor_store(desc, smem_buffer, [offset_m, offset_n])
         tlx.async_descriptor_store_wait(0)
 
@@ -6215,3 +6478,53 @@ def test_async_load_bulk_auto_size(CHUNK_SIZE, device):
 
     # Verify correctness
     torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_fence_gpu(device):
+
+    @triton.jit
+    def fence_gpu_kernel(ptr):
+        tl.atomic_add(ptr, 1)
+        tlx.fence("gpu")
+        tl.atomic_add(ptr + 1, 1)
+
+    x = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = fence_gpu_kernel[(1, )](x, num_warps=1)
+
+    # Verify TTGIR contains the fence op with gpu scope
+    ttgir = kernel.asm["ttgir"]
+    assert 'ttng.fence {scope = "gpu"}' in ttgir
+
+    # Verify PTX contains the correct fence instruction
+    ptx = kernel.asm["ptx"]
+    assert "fence.acq_rel.gpu" in ptx
+
+    # Verify correctness
+    assert x[0].item() == 1
+    assert x[1].item() == 1
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_fence_sys(device):
+
+    @triton.jit
+    def fence_sys_kernel(ptr):
+        tl.atomic_add(ptr, 1)
+        tlx.fence(scope="sys")
+        tl.atomic_add(ptr + 1, 1)
+
+    x = torch.zeros(2, dtype=torch.int32, device=device)
+    kernel = fence_sys_kernel[(1, )](x, num_warps=1)
+
+    # Verify TTGIR contains the fence op with sys scope
+    ttgir = kernel.asm["ttgir"]
+    assert 'ttng.fence {scope = "sys"}' in ttgir
+
+    # Verify PTX contains the correct fence instruction
+    ptx = kernel.asm["ptx"]
+    assert "fence.acq_rel.sys" in ptx
+
+    # Verify correctness
+    assert x[0].item() == 1
+    assert x[1].item() == 1
