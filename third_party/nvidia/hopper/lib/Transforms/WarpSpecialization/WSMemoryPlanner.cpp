@@ -1443,8 +1443,7 @@ public:
   /// Uses bidirectional data dependency via SSA def-use chain walk (primary),
   /// with samePartition fallback for cross-loop buffers where SSA chains may
   /// be broken by loop-carried values.
-  int hasPotentialReuse(BufferT *owner, BufferT *candidate,
-                        Operation *ctrlOp) {
+  int hasPotentialReuse(BufferT *owner, BufferT *candidate, Operation *ctrlOp) {
     // Size check: candidate must fit in owner's columns
     if (candidate->colSize > owner->colSize)
       return 0;
@@ -1465,18 +1464,8 @@ public:
       return false;
     };
 
-    if (!hasDependency()) {
-      // SSA walk didn't find a dependency. For cross-loop buffers, fall
-      // back to partition matching (async task ID comparison) since
-      // loop-carried values break SSA chains.
-      if (!isInSameLoop(owner, ctrlOp)) {
-        if (!samePartition(owner, candidate, 2) &&
-            !samePartition(owner, candidate, 1))
-          return 0;
-      } else {
-        return 0;
-      }
-    }
+    if (!hasDependency())
+      return 0;
 
     // Priority: prefer exact size matches
     if (candidate->colSize == owner->colSize)
@@ -1519,8 +1508,7 @@ public:
 
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
-                   AllocationState &state, size_t maxRows,
-                   Operation *ctrlOp) {
+                   AllocationState &state, size_t maxRows, Operation *ctrlOp) {
     // Base case: all buffers allocated
     if (idx == allocs.size())
       return true;
@@ -2380,13 +2368,11 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     // Apply from outermost to innermost (innermost wins).
     for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
       auto loop = *it;
-      if (auto attr =
-              loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
         effectiveSmemAllocAlgo = attr.getInt();
       if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
         effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
-      if (auto attr =
-              loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+      if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
         effectiveSmemCircularReuse = attr.getValue();
     }
   });
