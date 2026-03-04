@@ -112,6 +112,94 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
   if (isa<RegionBranchOpInterface, ttg::WarpSpecializePartitionsOp>(op))
     return visitRegionInReverse(op);
 
+  // Handle LocalLoadOp to infer smem layout from result encoding
+  if (auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(op)) {
+    LDBG("LocalLoadOp: processing " << *op);
+
+    // Get the result tensor type
+    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+    if (!resultType) {
+      LDBG("LocalLoadOp: result is not RankedTensorType, skipping");
+      return success();
+    }
+
+    auto resultEncoding = resultType.getEncoding();
+    if (!resultEncoding) {
+      LDBG("LocalLoadOp: result has no encoding, skipping");
+      return success();
+    }
+    LDBG("LocalLoadOp: result encoding = " << resultEncoding);
+
+    // Get the source MemDescType
+    auto srcType = dyn_cast<ttg::MemDescType>(localLoadOp.getSrc().getType());
+    if (!srcType) {
+      LDBG("LocalLoadOp: source is not MemDescType, skipping");
+      return success();
+    }
+    LDBG("LocalLoadOp: source type = " << srcType);
+
+    // Compute the shared memory encoding based on the result encoding.
+    // For blocked encoding, use the contiguity and order from the result type
+    // to create a vectorized shared encoding.
+    Attribute sharedEncoding;
+    if (isa<ttg::BlockedEncodingAttr>(resultEncoding)) {
+      LDBG("LocalLoadOp: result has BlockedEncodingAttr");
+
+      auto ctaLayout = ttg::getCTALayout(srcType.getEncoding());
+      auto order = ttg::getOrderForMemory(resultType);
+      unsigned bitWidth = srcType.getElementTypeBitWidth();
+
+      LDBG("LocalLoadOp: order = [" << order[0] << ", " << order[1]
+                                    << "], bitWidth = " << bitWidth);
+
+      // Get the contiguity per thread from the result encoding.
+      // The vector size is the contiguity in the fastest-varying dimension.
+      auto contigPerThread = ttg::getContigPerThread(resultType);
+      LDBG("LocalLoadOp: contigPerThread = [" << contigPerThread[0] << ", "
+                                              << contigPerThread[1] << "]");
+
+      unsigned vecSize = contigPerThread[order[0]];
+      // Limit vector size to 128 bits (max vectorized load size).
+      vecSize = std::min<unsigned>(vecSize, 128 / bitWidth);
+      vecSize = std::max<unsigned>(vecSize, 1);
+
+      LDBG("LocalLoadOp: vecSize = " << vecSize);
+
+      // Compute swizzling parameters to avoid bank conflicts.
+      // Following the pattern from WMMA/MFMA shared encoding computation.
+      constexpr unsigned numBanks = 32;
+      constexpr unsigned bankBitWidth = 32;
+      int64_t innerDimLength = srcType.getShape()[order[0]];
+      int elemsPerOneBanksRow = (numBanks * bankBitWidth) / bitWidth;
+      int perPhase = std::max<int>(1, elemsPerOneBanksRow / innerDimLength);
+      // maxPhase determines how many phases before the pattern repeats.
+      int maxPhase = std::max<int>(1, innerDimLength / vecSize / perPhase);
+
+      LDBG("LocalLoadOp: innerDimLength = "
+           << innerDimLength
+           << ", elemsPerOneBanksRow = " << elemsPerOneBanksRow
+           << ", perPhase = " << perPhase << ", maxPhase = " << maxPhase);
+
+      sharedEncoding = ttg::SwizzledSharedEncodingAttr::get(
+          op->getContext(), vecSize, perPhase, maxPhase, order, ctaLayout);
+
+      LDBG("LocalLoadOp: computed sharedEncoding = " << sharedEncoding);
+    } else {
+      LDBG("LocalLoadOp: result encoding is not BlockedEncodingAttr, skipping");
+    }
+
+    if (sharedEncoding) {
+      const auto layoutEncoding = LayoutEncoding(sharedEncoding);
+      auto operandLattice = operands[0];
+      ChangeResult changed = operandLattice->meet(layoutEncoding);
+      LDBG("LocalLoadOp: propagating layout, changed = "
+           << (changed == ChangeResult::Change ? "true" : "false"));
+      propagateIfChanged(operandLattice, changed);
+      visitWarpSpecRegionArgs(op, localLoadOp.getSrc(), layoutEncoding);
+    }
+    return success();
+  }
+
   // Transpose op needs to be handled specially. When flowing backwards through
   // it, we need to update the layout encoding.
   if (auto memDescTransOp = dyn_cast<ttg::MemDescTransOp>(op)) {
