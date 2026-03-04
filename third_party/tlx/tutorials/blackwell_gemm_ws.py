@@ -381,7 +381,7 @@ def get_cuda_autotune_config():
         for m in [1, 2]
         for subtile in [1, 2, 4, 8]
         for num_ctas in [1, 2]
-        for split_k in [1, 4]
+        for split_k in [1, 2, 3, 4, 5, 6]  # pruning selects one optimal SPLIT_K per tile group
         for interleave in [0, 1]
         for g in [1, 8, 64]
     ]
@@ -442,6 +442,9 @@ def preprocess_configs(configs, named_args, **kwargs):
         # Filter out invalid config that causes wrong hardware MMA
         if BLOCK_M // NUM_MMA_GROUPS > 128:
             continue
+        # Pair-CTA MMA doesn't work with M=64 per MMA group
+        if NUM_CTAS == 2 and BLOCK_M // NUM_MMA_GROUPS == 64:
+            continue
 
         # EPILOGUE_SUBTILE must evenly divide BLOCK_N
         if BLOCK_N % EPILOGUE_SUBTILE != 0:
@@ -490,21 +493,43 @@ def preprocess_configs(configs, named_args, **kwargs):
 
         pruned_configs.append(conf)
 
-    # Prefer configs that maximize SM utilization.
-    # If any config produces enough tiles to fill every SM, discard those
-    # that don't.  Otherwise, keep only configs whose tile count matches the
-    # best available utilization so we don't waste SMs.
+    # Two-level SPLIT_K filter (per tile-size group):
+    #   1. Minimize wave count (fewer waves = less wall-clock time).
+    #   2. Within the same wave count, maximize SPLIT_K (more K-parallelism
+    #      across SMs). E.g. with 148 SMs and 40 base tiles: SPLIT_K=3
+    #      gives 120 tiles (120 SMs active, each does K/3 work) vs SPLIT_K=1
+    #      giving 40 tiles (40 SMs active, each does K/1 work) — both 1 wave,
+    #      but SPLIT_K=3 is faster because work is spread across more SMs.
+    # Applied per (BM, BN, BK) group because different tile sizes have
+    # vastly different compute characteristics.
+    # Note: for saturated shapes, SPLIT_K>1 configs are already pruned by
+    # the base_tiles >= NUM_SMS gate above, so only SPLIT_K=1 survives.
     if pruned_configs:
 
         def _total_tiles(c):
             return (math.ceil(M / c.kwargs["BLOCK_SIZE_M"]) * math.ceil(N / c.kwargs["BLOCK_SIZE_N"]) *
                     c.kwargs.get("SPLIT_K", 1))
 
-        max_tiles = max(_total_tiles(c) for c in pruned_configs)
-        if max_tiles >= NUM_SMS:
-            pruned_configs = [c for c in pruned_configs if _total_tiles(c) >= NUM_SMS]
-        else:
-            pruned_configs = [c for c in pruned_configs if _total_tiles(c) == max_tiles]
+        def _num_waves(c):
+            return math.ceil(_total_tiles(c) / NUM_SMS)
+
+        def _tile_key(c):
+            return (c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"], c.kwargs["BLOCK_SIZE_K"])
+
+        # Group by tile size
+        tile_groups = {}
+        for c in pruned_configs:
+            tile_groups.setdefault(_tile_key(c), []).append(c)
+
+        result = []
+        for group_configs in tile_groups.values():
+            min_waves = min(_num_waves(c) for c in group_configs)
+            best = [c for c in group_configs if _num_waves(c) == min_waves]
+            max_sk = max(c.kwargs.get("SPLIT_K", 1) for c in best)
+            best = [c for c in best if c.kwargs.get("SPLIT_K", 1) == max_sk]
+            result.extend(best)
+
+        pruned_configs = result
 
     # --- Golden Rule: sweep the large dimension, fix the small one ---
     # A[M,K] changes with M; B[K,N] changes with N.
