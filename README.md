@@ -143,6 +143,7 @@ def inspect_stages(_self, stages, options, language, capability):
 triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
 ```
 
+Binary wheels are available for CPython 3.10-3.14.
 
 ### Remote buffer operations
 
