@@ -254,40 +254,69 @@ struct ArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    bool isPerThread = op.getPerThread();
+
     bool isRemoteBarrier = false;
     if (auto barType = dyn_cast<ttg::MemDescType>(op.getAlloc().getType())) {
       isRemoteBarrier =
           isa<ttng::SharedClusterMemorySpaceAttr>(barType.getMemorySpace());
     }
 
-    // TODO: Add phase result as needed.
-    std::stringstream ptxAsm;
-    ptxAsm << "@$0 mbarrier.arrive.shared::";
-    if (isRemoteBarrier)
-      ptxAsm << "cluster";
-    else
-      ptxAsm << "cta";
-    ptxAsm << ".b64 _, [$1]";
-    if (op.getCount() > 1) {
-      ptxAsm << ", " << op.getCount();
+    if (isPerThread) {
+      // Warp arrive: every thread arrives independently, no leader pattern.
+      bool hasPred = !!op.getPred();
+      std::stringstream ptxAsm;
+      if (hasPred) {
+        ptxAsm << "@$0 ";
+      }
+      ptxAsm << "mbarrier.arrive.shared::cta.b64 _, ["
+             << (hasPred ? "$1" : "$0") << "]";
+      if (op.getCount() > 1) {
+        ptxAsm << ", " << op.getCount();
+      }
+      ptxAsm << ";";
+
+      PTXBuilder ptxBuilder;
+      SmallVector<PTXBuilder::Operand *, 2> operands;
+      if (hasPred) {
+        operands.push_back(ptxBuilder.newOperand(adaptor.getPred(), "b"));
+      }
+      operands.push_back(ptxBuilder.newOperand(adaptor.getAlloc(), "r"));
+
+      auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
+      arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
+      auto voidTy = void_ty(getContext());
+      ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
+    } else {
+      // Leader pattern: only thread 0 arrives.
+      std::stringstream ptxAsm;
+      ptxAsm << "@$0 mbarrier.arrive.shared::";
+      if (isRemoteBarrier)
+        ptxAsm << "cluster";
+      else
+        ptxAsm << "cta";
+      ptxAsm << ".b64 _, [$1]";
+      if (op.getCount() > 1) {
+        ptxAsm << ", " << op.getCount();
+      }
+      ptxAsm << ";";
+
+      TritonLLVMOpBuilder b(op.getLoc(), rewriter);
+      Value id = getThreadId(rewriter, op.getLoc());
+      Value pred = b.icmp_eq(id, b.i32_val(0));
+      if (op.getPred())
+        pred = b.and_(pred, adaptor.getPred());
+
+      PTXBuilder ptxBuilder;
+      SmallVector<PTXBuilder::Operand *, 2> operands = {
+          ptxBuilder.newOperand(pred, "b"),
+          ptxBuilder.newOperand(adaptor.getAlloc(), "r")};
+
+      auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
+      arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
+      auto voidTy = void_ty(getContext());
+      ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
     }
-    ptxAsm << ";";
-
-    TritonLLVMOpBuilder b(op.getLoc(), rewriter);
-    Value id = getThreadId(rewriter, op.getLoc());
-    Value pred = b.icmp_eq(id, b.i32_val(0));
-    if (op.getPred())
-      pred = b.and_(pred, adaptor.getPred());
-
-    PTXBuilder ptxBuilder;
-    SmallVector<PTXBuilder::Operand *, 2> operands = {
-        ptxBuilder.newOperand(pred, "b"),
-        ptxBuilder.newOperand(adaptor.getAlloc(), "r")};
-
-    auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
-    arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
-    auto voidTy = void_ty(getContext());
-    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
 
     rewriter.eraseOp(op);
     return success();

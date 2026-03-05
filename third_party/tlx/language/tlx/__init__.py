@@ -2,6 +2,7 @@ from . import compiler
 from .async_task_utils import async_task, async_tasks
 from .barrier import (
     alloc_barriers,
+    alloc_warp_barrier,
     barrier_arrive,
     barrier_expect_bytes,
     barrier_wait,
@@ -138,6 +139,7 @@ __all__ = [
     # barriers
     "cluster_barrier",
     "alloc_barriers",
+    "alloc_warp_barrier",
     "barrier_expect_bytes",
     "barrier_wait",
     "barrier_arrive",
