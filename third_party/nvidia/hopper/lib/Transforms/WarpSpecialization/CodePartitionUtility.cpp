@@ -598,6 +598,119 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
   return -1;
 }
 
+// Check whether there is a dependency chain from the consumer of channel A
+// to the producer of channel B: A.dstOp -> ... -> B.srcOp.
+// We check whether B.srcOp is a transitive user of A.dstOp's result.
+static bool hasDependencyChain(Channel *A, Channel *B) {
+  Operation *aConsumer = A->getDstOp();
+  Operation *bProducer = B->getSrcOp();
+  if (!aConsumer || !bProducer)
+    return false;
+
+  // Walk transitive users of aConsumer's results.
+  DenseSet<Operation *> visited;
+  SmallVector<Operation *> worklist;
+  for (auto result : aConsumer->getResults()) {
+    for (auto *user : result.getUsers())
+      worklist.push_back(user);
+  }
+  while (!worklist.empty()) {
+    auto *op = worklist.pop_back_val();
+    if (!visited.insert(op).second)
+      continue;
+    if (op == bProducer)
+      return true;
+    for (auto result : op->getResults()) {
+      for (auto *user : result.getUsers())
+        worklist.push_back(user);
+    }
+  }
+
+  // Also check program order: if both are in the same block and aConsumer
+  // appears before bProducer, there is an implicit dependency via ordering.
+  if (aConsumer->getBlock() == bProducer->getBlock())
+    return appearsBefore(aConsumer, bProducer);
+
+  return false;
+}
+
+bool verifyReuseGroup2(ReuseGroup *group) {
+  assert(group->channels.size() == 2 &&
+         "verifyReuseGroup2 requires exactly 2 channels");
+  auto *chA = group->channels[0];
+  auto *chB = group->channels[1];
+  assert(chA->getNumBuffers() == 1 && chB->getNumBuffers() == 1 &&
+         "verifyReuseGroup2 requires single-copy buffers");
+
+  bool hasAtoB = hasDependencyChain(chA, chB);
+  bool hasBtoA = hasDependencyChain(chB, chA);
+  LDBG("verifyReuseGroup2: channel " << chA->uniqID << " -> channel "
+                                     << chB->uniqID << ": " << hasAtoB);
+  LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
+                                     << chA->uniqID << ": " << hasBtoA);
+  assert((hasAtoB || hasBtoA) &&
+         "No dependency chain between channels in reuse group");
+  return true;
+}
+
+std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
+  assert(group->channels.size() == 2);
+  auto *chA = group->channels[0];
+  auto *chB = group->channels[1];
+
+  // The early channel is the one whose consumer feeds into the other's
+  // producer. If A.consumer -> B.producer dependency exists, A is early.
+  if (hasDependencyChain(chA, chB))
+    return {chA, chB};
+  assert(hasDependencyChain(chB, chA) &&
+         "No dependency chain found in either direction");
+  return {chB, chA};
+}
+
+bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
+  Operation *earlyProducer = earlyChannel->getSrcOp();
+  Operation *lateConsumer = lateChannel->getDstOp();
+  if (!earlyProducer || !lateConsumer)
+    return true;
+
+  // Get the actual consumer op (e.g., resolve through memdesc_trans).
+  auto actualConsumers = getActualConsumers(lateConsumer);
+
+  auto earlyProducerTasks = getAsyncTaskIds(earlyProducer);
+
+  for (auto *consumer : actualConsumers) {
+    auto consumerTasks = getAsyncTaskIds(consumer);
+    // Check if any task ID is shared between earlyProducer and this consumer.
+    bool samePartition = false;
+    for (auto tid : earlyProducerTasks) {
+      if (std::find(consumerTasks.begin(), consumerTasks.end(), tid) !=
+          consumerTasks.end()) {
+        samePartition = true;
+        break;
+      }
+    }
+    if (!samePartition)
+      continue;
+
+    // Same partition: check if earlyProducer appears before lateConsumer.
+    // If so, partition-internal ordering guarantees that lateConsumer's
+    // consumer_release will happen before earlyProducer's next
+    // producer_acquire.
+    if (earlyProducer->getBlock() == consumer->getBlock() &&
+        appearsBefore(earlyProducer, consumer)) {
+      LDBG("needExplicitReuseWait: no explicit wait needed, "
+           << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
+           << lateChannel->uniqID << " have same-partition ordering");
+      return false;
+    }
+  }
+
+  LDBG("needExplicitReuseWait: explicit wait needed for "
+       << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
+       << lateChannel->uniqID);
+  return true;
+}
+
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
