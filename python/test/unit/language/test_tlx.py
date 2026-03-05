@@ -6529,3 +6529,53 @@ def test_fence_sys(device):
     # Verify correctness
     assert x[0].item() == 1
     assert x[1].item() == 1
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_atomic_add_cga(device):
+    """Test that atomic operations work correctly in CGA (cluster) kernels.
+
+    In a 2-CTA cluster, both CTAs should execute the atomic_add,
+    resulting in a counter value of 2 (one increment per CTA).
+    """
+
+    @triton.heuristics(values={"ctas_per_cga": lambda args: (2, 1, 1)})
+    @triton.jit
+    def atomic_add_cga_kernel(counter_ptr, out_ptr, NUM_CTAS: tl.constexpr):
+        pid = tl.program_id(0)
+        cta_rank = tlx.cluster_cta_rank()
+
+        # Each CTA's thread 0 should atomic_add on the same counter
+        val = tl.atomic_add(counter_ptr, 1, sem="relaxed")
+
+        # Store the returned value and CTA rank for verification
+        tl.store(out_ptr + pid * 2, val)
+        tl.store(out_ptr + pid * 2 + 1, cta_rank)
+
+    grid_size = 2  # 2 CTAs in the cluster
+    counter = torch.zeros(1, dtype=torch.int32, device=device)
+    out = torch.full((grid_size * 2, ), -1, dtype=torch.int32, device=device)
+
+    atomic_add_cga_kernel[(grid_size, )](counter, out, NUM_CTAS=grid_size)
+
+    # Check the results
+    counter_val = counter.item()
+
+    # Each CTA should have executed the atomic, so counter should be 2
+    assert counter_val == grid_size, f"Expected counter={grid_size}, got {counter_val}"
+
+    # Check that both CTAs participated
+    atomic_vals = []
+    cta_ranks = []
+    for i in range(grid_size):
+        atomic_val = out[i * 2].item()
+        cta_rank = out[i * 2 + 1].item()
+        atomic_vals.append(atomic_val)
+        cta_ranks.append(cta_rank)
+
+    # The atomic values should be 0 and 1 (in some order)
+    # showing that both CTAs executed the atomic
+    assert set(atomic_vals) == {0, 1}, f"Expected atomic values {{0, 1}}, got {set(atomic_vals)}"
+
+    # CTA ranks should be 0 and 1
+    assert set(cta_ranks) == {0, 1}, f"Expected CTA ranks {{0, 1}}, got {set(cta_ranks)}"
