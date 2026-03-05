@@ -228,32 +228,46 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       curBlockInfo = funcBlockInfoMap->lookup(callee);
   } else {
     // Intra-function dependencies
-    if (auto memoryEffectOpInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
-      // Explicit buffer
-      SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>>
-          effectInstances;
-      memoryEffectOpInterface.getEffects(effectInstances);
-      for (auto effectInstance : effectInstances) {
-        if (auto value = effectInstance.getValue()) {
-          for (auto bufferId : allocation->getBufferIds(value)) {
-            if (bufferId != Allocation::InvalidBufferId) {
-              auto interval = allocation->getAllocatedInterval(bufferId);
-              interval = narrowIntervalForSubview(value, interval);
-              if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
-                curBlockInfo.syncWriteIntervals[interval].insert(op);
-              else if (isa<MemoryEffects::Read>(effectInstance.getEffect()))
-                curBlockInfo.syncReadIntervals[interval].insert(op);
+    //
+    // For perThread ArriveBarrierOp, skip all SMEM hazard tracking.
+    // mbarrier.arrive has release semantics and mbarrier.wait has acquire
+    // semantics, so no CTA-wide bar.sync is needed before a perThread arrive.
+    // Each thread's program order guarantees its own SMEM ops are visible
+    // before its arrive, and the mbarrier accumulates all arrivals before
+    // releasing the waiter.
+    bool isPerThreadArrive = false;
+    if (auto arriveOp = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op))
+      isPerThreadArrive = arriveOp.getPerThread();
+
+    if (!isPerThreadArrive) {
+      if (auto memoryEffectOpInterface =
+              dyn_cast<MemoryEffectOpInterface>(op)) {
+        // Explicit buffer
+        SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>>
+            effectInstances;
+        memoryEffectOpInterface.getEffects(effectInstances);
+        for (auto effectInstance : effectInstances) {
+          if (auto value = effectInstance.getValue()) {
+            for (auto bufferId : allocation->getBufferIds(value)) {
+              if (bufferId != Allocation::InvalidBufferId) {
+                auto interval = allocation->getAllocatedInterval(bufferId);
+                interval = narrowIntervalForSubview(value, interval);
+                if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
+                  curBlockInfo.syncWriteIntervals[interval].insert(op);
+                else if (isa<MemoryEffects::Read>(effectInstance.getEffect()))
+                  curBlockInfo.syncReadIntervals[interval].insert(op);
+              }
             }
           }
         }
       }
-    }
-    // If this op is may be signalling other threads asynchronously, make sure
-    // all shared memory transactions are complete beforehand.
-    if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
-      Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
-      curBlockInfo.syncWriteIntervals[allIntervals].insert(op);
-      curBlockInfo.syncReadIntervals[allIntervals].insert(op);
+      // If this op may be signalling other threads asynchronously, make sure
+      // all shared memory transactions are complete beforehand.
+      if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
+        Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
+        curBlockInfo.syncWriteIntervals[allIntervals].insert(op);
+        curBlockInfo.syncReadIntervals[allIntervals].insert(op);
+      }
     }
     scratchBufferId = allocation->getBufferId(op);
   }

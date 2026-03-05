@@ -980,6 +980,7 @@ def matmul_kernel_tma_ws_blackwell(
     SPLIT_K: tl.constexpr,
     INTERLEAVE_EPILOGUE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    USE_WARP_BARRIER: tl.constexpr = False,
 ):
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
@@ -1026,8 +1027,14 @@ def matmul_kernel_tma_ws_blackwell(
     A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=EPILOGUE_SUBTILE)
+    if USE_WARP_BARRIER:
+        tmem_full_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=1)
+        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
+                                                 num_arrivals=EPILOGUE_SUBTILE)
+    else:
+        tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+                                             arrive_count=EPILOGUE_SUBTILE)
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
@@ -1197,7 +1204,7 @@ def matmul_kernel_tma_ws_blackwell(
                 tile_id += NUM_SMS
 
 
-def matmul(a, b, config=None, use_heuristic=False):
+def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
     """Matrix multiplication using TLX GEMM kernel.
 
     Args:
@@ -1261,6 +1268,7 @@ def matmul(a, b, config=None, use_heuristic=False):
             N,
             K,
             NUM_SMS=NUM_SMS,
+            USE_WARP_BARRIER=use_warp_barrier,
             ctas_per_cga=ctas_per_cga,
             **config,
         )
@@ -1284,5 +1292,10 @@ def matmul(a, b, config=None, use_heuristic=False):
             N,
             K,
             NUM_SMS=NUM_SMS,
+            USE_WARP_BARRIER=use_warp_barrier,
         )
     return c
+
+
+def matmul_warp_barrier(a, b, config=None, use_heuristic=True):
+    return matmul(a, b, config=config, use_heuristic=use_heuristic, use_warp_barrier=True)

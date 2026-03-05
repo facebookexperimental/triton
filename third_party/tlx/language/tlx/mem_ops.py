@@ -265,7 +265,8 @@ def local_view(
     buffer_idx = _semantic._convert_elem_to_ir_value(buffer_idx, require_i64=False)
     view_handle = _semantic.builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarrier):
-        return tlx.mbarrier(view_handle, 0, local_allocated_buffers.type.layout)
+        return tlx.mbarrier(view_handle, 0, local_allocated_buffers.type.layout,
+                            is_warp_barrier=local_allocated_buffers.is_warp_barrier)
     elif isinstance(local_allocated_buffers, tlx.clc_response):
         return tlx.clc_response(view_handle, 0, local_allocated_buffers.type.layout)
     else:

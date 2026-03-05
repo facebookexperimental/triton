@@ -68,6 +68,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // CHECK-LABEL: arrive_barrier_per_thread
+  tt.func @arrive_barrier_per_thread(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>) {
+    // CHECK-NOT: nvvm.read.ptx.sreg.tid.x
+    // CHECK-NOT: llvm.icmp "eq"
+    // CHECK: "mbarrier.arrive.shared::cta.b64 _, [$0], 2;", "r" %arg0
+    ttng.arrive_barrier %alloc, 2 {perThread} : !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+
   // CHECK-LABEL: arrive_barrier_named
   tt.func @arrive_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
     %c9_i32 = arith.constant 9 : i32

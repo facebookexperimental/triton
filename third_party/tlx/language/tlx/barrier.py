@@ -41,6 +41,47 @@ def alloc_barriers(
 
 
 @tl.builtin
+def alloc_warp_barrier(
+        num_barriers: tl.constexpr,
+        num_warps: tl.constexpr = tl.constexpr(1),
+        num_arrivals: tl.constexpr = tl.constexpr(1),
+        _semantic=None,
+) -> tlx.mbarrier:
+    """
+    Allocates warp barriers where all threads arrive independently.
+
+    Unlike alloc_barriers (where a single leader thread signals the arrive after
+    a warp sync), warp barriers expect every thread to arrive individually. This
+    removes the need for thread synchronization before the arrive, reducing
+    unnecessary syncs and improving performance when there is warp divergence.
+
+    Input:
+    - `num_barriers`: The number of barriers to allocate.
+    - `num_warps`: The number of warps whose threads will arrive at the barrier.
+    - `num_arrivals`: The number of times barrier_arrive is called per phase.
+                      The total arrive count is num_warps * 32 * num_arrivals.
+    """
+
+    arrive_count = num_warps.value * 32 * num_arrivals.value
+    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
+    layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
+        layout.vectorSize,
+        layout.perPhase,
+        layout.maxPhase,
+        layout.order,
+        layout.numCTAsPerCGA,
+        layout.numCTASplit,
+        layout.numCTAOrder,
+    )
+    return tlx.mbarrier(
+        _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count, layout_handle),
+        num_barriers,
+        layout,
+        is_warp_barrier=True,
+    )
+
+
+@tl.builtin
 def barrier_expect_bytes(
     bar: tlx.mbarrier,
     size: tl.constexpr,
@@ -114,7 +155,11 @@ def barrier_arrive(
 
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
-    _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)
+
+    if getattr(bar, 'is_warp_barrier', False):
+        _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value)
+    else:
+        _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)
 
 
 @tl.builtin

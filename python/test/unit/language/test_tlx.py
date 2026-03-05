@@ -1302,7 +1302,7 @@ def test_async_dot_blackwell_2cta_tma(device):
     with pytest.raises(Exception) as e:
         run_async_dot_blackwell_2cta_tma(device, False, 128)
     assert isinstance(e.value, triton.CompilationError), "expecting a compilation error"
-    assert 'only supports M=128 per CTA for pair-CTA mma' in e.value.error_message
+    assert "only supports M=128 per CTA for pair-CTA mma" in e.value.error_message
 
 
 def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
@@ -2701,6 +2701,103 @@ def test_wait_arrive_ws(BLOCK_SIZE, device):
     assert ((ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2)
             and (ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 2)
             and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1)), f"TTGIR {ttgir}"
+
+
+@triton.jit
+def tlx_square_warp_barrier(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    """
+    Warp-specialized kernel demonstrating perThread barrier arrives with SMEM.
+    Producer loads global → stores SMEM → arrives (perThread, no bar.sync).
+    Consumer waits → loads SMEM → computes z=x*x → stores global → arrives.
+
+    This mirrors the GEMM epilogue pattern where local_load from shared memory
+    is followed by barrier_arrive to signal the buffer is consumed.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    # Warp barriers: each thread arrives independently (no leader sync)
+    bars = tlx.alloc_warp_barrier(num_barriers=2, num_warps=NUM_WARPS)
+    b0 = tlx.local_view(bars, 0)
+    b1 = tlx.local_view(bars, 1)
+
+    # Shared memory buffer for producer-consumer data transfer
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    smem = tlx.local_view(buf, 0)
+
+    phase = 0
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+
+            # Producer: load from global, store to SMEM
+            x = tl.load(x_ptr + offsets, mask=mask)
+            tlx.local_store(smem, x)
+            # KEY PATTERN: SMEM write → perThread arrive (no bar.sync)
+            tlx.barrier_arrive(bar=b0)
+
+        with tlx.async_task(num_warps=4):
+            tlx.barrier_wait(bar=b0, phase=phase)
+
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            # Consumer: load from SMEM, compute, store to global
+            data = tlx.local_load(smem)
+            z = data * data
+            tl.store(z_ptr + offsets, z, mask=mask)
+            # KEY PATTERN: SMEM read → perThread arrive (no bar.sync)
+            tlx.barrier_arrive(bar=b0)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("num_warps", [4])
+def test_alloc_warp_barrier(BLOCK_SIZE, num_warps, device):
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    z = torch.empty_like(x)
+    n_elements = x.numel()
+
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = tlx_square_warp_barrier[grid](
+        x,
+        z,
+        n_elements,
+        BLOCK_SIZE,
+        num_warps,
+        num_warps=num_warps,
+    )
+
+    z_ref = x * x
+    torch.testing.assert_close(z, z_ref, check_dtype=False)
+
+    # Verify TTGIR: warp-specialized with perThread arrives
+    ttgir = kernel.asm["ttgir"]
+    assert "perThread" in ttgir, f"Expected perThread attrs in TTGIR:\n{ttgir}"
+    assert "ttng.arrive_barrier" in ttgir, f"Expected arrive_barrier in TTGIR:\n{ttgir}"
+
+    # Verify LLIR: perThread arrives use per-thread lowering (no leader predicate)
+    llir = kernel.asm["llir"]
+    # Per-thread arrive emits unpredicated: mbarrier.arrive.shared::cta.b64 _, [$0]
+    assert "mbarrier.arrive.shared::cta.b64 _, [$0]" in llir, (
+        f"Expected unpredicated per-thread mbarrier.arrive in LLIR:\n{llir}")
+    # Leader pattern would emit predicated: @$0 mbarrier.arrive
+    assert "@$0 mbarrier.arrive" not in llir, f"Unexpected leader-predicated mbarrier.arrive in LLIR:\n{llir}"
+    # No bar.sync immediately before mbarrier.arrive (membar pass should skip
+    # perThread arrives for both full-range and per-buffer SMEM hazards).
+    # Other bar.sync may exist (e.g. before wait_barrier) — that's fine.
+
+    assert not re.search(r"barrier\.cta\.sync.*\n.*mbarrier\.arrive",
+                         llir), (f"Unexpected bar.sync before mbarrier.arrive in LLIR:\n{llir}")
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -6383,13 +6480,13 @@ def test_async_bulk_copy_roundtrip(CHUNK_SIZE, device):
     ttgir = kernel.asm["ttgir"]
     assert "ttg.async_copy_global_to_local" in ttgir, "Expected async_copy_global_to_local in TTGIR"
     assert "useBulk = true" in ttgir, "Expected useBulk = true in TTGIR"
-    assert "ttng.async_store" in ttgir, ("Expected async_store in TTGIR")
+    assert "ttng.async_store" in ttgir, "Expected async_store in TTGIR"
 
     # Verify PTX contains the bulk copy instructions
     ptx = kernel.asm["ptx"]
     assert "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes" in ptx, (
         "Expected cp.async.bulk gmem->smem in PTX")
-    assert "cp.async.bulk.global.shared::cta.bulk_group" in ptx, ("Expected cp.async.bulk smem->gmem in PTX")
+    assert "cp.async.bulk.global.shared::cta.bulk_group" in ptx, "Expected cp.async.bulk smem->gmem in PTX"
 
     # Verify correctness
     torch.testing.assert_close(src, dst)

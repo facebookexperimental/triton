@@ -7,7 +7,9 @@ import triton
 from triton.language.extra.tlx.tutorials.hopper_gemm_pipelined import (
     matmul as _matmul_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
-    matmul as _matmul_ws, )
+    matmul as _matmul_ws,
+    matmul_warp_barrier as _matmul_ws_warp_barrier,
+)
 
 from triton._internal_testing import is_hopper
 
@@ -16,6 +18,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 MATMUL_METHODS = {
     "pipelined": _matmul_pipelined,
     "ws": _matmul_ws,
+    "ws_warp_barrier": _matmul_ws_warp_barrier,
 }
 
 ref_lib = "cuBLAS"
@@ -65,13 +68,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
+        nargs="+",
         choices=list(MATMUL_METHODS.keys()),
-        help=f"Run only the specified version. Choices: {list(MATMUL_METHODS.keys())}",
+        help=f"Run only the specified version(s). Choices: {list(MATMUL_METHODS.keys())}",
     )
     args = parser.parse_args()
 
     if is_hopper():
-        versions = [args.version] if args.version else list(MATMUL_METHODS.keys())
+        versions = args.version if args.version else list(MATMUL_METHODS.keys())
         print(f"Running benchmarks for: {versions}")
         benchmark = create_benchmark(versions)
         benchmark.run(print_data=True)

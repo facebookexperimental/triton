@@ -320,6 +320,12 @@ void init_triton_tlx_ir(py::module &&m) {
           [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
             self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
           })
+      .def("create_warp_barrier_arrive",
+           [](TritonOpBuilder &self, Value mbarrierLoc,
+              int arriveCount) -> void {
+             self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
+                                                /*perThread=*/true);
+           })
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);

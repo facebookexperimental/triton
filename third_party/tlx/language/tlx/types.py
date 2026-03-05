@@ -863,12 +863,14 @@ class mbarrier(tl.base_value):
         num: int,
         layout: Optional[swizzled_shared_layout_encoding],
         storage: storage_kind = storage_kind.smem,
+        is_warp_barrier: bool = False,
     ):
         assert storage == storage_kind.smem or storage == storage_kind.smemCluster, (
             "mbarrier requires storage to be smem or smemCluster")
         self.handle = handle
-        self.type = mbarrier_type(num, layout, storage)
+        self.type = mbarrier_type(num, layout, storage, is_warp_barrier)
         self.num = num
+        self.is_warp_barrier = is_warp_barrier
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
@@ -883,11 +885,13 @@ class mbarrier(tl.base_value):
 
 class mbarrier_type(buffered_tensor_type):
 
-    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage):
+    def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding], storage,
+                 is_warp_barrier: bool = False):
         super().__init__(tl.int64, [1], num, storage, layout)
+        self.is_warp_barrier = is_warp_barrier
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
-        value = mbarrier(handles[cursor], self.num, self.layout, self.storage)
+        value = mbarrier(handles[cursor], self.num, self.layout, self.storage, is_warp_barrier=self.is_warp_barrier)
         return value, cursor + 1
 
     def to_ir(self, builder: ir.builder) -> None:

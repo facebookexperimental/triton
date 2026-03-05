@@ -5,9 +5,13 @@ import torch
 import triton
 
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
-    matmul as _blackwell_gemm_ws, )
+    matmul as _blackwell_gemm_ws,
+    matmul_warp_barrier as _blackwell_gemm_ws_warp_barrier,
+)
 from triton.language.extra.tlx.tutorials.blackwell_gemm_clc import (
-    matmul as _blackwell_gemm_clc, )
+    matmul as _blackwell_gemm_clc,
+    matmul_warp_barrier as _blackwell_gemm_clc_warp_barrier,
+)
 from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
     matmul as _blackwell_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
@@ -27,7 +31,9 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws import (
 from triton.language.extra.tlx.tutorials.hopper_gemm_pipelined import (
     matmul as _hopper_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
-    matmul as _hopper_gemm_ws, )
+    matmul as _hopper_gemm_ws,
+    matmul_warp_barrier as _hopper_gemm_ws_warp_barrier,
+)
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
     attention as _hopper_fa_ws_pipelined_pingpong_persistent, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
@@ -233,6 +239,18 @@ def test_blackwell_gemm_clc(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_warp_barrier(dtype):
+    Gemm.run_test(_blackwell_gemm_ws_warp_barrier, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_clc_warp_barrier(dtype):
+    Gemm.run_test(_blackwell_gemm_clc_warp_barrier, Gemm.CONFIGS["blackwell_gemm_clc"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_pipelined(dtype):
     Gemm.run_test(_blackwell_gemm_pipelined, Gemm.CONFIGS["blackwell_gemm_pipelined"], dtype=dtype)
 
@@ -339,6 +357,11 @@ def test_hopper_gemm_pipelined():
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
 def test_hopper_gemm_ws():
     Gemm.run_test(_hopper_gemm_ws, Gemm.CONFIGS["hopper_gemm_ws"])
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
+def test_hopper_gemm_ws_warp_barrier():
+    Gemm.run_test(_hopper_gemm_ws_warp_barrier, Gemm.CONFIGS["hopper_gemm_ws"])
 
 
 # =============================================================================
