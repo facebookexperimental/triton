@@ -212,7 +212,7 @@ def matmul(a, b, config=None, use_warp_barrier=False):
     triton.set_allocator(alloc_fn)
 
     (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
-    c = torch.zeros(
+    c = torch.empty(
         (M, N),
         dtype=torch.float16,
         device=DEVICE,
