@@ -69,6 +69,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                  NUM_BUFFERS_KV: tl.constexpr,  #
                  NUM_BUFFERS_QK: tl.constexpr,  #
                  NUM_MMA_GROUPS: tl.constexpr,  #
+                 USE_WARP_BARRIER: tl.constexpr = False,  #
                  ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
@@ -119,13 +120,20 @@ def _attn_fwd_ws(sm_scale, M,  #
                                 tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
-    p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
-    acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
 
-    alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
-    alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
-    l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    if USE_WARP_BARRIER:
+        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK, num_warps=4)
+        acc_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK, num_warps=4)
+        alpha_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK, num_warps=4)
+        alpha_empties = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK, num_warps=4)
+        l_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+    else:
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
+        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
+        alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
+        alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_QK)
+        l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     with tlx.async_tasks():
         # correction group
@@ -334,7 +342,7 @@ def _attn_fwd_ws(sm_scale, M,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale):
+    def forward(ctx, q, k, v, sm_scale, use_warp_barrier=False):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -378,6 +386,7 @@ class _attention(torch.autograd.Function):
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+            USE_WARP_BARRIER=use_warp_barrier,  #
             **extra_kern_args,
         )
 
@@ -387,9 +396,9 @@ class _attention(torch.autograd.Function):
         return o
 
 
-def attention(q, k, v, sm_scale, config=None):
+def attention(q, k, v, sm_scale, config=None, use_warp_barrier=False):
     if config is None:
-        return _attention.apply(q, k, v, sm_scale)
+        return _attention.apply(q, k, v, sm_scale, use_warp_barrier)
 
     # Non-autotuned path with explicit config
     HEAD_DIM_K = q.shape[-1]
@@ -436,6 +445,11 @@ def attention(q, k, v, sm_scale, config=None):
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+        USE_WARP_BARRIER=use_warp_barrier,
         **config,
     )
     return o
+
+
+def attention_warp_barrier(q, k, v, sm_scale):
+    return attention(q, k, v, sm_scale, use_warp_barrier=True)
