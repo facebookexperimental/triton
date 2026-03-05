@@ -1073,6 +1073,211 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, subsliceType, alloc, offset);
 }
 
+// -- SubtiledRegionOp --
+LogicalResult SubtiledRegionOp::verify() {
+  // 1. Setup region terminates with SubtiledRegionYieldOp
+  auto &setupBlock = getSetupRegion().front();
+  if (!isa<SubtiledRegionYieldOp>(setupBlock.getTerminator()))
+    return emitOpError("setup region must terminate with "
+                       "'ttng.subtiled_region_yield'");
+
+  // 2. Tile region terminates with SubtiledRegionReturnOp
+  auto &tileBlock = getTileRegion().front();
+  if (!isa<SubtiledRegionReturnOp>(tileBlock.getTerminator()))
+    return emitOpError("tile region must terminate with "
+                       "'ttng.subtiled_region_return'");
+
+  auto yieldOp = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
+  unsigned numSetupOutputs = yieldOp.getResults().size();
+  unsigned numTileArgs = tileBlock.getNumArguments();
+
+  // 3. tileMappings is non-empty
+  ArrayAttr tileMappings = getTileMappings();
+  if (tileMappings.empty())
+    return emitOpError("tileMappings must have at least one tile");
+
+  // 4-6. Validate each tile mapping
+  for (auto [i, mapping] : llvm::enumerate(tileMappings)) {
+    auto indices = dyn_cast<DenseI32ArrayAttr>(mapping);
+    if (!indices)
+      return emitOpError("tileMappings[")
+             << i << "] must be a DenseI32ArrayAttr";
+
+    // 4. Inner array length = number of tile block args
+    if (static_cast<unsigned>(indices.size()) != numTileArgs)
+      return emitOpError("tileMappings[") << i << "] has " << indices.size()
+                                          << " entries but tile region has "
+                                          << numTileArgs << " block arguments";
+
+    for (auto [j, idx] : llvm::enumerate(indices.asArrayRef())) {
+      // 5. Indices in range
+      if (idx < 0 || static_cast<unsigned>(idx) >= numSetupOutputs)
+        return emitOpError("tileMappings[")
+               << i << "][" << j << "] = " << idx << " is out of range [0, "
+               << numSetupOutputs << ")";
+
+      // 6. Types match
+      Type setupType = yieldOp.getResults()[idx].getType();
+      Type tileArgType = tileBlock.getArgument(j).getType();
+      if (setupType != tileArgType)
+        return emitOpError("type mismatch: setup output ")
+               << idx << " has type " << setupType << " but tile block arg "
+               << j << " has type " << tileArgType;
+    }
+  }
+
+  // 7-8. Validate barrier annotations
+  unsigned numBarriers = getBarriers().size();
+  unsigned numPhases = getBarrierPhases().size();
+  for (auto [i, attr] : llvm::enumerate(getBarrierAnnotations())) {
+    auto annotation = dyn_cast<BarrierAnnotationAttr>(attr);
+    if (!annotation)
+      return emitOpError("barrierAnnotations[")
+             << i << "] must be a BarrierAnnotationAttr";
+
+    // 7. barrierIdx in range
+    if (annotation.getBarrierIdx() >= numBarriers)
+      return emitOpError("barrierAnnotations[")
+             << i << "] has barrierIdx=" << annotation.getBarrierIdx()
+             << " but there are only " << numBarriers << " barriers";
+
+    // 8. For wait_barrier, check phase exists
+    if (annotation.getBarrierOpKind().getValue() == "wait_barrier") {
+      if (annotation.getBarrierIdx() >= numPhases)
+        return emitOpError("barrierAnnotations[")
+               << i << "] is a wait_barrier with barrierIdx="
+               << annotation.getBarrierIdx() << " but there are only "
+               << numPhases << " phases";
+    }
+
+    // Validate barrierOpKind is one of the known values
+    StringRef kind = annotation.getBarrierOpKind().getValue();
+    if (kind != "wait_barrier" && kind != "arrive_barrier")
+      return emitOpError("barrierAnnotations[")
+             << i << "] has unknown barrierOpKind '" << kind << "'";
+  }
+
+  return success();
+}
+
+void SubtiledRegionOp::print(OpAsmPrinter &p) {
+  // Print barriers
+  if (!getBarriers().empty()) {
+    p << " barriers(";
+    llvm::interleaveComma(getBarriers(), p,
+                          [&](Value v) { p.printOperand(v); });
+    p << " : ";
+    llvm::interleaveComma(getBarriers().getTypes(), p,
+                          [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+
+  // Print phases
+  if (!getBarrierPhases().empty()) {
+    p << " phases(";
+    llvm::interleaveComma(getBarrierPhases(), p,
+                          [&](Value v) { p.printOperand(v); });
+    p << " : ";
+    llvm::interleaveComma(getBarrierPhases().getTypes(), p,
+                          [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+
+  // Print tileMappings
+  p << " tile_mappings = ";
+  p.printAttribute(getTileMappings());
+
+  // Print barrierAnnotations
+  p << " barrier_annotations = ";
+  p.printAttribute(getBarrierAnnotations());
+
+  // Print attr-dict (excluding our custom attrs and operand segment sizes)
+  p.printOptionalAttrDict(
+      (*this)->getAttrs(),
+      {"tileMappings", "barrierAnnotations", getOperandSegmentSizeAttr()});
+
+  // Print setup region
+  p << " setup ";
+  p.printRegion(getSetupRegion(), /*printEntryBlockArgs=*/false);
+
+  // Print tile region with block args
+  p << " tile";
+  p.printRegion(getTileRegion(), /*printEntryBlockArgs=*/true);
+}
+
+ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  SmallVector<OpAsmParser::UnresolvedOperand> barrierOperands;
+  SmallVector<Type> barrierTypes;
+  SmallVector<OpAsmParser::UnresolvedOperand> phaseOperands;
+  SmallVector<Type> phaseTypes;
+
+  // Parse optional barriers(...)
+  if (succeeded(parser.parseOptionalKeyword("barriers"))) {
+    if (parser.parseLParen() || parser.parseOperandList(barrierOperands) ||
+        parser.parseColonTypeList(barrierTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  // Parse optional phases(...)
+  if (succeeded(parser.parseOptionalKeyword("phases"))) {
+    if (parser.parseLParen() || parser.parseOperandList(phaseOperands) ||
+        parser.parseColonTypeList(phaseTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  // Parse tile_mappings = <attr>
+  Attribute tileMappingsAttr;
+  if (parser.parseKeyword("tile_mappings") || parser.parseEqual() ||
+      parser.parseAttribute(tileMappingsAttr))
+    return failure();
+  result.addAttribute("tileMappings", tileMappingsAttr);
+
+  // Parse barrier_annotations = <attr>
+  Attribute barrierAnnotationsAttr;
+  if (parser.parseKeyword("barrier_annotations") || parser.parseEqual() ||
+      parser.parseAttribute(barrierAnnotationsAttr))
+    return failure();
+  result.addAttribute("barrierAnnotations", barrierAnnotationsAttr);
+
+  // Parse optional attr-dict
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperands(barrierOperands, barrierTypes,
+                             parser.getCurrentLocation(), result.operands) ||
+      parser.resolveOperands(phaseOperands, phaseTypes,
+                             parser.getCurrentLocation(), result.operands))
+    return failure();
+
+  // Set operand segment sizes
+  result.addAttribute(SubtiledRegionOp::getOperandSegmentSizeAttr(),
+                      parser.getBuilder().getDenseI32ArrayAttr(
+                          {static_cast<int32_t>(barrierOperands.size()),
+                           static_cast<int32_t>(phaseOperands.size())}));
+
+  // Parse setup region
+  if (parser.parseKeyword("setup"))
+    return failure();
+  Region *setupRegion = result.addRegion();
+  if (parser.parseRegion(*setupRegion))
+    return failure();
+
+  // Parse tile region with block arguments
+  if (parser.parseKeyword("tile"))
+    return failure();
+  SmallVector<OpAsmParser::Argument> tileArgs;
+  if (parser.parseArgumentList(tileArgs, OpAsmParser::Delimiter::Paren,
+                               /*allowType=*/true))
+    return failure();
+  Region *tileRegion = result.addRegion();
+  if (parser.parseRegion(*tileRegion, tileArgs))
+    return failure();
+
+  return success();
+}
+
 // -- TensormapCreateOp --
 LogicalResult TensormapCreateOp::verify() {
   auto rank = getBoxDim().size();

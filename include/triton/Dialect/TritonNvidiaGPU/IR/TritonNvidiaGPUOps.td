@@ -37,6 +37,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td" // ReturnLike
 
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
 def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
@@ -1116,6 +1117,90 @@ def TTNG_PrefetchTensormapOp: TTNG_Op<
   let assemblyFormat = [{
     $desc attr-dict `:` qualified(type($desc))
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// SubtiledRegionOp
+//===----------------------------------------------------------------------===//
+
+def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
+    RecursiveMemoryEffects,
+    AttrSizedOperandSegments
+]> {
+  let summary = "Encapsulates a subtiling pattern for epilogue operations";
+
+  let description = [{
+    The `ttng.subtiled_region` operation explicitly represents a subtiling
+    pattern where a large tile is split into subtiles processed sequentially.
+    This gives the compiler a structured way to reason about per-tile operations
+    and barrier placement.
+
+    The op has two regions:
+    - `setupRegion`: computes subtile values (e.g. tmem_subslice + tmem_load,
+      constants). Terminated by `subtiled_region_yield`.
+    - `tileRegion`: per-tile body that is replicated during lowering. Block
+      arguments are substituted from setup outputs via `tileMappings`.
+      Terminated by `subtiled_region_return`.
+
+    `tileMappings` is an array of arrays: one per tile, each entry is an index
+    into the setup yield values. The length of each inner array must equal the
+    number of tile block arguments.
+
+    `barrierAnnotations` describes where to insert barrier operations during
+    lowering, relative to the first or last tile.
+  }];
+
+  let arguments = (ins
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I32>:$barrierPhases,
+    ArrayAttr:$tileMappings,
+    ArrayAttr:$barrierAnnotations
+  );
+
+  let regions = (region
+    SizedRegion<1>:$setupRegion,
+    SizedRegion<1>:$tileRegion
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// SubtiledRegionYieldOp
+//===----------------------------------------------------------------------===//
+
+def TTNG_SubtiledRegionYieldOp : TTNG_Op<"subtiled_region_yield", [
+    Pure, Terminator, ReturnLike,
+    ParentOneOf<["SubtiledRegionOp"]>
+]> {
+  let summary = "Yield values from the setup region of subtiled_region";
+
+  let description = [{
+    Terminates the setup region of a `subtiled_region` op. The yielded values
+    are referenced by the tile mappings to provide arguments to each tile
+    replication.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$results);
+  let assemblyFormat = "($results^ `:` type($results))? attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// SubtiledRegionReturnOp
+//===----------------------------------------------------------------------===//
+
+def TTNG_SubtiledRegionReturnOp : TTNG_Op<"subtiled_region_return", [
+    Pure, Terminator, ReturnLike,
+    ParentOneOf<["SubtiledRegionOp"]>
+]> {
+  let summary = "Terminate the tile region of subtiled_region";
+
+  let description = [{
+    Terminates the tile region of a `subtiled_region` op. Takes no operands.
+  }];
+
+  let assemblyFormat = "attr-dict";
 }
 
 #endif
