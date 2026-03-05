@@ -69,6 +69,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                          NUM_MMA_WARPS: tl.constexpr,  #
                          NUM_MMA_GROUPS: tl.constexpr,  #
                          EPILOGUE_SUBTILE: tl.constexpr,  #
+                         USE_WARP_BARRIER: tl.constexpr = False,  #
                          ):
     # Descriptor
     BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
@@ -82,9 +83,13 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
     # Need NUM_STAGES sets of mbarriers for A and B
     # where each set contains two for A and one for B.
     # Do the above for both empty states and full states respectively.
-    bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
+    if USE_WARP_BARRIER:
+        bars_empty_a = tlx.alloc_warp_barrier(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, num_warps=4)
+        bars_empty_b = tlx.alloc_warp_barrier(num_barriers=NUM_STAGES, num_warps=4, num_arrivals=NUM_MMA_GROUPS)
+    else:
+        bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
+        bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS)
     bars_full_a = tlx.alloc_barriers(num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
-    bars_empty_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS)
     bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
 
     # Warp specilization
@@ -198,7 +203,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 c_desc.store([offset_cm, offset_bn], acc.to(tlx.dtype_of(c_desc)))  # noqa
 
 
-def matmul(a, b, config=None):
+def matmul(a, b, config=None, use_warp_barrier=False):
     """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
@@ -253,6 +258,7 @@ def matmul(a, b, config=None):
             M,
             N,
             K,
+            USE_WARP_BARRIER=use_warp_barrier,
             **config,
         )
     else:
@@ -265,5 +271,10 @@ def matmul(a, b, config=None):
             M,
             N,
             K,
+            USE_WARP_BARRIER=use_warp_barrier,
         )
     return c
+
+
+def matmul_warp_barrier(a, b, config=None):
+    return matmul(a, b, config=config, use_warp_barrier=True)
