@@ -670,9 +670,10 @@ def _attn_bwd_dkdv_inner(
     dk += tl.dot(dsT, tl.trans(qT))
     dq = tl.dot(tl.trans(dsT), k)
     dqs = _split_n(dq, EPILOGUE_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dqN = dqs[slice_id] * LN2
-        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), 0], dqN)
+        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dqN)
     curr_m += step_m
     return dk, dv, curr_m
 
@@ -887,10 +888,11 @@ def _attn_bwd_core(
     )
 
     dvs = _split_n(dv, EPILOGUE_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dvN = dvs[slice_id]
         desc_dv.store(
-            [(off_bh + start_n).to(tl.int32), 0],
+            [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
             dvN.to(dtype),
         )
 
@@ -898,7 +900,7 @@ def _attn_bwd_core(
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dkN = dks[slice_id] * sm_scale
         desc_dk.store(
-            [(off_bh + start_n).to(tl.int32), 0],
+            [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
             dkN.to(dtype),
         )
 
@@ -1188,7 +1190,7 @@ class _attention_opt(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 128
             else:
                 extra_kern_args["maxnreg"] = 128
-        if persistent:
+        if True:  #persistent:
             _attn_fwd_persist[grid_persist](
                 sm_scale,
                 M,  #
@@ -1491,7 +1493,7 @@ BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:
-    for baseVariant in ["ws"]: #"ws", "ws_persistent"]:
+    for baseVariant in ["ws"]:  #"ws", "ws_persistent"]:
         for mode in ["bwd"]:
             configs.append(
                 triton.testing.Benchmark(
