@@ -55,7 +55,7 @@ Value maybeAnd(RewriterBase &rewriter, Location loc, Value a, Value b) {
 Value emitRedundantThreadPredicate(
     const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
     ConversionPatternRewriter &rewriter, Location loc,
-    const NVIDIA::TargetInfo &targetInfo) {
+    const NVIDIA::TargetInfo &targetInfo, Operation *op) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto ctx = rewriter.getContext();
   auto kLane = str_attr("lane");
@@ -64,7 +64,22 @@ Value emitRedundantThreadPredicate(
 
   Value zero = b.i32_val(0);
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-  Value blockId = freeVarMasks.lookup(kBlock) == 0
+
+  // In TLX clustered kernels, always use zero for blockId instead of cluster
+  // CTA ID This ensures operations execute based on the CTA-local thread ID,
+  // not cluster position
+  bool isClusteredKernel = false;
+  if (op) {
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    if (moduleOp) {
+      const SmallVector<int> clusterDims =
+          triton::gpu::TritonGPUDialect::getClusterDims(moduleOp);
+      isClusteredKernel =
+          llvm::any_of(clusterDims, [](int dim) { return dim > 1; });
+    }
+  }
+
+  Value blockId = (freeVarMasks.lookup(kBlock) == 0 || isClusteredKernel)
                       ? zero
                       : targetInfo.getClusterCTAId(rewriter, loc);
 
@@ -466,8 +481,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     const size_t valueElemNBits = dtsize * 8;
 
     auto freeVarMasks = getFreeVariableMasks(ptr.getType());
-    Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+    Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
+                                                    targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
 
     const int numVecs = elemsPerThread / vec;
@@ -612,8 +627,8 @@ struct AtomicCASOpConversion
     auto valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
     auto elemsPerThread = getTotalElemsPerThread(op.getVal().getType());
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
-    Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+    Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
+                                                    targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
 
     SmallVector<Value> resultVals(elemsPerThread);
@@ -811,8 +826,8 @@ public:
                        << " numElems = " << numElems;
 
     auto freeVarMasks = getFreeVariableMasks(ptr.getType());
-    Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+    Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
+                                                    targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
 
     auto packedTy = vec_ty(valueElemTy, packed);
@@ -1250,8 +1265,8 @@ struct AsyncCopyGlobalToLocalOpConversion
     // is available in each CTAs respective shared memory. Otherwise, we would
     // need an additional broadcast step to copy the data between CTAs.
     freeVarMasks[str_attr("block")] = 0;
-    Value threadPred =
-        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+    Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
+                                                    targetInfo, op);
 
     auto emitCpAsync = [&b, threadPred, ptrTy, hasMask = bool(llMask)](
                            RewriterBase &rewriter, Location loc,
