@@ -2763,6 +2763,46 @@ void insertAsyncComm(
         producerAcquireForChannelLoop = bwdCh->getDstOp();
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
+
+    // 2-buffer reuse group handling: determine if producer_acquire needs to
+    // be moved for correct synchronization across reused buffers.
+    // Use reuseBarrier=false to find reuse groups even with single-copy
+    // buffers.
+    int reuseGrp2 = channelInReuseGroup(masterChannel, config,
+                                        /*reuseBarrier=*/false);
+    if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
+      auto *group = config->getGroup(reuseGrp2);
+      if (group->channels.size() == 2 && verifyReuseGroup2(group)) {
+        auto [earlyChannel, lateChannel] = orderReuseGroup2(group);
+        if (masterChannel == lateChannel &&
+            needExplicitReuseWait(earlyChannel, lateChannel)) {
+          // Move the late buffer's producer_acquire to before the early
+          // buffer's producer so that the shared token ensures the late
+          // buffer's consumer_release completes before the early buffer is
+          // overwritten. The early channel's producer must be in the same
+          // block and appear before the late channel's head producer.
+          // Additionally, the late channel's consumer must be in the same
+          // block as the early channel's producer — otherwise they are in
+          // different partitions and the reuse ordering is already handled
+          // implicitly (e.g., in the FWD persistent kernel where the
+          // tmem_store and MMA are in separate task partitions).
+          auto *earlyProducer = earlyChannel->getSrcOp();
+          auto *lateConsumer = lateChannel->getDstOp();
+          if (earlyProducer->getBlock() == headProducer->getBlock() &&
+              lateConsumer->getBlock() == earlyProducer->getBlock() &&
+              appearsBefore(earlyProducer, headProducer)) {
+            producerAcquireForChannelLoop = earlyProducer;
+            LLVM_DEBUG({
+              LDBG("reuse group: move producer_acquire for late channel "
+                   << masterChannel->uniqID << " before early channel "
+                   << earlyChannel->uniqID << " producer");
+              producerAcquireForChannelLoop->dump();
+            });
+          }
+        }
+      }
+    }
+
     builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index

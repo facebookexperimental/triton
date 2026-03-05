@@ -639,8 +639,10 @@ bool verifyReuseGroup2(ReuseGroup *group) {
          "verifyReuseGroup2 requires exactly 2 channels");
   auto *chA = group->channels[0];
   auto *chB = group->channels[1];
-  assert(chA->getNumBuffers() == 1 && chB->getNumBuffers() == 1 &&
-         "verifyReuseGroup2 requires single-copy buffers");
+
+  // Only handle single-copy buffers.
+  if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
+    return false;
 
   bool hasAtoB = hasDependencyChain(chA, chB);
   bool hasBtoA = hasDependencyChain(chB, chA);
@@ -648,8 +650,10 @@ bool verifyReuseGroup2(ReuseGroup *group) {
                                      << chB->uniqID << ": " << hasAtoB);
   LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
                                      << chA->uniqID << ": " << hasBtoA);
-  assert((hasAtoB || hasBtoA) &&
-         "No dependency chain between channels in reuse group");
+  if (!hasAtoB && !hasBtoA) {
+    LDBG("verifyReuseGroup2: no dependency chain between channels");
+    return false;
+  }
   return true;
 }
 
