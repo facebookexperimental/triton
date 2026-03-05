@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=OPERANDD
 
 // Test case: FA BWD pattern with budget-aware SMEM allocation (algo=1).
 // With smem_budget=200000, only one of the two cross-stage TMA buffers
@@ -439,3 +440,24 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 #loc201 = loc(callsite(#loc51 at #loc183))
 #loc202 = loc(callsite(#loc52 at #loc183))
 #loc203 = loc(callsite(#loc196 at #loc2))
+
+// ----
+// Operand-D race fix: verify token-based producer_acquire fires for the
+// dk/dv zeroing tmem_stores (tmem.start) in the BWD kernel.
+//
+// The dk zeroing tmem_store (task 0, gemm) and dk tmem_load (task 3,
+// computation) are in DIFFERENT partitions, creating a cross-partition
+// race. The operand-D race fix detects this and inserts:
+//   tmem_load → consumer_release(tok) → producer_acquire(tok) → tmem_store
+//
+// Verify: producer_acquire (token) before dk and dv zeroing tmem_stores
+// appear BEFORE the inner scf.for loop (they are initial zeroing ops).
+//
+// OPERANDD-LABEL: tt.func public @_attn_bwd
+// OPERANDD: ttg.warp_specialize
+// OPERANDD: default
+// OPERANDD: nvws.producer_acquire
+// OPERANDD: ttng.tmem_store {{.*}}tmem.start
+// OPERANDD: nvws.producer_acquire
+// OPERANDD: ttng.tmem_store {{.*}}tmem.start
+// OPERANDD: scf.for

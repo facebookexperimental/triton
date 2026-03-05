@@ -158,6 +158,11 @@ struct TmemDataChannel : Channel {
 struct TmemDataChannelPost : Channel {
   bool isOperandD;
   bool isOperandDNoAcc;
+  // When true, this channel is a same-iteration resource-hazard guard:
+  // tmem_load (producer) → tmem_store (consumer). It ensures the tmem_load
+  // finishes reading before the next iteration's tmem_store overwrites.
+  // This is the reverse direction of the wrap-around data-flow channel.
+  bool isSameIterGuard = false;
   Operation *allocOp;
 
   // Can be produced by tmem_store or operand D of gen5, consumed by tmem_load

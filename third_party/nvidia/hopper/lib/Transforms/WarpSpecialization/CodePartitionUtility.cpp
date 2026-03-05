@@ -639,8 +639,10 @@ bool verifyReuseGroup2(ReuseGroup *group) {
          "verifyReuseGroup2 requires exactly 2 channels");
   auto *chA = group->channels[0];
   auto *chB = group->channels[1];
-  assert(chA->getNumBuffers() == 1 && chB->getNumBuffers() == 1 &&
-         "verifyReuseGroup2 requires single-copy buffers");
+
+  // Only handle single-copy buffers.
+  if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
+    return false;
 
   bool hasAtoB = hasDependencyChain(chA, chB);
   bool hasBtoA = hasDependencyChain(chB, chA);
@@ -648,8 +650,10 @@ bool verifyReuseGroup2(ReuseGroup *group) {
                                      << chB->uniqID << ": " << hasAtoB);
   LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
                                      << chA->uniqID << ": " << hasBtoA);
-  assert((hasAtoB || hasBtoA) &&
-         "No dependency chain between channels in reuse group");
+  if (!hasAtoB && !hasBtoA) {
+    LDBG("verifyReuseGroup2: no dependency chain between channels");
+    return false;
+  }
   return true;
 }
 
@@ -2426,6 +2430,44 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         createChannelsForProducers(prods, firstProdTaskId, lastConsumerIds,
                                    tmemAllocOp.getOperation(), lastConsumer,
                                    channels);
+      }
+    }
+
+    // Create a guard channel in the reverse direction: tmem_load (last
+    // consumer) → tmem_store (first producer). This prevents the next
+    // iteration's tmem_store from overwriting TMEM before the current
+    // iteration's tmem_load finishes reading.
+    //
+    // Without this, a TMEMStoreOp producer (e.g., reduction partition
+    // zeroing dk/dv) would use the gen5 inline barrier for its
+    // producer_acquire, but that barrier fires when the MMA commits —
+    // too early. The tmem_store must wait until the sibling tmem_load
+    // finishes reading. This guard channel provides that dependency
+    // through the normal token infrastructure:
+    //   ProducerCommit (after tmem_load) → ConsumerWait (before tmem_store)
+    //
+    // The needsChannel check naturally skips the same-task case (e.g.,
+    // FA fwd where both ops are in the computation partition), avoiding
+    // deadlocks.
+    if (lastConsumerIds.size() == 1 && isa<ttng::TMEMLoadOp>(lastConsumer) &&
+        isa<ttng::TMEMStoreOp>(firstProducer)) {
+      int lastConsTaskId = lastConsumerIds.front();
+      if (needsChannel(lastConsTaskId, firstProdTaskIds)) {
+        auto channelID = channels.size();
+        auto guardCh = std::make_unique<ttng::TmemDataChannelPost>(
+            lastConsTaskId, firstProdTaskIds, tmemAllocOp.getOperation(),
+            true /*isOperandD*/, false, channelID);
+        guardCh->isSameIterGuard = true;
+        guardCh->srcName = getOutermostNameFromLoc(tmemAllocOp->getLoc());
+        channels.push_back(std::move(guardCh));
+        setTmemChannelAttr(lastConsumer, channelID, "tmem.start");
+        setTmemChannelAttr(firstProducer, channelID, "tmem.end");
+        LLVM_DEBUG({
+          LDBG("guard channel " << channelID << ": tmem_load (task "
+                                << lastConsTaskId << ") -> tmem_store (task "
+                                << firstProdTaskIds.front()
+                                << ") for operand D race protection");
+        });
       }
     }
   }

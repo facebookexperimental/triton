@@ -10,6 +10,7 @@ Three backward implementations are compared:
 Both Triton backward kernels share the same forward pass so that the
 comparison isolates backward-pass differences only.
 """
+
 import sys
 import os
 import torch
@@ -114,7 +115,7 @@ def shared_forward(q, k, v, sm_scale, causal, baseVariant):
     def grid(META):
         return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
-    if persistent:
+    if True:  # persistent: fwd non-persistent is not working yet.
         fused_attn_mod._attn_fwd_persist[grid_persist](
             sm_scale,
             M,
@@ -423,6 +424,153 @@ def print_table(rows, col_widths):
 
 
 # ============================================================================
+# Debug: element-wise dk analysis
+# ============================================================================
+def _debug_dk(orig_dk, tlx_dk, ref_dk, sm_scale):
+    """Dump element-wise dk comparison to find systematic scaling error."""
+    RCP_LN2 = 1.4426950408889634
+    LN2 = 0.6931471805599453
+
+    o = orig_dk.float()
+    t = tlx_dk.float()
+    r = ref_dk.float()
+
+    print(f"\n{'=' * 78}")
+    print("  DEBUG: element-wise dK analysis")
+    print(f"{'=' * 78}")
+
+    # --- basic stats ----------------------------------------------------------
+    print(f"\n  Shape: {list(r.shape)}")
+    print(f"  ref_dk   — min={r.min().item():.6f}  max={r.max().item():.6f}  absmax={r.abs().max().item():.6f}")
+    print(f"  orig_dk  — min={o.min().item():.6f}  max={o.max().item():.6f}  absmax={o.abs().max().item():.6f}")
+    print(f"  tlx_dk   — min={t.min().item():.6f}  max={t.max().item():.6f}  absmax={t.abs().max().item():.6f}")
+
+    # --- error location -------------------------------------------------------
+    diff = (o - r).abs()
+    flat_idx = diff.argmax().item()
+    idx = []
+    rem = flat_idx
+    for s in reversed(r.shape):
+        idx.append(rem % s)
+        rem //= s
+    idx = tuple(reversed(idx))
+    print(f"\n  Max |orig-ref| error location: {idx}")
+    print(f"    orig_dk = {o[idx].item():.8f}")
+    print(f"    tlx_dk  = {t[idx].item():.8f}")
+    print(f"    ref_dk  = {r[idx].item():.8f}")
+    print(f"    error   = {diff[idx].item():.8f}")
+
+    # --- element-wise ratio ---------------------------------------------------
+    # Mask out near-zero elements to avoid division noise
+    mask = r.abs() > 1e-4
+    num_valid = mask.sum().item()
+    print(f"\n  Ratio analysis (|ref_dk| > 1e-4,  {num_valid} / {r.numel()} elements):")
+
+    if num_valid > 0:
+        ratio_orig = o[mask] / r[mask]
+        ratio_tlx = t[mask] / r[mask]
+
+        print(f"    orig/ref — mean={ratio_orig.mean().item():.8f}  "
+              f"median={ratio_orig.median().item():.8f}  "
+              f"std={ratio_orig.std().item():.8f}")
+        print(f"    tlx/ref  — mean={ratio_tlx.mean().item():.8f}  "
+              f"median={ratio_tlx.median().item():.8f}  "
+              f"std={ratio_tlx.std().item():.8f}")
+
+        # ratio of orig to tlx (both are kernel outputs)
+        mask2 = t.abs() > 1e-4
+        num_valid2 = (mask & mask2).sum().item()
+        if num_valid2 > 0:
+            ratio_ot = o[mask & mask2] / t[mask & mask2]
+            print(f"    orig/tlx — mean={ratio_ot.mean().item():.8f}  "
+                  f"median={ratio_ot.median().item():.8f}  "
+                  f"std={ratio_ot.std().item():.8f}")
+
+    # --- check common scaling factors ----------------------------------------
+    print("\n  Known constants:")
+    print(f"    sm_scale        = {sm_scale}")
+    print(f"    RCP_LN2         = {RCP_LN2:.10f}")
+    print(f"    LN2             = {LN2:.10f}")
+    print(f"    sm_scale*RCP_LN2= {sm_scale * RCP_LN2:.10f}")
+
+    print("\n  Hypothesis tests (orig ≈ ref * C?):")
+    for name, C in [
+        ("LN2", LN2),
+        ("RCP_LN2", RCP_LN2),
+        ("sm_scale", sm_scale),
+        ("1/sm_scale", 1.0 / sm_scale),
+        ("sm_scale*RCP_LN2", sm_scale * RCP_LN2),
+        ("sm_scale*LN2", sm_scale * LN2),
+        ("1/(sm_scale*RCP_LN2)", 1.0 / (sm_scale * RCP_LN2)),
+        ("sm_scale^2", sm_scale**2),
+        ("sm_scale^2*RCP_LN2", sm_scale**2 * RCP_LN2),
+    ]:
+        err = (o - r * C).abs().max().item()
+        print(f"    orig ≈ ref * {name:22s}  →  max|err| = {err:.6e}")
+
+    # --- per-tile analysis (N-tile × batch-head) -----------------------------
+    Z, Nh, N_CTX, D = r.shape
+    BLOCK_N = 128  # BLOCK_N1
+    n_tiles = N_CTX // BLOCK_N
+    print(f"\n  Per N-tile max|orig-ref| and max|orig| (BLOCK_N={BLOCK_N}, {n_tiles} tiles):")
+    print(f"  {'tile':>4s}  {'max|orig-ref|':>14s}  {'max|orig|':>12s}  {'max|ref|':>12s}  {'frac_zero':>10s}")
+    for t_idx in range(n_tiles):
+        sl = slice(t_idx * BLOCK_N, (t_idx + 1) * BLOCK_N)
+        o_tile = o[:, :, sl, :]
+        r_tile = r[:, :, sl, :]
+        tile_err = (o_tile - r_tile).abs().max().item()
+        tile_omax = o_tile.abs().max().item()
+        tile_rmax = r_tile.abs().max().item()
+        frac_zero = (o_tile.abs() < 1e-6).float().mean().item()
+        print(f"  {t_idx:4d}  {tile_err:14.6e}  {tile_omax:12.6e}  {tile_rmax:12.6e}  {frac_zero:10.4f}")
+
+    # --- per batch-head zero fraction -----------------------------------------
+    per_bh_zero = (o.abs() < 1e-6).float().reshape(Z * Nh, -1).mean(dim=1)
+    n_all_zero = (per_bh_zero > 0.99).sum().item()
+    n_partial = ((per_bh_zero > 0.01) & (per_bh_zero < 0.99)).sum().item()
+    n_all_ok = (per_bh_zero < 0.01).sum().item()
+    print(f"\n  Per batch-head analysis ({Z * Nh} total heads):")
+    print(f"    All-zero heads (>99%% zeros): {n_all_zero}")
+    print(f"    Partial heads:                {n_partial}")
+    print(f"    Fully written heads (<1%% z): {n_all_ok}")
+
+    # --- accuracy of non-zero elements ----------------------------------------
+    nonzero_mask = o.abs() > 1e-6
+    num_nonzero = nonzero_mask.sum().item()
+    print(f"\n  Non-zero element accuracy ({num_nonzero} / {o.numel()} elements):")
+    if num_nonzero > 0:
+        nonzero_err = (o[nonzero_mask] - r[nonzero_mask]).abs()
+        print(f"    max|err| among non-zero orig = {nonzero_err.max().item():.6e}")
+        print(f"    mean|err| among non-zero orig = {nonzero_err.mean().item():.6e}")
+        # ratio of non-zero orig to ref
+        valid = nonzero_mask & (r.abs() > 1e-4)
+        if valid.sum() > 0:
+            r_nz = o[valid] / r[valid]
+            print(f"    ratio orig/ref — mean={r_nz.mean().item():.8f}  "
+                  f"median={r_nz.median().item():.8f}  "
+                  f"std={r_nz.std().item():.8f}")
+
+    # --- per batch-head per N-tile pattern ------------------------------------
+    # Show first 4 heads: which N-tiles are zero vs non-zero
+    print("\n  Per-head N-tile zero pattern (Z=zeros, .=ok):")
+    for bh in range(min(32, Z * Nh)):
+        b, h = bh // Nh, bh % Nh
+        pattern = ""
+        for t_idx in range(n_tiles):
+            sl = slice(t_idx * BLOCK_N, (t_idx + 1) * BLOCK_N)
+            fz = (o[b, h, sl, :].abs() < 1e-6).float().mean().item()
+            if fz > 0.95:
+                pattern += "Z"
+            elif fz < 0.05:
+                pattern += "."
+            else:
+                pattern += "p"
+        print(f"    head [{b:2d},{h:2d}]: {pattern}")
+
+    print(f"{'=' * 78}\n")
+
+
+# ============================================================================
 # Main comparison
 # ============================================================================
 def compare_accuracy(Z, H, N_CTX, HEAD_DIM, causal, baseVariant, dtype=torch.float16, atol=1e-2):
@@ -474,9 +622,11 @@ def compare_accuracy(Z, H, N_CTX, HEAD_DIM, causal, baseVariant, dtype=torch.flo
         causal,
     )
 
+    # ---- Debug: element-wise dk analysis -------------------------------------
+    # _debug_dk(orig_dk, tlx_dk, ref_dk, sm_scale)
+
     # ---- Print header --------------------------------------------------------
-    hdr = (f"Config: Z={Z}, H={H}, N_CTX={N_CTX}, HEAD_DIM={HEAD_DIM}, "
-           f"causal={causal}, baseVariant={baseVariant}")
+    hdr = f"Config: Z={Z}, H={H}, N_CTX={N_CTX}, HEAD_DIM={HEAD_DIM}, causal={causal}, baseVariant={baseVariant}"
     print(f"\n{'=' * 78}")
     print(hdr)
     print(f"{'=' * 78}")
@@ -538,8 +688,8 @@ if __name__ == "__main__":
         # (Z,  H,  N_CTX, HEAD_DIM, causal, baseVariant)
         #(8,  16, 1024,  64,  False, "ws"),
         #(8,  16, 1024,  128, False, "ws"),
-        #(8,  16, 1024,  64,  False, "ws_persistent"),
-        (8, 16, 1024, 128, False, "ws_persistent"),
+        #(8, 16, 1024, 64, False, "ws_persistent"), # data race
+        (8, 16, 1024, 128, False, "ws_persistent"), # works
     ]
 
     all_pass = True
