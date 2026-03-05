@@ -3309,21 +3309,30 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   }
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
-      ReuseGroup group;
-      // make sure the channel without buffer.offset is the first one (i.e the
-      // representative channel)
-      std::vector<Channel *> ordered(kv.second);
-      std::stable_partition(ordered.begin(), ordered.end(), [](Channel *ch) {
-        auto bufferOffset =
-            ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
-        if (bufferOffset)
-          return false;
-        return true;
-      });
-      group.channels = ordered;
-      LDBG("ReuseGroup with size " << kv.second.size() << " buffer.id "
-                                   << kv.first << "\n");
-      config.groups.push_back(group);
+      // Sub-partition channels with the same buffer.id by getDstOp().
+      // Channels feeding different consumer ops must not share a buffer.
+      DenseMap<Operation *, std::vector<Channel *>> dstOpToChannels;
+      for (auto *ch : kv.second)
+        dstOpToChannels[ch->getDstOp()].push_back(ch);
+      for (auto &[dstOp, channels] : dstOpToChannels) {
+        if (channels.size() <= 1)
+          continue;
+        ReuseGroup group;
+        // make sure the channel without buffer.offset is the first one (i.e the
+        // representative channel)
+        std::stable_partition(
+            channels.begin(), channels.end(), [](Channel *ch) {
+              auto bufferOffset =
+                  ch->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
+              if (bufferOffset)
+                return false;
+              return true;
+            });
+        group.channels = channels;
+        LDBG("ReuseGroup with size " << channels.size() << " buffer.id "
+                                     << kv.first << "\n");
+        config.groups.push_back(group);
+      }
     }
   }
   // Merge consumer groups for channels in the same reuse group.
@@ -3337,6 +3346,26 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     for (size_t i = 1; i < group.channels.size(); i++) {
       Channel *ch = group.channels[i];
       if (ch->relation.second != rep->relation.second)
+        continue;
+      if (ch->getDstOp() != rep->getDstOp())
+        continue;
+      // Skip if either producer is a TCGen5MMAOp: commit handling for
+      // MMA-produced TMEM channels doesn't work when fused into one group.
+      //
+      // Even once supported we will need to prove that the MMA op dominates
+      // the other op in program order.
+      if (isa<ttng::TCGen5MMAOp>(ch->getSrcOp()) ||
+          isa<ttng::TCGen5MMAOp>(rep->getSrcOp()))
+        continue;
+      // Only merge TMA-produced channels with other TMA-produced channels.
+      // This is because otherwise the barriers cannot be "fused" proeperly
+      // as one step is async.
+      //
+      // To support this we need to prove the TMA op dominates the non-TMA op
+      // in program order.
+      bool chIsTMA = isProducerTMA(ch, /*isPost=*/true);
+      bool repIsTMA = isProducerTMA(rep, /*isPost=*/true);
+      if (chIsTMA != repIsTMA)
         continue;
       channelsGroupedByConsumers[rep].push_back(ch);
       channelsGroupedByConsumers.erase(ch);
