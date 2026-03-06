@@ -871,7 +871,8 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
 /// Buffers sharing the same buffer.id (reuse group) contribute
 /// max(sizes) * copies instead of sum(sizes) * copies.
 static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
-  DenseMap<unsigned, std::pair<unsigned, unsigned>> idInfo; // id -> (maxSize, copies)
+  DenseMap<unsigned, std::pair<unsigned, unsigned>>
+      idInfo; // id -> (maxSize, copies)
   for (const auto &buf : wsBuffers) {
     auto it = idInfo.find(buf.bufferId);
     if (it == idInfo.end()) {
@@ -898,8 +899,7 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
 /// Returns the next available buffer ID after the SMEM allocations.
 static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
                                     SmallVector<Channel *> &channels,
-                                    unsigned numBuffers,
-                                    unsigned smemBudget,
+                                    unsigned numBuffers, unsigned smemBudget,
                                     bool smemCircularReuse) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
@@ -921,11 +921,10 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
 
     wsBuffers.push_back(buf);
 
-    LDBG("Phase 1: WSBuffer[" << buf.bufferId << "] "
-                              << buf.sizeBytes << " bytes"
-                              << " innermost=" << buf.isInnermost
-                              << " TMA=" << buf.isTMA
-                              << " crossStage=" << buf.isCrossStage);
+    LDBG("Phase 1: WSBuffer["
+         << buf.bufferId << "] " << buf.sizeBytes << " bytes"
+         << " innermost=" << buf.isInnermost << " TMA=" << buf.isTMA
+         << " crossStage=" << buf.isCrossStage);
   });
 
   if (wsBuffers.empty())
@@ -944,10 +943,10 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
                                   << " (totalSmem=" << totalSmem << ")");
       } else {
         buf.numCopies = saved;
-        LDBG("Phase 2: WSBuffer[" << buf.bufferId
-                                  << "] cross-stage copy=2 skipped"
-                                  << " (would exceed budget: " << totalSmem
-                                  << " > " << smemBudget << ")");
+        LDBG("Phase 2: WSBuffer["
+             << buf.bufferId << "] cross-stage copy=2 skipped"
+             << " (would exceed budget: " << totalSmem << " > " << smemBudget
+             << ")");
       }
     }
   }
@@ -961,8 +960,8 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     } else {
       buf.priority = WSBufferPriority::P2_Other;
     }
-    LDBG("Phase 3: WSBuffer[" << buf.bufferId << "] priority="
-                              << static_cast<int>(buf.priority));
+    LDBG("Phase 3: WSBuffer["
+         << buf.bufferId << "] priority=" << static_cast<int>(buf.priority));
   }
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
@@ -978,9 +977,9 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     if (candidateIndices.empty())
       continue;
 
-    LDBG("Phase 4: processing priority="
-         << static_cast<int>(priority) << " with "
-         << candidateIndices.size() << " candidates");
+    LDBG("Phase 4: processing priority=" << static_cast<int>(priority)
+                                         << " with " << candidateIndices.size()
+                                         << " candidates");
 
     // Step 0: Decide grouping upfront.
     bool isReuseGroup = false;
@@ -1049,10 +1048,9 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
         } else {
           bufA.numCopies = savedA;
           bufB.numCopies = savedB;
-          LDBG("Phase 4: reuse group copies=" << currentGroupCopies
-                                              << " totalSmem=" << totalSmem
-                                              << " > " << smemBudget
-                                              << " — budget exhausted");
+          LDBG("Phase 4: reuse group copies="
+               << currentGroupCopies << " totalSmem=" << totalSmem << " > "
+               << smemBudget << " — budget exhausted");
           break;
         }
       } else {
@@ -1078,17 +1076,15 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
           if (totalSmem <= smemBudget) {
             advancedAny = true;
             foundValidSolution = true;
-            LDBG("Phase 4: WSBuffer[" << buf.bufferId
-                                      << "] copies=" << currentGroupCopies
-                                      << " totalSmem=" << totalSmem
-                                      << " ≤ " << smemBudget);
+            LDBG("Phase 4: WSBuffer["
+                 << buf.bufferId << "] copies=" << currentGroupCopies
+                 << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
           } else {
             buf.numCopies = saved;
-            LDBG("Phase 4: WSBuffer[" << buf.bufferId
-                                      << "] copies=" << currentGroupCopies
-                                      << " totalSmem=" << totalSmem
-                                      << " > " << smemBudget
-                                      << " — skipped");
+            LDBG("Phase 4: WSBuffer["
+                 << buf.bufferId << "] copies=" << currentGroupCopies
+                 << " totalSmem=" << totalSmem << " > " << smemBudget
+                 << " — skipped");
           }
         }
 
@@ -1110,9 +1106,8 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
         bufB.numCopies = half;
         bufB.bufferId = nextBufferId++;
         isReuseGroup = false;
-        LDBG("Phase 4: split reuse group — even copies=" << (half * 2)
-                                                         << " → each gets "
-                                                         << half);
+        LDBG("Phase 4: split reuse group — even copies="
+             << (half * 2) << " → each gets " << half);
       }
     }
 
@@ -1128,8 +1123,7 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
   // ── Phase 5: Emit buffer.id and buffer.copy attributes ──────────────
   auto i32Type = IntegerType::get(funcOp.getContext(), 32);
   for (auto &buf : wsBuffers) {
-    buf.allocOp->setAttr("buffer.id",
-                         IntegerAttr::get(i32Type, buf.bufferId));
+    buf.allocOp->setAttr("buffer.id", IntegerAttr::get(i32Type, buf.bufferId));
     buf.allocOp->setAttr("buffer.copy",
                          IntegerAttr::get(i32Type, buf.numCopies));
     LDBG("Phase 5: WSBuffer[" << buf.bufferId << "] buffer.id=" << buf.bufferId
@@ -2036,12 +2030,16 @@ public:
   };
 
   /// Check if candidate can potentially reuse owner's space.
-  /// Returns priority: 0 = cannot reuse, 1 = can reuse, 2 = exact size match.
-  /// Uses bidirectional data dependency via SSA def-use chain walk (primary),
-  /// with samePartition fallback for cross-loop buffers where SSA chains may
-  /// be broken by loop-carried values.
-  int hasPotentialReuse(BufferT *owner, BufferT *candidate,
-                        Operation *ctrlOp) {
+  /// Returns priority: 0 = cannot reuse.
+  /// Higher values indicate stronger reuse preference:
+  ///   4 = exact size + actual SSA data dependency
+  ///   3 = fits (not exact) + actual SSA data dependency
+  ///   2 = exact size + partition match only (no direct dependency)
+  ///   1 = fits (not exact) + partition match only
+  /// This ranking ensures buffers with real data dependencies (which share
+  /// barrier chains and are safe to alias) are preferred over buffers that
+  /// merely happen to be in the same partition but use independent barriers.
+  int hasPotentialReuse(BufferT *owner, BufferT *candidate, Operation *ctrlOp) {
     // Size check: candidate must fit in owner's columns
     if (candidate->colSize > owner->colSize)
       return 0;
@@ -2062,7 +2060,9 @@ public:
       return false;
     };
 
-    if (!hasDependency()) {
+    bool hasActualDep = hasDependency();
+
+    if (!hasActualDep) {
       // SSA walk didn't find a dependency. For cross-loop buffers, fall
       // back to partition matching (async task ID comparison) since
       // loop-carried values break SSA chains.
@@ -2075,10 +2075,10 @@ public:
       }
     }
 
-    // Priority: prefer exact size matches
-    if (candidate->colSize == owner->colSize)
-      return 2;
-    return 1;
+    bool exactSize = (candidate->colSize == owner->colSize);
+    if (hasActualDep)
+      return exactSize ? 4 : 3;
+    return exactSize ? 2 : 1;
   }
 
   /// Compute column offset for candidate in owner's reuse group.
@@ -2116,8 +2116,7 @@ public:
 
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
-                   AllocationState &state, size_t maxRows,
-                   Operation *ctrlOp) {
+                   AllocationState &state, size_t maxRows, Operation *ctrlOp) {
     // Base case: all buffers allocated
     if (idx == allocs.size())
       return true;
@@ -2131,9 +2130,22 @@ public:
       if (priority > 0)
         candidates.push_back({owner, priority});
     }
-    // Sort by priority descending
-    llvm::sort(candidates, [](const auto &a, const auto &b) {
-      return a.second > b.second;
+    // Sort by priority descending, then prefer owners where the candidate
+    // fits at column offset 0 (which means it overlaps with the owner's
+    // own barrier chain — safer than packing at a non-zero offset in
+    // dead space that the owner's MMA may clobber independently).
+    // Final tiebreaker: operationId for determinism (DenseSet iteration
+    // order is non-deterministic due to pointer hashing).
+    llvm::sort(candidates, [&](const auto &a, const auto &b) {
+      if (a.second != b.second)
+        return a.second > b.second;
+      size_t colA = computeColOffset(buf, a.first, state, ctrlOp);
+      size_t colB = computeColOffset(buf, b.first, state, ctrlOp);
+      bool aAtZero = (colA == 0);
+      bool bAtZero = (colB == 0);
+      if (aAtZero != bAtZero)
+        return aAtZero;
+      return operationId[a.first->owner] < operationId[b.first->owner];
     });
 
     // Try each reuse candidate
@@ -2874,13 +2886,11 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     // Apply from outermost to innermost (innermost wins).
     for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
       auto loop = *it;
-      if (auto attr =
-              loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
         effectiveSmemAllocAlgo = attr.getInt();
       if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
         effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
-      if (auto attr =
-              loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+      if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
         effectiveSmemCircularReuse = attr.getValue();
     }
   });
@@ -2891,9 +2901,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)"
          << " smemBudget=" << effectiveSmemBudget
          << " smemCircularReuse=" << effectiveSmemCircularReuse);
-    bufferId = allocateSmemBuffers(funcOp, channels, numBuffers,
-                                   effectiveSmemBudget,
-                                   effectiveSmemCircularReuse);
+    bufferId =
+        allocateSmemBuffers(funcOp, channels, numBuffers, effectiveSmemBudget,
+                            effectiveSmemCircularReuse);
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");
@@ -2980,8 +2990,8 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
       if (failed(doMemoryPlanner(funcOp, numBuffers, readDecisionFile,
-                                 writeDecisionFile, smemAllocAlgo,
-                                 smemBudget, smemCircularReuse)))
+                                 writeDecisionFile, smemAllocAlgo, smemBudget,
+                                 smemCircularReuse)))
         signalPassFailure();
     }
   }
