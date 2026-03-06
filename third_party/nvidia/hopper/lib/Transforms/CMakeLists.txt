@@ -12,6 +12,7 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSLowerToken.cpp
   WarpSpecialization/WSMemoryPlanner.cpp
   WarpSpecialization/WSSpecialize.cpp
+  WarpSpecialization/WSTMAStoreLowering.cpp
   WarpSpecialization/WSTaskIdPropagate.cpp
   WarpSpecialization/WSTaskPartition.cpp
 
