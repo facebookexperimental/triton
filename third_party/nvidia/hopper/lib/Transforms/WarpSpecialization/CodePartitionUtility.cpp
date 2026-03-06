@@ -291,23 +291,23 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
   return !enclosing(ifOp, pOp.getOperation());
 }
 
+static bool isBackwardOfChannelLoopInGroup(Channel *chB, ReuseGroup *group);
+
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
+  if (group->channels.size() <= 1)
+    return false;
   if (group->channels[0]->getNumBuffers() <= 1)
     return false;
-  // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
-  // see if it is inside ctrlOp.
   for (auto *ch : group->channels) {
+    if (isBackwardOfChannelLoopInGroup(ch, group))
+      continue;
     if (auto forOp = dyn_cast<scf::ForOp>(ctrlOp)) {
-      if (enclosing(forOp, ch->getSrcOp()))
-        return true;
       if (enclosing(forOp, ch->getDstOp()))
         return true;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(ctrlOp)) {
-      if (enclosing(ifOp, ch->getSrcOp()))
-        return true;
       if (enclosing(ifOp, ch->getDstOp()))
         return true;
     }
@@ -392,6 +392,36 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   return ctrlId;
 }
 
+// Check whether chB is the backward half of an operandD channel loop within
+// the given reuse group. A backward channel carries data from MMA back to
+// tmem_load, while its forward partner carries data from tmem_store to MMA.
+// The two form a cycle on the same TMEM allocation.
+static bool isBackwardOfChannelLoopInGroup(Channel *chB, ReuseGroup *group) {
+  if (chB->channelKind != DataChannelKind::TMEMPost)
+    return false;
+  auto *tmemChB = static_cast<ttng::TmemDataChannelPost *>(chB);
+  if (!tmemChB->isOperandD)
+    return false;
+  for (auto *ch : group->channels) {
+    if (ch == chB)
+      continue;
+    if (ch->channelKind != DataChannelKind::TMEMPost)
+      continue;
+    auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+    if (!tmemCh->isOperandD)
+      continue;
+    if (ch->getAllocOp() != chB->getAllocOp())
+      continue;
+    // ch is the candidate forward channel. Check:
+    // 1. Forward's dstOp == backward's srcOp (both point to MMA)
+    // 2. Backward's dstOp appears before forward's srcOp (backward direction)
+    if (ch->getDstOp() == chB->getSrcOp() &&
+        appearsBefore(chB->getDstOp(), ch->getSrcOp()))
+      return true;
+  }
+  return false;
+}
+
 // Find channels of reuse group that are inside regionOp. If the channel is
 // directly in regionOp, add the channel's DstOp, otherwise add the region Op
 // that is directly in regionOp and encloses the channel.
@@ -418,14 +448,17 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
         }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
-        // dstOp has the same enclosing parentOp.
+        // dstOp has the same enclosing parentOp. Skip backward channels of
+        // operandD channel loops so the counter increments once per iteration.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp()) {
+          if (&op == ch->getDstOp() &&
+              !isBackwardOfChannelLoopInGroup(ch, group)) {
             LLVM_DEBUG({
               LDBG("\nchannel with DstOp: ");
               op.dump();
             });
             chList.push_back(&op);
+            break;
           }
         }
       }
@@ -441,14 +474,17 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
         }
       } else {
         // Check if op is dstOp of a channel in reuse group. Assume srcOp and
-        // dstOp has the same enclosing parentOp.
+        // dstOp has the same enclosing parentOp. Skip backward channels of
+        // operandD channel loops so the counter increments once per iteration.
         for (auto *ch : group->channels) {
-          if (&op == ch->getDstOp()) {
+          if (&op == ch->getDstOp() &&
+              !isBackwardOfChannelLoopInGroup(ch, group)) {
             LLVM_DEBUG({
               LDBG("\nchannel with DstOp: ");
               op.dump();
             });
             chList.push_back(&op);
+            break;
           }
         }
       }
@@ -568,6 +604,22 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
   }
 
+  // For reuse groups, the immediate parent ForOp may not carry a reuse
+  // accumCnt (e.g., an inner K-loop whose dstOps are all outside it). Walk up
+  // to the enclosing ForOp that actually has the reuse accumCnt.
+  if (reuseGroupIdx >= 0 && config) {
+    while (parentForOp &&
+           !needAccumCntForReuse(parentForOp.getOperation(),
+                                 config->getGroup(reuseGroupIdx))) {
+      parentForOp = parentForOp->getParentOfType<scf::ForOp>();
+    }
+    if (!parentForOp) {
+      LDBG("getAccumCount: no enclosing ForOp with reuse accumCnt, returning "
+           "constant 0");
+      return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
+    }
+  }
+
   auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
@@ -616,6 +668,14 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
   auto parentForOp = op->getParentOfType<scf::ForOp>();
+  // Walk up to the ForOp that actually carries the reuse accumCnt, matching
+  // the same logic used in getAccumCount.
+  while (parentForOp &&
+         !needAccumCntForReuse(parentForOp.getOperation(),
+                               config->getGroup(reuseGroupIdx))) {
+    parentForOp = parentForOp->getParentOfType<scf::ForOp>();
+  }
+  assert(parentForOp && "no enclosing ForOp with reuse accumCnt");
   getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
@@ -626,6 +686,37 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       break;
     }
     ++vecIdx;
+  }
+  // If not found, this may be a backward channel whose dstOp was excluded from
+  // chList. Find its forward partner and use that partner's position so both
+  // directions share the same buffer index within an iteration.
+  if (theIdx < 0) {
+    auto *group = config->getGroup(reuseGroupIdx);
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      if (tmemCh->isOperandD) {
+        for (auto *fwdCh : group->channels) {
+          if (fwdCh == ch || fwdCh->channelKind != DataChannelKind::TMEMPost)
+            continue;
+          auto *tmemFwd = static_cast<ttng::TmemDataChannelPost *>(fwdCh);
+          if (!tmemFwd->isOperandD || fwdCh->getAllocOp() != ch->getAllocOp())
+            continue;
+          if (fwdCh->getDstOp() == ch->getSrcOp() &&
+              appearsBefore(ch->getDstOp(), fwdCh->getSrcOp())) {
+            // Found forward partner, use its position in chList.
+            int fwdIdx = 0;
+            for (auto *tCh : chList) {
+              if (tCh == fwdCh->getDstOp()) {
+                theIdx = fwdIdx;
+                break;
+              }
+              ++fwdIdx;
+            }
+            break;
+          }
+        }
+      }
+    }
   }
   assert(theIdx >= 0);
   if (theIdx == 0) {

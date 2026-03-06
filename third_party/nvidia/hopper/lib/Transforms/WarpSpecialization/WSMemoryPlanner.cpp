@@ -688,6 +688,12 @@ namespace triton {
 /// and performs memory reuse optimization by allowing non-interfering buffers
 /// to share TMEM space. Prioritizes operand D (accumulator) allocations and
 /// larger buffers when assigning memory locations.
+struct TMemAllocInfo {
+  ttng::TMEMAllocOp alloc;
+  unsigned baseCols;
+  unsigned copy;
+};
+
 class MemoryPlannerTmem : public MemoryPlannerBase {
 public:
   MemoryPlannerTmem(Operation *operation, Allocation *allocation,
@@ -741,6 +747,16 @@ private:
                     }
                   });
     return Interval(minId, maxId);
+  }
+
+  // Detect persistent kernels by checking for tt::GetNumProgramsOp, which is
+  // used to compute tile-to-SM mappings in persistent loops.
+  // TODO: Also detect CLC-based persistent kernels
+  // (AsyncCLCTryCancelOp) once CLC support lands in pure Triton.
+  bool isLikelyPersistentKernel() {
+    bool found = false;
+    operation->walk([&](tt::GetNumProgramsOp) { found = true; });
+    return found;
   }
 
   unsigned getLoopDepth(Operation *op) {
@@ -951,6 +967,58 @@ public:
         return failure();
       bufferId = *result;
     }
+    // Post-processing: maximize TMEM utilization by increasing buffer.copy
+    // for TMEM allocs in round-robin until we approach the 512-column limit.
+    // Only applies to persistent kernels where CTAs process multiple tiles.
+    if (isLikelyPersistentKernel()) {
+      constexpr unsigned tmemColLimit = 512;
+
+      SmallVector<TMemAllocInfo> allocInfos;
+
+      unsigned totalCols = 0;
+      for (auto alloc : allocs) {
+        ttng::TMemAllocation allocSize =
+            ttng::getTmemAllocSizes(alloc.getType());
+        unsigned baseCols = allocSize.numCols;
+        unsigned copy = 1;
+        if (auto copyAttr = alloc->getAttrOfType<IntegerAttr>("buffer.copy"))
+          copy = copyAttr.getInt();
+        allocInfos.push_back({alloc, baseCols, copy});
+        totalCols += baseCols * copy;
+      }
+
+      while (totalCols < tmemColLimit && !allocInfos.empty()) {
+        bool added = false;
+        for (unsigned idx = 0; idx < allocInfos.size(); idx++) {
+          auto &info = allocInfos[idx];
+          if (totalCols + info.baseCols <= tmemColLimit) {
+            info.copy += 1;
+            totalCols += info.baseCols;
+            added = true;
+          }
+        }
+        if (!added)
+          break;
+      }
+
+      for (auto &info : allocInfos) {
+        info.alloc->setAttr(
+            "buffer.copy",
+            IntegerAttr::get(IntegerType::get(info.alloc->getContext(), 32),
+                             info.copy));
+      }
+
+      LLVM_DEBUG({
+        DBGS() << "TMEM multi-buffering post-processing: totalCols = "
+               << totalCols << " / " << tmemColLimit << "\n";
+        for (auto &info : allocInfos) {
+          DBGS() << "  baseCols=" << info.baseCols << " copy=" << info.copy
+                 << ": ";
+          info.alloc->dump();
+        }
+      });
+    }
+
     return success();
   }
 
@@ -1301,7 +1369,7 @@ public:
         alloc.getOperation()->dump();
       });
 
-      // FIXME: heuristics
+      // Initial buffer.copy = 1; post-processing in run() may increase this.
       alloc.getOperation()->setAttr(
           "buffer.copy",
           IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
