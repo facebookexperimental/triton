@@ -5,13 +5,21 @@ import torch
 import triton
 
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
-    attention as _attention_ws_pipelined_persistent, )
+    attention as _attention_ws_pipelined_persistent,
+    attention_warp_barrier as _attention_ws_pipelined_persistent_warp_barrier,
+)
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined import (
-    attention as _attention_ws_pipelined, )
+    attention as _attention_ws_pipelined,
+    attention_warp_barrier as _attention_ws_pipelined_warp_barrier,
+)
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_persistent import (
-    attention as _attention_ws_persistent, )
+    attention as _attention_ws_persistent,
+    attention_warp_barrier as _attention_ws_persistent_warp_barrier,
+)
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws import (
-    attention as _attention_ws, )
+    attention as _attention_ws,
+    attention_warp_barrier as _attention_ws_warp_barrier,
+)
 
 from triton._internal_testing import is_blackwell
 
@@ -19,9 +27,13 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 ATTENTION_METHODS = {
     "ws_pipelined_persistent": _attention_ws_pipelined_persistent,
+    "ws_pipelined_persistent_warp_barrier": _attention_ws_pipelined_persistent_warp_barrier,
     "ws_pipelined": _attention_ws_pipelined,
+    "ws_pipelined_warp_barrier": _attention_ws_pipelined_warp_barrier,
     "ws_persistent": _attention_ws_persistent,
+    "ws_persistent_warp_barrier": _attention_ws_persistent_warp_barrier,
     "ws": _attention_ws,
+    "ws_warp_barrier": _attention_ws_warp_barrier,
 }
 
 ref_lib = "SDPA"
@@ -63,9 +75,9 @@ def create_benchmark(versions):
             )
         elif provider in ATTENTION_METHODS:
             attention = ATTENTION_METHODS[provider]
-            if provider == "ws_pipelined_persistent":
+            if provider in ("ws_pipelined_persistent", "ws_pipelined_persistent_warp_barrier"):
                 fn = lambda: attention(q, k, v, sm_scale, causal, 64, 1)
-            elif provider == "ws":
+            elif provider in ("ws", "ws_warp_barrier"):
                 fn = lambda: attention(q, k, v, sm_scale)
             else:
                 fn = lambda: attention(q, k, v, sm_scale, causal)
@@ -89,13 +101,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
+        nargs="+",
         choices=list(ATTENTION_METHODS.keys()),
-        help=f"Run only the specified version. Choices: {list(ATTENTION_METHODS.keys())}",
+        help=f"Run only the specified version(s). Choices: {list(ATTENTION_METHODS.keys())}",
     )
     args = parser.parse_args()
 
     if is_blackwell():
-        versions = [args.version] if args.version else list(ATTENTION_METHODS.keys())
+        versions = args.version if args.version else list(ATTENTION_METHODS.keys())
         print(f"Running benchmarks for: {versions}")
         benchmark = create_benchmark(versions)
         benchmark.run(print_data=True)
