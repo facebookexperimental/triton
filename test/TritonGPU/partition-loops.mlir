@@ -396,6 +396,29 @@ tt.func @clone_then_capture(%arg0: i32) {
   tt.return
 }
 
+// Regression test: an scf.if inside a loop where the if-op is only in one
+// partition (partition 1), but a result (async token) is not produced by any
+// annotated op. inferIfOpPartitions assigns it to partition 0 by default. The
+// yield inside the if-op must only be created for the if-op's own partitions,
+// not for all partitions, otherwise a stray scf.yield lands in the wrong block.
+// CHECK-LABEL: @if_result_partition_mismatch
+tt.func @if_result_partition_mismatch(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
+  %c0 = arith.constant 0 : i32
+  %poison_token = ub.poison : !ttg.async.token
+  // CHECK: nvws.warp_group
+  scf.for %i = %lb to %ub step %step iter_args(%k = %c0) -> (i32) : i32 {
+    "op_a"(%i) {ttg.partition = array<i32: 0>} : (i32) -> ()
+    %ret:2 = scf.if %cond -> (i32, !ttg.async.token) {
+      %v = "op_b"(%i) {ttg.partition = array<i32: 1>} : (i32) -> i32
+      scf.yield %v, %poison_token : i32, !ttg.async.token
+    } else {
+      scf.yield %k, %poison_token : i32, !ttg.async.token
+    }
+    scf.yield %ret#0 : i32
+  } {ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+  tt.return
+}
+
 // CHECK-LABEL: @if_stmt_split
 tt.func @if_stmt_split(%arg1: !ty, %ub: i32, %lb: i32, %step: i32) {
   %out:2 = scf.for %i = %lb to %ub step %step iter_args(%a = %arg1, %b = %arg1) -> (!ty, !ty) : i32 {
