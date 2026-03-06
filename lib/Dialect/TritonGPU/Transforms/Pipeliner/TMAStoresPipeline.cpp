@@ -72,7 +72,8 @@ static void createTMAAsyncCopy(scf::ForOp forOp, const TMAStore &store,
         reduceOp.getDesc().getType().getBlockType().getEncoding(),
         reduceOp.getIndices());
     builder.create<ttng::AsyncTMAReduceOp>(loc, reduceOp.getKind(), desc,
-                                           reduceOp.getIndices(), alloc);
+                                           reduceOp.getIndices(), alloc,
+                                           triton::EvictionPolicy::NORMAL);
   } else {
     auto scatterOp = cast<tt::DescriptorScatterOp>(store.op);
     builder.create<ttng::AsyncTMAScatterOp>(loc, desc, scatterOp.getXOffsets(),

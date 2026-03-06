@@ -168,6 +168,8 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
         channels.push_back(std::make_unique<Channel>(
             producerTaskId, consumerTaskIds, userOp, user.second,
             producerNumBuffers, channels.size(), channelKind));
+        channels.back()->srcName =
+            getOutermostNameFromLoc(producerOp->getLoc());
       }
     }
   }
@@ -1490,8 +1492,12 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     Type memdescType =
         ttg::MemDescType::get(bufferShape, elemType, encoding,
                               tensorMemorySpace, /*mutableMemory*/ true);
+    Location allocLoc =
+        channel->srcName.empty()
+            ? srcOp->getLoc()
+            : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
     auto allocOp = builder.create<ttng::TMEMAllocOp>(
-        srcOp->getLoc(), memdescType, builder.getType<ttg::AsyncTokenType>(),
+        allocLoc, memdescType, builder.getType<ttg::AsyncTokenType>(),
         /*src=*/Value());
     newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
         dyn_cast<mlir::OpResult>(srcResult), channel->relation.first, dstOp,
@@ -1555,8 +1561,11 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     Type memdescType = ttg::MemDescType::get(
         isPost ? sliceShape : bufferShape, elemType, sharedLayout,
         sharedMemorySpace, /*mutableMemory*/ true);
-    auto allocOp =
-        builder.create<ttg::LocalAllocOp>(srcOp->getLoc(), memdescType);
+    Location allocLoc =
+        channel->srcName.empty()
+            ? srcOp->getLoc()
+            : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
+    auto allocOp = builder.create<ttg::LocalAllocOp>(allocLoc, memdescType);
     buffer = allocOp->getResult(0);
 
     if (isPost) {
@@ -1841,7 +1850,6 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       }
     }
   }
-
   return bufferMap;
 }
 

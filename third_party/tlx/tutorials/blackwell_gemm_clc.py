@@ -70,6 +70,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                                        NUM_SMS: tl.constexpr,  #
                                        NUM_CLC_STAGES: tl.constexpr,  #
                                        EPILOGUE_SUBTILE: tl.constexpr,  #
+                                       USE_WARP_BARRIER: tl.constexpr = False,  #
                                        ):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
@@ -80,8 +81,12 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
     # allocate barriers
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+    if USE_WARP_BARRIER:
+        tmem_full_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS, num_warps=1)
+        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS, num_warps=4)
+    else:
+        tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     clc_context = tlx.clc_create_context(num_consumers=3)
 
@@ -241,7 +246,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 clc_phase_consumer ^= 1
 
 
-def matmul(a, b, config=None):
+def matmul(a, b, config=None, use_warp_barrier=False):
     """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -277,6 +282,7 @@ def matmul(a, b, config=None):
             K,
             NUM_SMS=NUM_SMS,
             NUM_CLC_STAGES=1,
+            USE_WARP_BARRIER=use_warp_barrier,
             **config,
         )
     else:
@@ -290,6 +296,11 @@ def matmul(a, b, config=None):
             K,
             NUM_SMS=NUM_SMS,
             NUM_CLC_STAGES=1,
+            USE_WARP_BARRIER=use_warp_barrier,
         )
 
     return c
+
+
+def matmul_warp_barrier(a, b, config=None):
+    return matmul(a, b, config=config, use_warp_barrier=True)
