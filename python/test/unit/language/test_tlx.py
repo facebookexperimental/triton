@@ -6675,3 +6675,92 @@ def test_atomic_add_cga(device):
 
     # CTA ranks should be 0 and 1
     assert set(cta_ranks) == {0, 1}, f"Expected CTA ranks {{0, 1}}, got {set(cta_ranks)}"
+
+
+# =============================================================================
+# Test: named_barrier_wait in 1-warp async_task (DEADLOCKS)
+# =============================================================================
+
+
+def _run_kernel_diverge_both_1warp(result_queue):
+    """Subprocess target: runs the deadlocking kernel and reports back."""
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+        import triton.language.extra.tlx as tlx
+
+        @triton.jit
+        def _kernel_diverge_both_1warp(output_ptr):
+            """1-warp task, divergence on both sides -> DEADLOCKS."""
+            with tlx.async_tasks():
+                with tlx.async_task(num_warps=1):
+                    if tlx.thread_id(axis=0) % 32 == 0:
+                        tl.store(output_ptr + 1, 99)  # divergence BEFORE
+                    tlx.named_barrier_wait(14, 32)
+                    if tlx.thread_id(axis=0) % 32 == 0:
+                        tl.store(output_ptr + 0, 5)  # divergence AFTER
+                with tlx.async_task("default"):
+                    pass
+
+        output = torch.zeros(2, dtype=torch.int32, device="cuda")
+        _kernel_diverge_both_1warp[(1, )](output, num_warps=4)
+        torch.cuda.synchronize()
+        result_queue.put(("PASS", output.cpu().tolist()))
+    except Exception as e:
+        result_queue.put(("ERROR", str(e)))
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_named_barrier_wait_1warp_async_deadlock(device):
+    """Test that named_barrier_wait(14, 32) in 1-warp async_task deadlocks.
+
+    This test demonstrates a known deadlock scenario where a named barrier
+    with divergent code on both sides deadlocks inside an async_task.
+    The kernel is run in a subprocess with a timeout so a deadlock doesn't
+    hang the entire test suite.
+    """
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_run_kernel_diverge_both_1warp, args=(result_queue, ))
+    proc.start()
+    proc.join(timeout=15)
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=10)
+        pytest.xfail("Kernel deadlocked as expected (known issue: named_barrier_wait "
+                     "with divergent code on both sides inside async_task)")
+    elif result_queue.empty():
+        pytest.fail("Subprocess exited without producing a result")
+    else:
+        status, detail = result_queue.get()
+        if status == "PASS":
+            # If this passes, the bug has been fixed!
+            pass
+        else:
+            pytest.fail(f"Kernel raised an error: {detail}")
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
+    """Same as test_named_barrier_wait_1warp_async_deadlock but runs in the
+    current process for easier IR debugging. WARNING: will hang if the bug
+    is present — use with a timeout (e.g. ``pytest --timeout=15``)."""
+
+    @triton.jit
+    def _kernel_diverge_both_1warp_sp(output_ptr):
+        if tlx.thread_id(axis=0) % 32 == 0:
+            tl.store(output_ptr + 1, 99)  # divergence BEFORE
+        tlx.named_barrier_wait(14, 32)
+        if tlx.thread_id(axis=0) % 32 == 0:
+            tl.store(output_ptr + 0, 5)  # divergence AFTER
+
+    output = torch.zeros(2, dtype=torch.int32, device=device)
+    _kernel_diverge_both_1warp_sp[(1, )](output, num_warps=4)
+    torch.cuda.synchronize()
+    result = output.cpu().tolist()
+    assert result[0] == 5, f"Expected output[0]=5, got {result[0]}"
+    assert result[1] == 99, f"Expected output[1]=99, got {result[1]}"
