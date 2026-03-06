@@ -137,3 +137,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Test that task IDs propagate correctly through tt.map_elementwise ops and
+// into their region bodies. This validates the fix for a crash where
+// TaskIdPropagation hit an unsupported parent op (MapElementwiseOp) when
+// propagating task IDs for ops inside the map_elementwise region.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 0}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+
+  // CHECK-LABEL: @matmul_with_map_elementwise
+  //
+  // Verify ops inside the map_elementwise region get task IDs.
+  // CHECK:      "tt.map_elementwise"
+  // CHECK:        arith.constant {async_task_id = array<i32: 1, 2>} 0xFF800000 : f32
+  // CHECK:        arith.maxnumf %{{.*}}, %{{.*}} {async_task_id = array<i32: 1, 2>} : f32
+  // CHECK:        tt.map_elementwise.return {async_task_id = array<i32: 1, 2>} %{{.*}} : f32
+  //
+  // Verify the map_elementwise op itself gets the consumer task IDs.
+  // CHECK:      }) {async_task_id = array<i32: 1, 2>} :
+
+  tt.func public @matmul_with_map_elementwise(%arg0: !tt.tensordesc<tensor<128x64xf16>>, %arg1: !tt.tensordesc<tensor<64x256xf16>>, %arg2: !tt.tensordesc<tensor<128x256xf16>>, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}) {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #mma>
+    %0 = tt.get_program_id x : i32
+    %1 = tt.get_num_programs x : i32
+    scf.for %arg6 = %0 to %arg3 step %1  : i32 {
+      %2 = scf.for %arg7 = %c0_i32 to %arg5 step %c1_i32 iter_args(%arg8 = %cst) -> (tensor<128x256xf32, #mma>)  : i32 {
+        %5 = tt.descriptor_load %arg0[%arg6, %c0_i32] {async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
+        %6 = ttg.local_alloc %5 : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %7 = tt.descriptor_load %arg1[%c0_i32, %arg6] {async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<64x256xf16>> -> tensor<64x256xf16, #blocked1>
+        %8 = ttg.local_alloc %7 : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+        %9 = ttng.warp_group_dot %6, %8, %arg8 {async_task_id = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+        // Apply map_elementwise to the dot result (simulates causal mask)
+        %10 = "tt.map_elementwise"(%9) <{pack = 1 : i32}> ({
+        ^bb0(%val: f32):
+          %neg_inf = arith.constant 0xFF800000 : f32
+          %result = arith.maxnumf %val, %neg_inf : f32
+          tt.map_elementwise.return %result : f32
+        }) : (tensor<128x256xf32, #mma>) -> tensor<128x256xf32, #mma>
+        scf.yield %10 : tensor<128x256xf32, #mma>
+      }
+      %3 = arith.truncf %2 : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
+      %4 = ttg.convert_layout %3 : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
+      tt.descriptor_store %arg2[%arg6, %arg6], %4 {async_task_id = array<i32: 1, 2>} : !tt.tensordesc<tensor<128x256xf16>>, tensor<128x256xf16, #blocked1>
+    }
+    tt.return
+  }
+}

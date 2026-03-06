@@ -368,6 +368,14 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
       for (unsigned i = 0; i < op->getNumResults(); ++i)
         mapping.map(op->getResult(i), newOp->getResult(i));
       return newOp;
+    } else if (isa<triton::MapElementwiseOp>(op)) {
+      Operation *newOp = builder.clone(*op, mapping);
+      // recursively set async task ids for child ops
+      newOp->walk(
+          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        mapping.map(op->getResult(i), newOp->getResult(i));
+      return newOp;
     } else {
       llvm_unreachable("Unexpected Op with regions");
     }
