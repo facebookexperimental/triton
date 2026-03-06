@@ -332,6 +332,7 @@ class CUDABackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
+            nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
@@ -355,6 +356,7 @@ class CUDABackend(BaseBackend):
                     passes.ttgpuir.add_partition_scheduling(pm)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled)
+                nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
