@@ -21,6 +21,23 @@
 // (at #loc177) gets inserted between the qk MMAs and the consumer_waits,
 // causing the MMA to read stale/corrupted TMEM data.
 //
+// Operand-D race fix same-task guard:
+// The operand-D race fix must NOT fire for FA fwd because the tmem_store
+// (task 0, computation) and tmem_load (task 0, computation) for the
+// accumulator are in the same partition.  If it fires, a token-based
+// ProducerAcquire is inserted before the tmem_store (at #loc177) which
+// creates a deadlock.  Instead, a WaitBarrierOp (from desyncTCGen5MMAOp)
+// must appear before the accumulator tmem_store.
+//
+// Verify: wait_barrier (NOT producer_acquire with create_token) appears
+// before the accumulator tmem_store at #loc177 in the default partition.
+// The default partition appears first in the output, before partition1.
+//
+// CHECK: ttg.warp_specialize
+// CHECK: default
+// CHECK: ttng.wait_barrier {{.*}}loc(#loc177)
+// CHECK: ttng.tmem_store {{.*}}tmem.start{{.*}}loc(#loc177)
+//
 // Verify: no acc producer_acquire (loc177) appears between qk MMA
 // (cluster 2) and the acc consumer_wait (cluster 4).
 //
