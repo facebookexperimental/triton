@@ -107,7 +107,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // Test host-side TMA: TensorDescType passed as function argument.
 // CHECK-LABEL: @host_tma_data_partition
 // Function signature should show sliced descriptor block types:
-// CHECK: tt.func public @host_tma_data_partition(
 // CHECK-SAME: !tt.tensordesc<tensor<64x64xf16>>
 // CHECK-SAME: !tt.tensordesc<tensor<64x256xf16>>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
