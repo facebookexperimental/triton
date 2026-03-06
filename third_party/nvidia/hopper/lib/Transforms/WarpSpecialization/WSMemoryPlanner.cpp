@@ -543,6 +543,12 @@ public:
 
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
+    // Track whether the innermost reuse group requires TMA split copies.
+    // Buffers can share a reuse group only if they all agree on split-copy
+    // status.  Two buffers that both need split copies generate the same
+    // number of barrier arrivals per slot, so sharing is safe.  A mismatch
+    // (one needs split, the other doesn't) would cause over-arrival.
+    bool innermostNeedsSplitCopy = false;
 
     DenseMap<int, Type> idTypes;
     for (auto bufferIter : bufferRange) {
@@ -557,8 +563,10 @@ public:
           ++numD;
       }
       if (usersInInnermostLoop(owner) && numD >= 2) {
+        bool needsSplit = requiresTMASplitCopies(allocDescType);
         if (bufferIdInnermost < 0) {
           bufferIdInnermost = bufferId;
+          innermostNeedsSplitCopy = needsSplit;
           ++bufferId;
         }
         if (idTypes.count(bufferIdInnermost) == 0) {
@@ -566,15 +574,17 @@ public:
         }
         if (idTypes[bufferIdInnermost] != elemType) {
           bufferIdInnermost = bufferId;
+          innermostNeedsSplitCopy = needsSplit;
           idTypes[bufferIdInnermost] = elemType;
           ++bufferId;
         }
         // Buffers requiring TMA split copies get their own unique buffer.id
-        // to avoid sharing a barrier with other buffers. Each split copy
-        // emits a separate barrier_expect/arrive, so sharing would cause
-        // barrier over-arrival (UB per CUDA PTX spec).
+        // ONLY when the existing reuse group has a different split-copy
+        // status.  If both the group and this buffer agree (both need split
+        // or both don't), they can safely share a barrier — each slot sees
+        // the same number of arrivals regardless of which buffer occupies it.
         unsigned assignedId = bufferIdInnermost;
-        if (requiresTMASplitCopies(allocDescType)) {
+        if (needsSplit != innermostNeedsSplitCopy) {
           assignedId = bufferId;
           ++bufferId;
         }
@@ -1230,7 +1240,7 @@ public:
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
-           ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
+           ttng::TMemAllocation(allocSize.numRows, allocSize.numCols)});
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
@@ -1373,12 +1383,24 @@ public:
            << ctrlInt.end());
       for (auto t : allocsForThisLoop)
         LLVM_DEBUG(t.getOperation()->dump());
-      // Check for per-loop tt.tmem_alloc_algo attribute on the forOp.
+      // Check for per-loop tt.tmem_alloc_algo attribute on the forOp
+      // or its parent ForOps (e.g., the WS loop wrapping the innermost
+      // scheduled loop in persistent kernels).
       // 1 = greedy (allocateTMemAllocs), 2 = backtracking
       // (allocateTMemAllocs2). Default is 1 (greedy).
       int tmemAllocAlgo = 1;
       if (auto attr = ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
         tmemAllocAlgo = attr.getInt();
+      // Walk parent ForOps: outermost sets the default, innermost wins.
+      for (auto parent = ctrlOp->getParentOfType<scf::ForOp>(); parent;
+           parent = parent->getParentOfType<scf::ForOp>()) {
+        if (auto attr =
+                parent->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo")) {
+          // Only override if the innermost (ctrlOp) didn't set it.
+          if (!ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
+            tmemAllocAlgo = attr.getInt();
+        }
+      }
 
       FailureOr<unsigned> result;
       if (tmemAllocAlgo == 1) {
@@ -1428,7 +1450,10 @@ public:
 
   /// Check if candidate can potentially reuse owner's space.
   /// Returns priority: 0 = cannot reuse, 1 = can reuse, 2 = exact size match.
-  int hasPotentialReuse(BufferT *owner, BufferT *candidate) {
+  /// Uses bidirectional data dependency via SSA def-use chain walk (primary),
+  /// with samePartition fallback for cross-loop buffers where SSA chains may
+  /// be broken by loop-carried values.
+  int hasPotentialReuse(BufferT *owner, BufferT *candidate, Operation *ctrlOp) {
     // Size check: candidate must fit in owner's columns
     if (candidate->colSize > owner->colSize)
       return 0;
@@ -1437,10 +1462,7 @@ public:
     if (bufferRange[owner].intersects(bufferRange[candidate]))
       return 0;
 
-    // Bidirectional data dependency check via channels.
-    // Check bidirectional data dependency:
-    // 1. src → dst: src's consumer leads to dst's producer
-    // 2. dst → src: dst's consumer leads to src's producer
+    // Bidirectional data dependency check via channels (SSA def-use walk).
     auto *srcCh = allocToChannel[owner->owner];
     auto *dstCh = allocToChannel[candidate->owner];
     auto hasDependency = [&]() -> bool {
@@ -1451,6 +1473,7 @@ public:
         return true;
       return false;
     };
+
     if (!hasDependency())
       return 0;
 
@@ -1464,7 +1487,7 @@ public:
   /// Returns INVALID (max size_t) if can't fit.
   /// Uses hasPotentialReuse to determine if buffers can share columns.
   size_t computeColOffset(BufferT *candidate, BufferT *owner,
-                          const AllocationState &state) {
+                          const AllocationState &state, Operation *ctrlOp) {
     size_t maxColOffset = 0;
 
     // Check compatibility with existing reusers using hasPotentialReuse.
@@ -1476,8 +1499,9 @@ public:
         continue;
 
       // Check if reuser and candidate can share columns
-      bool canShareColumns = (hasPotentialReuse(reuser, candidate) > 0 ||
-                              hasPotentialReuse(candidate, reuser) > 0);
+      bool canShareColumns =
+          (hasPotentialReuse(reuser, candidate, ctrlOp) > 0 ||
+           hasPotentialReuse(candidate, reuser, ctrlOp) > 0);
       if (!canShareColumns) {
         // They can't share - place candidate after reuser's column range
         maxColOffset =
@@ -1494,7 +1518,7 @@ public:
 
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
-                   AllocationState &state, size_t maxRows) {
+                   AllocationState &state, size_t maxRows, Operation *ctrlOp) {
     // Base case: all buffers allocated
     if (idx == allocs.size())
       return true;
@@ -1504,7 +1528,7 @@ public:
     // Collect reuse candidates sorted by priority (descending)
     SmallVector<std::pair<BufferT *, int>> candidates;
     for (BufferT *owner : state.owners) {
-      int priority = hasPotentialReuse(owner, buf);
+      int priority = hasPotentialReuse(owner, buf, ctrlOp);
       if (priority > 0)
         candidates.push_back({owner, priority});
     }
@@ -1515,7 +1539,7 @@ public:
 
     // Try each reuse candidate
     for (auto &[owner, priority] : candidates) {
-      size_t colOffset = computeColOffset(buf, owner, state);
+      size_t colOffset = computeColOffset(buf, owner, state, ctrlOp);
       if (colOffset == std::numeric_limits<size_t>::max())
         continue; // Can't fit or dependency check failed
 
@@ -1531,7 +1555,7 @@ public:
       });
 
       // Recurse
-      if (tryAllocate(allocs, idx + 1, newState, maxRows)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
         state = newState;
         return true;
       }
@@ -1556,7 +1580,7 @@ public:
              << ") at row " << state.usedRows);
       });
 
-      if (tryAllocate(allocs, idx + 1, newState, maxRows)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
         state = newState;
         return true;
       }
@@ -1646,7 +1670,7 @@ public:
           if (alloc_i.getOperation() != alloc_j.getOperation()) {
             auto *buf_i = getBuffer(alloc_i.getOperation());
             auto *buf_j = getBuffer(alloc_j.getOperation());
-            int priority = hasPotentialReuse(buf_i, buf_j);
+            int priority = hasPotentialReuse(buf_i, buf_j, ctrlOp);
             if (priority > 0) {
               llvm::dbgs() << "  hasPotentialReuse(["
                            << bufferRange[buf_i].start() << "-"
@@ -1665,7 +1689,7 @@ public:
     AllocationState state;
     constexpr size_t maxRows = 512; // TMEM has 512 rows
 
-    if (!tryAllocate(allocs, 0, state, maxRows)) {
+    if (!tryAllocate(allocs, 0, state, maxRows, ctrlOp)) {
       return allocs[0].emitError(
           "allocateTMemAllocs2: failed to allocate TMEM buffers");
     }
@@ -1700,6 +1724,8 @@ public:
       // consumer partition of srcAllc vs. producer partition of dstAlloc
       auto *srcCh = allocToChannel[src];
       auto *dstCh = allocToChannel[dst];
+      if (!srcCh || !dstCh)
+        return false;
       if (getAsyncTaskIds(dstCh->getSrcOp()) ==
           getAsyncTaskIds(srcCh->getDstOp()))
         return true;
@@ -1751,6 +1777,8 @@ public:
         // Check dstPartition of alloc with srcPartiton of cand
         auto *srcCh = allocToChannel[alloc->owner];
         auto *dstCh = allocToChannel[cand->owner];
+        if (!srcCh || !dstCh)
+          return false;
         auto dstChPart = getAsyncTaskIds(dstCh->getSrcOp());
         auto srcChPart = getAsyncTaskIds(srcCh->getDstOp());
         LLVM_DEBUG(llvm::dbgs() << "Check partitions\n");
@@ -2343,12 +2371,24 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   funcOp->walk([&](scf::ForOp forOp) {
     if (!forOp->hasAttr("tt.warp_specialize"))
       return;
-    if (auto attr = forOp->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
-      effectiveSmemAllocAlgo = attr.getInt();
-    if (auto attr = forOp->getAttrOfType<IntegerAttr>("tt.smem_budget"))
-      effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
-    if (auto attr = forOp->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
-      effectiveSmemCircularReuse = attr.getValue();
+    // Walk from the WS ForOp up through parent ForOps, collecting
+    // attributes. The innermost (WS) loop has highest priority.
+    SmallVector<scf::ForOp> loopChain;
+    loopChain.push_back(forOp);
+    for (auto parent = forOp->getParentOfType<scf::ForOp>(); parent;
+         parent = parent->getParentOfType<scf::ForOp>()) {
+      loopChain.push_back(parent);
+    }
+    // Apply from outermost to innermost (innermost wins).
+    for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
+      auto loop = *it;
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+        effectiveSmemAllocAlgo = attr.getInt();
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
+        effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
+      if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+        effectiveSmemCircularReuse = attr.getValue();
+    }
   });
 
   unsigned bufferId;
