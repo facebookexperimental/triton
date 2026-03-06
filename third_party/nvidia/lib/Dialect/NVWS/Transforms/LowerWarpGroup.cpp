@@ -160,6 +160,11 @@ class LowerWarpGroup : public OpRewritePattern<WarpGroupOp> {
 
     wsOp.setPartitionNumWarps(numWarps);
 
+    // Copy partition types attribute if present
+    if (auto typesAttr = warpGroupOp->getAttr("ttg.partition.types")) {
+      wsOp->setAttr("ttg.partition.types", typesAttr);
+    }
+
     auto &defaultBlock = wsOp.getDefaultRegion().emplaceBlock();
     rewriter.setInsertionPointToEnd(&defaultBlock);
 
