@@ -165,6 +165,17 @@ public:
             getContext(), allocOp.getLoc(), allocType, srcShape, innerTy)))
       return failure();
 
+    // Verify round-trip: reshaping innerTy back to dstShape must recover
+    // allocType exactly.  This can fail when backward inference changes the
+    // encoding family (e.g. NVMMAShared → SharedLinear) and the forward
+    // direction cannot recover the original encoding.
+    MemDescType roundTripTy;
+    if (failed(MemDescReshapeOp::inferReturnTypes(
+            getContext(), allocOp.getLoc(), innerTy, dstShape, roundTripTy)))
+      return failure();
+    if (roundTripTy != allocType)
+      return failure();
+
     auto newAlloc = rewriter.create<LocalAllocOp>(allocOp.getLoc(), innerTy,
                                                   reshapeOp.getSrc());
     rewriter.replaceOpWithNewOp<MemDescReshapeOp>(allocOp, allocOp.getType(),
