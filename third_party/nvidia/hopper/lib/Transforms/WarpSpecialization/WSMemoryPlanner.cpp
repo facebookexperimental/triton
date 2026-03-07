@@ -786,7 +786,7 @@ public:
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
-           ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
+           ttng::TMemAllocation(allocSize.numRows, allocSize.numCols)});
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
