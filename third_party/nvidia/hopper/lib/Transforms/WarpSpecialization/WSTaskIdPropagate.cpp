@@ -143,25 +143,40 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
 }
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
-  // Compute the min partition to normalize to 0
+  // Compute the min partition and count total distinct partitions to normalize
+  // to 0 and identify root partition ops (ops belonging to all partitions).
   int64_t minPartition = INT64_MAX;
+  DenseSet<int64_t> allPartitionIndices;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0];
-      assert(idx >= 0);
-      minPartition = std::min(idx, minPartition);
+      for (int64_t idx : attr.asArrayRef()) {
+        assert(idx >= 0);
+        minPartition = std::min(idx, minPartition);
+        allPartitionIndices.insert(idx);
+      }
     }
   });
+  unsigned numPartitions = allPartitionIndices.size();
   DenseSet<AsyncTaskId> totalTaskIds;
-  // Convert ttg.partition to async_task_id
+  // Convert ttg.partition to async_task_id.
+  // Ops belonging to ALL partitions (root ops) are left unannotated so that
+  // the backward propagation solver assigns them the correct narrower set.
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0] - minPartition;
-      totalTaskIds.insert(idx);
-      assert(idx >= 0);
-      setAsyncTaskIds(op, idx);
+      // Collect normalized task IDs.
+      SmallVector<AsyncTaskId> taskIds;
+      for (int64_t idx : attr.asArrayRef()) {
+        int64_t normalized = idx - minPartition;
+        assert(normalized >= 0);
+        totalTaskIds.insert(normalized);
+        taskIds.push_back(normalized);
+      }
+      // Only assign task IDs for ops belonging to a strict subset of
+      // partitions.  Root partition ops (belonging to all partitions) are
+      // handled by the backward propagation solver below.
+      if (taskIds.size() < numPartitions) {
+        setAsyncTaskIds(op, taskIds);
+      }
       op->removeAttr(kPartitionAttrName);
     }
   });
