@@ -1056,7 +1056,7 @@ getInitialSchedule(scf::ForOp mainLoop,
           break;
         if (isa<ttng::TMEMStoreOp>(op))
           op.setAttr(kPartitionAttrName,
-                     b.getI32IntegerAttr(reductionPartition->getIndex()));
+                     b.getDenseI32ArrayAttr({reductionPartition->getIndex()}));
       }
     }
   }
