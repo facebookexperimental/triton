@@ -322,6 +322,14 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        # 2-CTA support: transform B loads and insert cross-CTA sync
+        # These passes detect TCGen5MMAOp with two_ctas=True and:
+        # 1. Transform B loads to load BLOCK_N/2 per CTA
+        # 2. Insert arrive_remote/wait_local sync pattern
+        if capability // 10 >= 10 and opt.cluster_dims is not None:
+            if opt.cluster_dims[0] >= 2 or opt.cluster_dims[1] >= 2 or opt.cluster_dims[2] >= 2:
+                nvidia.passes.hopper.add_2cta_transform_loads(pm)
+                nvidia.passes.hopper.add_2cta_insert_sync(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
         use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule
