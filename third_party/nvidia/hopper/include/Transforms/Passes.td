@@ -212,7 +212,9 @@ def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect",
+                           "mlir::arith::ArithDialect"];
 }
 
 def NVGPU2CTAInsertSync : Pass<"nvgpu-2cta-insert-sync", "mlir::ModuleOp"> {
@@ -233,7 +235,9 @@ def NVGPU2CTAInsertSync : Pass<"nvgpu-2cta-insert-sync", "mlir::ModuleOp"> {
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect",
+                           "mlir::arith::ArithDialect"];
 }
 
 #endif // NV_TRANSFORMS_PASSES
