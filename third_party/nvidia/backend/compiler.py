@@ -328,6 +328,9 @@ class CUDABackend(BaseBackend):
         # 1. Set two_ctas=true on TCGen5MMAOp (based on cluster config)
         # 2. Transform B loads to load BLOCK_N/2 per CTA
         # 3. Insert arrive_remote/wait_local sync pattern
+        # NOTE: These passes are skipped when WS is enabled because the WS passes
+        # restructure the IR in ways that are incompatible with the sync pattern.
+        # For WS+2CTA, use TLX which has native support.
         if capability // 10 >= 10 and opt.cluster_dims is not None:
             if opt.cluster_dims[0] >= 2 or opt.cluster_dims[1] >= 2 or opt.cluster_dims[2] >= 2:
                 nvidia.passes.hopper.add_2cta_propagate_attr(pm)

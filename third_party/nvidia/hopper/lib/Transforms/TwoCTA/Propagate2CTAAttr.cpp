@@ -10,8 +10,13 @@
 // the MMA ops but doesn't set two_ctas, so we set it here based on the cluster
 // configuration.
 //
+// NOTE: This pass is skipped when warp specialization is enabled because the
+// WS passes restructure the IR in ways that are incompatible with 2-CTA sync.
+// For WS+2CTA, use TLX which has native support.
+//
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -30,6 +35,19 @@ namespace ttng = triton::nvidia_gpu;
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace {
+
+/// Check if warp specialization is enabled on any loop
+static bool isWarpSpecializationEnabled(ModuleOp moduleOp) {
+  bool wsEnabled = false;
+  moduleOp.walk([&](scf::ForOp forOp) {
+    if (forOp->hasAttr("tt.warp_specialize")) {
+      wsEnabled = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return wsEnabled;
+}
 
 /// Check if the module is configured for 2-CTA mode based on cluster dimensions
 static bool isModule2CTAEnabled(ModuleOp moduleOp) {
@@ -66,6 +84,15 @@ struct Propagate2CTAAttrPass
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+
+    // Skip if warp specialization is enabled
+    // WS passes restructure the IR in ways that are incompatible with 2-CTA sync.
+    // For WS+2CTA, use TLX which has native support.
+    if (isWarpSpecializationEnabled(moduleOp)) {
+      LDBG("Warp specialization enabled (tt.warp_specialize attr found)");
+      LDBG("Skipping 2-CTA attribute propagation - use TLX for WS+2CTA");
+      return;
+    }
 
     // Check if module is configured for 2-CTA mode
     if (!isModule2CTAEnabled(moduleOp)) {
