@@ -136,9 +136,11 @@ def _prune_configs_for_pair_cta(configs, named_args, **kwargs):  # noqa
                                and (BLOCK_M >= 128)  # Required for 2-CTA MMA
                                )
 
-        c.kwargs["PAIR_CTA"] = pair_cta_compatible
+        # Disable PAIR_CTA for now - cluster configuration is not yet supported
+        # in the autotuning path. When enabled, requires ctas_per_cga=(2, 1, 1)
+        c.kwargs["PAIR_CTA"] = False  # pair_cta_compatible
         # Set ctas_per_cga for CUDA-native cluster launch semantics (TLX way)
-        c.ctas_per_cga = (2, 1, 1) if pair_cta_compatible else None
+        # c.ctas_per_cga = (2, 1, 1) if pair_cta_compatible else None
 
         pruned.append(c)
     return pruned
@@ -317,7 +319,8 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
 
 @triton_autotune(
     configs=get_mm_configs(pre_hook=_addmm_tma_set_block_size_hook),
-    key=["N", "K", "WARP_SPECIALIZE"],
+    key=["M", "N", "K", "WARP_SPECIALIZE"],
+    prune_configs_by={"early_config_prune": _prune_configs_for_pair_cta},
 )
 @triton.jit
 def _addmm_fwd_tma_persistent(
@@ -336,6 +339,7 @@ def _addmm_fwd_tma_persistent(
     BROADCAST_Y: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    PAIR_CTA: tl.constexpr = False,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -355,13 +359,17 @@ def _addmm_fwd_tma_persistent(
             offs_k = k * BLOCK_K
             x = x_desc.load([offs_xm, offs_k])
             w = w_desc.load([offs_k, offs_wn])
-            accumulator = tl.dot(x, w, accumulator, allow_tf32=ALLOW_TF32)
+
+            accumulator = tl.dot(x, w, accumulator, allow_tf32=ALLOW_TF32, two_ctas=PAIR_CTA)
+
+        # Full tile offset for y and z (same for both CTAs)
+        offs_wn_full = pid_n * BLOCK_N
         if BROADCAST_Y:
-            y = y_desc.load([0, offs_wn])
+            y = y_desc.load([0, offs_wn_full])
         else:
-            y = y_desc.load([offs_xm, offs_wn])
+            y = y_desc.load([offs_xm, offs_wn_full])
         z = (accumulator + y.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn], z)
+        z_desc.store([offs_xm, offs_wn_full], z)
 
 
 @triton_autotune(
@@ -829,7 +837,17 @@ def triton_addmm_fwd_tma_persistent(
     w: torch.Tensor,
     y: torch.Tensor,
     warp_specialize: bool = False,
+    pair_cta: bool = False,
 ) -> torch.Tensor:
+    """Standard Triton 2-CTA implementation using tl.dot(..., two_ctas=True).
+    
+    Args:
+        x: Input matrix (M, K)
+        w: Weight matrix (K, N)
+        y: Bias matrix (M, N) or (N,) for broadcast
+        warp_specialize: Enable warp specialization
+        pair_cta: Enable 2-CTA mode for cooperative MMA
+    """
     M, K = x.shape
     _, N = w.shape
 
@@ -840,7 +858,28 @@ def triton_addmm_fwd_tma_persistent(
     if M == 0 or N == 0:
         return z
 
-    # A dummy block value that will be overwritten when we have the real block size
+    # Configuration for PAIR_CTA mode (bypasses autotuner for proper cluster config)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    GROUP_M = 8
+
+    # Check if PAIR_CTA is compatible with the problem size
+    num_tiles_m = triton.cdiv(M, BLOCK_M)
+    num_tiles_n = triton.cdiv(N, BLOCK_N)
+    total_tiles = num_tiles_m * num_tiles_n
+
+    # PAIR_CTA (2-CTA) mode requirements
+    pair_cta_compatible = (
+        (num_tiles_m % 2 == 0) and
+        (total_tiles % 2 == 0) and
+        (BLOCK_M >= 128) and
+        (BLOCK_N >= 64)
+    )
+    PAIR_CTA = pair_cta and pair_cta_compatible
+
+    # Set ctas_per_cga for 2-CTA cluster launch
+    ctas_per_cga = (2, 1, 1) if PAIR_CTA else None
+
+    # A dummy block value that will be overwritten by the hook
     dummy_block = [1, 1]
     # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
     # argument, expected `List[int]` but got `Size`
@@ -857,28 +896,74 @@ def triton_addmm_fwd_tma_persistent(
     z_desc = TensorDescriptor(z, z.shape, z.stride(), dummy_block)
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    def grid(meta):
-        nonlocal x_desc, w_desc, z_desc
-        BLOCK_M = meta["BLOCK_M"]
-        BLOCK_N = meta["BLOCK_N"]
-        return (min(
-            NUM_SMS,
-            triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-        ), )
+    if PAIR_CTA:
+        # Use direct JIT call with ctas_per_cga for cluster launch
+        # Note: For standard tl.dot with two_ctas=True, we set PAIR_CTA=False
+        # in nargs because the kernel code loads full BLOCK_N and the backend
+        # Transform2CTALoads pass handles adding offsets. However, the descriptor
+        # shape needs to match what the kernel code expects.
+        # TODO: The current approach doesn't properly split the work - both CTAs
+        # load the same data. Need to investigate further.
+        nargs = {
+            "x_desc": x_desc,
+            "w_desc": w_desc,
+            "y_desc": y_desc,
+            "z_desc": z_desc,
+            "BLOCK_M": BLOCK_M,
+            "BLOCK_N": BLOCK_N,
+            "BLOCK_K": BLOCK_K,
+            "PAIR_CTA": False,  # Don't split W for standard tl.dot
+            "EPILOGUE_SUBTILE": False,
+            "BROADCAST_Y": is_y_1d,
+        }
+        _addmm_tma_set_block_size_hook(nargs)
 
-    _addmm_fwd_tma_persistent[grid](
-        x_desc,
-        w_desc,
-        y_desc,
-        z_desc,
-        M,
-        N,
-        K,
-        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        BROADCAST_Y=is_y_1d,
-        WARP_SPECIALIZE=warp_specialize,
-        NUM_SMS=NUM_SMS,
-    )
+        grid = (min(NUM_SMS, total_tiles), )
+
+        _addmm_fwd_tma_persistent.fn[grid](
+            x_desc,
+            w_desc,
+            y_desc,
+            z_desc,
+            M,
+            N,
+            K,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            GROUP_M=GROUP_M,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            BROADCAST_Y=is_y_1d,
+            WARP_SPECIALIZE=warp_specialize,
+            NUM_SMS=NUM_SMS,
+            PAIR_CTA=PAIR_CTA,
+            ctas_per_cga=ctas_per_cga,
+        )
+    else:
+        # Use autotuner for non-PAIR_CTA mode
+        def grid(meta):
+            nonlocal x_desc, w_desc, z_desc
+            BLOCK_M = meta["BLOCK_M"]
+            BLOCK_N = meta["BLOCK_N"]
+            return (min(
+                NUM_SMS,
+                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+            ), )
+
+        _addmm_fwd_tma_persistent[grid](
+            x_desc,
+            w_desc,
+            y_desc,
+            z_desc,
+            M,
+            N,
+            K,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            BROADCAST_Y=is_y_1d,
+            WARP_SPECIALIZE=warp_specialize,
+            NUM_SMS=NUM_SMS,
+            PAIR_CTA=False,
+        )
     return z
 
 
@@ -934,6 +1019,7 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
+    pair_cta: bool = True,
 ) -> torch.Tensor:
     M, K = x.shape
     _, N = w.shape
@@ -969,15 +1055,52 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
     # argument, expected `List[int]` but got `Size`
     z_desc = TensorDescriptor(z, z.shape, z.stride(), dummy_block)
 
-    def grid(meta):
-        BLOCK_M = meta["BLOCK_M"]
-        BLOCK_N = meta["BLOCK_N"]
-        return (min(
-            NUM_SMS,
-            triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-        ), )
+    # Configuration - use fixed config for now since we're bypassing autotuner
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    GROUP_M = 8
+    EPILOGUE_SUBTILE = True
 
-    _addmm_fwd_tma_ws_persistent[grid](
+    # Check if PAIR_CTA is compatible with the problem size
+    num_tiles_m = triton.cdiv(M, BLOCK_M)
+    num_tiles_n = triton.cdiv(N, BLOCK_N)
+    total_tiles = num_tiles_m * num_tiles_n
+
+    # PAIR_CTA (2-CTA) mode requirements:
+    # - Even number of M tiles (so CTA pairs tile evenly)
+    # - Even total tiles
+    # - BLOCK_M >= 128 for tcgen05 MMA
+    # - BLOCK_N >= 64 (each CTA loads BLOCK_N // 2)
+    pair_cta_compatible = (
+        (num_tiles_m % 2 == 0) and
+        (total_tiles % 2 == 0) and
+        (BLOCK_M >= 128) and
+        (BLOCK_N >= 64)
+    )
+    PAIR_CTA = pair_cta and pair_cta_compatible
+
+    # Set ctas_per_cga for 2-CTA cluster launch (2 CTAs in M dimension)
+    ctas_per_cga = (2, 1, 1) if PAIR_CTA else None
+
+    # Use the hook to properly set TMA descriptor block sizes
+    nargs = {
+        "x_desc": x_desc,
+        "w_desc": w_desc,
+        "y_desc": y_desc,
+        "z_desc": z_desc,
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "BLOCK_K": BLOCK_K,
+        "PAIR_CTA": PAIR_CTA,
+        "EPILOGUE_SUBTILE": EPILOGUE_SUBTILE,
+        "BROADCAST_Y": is_y_1d,
+    }
+    _addmm_tma_set_block_size_hook(nargs)
+
+    grid = (min(NUM_SMS, total_tiles), )
+
+    # Use direct JIT call (.fn[grid]) with ctas_per_cga for cluster launch
+    # This bypasses autotuner but allows passing ctas_per_cga for 2-CTA mode
+    _addmm_fwd_tma_ws_persistent.fn[grid](
         x_desc,
         w_desc,
         y_desc,
@@ -985,12 +1108,18 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
         M,
         N,
         K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         BROADCAST_Y=is_y_1d,
         NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
         NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
         NUM_SMS=NUM_SMS,
-        EPILOGUE_SUBTILE=True,
+        EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+        PAIR_CTA=PAIR_CTA,
+        ctas_per_cga=ctas_per_cga,
     )
     return z
 
@@ -1084,7 +1213,7 @@ class _AddMmFunction(torch.autograd.Function):
         ctx.save_for_backward(x, w)
         ctx.is_y_1d = y.dim() == 1
         if is_sm100_plus() and TMA_AVAILABLE and _check_tma_alignment(x, w, y):
-            if True:  # x.dtype == torch.float32 or HAS_TLX == False:
+            if x.dtype == torch.float32 or HAS_TLX == False:
                 # use TMA persistent kernel on sm100
                 return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)
             else:

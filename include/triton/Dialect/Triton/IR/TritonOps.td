@@ -684,6 +684,10 @@ def TT_DotOp : TT_Op<"dot", [Pure,
         bf16x6: implement the 6xBF16 trick. For more info see the pass in F32DotTC.cpp
         ieee: don't use TC, implement dot in software.
         If the GPU does not have Tensor cores or the inputs are not f32, this flag is ignored.
+
+        If $two_ctas is set, the op will execute a matmul across two contiguous CTAs.
+        Each CTA loads half of the B matrix (BLOCK_N/2 columns) and the results are combined.
+        This requires cluster size >= 2 in the X dimension.
     }];
 
     let arguments = (
@@ -692,7 +696,8 @@ def TT_DotOp : TT_Op<"dot", [Pure,
       TT_FpIntTensor:$b,
       TT_FpIntTensor:$c,
       DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
-      DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc
+      DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc,
+      UnitAttr:$two_ctas
     );
 
     let results = (outs TT_FpIntTensor:$d);

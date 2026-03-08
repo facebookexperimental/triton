@@ -194,6 +194,30 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
 // 2-CTA Support Passes
 //===----------------------------------------------------------------------===//
 
+def NVGPU2CTAPropagateAttr : Pass<"nvgpu-2cta-propagate-attr", "mlir::ModuleOp"> {
+  let summary = "Propagate two_ctas attribute to TCGen5MMAOp";
+
+  let description = [{
+    This pass propagates the two_ctas attribute from the module configuration
+    to TCGen5MMAOp operations. When the frontend uses `tl.dot(two_ctas=True)`,
+    the cluster-dim-x is set to 2, but AccelerateMatmul does not set two_ctas
+    on the resulting TCGen5MMAOp.
+    
+    This pass detects when cluster-dim-x == 2 and sets two_ctas=true on all
+    TCGen5MMAOp operations that meet the size requirements (M >= 64, N >= 32).
+    
+    This approach is similar to how TLX handles 2-CTA mode - TLX directly creates
+    TCGen5MMAOp with two_ctas=true. For standard Triton, we set it here based on
+    the cluster configuration.
+    
+    This pass should run after `accelerate_matmul` and before
+    `NVGPU2CTATransformLoads`.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp"> {
   let summary = "Transform loads for 2-CTA mode";
 

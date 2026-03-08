@@ -99,6 +99,8 @@ void init_triton_hopper_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
                      mlir::createNVGPUPartitionSchedulingMeta);
   // 2-CTA support passes
+  ADD_PASS_WRAPPER_0("add_2cta_propagate_attr",
+                     mlir::createNVGPU2CTAPropagateAttr);
   ADD_PASS_WRAPPER_0("add_2cta_transform_loads",
                      mlir::createNVGPU2CTATransformLoads);
   ADD_PASS_WRAPPER_0("add_2cta_insert_sync",

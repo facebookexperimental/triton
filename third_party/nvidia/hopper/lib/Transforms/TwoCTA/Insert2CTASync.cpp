@@ -157,6 +157,19 @@ static Value find2CTASyncBarrier(tt::FuncOp funcOp) {
   return result;
 }
 
+/// Check if the MMA op already has cross-CTA sync operations nearby
+/// Returns true if sync is already present (from frontend)
+static bool hasExisting2CTASync(ttng::TCGen5MMAOp mmaOp) {
+  // Check if there's a MapToRemoteBufferOp before this MMA in the same block
+  Block *block = mmaOp->getBlock();
+  for (auto it = block->begin(); it != Block::iterator(mmaOp); ++it) {
+    if (isa<ttng::MapToRemoteBufferOp>(&*it)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 struct Insert2CTASyncPass
     : public mlir::impl::NVGPU2CTAInsertSyncBase<Insert2CTASyncPass> {
   using NVGPU2CTAInsertSyncBase::NVGPU2CTAInsertSyncBase;
@@ -179,6 +192,13 @@ struct Insert2CTASyncPass
 
     for (auto mmaOp : mmaOps) {
       if (processedOps.contains(mmaOp)) {
+        continue;
+      }
+
+      // Check if sync is already present from frontend (TLX)
+      if (hasExisting2CTASync(mmaOp)) {
+        LDBG("2-CTA sync already present from frontend, skipping");
+        processedOps.insert(mmaOp);
         continue;
       }
 
