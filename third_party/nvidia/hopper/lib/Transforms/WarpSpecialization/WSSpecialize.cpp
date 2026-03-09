@@ -526,12 +526,18 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   for (AsyncTaskId asyncTaskId : nTaskIds) {
     if (asyncTaskId == 0)
       continue;
-    // HACK: hardcode 1,2,3 with 1 warp
-    // TODO: check TritonGPUAllocateWarpGroups
-    if (asyncTaskId == 1 || asyncTaskId == 2 || asyncTaskId == 3)
-      partitionNumWarps.push_back(4);
-    else
-      partitionNumWarps.push_back(4);
+    // Determine minimum warps for this partition by scanning its ops.
+    // Default to 1 warp; increase for ops that require more.
+    int32_t numWarps = 1;
+    funcOp.walk([&](Operation *op) {
+      if (!hasAsyncTaskId(op, asyncTaskId))
+        return;
+      if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
+        numWarps = std::max(numWarps, static_cast<int32_t>(4));
+      else if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp>(op))
+        numWarps = std::max(numWarps, static_cast<int32_t>(2));
+    });
+    partitionNumWarps.push_back(numWarps);
   }
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);

@@ -186,6 +186,21 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
+
+  let description = [{
+    This pass splits `ttng.async_tma_store_token_wait` ops that have attached
+    barriers into a `ttng.async_tma_store_wait` followed by one
+    `ttng.arrive_barrier` per barrier.  Running this before the LLVM lowering
+    pass allows the membar analysis to insert CTA-level barriers (bar.sync 0)
+    between the wait and the arrive, ensuring all warps complete the wait
+    before any thread signals the mbarrier.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
   let summary = "Meta warp specialization partitioning pass";
 

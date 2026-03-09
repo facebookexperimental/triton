@@ -88,4 +88,31 @@ struct NVGPUWSTMAStoreLoweringPass
   }
 };
 
+// ---------------------------------------------------------------------------
+// Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITLOWERING
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUTMAStoreTokenWaitLoweringPass
+    : public impl::NVGPUTMAStoreTokenWaitLoweringBase<
+          NVGPUTMAStoreTokenWaitLoweringPass> {
+  void runOnOperation() override {
+    SmallVector<ttng::TMAStoreTokenWaitOp> opsToLower;
+    getOperation()->walk([&](ttng::TMAStoreTokenWaitOp op) {
+      if (!op.getBarriers().empty())
+        opsToLower.push_back(op);
+    });
+    for (auto op : opsToLower) {
+      OpBuilder builder(op);
+      auto loc = op.getLoc();
+      builder.create<ttng::TMAStoreWaitOp>(loc, /*pendings=*/0);
+      for (auto barrier : op.getBarriers()) {
+        builder.create<ttng::ArriveBarrierOp>(loc, barrier, /*count=*/1);
+      }
+      op.erase();
+    }
+  }
+};
+
 } // namespace mlir

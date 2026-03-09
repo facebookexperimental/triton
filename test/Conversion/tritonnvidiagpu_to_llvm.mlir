@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm=compute-capability=90 -reconcile-unrealized-casts | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm=compute-capability=90 -reconcile-unrealized-casts | FileCheck %s
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
 #smem = #ttg.shared_memory
@@ -431,6 +431,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: tma_store_token_wait_with_barriers
   // CHECK: nvvm.cp.async.bulk.wait_group 0 {read}
+  // CHECK: nvvm.barrier0
   // CHECK: mbarrier.arrive.shared::cta.b64
   tt.func @tma_store_token_wait_with_barriers(%tma: !tt.tensordesc<tensor<128x128xf32, #shared1>>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32, %barrier: !ttg.memdesc<1xi64, #shared1, #smem, mutable>) {
     %true = arith.constant true
