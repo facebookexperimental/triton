@@ -265,7 +265,8 @@ def local_view(
     buffer_idx = _semantic._convert_elem_to_ir_value(buffer_idx, require_i64=False)
     view_handle = _semantic.builder.create_memdesc_subview(local_allocated_buffers.handle, buffer_idx)
     if isinstance(local_allocated_buffers, tlx.mbarrier):
-        return tlx.mbarrier(view_handle, 0, local_allocated_buffers.type.layout)
+        return tlx.mbarrier(view_handle, 0, local_allocated_buffers.type.layout,
+                            is_warp_barrier=local_allocated_buffers.is_warp_barrier)
     elif isinstance(local_allocated_buffers, tlx.clc_response):
         return tlx.clc_response(view_handle, 0, local_allocated_buffers.type.layout)
     else:
@@ -791,28 +792,89 @@ def async_descriptor_load(
 
 
 @tl.builtin
+def async_descriptor_prefetch_tensor(
+    desc: tl.tensor_descriptor_base,
+    offsets: list[tl.tensor],
+    pred: tl.tensor = None,
+    eviction_policy: str = "",
+    _semantic=None,
+) -> None:
+    """
+    Hint the hardware to prefetch a tensor tile from global memory into L2 cache using TMA.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    assert eviction_policy in ("", "evict_first", "evict_last"), \
+        f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    eviction = _semantic._str_to_eviction_policy(eviction_policy)
+    if pred is None:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        pred_handle = pred.handle
+    _semantic.builder.create_async_TMA_prefetch(
+        desc.handle,
+        offsets,
+        pred_handle,
+        eviction,
+    )
+
+
+@tl.builtin
 def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
     offsets: list[tl.tensor],
     eviction_policy: str = "",
+    store_reduce: str = "",
     _semantic=None,
 ) -> None:
+    """
+    Asynchronously store data from shared memory to global memory using TMA.
+
+    Args:
+        desc: Tensor descriptor for the destination
+        source: Source buffer in shared memory
+        offsets: List of offsets for each dimension
+        eviction_policy: Cache eviction policy ("", "evict_first", "evict_last")
+        store_reduce: Atomic reduction kind ("", "add", "min", "max", "and", "or", "xor")
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
+    eviction_policy = tl._unwrap_if_constexpr(eviction_policy)
+    store_reduce = tl._unwrap_if_constexpr(store_reduce)
     assert eviction_policy in ("", "evict_first", "evict_last"), (
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
+    assert store_reduce in ("", "add", "min", "max", "and", "or", "xor"), (
+        f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', or 'xor', got '{store_reduce}'")
     from triton._C.libtriton import ir
+
+    ndim = len(desc.block_shape)
+    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
+    offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
 
     evict = ir.EVICTION_POLICY.NORMAL
     if eviction_policy == "evict_first":
         evict = ir.EVICTION_POLICY.EVICT_FIRST
     elif eviction_policy == "evict_last":
         evict = ir.EVICTION_POLICY.EVICT_LAST
-    ndim = len(desc.block_shape)
-    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-    source_handle = require_nv_mma_shared_layout(source, True, _semantic.builder)
-    offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
+
+    if store_reduce == "":
+        # Regular store
+        _semantic.builder.create_async_TMA_store(desc.handle, offsets, source_handle, evict)
+    else:
+        # Atomic reduce store
+        reduce_kind_map = {
+            "add": ir.DESCRIPTOR_REDUCE_KIND.ADD,
+            "min": ir.DESCRIPTOR_REDUCE_KIND.MIN,
+            "max": ir.DESCRIPTOR_REDUCE_KIND.MAX,
+            "and": ir.DESCRIPTOR_REDUCE_KIND.AND,
+            "or": ir.DESCRIPTOR_REDUCE_KIND.OR,
+            "xor": ir.DESCRIPTOR_REDUCE_KIND.XOR,
+        }
+        reduce_kind = reduce_kind_map[store_reduce]
+        _semantic.builder.create_async_TMA_reduce(reduce_kind, desc.handle, offsets, source_handle, evict)
 
 
 @tl.builtin
@@ -857,10 +919,34 @@ def async_descriptor_store_wait(
 
 
 @tl.builtin
-def fence_async_shared(_semantic=None, ) -> None:
+def fence(scope: tl.constexpr, _semantic=None) -> None:
     """
-    Order memory operations that go through the shared memory.
+    Memory fence with the specified scope.
+
+    Args:
+        scope: "gpu" for device-scope fence ordering global/shared
+                   memory writes visible to all GPU threads.
+               "sys" for system-scope fence also visible to host CPU.
+               "async_shared" for proxy fence ordering async shared memory
+                   operations (e.g. between local_store and TMA store).
+
+    PTX equivalents:
+        scope="gpu"          → fence.acq_rel.gpu
+        scope="sys"          → fence.acq_rel.sys
+        scope="async_shared" → fence.proxy.async.shared::cta
     """
+    scope = tl._unwrap_if_constexpr(scope)
+    if scope == "async_shared":
+        _semantic.builder.create_fence_async_shared(False)
+    elif scope in ("gpu", "sys"):
+        _semantic.builder.create_threadfence(scope)
+    else:
+        raise ValueError(f"fence scope must be 'gpu', 'sys', or 'async_shared', got '{scope}'")
+
+
+@tl.builtin
+def fence_async_shared(_semantic=None) -> None:
+    """Deprecated: use ``fence("async_shared")`` instead."""
     _semantic.builder.create_fence_async_shared(False)
 
 

@@ -61,6 +61,20 @@ def TTNG_FenceAsyncSharedOp : TTNG_Op<"fence_async_shared"> {
   }];
 }
 
+def TTNG_FenceOp : TTNG_Op<"fence"> {
+  let arguments = (ins StrAttr:$scope);
+
+  let summary = "GPU or system scope memory fence";
+
+  let assemblyFormat = "attr-dict";
+
+  let extraClassDeclaration = [{
+    static bool isSupported(int computeCapability) {
+      return computeCapability >= 70;
+    }
+  }];
+}
+
 def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
   let arguments = (ins I1Attr:$relaxed);
   let assemblyFormat = "attr-dict";
@@ -266,7 +280,8 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
     I32Attr:$count,
-    Optional<I1>:$pred
+    Optional<I1>:$pred,
+    UnitAttr:$perThread
   );
 
   let assemblyFormat = [{
@@ -275,7 +290,10 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
 
   let builders = [
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value());
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*perThread=*/false);
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), perThread);
     }]>
   ];
 
@@ -419,6 +437,31 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
   }];
 }
 
+def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "prefetch data based on descriptor from global memory to L2 cache asynchronously";
+
+  let description = [{
+    This operation prefetches data from global memory into L2 cache
+    asynchronously using TMA.  Unlike `async_tma_copy_global_to_local`, this does
+    not copy data to shared memory and does not use an mbarrier.  It issues a
+    `cp.async.bulk.prefetch.tensor` instruction which is a performance hint to
+    fill the L2 cache before a subsequent TMA load.
+  }];
+
+  let arguments = (ins
+    Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
+    Variadic<I32>:$coord,
+    I1:$pred,
+    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
+  );
+
+  let assemblyFormat = [{
+    $desc `[` $coord `]` `,` $pred
+    oilist(`evictionPolicy` `=` $evict)
+    attr-dict `:` qualified(type($desc))
+  }];
+}
+
 def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
   let summary = "copy data based on descriptor from local memory to global memory asynchronously";
 
@@ -458,11 +501,13 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
     TT_DescriptorReduceKindAttr:$kind,
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$coord,
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
   );
 
   let assemblyFormat = [{
     $kind `,` $desc `[` $coord `]` $src
+    oilist(`evictionPolicy` `=` $evict)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
   }];
 }
