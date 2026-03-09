@@ -2886,98 +2886,76 @@ void insertAsyncComm(
         }
         // Get the last consumer op.
         auto *lastConsumer = getLastOpInBlock(filteredOps);
+        auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(lastConsumer);
+        if (!mmaOp)
+          continue;
+        // Assume a single task for mmaOp.
+        SmallVector<AsyncTaskId> asyncTasksMma = getAsyncTaskIds(mmaOp);
+        assert(asyncTasksMma.size() == 1 && asyncTasksMma[0] == consumerTaskId);
+        LLVM_DEBUG({
+          LDBG("unique actual consumer is gen5 mma " << masterChannel->uniqID
+                                                     << " ");
+          mmaOp->dump();
+        });
         auto iter = commChannel.consumerBarriers.find(consumerTaskId);
         Value consumerBarrier = iter->second;
-
-        if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(lastConsumer)) {
-          // Assume a single task for mmaOp.
-          SmallVector<AsyncTaskId> asyncTasksMma = getAsyncTaskIds(mmaOp);
-          assert(asyncTasksMma.size() == 1 &&
-                 asyncTasksMma[0] == consumerTaskId);
+        // Use consumerBarrier as gen5 inline barrier.
+        // Correctly set the insertion point for producerAcquire when there is a
+        // tma/gen5 channel.
+        Operation *producerAcquirePoint = headProducer;
+        if (isProducerTMA(masterChannel, isPost))
+          producerAcquirePoint = tmaHeadProducer;
+        if (producerAcquireForChannelLoop) {
           LLVM_DEBUG({
-            LDBG("unique actual consumer is gen5 mma " << masterChannel->uniqID
-                                                       << " ");
-            mmaOp->dump();
+            LDBG("move producer acquire for inline barrier "
+                 << masterChannel->uniqID << " ");
+            producerAcquireForChannelLoop->dump();
           });
-          // Use consumerBarrier as gen5 inline barrier.
-          // Correctly set the insertion point for producerAcquire when there
-          // is a tma/gen5 channel.
-          Operation *producerAcquirePoint = headProducer;
-          if (isProducerTMA(masterChannel, isPost))
-            producerAcquirePoint = tmaHeadProducer;
-          if (producerAcquireForChannelLoop) {
-            LLVM_DEBUG({
-              LDBG("move producer acquire for inline barrier "
-                   << masterChannel->uniqID << " ");
-              producerAcquireForChannelLoop->dump();
-            });
-            producerAcquirePoint = producerAcquireForChannelLoop;
-          }
-          bool addCompletionBarrier = nestedInsertionTarget == nullptr;
-          if (!addCompletionBarrier) {
-            // We need to place the commit after the for loop.
-            builder.setInsertionPointAfter(nestedInsertionTarget);
-            builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
-            builder.setAsyncTaskIdsFromOp(mmaOp);
-            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), consumerBarrier);
-            builder.clearLoopScheduleInfo();
-          }
-          auto tmemWaitBarrier = desyncTCGen5MMAOp(
-              builder, mmaOp, consumerBarrier, bufferIdx, phase,
-              masterChannel->getNumBuffers(), producerAcquirePoint,
-              regionsWithChannels, dom, true, config, addCompletionBarrier);
-          tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
-        } else {
-          continue;
+          producerAcquirePoint = producerAcquireForChannelLoop;
         }
+        bool addCompletionBarrier = nestedInsertionTarget == nullptr;
+        if (!addCompletionBarrier) {
+          // We need to place the commit after the for loop.
+          builder.setInsertionPointAfter(nestedInsertionTarget);
+          builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
+          builder.setAsyncTaskIdsFromOp(mmaOp);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               consumerBarrier);
+          builder.clearLoopScheduleInfo();
+        }
+        auto tmemWaitBarrier = desyncTCGen5MMAOp(
+            builder, mmaOp, consumerBarrier, bufferIdx, phase,
+            masterChannel->getNumBuffers(), producerAcquirePoint,
+            regionsWithChannels, dom, true, config, addCompletionBarrier);
+        tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
 
     for (const auto &token : commChannel.tokens) {
       // Use token for producer acquire and consumer release.
       if (commChannel.consumerBarriers.empty()) {
-        // Check if TMA fusion will handle this token's consumer release. If
-        // so, skip the ProducerAcquireOp because the TMA fusion code creates
-        // its own WaitBarrierOp with a separate barrier. Creating both would
-        // result in the producer waiting on two barriers but only one being
-        // arrived on (deadlock).
-        bool tmaFusionWillHandle = false;
-        for (auto *op : actualConsumerOps) {
-          if (auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(op)) {
-            SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(op);
-            if (std::find(asyncTasks.begin(), asyncTasks.end(), token.first) !=
-                asyncTasks.end()) {
-              tmaFusionWillHandle = true;
-              break;
-            }
-          }
+        // Insert ProducerAcquireOp before the producer.
+        // Even when A is nested inside B we still need to place
+        // the acquire right before the head producer to avoid
+        // reordering the barriers incorrectly. This acquire will
+        // be idemponent in the loop because we don't flip the phase.
+        auto producerAcquirePoint =
+            getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
+        builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+        if (producerAcquireForChannelLoop) {
+          builder.setInsertionPoint(producerAcquireForChannelLoop);
+          builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
+        } else {
+          builder.setInsertionPoint(producerAcquirePoint);
+          builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
         }
-
-        if (!tmaFusionWillHandle) {
-          // Insert ProducerAcquireOp before the producer.
-          // Even when A is nested inside B we still need to place
-          // the acquire right before the head producer to avoid
-          // reordering the barriers incorrectly. This acquire will
-          // be idemponent in the loop because we don't flip the phase.
-          auto producerAcquirePoint =
-              getSameLevelOp(headConsumer, tmaHeadProducer); // tmaHeadProducer;
-          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
-          if (producerAcquireForChannelLoop) {
-            builder.setInsertionPoint(producerAcquireForChannelLoop);
-            builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
-          } else {
-            builder.setInsertionPoint(producerAcquirePoint);
-            builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
-          }
-          auto acquireOp =
-              builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-                  headProducer->getLoc(), token.second, bufferIdx, phase);
-          LLVM_DEBUG({
-            LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
-            producerAcquirePoint->dump();
-          });
-        }
+        auto acquireOp =
+            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                headProducer->getLoc(), token.second, bufferIdx, phase);
+        LLVM_DEBUG({
+          LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
+          producerAcquirePoint->dump();
+        });
       }
 
       if (!commChannel.producerBarrier) {
