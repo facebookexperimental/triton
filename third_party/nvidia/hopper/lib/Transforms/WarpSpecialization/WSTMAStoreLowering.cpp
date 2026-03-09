@@ -5,6 +5,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/Support/Debug.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
