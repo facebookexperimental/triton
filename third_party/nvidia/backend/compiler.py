@@ -331,7 +331,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            nvidia.passes.hopper.add_tma_store_lowering(pm)
+            if knobs.nvidia.use_early_tma_store_lowering:
+                nvidia.passes.hopper.add_tma_store_lowering(pm)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
@@ -350,7 +351,8 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                nvidia.passes.hopper.add_tma_store_lowering(pm)
+                if knobs.nvidia.use_early_tma_store_lowering:
+                    nvidia.passes.hopper.add_tma_store_lowering(pm)
                 if knobs.nvidia.use_meta_partition:
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
