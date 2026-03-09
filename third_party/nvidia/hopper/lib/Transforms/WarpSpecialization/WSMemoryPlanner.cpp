@@ -1028,6 +1028,8 @@ public:
         return failure();
       bufferId = *result;
     }
+    // TODO: Remove this when the memory planner has the logic for allocating
+    // multi-buffer TMEM fully working.
     // Post-processing: maximize TMEM utilization by increasing buffer.copy
     // for TMEM allocs in round-robin until we approach the 512-column limit.
     // Only applies to persistent kernels where CTAs process multiple tiles.
