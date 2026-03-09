@@ -471,6 +471,10 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global">
     local memory pointed by the memory descriptor instead of a distributed
     tensor. The data copied depends on the global memory descriptor pointed to
     by `desc`.
+
+    When the optional token result is present, the token can be passed to
+    `async_tma_store_token_wait` to wait for this specific TMA store to finish
+    reading from shared memory.
   }];
 
   let arguments = (ins
@@ -480,10 +484,23 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global">
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
   );
 
+  let results = (outs Optional<TTG_AsyncToken>:$token);
+
+  let builders = [
+    OpBuilder<(ins "Value":$desc, "ValueRange":$coord, "Value":$src,
+               "triton::EvictionPolicy":$evict), [{
+      build($_builder, $_state, Type(), desc, coord, src, evict);
+    }]>,
+    OpBuilder<(ins "Value":$desc, "ValueRange":$coord, "Value":$src), [{
+      build($_builder, $_state, Type(), desc, coord, src,
+            triton::EvictionPolicy::NORMAL);
+    }]>
+  ];
+
   let assemblyFormat = [{
     $desc `[` $coord `]` $src
     oilist(`evictionPolicy` `=` $evict)
-    attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
+    attr-dict `:` qualified(type($desc)) `,` qualified(type($src)) (`->` type($token)^)?
   }];
 }
 
@@ -573,6 +590,16 @@ def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait"> {
   }];
 
   let assemblyFormat = "attr-dict";
+}
+
+def TTNG_TMAStoreTokenWaitOp : TTNG_Op<"async_tma_store_token_wait"> {
+  let summary = "wait for a specific TMA store to finish reading from shared memory.";
+  let arguments = (ins TTG_AsyncToken:$token);
+  let description = [{
+    Wait for a specific TMA store (identified by its token) to finish reading
+    from shared memory. This allows the shared memory buffer to be rewritten.
+  }];
+  let assemblyFormat = "$token attr-dict `:` type($token)";
 }
 
 def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
