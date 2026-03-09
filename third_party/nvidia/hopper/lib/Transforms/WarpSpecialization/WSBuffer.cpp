@@ -778,26 +778,31 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   LDBG("-- accumArgId after channels directly under " << accumArgId);
 
   // Handle the loop body. This order should align with the preorder that is
-  // used for accumCnts.
+  // used for accumCnts. Only handle per-region accumCnts here; reuse group
+  // accumCnts are handled in the next section. This distinction matters when
+  // there are multiple sequential inner loops sharing a reuse group: the outer
+  // loop has one shared reuse accumCnt, not one per inner loop.
   SmallVector<Operation *> dummy;
-  // Track seen ops for the reuse group section.
-  DenseSet<Operation *> seenOps;
   for (auto *op : opList) {
     if (!enclosingAChannel(op, regionsWithChannels))
       continue;
 
     auto numRes = op->getNumResults();
-    unsigned tCnts = getAccumCnts(op, regionsWithChannels, config);
-    LDBG("-- numRes, tCnts, accumArgId " << numRes << " " << tCnts << " "
-                                         << accumArgId);
-    // Each accumCnt nested under "op", it will have a corresponding argument in
-    // this "ForOp". If "op" has tCnts, this "ForOp" will have the same number
-    // of corresponding accumCnts, in the same order.
-    for (unsigned i = 0; i < tCnts; ++i) {
+    // Total accumCnts on op (per-region + reuse), used for result indexing.
+    unsigned totalTCnts = getAccumCnts(op, regionsWithChannels, config);
+    // Per-region accumCnts only (excluding reuse groups).
+    unsigned perRegionTCnts = getAccumCnts(op, regionsWithChannels, nullptr);
+    LDBG("-- numRes, totalTCnts, perRegionTCnts, accumArgId "
+         << numRes << " " << totalTCnts << " " << perRegionTCnts << " "
+         << accumArgId);
+    // Each per-region accumCnt nested under "op" has a corresponding argument
+    // in this "ForOp". Use totalTCnts for correct result offset since the op's
+    // results are ordered: [orig...] [per-region...] [reuse...].
+    for (unsigned i = 0; i < perRegionTCnts; ++i) {
       Value arg = newForOp.getBody()->getArgument(accumArgId);
-      Value endAccum = op->getResult(numRes - tCnts + i);
+      Value endAccum = op->getResult(numRes - totalTCnts + i);
       LLVM_DEBUG({
-        LDBG("-- replace use of arg with result " << numRes - tCnts + i);
+        LDBG("-- replace use of arg with result " << numRes - totalTCnts + i);
         op->dump();
       });
       // In createNewLoop, yieldOp yields the argument value directly, it is
@@ -806,13 +811,11 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       LLVM_DEBUG(yieldOp->dump());
       ++accumArgId;
     }
-    // Insert ops for control flow to ensure they aren't also processed
-    // in the reuse group section.
-    if (tCnts > 0)
-      seenOps.insert(op);
   }
 
-  // Handle reuse groups.
+  // Handle reuse groups. Reuse group accumCnts are shared across all body ops
+  // in the reuse chain, so they are always handled here (not in the per-region
+  // section above).
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
@@ -822,9 +825,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (chList.empty())
       continue;
     Operation *lastCh = chList.back();
-    // Check if we have already accounted for this accumulator via nesting.
-    if (seenOps.contains(lastCh))
-      continue;
     auto forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
                                           config, idx, false);
     Value arg = newForOp.getBody()->getArgument(accumArgId);
