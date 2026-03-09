@@ -2504,12 +2504,7 @@ void insertAsyncComm(
               // AsyncTMACopyLocalToGlobalOp -> TMAStoreTokenWaitOp
               if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
                 consumerOps.insert(user);
-                for (auto storeUser : user->getUsers()) {
-                  if (llvm::isa<ttng::TMAStoreTokenWaitOp>(storeUser)) {
-                    consumerOps.insert(storeUser);
-                    actualConsumerOps.insert(storeUser);
-                  }
-                }
+                actualConsumerOps.insert(user);
               }
             }
           }
