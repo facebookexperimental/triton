@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -48,12 +49,8 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         tensorType.getShape(), tensorType.getElementType(), encoding,
         sharedMemorySpace, /*mutableMemory=*/true);
 
-    // Create empty LocalAllocOp (no src) so createChannelPost can find
-    // the separate LocalStoreOp as the producer.
-    auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType);
-
-    // Copy register data → SMEM.
-    builder.create<ttg::LocalStoreOp>(loc, src, alloc);
+    // Allocate SMEM and copy register data into it in one step.
+    auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
 
     // Fence for ordering between software write and TMA hardware read.
     builder.create<ttng::FenceAsyncSharedOp>(loc, /*bCluster=*/false);
@@ -73,5 +70,19 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
     storeOp.erase();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Standalone pass wrapper
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUWSTMASTORELOWERING
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUWSTMAStoreLoweringPass
+    : public impl::NVGPUWSTMAStoreLoweringBase<NVGPUWSTMAStoreLoweringPass> {
+  void runOnOperation() override {
+    getOperation()->walk(
+        [&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
+  }
+};
 
 } // namespace mlir

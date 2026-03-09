@@ -172,4 +172,36 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
   ];
 }
 
+def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower descriptor stores to async TMA copies via shared memory";
+
+  let description = [{
+    This pass lowers `tt.descriptor_store` ops into an SMEM local_alloc +
+    local_store + async TMA copy sequence.  Running it as a standalone pass
+    (before partition scheduling) ensures the created `local_alloc` is visible
+    to the scheduler and can later be hoisted by buffer allocation.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
+  let summary = "Meta warp specialization partitioning pass";
+
+  let description = [{
+    The `nvgpu-partition-scheduling-meta` is Meta's version of the partition
+    scheduling pass. It analyzes the loads, MMAs, and other operations in a loop
+    that is meant to be warp specialized and determines which partitions to
+    assign to each operation.
+  }];
+
+  let options = [
+    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue stores into the computation partition "
+           "instead of creating a separate epilogue partition">
+  ];
+}
+
 #endif // NV_TRANSFORMS_PASSES
