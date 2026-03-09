@@ -57,6 +57,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      createTritonGPUProxyFenceInsertionWrapper, int32_t);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
+  ADD_PASS_WRAPPER_0("add_tma_store_buffer_reuse",
+                     ttng::createTritonNvidiaGPUTMAStoreBufferReusePass);
   ADD_PASS_WRAPPER_0("add_promote_lhs_to_tmem",
                      ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
   ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
@@ -94,6 +96,8 @@ void init_triton_hopper_passes(py::module &&m) {
                             bool);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
+  ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
+                     mlir::createNVGPUPartitionSchedulingMeta);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,

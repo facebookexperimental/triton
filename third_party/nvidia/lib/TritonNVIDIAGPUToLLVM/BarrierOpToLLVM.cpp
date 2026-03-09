@@ -55,6 +55,24 @@ struct FenceAsyncSharedOpConversion
   }
 };
 
+struct FenceOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::FenceOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::FenceOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::FenceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto ctx = rewriter.getContext();
+    auto scope = op.getScope();
+    // "gpu" -> syncscope("device"), "sys" -> syncscope("") (system scope)
+    StringRef syncscope = scope == "gpu" ? "device" : "";
+    rewriter.replaceOpWithNewOp<LLVM::FenceOp>(
+        op, LLVM::AtomicOrdering::acq_rel, StringAttr::get(ctx, syncscope));
+    return success();
+  }
+};
+
 struct InitBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::InitBarrierOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -236,40 +254,69 @@ struct ArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    bool isPerThread = op.getPerThread();
+
     bool isRemoteBarrier = false;
     if (auto barType = dyn_cast<ttg::MemDescType>(op.getAlloc().getType())) {
       isRemoteBarrier =
           isa<ttng::SharedClusterMemorySpaceAttr>(barType.getMemorySpace());
     }
 
-    // TODO: Add phase result as needed.
-    std::stringstream ptxAsm;
-    ptxAsm << "@$0 mbarrier.arrive.shared::";
-    if (isRemoteBarrier)
-      ptxAsm << "cluster";
-    else
-      ptxAsm << "cta";
-    ptxAsm << ".b64 _, [$1]";
-    if (op.getCount() > 1) {
-      ptxAsm << ", " << op.getCount();
+    if (isPerThread) {
+      // Warp arrive: every thread arrives independently, no leader pattern.
+      bool hasPred = !!op.getPred();
+      std::stringstream ptxAsm;
+      if (hasPred) {
+        ptxAsm << "@$0 ";
+      }
+      ptxAsm << "mbarrier.arrive.shared::cta.b64 _, ["
+             << (hasPred ? "$1" : "$0") << "]";
+      if (op.getCount() > 1) {
+        ptxAsm << ", " << op.getCount();
+      }
+      ptxAsm << ";";
+
+      PTXBuilder ptxBuilder;
+      SmallVector<PTXBuilder::Operand *, 2> operands;
+      if (hasPred) {
+        operands.push_back(ptxBuilder.newOperand(adaptor.getPred(), "b"));
+      }
+      operands.push_back(ptxBuilder.newOperand(adaptor.getAlloc(), "r"));
+
+      auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
+      arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
+      auto voidTy = void_ty(getContext());
+      ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
+    } else {
+      // Leader pattern: only thread 0 arrives.
+      std::stringstream ptxAsm;
+      ptxAsm << "@$0 mbarrier.arrive.shared::";
+      if (isRemoteBarrier)
+        ptxAsm << "cluster";
+      else
+        ptxAsm << "cta";
+      ptxAsm << ".b64 _, [$1]";
+      if (op.getCount() > 1) {
+        ptxAsm << ", " << op.getCount();
+      }
+      ptxAsm << ";";
+
+      TritonLLVMOpBuilder b(op.getLoc(), rewriter);
+      Value id = getThreadId(rewriter, op.getLoc());
+      Value pred = b.icmp_eq(id, b.i32_val(0));
+      if (op.getPred())
+        pred = b.and_(pred, adaptor.getPred());
+
+      PTXBuilder ptxBuilder;
+      SmallVector<PTXBuilder::Operand *, 2> operands = {
+          ptxBuilder.newOperand(pred, "b"),
+          ptxBuilder.newOperand(adaptor.getAlloc(), "r")};
+
+      auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
+      arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
+      auto voidTy = void_ty(getContext());
+      ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
     }
-    ptxAsm << ";";
-
-    TritonLLVMOpBuilder b(op.getLoc(), rewriter);
-    Value id = getThreadId(rewriter, op.getLoc());
-    Value pred = b.icmp_eq(id, b.i32_val(0));
-    if (op.getPred())
-      pred = b.and_(pred, adaptor.getPred());
-
-    PTXBuilder ptxBuilder;
-    SmallVector<PTXBuilder::Operand *, 2> operands = {
-        ptxBuilder.newOperand(pred, "b"),
-        ptxBuilder.newOperand(adaptor.getAlloc(), "r")};
-
-    auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
-    arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
-    auto voidTy = void_ty(getContext());
-    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
 
     rewriter.eraseOp(op);
     return success();
@@ -286,18 +333,11 @@ struct NamedBarrierArriveOpConversion
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    std::string ptxAsm = "bar.arrive $0, $1;";
-
-    PTXBuilder ptxBuilder;
-    SmallVector<PTXBuilder::Operand *, 2> operands = {
-        ptxBuilder.newOperand(adaptor.getBar(), "r"),
-        ptxBuilder.newOperand(adaptor.getNumThreads(), "r")};
-
-    auto arriveOp = *ptxBuilder.create<>(ptxAsm);
-    arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
-    auto voidTy = void_ty(getContext());
-    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
-
+    // Use the NVVM intrinsic which has IntrConvergent, preventing LLVM from
+    // duplicating this barrier across control flow (e.g., jump threading).
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.nvvm.barrier.cta.arrive.aligned.count",
+        TypeRange{}, {adaptor.getBar(), adaptor.getNumThreads()});
     rewriter.eraseOp(op);
     return success();
   }
@@ -312,18 +352,11 @@ struct NamedBarrierWaitOpConversion
   matchAndRewrite(triton::nvidia_gpu::NamedBarrierWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    std::string ptxAsm = "bar.sync $0, $1;";
-
-    PTXBuilder ptxBuilder;
-    SmallVector<PTXBuilder::Operand *, 2> operands = {
-        ptxBuilder.newOperand(adaptor.getBar(), "r"),
-        ptxBuilder.newOperand(adaptor.getNumThreads(), "r")};
-
-    auto waitOp = *ptxBuilder.create<>(ptxAsm);
-    waitOp(operands, /*onlyAttachMLIRArgs=*/true);
-    auto voidTy = void_ty(getContext());
-    ptxBuilder.launch(rewriter, op.getLoc(), voidTy);
-
+    // Use the NVVM intrinsic which has IntrConvergent, preventing LLVM from
+    // duplicating this barrier across control flow (e.g., jump threading).
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.nvvm.barrier.cta.sync.aligned.count", TypeRange{},
+        {adaptor.getBar(), adaptor.getNumThreads()});
     rewriter.eraseOp(op);
     return success();
   }
@@ -480,6 +513,7 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit, NVIDIA::TargetInfo &targetInfo) {
   patterns.add<FenceAsyncSharedOpConversion>(typeConverter, benefit);
+  patterns.add<FenceOpConversion>(typeConverter, benefit);
   patterns.add<InitBarrierOpConversion, InvalBarrierOpConversion>(typeConverter,
                                                                   benefit);
   patterns.add<WaitBarrierOpConversion>(typeConverter, benefit, targetInfo);

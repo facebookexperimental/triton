@@ -105,7 +105,8 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
       ChangeResult changed = condLattice->meet(taskId);
       propagateIfChanged(condLattice, changed);
     } else {
-      if (!isa<triton::FuncOp, triton::ReduceOp>(parentOp))
+      if (!isa<triton::FuncOp, triton::ReduceOp, triton::MapElementwiseOp>(
+              parentOp))
         llvm_unreachable("Other parent ops are not supported.");
     }
     parentOp = parentOp->getParentOp();
@@ -142,6 +143,19 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
       if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
         propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
                               results);
+      } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
+        // MapElementwiseOp's region terminator may have pack * num_results
+        // operands, so propagate all result task IDs to every terminator
+        // operand.
+        auto *terminator = mapOp.getScalarOp().front().getTerminator();
+        for (auto terminatorOperand : terminator->getOperands()) {
+          auto terminatorLattice = getLatticeElement(terminatorOperand);
+          for (auto resultLattice : results) {
+            ChangeResult changed =
+                terminatorLattice->meet(resultLattice->getValue());
+            propagateIfChanged(terminatorLattice, changed);
+          }
+        }
       }
     }
 
@@ -174,6 +188,16 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
     if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
                             results);
+    } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
+      auto *terminator = mapOp.getScalarOp().front().getTerminator();
+      for (auto terminatorOperand : terminator->getOperands()) {
+        auto terminatorLattice = getLatticeElement(terminatorOperand);
+        for (auto resultLattice : results) {
+          ChangeResult changed =
+              terminatorLattice->meet(resultLattice->getValue());
+          propagateIfChanged(terminatorLattice, changed);
+        }
+      }
     }
   }
 
