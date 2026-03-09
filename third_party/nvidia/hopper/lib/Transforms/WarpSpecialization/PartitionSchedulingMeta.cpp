@@ -857,7 +857,8 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
     Operation *op = worklist.pop_back_val();
     if (!seen.insert(op).second)
       continue;
-    if (hasPartition(op))
+    auto partitionIds = getPartitionIds(op);
+    if (partitionIds && partitionIds->size() != schedule.getNumPartitions())
       return true;
     iterateDefs(loop, op,
                 [&](OpResult def) { worklist.push_back(def.getDefiningOp()); });
@@ -1050,13 +1051,12 @@ getInitialSchedule(scf::ForOp mainLoop,
     // because pre-loop ops must not be added to the partition's ops list
     // (optimizeSchedule only handles in-loop ops).
     if (reductionPartition != nullptr) {
-      Builder b(loopOp->getContext());
       for (Operation &op : *loopOp->getBlock()) {
         if (&op == loopOp)
           break;
         if (isa<ttng::TMEMStoreOp>(op))
-          op.setAttr(kPartitionAttrName,
-                     b.getI32IntegerAttr(reductionPartition->getIndex()));
+          setPartition(&op, ArrayRef<int>{static_cast<int>(
+                                reductionPartition->getIndex())});
       }
     }
   }
@@ -1167,11 +1167,13 @@ getInitialSchedule(scf::ForOp mainLoop,
 
         // Duplicate the op if necessary to ensure MMA partition is only user
         if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-              return schedule.getPartition(user) == mmaPartition;
+              auto ids = getPartitionIds(user);
+              return ids && ids->contains(mmaPartition->getIndex());
             })) {
           Operation *newOp = OpBuilder(op).clone(*op);
           op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-            return schedule.getPartition(use.getOwner()) == mmaPartition;
+            auto ids = getPartitionIds(use.getOwner());
+            return ids && ids->contains(mmaPartition->getIndex());
           });
           op = newOp;
         }
@@ -1429,10 +1431,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // Look at the definitions directly feeding into this operation.
     iterateDefs(loop, op, [&](OpResult def) {
       Operation *defOp = def.getDefiningOp();
-      if (hasPartition(defOp)) {
+      if (auto partitionIds = getPartitionIds(defOp)) {
         // The input originates from an operation already assigned to a
         // partition. Add this as a def partition.
-        cluster->defPartitions.insert(schedule.getPartition(defOp));
+        for (auto id : *partitionIds) {
+          cluster->defPartitions.insert(schedule.getPartition(id));
+        }
       } else {
         // If the input is not reachable from a partition, ignore it.
         if (!hasDefPartition(loop, defOp, schedule))
@@ -1454,11 +1458,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     });
     // Check the users of the operation.
     iterateUsers(loop, op, [&](Operation *user) {
-      if (hasPartition(user)) {
+      if (auto partitionIds = getPartitionIds(user)) {
         // If the user is already assigned to a partition, add that partition as
         // one of the sink partitions.
-        Partition *userPartition = schedule.getPartition(user);
-        cluster->sinkPartitions.insert(userPartition);
+        for (auto id : *partitionIds) {
+          cluster->sinkPartitions.insert(schedule.getPartition(id));
+        }
         return;
       }
       // If the user does not already have a cluster, add it to the current
@@ -1554,20 +1559,28 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
 /// partition that they have users in. This reduces the amount of data that
 /// needs to be transferred through memory.
 void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
+  // Helper to get partition for an op, returning null if unscheduled.
+  auto getPartition = [&](Operation *op) -> Partition * {
+    auto ids = getPartitionIds(op);
+    if (!ids || ids->size() != 1)
+      return nullptr;
+    return schedule.getPartition(static_cast<unsigned>((*ids)[0]));
+  };
+
   // Walk everything in reverse so that operations are visited before their
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
     if (!isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
       return;
 
-    Partition *partition = schedule.getPartition(op);
+    Partition *partition = getPartition(op);
     if (!partition)
       return;
 
     // Record all the other partitions in which we have users.
     llvm::SmallDenseSet<Partition *, 2> userPartitions;
     for (OpOperand &use : op->getUses()) {
-      Partition *userPartition = schedule.getPartition(use.getOwner());
+      Partition *userPartition = getPartition(use.getOwner());
       if (!userPartition || userPartition == partition)
         continue;
       userPartitions.insert(userPartition);
@@ -1579,7 +1592,7 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
       setPartition(clone, userPartition);
       // Replace all users in that partition with the clone.
       op->replaceUsesWithIf(clone->getResults(), [&](OpOperand &otherUse) {
-        return schedule.getPartition(otherUse.getOwner()) == userPartition;
+        return getPartition(otherUse.getOwner()) == userPartition;
       });
     }
   });
