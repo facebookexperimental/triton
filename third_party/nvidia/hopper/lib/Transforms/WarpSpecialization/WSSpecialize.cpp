@@ -522,43 +522,17 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   // Instead of a new IfOp for each task, we create one partitionRegion.
   auto nTaskIds = getNestedAsyncTaskIds(funcOp);
-  // TODO: The per-partition warp count heuristic is only validated for
-  // kernels with <= 4 partitions. For larger partition counts, fall back
-  // to the old behavior of 4 warps per partition until AllocateWarpGroups
-  // and the rest of the pipeline are generalized.
   SmallVector<int32_t> partitionNumWarps;
-  int numPartitions = nTaskIds.size() - 1; // excludes task 0 (default)
-  if (numPartitions <= 3) {
-    for (AsyncTaskId asyncTaskId : nTaskIds) {
-      if (asyncTaskId == 0)
-        continue;
-      // Determine minimum warps for this partition by scanning its ops.
-      // Default to 1 warp; increase for ops that require more.
-      int32_t numWarps = 1;
-      funcOp.walk([&](Operation *op) {
-        if (!hasAsyncTaskId(op, asyncTaskId))
-          return;
-        if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
-                ttg::ConvertLayoutOp>(op))
-          // HACK: If we have a convert layout there are bugs in the supported
-          // layouts matching.
-          numWarps = std::max(numWarps, static_cast<int32_t>(4));
-        else if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp>(op))
-          numWarps = std::max(numWarps, static_cast<int32_t>(2));
-      });
-      partitionNumWarps.push_back(numWarps);
-    }
-  } else {
-    for (AsyncTaskId asyncTaskId : nTaskIds) {
-      if (asyncTaskId == 0)
-        continue;
-      // HACK: hardcode 1,2,3 with 1 warp
-      // TODO: check TritonGPUAllocateWarpGroups
-      if (asyncTaskId == 1 || asyncTaskId == 2 || asyncTaskId == 3)
-        partitionNumWarps.push_back(4);
-      else
-        partitionNumWarps.push_back(4);
-    }
+  // TODO: FIX FOR GEMM.
+  for (AsyncTaskId asyncTaskId : nTaskIds) {
+    if (asyncTaskId == 0)
+      continue;
+    // HACK: hardcode 1,2,3 with 1 warp
+    // TODO: check TritonGPUAllocateWarpGroups
+    if (asyncTaskId == 1 || asyncTaskId == 2 || asyncTaskId == 3)
+      partitionNumWarps.push_back(4);
+    else
+      partitionNumWarps.push_back(4);
   }
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
