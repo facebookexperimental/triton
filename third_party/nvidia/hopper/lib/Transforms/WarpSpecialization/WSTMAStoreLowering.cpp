@@ -67,7 +67,8 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         loc, tokenType, desc, indices, alloc, tt::EvictionPolicy::NORMAL);
 
     // Wait for this specific TMA store to finish reading from SMEM.
-    builder.create<ttng::TMAStoreTokenWaitOp>(loc, tmaStore.getToken());
+    builder.create<ttng::TMAStoreTokenWaitOp>(loc, tmaStore.getToken(),
+                                              ValueRange{}, ValueRange{});
 
     storeOp.erase();
   }

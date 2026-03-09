@@ -2500,6 +2500,17 @@ void insertAsyncComm(
                 consumerOps.insert(user);
                 actualConsumerOps.insert(user);
               }
+              // Also handle the early-lowered TMA store pattern:
+              // AsyncTMACopyLocalToGlobalOp -> TMAStoreTokenWaitOp
+              if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+                consumerOps.insert(user);
+                for (auto storeUser : user->getUsers()) {
+                  if (llvm::isa<ttng::TMAStoreTokenWaitOp>(storeUser)) {
+                    consumerOps.insert(storeUser);
+                    actualConsumerOps.insert(storeUser);
+                  }
+                }
+              }
             }
           }
         }
@@ -2508,6 +2519,25 @@ void insertAsyncComm(
         consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
         actualConsumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
       }
+    }
+
+    // If any actual consumer is an AsyncTMACopyLocalToGlobalOp, follow
+    // its token result to find TMAStoreTokenWaitOp and add it to
+    // actualConsumerOps. This enables barrier fusion for the early-lowered
+    // TMA store pattern (local_alloc → async_tma_copy → token_wait).
+    DenseSet<Operation *> additionalConsumerOps;
+    for (auto *op : actualConsumerOps) {
+      if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+        for (auto user : op->getUsers()) {
+          if (llvm::isa<ttng::TMAStoreTokenWaitOp>(user)) {
+            additionalConsumerOps.insert(user);
+          }
+        }
+      }
+    }
+    for (auto *op : additionalConsumerOps) {
+      consumerOps.insert(op);
+      actualConsumerOps.insert(op);
     }
 
     // Assuming all ops are under the same block.
@@ -2859,50 +2889,53 @@ void insertAsyncComm(
             // XXX: Op can have multiple async tasks
           }
         }
-        // Get the last mmaOp.
+        // Get the last consumer op.
         auto *lastConsumer = getLastOpInBlock(filteredOps);
-        auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(lastConsumer);
-        if (!mmaOp)
-          continue;
-        // Assume a single task for mmaOp.
-        SmallVector<AsyncTaskId> asyncTasksMma = getAsyncTaskIds(mmaOp);
-        assert(asyncTasksMma.size() == 1 && asyncTasksMma[0] == consumerTaskId);
-        LLVM_DEBUG({
-          LDBG("unique actual consumer is gen5 mma " << masterChannel->uniqID
-                                                     << " ");
-          mmaOp->dump();
-        });
         auto iter = commChannel.consumerBarriers.find(consumerTaskId);
         Value consumerBarrier = iter->second;
-        // Use consumerBarrier as gen5 inline barrier.
-        // Correctly set the insertion point for producerAcquire when there is a
-        // tma/gen5 channel.
-        Operation *producerAcquirePoint = headProducer;
-        if (isProducerTMA(masterChannel, isPost))
-          producerAcquirePoint = tmaHeadProducer;
-        if (producerAcquireForChannelLoop) {
+
+        if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(lastConsumer)) {
+          // Assume a single task for mmaOp.
+          SmallVector<AsyncTaskId> asyncTasksMma = getAsyncTaskIds(mmaOp);
+          assert(asyncTasksMma.size() == 1 &&
+                 asyncTasksMma[0] == consumerTaskId);
           LLVM_DEBUG({
-            LDBG("move producer acquire for inline barrier "
-                 << masterChannel->uniqID << " ");
-            producerAcquireForChannelLoop->dump();
+            LDBG("unique actual consumer is gen5 mma " << masterChannel->uniqID
+                                                       << " ");
+            mmaOp->dump();
           });
-          producerAcquirePoint = producerAcquireForChannelLoop;
+          // Use consumerBarrier as gen5 inline barrier.
+          // Correctly set the insertion point for producerAcquire when there
+          // is a tma/gen5 channel.
+          Operation *producerAcquirePoint = headProducer;
+          if (isProducerTMA(masterChannel, isPost))
+            producerAcquirePoint = tmaHeadProducer;
+          if (producerAcquireForChannelLoop) {
+            LLVM_DEBUG({
+              LDBG("move producer acquire for inline barrier "
+                   << masterChannel->uniqID << " ");
+              producerAcquireForChannelLoop->dump();
+            });
+            producerAcquirePoint = producerAcquireForChannelLoop;
+          }
+          bool addCompletionBarrier = nestedInsertionTarget == nullptr;
+          if (!addCompletionBarrier) {
+            // We need to place the commit after the for loop.
+            builder.setInsertionPointAfter(nestedInsertionTarget);
+            builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
+            builder.setAsyncTaskIdsFromOp(mmaOp);
+            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+                mmaOp->getLoc(), consumerBarrier);
+            builder.clearLoopScheduleInfo();
+          }
+          auto tmemWaitBarrier = desyncTCGen5MMAOp(
+              builder, mmaOp, consumerBarrier, bufferIdx, phase,
+              masterChannel->getNumBuffers(), producerAcquirePoint,
+              regionsWithChannels, dom, true, config, addCompletionBarrier);
+          tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+        } else {
+          continue;
         }
-        bool addCompletionBarrier = nestedInsertionTarget == nullptr;
-        if (!addCompletionBarrier) {
-          // We need to place the commit after the for loop.
-          builder.setInsertionPointAfter(nestedInsertionTarget);
-          builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
-          builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               consumerBarrier);
-          builder.clearLoopScheduleInfo();
-        }
-        auto tmemWaitBarrier = desyncTCGen5MMAOp(
-            builder, mmaOp, consumerBarrier, bufferIdx, phase,
-            masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config, addCompletionBarrier);
-        tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
       }
     }
 
@@ -3013,18 +3046,76 @@ void insertAsyncComm(
 
       // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
       // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
+      // Similarly, for TMAStoreTokenWaitOp, embed the barrier arrive
+      // directly into the wait op.
       if (commChannel.consumerBarriers.empty()) {
-        auto consumerReleasePoint =
-            consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
-        builder.setInsertionPointAfter(consumerReleasePoint);
-        builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
-        auto releaseOp =
-            builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-                consumerReleasePoint->getLoc(), token.second, bufferIdx);
-        LLVM_DEBUG({
-          LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
-          token.second.dump();
-        });
+        // Check if any actual consumer is a TMAStoreTokenWaitOp. If so,
+        // attach a barrier to it instead of creating a ConsumerReleaseOp.
+        ttng::TMAStoreTokenWaitOp tmaStoreWaitOp = nullptr;
+        for (auto *op : actualConsumerOps) {
+          if (auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(op)) {
+            SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(op);
+            if (std::find(asyncTasks.begin(), asyncTasks.end(), token.first) !=
+                asyncTasks.end()) {
+              tmaStoreWaitOp = waitOp;
+              break;
+            }
+          }
+        }
+        if (tmaStoreWaitOp) {
+          // Allocate a consumer barrier and attach it to the wait op.
+          Value consumerBarrierAlloc =
+              createBarrierAlloc(funcOp, masterChannel->getNumBuffers());
+          builder.setInsertionPoint(tmaStoreWaitOp);
+          builder.setAsyncTaskIdsFromOp(tmaStoreWaitOp);
+          builder.setLoopScheduleInfoFromOp(tmaStoreWaitOp);
+          auto barrier = getBarrierForPipelineStage(
+              builder, consumerBarrierAlloc, bufferIdx);
+          auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+              tmaStoreWaitOp->getLoc(), true, 1);
+          tmaStoreWaitOp.addBarrier(barrier, pred);
+          LLVM_DEBUG({
+            LDBG("attach barrier to TMA store token wait "
+                 << masterChannel->uniqID << " ");
+            tmaStoreWaitOp->dump();
+          });
+
+          // Create a WaitBarrierOp (producer acquire) before the head
+          // producer.
+          Operation *producerAcquirePoint = headProducer;
+          if (isProducerTMA(masterChannel, isPost))
+            producerAcquirePoint = tmaHeadProducer;
+          if (producerAcquireForChannelLoop)
+            producerAcquirePoint = producerAcquireForChannelLoop;
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+          builder.setInsertionPoint(producerAcquirePoint);
+          builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
+          auto producerBarrier = getBarrierForPipelineStage(
+              builder, consumerBarrierAlloc, bufferIdx);
+          auto loc = producerAcquirePoint->getLoc();
+          Value _1_1b =
+              builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+          Value acquirePhase =
+              builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, phase,
+                                                                  _1_1b);
+          acquirePhase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+              loc, builder.getI32Type(), acquirePhase);
+          builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+              loc, producerBarrier, acquirePhase);
+          builder.clearLoopScheduleInfo();
+        } else {
+          auto consumerReleasePoint =
+              consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
+          builder.setInsertionPointAfter(consumerReleasePoint);
+          builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
+          auto releaseOp =
+              builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  consumerReleasePoint->getLoc(), token.second, bufferIdx);
+          LLVM_DEBUG({
+            LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
+            token.second.dump();
+          });
+        }
       }
     }
 

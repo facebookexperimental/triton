@@ -2141,10 +2141,35 @@ struct TMAStoreTokenWaitOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     // TODO: Set the pending count based on the location relative to
     // the TMA store op.
+    auto loc = op.getLoc();
     auto ctx = op.getContext();
     auto isRead = UnitAttr::get(ctx);
-    rewriter.replaceOpWithNewOp<NVVM::CpAsyncBulkWaitGroupOp>(
-        op, rewriter.getI32IntegerAttr(0), isRead);
+    rewriter.create<NVVM::CpAsyncBulkWaitGroupOp>(
+        loc, rewriter.getI32IntegerAttr(0), isRead);
+
+    // Emit barrier arrives for any attached barriers (leader pattern: only
+    // thread 0 arrives).
+    TritonLLVMOpBuilder b(loc, rewriter);
+    for (auto [barrier, barrierPred] :
+         llvm::zip(adaptor.getBarriers(), adaptor.getBarrierPreds())) {
+      Value id = getThreadId(rewriter, loc);
+      Value pred = b.icmp_eq(id, b.i32_val(0));
+      pred = b.and_(pred, barrierPred);
+
+      auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, barrier, rewriter.getI64Type(), rewriter);
+
+      PTXBuilder ptxBuilder;
+      auto &arriveOp =
+          *ptxBuilder.create<>("@$0 mbarrier.arrive.shared::cta.b64 _, [$1];");
+      arriveOp({ptxBuilder.newOperand(pred, "b"),
+                ptxBuilder.newOperand(smemObj.getBase(), "r")},
+               /*onlyAttachMLIRArgs=*/true);
+      auto voidTy = void_ty(ctx);
+      ptxBuilder.launch(rewriter, loc, voidTy);
+    }
+
+    rewriter.eraseOp(op);
     return success();
   }
 };

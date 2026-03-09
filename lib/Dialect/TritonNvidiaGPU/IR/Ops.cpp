@@ -494,6 +494,11 @@ void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
   getBarriersMutable().append(barrier);
 }
 
+void TMAStoreTokenWaitOp::addBarrier(Value barrier, Value pred) {
+  getBarriersMutable().append(barrier);
+  getBarrierPredsMutable().append(pred);
+}
+
 TypedValue<MemDescType> TCGen5MMAOp::getAccumulator() { return getD(); }
 
 void TCGen5MMAOp::setAccumulator(Value accum) { getDMutable().assign(accum); }
