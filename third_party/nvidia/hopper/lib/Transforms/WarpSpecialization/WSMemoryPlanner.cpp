@@ -1410,11 +1410,15 @@ public:
     size_t usedRows = 0;
   };
 
-  /// Check if candidate can potentially reuse owner's space.
-  /// Returns priority: 0 = cannot reuse, 1 = can reuse, 2 = exact size match.
-  /// Uses bidirectional data dependency via SSA def-use chain walk (primary),
-  /// with samePartition fallback for cross-loop buffers where SSA chains may
-  /// be broken by loop-carried values.
+  /// Returns priority: 0 = cannot reuse.
+  /// Higher values indicate stronger reuse preference:
+  ///   4 = exact size + actual SSA data dependency
+  ///   3 = fits (not exact) + actual SSA data dependency
+  ///   2 = exact size + partition match only (no direct dependency)
+  ///   1 = fits (not exact) + partition match only
+  /// This ranking ensures buffers with real data dependencies (which share
+  /// barrier chains and are safe to alias) are preferred over buffers that
+  /// merely happen to be in the same partition but use independent barriers.
   int hasPotentialReuse(BufferT *owner, BufferT *candidate, Operation *ctrlOp) {
     // Size check: candidate must fit in owner's columns
     if (candidate->colSize > owner->colSize)
@@ -1436,13 +1440,15 @@ public:
       return false;
     };
 
-    if (!hasDependency())
+    bool hasActualDep = hasDependency();
+
+    if (!hasActualDep) {
       return 0;
 
-    // Priority: prefer exact size matches
-    if (candidate->colSize == owner->colSize)
-      return 2;
-    return 1;
+    bool exactSize = (candidate->colSize == owner->colSize);
+    if (hasActualDep)
+      return exactSize ? 4 : 3;
+    return exactSize ? 2 : 1;
   }
 
   /// Compute column offset for candidate in owner's reuse group.
@@ -1494,9 +1500,22 @@ public:
       if (priority > 0)
         candidates.push_back({owner, priority});
     }
-    // Sort by priority descending
-    llvm::sort(candidates, [](const auto &a, const auto &b) {
-      return a.second > b.second;
+    // Sort by priority descending, then prefer owners where the candidate
+    // fits at column offset 0 (which means it overlaps with the owner's
+    // own barrier chain — safer than packing at a non-zero offset in
+    // dead space that the owner's MMA may clobber independently).
+    // Final tiebreaker: operationId for determinism (DenseSet iteration
+    // order is non-deterministic due to pointer hashing).
+    llvm::sort(candidates, [&](const auto &a, const auto &b) {
+      if (a.second != b.second)
+        return a.second > b.second;
+      size_t colA = computeColOffset(buf, a.first, state, ctrlOp);
+      size_t colB = computeColOffset(buf, b.first, state, ctrlOp);
+      bool aAtZero = (colA == 0);
+      bool bAtZero = (colB == 0);
+      if (aAtZero != bAtZero)
+        return aAtZero;
+      return operationId[a.first->owner] < operationId[b.first->owner];
     });
 
     // Try each reuse candidate
