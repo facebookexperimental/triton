@@ -15,9 +15,6 @@ namespace mlir {
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 void doTMAStoreLowering(triton::FuncOp &funcOp) {
-  if (!triton::tools::getBoolEnv("TRITON_LOWER_TMA_STORE"))
-    return;
-
   SmallVector<tt::DescriptorStoreOp> storeOps;
   funcOp.walk([&](tt::DescriptorStoreOp op) {
     // Skip stores with non-trivial reduce semantics.
