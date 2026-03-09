@@ -543,6 +543,12 @@ public:
 
     unsigned bufferId = 0;
     int bufferIdInnermost = -1;
+    // Separate shared group for buffers requiring TMA split copies.
+    // These must not share a barrier with non-split buffers (different
+    // arrive counts), but CAN share with each other when they have the
+    // same TMA block shape (same split pattern).
+    int bufferIdSplit = -1;
+    SmallVector<int64_t> splitBlockShape;
 
     DenseMap<int, Type> idTypes;
     for (auto bufferIter : bufferRange) {
@@ -569,14 +575,25 @@ public:
           idTypes[bufferIdInnermost] = elemType;
           ++bufferId;
         }
-        // Buffers requiring TMA split copies get their own unique buffer.id
-        // to avoid sharing a barrier with other buffers. Each split copy
-        // emits a separate barrier_expect/arrive, so sharing would cause
-        // barrier over-arrival (UB per CUDA PTX spec).
+        // Buffers requiring TMA split copies must not share a barrier with
+        // non-split buffers (the split copies produce extra barrier arrives
+        // that would cause over-arrival). However, split buffers CAN share
+        // with each other when they have the same TMA block shape (same
+        // split pattern), so the barrier accounting stays symmetric.
         unsigned assignedId = bufferIdInnermost;
         if (requiresTMASplitCopies(allocDescType)) {
-          assignedId = bufferId;
-          ++bufferId;
+          auto blockShape = ttng::getTMABlockShape(allocDescType,
+                                                   /*packedSize=*/true);
+          bool needNewGroup = bufferIdSplit < 0 ||
+                              idTypes[bufferIdSplit] != elemType ||
+                              blockShape != splitBlockShape;
+          if (needNewGroup) {
+            bufferIdSplit = bufferId;
+            idTypes[bufferIdSplit] = elemType;
+            splitBlockShape = blockShape;
+            ++bufferId;
+          }
+          assignedId = bufferIdSplit;
         }
         owner->setAttr(
             "buffer.id",
@@ -833,7 +850,7 @@ public:
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
-           ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
+           ttng::TMemAllocation(allocSize.numRows, allocSize.numCols)});
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
