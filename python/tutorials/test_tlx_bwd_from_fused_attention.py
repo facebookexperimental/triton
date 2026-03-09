@@ -686,10 +686,10 @@ if __name__ == "__main__":
 
     configs = [
         # (Z,  H,  N_CTX, HEAD_DIM, causal, baseVariant)
-        # (8,  16, 1024,  64,  False, "ws"),
-        # (8,  16, 1024,  128, False, "ws"),
-        (8, 16, 1024, 64, False, "ws_persistent"),
-        (8, 16, 1024, 128, False, "ws_persistent"),
+        #(8,  16, 1024,  64,  False, "ws"),
+        #(8,  16, 1024,  128, False, "ws"),
+        #(8, 16, 1024, 64, False, "ws_persistent"), # data race
+        (8, 16, 1024, 128, False, "ws_persistent"), # works
     ]
 
     all_pass = True

@@ -1444,6 +1444,7 @@ public:
 
     if (!hasActualDep) {
       return 0;
+    }
 
     bool exactSize = (candidate->colSize == owner->colSize);
     if (hasActualDep)
