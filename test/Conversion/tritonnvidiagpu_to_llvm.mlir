@@ -170,6 +170,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: prefetch_tensormap
+  // CHECK: "prefetch.param.tensormap [ $0
+  // CHECK: return
+  tt.func @prefetch_tensormap(%desc_ptr: !tt.tensordesc<tensor<128x128xf32>>) {
+    ttng.prefetch_tensormap %desc_ptr : !tt.tensordesc<tensor<128x128xf32>>
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
 #smem = #ttg.shared_memory

@@ -314,12 +314,35 @@ struct ReinterpretTensorDescOpConversion
   }
 };
 
+struct PrefetchTensormapOpConversion
+    : public ConvertOpToLLVMPattern<ttng::PrefetchTensormapOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ttng::PrefetchTensormapOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    PTXBuilder ptxBuilder;
+    auto *descAddrOpr = ptxBuilder.newAddrOperand(adaptor.getDesc(), "l");
+    auto &prefetch = *ptxBuilder.create<>("prefetch.param.tensormap");
+    prefetch(descAddrOpr);
+
+    auto voidTy = void_ty(op->getContext());
+    ptxBuilder.launch(rewriter, loc, voidTy);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateTMAToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<TensormapCreateOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<TensormapFenceproxyAcquireOpConversion,
-               ReinterpretTensorDescOpConversion>(typeConverter, benefit);
+  patterns
+      .add<TensormapFenceproxyAcquireOpConversion,
+           PrefetchTensormapOpConversion, ReinterpretTensorDescOpConversion>(
+          typeConverter, benefit);
 }

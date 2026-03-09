@@ -875,6 +875,23 @@ def prefetch(pointer, level="L2", mask=None, _semantic=None):
 
 
 @tl.builtin
+def prefetch_tensormap(
+    desc: tl.tensor_descriptor,
+    _semantic=None,
+) -> None:
+    """
+    Prefetch a host side TMA tensor map descriptor object into cache.
+
+    This is a
+    performance hint that warms the cache for a subsequent TMA operation
+    that references the same descriptor.
+
+    :param desc: Tensor descriptor, must be initialized on the host side
+    """
+    _semantic.builder.create_prefetch_tensormap(desc.handle)
+
+
+@tl.builtin
 def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
