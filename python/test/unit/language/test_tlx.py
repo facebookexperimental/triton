@@ -5047,6 +5047,34 @@ def test_ctas_per_cga(device):
         f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell or newer for preferred cluster dimension")
+def test_preferred_ctas_per_cga(device):
+    """Test launching kernels with preferred_ctas_per_cga hint (CUDA 12.8+ preferred cluster dimension)."""
+
+    @triton.jit
+    def simple_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tl.store(x_ptr + offsets, offsets, mask=mask)
+
+    # NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    BLOCK_SIZE = 16
+    NUM_ELEMENT = 256
+    x = torch.zeros(NUM_ELEMENT, dtype=torch.float32, device=device)
+    num_blocks = triton.cdiv(NUM_ELEMENT, BLOCK_SIZE)
+    kern_kwargs = {
+        "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 4, "preferred_ctas_per_cga": (16, 1, 1), "ctas_per_cga": (2, 1, 1)
+    }
+
+    kernel = simple_kernel[(num_blocks, )](x, 256, **kern_kwargs)
+
+    assert kernel.metadata.preferred_ctas_per_cga == (2, 1, 1), (
+        f"expecting preferred_ctas_per_cga to be (2, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
+    assert kernel.metadata.cluster_dims == (1, 1, 1), (
+        f"expecting cluster_dims to be (1, 1, 1), got {kernel.metadata.cluster_dims}")
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell for TMEM")
 def test_dummy_layout_function_inlining(device):
     """Test that dummy layouts are correctly resolved when helper functions are inlined into async tasks.
