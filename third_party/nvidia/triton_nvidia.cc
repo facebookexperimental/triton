@@ -91,9 +91,9 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
 
 void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
-  ADD_PASS_OPTION_WRAPPER_4("add_hopper_warpspec",
+  ADD_PASS_OPTION_WRAPPER_5("add_hopper_warpspec",
                             mlir::createNVGPUWarpSpecialization, int, int, bool,
-                            bool);
+                            bool, int);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",

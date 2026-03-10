@@ -666,7 +666,8 @@ def _attn_bwd_dkdv(
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
-    for blk_idx in tl.range(0, num_steps, warp_specialize=warp_specialize, tmem_alloc_algo=2):
+    for blk_idx in tl.range(0, num_steps, warp_specialize=warp_specialize, tmem_alloc_algo=2, smem_alloc_algo=1,
+                            smem_budget=200000):
         q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
         qT = tl.trans(q)
         # Load m before computing qk to reduce pipeline stall.
@@ -1204,7 +1205,7 @@ for HEAD_DIM in [64, 128]:
                 "H": N_HEADS,
                 "BATCH": BATCH,
                 "HEAD_DIM": HEAD_DIM,
-                "mode": "fwd",
+                "mode": "bwd",
             },
         ))
 

@@ -331,7 +331,11 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
+            from triton.runtime.driver import driver as rt_driver
+            smem_budget = rt_driver.active.utils.get_device_properties(
+                rt_driver.active.get_current_device())["max_shared_mem"]
+            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
+                                                     smem_budget)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
@@ -353,8 +357,11 @@ class CUDABackend(BaseBackend):
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
                     passes.ttgpuir.add_partition_scheduling(pm)
+                from triton.runtime.driver import driver as rt_driver
+                smem_budget = rt_driver.active.utils.get_device_properties(
+                    rt_driver.active.get_current_device())["max_shared_mem"]
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled)
+                                                         dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
