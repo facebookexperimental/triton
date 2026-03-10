@@ -275,30 +275,12 @@ def get_warp_size() -> int:
         Warp size: 64 for AMD GPUs (wavefront), 32 for NVIDIA GPUs
 
     Raises:
-        RuntimeError: If CUDA/ROCm is not available or GPU type is not recognized
+        RuntimeError: If CUDA/ROCm is not available
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA/ROCm not available")
 
-    device_name = torch.cuda.get_device_name(0).lower()
-
-    # AMD GPUs use 64-thread wavefronts
-    # Common identifiers: "amd", "radeon", "mi" (e.g., MI250, MI300), "gfx" (e.g., gfx90a)
-    if ("amd" in device_name or "radeon" in device_name or "mi" in device_name or "gfx" in device_name):
-        return 64
-
-    # NVIDIA GPUs use 32-thread warps
-    # Common identifiers: "nvidia", "geforce", "tesla", "quadro", "rtx", "gtx",
-    # Data center GPUs: "a100", "h100", "h200", "b100", "b200", "v100", "p100"
-    if ("nvidia" in device_name or "geforce" in device_name or "tesla" in device_name or "quadro" in device_name
-            or "rtx" in device_name or "gtx" in device_name or "a100" in device_name or "h100" in device_name
-            or "h200" in device_name or "b100" in device_name or "b200" in device_name or "v100" in device_name
-            or "p100" in device_name):
-        return 32
-
-    raise RuntimeError(f"Unsupported GPU type: '{device_name}'. "
-                       "Expected AMD GPU (warp size 64) or NVIDIA GPU (warp size 32). "
-                       "Please update get_warp_size() to support this GPU.")
+    return torch.cuda.get_device_properties(0).warp_size
 
 
 def get_expected_params(D: int, warp_size: int, num_warps: int) -> dict:
