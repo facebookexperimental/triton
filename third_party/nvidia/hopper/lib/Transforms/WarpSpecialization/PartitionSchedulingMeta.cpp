@@ -1090,9 +1090,12 @@ getInitialSchedule(scf::ForOp mainLoop,
   // truncf, etc.)
   if (epiloguePartition) {
     // Stores inside loops
-    for (auto loop : loops)
+    for (auto loop : loops) {
       for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
         tryScheduleOp(epiloguePartition, op);
+      for (StoreOp op : loop.getOps<StoreOp>())
+        setPartition(op, epiloguePartition);
+    }
 
     // Also schedule categorized epilogue stores (includes post-loop stores for
     // bwd) and their backward slice (tmem_load, truncf that feed into them)
