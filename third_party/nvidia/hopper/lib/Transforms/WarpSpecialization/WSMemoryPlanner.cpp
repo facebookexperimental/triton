@@ -47,25 +47,6 @@ namespace mlir {
 
 using OperationListT = std::vector<Operation *>;
 
-// Check if a SMEM allocation requires TMA split copies. This happens when the
-// TMA block shape (clamped by swizzle) is smaller than the shapePerCTA in any
-// dimension, causing the codegen to emit multiple cp.async.bulk.tensor ops.
-// Buffers requiring split copies must not share a reuse group (and thus a
-// barrier) with other buffers, because each copy emits a separate
-// barrier_expect/arrive on the shared barrier, causing over-arrival.
-static bool requiresTMASplitCopies(ttg::MemDescType memDescTy) {
-  auto encoding = memDescTy.getEncoding();
-  if (!isa<ttg::NVMMASharedEncodingAttr>(encoding))
-    return false;
-  auto blockShape = ttng::getTMABlockShape(memDescTy, /*packedSize=*/true);
-  auto shapePerCTA = ttg::getShapePerCTA(memDescTy);
-  for (size_t i = 0; i < shapePerCTA.size(); ++i) {
-    if (blockShape[i] != shapePerCTA[i])
-      return true;
-  }
-  return false;
-}
-
 //===----------------------------------------------------------------------===//
 // MemoryPlannerBase - Abstract base class for memory planners
 //===----------------------------------------------------------------------===//
@@ -569,19 +550,10 @@ public:
           idTypes[bufferIdInnermost] = elemType;
           ++bufferId;
         }
-        // Buffers requiring TMA split copies get their own unique buffer.id
-        // to avoid sharing a barrier with other buffers. Each split copy
-        // emits a separate barrier_expect/arrive, so sharing would cause
-        // barrier over-arrival (UB per CUDA PTX spec).
-        unsigned assignedId = bufferIdInnermost;
-        if (requiresTMASplitCopies(allocDescType)) {
-          assignedId = bufferId;
-          ++bufferId;
-        }
         owner->setAttr(
             "buffer.id",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
-                             assignedId));
+                             bufferIdInnermost));
         owner->setAttr(
             "buffer.copy",
             IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
