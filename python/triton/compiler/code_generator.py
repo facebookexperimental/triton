@@ -1195,6 +1195,8 @@ class CodeGenerator(ast.NodeVisitor):
         loop_unroll_factor = None
         disallow_acc_multi_buffer = False
         data_partition_factor = None
+        merge_epilogue = False
+        tmem_alloc_algo = None
         flatten = False
         warp_specialize = False
         disable_licm = False
@@ -1210,6 +1212,8 @@ class CodeGenerator(ast.NodeVisitor):
             loop_unroll_factor = iterator.loop_unroll_factor
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
             data_partition_factor = iterator.data_partition_factor
+            merge_epilogue = iterator.merge_epilogue
+            tmem_alloc_algo = iterator.tmem_alloc_algo
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
@@ -1234,6 +1238,12 @@ class CodeGenerator(ast.NodeVisitor):
         # induction variable type
         if not lb.dtype.is_int() or not ub.dtype.is_int() or not step.dtype.is_int():
             raise TypeError(f"For loop bounds and step must all be ints, are ({lb.dtype}, {ub.dtype}, {step.dtype})")
+        if _is_non_scalar_tensor(lb):
+            raise TypeError(f"For lower bound must be a scalar, got {lb.type}")
+        if _is_non_scalar_tensor(ub):
+            raise TypeError(f"For upper bound must be a scalar, got {ub.type}")
+        if _is_non_scalar_tensor(step):
+            raise TypeError(f"For step must be a scalar, got {step.type}")
         iv_type = self.semantic.integer_promote_impl(lb.dtype, ub.dtype)
         iv_type = self.semantic.integer_promote_impl(iv_type, step.dtype)
         iv_ir_type = iv_type.to_ir(self.builder)
@@ -1271,6 +1281,10 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
+            if merge_epilogue:
+                for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
+            if tmem_alloc_algo is not None:
+                for_op.set_attr("tt.tmem_alloc_algo", self.builder.get_int32_attr(tmem_alloc_algo))
             if disable_licm:
                 for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
 

@@ -17,6 +17,7 @@ class ForOp;
 } // namespace mlir
 
 static constexpr char kPartitionAttrName[] = "ttg.partition";
+static constexpr char kPartitionOutputsAttrName[] = "ttg.partition.outputs";
 static constexpr char kPartitionStagesAttrName[] = "ttg.partition.stages";
 static constexpr char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
 
@@ -128,6 +129,7 @@ void setPartition(Operation *op, const SetVector<Partition *> &partitions);
 // Annotate the op with the partition indices. It should only be used in a pass
 // which does not work with Partition instances and iterate* functions, since
 // it does not keep the op attributes and the op list of a partition in sync.
+void setPartition(Operation *op, ArrayRef<int> partitionIds);
 void setPartition(Operation *op, const SetVector<int> &partitionIds);
 
 std::optional<SetVector<int>> getPartitionIds(Operation *op);

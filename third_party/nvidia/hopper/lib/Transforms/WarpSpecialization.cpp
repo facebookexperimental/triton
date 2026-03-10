@@ -22,6 +22,7 @@ namespace mlir {
 static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   OpPrintingFlags flags;
   flags.enableDebugInfo();
+  flags.printNameLocAsPrefix(true);
   return flags;
 }
 
@@ -89,7 +90,6 @@ public:
 
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-    // FIXME: skip data partitioning with on-host TMA.
     // FIXME: skip data partitioning for Blackwell.
     bool ForBlackWell = (capability / 10) > 9;
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;

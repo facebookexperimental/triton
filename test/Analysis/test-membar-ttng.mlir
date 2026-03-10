@@ -176,21 +176,70 @@ tt.func @barrier_between_same_index_init_inval() {
 // -----
 
 // CHECK-LABEL: tmem_copy_after_alloc
-#blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
 
 //#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 module attributes {"ttg.num-warps" = 4 : i32} {
-  tt.func @tmem_copy_after_alloc(%arg0: tensor<1x2048xf8E4M3FN, #blocked>) {
+  tt.func @tmem_copy_after_alloc(%arg0: tensor<128x16xf8E4M3FN, #blocked>) {
     // CHECK: local_alloc
-    %0 = ttg.local_alloc %arg0 {allocation.offset = 53248 : i32} : (tensor<1x2048xf8E4M3FN, #blocked>) -> !ttg.memdesc<1x2048xf8E4M3FN, #shared, #smem>
+    %0 = ttg.local_alloc %arg0 {allocation.offset = 53248 : i32} : (tensor<128x16xf8E4M3FN, #blocked>) -> !ttg.memdesc<128x16xf8E4M3FN, #shared, #smem>
     // CHECK: tmem_alloc
     %1 = ttng.tmem_alloc  {tensor_memory_col_offset = 256 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
     // gpu.barrier
     // CHECK: tmem_copy
-    ttng.tmem_copy %0, %1 : !ttg.memdesc<1x2048xf8E4M3FN, #shared, #smem>, !ttg.memdesc<128x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
+    ttng.tmem_copy %0, %1 : !ttg.memdesc<128x16xf8E4M3FN, #shared, #smem>, !ttg.memdesc<128x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
     tt.return
   }
+}
+
+// -----
+
+// Verify that a perThread arrive after a shared memory write does NOT get a
+// gpu.barrier inserted before it. The perThread attribute opts out of the
+// CTA-wide fence because each thread's program order guarantees its own SMEM
+// ops complete before its arrive.
+
+#shared_pt = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#blocked_pt = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#A_SHARED_pt = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
+// CHECK-LABEL: @no_barrier_before_perthread_arrive
+tt.func @no_barrier_before_perthread_arrive(%arg: tensor<32x16xf16, #blocked_pt>) {
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_pt, #ttg.shared_memory, mutable>
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_pt, #ttg.shared_memory, mutable>
+  //      CHECK: ttg.local_store
+  // CHECK-NEXT: ttng.arrive_barrier
+  //  CHECK-NOT: gpu.barrier
+  //      CHECK: tt.return
+  ttg.local_store %arg, %alloc : tensor<32x16xf16, #blocked_pt> -> !ttg.memdesc<32x16xf16, #A_SHARED_pt, #ttg.shared_memory, mutable>
+  ttng.arrive_barrier %barrier, 1 {perThread} : !ttg.memdesc<1xi64, #shared_pt, #ttg.shared_memory, mutable>
+  tt.return
+}
+}
+
+// -----
+
+// Verify that a regular (non-perThread) arrive after a shared memory write
+// DOES get a gpu.barrier inserted before it (existing behavior preserved).
+
+#shared_reg = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#blocked_reg = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#A_SHARED_reg = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
+// CHECK-LABEL: @barrier_before_regular_arrive
+tt.func @barrier_before_regular_arrive(%arg: tensor<32x16xf16, #blocked_reg>) {
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_reg, #ttg.shared_memory, mutable>
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  //      CHECK: ttg.local_store
+  // CHECK-NEXT: gpu.barrier
+  // CHECK-NEXT: ttng.arrive_barrier
+  ttg.local_store %arg, %alloc : tensor<32x16xf16, #blocked_reg> -> !ttg.memdesc<32x16xf16, #A_SHARED_reg, #ttg.shared_memory, mutable>
+  ttng.arrive_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
+  tt.return
+}
 }

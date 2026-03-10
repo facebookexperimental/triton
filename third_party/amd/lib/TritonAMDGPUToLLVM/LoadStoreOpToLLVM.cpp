@@ -884,7 +884,7 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    auto srcTy = op.getSrc().getType();
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
 
     auto dstTy = op.getResult().getType();
     auto dstEnc = dstTy.getEncoding();

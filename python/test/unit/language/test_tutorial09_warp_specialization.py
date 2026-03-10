@@ -256,6 +256,7 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -340,6 +341,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -436,6 +438,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
