@@ -1093,8 +1093,17 @@ getInitialSchedule(scf::ForOp mainLoop,
     for (auto loop : loops) {
       for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
         tryScheduleOp(epiloguePartition, op);
-      for (StoreOp op : loop.getOps<StoreOp>())
-        setPartition(op, epiloguePartition);
+      // Schedule regular StoreOps to epilogue only when the loop has no
+      // DescriptorStoreOps. When DescriptorStoreOps exist (e.g., FA kernels),
+      // they handle the main output via TMA and any additional StoreOps are
+      // auxiliary metadata (e.g., LSE) that should stay in the computation
+      // partition to avoid cross-partition TMEM overhead. When there are no
+      // DescriptorStoreOps (e.g., GEMM with tl.store), the StoreOps ARE the
+      // main output and should go to epilogue for warp-specialization overlap.
+      if (loop.getOps<DescriptorStoreOp>().empty()) {
+        for (StoreOp op : loop.getOps<StoreOp>())
+          tryScheduleOp(epiloguePartition, op);
+      }
     }
 
     // Also schedule categorized epilogue stores (includes post-loop stores for
