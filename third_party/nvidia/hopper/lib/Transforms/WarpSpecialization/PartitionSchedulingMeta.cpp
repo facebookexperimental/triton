@@ -1102,7 +1102,7 @@ getInitialSchedule(scf::ForOp mainLoop,
       // main output and should go to epilogue for warp-specialization overlap.
       if (loop.getOps<DescriptorStoreOp>().empty()) {
         for (StoreOp op : loop.getOps<StoreOp>())
-          tryScheduleOp(epiloguePartition, op);
+          setPartition(op, epiloguePartition);
       }
     }
 
