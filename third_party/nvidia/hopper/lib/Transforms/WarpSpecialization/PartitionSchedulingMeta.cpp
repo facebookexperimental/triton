@@ -1551,7 +1551,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
       }
       if (hasReduction && !hasEpilogue && existingComputation) {
         for (Operation *op : cluster.ops)
-          schedule.insert(existingComputation, op);
+          setPartition(op, existingComputation);
         continue;
       }
       Partition *newPartition = schedule.addPartition(0);

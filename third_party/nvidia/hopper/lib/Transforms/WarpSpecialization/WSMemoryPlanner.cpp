@@ -1436,18 +1436,8 @@ public:
       return false;
     };
 
-    if (!hasDependency()) {
-      // SSA walk didn't find a dependency. For cross-loop buffers, fall
-      // back to partition matching (async task ID comparison) since
-      // loop-carried values break SSA chains.
-      if (!isInSameLoop(owner, ctrlOp)) {
-        if (!samePartition(owner, candidate, 2) &&
-            !samePartition(owner, candidate, 1))
-          return 0;
-      } else {
-        return 0;
-      }
-    }
+    if (!hasDependency())
+      return 0;
 
     // Priority: prefer exact size matches
     if (candidate->colSize == owner->colSize)
