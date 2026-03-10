@@ -1202,7 +1202,7 @@ public:
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
           {alloc.getOperation(),
-           ttng::TMemAllocation(allocSize.numCols, allocSize.numRows)});
+           ttng::TMemAllocation(allocSize.numRows, allocSize.numCols)});
       allocToChannel[alloc.getOperation()] = TheCh;
     }
     // Sort allocs according to isOperandD, size, live interval.
@@ -1686,6 +1686,8 @@ public:
       // consumer partition of srcAllc vs. producer partition of dstAlloc
       auto *srcCh = allocToChannel[src];
       auto *dstCh = allocToChannel[dst];
+      if (!srcCh || !dstCh)
+        return false;
       if (getAsyncTaskIds(dstCh->getSrcOp()) ==
           getAsyncTaskIds(srcCh->getDstOp()))
         return true;
@@ -1737,6 +1739,8 @@ public:
         // Check dstPartition of alloc with srcPartiton of cand
         auto *srcCh = allocToChannel[alloc->owner];
         auto *dstCh = allocToChannel[cand->owner];
+        if (!srcCh || !dstCh)
+          return false;
         auto dstChPart = getAsyncTaskIds(dstCh->getSrcOp());
         auto srcChPart = getAsyncTaskIds(srcCh->getDstOp());
         LLVM_DEBUG(llvm::dbgs() << "Check partitions\n");
