@@ -2815,12 +2815,18 @@ def test_barrier_live_range(device):
 
         bars2 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=2)
         tlx.barrier_arrive(bars2[0])
+        # No-op wait to avoid pruning.
+        tlx.barrier_wait(bar=bars2[0], phase=1)
 
         bars3 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=3)
         tlx.barrier_arrive(bars3[0])
+        # No-op wait to avoid pruning.
+        tlx.barrier_wait(bar=bars3[0], phase=1)
 
         # bars1 and bars2 should both be live here
         tlx.barrier_arrive(bars1[0])
+        # No-op wait to avoid pruning.
+        tlx.barrier_wait(bar=bars1[0], phase=0)
 
     torch.manual_seed(0)
     kernel = bar_live_kernel[(2, 1)]()
