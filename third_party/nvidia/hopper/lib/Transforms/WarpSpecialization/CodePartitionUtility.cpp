@@ -665,6 +665,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // op is a user of the channel. accumCnt is the corresponding argument of the
   // parentForOp.
   // Go through chList in the parentForOp to find ch's position.
+  // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
   auto parentForOp = op->getParentOfType<scf::ForOp>();
   // Walk up to the ForOp that actually carries the reuse accumCnt, matching

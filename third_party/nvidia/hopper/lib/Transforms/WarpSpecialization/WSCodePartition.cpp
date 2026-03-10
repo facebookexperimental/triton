@@ -2896,8 +2896,10 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               consumerBarrier);
+          auto indexedConsumerBarrier =
+              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), indexedConsumerBarrier);
           builder.clearLoopScheduleInfo();
         }
         auto tmemWaitBarrier = desyncTCGen5MMAOp(
