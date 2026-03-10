@@ -664,8 +664,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   }
   // op is a user of the channel. accumCnt is the corresponding argument of the
   // parentForOp.
-  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
-  // FIXME: handle the case where ch is inside in IfOp.
+  // Go through chList in the parentForOp to find ch's position.
   SmallVector<Operation *> chList;
   auto parentForOp = op->getParentOfType<scf::ForOp>();
   // Walk up to the ForOp that actually carries the reuse accumCnt, matching
@@ -679,6 +678,31 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
+  // When chList has only 1 entry, the buffer doesn't rotate within this
+  // loop — all iterations use the same buffer. Walk up to the enclosing
+  // ForOp that has multiple entries, so the buffer index is computed from
+  // the outer loop's counter instead.
+  if (chList.size() == 1) {
+    auto outerForOp = parentForOp->getParentOfType<scf::ForOp>();
+    while (outerForOp && !needAccumCntForReuse(outerForOp.getOperation(),
+                                               config->getGroup(reuseGroupIdx)))
+      outerForOp = outerForOp->getParentOfType<scf::ForOp>();
+    if (outerForOp) {
+      parentForOp = outerForOp;
+      chList.clear();
+      getReuseChannels(config->getGroup(reuseGroupIdx),
+                       parentForOp.getOperation(), chList);
+      // Re-fetch accumCnt from the outer ForOp's body arg.
+      unsigned reuseArgIdx =
+          getReuseAccumArgIdx(outerForOp.getOperation(), regionsWithChannels,
+                              config, reuseGroupIdx);
+      unsigned tSize = outerForOp.getBody()->getArguments().size();
+      unsigned outerTCnts =
+          getAccumCnts(outerForOp, regionsWithChannels, config);
+      accumCnt =
+          outerForOp.getBody()->getArgument(tSize - outerTCnts + reuseArgIdx);
+    }
+  }
   int vecIdx = 0, theIdx = -1;
   for (auto *tCh : chList) {
     if (tCh == ch->getDstOp()) {
@@ -686,6 +710,26 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       break;
     }
     ++vecIdx;
+  }
+  // If not found directly, the DstOp may be nested inside an inner
+  // ForOp/IfOp that appears in chList. Walk up from the DstOp to find
+  // the enclosing op that is a direct child of parentForOp's body.
+  // This is used for TMEM-multibuffer of operand D with GEMM, where
+  // we update the output per iteration of the outer loop.
+  if (theIdx < 0) {
+    Operation *enclosing = ch->getDstOp();
+    while (enclosing && enclosing->getParentOp() != parentForOp.getOperation())
+      enclosing = enclosing->getParentOp();
+    if (enclosing) {
+      int idx = 0;
+      for (auto *tCh : chList) {
+        if (tCh == enclosing) {
+          theIdx = idx;
+          break;
+        }
+        ++idx;
+      }
+    }
   }
   // If not found, this may be a backward channel whose dstOp was excluded from
   // chList. Find its forward partner and use that partner's position so both
@@ -711,6 +755,24 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                 break;
               }
               ++fwdIdx;
+            }
+            // If not found directly, walk up from fwdCh's DstOp to find
+            // the enclosing op that is a direct child of parentForOp.
+            if (theIdx < 0) {
+              Operation *enclosing = fwdCh->getDstOp();
+              while (enclosing &&
+                     enclosing->getParentOp() != parentForOp.getOperation())
+                enclosing = enclosing->getParentOp();
+              if (enclosing) {
+                int idx = 0;
+                for (auto *tCh : chList) {
+                  if (tCh == enclosing) {
+                    theIdx = idx;
+                    break;
+                  }
+                  ++idx;
+                }
+              }
             }
             break;
           }
