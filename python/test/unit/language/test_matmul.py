@@ -842,11 +842,10 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, mfma_no
     triton_out = torch.empty((M, N), device=x.device)
 
     kernel_kwargs = {}
-    if is_hip():
-        kernel_kwargs["matrix_instr_nonkdim"] = mfma_nonkdim
+    kernel_kwargs["matrix_instr_nonkdim"] = mfma_nonkdim
 
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
-    _gemm_afp4_wfp4_kernel_preshuffled_scales_cdna4[grid](
+    k = _gemm_afp4_wfp4_kernel_preshuffled_scales_cdna4[grid](
         x,
         w,
         triton_out,
@@ -877,6 +876,9 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, mfma_no
     )
     triton_out = triton_out.to(torch.float32)
     torch.testing.assert_close(torch_out, triton_out)
+    if is_hip() and preshuffle:
+        assert "tilesPerWarp = [2, 2]" in k.asm["ttgir"]
+        assert "ds_read_u8" not in k.asm["amdgcn"]
 
 
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 512), (998, 111, 512), (63, 128, 512)])

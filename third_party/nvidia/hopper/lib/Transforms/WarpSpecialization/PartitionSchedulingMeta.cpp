@@ -862,7 +862,7 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
     if (!seen.insert(op).second)
       continue;
     auto partitionIds = getPartitionIds(op);
-    if (partitionIds && partitionIds->size() != schedule.getNumPartitions())
+    if (partitionIds)
       return true;
     iterateDefs(loop, op,
                 [&](OpResult def) { worklist.push_back(def.getDefiningOp()); });
