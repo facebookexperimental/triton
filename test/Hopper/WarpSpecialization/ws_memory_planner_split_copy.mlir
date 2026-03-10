@@ -1,21 +1,18 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner=num-buffers=3 | FileCheck %s
 
-// Test: When a SMEM buffer requires TMA split copies (inner dim exceeds the
-// swizzle byte width), the memory planner assigns it a unique buffer.id.
-// This prevents it from sharing a barrier with other buffers, since each split
-// copy emits a separate barrier_expect/arrive, and sharing would cause barrier
-// over-arrival (UB per CUDA PTX spec).
+// Test: When two SMEM buffers are in the same innermost loop but one requires
+// TMA split copies (inner dim exceeds the swizzle byte width), the memory
+// planner assigns both the same buffer.id. The code partition pass later
+// merges consumer groups for channels sharing a reuse group, so a single
+// barrier_expect + wait is emitted.
 //
 // A_smem (128x64xf16, swizzle=128): inner dim = 64 × 2B = 128B = swizzle → no split
 // B_smem (64x128xf16, swizzle=128): inner dim = 128 × 2B = 256B > swizzle → split needed
-//
-// Without the fix, both allocs would share buffer.id = 0 (same innermost loop).
-// With the fix, B_smem gets a separate buffer.id to use its own barrier.
 
 // CHECK-LABEL: @tma_split_copy_separate_buffer_id
 // CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32}
 // CHECK-SAME: 128x64xf16
-// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 1 : i32}
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32}
 // CHECK-SAME: 64x128xf16
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

@@ -15,6 +15,13 @@ def alloc_fn(size: int, align: int, stream: Optional[int]):
     return torch.empty(size, dtype=torch.int8, device=DEVICE)
 
 
+@triton.jit
+def _get_bufidx_phase(accum_cnt, NUM_BUFFERS):
+    bufIdx = accum_cnt % NUM_BUFFERS
+    phase = (accum_cnt // NUM_BUFFERS) & 1
+    return bufIdx, phase
+
+
 def matmul_tma_set_block_size_hook(nargs):
     BLOCK_M = nargs["BM"]
     BLOCK_N = nargs["BN"]
@@ -28,6 +35,9 @@ def matmul_tma_set_block_size_hook(nargs):
         nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N // 2]
     else:
         nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N]
+    # Add NUM_SMS
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    nargs["NUM_SMS"] = NUM_SMS
 
 
 @triton.autotune(
@@ -69,6 +79,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                          NUM_MMA_WARPS: tl.constexpr,  #
                          NUM_MMA_GROUPS: tl.constexpr,  #
                          EPILOGUE_SUBTILE: tl.constexpr,  #
+                         NUM_SMS: tl.constexpr,  #
                          USE_WARP_BARRIER: tl.constexpr = False,  #
                          ):
     # Descriptor
@@ -96,111 +107,125 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
     with tlx.async_tasks():
         # Producer (async load)
         with tlx.async_task("default"):
-            pid = tl.program_id(axis=0)
+            sm_id = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BM)
             num_pid_n = tl.cdiv(N, BN)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            group_id = pid // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + (pid % group_size_m)
-            pid_n = (pid % num_pid_in_group) // group_size_m
-            offset_am = pid_m * BM
-            offset_bn = pid_n * BN
+            num_tiles = num_pid_m * num_pid_n
 
-            # Assuming NUM_STAGES = 2
-            # p should be 1, 1, 0, 0, 1, 1, 0, 0, ...
-            p = 1
+            # Persistent loop - each SM processes tiles with stride NUM_SMS
+            tile_id = sm_id
+            smem_accum_cnt = 0
+            while tile_id < num_tiles:
+                # Convert tile_id to pid_m and pid_n
+                pid = tile_id
+                group_id = pid // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + (pid % group_size_m)
+                pid_n = (pid % num_pid_in_group) // group_size_m
+                offset_am = pid_m * BM
+                offset_bn = pid_n * BN
 
-            for k in range(0, tl.cdiv(K, BK)):
-                buf = k % NUM_STAGES
-                offset_k = k * BK
+                for k in range(0, tl.cdiv(K, BK)):
+                    buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
+                    offset_k = k * BK
 
-                # Async load to a[buf]
-                empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
-                full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
-                tlx.barrier_wait(bar=empty_a_1st, phase=p)  # EmptyBar A1 wait
-                tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
-                data_a_1st = tlx.local_view(a, buf)  # smem data
-                tlx.async_descriptor_load(a_desc, data_a_1st, [offset_am, offset_k], full_a_1st)
+                    # Async load to a[buf]
+                    empty_a_1st = tlx.local_view(bars_empty_a, buf)  # mbar
+                    full_a_1st = tlx.local_view(bars_full_a, buf)  # mbar
+                    tlx.barrier_wait(bar=empty_a_1st, phase=p ^ 1)  # EmptyBar A1 wait
+                    tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
+                    data_a_1st = tlx.local_view(a, buf)  # smem data
+                    tlx.async_descriptor_load(a_desc, data_a_1st, [offset_am, offset_k], full_a_1st)
 
-                # Async load to b[buf]
-                empty_b = tlx.local_view(bars_empty_b, buf)
-                full_b = tlx.local_view(bars_full_b, buf)
-                tlx.barrier_wait(bar=empty_b, phase=p)
-                tlx.barrier_expect_bytes(full_b, BN * BK * tlx.size_of(tlx.dtype_of(a_desc)))
-                data_b = tlx.local_view(b, buf)
-                tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full_b)
+                    # Async load to b[buf]
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=empty_b, phase=p ^ 1)
+                    tlx.barrier_expect_bytes(full_b, BN * BK * tlx.size_of(tlx.dtype_of(a_desc)))
+                    data_b = tlx.local_view(b, buf)
+                    tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full_b)
 
-                # Async load to a[buf+NUM_STAGES]
-                empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
-                full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
-                tlx.barrier_wait(bar=empty_a_2nd, phase=p)
-                tlx.barrier_expect_bytes(bar=full_a_2nd, size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
-                data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)  # smem data
-                tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
+                    # Async load to a[buf+NUM_STAGES]
+                    empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
+                    full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
+                    tlx.barrier_wait(bar=empty_a_2nd, phase=p ^ 1)
+                    tlx.barrier_expect_bytes(bar=full_a_2nd,
+                                             size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
+                    data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)  # smem data
+                    tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
 
-                # Flip phase after every NUM_STAGES iterations finish
-                p = p ^ (buf == (NUM_STAGES - 1))
+                    smem_accum_cnt += 1
+
+                # Move to next tile with stride NUM_SMS
+                tile_id += NUM_SMS
 
         # consumers (wgmma + async store)
         with tlx.async_task(num_warps=4, replicate=2):
-            pid = tl.program_id(axis=0)
+            sm_id = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BM)
             num_pid_n = tl.cdiv(N, BN)
             num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            group_id = pid // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + (pid % group_size_m)
-            pid_n = (pid % num_pid_in_group) // group_size_m
-            offset_am = pid_m * BM
-            offset_bn = pid_n * BN
+            num_tiles = num_pid_m * num_pid_n
 
-            p = 0
-            # Assuming NUM_STAGES = 2
-            # p should be 0, 0, 1, 1, 0, 0, ...
-            acc = tl.zeros([BM // 2, BN], dtype=tl.float32)
-            for k in range(0, tl.cdiv(K, BK)):
-                buf = k % NUM_STAGES
+            # Persistent loop - each SM processes tiles with stride NUM_SMS
+            tile_id = sm_id
+            smem_accum_cnt = 0
+            while tile_id < num_tiles:
+                # Convert tile_id to pid_m and pid_n
+                pid = tile_id
+                group_id = pid // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + (pid % group_size_m)
+                pid_n = (pid % num_pid_in_group) // group_size_m
+                offset_am = pid_m * BM
+                offset_bn = pid_n * BN
 
-                # Wait for TMA load
-                full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
-                full_b = tlx.local_view(bars_full_b, buf)
-                tlx.barrier_wait(bar=full_a, phase=p)
-                tlx.barrier_wait(bar=full_b, phase=p)
+                acc = tl.zeros([BM // 2, BN], dtype=tl.float32)
+                for k in range(0, tl.cdiv(K, BK)):
+                    buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
 
-                # async_dot
-                data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
-                data_b = tlx.local_view(b, buf)
-                acc = tlx.async_dot(
-                    data_a,
-                    data_b,
-                    acc,
-                )
-                # async_wait
-                acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                    # Wait for TMA load
+                    full_a = tlx.local_view(bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_a, phase=p)
+                    tlx.barrier_wait(bar=full_b, phase=p)
 
-                # Release buffers
-                empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
-                empty_b = tlx.local_view(bars_empty_b, buf)
-                tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
-                tlx.barrier_arrive(empty_b)
+                    # async_dot
+                    data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
+                    data_b = tlx.local_view(b, buf)
+                    acc = tlx.async_dot(
+                        data_a,
+                        data_b,
+                        acc,
+                    )
+                    # async_wait
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
 
-                # Flip phase after every NUM_STAGES iterations finish
-                p = p ^ (buf == (NUM_STAGES - 1))
+                    # Release buffers
+                    empty_a = tlx.local_view(bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_a)  # EmptyBar A1 arrive
+                    tlx.barrier_arrive(empty_b)
 
-            offset_cm = offset_am + BLOCK_M_SPLIT * tlx.async_task_replica_id()
-            if EPILOGUE_SUBTILE:
-                acc = tl.reshape(acc, (BLOCK_M_SPLIT, 2, BN // 2))
-                acc = tl.permute(acc, (0, 2, 1))
-                acc0, acc1 = tl.split(acc)
-                c0 = acc0.to(tlx.dtype_of(c_desc))
-                c_desc.store([offset_cm, offset_bn], c0)
-                c1 = acc1.to(tlx.dtype_of(c_desc))
-                c_desc.store([offset_cm, offset_bn + BN // 2], c1)
-            else:
-                c_desc.store([offset_cm, offset_bn], acc.to(tlx.dtype_of(c_desc)))  # noqa
+                    smem_accum_cnt += 1
+
+                offset_cm = offset_am + BLOCK_M_SPLIT * tlx.async_task_replica_id()
+                if EPILOGUE_SUBTILE:
+                    acc = tl.reshape(acc, (BLOCK_M_SPLIT, 2, BN // 2))
+                    acc = tl.permute(acc, (0, 2, 1))
+                    acc0, acc1 = tl.split(acc)
+                    c0 = acc0.to(tlx.dtype_of(c_desc))
+                    c_desc.store([offset_cm, offset_bn], c0)
+                    c1 = acc1.to(tlx.dtype_of(c_desc))
+                    c_desc.store([offset_cm, offset_bn + BN // 2], c1)
+                else:
+                    c_desc.store([offset_cm, offset_bn], acc.to(tlx.dtype_of(c_desc)))  # noqa
+
+                # Move to next tile with stride NUM_SMS
+                tile_id += NUM_SMS
 
 
 def matmul(a, b, config=None, use_warp_barrier=False):
@@ -217,6 +242,9 @@ def matmul(a, b, config=None, use_warp_barrier=False):
         dtype=torch.float16,
         device=DEVICE,
     )
+
+    # Get number of SMs
+    NUM_SMS = torch.cuda.get_device_properties(DEVICE).multi_processor_count
 
     dummy_block = [1, 1]
     desc_in_1 = TensorDescriptor(
@@ -250,7 +278,11 @@ def matmul(a, b, config=None, use_warp_barrier=False):
         else:
             desc_out.block_shape = [BLOCK_M_SPLIT, config["BN"]]
 
-        grid = (triton.cdiv(M, config['BM']) * triton.cdiv(N, config['BN']), )
+        # Use persistent kernel with min(NUM_SMS, total_tiles) blocks
+        num_pid_m = triton.cdiv(M, config["BM"])
+        num_pid_n = triton.cdiv(N, config["BN"])
+        total_tiles = num_pid_m * num_pid_n
+        grid = (min(NUM_SMS, total_tiles), )
         matmul_kernel_tlx_ws.fn[grid](
             desc_in_1,
             desc_in_2,
@@ -258,12 +290,13 @@ def matmul(a, b, config=None, use_warp_barrier=False):
             M,
             N,
             K,
+            NUM_SMS=NUM_SMS,
             USE_WARP_BARRIER=use_warp_barrier,
             **config,
         )
     else:
-        grid = lambda META: (  # noqa E731
-            triton.cdiv(M, META['BM']) * triton.cdiv(N, META['BN']), )
+        # Use persistent kernel with min(NUM_SMS, total_tiles) blocks
+        grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META['BM']) * triton.cdiv(N, META['BN'])), )  # noqa: E731
         matmul_kernel_tlx_ws[grid](
             desc_in_1,
             desc_in_2,
@@ -271,6 +304,7 @@ def matmul(a, b, config=None, use_warp_barrier=False):
             M,
             N,
             K,
+            NUM_SMS=NUM_SMS,
             USE_WARP_BARRIER=use_warp_barrier,
         )
     return c

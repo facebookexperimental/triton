@@ -94,6 +94,21 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   ];
 }
 
+def TritonNvidiaGPUTMAStoreBufferReusePass
+    : Pass<"triton-nvidia-tma-store-buffer-reuse", "mlir::ModuleOp"> {
+  let summary = "Reuse SMEM buffers across sequential TMA stores";
+  let description = [{
+    After TMA lowering, sequential descriptor stores each allocate their own
+    shared memory buffer. When a tma_store_wait with pendings=0 guarantees
+    the buffer is safe to reuse, this pass merges compatible allocations
+    into a single mutable buffer with local_store writes.
+  }];
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 def TritonTensorMemoryAllocationPass : Pass<"triton-tensor-memory-allocation", "mlir::ModuleOp"> {
   let summary = "Assign tensor memory allocation";
 
