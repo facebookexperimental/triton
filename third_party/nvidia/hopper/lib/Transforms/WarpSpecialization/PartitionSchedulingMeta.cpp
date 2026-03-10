@@ -1097,7 +1097,7 @@ getInitialSchedule(scf::ForOp mainLoop,
     // post-lowering AsyncTMACopyLocalToGlobalOp)
     for (auto loop : loops) {
       loop.walk([&](Operation *op) {
-        if (isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp, StoreOP>(
+        if (isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp, StoreOp>(
                 op))
           tryScheduleOp(epiloguePartition, op);
       });
