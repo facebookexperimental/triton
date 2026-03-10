@@ -189,7 +189,7 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
            "instead of creating a separate epilogue partition">,
     Option<"computePartitionGranularity", "compute-partition-granularity",
            "std::string", /*default*/"\"auto\"",
-           "Compute partition granularity: auto, merged, or separate">
+           "Compute partition granularity: auto, merged, separate, or cluster">
   ];
 }
 
