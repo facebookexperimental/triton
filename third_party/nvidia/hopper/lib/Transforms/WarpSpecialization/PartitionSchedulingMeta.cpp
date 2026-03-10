@@ -1621,8 +1621,7 @@ void PartitionSchedulingMeta::runOnOperation() {
       computePartitionGranularity != "separate")
     llvm::report_fatal_error(
         llvm::Twine("Invalid compute-partition-granularity '") +
-        computePartitionGranularity +
-        "'. Expected: auto, merged, or separate");
+        computePartitionGranularity + "'. Expected: auto, merged, or separate");
 
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
@@ -1637,8 +1636,8 @@ void PartitionSchedulingMeta::runOnOperation() {
       mergeEpilogue = attr.getValue();
 
     llvm::StringRef computeGranularity = computePartitionGranularity;
-    if (auto attr = loop->getAttrOfType<StringAttr>(
-            "tt.compute_partition_granularity"))
+    if (auto attr =
+            loop->getAttrOfType<StringAttr>("tt.compute_partition_granularity"))
       computeGranularity = attr.getValue();
 
     if (std::optional<ScheduleResult> result =
