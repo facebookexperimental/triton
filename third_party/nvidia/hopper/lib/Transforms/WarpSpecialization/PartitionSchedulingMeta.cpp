@@ -1285,8 +1285,8 @@ getInitialSchedule(scf::ForOp mainLoop,
   // per-MMA-exclusive ops for the computation partitions.
 
   // Compute partition strategy is determined by computePartitionGranularity:
-  //   "auto"     → one partition per union-find cluster (= cluster when
-  //                dpFactor>1, merged when dpFactor<=1)
+  //   "auto"     → use dataPartitionFactor heuristic (dpFactor>1 = separate,
+  //                dpFactor <=1 merged)
   //   "cluster"  → always one partition per union-find cluster
   //   "separate" → always one partition per MMA
   //   "merged"   → always one shared computation partition
