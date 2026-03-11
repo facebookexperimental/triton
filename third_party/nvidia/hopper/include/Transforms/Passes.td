@@ -27,9 +27,12 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
            "bool", /*default*/"false",
            "Enable ping pong barrier insertion around critical regions">,
     Option<"dumpIntermediateSteps", "dump-intermediate-steps",
-           "bool", /*default*/"false",
-           "Dump intermediate steps">
-  ];
+             "bool", /*default*/"false",
+             "Dump intermediate steps">,
+    Option<"smemBudget", "smem-budget",
+             "int32_t", /*default*/"0",
+             "SMEM budget in bytes (0 = auto-detect from target)">
+    ];
 }
 
 def NVGPUTestWSTaskPartition : Pass<"nvgpu-test-ws-task-partition", "mlir::ModuleOp"> {
@@ -55,6 +58,15 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
            "number of buffering for warp specialization">,
+    Option<"smemAllocAlgo", "smem-alloc-algo",
+           "int32_t", /*default*/"0",
+           "SMEM allocation algorithm: 0 = original, 1 = WSBuffer-based">,
+    Option<"smemBudget", "smem-budget",
+           "int32_t", /*default*/"0",
+           "SMEM budget in bytes (0 = auto-detect from target)">,
+    Option<"smemCircularReuse", "smem-circular-reuse",
+           "bool", /*default*/"false",
+           "Enable circular buffer reuse for SMEM allocation">,
     Option<"readDecisionFile", "read-decision-file",
            "std::string", /*default*/"\"\"",
            "path to JSON file containing buffer decisions to apply">,
@@ -170,6 +182,35 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
            "int32_t", /*default*/"3",
            "number of stages for software pipelining">,
   ];
+}
+
+def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower descriptor stores to async TMA copies via shared memory";
+
+  let description = [{
+    This pass lowers `tt.descriptor_store` ops into an SMEM local_alloc +
+    local_store + async TMA copy sequence.  Running it as a standalone pass
+    (before partition scheduling) ensures the created `local_alloc` is visible
+    to the scheduler and can later be hoisted by buffer allocation.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
+  let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
+
+  let description = [{
+    This pass splits `ttng.async_tma_store_token_wait` ops that have attached
+    barriers into a `ttng.async_tma_store_wait` followed by one
+    `ttng.arrive_barrier` per barrier.  Running this before the LLVM lowering
+    pass allows the membar analysis to insert CTA-level barriers (bar.sync 0)
+    between the wait and the arrive, ensuring all warps complete the wait
+    before any thread signals the mbarrier.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
 def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {

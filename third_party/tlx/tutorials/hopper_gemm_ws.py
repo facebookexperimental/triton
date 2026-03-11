@@ -40,33 +40,49 @@ def matmul_tma_set_block_size_hook(nargs):
     nargs["NUM_SMS"] = NUM_SMS
 
 
+def preprocess_configs(configs, named_args, **kwargs):
+    M = named_args["M"]
+    N = named_args["N"]
+
+    IMBALANCE_THRESHOLD = 10
+    if M > N * IMBALANCE_THRESHOLD:
+        # M >> N: keep only small GROUP_SIZE_M to sweep M, reuse B
+        configs = [c for c in configs if c.kwargs["GROUP_SIZE_M"] == 1]
+    elif N > M * IMBALANCE_THRESHOLD:
+        # N >> M: keep only large GROUP_SIZE_M to sweep N, reuse A
+        configs = [c for c in configs if c.kwargs["GROUP_SIZE_M"] >= 32]
+    else:
+        # Balanced: keep moderate GROUP_SIZE_M for L2 locality
+        configs = [c for c in configs if c.kwargs["GROUP_SIZE_M"] == 8]
+
+    return configs
+
+
+def get_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BM": BM,
+                "BN": BN,
+                "BK": BK,
+                "GROUP_SIZE_M": g,
+                "NUM_STAGES": s,
+                "NUM_MMA_WARPS": 8,
+                "NUM_MMA_GROUPS": 2,
+                "EPILOGUE_SUBTILE": epilogue,
+            },
+            num_stages=1,
+            num_warps=4,
+            pre_hook=matmul_tma_set_block_size_hook,
+        ) for BM in [128] for BN in [256] for BK in [64] for s in [3] for epilogue in [True, False] for g in [1, 8, 64]
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {
-                "BM": 128,
-                "BN": 256,
-                "BK": 64,
-                "GROUP_SIZE_M": 8,
-                "NUM_STAGES": 4,
-                "NUM_MMA_WARPS": 8,
-                "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": True,
-            }, num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
-        triton.Config(
-            {
-                "BM": 128,
-                "BN": 256,
-                "BK": 64,
-                "GROUP_SIZE_M": 8,
-                "NUM_STAGES": 3,
-                "NUM_MMA_WARPS": 8,
-                "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": False,
-            }, num_stages=1, num_warps=4, pre_hook=matmul_tma_set_block_size_hook),
-    ],
+    configs=get_autotune_configs(),
     key=["M", "N", "K"],
     use_cuda_graph=True,
+    prune_configs_by={"early_config_prune": preprocess_configs},
 )
 @triton.jit
 def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
@@ -296,7 +312,7 @@ def matmul(a, b, config=None, use_warp_barrier=False):
         )
     else:
         # Use persistent kernel with min(NUM_SMS, total_tiles) blocks
-        grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META['BM']) * triton.cdiv(N, META['BN'])), )  # noqa: E731
+        grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"])), )  # noqa: E731
         matmul_kernel_tlx_ws[grid](
             desc_in_1,
             desc_in_2,

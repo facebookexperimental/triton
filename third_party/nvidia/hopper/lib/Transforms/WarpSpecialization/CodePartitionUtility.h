@@ -295,6 +295,7 @@ SmallVector<Operation *> getActualConsumers(Operation *consumerOp);
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier = true);
 void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
+void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
 } // namespace mlir
 

@@ -358,7 +358,7 @@ class HIPBackend(BaseBackend):
                 pm = ir.pass_manager(mod.context)
                 pm.enable_debug()
                 passes.llvmir.add_di_scope(pm)
-                pm.run(mod)
+                pm.run(mod, 'make_llir.disable_line_info')
 
             # insert dbg intrinsic with several DI Attribute including source
             # var name and type info note: unknown reason for now, but this
@@ -368,7 +368,7 @@ class HIPBackend(BaseBackend):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
             passes.llvmir.add_di_local_variable(pm)
-            pm.run(mod)
+            pm.run(mod, 'make_llir.dump_ir_extract_di_local_variables')
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
