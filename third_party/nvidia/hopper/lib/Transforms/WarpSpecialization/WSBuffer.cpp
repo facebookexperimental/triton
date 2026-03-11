@@ -823,8 +823,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       continue;
     Operation *lastCh = chList.back();
     // Check if we have already accounted for this accumulator via nesting.
-    if (llvm::any_of(chList,
-                     [&](Operation *op) { return seenOps.contains(op); }))
+    if (seenOps.contains(lastCh))
       continue;
     auto forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
                                           config, idx, false);
