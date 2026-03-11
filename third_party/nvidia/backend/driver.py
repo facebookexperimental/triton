@@ -379,9 +379,9 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
     if (preferredClusterDimX > 0) {{
       CUlaunchAttribute preferredClusterAttr = {{}};
       preferredClusterAttr.id = CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
-      preferredClusterAttr.value.clusterDim.x = preferredClusterDimX;
-      preferredClusterAttr.value.clusterDim.y = preferredClusterDimY;
-      preferredClusterAttr.value.clusterDim.z = preferredClusterDimZ;
+      preferredClusterAttr.value.preferredClusterDim.x = preferredClusterDimX;
+      preferredClusterAttr.value.preferredClusterDim.y = preferredClusterDimY;
+      preferredClusterAttr.value.preferredClusterDim.z = preferredClusterDimZ;
       launchAttr[num_attrs] = preferredClusterAttr;
       ++num_attrs;
     }}

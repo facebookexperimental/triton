@@ -370,9 +370,9 @@ class Config:
         Unlike cluster_dims which spawns new CTAs, ctas_per_cga regroups existing grid CTAs into clusters.
         This matches CUDA's cuLaunchKernelEx CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION semantics.
     :type ctas_per_cga: tuple[int, int, int]
-    :ivar preferred_ctas_per_cga: preferred number of CTAs per cluster (CUDA 12.8+). Unlike ctas_per_cga which is
+    :ivar preferred_ctas_per_cga: preferred number of CTAs per cluster. Unlike ctas_per_cga which is
         required, this is a hint: the driver may use a smaller cluster if resources are constrained.
-        Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION.
+        Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
     :type preferred_ctas_per_cga: tuple[int, int, int]
     """
 

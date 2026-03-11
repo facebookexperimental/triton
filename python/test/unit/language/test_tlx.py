@@ -5049,30 +5049,53 @@ def test_ctas_per_cga(device):
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell or newer for preferred cluster dimension")
 def test_preferred_ctas_per_cga(device):
-    """Test launching kernels with preferred_ctas_per_cga hint (CUDA 12.8+ preferred cluster dimension)."""
+    """Test launching kernels with preferred_ctas_per_cga hint."""
 
     @triton.jit
-    def simple_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    def simple_kernel(x_ptr, log_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis=0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         tl.store(x_ptr + offsets, offsets, mask=mask)
 
-    # NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    BLOCK_SIZE = 16
-    NUM_ELEMENT = 256
+        if pid >= 2:
+            # make all other CTAs slow to simulate busy SM
+            tl.inline_asm_elementwise(
+                "nanosleep.u32 $1;",
+                "=r, r",
+                [1000000 * 500],  # ~500ms
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+
+        # assuming log_ptr tensor has size equal to number of programs
+        if tlx.thread_id(0) == 0:
+            tl.store(log_ptr + pid, tlx.cluster_cta_rank())
+
+    # setting up grid in a way that there's exactly one wave (one CTA per SM)
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # grid large enough to make sure all CTAs cannot co-occupy SMs at the same time
+    GRID_SIZE = NUM_SMS * 40
+    BLOCK_SIZE = 4
+    NUM_ELEMENT = GRID_SIZE * BLOCK_SIZE
     x = torch.zeros(NUM_ELEMENT, dtype=torch.float32, device=device)
-    num_blocks = triton.cdiv(NUM_ELEMENT, BLOCK_SIZE)
+    # each value is the cluster_cta_rank of a CTA
+    cta_rank_log = torch.full((GRID_SIZE, ), -1, dtype=torch.int16, device=device)
     kern_kwargs = {
-        "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 4, "preferred_ctas_per_cga": (16, 1, 1), "ctas_per_cga": (2, 1, 1)
+        "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 16, "preferred_ctas_per_cga": (4, 1, 1), "ctas_per_cga": (2, 1, 1)
     }
+    kernel = simple_kernel[(GRID_SIZE, )](x, cta_rank_log, NUM_ELEMENT, **kern_kwargs)
+    assert kernel.metadata.preferred_ctas_per_cga == (4, 1, 1), (
+        f"expecting preferred_ctas_per_cga to be (4, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster_dims to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
 
-    kernel = simple_kernel[(num_blocks, )](x, 256, **kern_kwargs)
-
-    assert kernel.metadata.preferred_ctas_per_cga == (2, 1, 1), (
-        f"expecting preferred_ctas_per_cga to be (2, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
-    assert kernel.metadata.cluster_dims == (1, 1, 1), (
-        f"expecting cluster_dims to be (1, 1, 1), got {kernel.metadata.cluster_dims}")
+    cta_ranks, counts = cta_rank_log.unique(return_counts=True)
+    d = dict(zip(cta_ranks.tolist(), counts.tolist()))
+    assert d[0] == d[1], f"expecting equal number of CTA 0 and 1, got {d}"
+    assert d[2] == d[3], f"expecting equal number of CTA 2 and 3, got {d}"
+    assert d[0] > d[2], f"expecting more CTA 0 than CTA 2 (some cluster has size 2, some size 4), got {d}"
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell for TMEM")
