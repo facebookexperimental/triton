@@ -26,6 +26,10 @@ namespace ttng = triton::nvidia_gpu;
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 namespace {
 
+inline bool isEpilogueStoreOp(Operation *op) {
+  return isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(op);
+}
+
 //===----------------------------------------------------------------------===//
 // Op Categories and Scheduling Template Infrastructure
 //===----------------------------------------------------------------------===//
@@ -586,9 +590,6 @@ private:
   }
 
   void categorizeEpilogueStores() {
-    auto isEpilogueStoreOp = [](Operation *op) {
-      return isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(op);
-    };
     // Collect stores inside the loops.
     for (auto loop : loops) {
       loop.walk([&](Operation *op) {
@@ -1097,8 +1098,7 @@ getInitialSchedule(scf::ForOp mainLoop,
     // post-lowering AsyncTMACopyLocalToGlobalOp)
     for (auto loop : loops) {
       loop.walk([&](Operation *op) {
-        if (isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp, StoreOp>(
-                op))
+        if (isEpilogueStoreOp(op))
           tryScheduleOp(epiloguePartition, op);
       });
     }
