@@ -1008,7 +1008,16 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS,
   if (loops.empty())
     return;
   for (auto forOp : loops) {
+    // Check the loop itself and any ancestor ForOp for the tt.split_mma
+    // attribute. The Python frontend sets tt.split_mma on the tl.range() loop,
+    // but after FuseNestedLoops, the attribute ends up on the outer
+    // (persistent) loop while the inner loop (where the MMAs live) is the one
+    // being scheduled.
     bool splitMMA = useSplitMMA || forOp->hasAttr(kSplitMMAAttrName);
+    if (!splitMMA) {
+      if (auto parentFor = forOp->getParentOfType<scf::ForOp>())
+        splitMMA = parentFor->hasAttr(kSplitMMAAttrName);
+    }
     scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS, splitMMA);
   }
 }
