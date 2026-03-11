@@ -999,6 +999,13 @@ static void fuseOneLevel(LoopNestNode *parent, mlir::DominanceInfo &domInfo) {
       }))
     fused->setAttr(kWarpSpecializeAttrName, b.getUnitAttr());
 
+  // Propagate split MMA flag.
+  if (outer->hasAttr(kSplitMMAAttrName) ||
+      llvm::any_of(innerLoops, [](InnerLoop &loop) {
+        return loop.op->hasAttr(kSplitMMAAttrName);
+      }))
+    fused->setAttr(kSplitMMAAttrName, b.getUnitAttr());
+
   // Propagate the `tt.disallow_acc_multi_buffer` attribute to the parent loop.
   bool disallowAccMultiBuffer = getDisallowAccMultiBuffer(outer);
   for (InnerLoop &loop : innerLoops) {
