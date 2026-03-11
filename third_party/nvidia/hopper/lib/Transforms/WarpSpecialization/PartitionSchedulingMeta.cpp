@@ -1329,9 +1329,12 @@ getInitialSchedule(scf::ForOp mainLoop,
                                 targetPart, mmaOp);
       if (policy == ComputePolicy::Merged && !sharedComputePartition)
         sharedComputePartition = part;
-      if (policy == ComputePolicy::Cluster)
-        clusterPartitions.try_emplace(
-            categorizer.getMMAGroupIds().lookup(mmaOp.getOperation()), part);
+      if (policy == ComputePolicy::Cluster && part) {
+        unsigned group =
+            categorizer.getMMAGroupIds().lookup(mmaOp.getOperation());
+        if (!clusterPartitions.count(group))
+          clusterPartitions[group] = part;
+      }
       mmaToPartition[mmaOp.getOperation()] = part;
       inFirstLoop.push_back(mmaOp.getOperation());
     }
