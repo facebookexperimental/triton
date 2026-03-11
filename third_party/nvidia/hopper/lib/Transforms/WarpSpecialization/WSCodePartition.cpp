@@ -3041,15 +3041,25 @@ void insertAsyncComm(
       if (commChannel.consumerBarriers.empty()) {
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
-        builder.setInsertionPointAfter(consumerReleasePoint);
         builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
-        auto releaseOp =
-            builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-                consumerReleasePoint->getLoc(), token.second, bufferIdx);
-        LLVM_DEBUG({
-          LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
-          token.second.dump();
-        });
+        if (auto tokenWaitOp =
+                dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
+          builder.setInsertionPoint(consumerReleasePoint);
+          auto barrier =
+              getBarrierForPipelineStage(builder, token.second, bufferIdx);
+          Value truePred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+              consumerReleasePoint->getLoc(), 1, 1);
+          tokenWaitOp.addBarrier(barrier, truePred);
+        } else {
+          builder.setInsertionPointAfter(consumerReleasePoint);
+          auto releaseOp =
+              builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  consumerReleasePoint->getLoc(), token.second, bufferIdx);
+          LLVM_DEBUG({
+            LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
+            token.second.dump();
+          });
+        }
       }
     }
 
