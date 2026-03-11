@@ -200,6 +200,8 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
                         const DenseSet<Operation *> &regionsWithChannels,
                         ReuseConfig *config, int reuseGroupIdx);
 
+bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group);
+
 void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
                       SmallVector<Operation *> &chList);
 // Skip the accumCnt for unique channels.
@@ -231,6 +233,12 @@ void insertAsyncCopy(
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx);
+
+// Walk up the loop nest from `op` to find the enclosing ForOp that has accum
+// counters for the given reuse group.
+scf::ForOp findAccumLoop(Operation *op,
+                         const DenseSet<Operation *> &regionsWithChannels,
+                         ReuseConfig *config, int reuseGroupIdx);
 std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
                                              Location loc, Value accumCnt,
                                              unsigned numBuffers);
