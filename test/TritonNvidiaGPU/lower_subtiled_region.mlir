@@ -178,12 +178,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = before,
-              targetOpIdx = 0 : ui32, barrierOpKind = "wait_barrier",
-              count = 1 : ui32>,
-          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
-              targetOpIdx = 0 : ui32, barrierOpKind = "arrive_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 0, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier">,
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
         ]
       setup {
         %c42 = arith.constant 42 : i32

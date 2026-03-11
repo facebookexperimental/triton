@@ -215,9 +215,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 3 : ui32, placement = after,
-              targetOpIdx = 0 : ui32, barrierOpKind = "arrive_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 3, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
         ]
       setup {
         %c0 = arith.constant 0 : i32
@@ -244,9 +243,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 1 : ui32, placement = before,
-              targetOpIdx = 0 : ui32, barrierOpKind = "wait_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 1, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier">
         ]
       setup {
         %c0 = arith.constant 0 : i32
@@ -272,14 +270,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
-              targetOpIdx = 0 : ui32, barrierOpKind = "bogus",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "bogus">
         ]
       setup {
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
         ttng.subtiled_region_return
       }
     tt.return
@@ -300,9 +298,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
-              targetOpIdx = 5 : ui32, barrierOpKind = "arrive_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 5, barrierOpKind = "arrive_barrier">
         ]
       setup {
         %c0 = arith.constant 0 : i32
