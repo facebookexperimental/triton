@@ -95,25 +95,20 @@ def get_autotune_configs():
     prune_configs_by={"early_config_prune": preprocess_configs},
 )
 @triton.jit
-def matmul_kernel_tlx_ws(
-    a_desc,
-    b_desc,
-    c_desc,  #
-    M,
-    N,
-    K,  #
-    BM: tl.constexpr,  #
-    BN: tl.constexpr,  #
-    BK: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
-    NUM_STAGES: tl.constexpr,  #
-    NUM_MMA_WARPS: tl.constexpr,  #
-    NUM_MMA_GROUPS: tl.constexpr,  #
-    EPILOGUE_SUBTILE: tl.constexpr,  #
-    NUM_CTAS: tl.constexpr,  #
-    NUM_SMS: tl.constexpr,  #
-    USE_WARP_BARRIER: tl.constexpr = False,  #
-):
+def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
+                         M, N, K,  #
+                         BM: tl.constexpr,  #
+                         BN: tl.constexpr,  #
+                         BK: tl.constexpr,  #
+                         GROUP_SIZE_M: tl.constexpr,  #
+                         NUM_STAGES: tl.constexpr,  #
+                         NUM_MMA_WARPS: tl.constexpr,  #
+                         NUM_MMA_GROUPS: tl.constexpr,  #
+                         EPILOGUE_SUBTILE: tl.constexpr,  #
+                         NUM_CTAS: tl.constexpr,  #
+                         NUM_SMS: tl.constexpr,  #
+                         USE_WARP_BARRIER: tl.constexpr = False,  #
+                         ):
     # Descriptor
     BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
 
@@ -209,9 +204,8 @@ def matmul_kernel_tlx_ws(
                     empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
                     full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
                     tlx.barrier_wait(bar=empty_a_2nd, phase=p ^ 1)
-                    tlx.barrier_expect_bytes(
-                        bar=full_a_2nd, size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc))
-                    )
+                    tlx.barrier_expect_bytes(bar=full_a_2nd,
+                                             size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
                     data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)  # smem data
                     tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
 
@@ -341,7 +335,7 @@ def matmul(a, b, config=None, use_warp_barrier=False):
         num_pid_m = triton.cdiv(M, config["BM"])
         num_pid_n = triton.cdiv(N, config["BN"])
         total_tiles = num_pid_m * num_pid_n
-        grid = (min(NUM_SMS, total_tiles),)
+        grid = (min(NUM_SMS, total_tiles), )
         matmul_kernel_tlx_ws.fn[grid](
             desc_in_1,
             desc_in_2,
@@ -355,7 +349,7 @@ def matmul(a, b, config=None, use_warp_barrier=False):
         )
     else:
         # Use persistent kernel with min(NUM_SMS, total_tiles) blocks
-        grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"])),)  # noqa: E731
+        grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"])), )  # noqa: E731
         matmul_kernel_tlx_ws[grid](
             desc_in_1,
             desc_in_2,
