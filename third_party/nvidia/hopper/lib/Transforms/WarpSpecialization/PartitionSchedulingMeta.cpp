@@ -26,6 +26,10 @@ namespace ttng = triton::nvidia_gpu;
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 namespace {
 
+inline bool isEpilogueStoreOp(Operation *op) {
+  return isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(op);
+}
+
 //===----------------------------------------------------------------------===//
 // Op Categories and Scheduling Template Infrastructure
 //===----------------------------------------------------------------------===//
@@ -588,9 +592,10 @@ private:
   void categorizeEpilogueStores() {
     // Collect stores inside the loops.
     for (auto loop : loops) {
-      for (auto storeOp : loop.getOps<DescriptorStoreOp>()) {
-        addCategorizedOp(storeOp, OpCategory::EpilogueStore);
-      }
+      loop.walk([&](Operation *op) {
+        if (isEpilogueStoreOp(op))
+          addCategorizedOp(op, OpCategory::EpilogueStore);
+      });
     }
     // Also collect stores AFTER the main loop in the parent block (e.g., bwd
     // epilogue stores that write gradients after the loop completes).
@@ -604,7 +609,7 @@ private:
         afterLoop = true;
         continue;
       }
-      if (afterLoop && isa<DescriptorStoreOp>(&op)) {
+      if (afterLoop && isEpilogueStoreOp(&op)) {
         addCategorizedOp(&op, OpCategory::EpilogueStore);
       }
     }
@@ -1089,12 +1094,13 @@ getInitialSchedule(scf::ForOp mainLoop,
   // Also schedule the backward slice of post-loop epilogue stores (tmem_load,
   // truncf, etc.)
   if (epiloguePartition) {
-    // Stores inside loops
+    // Stores inside loops (both pre-lowering DescriptorStoreOp and
+    // post-lowering AsyncTMACopyLocalToGlobalOp)
     for (auto loop : loops) {
-      for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
-        tryScheduleOp(epiloguePartition, op);
-      for (StoreOp op : loop.getOps<StoreOp>())
-        setPartition(op, epiloguePartition);
+      loop.walk([&](Operation *op) {
+        if (isEpilogueStoreOp(op))
+          tryScheduleOp(epiloguePartition, op);
+      });
     }
 
     // Also schedule categorized epilogue stores (includes post-loop stores for

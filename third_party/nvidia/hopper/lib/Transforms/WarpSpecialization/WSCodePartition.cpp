@@ -2500,6 +2500,12 @@ void insertAsyncComm(
                 consumerOps.insert(user);
                 actualConsumerOps.insert(user);
               }
+              // Also handle the early-lowered TMA store pattern:
+              // AsyncTMACopyLocalToGlobalOp -> TMAStoreTokenWaitOp
+              if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+                consumerOps.insert(user);
+                actualConsumerOps.insert(user);
+              }
             }
           }
         }
@@ -2508,6 +2514,25 @@ void insertAsyncComm(
         consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
         actualConsumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
       }
+    }
+
+    // If any actual consumer is an AsyncTMACopyLocalToGlobalOp, follow
+    // its token result to find TMAStoreTokenWaitOp and add it to
+    // actualConsumerOps. This enables barrier fusion for the early-lowered
+    // TMA store pattern (local_alloc → async_tma_copy → token_wait).
+    DenseSet<Operation *> additionalConsumerOps;
+    for (auto *op : actualConsumerOps) {
+      if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+        for (auto user : op->getUsers()) {
+          if (llvm::isa<ttng::TMAStoreTokenWaitOp>(user)) {
+            additionalConsumerOps.insert(user);
+          }
+        }
+      }
+    }
+    for (auto *op : additionalConsumerOps) {
+      consumerOps.insert(op);
+      actualConsumerOps.insert(op);
     }
 
     // Assuming all ops are under the same block.
@@ -3016,15 +3041,25 @@ void insertAsyncComm(
       if (commChannel.consumerBarriers.empty()) {
         auto consumerReleasePoint =
             consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
-        builder.setInsertionPointAfter(consumerReleasePoint);
         builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
-        auto releaseOp =
-            builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-                consumerReleasePoint->getLoc(), token.second, bufferIdx);
-        LLVM_DEBUG({
-          LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
-          token.second.dump();
-        });
+        if (auto tokenWaitOp =
+                dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
+          tokenWaitOp.addToken(token.second, bufferIdx);
+          LLVM_DEBUG({
+            LDBG("attached ConsumerRelease token to TMAStoreTokenWaitOp "
+                 << masterChannel->uniqID << " ");
+            token.second.dump();
+          });
+        } else {
+          builder.setInsertionPointAfter(consumerReleasePoint);
+          auto releaseOp =
+              builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  consumerReleasePoint->getLoc(), token.second, bufferIdx);
+          LLVM_DEBUG({
+            LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
+            token.second.dump();
+          });
+        }
       }
     }
 

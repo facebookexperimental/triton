@@ -1658,7 +1658,15 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
   // be able to schedule them at the high level.
   rewriter.create<NVVM::CpAsyncBulkCommitGroupOp>(loc);
 
-  rewriter.eraseOp(op);
+  if (op->getNumResults() > 0) {
+    // The token is a dummy i32 value; it only exists for SSA linkage at the
+    // TTGIR level and is consumed by TMAStoreTokenWaitOp.
+    Value dummy = rewriter.create<LLVM::ConstantOp>(
+        loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    rewriter.replaceOp(op, dummy);
+  } else {
+    rewriter.eraseOp(op);
+  }
   return success();
 };
 

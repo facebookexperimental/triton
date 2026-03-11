@@ -163,7 +163,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(producerWarps == 0 || producerWarps == nWarps);
         producerWarps = nWarps;
       } else if (dyn_cast<ttnvws::ConsumerReleaseOp>(user) ||
-                 dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
+                 dyn_cast<ttnvws::ConsumerWaitOp>(user) ||
+                 dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
         auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
         assert(consumerWarps == 0 || consumerWarps == nWarps);
         consumerWarps = nWarps;
@@ -238,6 +239,18 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
                                  bufferEmptyCount);
         deprecatedOps.push_back(user);
+        return true;
+      } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+        Value truePred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
+        for (auto [nvwsTok, nvwsIdx] :
+             llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
+          Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);
+          setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
+          op.addBarrier(bufferEmpty, truePred);
+        }
+        op.getNvwsTokensMutable().clear();
+        op.getNvwsTokenIndicesMutable().clear();
+        // Do NOT erase — the op stays with its newly-added real barriers.
         return true;
       }
       return false;
