@@ -18,8 +18,9 @@
 //   * Barrier allocations -> tlx.alloc_barriers(count)
 //   * Buffer allocations -> tlx.local_alloc((shape), dtype, count)
 // - Variable name simplification:
-//   * Removes % prefix from SSA names
-//   * Prefixes numeric-only names with "var_" (e.g., %0 -> var_0)
+//   * Uses NameLoc metadata from the Python frontend to recover original
+//     variable names (e.g., %0 -> "Q" if assigned as `Q = tl.load(...)`)
+//   * Falls back to removing % prefix and prefixing numeric names with "var_"
 // - Argument substitution:
 //   * warp_specialize partition args -> original operands
 //   * scf.for outputs -> corresponding iter_args
@@ -413,40 +414,14 @@ getValueName(Value v,
     }
   }
 
-  // Inline constants: if this value is defined by arith.constant, return the
-  // literal value
-  if (inlineConstants) {
-    if (Operation *defOp = v.getDefiningOp()) {
-      if (defOp->getName().getStringRef() == "arith.constant") {
-        if (auto valueAttr = defOp->getAttr("value")) {
-          std::string result;
-          llvm::raw_string_ostream os(result);
-          if (auto intAttr = dyn_cast<IntegerAttr>(valueAttr)) {
-            if (intAttr.getType().isInteger(1)) {
-              os << (intAttr.getValue().getBoolValue() ? "True" : "False");
-            } else {
-              os << intAttr.getValue();
-            }
-          } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
-            SmallString<16> str;
-            floatAttr.getValue().toString(str);
-            os << str;
-          } else {
-            // Fall through to normal name handling for unsupported constant
-            // types
-            goto normal_name;
-          }
-          os.flush();
-          return result;
-        }
-      }
-    }
-  }
-
 normal_name:
   std::string name;
   llvm::raw_string_ostream os(name);
-  v.printAsOperand(os, OpPrintingFlags());
+  // Use printNameLocAsPrefix to recover Python variable names from NameLoc
+  // metadata. The Triton frontend wraps value locations with NameLoc during
+  // code generation (e.g., `x = tl.load(ptr)` → NameLoc("x")), and this flag
+  // tells the MLIR printer to use those names as SSA name prefixes.
+  v.printAsOperand(os, OpPrintingFlags().printNameLocAsPrefix(true));
   os.flush();
   // Remove type info if present (after ':')
   size_t colonPos = name.find(':');
@@ -928,6 +903,45 @@ void printWarpSpecialize(
   }
 }
 
+// Extract source location string (basename:line) from an MLIR Location.
+// Recursively unwraps NameLoc, CallSiteLoc, FusedLoc to find the underlying
+// FileLineColLoc.
+std::string getLocString(Location loc) {
+  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+    StringRef filename = fileLoc.getFilename().getValue();
+    size_t lastSlash = filename.rfind('/');
+    if (lastSlash != StringRef::npos)
+      filename = filename.substr(lastSlash + 1);
+    return (filename + ":" + Twine(fileLoc.getLine())).str();
+  }
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return getLocString(nameLoc.getChildLoc());
+  }
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    std::string result = getLocString(callSiteLoc.getCallee());
+    if (!result.empty())
+      return result;
+    return getLocString(callSiteLoc.getCaller());
+  }
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      std::string result = getLocString(subLoc);
+      if (!result.empty())
+        return result;
+    }
+  }
+  return "";
+}
+
+// Print "  # filename:line\n" comment suffix for an operation, or just "\n"
+// if location is unknown.
+void printLocComment(Operation *op, llvm::raw_ostream &os) {
+  std::string loc = getLocString(op->getLoc());
+  if (!loc.empty())
+    os << "  # " << loc;
+  os << "\n";
+}
+
 // Print operation in simplified TLX format
 void printSimplifiedOp(
     Operation *op, llvm::raw_ostream &os,
@@ -950,7 +964,7 @@ void printSimplifiedOp(
     } else {
       os << "const";
     }
-    os << "\n";
+    printLocComment(op, os);
     return;
   }
 
@@ -967,7 +981,8 @@ void printSimplifiedOp(
           os << ", ";
         os << shape[i];
       }
-      os << "])\n";
+      os << "])";
+      printLocComment(op, os);
       return;
     }
   }
@@ -981,7 +996,8 @@ void printSimplifiedOp(
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
          << getValueName(op->getOperand(0), argSubstitutionMap) << " "
          << infixIt->second << " "
-         << getValueName(op->getOperand(1), argSubstitutionMap) << "\n";
+         << getValueName(op->getOperand(1), argSubstitutionMap);
+      printLocComment(op, os);
       return;
     }
   }
@@ -990,7 +1006,8 @@ void printSimplifiedOp(
   if (opName == "arith.negf" && op->getNumOperands() == 1 &&
       op->getNumResults() > 0) {
     os << getValueName(op->getResult(0), argSubstitutionMap) << " = -"
-       << getValueName(op->getOperand(0), argSubstitutionMap) << "\n";
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    printLocComment(op, os);
     return;
   }
 
@@ -1003,7 +1020,8 @@ void printSimplifiedOp(
                                                  : getCmpFOperator(pred);
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
          << getValueName(op->getOperand(0), argSubstitutionMap) << " " << cmpOp
-         << " " << getValueName(op->getOperand(1), argSubstitutionMap) << "\n";
+         << " " << getValueName(op->getOperand(1), argSubstitutionMap);
+      printLocComment(op, os);
       return;
     }
   }
@@ -1018,7 +1036,8 @@ void printSimplifiedOp(
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")\n";
+        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        printLocComment(op, os);
         return;
       } else {
         // Print as tlx.local_alloc((shape), dtype, count)
@@ -1032,7 +1051,8 @@ void printSimplifiedOp(
           os << info.shape[i];
         }
         os << "), " << getElementTypeName(info.elementType) << ", "
-           << info.bufferCount << ")\n";
+           << info.bufferCount << ")";
+        printLocComment(op, os);
         return;
       }
     }
@@ -1072,7 +1092,7 @@ void printSimplifiedOp(
   }
   os << ")";
 
-  os << "\n";
+  printLocComment(op, os);
 }
 
 // Print a block

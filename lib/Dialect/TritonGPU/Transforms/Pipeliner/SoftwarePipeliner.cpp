@@ -106,7 +106,7 @@ static void expandLoops(ModuleOp moduleOp) {
       continue;
     }
     // Skip pipelining when we have a single stage.
-    if (metaWS && schedule.getNumStages() == 1) {
+    if (metaWS && schedule.getNumStages() == 1) { // DISABLE
       continue;
     }
 
