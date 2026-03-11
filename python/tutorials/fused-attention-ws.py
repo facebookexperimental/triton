@@ -997,11 +997,11 @@ TORCH_HAS_FP8 = False
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [64, 128]:
+for HEAD_DIM in [128]:  #64, 128]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[2**i for i in range(10, 15)],
+            x_vals=[2**i for i in range(12, 13)],  #0, 15)],
             line_arg="provider",
             line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
             line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
