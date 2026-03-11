@@ -216,7 +216,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 3 : ui32, placement = after,
-              targetOpName = "tt.store", barrierOpKind = "arrive_barrier",
+              targetOpIdx = 0 : ui32, barrierOpKind = "arrive_barrier",
               count = 1 : ui32>
         ]
       setup {
@@ -245,7 +245,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 1 : ui32, placement = before,
-              targetOpName = "arith.addi", barrierOpKind = "wait_barrier",
+              targetOpIdx = 0 : ui32, barrierOpKind = "wait_barrier",
               count = 1 : ui32>
         ]
       setup {
@@ -273,13 +273,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         tile_mappings = [array<i32: 0>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
-              targetOpName = "tt.store", barrierOpKind = "bogus",
+              targetOpIdx = 0 : ui32, barrierOpKind = "bogus",
               count = 1 : ui32>
         ]
       setup {
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
+        ttng.subtiled_region_return
+      }
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: targetOpIdx out of range
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_target_op_idx_out_of_range(
+      %bar: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>,
+      %phase: i32) {
+    // expected-error @+1 {{barrierAnnotations[0] has targetOpIdx=5 but tile block has only 1 ops}}
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>)
+        phases(%phase : i32)
+        tile_mappings = [array<i32: 0>]
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
+              targetOpIdx = 5 : ui32, barrierOpKind = "arrive_barrier",
+              count = 1 : ui32>
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        ttng.subtiled_region_yield %c0 : i32
+      } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
         ttng.subtiled_region_return
       }
     tt.return

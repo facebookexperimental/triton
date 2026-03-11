@@ -107,7 +107,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK-SAME: barriers(%[[BAR]] : !ttg.memdesc<1xi64, #shared2, #smem, mutable>)
     // CHECK-SAME: phases(%[[PHASE]] : i32)
     // CHECK-SAME: tile_mappings = [array<i32: 0>, array<i32: 1>]
-    // CHECK-SAME: barrier_annotations = [#ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after, targetOpName = "arith.addi", barrierOpKind = "arrive_barrier", count = 1 : ui32>]
+    // CHECK-SAME: barrier_annotations = [#ttng.barrier_annotation<barrierIdx = 0, placement = after, targetOpIdx = 0, barrierOpKind = "arrive_barrier">]
     // CHECK: setup
     // CHECK: ttng.subtiled_region_yield
     // CHECK: tile
@@ -117,9 +117,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
         phases(%phase : i32)
         tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
-          #ttng.barrier_annotation<barrierIdx = 0 : ui32, placement = after,
-              targetOpName = "arith.addi", barrierOpKind = "arrive_barrier",
-              count = 1 : ui32>
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
         ]
       setup {
         %c0 = arith.constant 0 : i32

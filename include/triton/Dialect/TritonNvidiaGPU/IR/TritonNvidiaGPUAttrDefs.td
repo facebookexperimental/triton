@@ -88,7 +88,7 @@ def TTNG_BarrierPlacementBefore : I32EnumAttrCase<"BEFORE", 0, "before">;
 def TTNG_BarrierPlacementAfter  : I32EnumAttrCase<"AFTER",  1, "after">;
 
 def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
-    "Barrier placement relative to first/last tile",
+    "Barrier placement relative to Op(s) in question",
     [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
@@ -104,7 +104,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
 
     - `barrierIdx`: index into the op's barriers operand list
     - `placement`: BEFORE first tile or AFTER last tile
-    - `targetOpName`: registered op name to anchor the barrier to
+    - `targetOpIdx`: 0-based index into the tile block's operations (excluding
+      the terminator) that the barrier should be anchored to
     - `barrierOpKind`: "wait_barrier" or "arrive_barrier"
     - `count`: arrive count for arrive_barrier (default 1)
   }];
@@ -112,7 +113,7 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
     ins
     "unsigned":$barrierIdx,
     "BarrierPlacement":$placement,
-    "StringAttr":$targetOpName,
+    "unsigned":$targetOpIdx,
     "StringAttr":$barrierOpKind,
     DefaultValuedParameter<"unsigned", "1">:$count
   );

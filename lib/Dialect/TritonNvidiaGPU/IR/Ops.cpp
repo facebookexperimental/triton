@@ -988,9 +988,10 @@ LogicalResult SubtiledRegionOp::verify() {
     }
   }
 
-  // 7-8. Validate barrier annotations
+  // 7-9. Validate barrier annotations
   unsigned numBarriers = getBarriers().size();
   unsigned numPhases = getBarrierPhases().size();
+  unsigned numTileOps = llvm::range_size(tileBlock.without_terminator());
   for (auto [i, attr] : llvm::enumerate(getBarrierAnnotations())) {
     auto annotation = dyn_cast<BarrierAnnotationAttr>(attr);
     if (!annotation)
@@ -1011,6 +1012,12 @@ LogicalResult SubtiledRegionOp::verify() {
                << annotation.getBarrierIdx() << " but there are only "
                << numPhases << " phases";
     }
+
+    // 9. targetOpIdx in range
+    if (annotation.getTargetOpIdx() >= numTileOps)
+      return emitOpError("barrierAnnotations[")
+             << i << "] has targetOpIdx=" << annotation.getTargetOpIdx()
+             << " but tile block has only " << numTileOps << " ops";
 
     // Validate barrierOpKind is one of the known values
     StringRef kind = annotation.getBarrierOpKind().getValue();

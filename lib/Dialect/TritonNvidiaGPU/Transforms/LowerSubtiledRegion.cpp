@@ -58,16 +58,17 @@ private:
       setupOutputs.push_back(setupMapping.lookupOrDefault(v));
 
     // 3. Pre-process barrier annotations.
-    //    beforeFirst[opName] -> annotations with placement=BEFORE
-    //    afterLast[opName]   -> annotations with placement=AFTER
-    llvm::StringMap<SmallVector<BarrierAnnotationAttr>> beforeFirst, afterLast;
+    //    beforeFirst[opIdx] -> annotations with placement=BEFORE
+    //    afterLast[opIdx]   -> annotations with placement=AFTER
+    DenseMap<unsigned, SmallVector<BarrierAnnotationAttr>> beforeFirst,
+        afterLast;
     for (Attribute attr : op.getBarrierAnnotations()) {
       auto annotation = cast<BarrierAnnotationAttr>(attr);
-      StringRef opName = annotation.getTargetOpName().getValue();
+      unsigned opIdx = annotation.getTargetOpIdx();
       if (annotation.getPlacement() == BarrierPlacement::BEFORE)
-        beforeFirst[opName].push_back(annotation);
+        beforeFirst[opIdx].push_back(annotation);
       else
-        afterLast[opName].push_back(annotation);
+        afterLast[opIdx].push_back(annotation);
     }
 
     ArrayAttr tileMappings = op.getTileMappings();
@@ -86,12 +87,11 @@ private:
       for (auto [j, idx] : llvm::enumerate(indices.asArrayRef()))
         tileMapping.map(tileBlock.getArgument(j), setupOutputs[idx]);
 
+      unsigned opIdx = 0;
       for (Operation &tileOp : tileBlock.without_terminator()) {
-        StringRef opName = tileOp.getName().getStringRef();
-
         // Before first tile: emit BEFORE annotations
         if (tileIdx == 0) {
-          auto it = beforeFirst.find(opName);
+          auto it = beforeFirst.find(opIdx);
           if (it != beforeFirst.end()) {
             for (auto &annotation : it->second)
               emitBarrierOp(builder, loc, annotation, barriers, phases);
@@ -102,12 +102,13 @@ private:
 
         // After last tile: emit AFTER annotations
         if (tileIdx == numTiles - 1) {
-          auto it = afterLast.find(opName);
+          auto it = afterLast.find(opIdx);
           if (it != afterLast.end()) {
             for (auto &annotation : it->second)
               emitBarrierOp(builder, loc, annotation, barriers, phases);
           }
         }
+        ++opIdx;
       }
     }
 
