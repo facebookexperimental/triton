@@ -437,6 +437,12 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   auto wgOp = topBuilder.create<nvws::WarpGroupOp>(resultTypes, numWarps,
                                                    numPartitions);
 
+  // Copy partition types attribute from the loop if present
+  if (auto typesAttr =
+          loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+    wgOp->setAttr(kPartitionTypesAttrName, typesAttr);
+  }
+
   SmallVector<WarpGroupBuilder> builders;
   for (Region &region : wgOp.getPartitionRegions()) {
     auto partitionId = builders.size();
