@@ -231,4 +231,17 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
   ];
 }
 
+def NVGPUAddSubtileRegions : Pass<"nvgpu-add-subtile-regions", "mlir::ModuleOp"> {
+  let summary = "Generate SubtiledRegionOp from subtiling patterns";
+
+  let description = [{
+    This pass analyzes the IR for subtiling patterns available from the frontend
+    and wraps them into `ttng.subtiled_region` ops, giving the compiler a
+    structured representation to reason about per-tile operations and barrier
+    placement.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES

@@ -364,6 +364,8 @@ class CUDABackend(BaseBackend):
                 from triton.runtime.driver import driver as rt_driver
                 smem_budget = rt_driver.active.utils.get_device_properties(
                     rt_driver.active.get_current_device())["max_shared_mem"]
+                if knobs.nvidia.use_subtiled_region_operator:
+                    nvidia.passes.hopper.add_subtile_regions(pm)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
