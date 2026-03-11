@@ -1203,6 +1203,7 @@ class CodeGenerator(ast.NodeVisitor):
         flatten = False
         warp_specialize = False
         disable_licm = False
+        split_mma = False
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
@@ -1223,6 +1224,7 @@ class CodeGenerator(ast.NodeVisitor):
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
+            split_mma = iterator.split_mma
         elif IteratorClass is range:
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1287,6 +1289,8 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
+            if split_mma:
+                for_op.set_attr("tt.split_mma", self.builder.get_unit_attr())
             if merge_epilogue:
                 for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
             if tmem_alloc_algo is not None:

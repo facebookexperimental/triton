@@ -1,12 +1,12 @@
-// RUN: triton-opt %s "-tritongpu-schedule-loops=num-stages=2 use-split-mma=true" | FileCheck %s
+// RUN: triton-opt %s "-tritongpu-schedule-loops=num-stages=2" | FileCheck %s
 
-// Backward attention kernel with 5 MMA ops. Verify that use-split-mma
-// produces the desired interleaved ordering:
+// Backward attention kernel with 5 MMA ops. Verify that tt.split_mma on the
+// ForOp produces the desired interleaved ordering:
 //   qkT(iter i) -> dQ(iter i-1) -> dK(iter i-1) -> dpT(iter i) -> dV(iter i)
 //
 // dQ and dK are "deferred MMAs" whose operand A depends on tmem_load results
 // of both qkT and dpT (via the dsT computation chain). They are placed at
-// stage 0 (iter i-1) to hide qkT's self-latency.
+// stage 1 (iter i-1) while qkT/dpT/dV are at stage 0 (iter i).
 
 // CHECK-LABEL: @_attn_bwd_split_mma
 
@@ -121,7 +121,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
       %next = arith.addi %arg44, %c128_i32 : i32
       scf.yield %next, %true, %qkT_tok, %dV, %dpT_tok, %dK, %dQ_tok : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
-    } 
+    } {tt.split_mma}
     %result_9, %token_10 = ttng.tmem_load %result_1[%28#3] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     %result_11, %token_12 = ttng.tmem_load %result_5[%28#5] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     %30 = ttg.convert_layout %result_9 : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked1>

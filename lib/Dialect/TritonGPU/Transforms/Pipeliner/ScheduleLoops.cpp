@@ -1008,7 +1008,8 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS,
   if (loops.empty())
     return;
   for (auto forOp : loops) {
-    scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS, useSplitMMA);
+    bool splitMMA = useSplitMMA || forOp->hasAttr(kSplitMMAAttrName);
+    scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS, splitMMA);
   }
 }
 //===----------------------------------------------------------------------===//
