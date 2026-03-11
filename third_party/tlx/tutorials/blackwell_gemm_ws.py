@@ -438,12 +438,19 @@ def preprocess_configs(configs, named_args, **kwargs):
         SPLIT_K = conf.kwargs.get("SPLIT_K", 1)
         EPILOGUE_SUBTILE = conf.kwargs["EPILOGUE_SUBTILE"]
         INTERLEAVE_EPILOGUE = conf.kwargs.get("INTERLEAVE_EPILOGUE", 0)
+        GROUP_SIZE_M = conf.kwargs["GROUP_SIZE_M"]
 
         # Filter out invalid config that causes wrong hardware MMA
         if BLOCK_M // NUM_MMA_GROUPS > 128:
             continue
         # Pair-CTA MMA doesn't work with M=64 per MMA group
         if NUM_CTAS == 2 and BLOCK_M // NUM_MMA_GROUPS == 64:
+            continue
+        # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
+        # tile_ids (assigned to paired CTAs in a cluster) always map to the
+        # same pid_n. Otherwise, at group boundaries a CTA pair can straddle
+        # two different pid_n values, breaking 2-CTA B-tile sharing.
+        if GROUP_SIZE_M % NUM_CTAS != 0:
             continue
 
         # EPILOGUE_SUBTILE must evenly divide BLOCK_N
