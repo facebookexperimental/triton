@@ -54,7 +54,9 @@ def TritonGPUScheduleLoops : Pass<"tritongpu-schedule-loops", "mlir::ModuleOp"> 
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
            "number of pipeline stages">,
     Option<"useMetaWS", "use-meta-ws", "bool", /*default*/"false",
-           "Which WS path to use">
+           "Which WS path to use">,
+    Option<"useSplitMMA", "use-split-mma", "bool", /*default*/"false",
+           "Split MMAs into deferred and current stages for bwd attention">
   ];
 }
 
