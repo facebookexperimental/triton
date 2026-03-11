@@ -235,8 +235,29 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
-        processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
-                                 bufferEmptyCount);
+
+        // Try to fuse the arrive into a nearby TMAStoreTokenWaitOp.
+        ttng::TMAStoreTokenWaitOp tmaStoreWaitOp = nullptr;
+        for (auto it = Block::iterator(op); it != op->getBlock()->begin();) {
+          --it;
+          if (auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&*it)) {
+            if (waitOp.getBarriers().empty()) {
+              tmaStoreWaitOp = waitOp;
+            }
+            break; // stop at first TMAStoreTokenWaitOp
+          }
+        }
+        if (tmaStoreWaitOp) {
+          // Move bufferEmpty's defining op before the wait so it dominates.
+          bufferEmpty.getDefiningOp()->moveBefore(tmaStoreWaitOp);
+          builder.setInsertionPoint(tmaStoreWaitOp);
+          auto pred = builder.create<arith::ConstantIntOp>(loc, true, 1);
+          setAsyncTaskIds(pred, getAsyncTaskIds(user));
+          tmaStoreWaitOp.addBarrier(bufferEmpty, pred);
+        } else {
+          processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
+                                   bufferEmptyCount);
+        }
         deprecatedOps.push_back(user);
         return true;
       }
