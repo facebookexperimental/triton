@@ -994,13 +994,13 @@ LogicalResult SubtiledRegionOp::verify() {
       return emitOpError("barrierAnnotations[")
              << i << "] must be a BarrierAnnotationAttr";
 
-    // 7. barrierIdx in range
+    // 5. barrierIdx in range
     if (annotation.getBarrierIdx() >= numBarriers)
       return emitOpError("barrierAnnotations[")
              << i << "] has barrierIdx=" << annotation.getBarrierIdx()
              << " but there are only " << numBarriers << " barriers";
 
-    // 8. For wait_barrier, check phase exists
+    // 6. For wait_barrier, check phase exists
     if (annotation.getBarrierOpKind().getValue() == "wait_barrier") {
       if (annotation.getBarrierIdx() >= numPhases)
         return emitOpError("barrierAnnotations[")
@@ -1009,7 +1009,7 @@ LogicalResult SubtiledRegionOp::verify() {
                << numPhases << " phases";
     }
 
-    // 9. targetOpIdx in range
+    // 7. targetOpIdx in range
     if (annotation.getTargetOpIdx() >= numTileOps)
       return emitOpError("barrierAnnotations[")
              << i << "] has targetOpIdx=" << annotation.getTargetOpIdx()
