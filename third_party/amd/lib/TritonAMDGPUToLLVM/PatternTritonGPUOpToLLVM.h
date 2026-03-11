@@ -51,6 +51,7 @@ void populateUpcastMXFPToLLVMPatterns(LLVMTypeConverter &typeConverter,
 
 void populateFp4ToFpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                    RewritePatternSet &patterns,
+                                   const TargetInfo &targetInfo,
                                    PatternBenefit benefit);
 
 void populateMaskedOpsToLLVMPatterns(RewritePatternSet &patterns);

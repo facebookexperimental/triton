@@ -3545,6 +3545,47 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       config.groups.push_back(group);
     }
   }
+  // Merge consumer groups for channels in the same reuse group.
+  // All channels in a reuse group share a barrier, so they must be processed
+  // together in insertAsyncComm to produce a single barrier_expect + wait.
+  DenseSet<Channel *> mergedChannels;
+  for (auto &group : config.groups) {
+    if (group.channels.size() <= 1)
+      continue;
+    Channel *rep = group.channels[0];
+    for (size_t i = 1; i < group.channels.size(); i++) {
+      Channel *ch = group.channels[i];
+      if (ch->relation.second != rep->relation.second)
+        continue;
+      if (ch->getDstOp() != rep->getDstOp())
+        continue;
+      // Skip if either producer is a TCGen5MMAOp: commit handling for
+      // MMA-produced TMEM channels doesn't work when fused into one group.
+      //
+      // Even once supported we will need to prove that the MMA op dominates
+      // the other op in program order.
+      if (isa<ttng::TCGen5MMAOp>(ch->getSrcOp()) ||
+          isa<ttng::TCGen5MMAOp>(rep->getSrcOp()))
+        continue;
+      // Only merge TMA-produced channels with other TMA-produced channels.
+      // This is because otherwise the barriers cannot be "fused" properly
+      // as one step is async.
+      //
+      // To support this we need to prove the TMA op dominates the non-TMA op
+      // in program order.
+      bool chIsTMA = isProducerTMA(ch, /*isPost=*/true);
+      bool repIsTMA = isProducerTMA(rep, /*isPost=*/true);
+      if (chIsTMA != repIsTMA)
+        continue;
+      channelsGroupedByConsumers[rep].push_back(ch);
+      channelsGroupedByConsumers.erase(ch);
+      mergedChannels.insert(ch);
+    }
+  }
+  orderedChannels.erase(
+      llvm::remove_if(orderedChannels,
+                      [&](Channel *ch) { return mergedChannels.count(ch); }),
+      orderedChannels.end());
   appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
                         &config);
   LLVM_DEBUG({
