@@ -937,7 +937,7 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
 
 // -- SubtiledRegionOp --
 LogicalResult SubtiledRegionOp::verify() {
-  // 0. Both regions must have exactly one basic block.
+  // 0. Setup and tile regions must have exactly one basic block.
   if (!getSetupRegion().hasOneBlock())
     return emitOpError("setup region must have exactly one block");
   if (!getTileRegion().hasOneBlock())
@@ -949,14 +949,14 @@ LogicalResult SubtiledRegionOp::verify() {
     return emitOpError("setup region must terminate with "
                        "'ttng.subtiled_region_yield'");
 
-  // 2. Tile region terminates with SubtiledRegionReturnOp
+  // 2. Tile region terminates with SubtiledRegionYieldOp
   auto &tileBlock = getTileRegion().front();
-  if (!isa<SubtiledRegionReturnOp>(tileBlock.getTerminator()))
+  if (!isa<SubtiledRegionYieldOp>(tileBlock.getTerminator()))
     return emitOpError("tile region must terminate with "
-                       "'ttng.subtiled_region_return'");
+                       "'ttng.subtiled_region_yield'");
 
-  auto yieldOp = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
-  unsigned numSetupOutputs = yieldOp.getResults().size();
+  auto setupYieldOp = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
+  unsigned numSetupOutputs = setupYieldOp.getResults().size();
   unsigned numTileArgs = tileBlock.getNumArguments();
 
   // 3. tileMappings is non-empty
@@ -985,7 +985,7 @@ LogicalResult SubtiledRegionOp::verify() {
                << numSetupOutputs << ")";
 
       // 6. Types match
-      Type setupType = yieldOp.getResults()[idx].getType();
+      Type setupType = setupYieldOp.getResults()[idx].getType();
       Type tileArgType = tileBlock.getArgument(j).getType();
       if (setupType != tileArgType)
         return emitOpError("type mismatch: setup output ")
@@ -1030,6 +1030,75 @@ LogicalResult SubtiledRegionOp::verify() {
     if (kind != "wait_barrier" && kind != "arrive_barrier")
       return emitOpError("barrierAnnotations[")
              << i << "] has unknown barrierOpKind '" << kind << "'";
+  }
+
+  // 10. Validate teardown region and tile yield interaction
+  auto tileYieldOp = cast<SubtiledRegionYieldOp>(tileBlock.getTerminator());
+  unsigned numTileYieldOperands = tileYieldOp.getResults().size();
+  unsigned numTiles = tileMappings.size();
+  bool hasTeardown = !getTeardownRegion().empty();
+
+  if (numTileYieldOperands > 0) {
+    // Tile yields values => teardown region must be present
+    if (!hasTeardown)
+      return emitOpError(
+          "tile region yields values but no teardown region is present");
+
+    if (!getTeardownRegion().hasOneBlock())
+      return emitOpError("teardown region must have exactly one block");
+
+    auto &teardownBlock = getTeardownRegion().front();
+    if (!isa<SubtiledRegionYieldOp>(teardownBlock.getTerminator()))
+      return emitOpError("teardown region must terminate with "
+                         "'ttng.subtiled_region_yield'");
+
+    // Teardown block arg count must equal K * N (numTiles *
+    // numTileYieldOperands)
+    unsigned totalTileYields = numTiles * numTileYieldOperands;
+    unsigned numTeardownArgs = teardownBlock.getNumArguments();
+    if (numTeardownArgs != totalTileYields)
+      return emitOpError("teardown region has ")
+             << numTeardownArgs << " block arguments but expected "
+             << totalTileYields << " (numTiles=" << numTiles
+             << " * numTileYields=" << numTileYieldOperands << ")";
+
+    // Type check: teardown block args must match tile yield types in order
+    for (unsigned i = 0; i < numTeardownArgs; ++i) {
+      unsigned yieldPos = i % numTileYieldOperands;
+      Type tileYieldType = tileYieldOp.getResults()[yieldPos].getType();
+      Type teardownArgType = teardownBlock.getArgument(i).getType();
+      if (tileYieldType != teardownArgType)
+        return emitOpError("teardown block arg ")
+               << i << " has type " << teardownArgType
+               << " but tile yield operand " << yieldPos << " has type "
+               << tileYieldType;
+    }
+
+    // Teardown yield count == op result count
+    auto teardownYieldOp =
+        cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
+    unsigned numTeardownYields = teardownYieldOp.getResults().size();
+    unsigned numResults = getNumResults();
+    if (numTeardownYields != numResults)
+      return emitOpError("teardown region yields ")
+             << numTeardownYields << " values but op has " << numResults
+             << " results";
+
+    // Teardown yield types == op result types
+    for (auto [i, pair] : llvm::enumerate(llvm::zip(
+             teardownYieldOp.getResults().getTypes(), getResultTypes()))) {
+      if (std::get<0>(pair) != std::get<1>(pair))
+        return emitOpError("teardown yield type ")
+               << std::get<0>(pair) << " at position " << i
+               << " doesn't match op result type " << std::get<1>(pair);
+    }
+  } else {
+    // Tile yields nothing => no teardown, no results
+    if (hasTeardown)
+      return emitOpError(
+          "teardown region is present but tile region yields no values");
+    if (getNumResults() > 0)
+      return emitOpError("op has results but tile region yields no values");
   }
 
   return success();
@@ -1078,6 +1147,19 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
   // Print tile region with block args
   p << " tile";
   p.printRegion(getTileRegion(), /*printEntryBlockArgs=*/true);
+
+  // Print teardown region (if non-empty)
+  if (!getTeardownRegion().empty()) {
+    p << " teardown";
+    p.printRegion(getTeardownRegion(), /*printEntryBlockArgs=*/true);
+  }
+
+  // Print result types
+  if (getNumResults() > 0) {
+    p << " -> (";
+    llvm::interleaveComma(getResultTypes(), p, [&](Type t) { p.printType(t); });
+    p << ")";
+  }
 }
 
 ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
@@ -1149,6 +1231,26 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
   Region *tileRegion = result.addRegion();
   if (parser.parseRegion(*tileRegion, tileArgs))
     return failure();
+
+  // Parse optional teardown region
+  Region *teardownRegion = result.addRegion();
+  if (succeeded(parser.parseOptionalKeyword("teardown"))) {
+    SmallVector<OpAsmParser::Argument> teardownArgs;
+    if (parser.parseArgumentList(teardownArgs, OpAsmParser::Delimiter::Paren,
+                                 /*allowType=*/true))
+      return failure();
+    if (parser.parseRegion(*teardownRegion, teardownArgs))
+      return failure();
+  }
+
+  // Parse optional result types: -> (type, ...)
+  if (succeeded(parser.parseOptionalArrow())) {
+    SmallVector<Type> resultTypes;
+    if (parser.parseLParen() || parser.parseTypeList(resultTypes) ||
+        parser.parseRParen())
+      return failure();
+    result.addTypes(resultTypes);
+  }
 
   return success();
 }

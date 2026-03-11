@@ -79,6 +79,12 @@ private:
     ValueRange phases = op.getBarrierPhases();
 
     // 4. For each tile, clone tile region ops with substitution.
+    //    Collect yielded values from each tile for teardown.
+    auto tileYieldOp = cast<SubtiledRegionYieldOp>(tileBlock.getTerminator());
+    unsigned numTileYieldOperands = tileYieldOp.getResults().size();
+    // Flat vector of K*N values: tileYieldValues[tileIdx * N + yieldPos]
+    SmallVector<Value> tileYieldValues;
+
     for (unsigned tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
       auto indices = cast<DenseI32ArrayAttr>(tileMappings[tileIdx]);
       IRMapping tileMapping;
@@ -110,9 +116,35 @@ private:
         }
         ++opIdx;
       }
+
+      // Collect remapped tile yield operands for this tile
+      for (Value v : tileYieldOp.getResults())
+        tileYieldValues.push_back(tileMapping.lookupOrDefault(v));
     }
 
-    // 5. Erase the SubtiledRegionOp.
+    // 5. If teardown region is present, inline it and replace op results.
+    if (!op.getTeardownRegion().empty()) {
+      Block &teardownBlock = op.getTeardownRegion().front();
+      IRMapping teardownMapping;
+
+      // Map teardown block args to collected tile yield values (in order)
+      for (auto [arg, val] :
+           llvm::zip(teardownBlock.getArguments(), tileYieldValues))
+        teardownMapping.map(arg, val);
+
+      // Clone teardown ops (except yield)
+      for (Operation &tdOp : teardownBlock.without_terminator())
+        builder.clone(tdOp, teardownMapping);
+
+      // Replace op results with remapped teardown yield operands
+      auto teardownYieldOp =
+          cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
+      for (auto [result, yieldVal] :
+           llvm::zip(op.getResults(), teardownYieldOp.getResults()))
+        result.replaceAllUsesWith(teardownMapping.lookupOrDefault(yieldVal));
+    }
+
+    // 6. Erase the SubtiledRegionOp.
     op.erase();
   }
 };

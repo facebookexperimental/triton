@@ -121,7 +121,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0.0 : f32
         ttng.subtiled_region_yield %c0 : f32
       } tile(%arg0: f32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -146,7 +146,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32, %arg1: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -171,7 +171,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c1 = arith.constant 1 : i32
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -195,7 +195,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: f32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -222,7 +222,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -250,7 +250,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %c0 = arith.constant 0 : i32
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -278,7 +278,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -306,8 +306,149 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: teardown present but tile yields no values
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_teardown_but_no_tile_yield() {
+    // expected-error @+1 {{teardown region is present but tile region yields no values}}
+    ttng.subtiled_region
+        tile_mappings = [array<i32: 0>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        ttng.subtiled_region_yield %c0 : i32
+      } tile(%arg0: i32) {
+        ttng.subtiled_region_yield
+      } teardown() {
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: tile yields values but no teardown region
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_tile_yield_no_teardown() {
+    // expected-error @+1 {{tile region yields values but no teardown region is present}}
+    ttng.subtiled_region
+        tile_mappings = [array<i32: 0>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        ttng.subtiled_region_yield %c0 : i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      }
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: teardown block arg count mismatch (expected numTiles * numTileYields)
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_teardown_arg_count_mismatch() {
+    // expected-error @+1 {{teardown region has 1 block arguments but expected 2 (numTiles=2 * numTileYields=1)}}
+    %r = ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      } teardown(%a: i32) {
+        ttng.subtiled_region_yield %a : i32
+      } -> (i32)
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: teardown block arg type mismatch
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_teardown_type_mismatch() {
+    // expected-error @+1 {{teardown block arg 0 has type 'f32' but tile yield operand 0 has type 'i32'}}
+    %r = ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      } teardown(%a: f32, %b: f32) {
+        %j = arith.addf %a, %b : f32
+        ttng.subtiled_region_yield %j : f32
+      } -> (f32)
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: teardown yield count != op result count
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_teardown_yield_count_mismatch() {
+    // expected-error @+1 {{teardown region yields 2 values but op has 1 results}}
+    %r = ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      } teardown(%a: i32, %b: i32) {
+        ttng.subtiled_region_yield %a, %b : i32, i32
+      } -> (i32)
+    tt.return
+  }
+}
+
+// -----
+
+// Verify: teardown yield type != op result type
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @subtiled_region_teardown_yield_type_mismatch() {
+    // expected-error @+1 {{teardown yield type 'i32' at position 0 doesn't match op result type 'f32'}}
+    %r = ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      } teardown(%a: i32, %b: i32) {
+        %j = arith.addi %a, %b : i32
+        ttng.subtiled_region_yield %j : i32
+      } -> (f32)
     tt.return
   }
 }

@@ -26,7 +26,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
         %idx = arith.index_cast %arg0 : i32 to index
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -60,7 +60,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c128 : i32, i32
       } tile(%arg0: i32) {
         %off = arith.addi %arg0, %row : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -91,7 +91,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -122,7 +122,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1, %c10, %c20 : i32, i32, i32, i32
       } tile(%a: i32, %b: i32) {
         %sum = arith.addi %a, %b : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -158,7 +158,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c3, %c5 : i32, i32
       } tile(%arg0: i32) {
         %res = arith.muli %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -188,7 +188,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c42 : i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %arg0 : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -212,7 +212,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
         %res = arith.addi %arg0, %outer : i32
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
     tt.return
   }
@@ -234,8 +234,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         ttng.subtiled_region_yield %c0, %c1 : i32, i32
       } tile(%arg0: i32) {
         %idx = arith.index_cast %arg0 : i32 to index
-        ttng.subtiled_region_return
+        ttng.subtiled_region_yield
       }
+    tt.return
+  }
+
+  // Test teardown region: 2 tiles, tile yields a value, teardown joins them.
+  // CHECK-LABEL: @teardown_join
+  tt.func @teardown_join(%t0: tensor<128x64xf32, #blocked>, %t1: tensor<128x64xf32, #blocked>) {
+    // Setup inlined:
+    // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : i32
+    // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : i32
+    // Tile 0 (arg0 = c0): addi c0, c0 => 0
+    // CHECK: %[[V0:.*]] = arith.addi %[[C0]], %[[C0]]
+    // Tile 1 (arg0 = c1): addi c1, c1 => 2
+    // CHECK: %[[V1:.*]] = arith.addi %[[C1]], %[[C1]]
+    // Teardown: addi of the two tile yields
+    // CHECK: %[[R:.*]] = arith.addi %[[V0]], %[[V1]]
+    // Result used:
+    // CHECK: arith.index_cast %[[R]]
+    // CHECK-NOT: ttng.subtiled_region
+    %result = ttng.subtiled_region
+        tile_mappings = [array<i32: 0>, array<i32: 1>]
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      } teardown(%a: i32, %b: i32) {
+        %j = arith.addi %a, %b : i32
+        ttng.subtiled_region_yield %j : i32
+      } -> (i32)
+    %idx = arith.index_cast %result : i32 to index
     tt.return
   }
 }
