@@ -68,6 +68,7 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
     // Wait for this specific TMA store to finish reading from SMEM.
     builder.create<ttng::TMAStoreTokenWaitOp>(loc, tmaStore.getToken(),
+                                              ValueRange{}, ValueRange{},
                                               ValueRange{}, ValueRange{});
 
     storeOp.erase();

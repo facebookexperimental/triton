@@ -3044,12 +3044,12 @@ void insertAsyncComm(
         builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
         if (auto tokenWaitOp =
                 dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
-          builder.setInsertionPoint(consumerReleasePoint);
-          auto barrier =
-              getBarrierForPipelineStage(builder, token.second, bufferIdx);
-          Value truePred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-              consumerReleasePoint->getLoc(), 1, 1);
-          tokenWaitOp.addBarrier(barrier, truePred);
+          tokenWaitOp.addToken(token.second, bufferIdx);
+          LLVM_DEBUG({
+            LDBG("attached ConsumerRelease token to TMAStoreTokenWaitOp "
+                 << masterChannel->uniqID << " ");
+            token.second.dump();
+          });
         } else {
           builder.setInsertionPointAfter(consumerReleasePoint);
           auto releaseOp =
