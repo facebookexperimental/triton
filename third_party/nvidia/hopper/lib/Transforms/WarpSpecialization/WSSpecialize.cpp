@@ -523,7 +523,6 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   // Instead of a new IfOp for each task, we create one partitionRegion.
   auto nTaskIds = getNestedAsyncTaskIds(funcOp);
   SmallVector<int32_t> partitionNumWarps;
-  // TODO: FIX FOR GEMM.
   for (AsyncTaskId asyncTaskId : nTaskIds) {
     if (asyncTaskId == 0)
       continue;
