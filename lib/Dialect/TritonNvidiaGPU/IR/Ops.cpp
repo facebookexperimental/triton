@@ -937,6 +937,12 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
 
 // -- SubtiledRegionOp --
 LogicalResult SubtiledRegionOp::verify() {
+  // 0. Both regions must have exactly one basic block.
+  if (!getSetupRegion().hasOneBlock())
+    return emitOpError("setup region must have exactly one block");
+  if (!getTileRegion().hasOneBlock())
+    return emitOpError("tile region must have exactly one block");
+
   // 1. Setup region terminates with SubtiledRegionYieldOp
   auto &setupBlock = getSetupRegion().front();
   if (!isa<SubtiledRegionYieldOp>(setupBlock.getTerminator()))

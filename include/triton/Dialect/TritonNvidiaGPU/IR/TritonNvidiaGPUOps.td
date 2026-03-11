@@ -1061,7 +1061,7 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     This gives the compiler a structured way to reason about per-tile operations
     and barrier placement.
 
-    The op has two regions:
+    The op has two single-block regions:
     - `setupRegion`: computes subtile values (e.g. tmem_subslice + tmem_load,
       constants). Terminated by `subtiled_region_yield`.
     - `tileRegion`: per-tile body that is replicated during lowering. Block
