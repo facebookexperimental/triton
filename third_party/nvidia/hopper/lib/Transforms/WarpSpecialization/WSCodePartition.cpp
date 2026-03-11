@@ -2884,7 +2884,7 @@ void insertAsyncComm(
             // XXX: Op can have multiple async tasks
           }
         }
-        // Get the last consumer op.
+        // Get the last mmaOp.
         auto *lastConsumer = getLastOpInBlock(filteredOps);
         auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(lastConsumer);
         if (!mmaOp)
