@@ -539,6 +539,15 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   auto wsOp = impB.create<ttg::WarpSpecializeOp>(dummyTypes, partitionNumWarps,
                                                  nTaskIds.size() - 1);
 
+  // Copy partition types attribute from the loop to the WarpSpecializeOp.
+  // This is needed by OptimizePartitionWarps for type-aware warp assignment.
+  funcOp.walk([&](scf::ForOp forOp) {
+    if (auto typesAttr =
+            forOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+      wsOp->setAttr(kPartitionTypesAttrName, typesAttr);
+    }
+  });
+
   // Clone all operations into the corresponding if blocks. If the operation
   // has multiple taskIds, it will be cloned for multiple if blocks.
   // If the original code has an IfOp, we should only clone its
