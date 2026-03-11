@@ -959,42 +959,32 @@ LogicalResult SubtiledRegionOp::verify() {
   unsigned numSetupOutputs = setupYieldOp.getResults().size();
   unsigned numTileArgs = tileBlock.getNumArguments();
 
-  // 3. tileMappings is non-empty
-  ArrayAttr tileMappings = getTileMappings();
-  if (tileMappings.empty())
-    return emitOpError("tileMappings must have at least one tile");
+  // 3. Infer number of tiles from setup outputs and tile block args.
+  //    Tile block args must be > 0, and setup outputs must be divisible.
+  if (numTileArgs == 0)
+    return emitOpError("tile region must have at least one block argument");
+  if (numSetupOutputs == 0)
+    return emitOpError("setup region must yield at least one value");
+  if (numSetupOutputs % numTileArgs != 0)
+    return emitOpError("setup region yields ")
+           << numSetupOutputs
+           << " values, which is not divisible by the number of tile block "
+              "arguments ("
+           << numTileArgs << ")";
+  unsigned numTiles = numSetupOutputs / numTileArgs;
 
-  // 4-6. Validate each tile mapping
-  for (auto [i, mapping] : llvm::enumerate(tileMappings)) {
-    auto indices = dyn_cast<DenseI32ArrayAttr>(mapping);
-    if (!indices)
-      return emitOpError("tileMappings[")
-             << i << "] must be a DenseI32ArrayAttr";
-
-    // 4. Inner array length = number of tile block args
-    if (static_cast<unsigned>(indices.size()) != numTileArgs)
-      return emitOpError("tileMappings[") << i << "] has " << indices.size()
-                                          << " entries but tile region has "
-                                          << numTileArgs << " block arguments";
-
-    for (auto [j, idx] : llvm::enumerate(indices.asArrayRef())) {
-      // 5. Indices in range
-      if (idx < 0 || static_cast<unsigned>(idx) >= numSetupOutputs)
-        return emitOpError("tileMappings[")
-               << i << "][" << j << "] = " << idx << " is out of range [0, "
-               << numSetupOutputs << ")";
-
-      // 6. Types match
-      Type setupType = setupYieldOp.getResults()[idx].getType();
-      Type tileArgType = tileBlock.getArgument(j).getType();
-      if (setupType != tileArgType)
-        return emitOpError("type mismatch: setup output ")
-               << idx << " has type " << setupType << " but tile block arg "
-               << j << " has type " << tileArgType;
-    }
+  // 4. Type check: setup outputs must match tile block arg types (repeating)
+  for (unsigned i = 0; i < numSetupOutputs; ++i) {
+    unsigned argPos = i % numTileArgs;
+    Type setupType = setupYieldOp.getResults()[i].getType();
+    Type tileArgType = tileBlock.getArgument(argPos).getType();
+    if (setupType != tileArgType)
+      return emitOpError("type mismatch: setup output ")
+             << i << " has type " << setupType << " but tile block arg "
+             << argPos << " has type " << tileArgType;
   }
 
-  // 7-9. Validate barrier annotations
+  // 5-7. Validate barrier annotations
   unsigned numBarriers = getBarriers().size();
   unsigned numPhases = getBarrierPhases().size();
   unsigned numTileOps = llvm::range_size(tileBlock.without_terminator());
@@ -1032,10 +1022,9 @@ LogicalResult SubtiledRegionOp::verify() {
              << i << "] has unknown barrierOpKind '" << kind << "'";
   }
 
-  // 10. Validate teardown region and tile yield interaction
+  // 8. Validate teardown region and tile yield interaction
   auto tileYieldOp = cast<SubtiledRegionYieldOp>(tileBlock.getTerminator());
   unsigned numTileYieldOperands = tileYieldOp.getResults().size();
-  unsigned numTiles = tileMappings.size();
   bool hasTeardown = !getTeardownRegion().empty();
 
   if (numTileYieldOperands > 0) {
@@ -1127,18 +1116,13 @@ void SubtiledRegionOp::print(OpAsmPrinter &p) {
     p << ")";
   }
 
-  // Print tileMappings
-  p << " tile_mappings = ";
-  p.printAttribute(getTileMappings());
-
   // Print barrierAnnotations
   p << " barrier_annotations = ";
   p.printAttribute(getBarrierAnnotations());
 
   // Print attr-dict (excluding our custom attrs and operand segment sizes)
-  p.printOptionalAttrDict(
-      (*this)->getAttrs(),
-      {"tileMappings", "barrierAnnotations", getOperandSegmentSizeAttr()});
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          {"barrierAnnotations", getOperandSegmentSizeAttr()});
 
   // Print setup region
   p << " setup ";
@@ -1182,13 +1166,6 @@ ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
         parser.parseColonTypeList(phaseTypes) || parser.parseRParen())
       return failure();
   }
-
-  // Parse tile_mappings = <attr>
-  Attribute tileMappingsAttr;
-  if (parser.parseKeyword("tile_mappings") || parser.parseEqual() ||
-      parser.parseAttribute(tileMappingsAttr))
-    return failure();
-  result.addAttribute("tileMappings", tileMappingsAttr);
 
   // Parse barrier_annotations = <attr>
   Attribute barrierAnnotationsAttr;

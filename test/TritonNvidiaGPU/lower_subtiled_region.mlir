@@ -18,7 +18,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: arith.index_cast %[[C1]]
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = []
       setup {
         %c0 = arith.constant 0 : i32
@@ -49,7 +48,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
         phases(%phase : i32)
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = after,
               targetOpIdx = 0, barrierOpKind = "arrive_barrier">
@@ -80,7 +78,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
         phases(%phase : i32)
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
               targetOpIdx = 0, barrierOpKind = "wait_barrier">
@@ -96,15 +93,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
-  // Test with multiple block args per tile.
+  // Test with multiple block args per tile (tile-major setup order).
   // CHECK-LABEL: @multi_arg_tiles
   tt.func @multi_arg_tiles() {
-    // Setup outputs: c0, c1, c10, c20
-    // Tile 0 maps [0, 2] => (c0, c10)
-    // Tile 1 maps [1, 3] => (c1, c20)
+    // Setup outputs in tile-major order: c0, c10 (tile 0), c1, c20 (tile 1)
     // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : i32
-    // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : i32
     // CHECK-DAG: %[[C10:.*]] = arith.constant 10 : i32
+    // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : i32
     // CHECK-DAG: %[[C20:.*]] = arith.constant 20 : i32
     // Tile 0: addi c0, c10
     // CHECK: arith.addi %[[C0]], %[[C10]]
@@ -112,14 +107,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: arith.addi %[[C1]], %[[C20]]
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
-        tile_mappings = [array<i32: 0, 2>, array<i32: 1, 3>]
         barrier_annotations = []
       setup {
         %c0 = arith.constant 0 : i32
-        %c1 = arith.constant 1 : i32
         %c10 = arith.constant 10 : i32
+        %c1 = arith.constant 1 : i32
         %c20 = arith.constant 20 : i32
-        ttng.subtiled_region_yield %c0, %c1, %c10, %c20 : i32, i32, i32, i32
+        ttng.subtiled_region_yield %c0, %c10, %c1, %c20 : i32, i32, i32, i32
       } tile(%a: i32, %b: i32) {
         %sum = arith.addi %a, %b : i32
         ttng.subtiled_region_yield
@@ -144,7 +138,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.subtiled_region
         barriers(%bar_wait, %bar_arrive : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>)
         phases(%phase, %phase : i32, i32)
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
               targetOpIdx = 0, barrierOpKind = "wait_barrier">,
@@ -176,7 +169,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.subtiled_region
         barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
         phases(%phase : i32)
-        tile_mappings = [array<i32: 0>]
         barrier_annotations = [
           #ttng.barrier_annotation<barrierIdx = 0, placement = before,
               targetOpIdx = 0, barrierOpKind = "wait_barrier">,
@@ -204,7 +196,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: arith.addi %{{.*}}, %[[OUTER]]
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = []
       setup {
         %c0 = arith.constant 0 : i32
@@ -226,7 +217,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: arith.index_cast
     // CHECK-NOT: ttng.subtiled_region
     ttng.subtiled_region
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = []
       setup {
         %c0 = arith.constant 0 : i32
@@ -239,7 +229,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
-  // Test teardown region: 2 tiles, tile yields a value, teardown joins them.
+  // Test teardown region: 2 tiles, tile yields a value, teardown combines them.
   // CHECK-LABEL: @teardown_join
   tt.func @teardown_join(%t0: tensor<128x64xf32, #blocked>, %t1: tensor<128x64xf32, #blocked>) {
     // Setup inlined:
@@ -255,7 +245,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: arith.index_cast %[[R]]
     // CHECK-NOT: ttng.subtiled_region
     %result = ttng.subtiled_region
-        tile_mappings = [array<i32: 0>, array<i32: 1>]
         barrier_annotations = []
       setup {
         %c0 = arith.constant 0 : i32

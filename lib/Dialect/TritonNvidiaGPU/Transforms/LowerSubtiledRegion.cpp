@@ -71,9 +71,9 @@ private:
         afterLast[opIdx].push_back(annotation);
     }
 
-    ArrayAttr tileMappings = op.getTileMappings();
-    unsigned numTiles = tileMappings.size();
     Block &tileBlock = op.getTileRegion().front();
+    unsigned numTileArgs = tileBlock.getNumArguments();
+    unsigned numTiles = setupOutputs.size() / numTileArgs;
 
     ValueRange barriers = op.getBarriers();
     ValueRange phases = op.getBarrierPhases();
@@ -86,12 +86,12 @@ private:
     SmallVector<Value> tileYieldValues;
 
     for (unsigned tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
-      auto indices = cast<DenseI32ArrayAttr>(tileMappings[tileIdx]);
       IRMapping tileMapping;
 
-      // Build mapping: tile block arg -> setup output
-      for (auto [j, idx] : llvm::enumerate(indices.asArrayRef()))
-        tileMapping.map(tileBlock.getArgument(j), setupOutputs[idx]);
+      // Build mapping: tile block arg -> sequential setup output
+      for (unsigned j = 0; j < numTileArgs; ++j)
+        tileMapping.map(tileBlock.getArgument(j),
+                        setupOutputs[tileIdx * numTileArgs + j]);
 
       unsigned opIdx = 0;
       for (Operation &tileOp : tileBlock.without_terminator()) {
