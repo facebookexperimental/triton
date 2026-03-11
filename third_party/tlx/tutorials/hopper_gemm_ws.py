@@ -186,7 +186,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                         tlx.barrier_wait(cta_bar, p)
 
                         # Each CTA loads half of B and multicasts to both CTAs
-                        if tlx.cluster_cta_rank() == 0:
+                        if cta_id == 0:
                             buf_b_slice = tlx.local_slice(data_b, [0, 0], [BK, BN // 2])
                         else:
                             buf_b_slice = tlx.local_slice(data_b, [0, BN // 2], [BK, BN // 2])
