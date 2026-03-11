@@ -30,7 +30,9 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "");
+                              StringRef writeDecisionFile = "",
+                              int smemAllocAlgo = 0, unsigned smemBudget = 0,
+                              bool smemCircularReuse = false);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
@@ -162,7 +164,9 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    if (failed(doMemoryPlanner(funcOp, numStages))) {
+    if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
+                               /*writeDecisionFile=*/"",
+                               /*smemAllocAlgo=*/0, smemBudget))) {
       signalPassFailure();
       return;
     }

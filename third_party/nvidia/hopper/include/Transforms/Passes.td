@@ -27,9 +27,12 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
            "bool", /*default*/"false",
            "Enable ping pong barrier insertion around critical regions">,
     Option<"dumpIntermediateSteps", "dump-intermediate-steps",
-           "bool", /*default*/"false",
-           "Dump intermediate steps">
-  ];
+             "bool", /*default*/"false",
+             "Dump intermediate steps">,
+    Option<"smemBudget", "smem-budget",
+             "int32_t", /*default*/"0",
+             "SMEM budget in bytes (0 = auto-detect from target)">
+    ];
 }
 
 def NVGPUTestWSTaskPartition : Pass<"nvgpu-test-ws-task-partition", "mlir::ModuleOp"> {
@@ -55,6 +58,15 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
            "number of buffering for warp specialization">,
+    Option<"smemAllocAlgo", "smem-alloc-algo",
+           "int32_t", /*default*/"0",
+           "SMEM allocation algorithm: 0 = original, 1 = WSBuffer-based">,
+    Option<"smemBudget", "smem-budget",
+           "int32_t", /*default*/"0",
+           "SMEM budget in bytes (0 = auto-detect from target)">,
+    Option<"smemCircularReuse", "smem-circular-reuse",
+           "bool", /*default*/"false",
+           "Enable circular buffer reuse for SMEM allocation">,
     Option<"readDecisionFile", "read-decision-file",
            "std::string", /*default*/"\"\"",
            "path to JSON file containing buffer decisions to apply">,

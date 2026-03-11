@@ -21,7 +21,6 @@ inline bool getBoolEnv(const std::string &env, bool defaultValue) {
   return str == "on" || str == "true" || str == "1";
 }
 
-
 inline std::string getStrEnv(const std::string &env) {
   std::lock_guard<std::mutex> lock(getenv_mutex);
   const char *s = std::getenv(env.c_str());

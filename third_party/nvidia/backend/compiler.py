@@ -331,7 +331,11 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
+            from triton.runtime.driver import driver as rt_driver
+            smem_budget = rt_driver.active.utils.get_device_properties(
+                rt_driver.active.get_current_device())["max_shared_mem"]
+            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
+                                                     smem_budget)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
@@ -357,8 +361,11 @@ class CUDABackend(BaseBackend):
                     )
                 else:
                     passes.ttgpuir.add_partition_scheduling(pm)
+                from triton.runtime.driver import driver as rt_driver
+                smem_budget = rt_driver.active.utils.get_device_properties(
+                    rt_driver.active.get_current_device())["max_shared_mem"]
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled)
+                                                         dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
@@ -376,6 +383,8 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        # TODO: Find the optimal place in the pipeline for this pass.
+        nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
@@ -465,7 +474,7 @@ class CUDABackend(BaseBackend):
                 pm = ir.pass_manager(mod.context)
                 pm.enable_debug()
                 passes.llvmir.add_di_scope(pm)
-                pm.run(mod)
+                pm.run(mod, 'make_llir.disable_line_info')
 
             # insert dbg intrinsic with several DI Attribute including source
             # var name and type info note: unknown reason for now, but this
@@ -475,7 +484,7 @@ class CUDABackend(BaseBackend):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
             passes.llvmir.add_di_local_variable(pm)
-            pm.run(mod)
+            pm.run(mod, 'make_llir.dump_ir_extract_di_local_variables')
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
