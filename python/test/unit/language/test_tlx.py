@@ -5052,40 +5052,35 @@ def test_preferred_ctas_per_cga(device):
     """Test launching kernels with preferred_ctas_per_cga hint."""
 
     @triton.jit
-    def simple_kernel(x_ptr, log_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    def copy_kernel(x_ptr, log_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis=0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         tl.store(x_ptr + offsets, offsets, mask=mask)
 
-        if pid >= 2:
-            # make all other CTAs slow to simulate busy SM
-            tl.inline_asm_elementwise(
-                "nanosleep.u32 $1;",
-                "=r, r",
-                [1000000 * 500],  # ~500ms
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+        # allocate 128x512 TMEM to force an occupancy of 1 (works on B200)
+        tmem_buf = tlx.local_alloc((128, 512), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_init = tl.full((128, 512), 1, dtype=tl.float32)
+        tlx.local_store(tmem_buf[0], acc_init)
 
         # assuming log_ptr tensor has size equal to number of programs
-        if tlx.thread_id(0) == 0:
-            tl.store(log_ptr + pid, tlx.cluster_cta_rank())
+        tl.store(log_ptr + pid, tlx.cluster_cta_rank())
 
     # setting up grid in a way that there's exactly one wave (one CTA per SM)
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    # grid large enough to make sure all CTAs cannot co-occupy SMs at the same time
-    GRID_SIZE = NUM_SMS * 40
+    GRID_SIZE = NUM_SMS
     BLOCK_SIZE = 4
     NUM_ELEMENT = GRID_SIZE * BLOCK_SIZE
     x = torch.zeros(NUM_ELEMENT, dtype=torch.float32, device=device)
     # each value is the cluster_cta_rank of a CTA
     cta_rank_log = torch.full((GRID_SIZE, ), -1, dtype=torch.int16, device=device)
     kern_kwargs = {
-        "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 16, "preferred_ctas_per_cga": (4, 1, 1), "ctas_per_cga": (2, 1, 1)
+        "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 4, "preferred_ctas_per_cga": (4, 1, 1), "ctas_per_cga": (2, 1, 1)
     }
-    kernel = simple_kernel[(GRID_SIZE, )](x, cta_rank_log, NUM_ELEMENT, **kern_kwargs)
+    # due to B200 number of SMS and number of GPCs limitation, 4x1 clusters cannot fully
+    # tile the 148 SMs (e.g. a GPC could possible has 18 SMs hypothetically), so we will
+    # have bubbles of 2 SMs that can be leveraged to fill a 2x1 cluster
+    kernel = copy_kernel[(GRID_SIZE, )](x, cta_rank_log, NUM_ELEMENT, **kern_kwargs)
     assert kernel.metadata.preferred_ctas_per_cga == (4, 1, 1), (
         f"expecting preferred_ctas_per_cga to be (4, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
     assert kernel.metadata.cluster_dims == (2, 1, 1), (
