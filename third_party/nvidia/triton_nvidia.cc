@@ -102,8 +102,6 @@ void init_triton_hopper_passes(py::module &&m) {
                      mlir::createNVGPUTMAStoreTokenWaitLowering);
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
                      mlir::createNVGPUPartitionSchedulingMeta);
-  ADD_PASS_WRAPPER_0("add_test_subtile_regions",
-                     mlir::createNVGPUTestAddSubtileRegions);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,
