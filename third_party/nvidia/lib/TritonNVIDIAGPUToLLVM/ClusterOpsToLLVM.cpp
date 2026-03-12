@@ -23,6 +23,7 @@
 
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -61,6 +62,30 @@ struct ClusterWaitOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     auto ctx = rewriter.getContext();
     rewriter.replaceOpWithNewOp<NVVM::ClusterWaitOp>(op, UnitAttr::get(ctx));
+    return success();
+  }
+};
+
+struct ClusterSize1DOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterSize1DOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterSize1DOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterSize1DOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<NVVM::ClusterDim>(op, i32_ty);
+    // Location loc = op.getLoc();
+
+    // PTXBuilder ptxBuilder;
+    // auto *outOpr = ptxBuilder.newOperand("=r");
+    // auto &movOp = *ptxBuilder.create<>("mov.u32 $0, %cluster_nctarank");
+    // movOp({outOpr}, /*onlyAttachMLIRArgs=*/true);
+    // Value result = ptxBuilder.launch(rewriter, loc, i32_ty,
+    //                                  /*hasSideEffect=*/false);
+
+    // rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -113,6 +138,7 @@ void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
     PatternBenefit benefit) {
   patterns.add<ClusterArriveOpConversion>(typeConverter, benefit);
   patterns.add<ClusterWaitOpConversion>(typeConverter, benefit);
+  patterns.add<ClusterSize1DOpConversion>(typeConverter, benefit);
   patterns.add<MapToRemoteBufferOpConversion>(typeConverter, benefit);
   return;
 }

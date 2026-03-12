@@ -1463,6 +1463,24 @@ def test_cluster_dims(device):
             in k.asm["ttgir"])
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
+def test_cluster_size_1d(device):
+
+    @triton.jit
+    def cluster_size_kernel(out_ptr, GRID_SIZE_X: tl.constexpr, GRID_SIZE_Y: tl.constexpr):
+        size = tlx.cluster_size_1d()
+        pid_x = tl.program_id(0)
+        pid_y = tl.program_id(1)
+        pid_z = tl.program_id(2)
+        offset = pid_x + GRID_SIZE_X * (pid_y + GRID_SIZE_Y * pid_z)
+        tl.store(out_ptr + offset, size)
+
+    GRID_SIZE = (10, 8, 12)
+    out = torch.full(GRID_SIZE, -1, device=device, dtype=torch.int32)
+    cluster_size_kernel[GRID_SIZE](out, GRID_SIZE[0], GRID_SIZE[1], ctas_per_cga=(2, 1, 3))
+    assert torch.all(out == 6)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for DSM")
 def test_remote_shmem_store(device):
 
