@@ -2697,17 +2697,6 @@ void insertAsyncComm(
     SmallVector<AsyncTaskId> asyncTasksPC = asyncTaskP;
     asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
                         asyncTaskC.end());
-    // Widen asyncTasksPC to include task IDs from all tokens and consumer
-    // barriers in the CommChannel, since bufferIdx/phase computed with these
-    // task IDs will be referenced by ops in those partitions.
-    for (const auto &token : commChannel.tokens) {
-      if (!llvm::is_contained(asyncTasksPC, token.first))
-        asyncTasksPC.push_back(token.first);
-    }
-    for (const auto &cb : commChannel.consumerBarriers) {
-      if (!llvm::is_contained(asyncTasksPC, cb.first))
-        asyncTasksPC.push_back(cb.first);
-    }
 
     OpBuilderWithAsyncTaskIds builder(headProducer->getContext());
     if (auto funcOp = dyn_cast<triton::FuncOp>(headProducer->getParentOp())) {
