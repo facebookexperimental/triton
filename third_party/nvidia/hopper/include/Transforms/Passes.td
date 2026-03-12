@@ -31,7 +31,10 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
              "Dump intermediate steps">,
     Option<"smemBudget", "smem-budget",
              "int32_t", /*default*/"0",
-             "SMEM budget in bytes (0 = auto-detect from target)">
+             "SMEM budget in bytes (0 = auto-detect from target)">,
+    Option<"useSubtiledRegionOperator", "use-subtiled-region-operator",
+             "bool", /*default*/"false",
+             "Enable subtiled region operator creation from split-tree patterns">
     ];
 }
 
@@ -231,7 +234,7 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
   ];
 }
 
-def NVGPUAddSubtileRegions : Pass<"nvgpu-add-subtile-regions", "mlir::ModuleOp"> {
+def NVGPUTestAddSubtileRegions : Pass<"nvgpu-test-add-subtile-regions", "mlir::ModuleOp"> {
   let summary = "Generate SubtiledRegionOp from subtiling patterns";
 
   let description = [{

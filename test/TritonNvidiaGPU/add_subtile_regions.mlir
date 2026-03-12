@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-add-subtile-regions | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-add-subtile-regions | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [0, 2, 1]}>

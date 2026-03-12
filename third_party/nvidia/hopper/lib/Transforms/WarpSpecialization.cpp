@@ -42,6 +42,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
+void doAddSubtileRegions(triton::FuncOp &funcOp);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -141,6 +142,16 @@ public:
                         "doTaskIdPropagate\n";
         moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
         llvm::dbgs() << "\n\n\n";
+      }
+
+      if (useSubtiledRegionOperator) {
+        doAddSubtileRegions(funcOp);
+        if (dumpIntermediateSteps) {
+          llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                          "doAddSubtileRegions\n";
+          moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+          llvm::dbgs() << "\n\n\n";
+        }
       }
     }
 

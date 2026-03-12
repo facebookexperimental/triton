@@ -520,54 +520,58 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
 
 namespace mlir {
 
-#define GEN_PASS_DEF_NVGPUADDSUBTILEREGIONS
+void doAddSubtileRegions(triton::FuncOp &funcOp) {
+  // Step 1: Find all SplitOps and identify root splits.
+  SmallVector<SplitOp> rootSplits;
+  funcOp.walk([&](SplitOp splitOp) {
+    Operation *root = traceBackToRoot(splitOp);
+    if (root) // nullptr means nested split, skip.
+      rootSplits.push_back(splitOp);
+  });
+
+  LDBG("Found " << rootSplits.size() << " root split(s)");
+
+  for (SplitOp rootSplit : rootSplits) {
+    // Step 1: Find setup root.
+    Operation *setupRoot = traceBackToRoot(rootSplit);
+    if (!setupRoot)
+      continue;
+
+    LDBG("Root split: " << *rootSplit);
+    LDBG("Setup root: " << *setupRoot);
+
+    // Step 2: Collect subtile leaves.
+    SmallVector<Value> leaves;
+    collectLeaves(rootSplit, leaves);
+
+    LDBG("Found " << leaves.size() << " subtile leaves");
+    if (leaves.size() < 2)
+      continue;
+
+    // Step 3: Match forward ops.
+    auto matchedOps = matchForwardOps(leaves);
+
+    LDBG("Matched " << matchedOps.size() << " forward op(s)");
+    if (matchedOps.empty())
+      continue;
+
+    // Step 4: Build SubtiledRegionOp.
+    buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps);
+  }
+}
+
+#define GEN_PASS_DEF_NVGPUTESTADDSUBTILEREGIONS
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-class NVGPUAddSubtileRegionsPass
-    : public impl::NVGPUAddSubtileRegionsBase<NVGPUAddSubtileRegionsPass> {
+class NVGPUTestAddSubtileRegionsPass
+    : public impl::NVGPUTestAddSubtileRegionsBase<
+          NVGPUTestAddSubtileRegionsPass> {
 public:
-  using NVGPUAddSubtileRegionsBase::NVGPUAddSubtileRegionsBase;
+  using NVGPUTestAddSubtileRegionsBase::NVGPUTestAddSubtileRegionsBase;
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-
-    // Step 1: Find all SplitOps and identify root splits.
-    SmallVector<SplitOp> rootSplits;
-    module.walk([&](SplitOp splitOp) {
-      Operation *root = traceBackToRoot(splitOp);
-      if (root) // nullptr means nested split, skip.
-        rootSplits.push_back(splitOp);
-    });
-
-    LDBG("Found " << rootSplits.size() << " root split(s)");
-
-    for (SplitOp rootSplit : rootSplits) {
-      // Step 1: Find setup root.
-      Operation *setupRoot = traceBackToRoot(rootSplit);
-      if (!setupRoot)
-        continue;
-
-      LDBG("Root split: " << *rootSplit);
-      LDBG("Setup root: " << *setupRoot);
-
-      // Step 2: Collect subtile leaves.
-      SmallVector<Value> leaves;
-      collectLeaves(rootSplit, leaves);
-
-      LDBG("Found " << leaves.size() << " subtile leaves");
-      if (leaves.size() < 2)
-        continue;
-
-      // Step 3: Match forward ops.
-      auto matchedOps = matchForwardOps(leaves);
-
-      LDBG("Matched " << matchedOps.size() << " forward op(s)");
-      if (matchedOps.empty())
-        continue;
-
-      // Step 4: Build SubtiledRegionOp.
-      buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps);
-    }
+    module.walk([&](triton::FuncOp funcOp) { doAddSubtileRegions(funcOp); });
   }
 };
 

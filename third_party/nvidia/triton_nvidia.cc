@@ -91,9 +91,9 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
 
 void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
-  ADD_PASS_OPTION_WRAPPER_5("add_hopper_warpspec",
+  ADD_PASS_OPTION_WRAPPER_6("add_hopper_warpspec",
                             mlir::createNVGPUWarpSpecialization, int, int, bool,
-                            bool, int);
+                            bool, int, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
   ADD_PASS_WRAPPER_0("add_tma_store_lowering",
@@ -102,7 +102,8 @@ void init_triton_hopper_passes(py::module &&m) {
                      mlir::createNVGPUTMAStoreTokenWaitLowering);
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
                      mlir::createNVGPUPartitionSchedulingMeta);
-  ADD_PASS_WRAPPER_0("add_subtile_regions", mlir::createNVGPUAddSubtileRegions);
+  ADD_PASS_WRAPPER_0("add_test_subtile_regions",
+                     mlir::createNVGPUTestAddSubtileRegions);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,
