@@ -5082,7 +5082,7 @@ def test_preferred_ctas_per_cga(device):
         tlx.local_store(tmem_buf[0], acc_init)
 
         # assuming log_ptr tensor has size equal to number of programs
-        tl.store(log_ptr + pid, tlx.cluster_cta_rank())
+        tl.store(log_ptr + pid, tlx.cluster_size_1d())
 
     # setting up grid in a way that there's exactly one wave (one CTA per SM)
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -5090,25 +5090,24 @@ def test_preferred_ctas_per_cga(device):
     BLOCK_SIZE = 4
     NUM_ELEMENT = GRID_SIZE * BLOCK_SIZE
     x = torch.zeros(NUM_ELEMENT, dtype=torch.float32, device=device)
-    # each value is the cluster_cta_rank of a CTA
-    cta_rank_log = torch.full((GRID_SIZE, ), -1, dtype=torch.int16, device=device)
+    # each value is the cluster size of a CTA
+    cluster_size_log = torch.full((GRID_SIZE, ), -1, dtype=torch.int16, device=device)
     kern_kwargs = {
         "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 4, "preferred_ctas_per_cga": (4, 1, 1), "ctas_per_cga": (2, 1, 1)
     }
     # due to B200 number of SMS and number of GPCs limitation, 4x1 clusters cannot fully
     # tile the 148 SMs (e.g. a GPC could possible has 18 SMs hypothetically), so we will
     # have bubbles of 2 SMs that can be leveraged to fill a 2x1 cluster
-    kernel = copy_kernel[(GRID_SIZE, )](x, cta_rank_log, NUM_ELEMENT, **kern_kwargs)
+    kernel = copy_kernel[(GRID_SIZE, )](x, cluster_size_log, NUM_ELEMENT, **kern_kwargs)
     assert kernel.metadata.preferred_ctas_per_cga == (4, 1, 1), (
         f"expecting preferred_ctas_per_cga to be (4, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
     assert kernel.metadata.cluster_dims == (2, 1, 1), (
         f"expecting cluster_dims to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
 
-    cta_ranks, counts = cta_rank_log.unique(return_counts=True)
-    d = dict(zip(cta_ranks.tolist(), counts.tolist()))
-    assert d[0] == d[1], f"expecting equal number of CTA 0 and 1, got {d}"
-    assert d[2] == d[3], f"expecting equal number of CTA 2 and 3, got {d}"
-    assert d[0] > d[2], f"expecting more CTA 0 than CTA 2 (some cluster has size 2, some size 4), got {d}"
+    sizes, counts = cluster_size_log.unique(return_counts=True)
+    d = dict(zip(sizes.tolist(), counts.tolist()))
+    assert len(d) == 2 and 2 in d and 4 in d, f"expecting exactly two cluster sizes as specified, got {d}"
+    assert 0 < d[2] and d[2] < d[4], f"expecting most clusters to have preferred sizes, got {d}"
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell for TMEM")
