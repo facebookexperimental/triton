@@ -728,6 +728,9 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       continue;
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
       continue;
+    // Skip reuse groups whose buffer index is not owned by this loop.
+    if (!needAccumCntForReuse(origForOp.getOperation(), config->getGroup(idx)))
+      continue;
     Operation *parentOp = origForOp->getParentOp();
 #if 0
     if (!isa<scf::ForOp>(parentOp) && !isa<scf::IfOp>(parentOp))
@@ -854,6 +857,9 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
 
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
+    // Skip reuse groups whose buffer index is not owned by this loop.
+    if (!needAccumCntForReuse(newForOp.getOperation(), config->getGroup(idx)))
+      continue;
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
     // that is directly in forOp.
