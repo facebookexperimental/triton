@@ -20,7 +20,7 @@ def expect(mbarrier, bytes, pred=True, _semantic=None):
 
 
 @builtin
-def arrive(mbarrier, *, count=1, pred=True, _semantic=None):
+def arrive(mbarrier, *, count=1, pred=True, per_thread=False, _semantic=None):
     """
     Arrive at an mbarrier with a specified count.
 
@@ -28,7 +28,9 @@ def arrive(mbarrier, *, count=1, pred=True, _semantic=None):
         mbarrier (shared_memory_descriptor): Barrier to be signalled.
         count (int): Count to arrive with. Defaults to 1.
         pred (bool): Scalar predicate. Operation is skipped if predicate is False. Defaults to True.
+        per_thread (bool): If True, each thread arrives independently. Defaults to False.
     """
     count = _unwrap_if_constexpr(count)
+    per_thread = _unwrap_if_constexpr(per_thread)
     pred = _semantic.to_tensor(pred)
-    _semantic.builder.create_mbarrier_arrive(mbarrier.handle, count, pred.handle)
+    _semantic.builder.create_mbarrier_arrive(mbarrier.handle, count, pred.handle, per_thread)

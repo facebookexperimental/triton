@@ -654,10 +654,14 @@ void init_gluon_ir(py::module &&m) {
               std::vector<Value> &deps) {
              self.create<ttng::WaitBarrierOp>(memDesc, phase, pred, deps);
            })
-      .def("create_mbarrier_arrive",
-           [](GluonOpBuilder &self, Value memDesc, int count, Value pred) {
-             self.create<ttng::ArriveBarrierOp>(memDesc, count, pred);
-           })
+      .def(
+          "create_mbarrier_arrive",
+          [](GluonOpBuilder &self, Value memDesc, int count, Value pred,
+             bool perThread) {
+            self.create<ttng::ArriveBarrierOp>(memDesc, count, pred, perThread);
+          },
+          py::arg("memDesc"), py::arg("count"), py::arg("pred"),
+          py::arg("perThread") = false)
       .def("create_tcgen05_mma",
            [](GluonOpBuilder &self, Value a, Value b, Value acc, Value useAcc,
               Value pred, std::vector<Value> &mbarriers,
