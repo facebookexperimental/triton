@@ -23,7 +23,6 @@
 
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
-#include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -76,16 +75,6 @@ struct ClusterSize1DOpConversion
                   ConversionPatternRewriter &rewriter) const override {
 
     rewriter.replaceOpWithNewOp<NVVM::ClusterDim>(op, i32_ty);
-    // Location loc = op.getLoc();
-
-    // PTXBuilder ptxBuilder;
-    // auto *outOpr = ptxBuilder.newOperand("=r");
-    // auto &movOp = *ptxBuilder.create<>("mov.u32 $0, %cluster_nctarank");
-    // movOp({outOpr}, /*onlyAttachMLIRArgs=*/true);
-    // Value result = ptxBuilder.launch(rewriter, loc, i32_ty,
-    //                                  /*hasSideEffect=*/false);
-
-    // rewriter.replaceOp(op, result);
     return success();
   }
 };
