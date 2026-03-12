@@ -20,6 +20,7 @@ def get_cuda_autotune_config():
                 "NUM_SMEM_BUFFERS": s,
                 "NUM_TMEM_BUFFERS": t,
                 "EPILOGUE_SUBTILE": subtile,
+                "USE_WARP_BARRIER": uwb,
             },
             num_warps=4,
             num_stages=1,
@@ -31,6 +32,7 @@ def get_cuda_autotune_config():
         for s in [2, 3, 4]
         for t in [2, 3]
         for subtile in [True]
+        for uwb in [False, True]
     ]
 
 
@@ -246,7 +248,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                 clc_phase_consumer ^= 1
 
 
-def matmul(a, b, config=None, use_warp_barrier=False):
+def matmul(a, b, config=None):
     """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -282,7 +284,6 @@ def matmul(a, b, config=None, use_warp_barrier=False):
             K,
             NUM_SMS=NUM_SMS,
             NUM_CLC_STAGES=1,
-            USE_WARP_BARRIER=use_warp_barrier,
             **config,
         )
     else:
@@ -296,11 +297,6 @@ def matmul(a, b, config=None, use_warp_barrier=False):
             K,
             NUM_SMS=NUM_SMS,
             NUM_CLC_STAGES=1,
-            USE_WARP_BARRIER=use_warp_barrier,
         )
 
     return c
-
-
-def matmul_warp_barrier(a, b, config=None):
-    return matmul(a, b, config=config, use_warp_barrier=True)

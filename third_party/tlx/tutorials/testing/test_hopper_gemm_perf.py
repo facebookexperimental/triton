@@ -7,9 +7,7 @@ import triton
 from triton.language.extra.tlx.tutorials.hopper_gemm_pipelined import (
     matmul as _matmul_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
-    matmul as _matmul_ws,
-    matmul_warp_barrier as _matmul_ws_warp_barrier,
-)
+    matmul as _matmul_ws, )
 
 from triton._internal_testing import is_hopper
 
@@ -18,7 +16,6 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 MATMUL_METHODS = {
     "pipelined": _matmul_pipelined,
     "ws": _matmul_ws,
-    "ws_warp_barrier": _matmul_ws_warp_barrier,
 }
 
 ref_lib = "cuBLAS"
