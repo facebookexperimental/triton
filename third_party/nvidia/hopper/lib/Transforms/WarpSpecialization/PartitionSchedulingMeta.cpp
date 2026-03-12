@@ -1102,12 +1102,9 @@ getInitialSchedule(scf::ForOp mainLoop,
   // truncf, etc.)
   if (epiloguePartition) {
     // Stores inside loops
-    for (auto loop : loops) {
+    for (auto loop : loops)
       for (DescriptorStoreOp op : loop.getOps<DescriptorStoreOp>())
         tryScheduleOp(epiloguePartition, op);
-      for (StoreOp op : loop.getOps<StoreOp>())
-        setPartition(op, epiloguePartition);
-    }
 
     // Also schedule categorized epilogue stores (includes post-loop stores for
     // bwd) and their backward slice (tmem_load, truncf that feed into them)
@@ -1146,6 +1143,17 @@ getInitialSchedule(scf::ForOp mainLoop,
           tryScheduleOp(epiloguePartition, op);
         }
       }
+    }
+
+    // Schedule regular StoreOps to epilogue only when the epilogue partition
+    // is otherwise empty (no DescriptorStoreOps or categorized epilogue stores
+    // were scheduled above). When epilogue already has stores (e.g., FA kernels
+    // with TMA output stores), additional StoreOps should stay in the
+    // computation partition to avoid cross-partition TMEM overhead.
+    if (epiloguePartition->getOps().empty()) {
+      for (auto loop : loops)
+        for (StoreOp op : loop.getOps<StoreOp>())
+          tryScheduleOp(epiloguePartition, op);
     }
   }
 
