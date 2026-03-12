@@ -136,8 +136,8 @@ static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
   } else {
     endAccum =
         ifBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-    endAccumElse = elseBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        accumCntLoc(loc), 0, 64);
+    endAccumElse =
+        elseBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64);
   }
   LLVM_DEBUG({
     LDBG("Update yieldOperands ");
