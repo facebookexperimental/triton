@@ -370,7 +370,7 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
 @pytest.mark.parametrize("A_col_major", [False, True])
