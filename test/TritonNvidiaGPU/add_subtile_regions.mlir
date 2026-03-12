@@ -85,4 +85,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     tt.return
   }
+
+  // Same split-tree pattern as above, but with consistent async_task_id
+  // attributes on all ops. The pass should still create a subtiled_region.
+
+  // CHECK-LABEL: @epilogue_subtile_with_async_task_id
+  // CHECK: ttng.subtiled_region
+  // CHECK: setup
+  // CHECK: ttng.tmem_load
+  // CHECK: tile
+  // CHECK: arith.truncf
+  // CHECK: ttg.convert_layout
+  // CHECK: ttg.local_alloc
+  tt.func @epilogue_subtile_with_async_task_id(
+      %acc_memdesc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %token: !ttg.async.token) {
+
+    %acc, %token2 = ttng.tmem_load %acc_memdesc[%token] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+
+    // Level 1 split: 128x128 -> 2 x 128x64
+    %reshaped = tt.reshape %acc {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> -> tensor<128x2x64xf32, #blocked3>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>, async_task_id = array<i32: 0>} : tensor<128x2x64xf32, #blocked3> -> tensor<128x64x2xf32, #blocked4>
+    %outLHS, %outRHS = tt.split %transposed {async_task_id = array<i32: 0>} : tensor<128x64x2xf32, #blocked4> -> tensor<128x64xf32, #blocked5>
+
+    // Level 2 split (LHS): 128x64 -> 2 x 128x32
+    %lo_reshaped = tt.reshape %outLHS {async_task_id = array<i32: 0>} : tensor<128x64xf32, #blocked5> -> tensor<128x2x32xf32, #blocked6>
+    %lo_transposed = tt.trans %lo_reshaped {order = array<i32: 0, 2, 1>, async_task_id = array<i32: 0>} : tensor<128x2x32xf32, #blocked6> -> tensor<128x32x2xf32, #blocked7>
+    %lo_lhs, %lo_rhs = tt.split %lo_transposed {async_task_id = array<i32: 0>} : tensor<128x32x2xf32, #blocked7> -> tensor<128x32xf32, #blocked8>
+
+    // Level 2 split (RHS): 128x64 -> 2 x 128x32
+    %hi_reshaped = tt.reshape %outRHS {async_task_id = array<i32: 0>} : tensor<128x64xf32, #blocked5> -> tensor<128x2x32xf32, #blocked6>
+    %hi_transposed = tt.trans %hi_reshaped {order = array<i32: 0, 2, 1>, async_task_id = array<i32: 0>} : tensor<128x2x32xf32, #blocked6> -> tensor<128x32x2xf32, #blocked7>
+    %hi_lhs, %hi_rhs = tt.split %hi_transposed {async_task_id = array<i32: 0>} : tensor<128x32x2xf32, #blocked7> -> tensor<128x32xf32, #blocked8>
+
+    // Per-subtile ops: truncf -> convert_layout -> local_alloc (x4) — all task 0
+    %c0 = arith.truncf %lo_lhs {async_task_id = array<i32: 0>} : tensor<128x32xf32, #blocked8> to tensor<128x32xf16, #blocked8>
+    %c0_cvt = ttg.convert_layout %c0 {async_task_id = array<i32: 0>} : tensor<128x32xf16, #blocked8> -> tensor<128x32xf16, #blocked9>
+    %c0_alloc = ttg.local_alloc %c0_cvt {async_task_id = array<i32: 0>} : (tensor<128x32xf16, #blocked9>) -> !ttg.memdesc<128x32xf16, #shared1, #smem, mutable>
+
+    %c1 = arith.truncf %lo_rhs {async_task_id = array<i32: 0>} : tensor<128x32xf32, #blocked8> to tensor<128x32xf16, #blocked8>
+    %c1_cvt = ttg.convert_layout %c1 {async_task_id = array<i32: 0>} : tensor<128x32xf16, #blocked8> -> tensor<128x32xf16, #blocked9>
+    %c1_alloc = ttg.local_alloc %c1_cvt {async_task_id = array<i32: 0>} : (tensor<128x32xf16, #blocked9>) -> !ttg.memdesc<128x32xf16, #shared1, #smem, mutable>
+
+    %c2 = arith.truncf %hi_lhs {async_task_id = array<i32: 0>} : tensor<128x32xf32, #blocked8> to tensor<128x32xf16, #blocked8>
+    %c2_cvt = ttg.convert_layout %c2 {async_task_id = array<i32: 0>} : tensor<128x32xf16, #blocked8> -> tensor<128x32xf16, #blocked9>
+    %c2_alloc = ttg.local_alloc %c2_cvt {async_task_id = array<i32: 0>} : (tensor<128x32xf16, #blocked9>) -> !ttg.memdesc<128x32xf16, #shared1, #smem, mutable>
+
+    %c3 = arith.truncf %hi_rhs {async_task_id = array<i32: 0>} : tensor<128x32xf32, #blocked8> to tensor<128x32xf16, #blocked8>
+    %c3_cvt = ttg.convert_layout %c3 {async_task_id = array<i32: 0>} : tensor<128x32xf16, #blocked8> -> tensor<128x32xf16, #blocked9>
+    %c3_alloc = ttg.local_alloc %c3_cvt {async_task_id = array<i32: 0>} : (tensor<128x32xf16, #blocked9>) -> !ttg.memdesc<128x32xf16, #shared1, #smem, mutable>
+
+    tt.return
+  }
 }

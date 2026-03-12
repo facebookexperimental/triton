@@ -1,3 +1,4 @@
+#include "Utility.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -36,7 +37,7 @@ static bool isMemoryToRegistersLoad(Operation *op) {
 /// Returns the earliest op in the chain (may be a load or the first shape op).
 /// If the backward trace reaches another SplitOp output, returns nullptr
 /// (indicating this is a nested split, not a root).
-static Operation *traceBackToRoot(SplitOp splitOp) {
+static Operation *findSplitTreeRoot(SplitOp splitOp) {
   Value current = splitOp.getSrc();
   Operation *earliest = splitOp;
 
@@ -92,6 +93,27 @@ static void collectLeaves(SplitOp splitOp, SmallVectorImpl<Value> &leaves) {
   }
 }
 
+/// Collect unvisited ops in the backward def chain starting from \p start,
+/// and append them in topological order (def before use) to \p setupOps.
+static void collectIntermediateOps(Value start, DenseSet<Operation *> &visited,
+                                   SmallVectorImpl<Operation *> &setupOps) {
+  SmallVector<Operation *> intermediates;
+  Value src = start;
+  while (auto *defOp = src.getDefiningOp()) {
+    if (visited.count(defOp))
+      break;
+    intermediates.push_back(defOp);
+    if (defOp->getNumOperands() > 0)
+      src = defOp->getOperand(0);
+    else
+      break;
+  }
+  for (auto it = intermediates.rbegin(); it != intermediates.rend(); ++it) {
+    if (visited.insert(*it).second)
+      setupOps.push_back(*it);
+  }
+}
+
 /// Collect all ops in the setup chain: from \p root through the split tree
 /// (inclusive). The ops are collected in topological order (def before use).
 static void collectSetupOps(Operation *root, SplitOp rootSplit,
@@ -128,24 +150,7 @@ static void collectSetupOps(Operation *root, SplitOp rootSplit,
     if (!visited.insert(split).second)
       continue;
     // Add intermediate shape ops between parent split output and this split.
-    // (For nested splits, trace back from split.getSrc() to parent output.)
-    {
-      SmallVector<Operation *> intermediates;
-      Value src = split.getSrc();
-      while (auto *defOp = src.getDefiningOp()) {
-        if (visited.count(defOp))
-          break;
-        intermediates.push_back(defOp);
-        if (defOp->getNumOperands() > 0)
-          src = defOp->getOperand(0);
-        else
-          break;
-      }
-      for (auto it = intermediates.rbegin(); it != intermediates.rend(); ++it) {
-        if (visited.insert(*it).second)
-          setupOps.push_back(*it);
-      }
-    }
+    collectIntermediateOps(split.getSrc(), visited, setupOps);
     setupOps.push_back(split);
 
     // Check each result for nested splits.
@@ -195,7 +200,8 @@ static SmallVector<MatchedOp> matchForwardOps(ArrayRef<Value> subtileLeaves) {
   SmallVector<SmallVector<Value>> frontiers(1);
   frontiers[0].assign(subtileLeaves.begin(), subtileLeaves.end());
 
-  while (true) {
+  bool keepGoing = true;
+  do {
     auto &currentValues = frontiers.back();
 
     // Each current value should have exactly one user for matching.
@@ -269,19 +275,54 @@ static SmallVector<MatchedOp> matchForwardOps(ArrayRef<Value> subtileLeaves) {
 
     matched.push_back(std::move(m));
 
-    if (matched.back().isTerminal)
-      return matched;
+    keepGoing = !matched.back().isTerminal && rep->getNumResults() == 1;
+    if (keepGoing) {
+      // Advance frontier: results of matched ops become new current values.
+      SmallVector<Value> nextValues;
+      for (unsigned i = 0; i < numTiles; ++i)
+        nextValues.push_back(userOps[i]->getResult(0));
+      frontiers.push_back(std::move(nextValues));
+    }
+  } while (keepGoing);
 
-    // Advance frontier: results of matched ops become new current values.
-    // Only support single-result ops for now.
-    if (rep->getNumResults() != 1)
-      return matched;
+  return matched;
+}
 
-    SmallVector<Value> nextValues;
-    for (unsigned i = 0; i < numTiles; ++i)
-      nextValues.push_back(userOps[i]->getResult(0));
-    frontiers.push_back(std::move(nextValues));
+//===----------------------------------------------------------------------===//
+// Async partition consistency
+//===----------------------------------------------------------------------===//
+
+/// Check that all setup ops and matched ops share the same async_task_id
+/// partition. Returns true if consistent (including the case where no ops have
+/// async_task_id attributes at all).
+static bool hasConsistentAsyncPartitions(ArrayRef<Operation *> setupOps,
+                                         ArrayRef<MatchedOp> matchedOps) {
+  SmallVector<AsyncTaskId> referenceIds;
+  bool foundReference = false;
+
+  auto checkOp = [&](Operation *op) -> bool {
+    auto ids = getAsyncTaskIds(op);
+    if (ids.empty())
+      return true; // No annotation — consistent by default.
+    if (!foundReference) {
+      referenceIds = std::move(ids);
+      foundReference = true;
+      return true;
+    }
+    return ids == referenceIds;
+  };
+
+  for (Operation *op : setupOps) {
+    if (!checkOp(op))
+      return false;
   }
+  for (auto &m : matchedOps) {
+    for (Operation *op : m.perTileOps) {
+      if (!checkOp(op))
+        return false;
+    }
+  }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -522,7 +563,7 @@ void doAddSubtileRegions(triton::FuncOp &funcOp) {
   // Step 1: Find all SplitOps and identify root splits.
   SmallVector<SplitOp> rootSplits;
   funcOp.walk([&](SplitOp splitOp) {
-    Operation *root = traceBackToRoot(splitOp);
+    Operation *root = findSplitTreeRoot(splitOp);
     if (root) // nullptr means nested split, skip.
       rootSplits.push_back(splitOp);
   });
@@ -531,7 +572,7 @@ void doAddSubtileRegions(triton::FuncOp &funcOp) {
 
   for (SplitOp rootSplit : rootSplits) {
     // Step 1: Find setup root.
-    Operation *setupRoot = traceBackToRoot(rootSplit);
+    Operation *setupRoot = findSplitTreeRoot(rootSplit);
     if (!setupRoot)
       continue;
 
@@ -552,6 +593,17 @@ void doAddSubtileRegions(triton::FuncOp &funcOp) {
     LDBG("Matched " << matchedOps.size() << " forward op(s)");
     if (matchedOps.empty())
       continue;
+
+    // Step 3.5: Verify async partition consistency.
+    {
+      SmallVector<Operation *> setupOpsForCheck;
+      collectSetupOps(setupRoot, rootSplit, setupOpsForCheck);
+      if (!hasConsistentAsyncPartitions(setupOpsForCheck, matchedOps)) {
+        rootSplit.emitError(
+            "ops in subtile region have inconsistent async_task_id partitions");
+        continue;
+      }
+    }
 
     // Step 4: Build SubtiledRegionOp.
     buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps);
