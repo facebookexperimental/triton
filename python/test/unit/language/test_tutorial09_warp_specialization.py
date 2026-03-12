@@ -467,10 +467,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 
         # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
-        if FLATTEN:
-            assert "ttg.warp_specialize" not in ttgir, "Expected no warp specialization with Flatten=True"
-        else:
-            assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
 
@@ -569,10 +566,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
 
         # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
-        if FLATTEN:
-            assert "ttg.warp_specialize" not in ttgir, "Expected no warp specialization with Flatten=True"
-        else:
-            assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
 
