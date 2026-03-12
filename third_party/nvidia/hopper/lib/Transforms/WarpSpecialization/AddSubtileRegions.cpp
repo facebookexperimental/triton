@@ -292,18 +292,21 @@ static SmallVector<MatchedOp> matchForwardOps(ArrayRef<Value> subtileLeaves) {
 // Async partition consistency
 //===----------------------------------------------------------------------===//
 
-/// Check that all setup ops and matched ops share the same async_task_id
-/// partition. Returns true if consistent (including the case where no ops have
-/// async_task_id attributes at all).
-static bool hasConsistentAsyncPartitions(ArrayRef<Operation *> setupOps,
-                                         ArrayRef<MatchedOp> matchedOps) {
+/// Verify that all setup and matched ops share the same async_task_id
+/// partition. Emits an error on \p rootSplit and returns failure if not.
+static LogicalResult
+verifyAsyncPartitionConsistency(Operation *setupRoot, SplitOp rootSplit,
+                                ArrayRef<MatchedOp> matchedOps) {
+  SmallVector<Operation *> setupOps;
+  collectSetupOps(setupRoot, rootSplit, setupOps);
+
   SmallVector<AsyncTaskId> referenceIds;
   bool foundReference = false;
 
   auto checkOp = [&](Operation *op) -> bool {
     auto ids = getAsyncTaskIds(op);
     if (ids.empty())
-      return true; // No annotation — consistent by default.
+      return true;
     if (!foundReference) {
       referenceIds = std::move(ids);
       foundReference = true;
@@ -312,17 +315,16 @@ static bool hasConsistentAsyncPartitions(ArrayRef<Operation *> setupOps,
     return ids == referenceIds;
   };
 
-  for (Operation *op : setupOps) {
+  for (Operation *op : setupOps)
     if (!checkOp(op))
-      return false;
-  }
-  for (auto &m : matchedOps) {
-    for (Operation *op : m.perTileOps) {
+      return rootSplit.emitError(
+          "ops in subtile region have inconsistent async_task_id partitions");
+  for (auto &m : matchedOps)
+    for (Operation *op : m.perTileOps)
       if (!checkOp(op))
-        return false;
-    }
-  }
-  return true;
+        return rootSplit.emitError(
+            "ops in subtile region have inconsistent async_task_id partitions");
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -595,15 +597,9 @@ void doAddSubtileRegions(triton::FuncOp &funcOp) {
       continue;
 
     // Step 3.5: Verify async partition consistency.
-    {
-      SmallVector<Operation *> setupOpsForCheck;
-      collectSetupOps(setupRoot, rootSplit, setupOpsForCheck);
-      if (!hasConsistentAsyncPartitions(setupOpsForCheck, matchedOps)) {
-        rootSplit.emitError(
-            "ops in subtile region have inconsistent async_task_id partitions");
-        continue;
-      }
-    }
+    if (failed(
+            verifyAsyncPartitionConsistency(setupRoot, rootSplit, matchedOps)))
+      continue;
 
     // Step 4: Build SubtiledRegionOp.
     buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps);
