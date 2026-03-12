@@ -25,14 +25,12 @@ namespace {
 /// Return true if \p op is a reshape or trans (shape-adjusting, no compute).
 static bool isShapeOp(Operation *op) { return isa<ReshapeOp, TransOp>(op); }
 
-/// Return true if \p op is a memory-producing load (tmem_load,
-/// descriptor_load).
-static bool isMemoryLoad(Operation *op) {
-  return isa<TMEMLoadOp, DescriptorLoadOp>(op);
+/// Return true if \p op loads from TMEM/SMEM into registers.
+/// Note: We don't have an explicit SMEM load op yet, so this
+/// is just TMEM.
+static bool isMemoryToRegistersLoad(Operation *op) {
+  return isa<TMEMLoadOp>(op);
 }
-
-/// Return true if \p op has memory effects (is not pure).
-static bool hasMemoryEffect(Operation *op) { return !isMemoryEffectFree(op); }
 
 /// Trace backward from \p splitOp through single-use reshape/trans chains.
 /// Returns the earliest op in the chain (may be a load or the first shape op).
@@ -48,7 +46,7 @@ static Operation *traceBackToRoot(SplitOp splitOp) {
       current = defOp->getOperand(0);
       continue;
     }
-    if (isMemoryLoad(defOp)) {
+    if (isMemoryToRegistersLoad(defOp)) {
       earliest = defOp;
       break;
     }
@@ -232,7 +230,7 @@ static SmallVector<MatchedOp> matchForwardOps(ArrayRef<Value> subtileLeaves) {
     MatchedOp m;
     m.repOp = rep;
     m.perTileOps.assign(userOps.begin(), userOps.end());
-    m.isTerminal = hasMemoryEffect(rep);
+    m.isTerminal = !isMemoryEffectFree(rep);
 
     for (unsigned opIdx = 0; opIdx < rep->getNumOperands(); ++opIdx) {
       // Check if the operand is the same value across all subtiles.
