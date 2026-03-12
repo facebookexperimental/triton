@@ -858,14 +858,14 @@ void createToken(
       }
     }
     if (hasTMAProducer) {
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // Pattern matching for tmem_store --> getD --> tmem_load (gen5 is the
     // actual producer) or gen5 --> tmem_load
     if (ProducerIsGen5(producerOp))
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
@@ -916,19 +916,18 @@ void createToken(
         Location tokenLoc = funcOp.getLoc();
         if (!channel->srcName.empty())
           tokenLoc = NameLoc::get(
-              StringAttr::get(funcOp.getContext(), channel->srcName),
-              tokenLoc);
+              StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
           v = builder.create<ttnvws::CreateTokenOp>(
               tokenLoc, channel->getNumBuffers(), tokenLoadType);
         else
-          v = builder.create<ttnvws::CreateTokenOp>(tokenLoc, 1,
-                                                    tokenLoadType);
+          v = builder.create<ttnvws::CreateTokenOp>(tokenLoc, 1, tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                                     channel->srcName);
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
@@ -1253,14 +1252,14 @@ void createTokenPost(
       }
     }
     if (hasTMAProducer) {
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // If channel is from a gen5, pre-allocate gen5 barrier.
     bool hasProdBar = false;
     if (isa<ttng::TCGen5MMAOp>(producerOp)) {
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
       hasProdBar = true;
     }
     // Check if this channel needs token-based synchronization.
@@ -1346,15 +1345,15 @@ void createTokenPost(
         Location tokenLoc = funcOp.getLoc();
         if (!channel->srcName.empty())
           tokenLoc = NameLoc::get(
-              StringAttr::get(funcOp.getContext(), channel->srcName),
-              tokenLoc);
+              StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
         v = builder.create<ttnvws::CreateTokenOp>(
             tokenLoc, channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                                     channel->srcName);
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
       }
     }
@@ -3031,10 +3030,9 @@ void insertAsyncComm(
                   &(funcOp.getBody().front()));
               Location tokenLoc = funcOp.getLoc();
               if (!masterChannel->srcName.empty())
-                tokenLoc = NameLoc::get(
-                    StringAttr::get(funcOp.getContext(),
-                                    masterChannel->srcName),
-                    tokenLoc);
+                tokenLoc = NameLoc::get(StringAttr::get(funcOp.getContext(),
+                                                        masterChannel->srcName),
+                                        tokenLoc);
               Value consumedToken = tokenBuilder.create<ttnvws::CreateTokenOp>(
                   tokenLoc, masterChannel->getNumBuffers(),
                   ttnvws::TokenLoadType::TmemLoadOp);
@@ -3892,6 +3890,24 @@ public:
       else
         doCodePartition(funcOp, numBuffers);
     }
+    // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
+    // yield operand already has an "accum_cnt" NameLoc. This must be done at
+    // the end because earlier steps may replace ForOps and lose block arg locs.
+    funcOp.walk([&](scf::ForOp forOp) {
+      auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      unsigned numIterArgs = forOp.getNumRegionIterArgs();
+      for (unsigned i = 0; i < numIterArgs; ++i) {
+        Value yieldVal = yieldOp.getOperand(i);
+        if (auto nameLoc = llvm::dyn_cast<NameLoc>(yieldVal.getLoc())) {
+          if (nameLoc.getName().getValue() == "accum_cnt") {
+            // The iter arg is block arg at index i+1 (skip induction var).
+            auto arg = forOp.getRegionIterArg(i);
+            arg.setLoc(NameLoc::get(
+                StringAttr::get(funcOp.getContext(), "accum_cnt")));
+          }
+        }
+      }
+    });
   }
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
