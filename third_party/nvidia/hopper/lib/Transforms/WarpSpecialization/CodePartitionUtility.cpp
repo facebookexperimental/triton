@@ -293,37 +293,22 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
-// For TMEM operandD reuse groups, use AND logic: ctrlOp must enclose BOTH
-// srcOp and dstOp of at least one channel. This prevents inner loops from
-// getting accum counters when the TMEM buffer only changes per outer loop
-// iteration. For all other groups, preserve existing OR logic.
-bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
+static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
   if (group->channels[0]->getNumBuffers() <= 1)
     return false;
-  // Check if this is a TMEM operandD group.
-  bool isTmemOperandD = false;
-  for (auto *ch : group->channels) {
-    if (ch->channelKind == DataChannelKind::TMEMPost) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
-      if (tmemCh->isOperandD) {
-        isTmemOperandD = true;
-        break;
-      }
-    }
-  }
-  // Goes through each channel in the ReuseGroup, check srcOp and dstOp to
+  // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
   for (auto *ch : group->channels) {
     if (auto forOp = dyn_cast<scf::ForOp>(ctrlOp)) {
-      bool encSrc = enclosing(forOp, ch->getSrcOp());
-      bool encDst = enclosing(forOp, ch->getDstOp());
-      if (isTmemOperandD ? (encSrc && encDst) : (encSrc || encDst))
+      if (enclosing(forOp, ch->getSrcOp()))
+        return true;
+      if (enclosing(forOp, ch->getDstOp()))
         return true;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(ctrlOp)) {
-      bool encSrc = enclosing(ifOp, ch->getSrcOp());
-      bool encDst = enclosing(ifOp, ch->getDstOp());
-      if (isTmemOperandD ? (encSrc && encDst) : (encSrc || encDst))
+      if (enclosing(ifOp, ch->getSrcOp()))
+        return true;
+      if (enclosing(ifOp, ch->getDstOp()))
         return true;
     }
   }
@@ -556,24 +541,6 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   return {initBufferIdx, initPhase};
 }
 
-// Walk up the loop nest from `op` to find the enclosing ForOp that has accum
-// counters for the given reuse group. For TMEM operandD reuse groups, this
-// skips inner loops that don't own the buffer index.
-scf::ForOp findAccumLoop(Operation *op,
-                         const DenseSet<Operation *> &regionsWithChannels,
-                         ReuseConfig *config, int reuseGroupIdx) {
-  auto parentForOp = op->getParentOfType<scf::ForOp>();
-  if (reuseGroupIdx < 0)
-    return parentForOp;
-  // Walk up until we find a ForOp that has accum counters for this reuse group.
-  while (parentForOp &&
-         !needAccumCntForReuse(parentForOp.getOperation(),
-                               config->getGroup(reuseGroupIdx))) {
-    parentForOp = parentForOp->getParentOfType<scf::ForOp>();
-  }
-  return parentForOp;
-}
-
 // Get the current accumulation count for the given op within its immediate
 // scope.
 // ForA (accumForA, accumIfA, accumForB, accumIfB)
@@ -592,8 +559,7 @@ scf::ForOp findAccumLoop(Operation *op,
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
-  auto parentForOp =
-      findAccumLoop(op, regionsWithChannels, config, reuseGroupIdx);
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
 
   // Handle operations outside loops (e.g., epilogue operations).
   // These operations don't participate in buffer cycling, so return constant 0.
@@ -602,13 +568,7 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
   }
 
-  // Walk up from op to find the immediate child of parentForOp containing op.
   auto *pOp = op->getParentOp();
-  while (pOp && pOp->getParentOp() != parentForOp.getOperation())
-    pOp = pOp->getParentOp();
-  if (!pOp)
-    pOp = op->getParentOp();
-
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
@@ -651,11 +611,12 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return;
   }
   // op is a user of the channel. accumCnt is the corresponding argument of the
-  // accum loop (the loop that owns this reuse group's buffer index).
+  // parentForOp.
+  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
+  // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
-  auto accumLoop =
-      findAccumLoop(op, regionsWithChannels, config, reuseGroupIdx);
-  getReuseChannels(config->getGroup(reuseGroupIdx), accumLoop.getOperation(),
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
   int vecIdx = 0, theIdx = -1;
@@ -666,11 +627,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     }
     ++vecIdx;
   }
-  // When the op's dstOp is not found in chList (e.g., tc_gen5_mma inside the
-  // inner loop — it's not a direct child of the accum loop), default to offset
-  // 0. All ops in a single outer-loop iteration reference the same buffer slot.
-  if (theIdx < 0)
-    theIdx = 0;
+  assert(theIdx >= 0);
   if (theIdx == 0) {
     std::tie(bufferIdx, phase) =
         getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);

@@ -560,59 +560,20 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
 void collectRegionsWithChannelsPost(
     const SmallVector<Channel *> &channels,
     DenseSet<Operation *> &regionsWithChannels) {
-  // Track TMEM operandD allocs we've already handled to avoid duplicates.
-  DenseSet<Operation *> handledAllocs;
   for (auto *channel : channels) {
     if (channel->channelKind == DataChannelKind::TMEMPost) {
       ttng::TmemDataChannelPost *tmemChannel =
           static_cast<ttng::TmemDataChannelPost *>(channel);
       if (tmemChannel->isOperandD) {
-        if (handledAllocs.contains(tmemChannel->allocOp))
-          continue;
-        handledAllocs.insert(tmemChannel->allocOp);
-        // Compute the innermost common ancestor ForOp of all users instead
-        // of adding each user's parent loop. This avoids incorrectly adding
-        // inner loops when the TMEM buffer only changes per outer loop
-        // iteration.
-        Operation *commonAncestor = nullptr;
+        // Go through all dst ops and src ops.
         for (auto user : cast<ttng::TMEMAllocOp>(tmemChannel->allocOp)
                              .getResult()
                              .getUsers()) {
-          if (!commonAncestor)
-            commonAncestor = user;
-          else
-            commonAncestor = commonAncestor->getBlock() == user->getBlock()
-                                 ? commonAncestor
-                                 : [&]() -> Operation * {
-              // Walk up from both ops to find common
-              // ancestor.
-              DenseSet<Operation *> ancestors;
-              Operation *p = commonAncestor;
-              while (p) {
-                ancestors.insert(p);
-                p = p->getParentOp();
-              }
-              p = user;
-              while (p) {
-                if (ancestors.contains(p))
-                  return p;
-                p = p->getParentOp();
-              }
-              return nullptr;
-            }();
-        }
-        // Find the innermost ForOp that is the common ancestor or encloses it.
-        if (commonAncestor) {
-          Operation *pOp = commonAncestor;
-          // If commonAncestor is itself a ForOp/IfOp, use it; otherwise walk
-          // up.
-          while (pOp && !isa<triton::FuncOp>(pOp)) {
-            if (isa<scf::ForOp>(pOp) || isa<scf::IfOp>(pOp)) {
-              regionsWithChannels.insert(pOp);
-              break;
-            }
-            pOp = pOp->getParentOp();
-          }
+          auto *pOp = user->getParentOp();
+          if (auto forOp = dyn_cast<scf::ForOp>(pOp))
+            regionsWithChannels.insert(pOp);
+          if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
+            regionsWithChannels.insert(pOp);
         }
         continue;
       }
@@ -726,11 +687,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (config->getGroup(idx)->channels.size() <= 1)
       continue;
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
-      continue;
-    // Skip reuse groups whose buffer index is not owned by this loop (e.g.,
-    // inner loops should not get accum counters for TMEM groups owned by an
-    // outer loop).
-    if (!needAccumCntForReuse(origForOp.getOperation(), config->getGroup(idx)))
       continue;
     Operation *parentOp = origForOp->getParentOp();
 #if 0
@@ -858,9 +814,6 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
 
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    // Skip reuse groups whose buffer index is not owned by this loop.
-    if (!needAccumCntForReuse(newForOp.getOperation(), config->getGroup(idx)))
-      continue;
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
     // that is directly in forOp.
