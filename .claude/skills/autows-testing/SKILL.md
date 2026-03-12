@@ -18,8 +18,11 @@ Those tests cover manual warp specialization via TLX, which is a separate system
 ## Python tests
 
 ```bash
-# Primary autoWS Python test
+# GEMM autoWS Python test
 pytest python/test/unit/language/test_tutorial09_warp_specialization.py
+
+# Addmm autoWS Python test
+pytest python/test/unit/language/test_addmm_warp_specialization.py
 
 # Additional autoWS tests
 pytest python/test/unit/language/test_warp_specialization.py
