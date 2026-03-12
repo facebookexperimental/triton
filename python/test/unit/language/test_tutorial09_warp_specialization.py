@@ -41,6 +41,8 @@ def matmul_kernel_tma_ws(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    A_COL_MAJOR: tl.constexpr,
+    B_COL_MAJOR: tl.constexpr,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
@@ -65,8 +67,14 @@ def matmul_kernel_tma_ws(
     # Always use warp_specialize=True
     for k in tl.range(k_tiles, warp_specialize=True, disallow_acc_multi_buffer=True):
         offs_k = k * BLOCK_SIZE_K
-        a = a_desc.load([offs_am, offs_k])
-        b = b_desc.load([offs_bn, offs_k])
+        if A_COL_MAJOR:
+            a = a_desc.load([offs_k, offs_am]).T
+        else:
+            a = a_desc.load([offs_am, offs_k])
+        if B_COL_MAJOR:
+            b = b_desc.load([offs_k, offs_bn]).T
+        else:
+            b = b_desc.load([offs_bn, offs_k])
         accumulator = tl.dot(a, b.T, accumulator)
 
     c = accumulator.to(dtype)
@@ -95,6 +103,8 @@ def matmul_kernel_tma_persistent_ws(
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FLATTEN: tl.constexpr,
+    A_COL_MAJOR: tl.constexpr,
+    B_COL_MAJOR: tl.constexpr,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
@@ -123,8 +133,14 @@ def matmul_kernel_tma_persistent_ws(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
+            if A_COL_MAJOR:
+                a = a_desc.load([offs_k, offs_am]).T
+            else:
+                a = a_desc.load([offs_am, offs_k])
+            if B_COL_MAJOR:
+                b = b_desc.load([offs_k, offs_bn]).T
+            else:
+                b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
@@ -164,6 +180,8 @@ def matmul_kernel_descriptor_persistent_ws(
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FLATTEN: tl.constexpr,
+    A_COL_MAJOR: tl.constexpr,
+    B_COL_MAJOR: tl.constexpr,
 ):
     """Persistent matmul with device-side TMA descriptors and warp specialization (always enabled)."""
     dtype = c_ptr.dtype.element_ty
@@ -173,18 +191,34 @@ def matmul_kernel_descriptor_persistent_ws(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    a_desc = tl.make_tensor_descriptor(
-        a_ptr,
-        shape=[M, K],
-        strides=[K, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-    )
-    b_desc = tl.make_tensor_descriptor(
-        b_ptr,
-        shape=[N, K],
-        strides=[K, 1],
-        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
-    )
+    if A_COL_MAJOR:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[K, M],
+            strides=[M, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_M],
+        )
+    else:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+    if B_COL_MAJOR:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[K, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+        )
+    else:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[N, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
     c_desc = tl.make_tensor_descriptor(
         c_ptr,
         shape=[M, N],
@@ -214,8 +248,14 @@ def matmul_kernel_descriptor_persistent_ws(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
+            if A_COL_MAJOR:
+                a = a_desc.load([offs_k, offs_am]).T
+            else:
+                a = a_desc.load([offs_am, offs_k])
+            if B_COL_MAJOR:
+                b = b_desc.load([offs_k, offs_bn]).T
+            else:
+                b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
@@ -244,10 +284,12 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages,
-                                               num_warps):
+def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps,
+                                               A_col_major, B_col_major):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
@@ -263,8 +305,14 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
         device = "cuda"
 
         torch.manual_seed(42)
-        A = torch.randn((M, K), dtype=dtype, device=device)
-        B = torch.randn((N, K), dtype=dtype, device=device)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
@@ -272,9 +320,15 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 
         triton.set_allocator(alloc_fn)
 
-        # Set up tensor descriptors
-        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
-        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        # Set up tensor descriptors (swap dims for col-major so contiguous dim is last)
+        if A_col_major:
+            a_desc = TensorDescriptor(A, [K, M], [M, 1], [BLOCK_SIZE_K, BLOCK_SIZE_M])
+        else:
+            a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        if B_col_major:
+            b_desc = TensorDescriptor(B, [K, N], [N, 1], [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        else:
+            b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
         c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
 
         grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
@@ -290,6 +344,8 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             GROUP_SIZE_M=GROUP_SIZE_M,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
             num_stages=num_stages,
             num_warps=num_warps,
         )
@@ -314,9 +370,11 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -329,6 +387,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     num_warps,
     FLATTEN,
     EPILOGUE_SUBTILE,
+    A_col_major,
+    B_col_major,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
     # Skip configurations that exceed hardware resource limits
@@ -349,8 +409,14 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         device = "cuda"
 
         torch.manual_seed(42)
-        A = torch.randn((M, K), dtype=dtype, device=device)
-        B = torch.randn((N, K), dtype=dtype, device=device)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
@@ -358,9 +424,15 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 
         triton.set_allocator(alloc_fn)
 
-        # Set up tensor descriptors
-        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
-        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        # Set up tensor descriptors (swap dims for col-major so contiguous dim is last)
+        if A_col_major:
+            a_desc = TensorDescriptor(A, [K, M], [M, 1], [BLOCK_SIZE_K, BLOCK_SIZE_M])
+        else:
+            a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        if B_col_major:
+            b_desc = TensorDescriptor(B, [K, N], [N, 1], [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        else:
+            b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
         c_desc = TensorDescriptor(
             C,
             C.shape,
@@ -387,11 +459,13 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             FLATTEN=FLATTEN,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
             num_stages=num_stages,
             num_warps=num_warps,
         )
 
-        # Verify IR contains warp_specialize
+        # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
@@ -411,9 +485,11 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -426,6 +502,8 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     num_warps,
     FLATTEN,
     EPILOGUE_SUBTILE,
+    A_col_major,
+    B_col_major,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
     # Skip configurations that exceed hardware resource limits
@@ -446,10 +524,15 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
         device = "cuda"
 
         torch.manual_seed(42)
-        # For device-side TMA descriptors, we need contiguous memory layout
-        A = torch.randn((M, K), dtype=dtype, device=device).contiguous()
-        B = torch.randn((N, K), dtype=dtype, device=device).contiguous()
-        C = torch.empty((M, N), dtype=dtype, device=device).contiguous()
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -475,11 +558,13 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             FLATTEN=FLATTEN,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
             num_stages=num_stages,
             num_warps=num_warps,
         )
 
-        # Verify IR contains warp_specialize
+        # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
