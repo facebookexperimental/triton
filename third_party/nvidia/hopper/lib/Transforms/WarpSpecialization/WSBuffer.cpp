@@ -557,6 +557,41 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
   }
 }
 
+// Check if an op is a loop-dependent MMA accumulator: it consumes a token
+// that is a block argument of its enclosing ForOp (previous iteration's
+// result) and produces a result that is yielded back to the same loop-carried
+// slot (next iteration's input). This indicates the MMA accumulates in-place
+// across loop iterations and the buffer index should not rotate per iteration.
+// TODO: Does this need to generalize to other token carrying patterns?
+static bool isLoopDepMMA(Operation *op) {
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  if (!parentForOp)
+    return false;
+  auto yieldOp = cast<scf::YieldOp>(parentForOp.getBody()->getTerminator());
+  auto iterArgs = parentForOp.getRegionIterArgs();
+  // For each yield operand position, check if the op produces the yielded
+  // value AND consumes the corresponding iter arg at the same position.
+  for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
+    Value yieldOperand = yieldOp.getOperand(i);
+    bool isResult = false;
+    for (auto result : op->getResults()) {
+      if (result == yieldOperand) {
+        isResult = true;
+        break;
+      }
+    }
+    if (!isResult)
+      continue;
+    // Check if the corresponding iter arg is an operand of our op.
+    Value correspondingArg = iterArgs[i];
+    for (auto operand : op->getOperands()) {
+      if (operand == correspondingArg)
+        return true;
+    }
+  }
+  return false;
+}
+
 void collectRegionsWithChannelsPost(
     const SmallVector<Channel *> &channels,
     DenseSet<Operation *> &regionsWithChannels) {
@@ -569,6 +604,11 @@ void collectRegionsWithChannelsPost(
         for (auto user : cast<ttng::TMEMAllocOp>(tmemChannel->allocOp)
                              .getResult()
                              .getUsers()) {
+          // Skip ops whose results are loop-carried (e.g. MMA accumulating
+          // across k-loop iterations). The buffer index doesn't change
+          // within the accumulation loop.
+          if (isLoopDepMMA(user))
+            continue;
           auto *pOp = user->getParentOp();
           if (auto forOp = dyn_cast<scf::ForOp>(pOp))
             regionsWithChannels.insert(pOp);
@@ -688,6 +728,9 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       continue;
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
       continue;
+    // Skip reuse groups whose buffer index is not owned by this loop.
+    if (!needAccumCntForReuse(origForOp.getOperation(), config->getGroup(idx)))
+      continue;
     Operation *parentOp = origForOp->getParentOp();
 #if 0
     if (!isa<scf::ForOp>(parentOp) && !isa<scf::IfOp>(parentOp))
@@ -787,17 +830,23 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       continue;
 
     auto numRes = op->getNumResults();
-    unsigned tCnts = getAccumCnts(op, regionsWithChannels, config);
-    LDBG("-- numRes, tCnts, accumArgId " << numRes << " " << tCnts << " "
-                                         << accumArgId);
-    // Each accumCnt nested under "op", it will have a corresponding argument in
-    // this "ForOp". If "op" has tCnts, this "ForOp" will have the same number
-    // of corresponding accumCnts, in the same order.
-    for (unsigned i = 0; i < tCnts; ++i) {
+    // Only consume unique accumCnts here; reuse group accumCnts are handled
+    // in step 3 below. This avoids the bug where a parent-only reuse group
+    // (e.g., TMEM buffer index) interleaves between a nested op's unique and
+    // reuse positions, causing step 2 to consume the wrong positions.
+    unsigned totalCnts = getAccumCnts(op, regionsWithChannels, config);
+    unsigned uniqueCnts = getAccumCnts(op, regionsWithChannels, nullptr);
+    LDBG("-- numRes, totalCnts, uniqueCnts, accumArgId "
+         << numRes << " " << totalCnts << " " << uniqueCnts << " "
+         << accumArgId);
+    // Each unique accumCnt nested under "op" has a corresponding argument in
+    // this "ForOp". We only process unique counts here; reuse counts from
+    // nested ops are handled in step 3.
+    for (unsigned i = 0; i < uniqueCnts; ++i) {
       Value arg = newForOp.getBody()->getArgument(accumArgId);
-      Value endAccum = op->getResult(numRes - tCnts + i);
+      Value endAccum = op->getResult(numRes - totalCnts + i);
       LLVM_DEBUG({
-        LDBG("-- replace use of arg with result " << numRes - tCnts + i);
+        LDBG("-- replace use of arg with result " << numRes - totalCnts + i);
         op->dump();
       });
       // In createNewLoop, yieldOp yields the argument value directly, it is
@@ -808,12 +857,15 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     }
     // Insert ops for control flow to ensure they aren't also processed
     // in the reuse group section.
-    if (tCnts > 0)
+    if (totalCnts > 0)
       seenOps.insert(op);
   }
 
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
+    // Skip reuse groups whose buffer index is not owned by this loop.
+    if (!needAccumCntForReuse(newForOp.getOperation(), config->getGroup(idx)))
+      continue;
     // Find channels of reuse group that are inside forOp. If the channel is
     // directly in forOp, add the channel's DstOp, otherwise add the region Op
     // that is directly in forOp.
@@ -822,11 +874,18 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (chList.empty())
       continue;
     Operation *lastCh = chList.back();
-    // Check if we have already accounted for this accumulator via nesting.
-    if (seenOps.contains(lastCh))
-      continue;
-    auto forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
-                                          config, idx, false);
+    Value forYield;
+    if (seenOps.contains(lastCh)) {
+      // Reuse group handled by a nested op — extract its result directly.
+      auto numRes = lastCh->getNumResults();
+      unsigned tCnts = getAccumCnts(lastCh, regionsWithChannels, config);
+      auto reuseArgIdx =
+          getReuseAccumArgIdx(lastCh, regionsWithChannels, config, idx);
+      forYield = lastCh->getResult(numRes - tCnts + reuseArgIdx);
+    } else {
+      forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
+                                       config, idx, false);
+    }
     Value arg = newForOp.getBody()->getArgument(accumArgId);
     yieldOp->replaceUsesOfWith(arg, forYield);
     ++accumArgId;
