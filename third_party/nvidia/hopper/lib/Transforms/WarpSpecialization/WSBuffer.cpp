@@ -557,6 +557,41 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
   }
 }
 
+// Check if an op is a loop-dependent MMA accumulator: it consumes a token
+// that is a block argument of its enclosing ForOp (previous iteration's
+// result) and produces a result that is yielded back to the same loop-carried
+// slot (next iteration's input). This indicates the MMA accumulates in-place
+// across loop iterations and the buffer index should not rotate per iteration.
+// TODO: Does this need to generalize to other token carrying patterns?
+static bool isLoopDepMMA(Operation *op) {
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  if (!parentForOp)
+    return false;
+  auto yieldOp = cast<scf::YieldOp>(parentForOp.getBody()->getTerminator());
+  auto iterArgs = parentForOp.getRegionIterArgs();
+  // For each yield operand position, check if the op produces the yielded
+  // value AND consumes the corresponding iter arg at the same position.
+  for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
+    Value yieldOperand = yieldOp.getOperand(i);
+    bool isResult = false;
+    for (auto result : op->getResults()) {
+      if (result == yieldOperand) {
+        isResult = true;
+        break;
+      }
+    }
+    if (!isResult)
+      continue;
+    // Check if the corresponding iter arg is an operand of our op.
+    Value correspondingArg = iterArgs[i];
+    for (auto operand : op->getOperands()) {
+      if (operand == correspondingArg)
+        return true;
+    }
+  }
+  return false;
+}
+
 void collectRegionsWithChannelsPost(
     const SmallVector<Channel *> &channels,
     DenseSet<Operation *> &regionsWithChannels) {
@@ -569,6 +604,11 @@ void collectRegionsWithChannelsPost(
         for (auto user : cast<ttng::TMEMAllocOp>(tmemChannel->allocOp)
                              .getResult()
                              .getUsers()) {
+          // Skip ops whose results are loop-carried (e.g. MMA accumulating
+          // across k-loop iterations). The buffer index doesn't change
+          // within the accumulation loop.
+          if (isLoopDepMMA(user))
+            continue;
           auto *pOp = user->getParentOp();
           if (auto forOp = dyn_cast<scf::ForOp>(pOp))
             regionsWithChannels.insert(pOp);
