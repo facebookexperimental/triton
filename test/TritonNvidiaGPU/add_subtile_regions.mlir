@@ -234,7 +234,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // Different-task TMA store: epilogue compute ops have task 0,
   // TMA store ops have task 1. Should produce two subtile regions.
 
-  // First subtile region: truncf -> cvt -> local_alloc (task 0).
+  // First subtile region: truncf -> cvt -> local_alloc -> fence (task 0).
+  // The fence goes with the store, not with the TMA copy.
   // CHECK-LABEL: @epilogue_subtile_tma_different_task
   // CHECK: ttng.subtiled_region
   // CHECK: setup
@@ -243,21 +244,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: arith.truncf
   // CHECK: ttg.convert_layout
   // CHECK: ttg.local_alloc
+  // CHECK: ttng.fence_async_shared
   // CHECK: ttng.subtiled_region_yield
   //
-  // Second subtile region: fence -> tma_copy -> wait (task 1).
+  // Second subtile region: tma_copy -> wait (task 1, no fence).
   // CHECK: ttng.subtiled_region
   // CHECK: setup
   // CHECK: ttng.subtiled_region_yield
   // CHECK: tile
-  // CHECK: ttng.fence_async_shared
+  // CHECK-NOT: ttng.fence_async_shared
   // CHECK: ttng.async_tma_copy_local_to_global
   // CHECK: ttng.async_tma_store_token_wait
   // CHECK: ttng.subtiled_region_yield
   //
   // Original TMA store ops should be erased.
   // CHECK: tt.return
-  // CHECK-NOT: ttng.fence_async_shared
   // CHECK-NOT: ttng.async_tma_copy_local_to_global
   tt.func @epilogue_subtile_tma_different_task(
       %acc_memdesc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
