@@ -1,4 +1,5 @@
 # TLX GEMM kernel optimized for Blackwell Warp Specialization
+import functools
 import math
 import os
 
@@ -10,6 +11,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 # Track which (M, N, K) shapes have already printed their heuristic config
 _printed_heuristic_configs = set()
+
+
+# Cached SM count — never changes during program lifetime.
+# Calling torch.cuda.get_device_properties() on every matmul() call
+# adds measurable overhead that degrades benchmark throughput on fast kernels.
+@functools.lru_cache(maxsize=1)
+def _get_num_sms():
+    return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
 def get_heuristic_config(M, N, K, num_sms=148):
@@ -400,8 +409,20 @@ def matmul_tma_set_block_size_hook(nargs):
         BLOCK_M // NUM_MMA_GROUPS,
         BLOCK_N // EPILOGUE_SUBTILE,
     ]
-    if nargs.get("SPLIT_K", 1) > 1:
-        nargs["c_desc"].base.zero_()
+    SPLIT_K = nargs.get("SPLIT_K", 1)
+    if SPLIT_K > 1:
+        M = nargs["M"]
+        N = nargs["N"]
+        workspace = torch.empty((SPLIT_K * M, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
+        nargs["workspace_desc"].base = workspace
+        nargs["workspace_desc"].shape = list(workspace.shape)
+    else:
+        nargs["workspace_desc"].base = nargs["c_desc"].base
+        nargs["workspace_desc"].shape = list(nargs["c_desc"].base.shape)
+    nargs["workspace_desc"].block_shape = [
+        BLOCK_M // NUM_MMA_GROUPS,
+        BLOCK_N // EPILOGUE_SUBTILE,
+    ]
 
 
 @triton.jit
@@ -416,7 +437,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
 
 def preprocess_configs(configs, named_args, **kwargs):
     # Blackwell B200A resource limits
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = _get_num_sms()
     MAX_SHARED_MEMORY = 232 * 1024  # bytes (232KB)
     MAX_TENSOR_MEMORY = 256 * 1024  # bytes (256KB TMEM per SM)
 
@@ -438,12 +459,19 @@ def preprocess_configs(configs, named_args, **kwargs):
         SPLIT_K = conf.kwargs.get("SPLIT_K", 1)
         EPILOGUE_SUBTILE = conf.kwargs["EPILOGUE_SUBTILE"]
         INTERLEAVE_EPILOGUE = conf.kwargs.get("INTERLEAVE_EPILOGUE", 0)
+        GROUP_SIZE_M = conf.kwargs["GROUP_SIZE_M"]
 
         # Filter out invalid config that causes wrong hardware MMA
         if BLOCK_M // NUM_MMA_GROUPS > 128:
             continue
         # Pair-CTA MMA doesn't work with M=64 per MMA group
         if NUM_CTAS == 2 and BLOCK_M // NUM_MMA_GROUPS == 64:
+            continue
+        # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
+        # tile_ids (assigned to paired CTAs in a cluster) always map to the
+        # same pid_n. Otherwise, at group boundaries a CTA pair can straddle
+        # two different pid_n values, breaking 2-CTA B-tile sharing.
+        if GROUP_SIZE_M % NUM_CTAS != 0:
             continue
 
         # EPILOGUE_SUBTILE must evenly divide BLOCK_N
@@ -642,6 +670,7 @@ def _process_tile_epilogue_inner(
     SPLIT_K,
     INTERLEAVE_EPILOGUE,
     c_desc,
+    workspace_desc,
     c_smem_buffers,
     tmem_buffers,
     tmem_full_bars,
@@ -656,7 +685,13 @@ def _process_tile_epilogue_inner(
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
 
     slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
-    STORE_REDUCE: tl.constexpr = "add" if SPLIT_K > 1 else ""
+    if SPLIT_K > 1:
+        split_id = tile_id // num_mn_tiles
+        out_desc = workspace_desc
+        row_base = split_id * M
+    else:
+        out_desc = c_desc
+        row_base = 0
 
     if INTERLEAVE_EPILOGUE:
         # Interleaved TMA stores across two groups to improve memory throughput.
@@ -674,15 +709,14 @@ def _process_tile_epilogue_inner(
         acc_sub = tlx.local_slice(acc_tmem_0, [0, 0 * slice_size], [BLOCK_M_SPLIT, slice_size])
         result = tlx.local_load(acc_sub)
         tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
-        c = result.to(tlx.dtype_of(c_desc))
+        c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[0]
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
         tlx.async_descriptor_store(
-            c_desc,
+            out_desc,
             c_smem,
-            [offs_am_0, offs_bn + 0 * slice_size],
-            store_reduce=STORE_REDUCE,
+            [row_base + offs_am_0, offs_bn + 0 * slice_size],
             eviction_policy="evict_first",
         )
 
@@ -691,15 +725,14 @@ def _process_tile_epilogue_inner(
         acc_sub = tlx.local_slice(acc_tmem_1, [0, 0 * slice_size], [BLOCK_M_SPLIT, slice_size])
         result = tlx.local_load(acc_sub)
         tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
-        c = result.to(tlx.dtype_of(c_desc))
+        c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[1]
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
         tlx.async_descriptor_store(
-            c_desc,
+            out_desc,
             c_smem,
-            [offs_am_1, offs_bn + 0 * slice_size],
-            store_reduce=STORE_REDUCE,
+            [row_base + offs_am_1, offs_bn + 0 * slice_size],
             eviction_policy="evict_first",
         )
 
@@ -709,16 +742,15 @@ def _process_tile_epilogue_inner(
             acc_sub = tlx.local_slice(acc_tmem_0, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
             result = tlx.local_load(acc_sub)
             tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
-            c = result.to(tlx.dtype_of(c_desc))
+            c = result.to(tlx.dtype_of(out_desc))
             c_smem = c_smem_buffers[0]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
             tlx.fence("async_shared")
             tlx.async_descriptor_store(
-                c_desc,
+                out_desc,
                 c_smem,
-                [offs_am_0, offs_bn + slice_id * slice_size],
-                store_reduce=STORE_REDUCE,
+                [row_base + offs_am_0, offs_bn + slice_id * slice_size],
                 eviction_policy="evict_first",
             )
 
@@ -726,16 +758,15 @@ def _process_tile_epilogue_inner(
             acc_sub = tlx.local_slice(acc_tmem_1, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
             result = tlx.local_load(acc_sub)
             tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
-            c = result.to(tlx.dtype_of(c_desc))
+            c = result.to(tlx.dtype_of(out_desc))
             c_smem = c_smem_buffers[1]
             tlx.async_descriptor_store_wait(1)
             tlx.local_store(c_smem, c)
             tlx.fence("async_shared")
             tlx.async_descriptor_store(
-                c_desc,
+                out_desc,
                 c_smem,
-                [offs_am_1, offs_bn + slice_id * slice_size],
-                store_reduce=STORE_REDUCE,
+                [row_base + offs_am_1, offs_bn + slice_id * slice_size],
                 eviction_policy="evict_first",
             )
     else:
@@ -756,16 +787,15 @@ def _process_tile_epilogue_inner(
                 )
                 result = tlx.local_load(acc_tmem_subslice)
                 tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
-                c = result.to(tlx.dtype_of(c_desc))
+                c = result.to(tlx.dtype_of(out_desc))
                 c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % 2]
                 tlx.async_descriptor_store_wait(1)
                 tlx.local_store(c_smem, c)
                 tlx.fence_async_shared()
                 tlx.async_descriptor_store(
-                    c_desc,
+                    out_desc,
                     c_smem,
-                    [offs_am, offs_bn + slice_id * slice_size],
-                    store_reduce=STORE_REDUCE,
+                    [row_base + offs_am, offs_bn + slice_id * slice_size],
                     eviction_policy="evict_first",
                 )
 
@@ -955,16 +985,75 @@ def _process_tile_producer_inner(
     return smem_accum_cnt
 
 
+TORCH_DTYPE_TO_TRITON = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
+
+@triton.jit
+def _reduce_k_kernel(
+    workspace_ptr,
+    c_ptr,
+    M,
+    N,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    base_offs = offs_m[:, None] * N + offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for s in range(SPLIT_K):
+        ws_offs = base_offs + s * M * N
+        partial = tl.load(workspace_ptr + ws_offs, mask=mask, other=0.0)
+        acc += partial.to(tl.float32)
+
+    tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+def reduce_post_hook(nargs, exception=None):
+    if exception is not None:
+        return
+    split_k = nargs.get("SPLIT_K", 1)
+    if split_k > 1:
+        M = nargs["M"]
+        N = nargs["N"]
+        workspace = nargs["workspace_desc"].base
+        c = nargs["c_desc"].base
+        reduce_grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
+        _reduce_k_kernel[reduce_grid](
+            workspace,
+            c,
+            M,
+            N,
+            SPLIT_K=split_k,
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[workspace.dtype],
+            num_warps=8,
+        )
+
+
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": preprocess_configs},
+    post_hook=reduce_post_hook,
 )
 @triton.jit
 def matmul_kernel_tma_ws_blackwell(
     a_desc,
     b_desc,
     c_desc,
+    workspace_desc,
     M,
     N,
     K,
@@ -1078,6 +1167,7 @@ def matmul_kernel_tma_ws_blackwell(
                     SPLIT_K=SPLIT_K,
                     INTERLEAVE_EPILOGUE=INTERLEAVE_EPILOGUE,
                     c_desc=c_desc,
+                    workspace_desc=workspace_desc,
                     c_smem_buffers=c_smem_buffers,
                     tmem_buffers=tmem_buffers,
                     tmem_full_bars=tmem_full_bars,
@@ -1233,7 +1323,7 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
     b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = _get_num_sms()
 
     # Use heuristic config if no config provided and heuristic is enabled
     if config is None and use_heuristic:
@@ -1250,20 +1340,37 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
         ctas_per_cga = config.pop("ctas_per_cga", None)
         # Extract and run pre_hook if present
         pre_hook = config.pop("pre_hook", None)
-        if pre_hook:
-            pre_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
+        split_k = config.get("SPLIT_K", 1)
+        if split_k > 1:
+            workspace = torch.empty((split_k * M, N), device=a.device, dtype=a.dtype)
+            workspace_desc = TensorDescriptor(workspace, workspace.shape, workspace.stride(), dummy_block)
         else:
-            matmul_tma_set_block_size_hook({"a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc, **config})
+            workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+        hook_args = {
+            "a_desc": a_desc,
+            "b_desc": b_desc,
+            "c_desc": c_desc,
+            "workspace_desc": workspace_desc,
+            "M": M,
+            "N": N,
+            "K": K,
+            **config,
+        }
+        if pre_hook:
+            pre_hook(hook_args)
+        else:
+            matmul_tma_set_block_size_hook(hook_args)
         NUM_CTAS = config.get("NUM_CTAS", 1)
         num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
         num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
         num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
-        total_tiles = num_pid_m * num_pid_n * config.get("SPLIT_K", 1)
+        total_tiles = num_pid_m * num_pid_n * split_k
         grid = (min(NUM_SMS, total_tiles), )
         matmul_kernel_tma_ws_blackwell.fn[grid](
             a_desc,
             b_desc,
             c_desc,
+            workspace_desc,
             M,
             N,
             K,
@@ -1272,7 +1379,24 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
             ctas_per_cga=ctas_per_cga,
             **config,
         )
+        # Run separate reduction kernel for split-K
+        if split_k > 1:
+            reduce_grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
+            _reduce_k_kernel[reduce_grid](
+                workspace_desc.base,
+                c,
+                M,
+                N,
+                SPLIT_K=split_k,
+                BLOCK_SIZE_M=128,
+                BLOCK_SIZE_N=128,
+                OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[a.dtype],
+                num_warps=8,
+            )
     else:
+        # Pass c as dummy workspace_desc. Pre_hook dynamically allocates
+        # the right-sized workspace per config based on SPLIT_K.
+        workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
         def grid(META):
             NUM_CTAS = META["NUM_CTAS"]
@@ -1288,12 +1412,14 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
             a_desc,
             b_desc,
             c_desc,
+            workspace_desc,
             M,
             N,
             K,
             NUM_SMS=NUM_SMS,
             USE_WARP_BARRIER=use_warp_barrier,
         )
+        # post_hook handles reduction for split-K > 1
     return c
 
 
