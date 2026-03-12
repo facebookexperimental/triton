@@ -747,13 +747,16 @@ getTaskTopRegion(triton::FuncOp funcOp,
 }
 
 // Create an allocation to hold the mbarriers.
-static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
+static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
+                                StringRef srcName = "") {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
       triton::gpu::SharedMemorySpaceAttr::get(funcOp.getContext());
   Location loc = funcOp.getLoc();
   auto context = funcOp.getContext();
+  if (!srcName.empty())
+    loc = NameLoc::get(StringAttr::get(context, srcName), loc);
   auto barrierCTALayout =
       ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
                               /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
@@ -856,13 +859,13 @@ void createToken(
     }
     if (hasTMAProducer) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // Pattern matching for tmem_store --> getD --> tmem_load (gen5 is the
     // actual producer) or gen5 --> tmem_load
     if (ProducerIsGen5(producerOp))
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
@@ -910,17 +913,22 @@ void createToken(
           llvm_unreachable("Unexpected load type");
         }
         Value v;
+        Location tokenLoc = funcOp.getLoc();
+        if (!channel->srcName.empty())
+          tokenLoc = NameLoc::get(
+              StringAttr::get(funcOp.getContext(), channel->srcName),
+              tokenLoc);
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
           v = builder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
+              tokenLoc, channel->getNumBuffers(), tokenLoadType);
         else
-          v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
+          v = builder.create<ttnvws::CreateTokenOp>(tokenLoc, 1,
                                                     tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
@@ -1246,13 +1254,13 @@ void createTokenPost(
     }
     if (hasTMAProducer) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // If channel is from a gen5, pre-allocate gen5 barrier.
     bool hasProdBar = false;
     if (isa<ttng::TCGen5MMAOp>(producerOp)) {
       commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
       hasProdBar = true;
     }
     // Check if this channel needs token-based synchronization.
@@ -1335,13 +1343,18 @@ void createTokenPost(
           llvm_unreachable("Unexpected load type");
         }
         Value v;
+        Location tokenLoc = funcOp.getLoc();
+        if (!channel->srcName.empty())
+          tokenLoc = NameLoc::get(
+              StringAttr::get(funcOp.getContext(), channel->srcName),
+              tokenLoc);
         v = builder.create<ttnvws::CreateTokenOp>(
-            funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
+            tokenLoc, channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
       }
     }
@@ -3016,8 +3029,14 @@ void insertAsyncComm(
               OpBuilder tokenBuilder(funcOp);
               tokenBuilder.setInsertionPointToStart(
                   &(funcOp.getBody().front()));
+              Location tokenLoc = funcOp.getLoc();
+              if (!masterChannel->srcName.empty())
+                tokenLoc = NameLoc::get(
+                    StringAttr::get(funcOp.getContext(),
+                                    masterChannel->srcName),
+                    tokenLoc);
               Value consumedToken = tokenBuilder.create<ttnvws::CreateTokenOp>(
-                  funcOp.getLoc(), masterChannel->getNumBuffers(),
+                  tokenLoc, masterChannel->getNumBuffers(),
                   ttnvws::TokenLoadType::TmemLoadOp);
 
               // Insert ProducerAcquireOp before the tmem_store.
