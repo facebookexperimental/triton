@@ -789,9 +789,13 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
      << getValueName(upperBound, argSubstitutionMap) << ", "
      << getValueName(step, argSubstitutionMap) << "):\n";
 
-  // Print the body
+  // Print the body, passing iter_args as yield targets so scf.yield prints
+  // assignments updating the iter_args at the end of each iteration.
+  SmallVector<Value> yieldTargets;
+  for (unsigned i = 0; i < numIterArgs; ++i)
+    yieldTargets.push_back(entryBlock.getArgument(1 + i));
   printRegion(bodyRegion, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-              argSubstitutionMap);
+              argSubstitutionMap, yieldTargets);
 }
 
 // Print scf.if with yield-to-assignment conversion
