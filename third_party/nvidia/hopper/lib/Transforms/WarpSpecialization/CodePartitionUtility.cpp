@@ -2118,6 +2118,12 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
   auto ctx = forOp.getContext();
   SmallVector<int> channelsToBeUpdate;
 
+  // Track the first producer and last consumer across the entire TMEM lifecycle
+  // to create a wrap-around channel that closes the cycle.
+  Operation *firstProducer = nullptr;
+  Operation *lastConsumer = nullptr;
+  unsigned numChannelsCreated = 0;
+
   // Check for producers outside the loop body (e.g., tmem_store before the
   // loop that initializes the accumulator). These producers dominate the loop.
   for (auto user : tmemAllocOp.getResult().getUsers()) {
@@ -2191,6 +2197,10 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         }
         int producerTaskId = producerTaskIds.front();
         if (needsChannel(producerTaskId, consumerIds)) {
+          if (!firstProducer)
+            firstProducer = currentProds.front();
+          lastConsumer = &op;
+          numChannelsCreated++;
           createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                      tmemAllocOp.getOperation(), &op, channels);
           currentProds.clear();
@@ -2222,6 +2232,10 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         auto producerTaskId = producerTaskIds.front();
         auto consumerIds = getAsyncTaskIds(&op);
         if (needsChannel(producerTaskId, consumerIds)) {
+          if (!firstProducer)
+            firstProducer = currentProds.front();
+          lastConsumer = &op;
+          numChannelsCreated++;
           createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                      tmemAllocOp.getOperation(), &op, channels);
         } else {
@@ -2245,6 +2259,10 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         auto producerTaskId = producerTaskIds.front();
         auto consumerIds = getAsyncTaskIds(&op);
         if (needsChannel(producerTaskId, consumerIds)) {
+          if (!firstProducer)
+            firstProducer = currentProds.front();
+          lastConsumer = &op;
+          numChannelsCreated++;
           createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                      tmemAllocOp.getOperation(), &op, channels);
         } else {
@@ -2300,10 +2318,41 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
       auto producerTaskId = producerTaskIds.front();
       auto consumerIds = getAsyncTaskIds(user);
       if (needsChannel(producerTaskId, consumerIds)) {
+        if (!firstProducer)
+          firstProducer = currentProds.front();
+        lastConsumer = user;
+        numChannelsCreated++;
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
         assert(false && "Unexpected Producer Found");
+      }
+    }
+  }
+  // Create a wrap-around channel between the first producer and last consumer
+  // to close the TMEM lifecycle. This ensures the last consumer (e.g.,
+  // tmem_load) signals the first producer (e.g., tmem_store) via the Empty
+  // barrier before the next iteration overwrites the buffer.
+  // Only needed when the chain is linear (>= 2 consecutive channels), since
+  // with only 1 channel the first-last pair is already directly connected.
+  // Also require first producer and last consumer to be in the same block
+  // (same nesting level). In FA, the acc lifecycle has tmem_store inside the
+  // inner loop and tmem_load outside it; creating a wrap-around channel across
+  // nesting levels would trigger unsupported paths in insertAsyncComm.
+  // TODO: Investigate whether we need to generalize this to handle
+  // cross-nesting-level wrap-around channels (e.g., for FA's accumulator
+  // correction pattern).
+  if (numChannelsCreated >= 2 && firstProducer && lastConsumer &&
+      firstProducer->getBlock() == lastConsumer->getBlock()) {
+    auto firstProdTaskIds = getAsyncTaskIds(firstProducer);
+    auto lastConsumerIds = getAsyncTaskIds(lastConsumer);
+    if (firstProdTaskIds.size() == 1) {
+      int firstProdTaskId = firstProdTaskIds.front();
+      if (needsChannel(firstProdTaskId, lastConsumerIds)) {
+        SmallVector<Operation *> prods = {firstProducer};
+        createChannelsForProducers(prods, firstProdTaskId, lastConsumerIds,
+                                   tmemAllocOp.getOperation(), lastConsumer,
+                                   channels);
       }
     }
   }
@@ -2364,7 +2413,13 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       return;
     }
 
-    producerOp = producers[0];
+    producerOp = producers.empty() ? nullptr : producers[0];
+    if (producers.empty()) {
+      // TMEM alloc with a source tensor (e.g., ttng.tmem_alloc %tensor) is
+      // self-contained — the data is embedded at allocation time. No
+      // separate producer channel is needed; skip channel creation.
+      return;
+    }
     if (producers.size() > 1) {
       assert(consumers.size() == 1);
       producerOp = nullptr;
