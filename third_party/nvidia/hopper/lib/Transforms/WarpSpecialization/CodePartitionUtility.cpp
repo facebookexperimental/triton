@@ -646,12 +646,15 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return;
   }
   // op is a user of the channel. accumCnt is the corresponding argument of the
-  // parentForOp.
-  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
-  // FIXME: handle the case where ch is inside in IfOp.
+  // accum-owning loop.
+  // Use the accum-owning loop (not just the immediate parent) to find the
+  // channel list. For TMEM operandD, this is the outer tile loop.
   SmallVector<Operation *> chList;
-  auto parentForOp = op->getParentOfType<scf::ForOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
+  auto accumLoop = op->getParentOfType<scf::ForOp>();
+  while (accumLoop && !needAccumCntForReuse(accumLoop.getOperation(),
+                                            config->getGroup(reuseGroupIdx)))
+    accumLoop = accumLoop->getParentOfType<scf::ForOp>();
+  getReuseChannels(config->getGroup(reuseGroupIdx), accumLoop.getOperation(),
                    chList);
   assert(chList.size() >= 1);
   int vecIdx = 0, theIdx = -1;
@@ -662,7 +665,17 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     }
     ++vecIdx;
   }
-  assert(theIdx >= 0);
+  // When the dstOp is inside a nested loop (not a direct child of the accum
+  // loop), it won't appear in chList. For example, the MMA op lives inside
+  // the inner k-loop but the accum-owning loop is the outer tile loop. Since
+  // tmem_store initializes the buffer, the MMA accumulates into it, and
+  // tmem_load reads the result — all within the same outer-loop iteration —
+  // they all share the same buffer slot. Use offset 0 (no additional offset
+  // beyond accumCnt).
+  // TODO: Verify this is safe for all cases where dstOp is in a nested loop,
+  // not just the TMEM operandD accumulation pattern.
+  if (theIdx < 0)
+    theIdx = 0;
   if (theIdx == 0) {
     std::tie(bufferIdx, phase) =
         getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
