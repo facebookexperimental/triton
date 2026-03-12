@@ -293,22 +293,36 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
-static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
+bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
   if (group->channels[0]->getNumBuffers() <= 1)
     return false;
-  // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
+  // Detect TMEM operandD groups.
+  bool isTmemOperandD = false;
+  for (auto *ch : group->channels) {
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      if (tmemCh->isOperandD) {
+        isTmemOperandD = true;
+        break;
+      }
+    }
+  }
+  // Goes through each channel in the ReuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
+  // For TMEM operandD: require BOTH src and dst enclosed (buffer changes per
+  // outer loop, not per inner accumulation loop).
+  // For others: require EITHER (original behavior).
   for (auto *ch : group->channels) {
     if (auto forOp = dyn_cast<scf::ForOp>(ctrlOp)) {
-      if (enclosing(forOp, ch->getSrcOp()))
-        return true;
-      if (enclosing(forOp, ch->getDstOp()))
+      bool encSrc = enclosing(forOp, ch->getSrcOp());
+      bool encDst = enclosing(forOp, ch->getDstOp());
+      if (isTmemOperandD ? (encSrc && encDst) : (encSrc || encDst))
         return true;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(ctrlOp)) {
-      if (enclosing(ifOp, ch->getSrcOp()))
-        return true;
-      if (enclosing(ifOp, ch->getDstOp()))
+      bool encSrc = enclosing(ifOp, ch->getSrcOp());
+      bool encDst = enclosing(ifOp, ch->getDstOp());
+      if (isTmemOperandD ? (encSrc && encDst) : (encSrc || encDst))
         return true;
     }
   }
