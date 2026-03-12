@@ -100,10 +100,8 @@ struct NVGPUTMAStoreTokenWaitLoweringPass
           NVGPUTMAStoreTokenWaitLoweringPass> {
   void runOnOperation() override {
     SmallVector<ttng::TMAStoreTokenWaitOp> opsToLower;
-    getOperation()->walk([&](ttng::TMAStoreTokenWaitOp op) {
-      if (!op.getBarriers().empty())
-        opsToLower.push_back(op);
-    });
+    getOperation()->walk(
+        [&](ttng::TMAStoreTokenWaitOp op) { opsToLower.push_back(op); });
     for (auto op : opsToLower) {
       OpBuilder builder(op);
       auto loc = op.getLoc();
