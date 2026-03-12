@@ -573,7 +573,21 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
-  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  scf::ForOp parentForOp;
+  if (reuseGroupIdx < 0) {
+    parentForOp = op->getParentOfType<scf::ForOp>();
+  } else {
+    // For reuse groups, walk up the loop nest to find the ForOp that owns
+    // the accum counter (where needAccumCntForReuse returns true). For TMEM
+    // operandD, this skips the inner accumulation loop and finds the outer
+    // tile loop.
+    parentForOp = op->getParentOfType<scf::ForOp>();
+    while (parentForOp &&
+           !needAccumCntForReuse(parentForOp.getOperation(),
+                                 config->getGroup(reuseGroupIdx))) {
+      parentForOp = parentForOp->getParentOfType<scf::ForOp>();
+    }
+  }
 
   // Handle operations outside loops (e.g., epilogue operations).
   // These operations don't participate in buffer cycling, so return constant 0.
@@ -582,7 +596,14 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
   }
 
+  // Walk up from op to find the immediate child of parentForOp.
+  // This is to handle when a channel has a loop carried dependency.
   auto *pOp = op->getParentOp();
+  while (pOp && pOp->getParentOp() != parentForOp.getOperation())
+    pOp = pOp->getParentOp();
+  if (!pOp)
+    pOp = op->getParentOp();
+
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
