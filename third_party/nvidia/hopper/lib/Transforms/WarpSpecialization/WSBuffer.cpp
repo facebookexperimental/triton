@@ -830,17 +830,23 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       continue;
 
     auto numRes = op->getNumResults();
-    unsigned tCnts = getAccumCnts(op, regionsWithChannels, config);
-    LDBG("-- numRes, tCnts, accumArgId " << numRes << " " << tCnts << " "
-                                         << accumArgId);
-    // Each accumCnt nested under "op", it will have a corresponding argument in
-    // this "ForOp". If "op" has tCnts, this "ForOp" will have the same number
-    // of corresponding accumCnts, in the same order.
-    for (unsigned i = 0; i < tCnts; ++i) {
+    // Only consume unique accumCnts here; reuse group accumCnts are handled
+    // in step 3 below. This avoids the bug where a parent-only reuse group
+    // (e.g., TMEM buffer index) interleaves between a nested op's unique and
+    // reuse positions, causing step 2 to consume the wrong positions.
+    unsigned totalCnts = getAccumCnts(op, regionsWithChannels, config);
+    unsigned uniqueCnts = getAccumCnts(op, regionsWithChannels, nullptr);
+    LDBG("-- numRes, totalCnts, uniqueCnts, accumArgId "
+         << numRes << " " << totalCnts << " " << uniqueCnts << " "
+         << accumArgId);
+    // Each unique accumCnt nested under "op" has a corresponding argument in
+    // this "ForOp". We only process unique counts here; reuse counts from
+    // nested ops are handled in step 3.
+    for (unsigned i = 0; i < uniqueCnts; ++i) {
       Value arg = newForOp.getBody()->getArgument(accumArgId);
-      Value endAccum = op->getResult(numRes - tCnts + i);
+      Value endAccum = op->getResult(numRes - totalCnts + i);
       LLVM_DEBUG({
-        LDBG("-- replace use of arg with result " << numRes - tCnts + i);
+        LDBG("-- replace use of arg with result " << numRes - totalCnts + i);
         op->dump();
       });
       // In createNewLoop, yieldOp yields the argument value directly, it is
@@ -851,7 +857,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     }
     // Insert ops for control flow to ensure they aren't also processed
     // in the reuse group section.
-    if (tCnts > 0)
+    if (totalCnts > 0)
       seenOps.insert(op);
   }
 
@@ -868,11 +874,18 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
     if (chList.empty())
       continue;
     Operation *lastCh = chList.back();
-    // Check if we have already accounted for this accumulator via nesting.
-    if (seenOps.contains(lastCh))
-      continue;
-    auto forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
-                                          config, idx, false);
+    Value forYield;
+    if (seenOps.contains(lastCh)) {
+      // Reuse group handled by a nested op — extract its result directly.
+      auto numRes = lastCh->getNumResults();
+      unsigned tCnts = getAccumCnts(lastCh, regionsWithChannels, config);
+      auto reuseArgIdx =
+          getReuseAccumArgIdx(lastCh, regionsWithChannels, config, idx);
+      forYield = lastCh->getResult(numRes - tCnts + reuseArgIdx);
+    } else {
+      forYield = getAccumForReuseGroup(lastCh, chList, regionsWithChannels,
+                                       config, idx, false);
+    }
     Value arg = newForOp.getBody()->getArgument(accumArgId);
     yieldOp->replaceUsesOfWith(arg, forYield);
     ++accumArgId;
