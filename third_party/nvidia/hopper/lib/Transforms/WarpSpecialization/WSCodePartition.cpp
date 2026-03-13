@@ -3591,6 +3591,27 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Merge consumer groups for channels in the same reuse group.
   // All channels in a reuse group share a barrier, so they must be processed
   // together in insertAsyncComm to produce a single barrier_expect + wait.
+  // Check whether two channels have the same full set of consumers.
+  // TMEMPost channels are skipped because getDstOps() is not safe to call on
+  // isOperandD channels, and TMEMPost always has a single consumer so the
+  // getDstOp() equality check alone is sufficient.
+  auto haveMatchingConsumers = [](Channel *a, Channel *b) -> bool {
+    if (a->channelKind == DataChannelKind::TMEMPost)
+      return true;
+    SmallVector<Operation *> aDsts, bDsts;
+    a->getDstOps(aDsts);
+    b->getDstOps(bDsts);
+    // getDstOps returns empty for base Channel (single consumer) —
+    // in that case the caller's getDstOp() check is sufficient.
+    if (aDsts.empty() && bDsts.empty())
+      return true;
+    if (aDsts.size() != bDsts.size())
+      return false;
+    llvm::sort(aDsts, [](Operation *x, Operation *y) { return x < y; });
+    llvm::sort(bDsts, [](Operation *x, Operation *y) { return x < y; });
+    return aDsts == bDsts;
+  };
+
   DenseSet<Channel *> mergedChannels;
   for (auto &group : config.groups) {
     if (group.channels.size() <= 1)
@@ -3606,22 +3627,8 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       // getDstOp() only returns the first consumer, but channels can have
       // multiple consumers (e.g., B feeds both MMA_0 and MMA_1).
       // Only merge when ALL consumers are the same.
-      {
-        SmallVector<Operation *> chDsts, repDsts;
-        ch->getDstOps(chDsts);
-        rep->getDstOps(repDsts);
-        // getDstOps returns empty for base Channel (single consumer) —
-        // in that case getDstOp() check above is sufficient.
-        if (!chDsts.empty() || !repDsts.empty()) {
-          if (chDsts.size() != repDsts.size()) {
-            continue;
-          }
-          llvm::sort(chDsts, [](Operation *a, Operation *b) { return a < b; });
-          llvm::sort(repDsts, [](Operation *a, Operation *b) { return a < b; });
-          if (chDsts != repDsts)
-            continue;
-        }
-      }
+      if (!haveMatchingConsumers(ch, rep))
+        continue;
       // Skip if either producer is a TCGen5MMAOp: commit handling for
       // MMA-produced TMEM channels doesn't work when fused into one group.
       //
