@@ -202,6 +202,13 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 
 void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
                       SmallVector<Operation *> &chList);
+
+// Like getReuseChannels, but outputs Channel* pointers instead of Operation*.
+// For control flow ops (ForOp/IfOp), pushes nullptr since they are not
+// channels. This is used in getBufferIdxAndPhase to distinguish channels that
+// share a dstOp.
+void getReuseChannelPtrs(ReuseGroup *group, Operation *regionOp,
+                         SmallVector<Channel *> &chPtrList);
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,
