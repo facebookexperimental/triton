@@ -114,7 +114,7 @@ Used for PingPong scheduling to prevent tensor core contention between consumer 
 |---|---|
 | `tlx.clc_create_context(num_consumers, num_stages=1)` | Create CLC pipeline context (allocates barriers + response buffers) |
 | `tlx.clc_producer(context, p_producer, multi_ctas=False, k=0)` | Issue CLC try_cancel request from CTA 0 |
-| `tlx.clc_consumer(context, p_consumer, multi_ctas=False, k=0)` | Decode tile ID from CLC response, signal completion. Returns tile_id or -1 |
+| `tlx.clc_consumer(context, p_consumer, multi_ctas=False, k=0, return_3d=False)` | Decode cluster CTA ID from CLC response, signal completion. Returns `tile_id_x` by default, or `(tile_id_x, tile_id_y, tile_id_z)` if `return_3d=True`. Returns `-1` or `(-1, -1, -1)` if no work. |
 
 For 2-CTA mode: set `multi_ctas=True` (uses "arrive remote, wait local" pattern).
 
