@@ -762,7 +762,7 @@ def async_descriptor_load(
     cache_modifier: str = "",
     eviction_policy: str = "",
     multicast_targets: list[tl.tensor] = [],
-    two_cta: bool = False,
+    two_ctas: bool = False,
     _semantic=None,
 ) -> None:
     """
@@ -777,7 +777,7 @@ def async_descriptor_load(
         cache_modifier: Cache modifier hint.
         eviction_policy: L2 eviction policy.
         multicast_targets: List of CTA indices for multicast TMA.
-        two_cta: If True, uses .cta_group::2 on the TMA instruction and
+        two_ctas: If True, uses .cta_group::2 on the TMA instruction and
                  automatically applies remote_view to map the barrier to the
                  leader CTA (rank 0) via mapa.shared::cluster. The .cta_group::2
                  modifier routes the mbarrier completion signal based on the
@@ -799,7 +799,7 @@ def async_descriptor_load(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
-    if two_cta:
+    if two_ctas:
         barrier = remote_view(barrier, 0, _semantic=_semantic)
     _semantic.builder.create_async_TMA_load(
         multicast_targets,
@@ -811,7 +811,7 @@ def async_descriptor_load(
         cache,
         eviction,
         False,
-        two_cta,
+        two_ctas,
     )
 
 

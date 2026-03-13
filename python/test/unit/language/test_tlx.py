@@ -3527,13 +3527,14 @@ def test_descriptor_load_two_cta(device):
         buffer = tlx.local_view(buffers, 0)
 
         # Leader's barrier tracks BOTH CTAs' TMA loads via cta_group::2
-        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bars = tlx.alloc_barriers(tl.constexpr(1), arrive_count=1)
         bar = tlx.local_view(bars, 0)
 
         TILE_BYTES: tl.constexpr = BLOCK_SIZE_M * BLOCK_SIZE_N * tlx.size_of(tlx.dtype_of(desc_in))
         if is_leader:
             # Leader expects both CTAs' worth of bytes
             tlx.barrier_expect_bytes(bar, TILE_BYTES)
+        tlx.cluster_barrier()
 
         # Cluster index: each cluster of NUM_CTAS CTAs processes one row tile
         cluster_id = pid // NUM_CTAS
@@ -3543,7 +3544,7 @@ def test_descriptor_load_two_cta(device):
         # completions to the leader's barrier automatically
         off_n = cta_rank * BLOCK_SIZE_N // NUM_CTAS
 
-        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, two_cta=True)
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, two_ctas=True)
 
         # Leader waits for both loads to complete
         if is_leader:
