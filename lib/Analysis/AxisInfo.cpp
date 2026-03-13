@@ -1084,12 +1084,18 @@ LogicalResult AxisInfoAnalysis::visitOperation(
   auto newContiguity = curr.getContiguity();
   auto newDivisibility = curr.getDivisibility();
   auto newConstancy = curr.getConstancy();
-  AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.contiguity"),
-                                  &newContiguity);
-  AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.divisibility"),
-                                  &newDivisibility);
-  AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.constancy"),
-                                  &newConstancy);
+  if (Attribute attr = op->getDiscardableAttr("tt.contiguity")) {
+    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
+    newContiguity = AxisInfo::DimVectorT(vals.begin(), vals.end());
+  }
+  if (Attribute attr = op->getDiscardableAttr("tt.divisibility")) {
+    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
+    newDivisibility = AxisInfo::DimVectorT(vals.begin(), vals.end());
+  }
+  if (Attribute attr = op->getDiscardableAttr("tt.constancy")) {
+    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
+    newConstancy = AxisInfo::DimVectorT(vals.begin(), vals.end());
+  }
   curr = AxisInfo(newContiguity, newDivisibility, newConstancy,
                   curr.getConstantValue());
   // join all lattice elements
@@ -1134,12 +1140,12 @@ void AxisInfoAnalysis::visitWarpSpecializeExplicitCaptures(
 
 } // anonymous namespace
 
-void AxisInfo::initPessimisticStateFromFunc(int argNumber,
-                                            FunctionOpInterface funcOp,
+template <class T>
+void AxisInfo::initPessimisticStateFromFunc(int argNumber, T funcOp,
                                             DimVectorT *contiguity,
                                             DimVectorT *divisibility,
                                             DimVectorT *constancy) {
-  // list of attributes that we care about
+  // liast of attributes that we care about
   SmallVector<std::pair<DimVectorT *, std::string>> retVecs;
   retVecs.push_back({contiguity, "tt.contiguity"});
   retVecs.push_back({divisibility, "tt.divisibility"});
@@ -1147,16 +1153,12 @@ void AxisInfo::initPessimisticStateFromFunc(int argNumber,
   // initialize attributes one by one
   for (auto [vec, attrName] : retVecs) {
     Attribute attr = funcOp.getArgAttr(argNumber, attrName);
-    AxisInfo::initDimVectorFromHint(attr, vec);
-  }
-}
-
-void AxisInfo::initDimVectorFromHint(Attribute attr, DimVectorT *vec) {
-  if (auto int_attr = dyn_cast_or_null<IntegerAttr>(attr))
-    *vec = DimVectorT(1, int_attr.getValue().getZExtValue());
-  if (auto dense_attr = dyn_cast_or_null<DenseElementsAttr>(attr)) {
-    auto vals = dense_attr.getValues<int>();
-    *vec = DimVectorT(vals.begin(), vals.end());
+    if (auto int_attr = dyn_cast_or_null<IntegerAttr>(attr))
+      *vec = DimVectorT(contiguity->size(), int_attr.getValue().getZExtValue());
+    if (auto dense_attr = dyn_cast_or_null<DenseElementsAttr>(attr)) {
+      auto vals = dense_attr.getValues<int>();
+      *vec = DimVectorT(vals.begin(), vals.end());
+    }
   }
 }
 
@@ -1200,12 +1202,18 @@ void AxisInfo::initDimVectorFromHint(Attribute attr, DimVectorT *vec) {
     }
     // Other operations are conservatively initialized with the lowest possible
     // divisibility, contiguity, and constancy unless they have specified.
-    AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.divisibility"),
-                                    &knownDivisibility);
-    AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.contiguity"),
-                                    &knownContiguity);
-    AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.constancy"),
-                                    &knownConstancy);
+    if (Attribute attr = op->getDiscardableAttr("tt.divisibility")) {
+      auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
+      knownDivisibility = DimVectorT(vals.begin(), vals.end());
+    }
+    if (Attribute attr = op->getDiscardableAttr("tt.contiguity")) {
+      auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
+      knownContiguity = DimVectorT(vals.begin(), vals.end());
+    }
+    if (Attribute attr = op->getDiscardableAttr("tt.constancy")) {
+      auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
+      knownConstancy = DimVectorT(vals.begin(), vals.end());
+    }
   }
 
   return AxisInfo(knownContiguity, knownDivisibility, knownConstancy);
