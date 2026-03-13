@@ -520,25 +520,20 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
   SmallVector<AsyncTaskId> refAsyncTaskIds;
   IntegerAttr refLoopStage;
   IntegerAttr refLoopCluster;
-  {
-    SmallVector<Operation *> allRefOps;
-    SmallVector<Operation *> setupOps;
-    collectSetupOps(setupRoot, rootSplit, setupOps);
-    allRefOps.append(setupOps.begin(), setupOps.end());
-    for (auto &m : matchedOps)
-      allRefOps.append(m.perTileOps.begin(), m.perTileOps.end());
-    for (Operation *op : allRefOps) {
-      if (refAsyncTaskIds.empty()) {
-        auto ids = getAsyncTaskIds(op);
-        if (!ids.empty())
-          refAsyncTaskIds = std::move(ids);
-      }
-      if (!refLoopStage && op->hasAttr(tt::kLoopStageAttrName))
-        refLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
-      if (!refLoopCluster && op->hasAttr(tt::kLoopClusterAttrName))
-        refLoopCluster =
-            op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  SmallVector<Operation *> refOps;
+  collectSetupOps(setupRoot, rootSplit, refOps);
+  for (auto &m : matchedOps)
+    refOps.append(m.perTileOps.begin(), m.perTileOps.end());
+  for (Operation *op : refOps) {
+    if (refAsyncTaskIds.empty()) {
+      auto ids = getAsyncTaskIds(op);
+      if (!ids.empty())
+        refAsyncTaskIds = std::move(ids);
     }
+    if (!refLoopStage && op->hasAttr(tt::kLoopStageAttrName))
+      refLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+    if (!refLoopCluster && op->hasAttr(tt::kLoopClusterAttrName))
+      refLoopCluster = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
   }
 
   // Helper to apply reference attributes to a newly created op.
