@@ -325,11 +325,9 @@ matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
 
   // The terminal must be a store to SMEM: either a LocalAllocOp with src
   // or a LocalStoreOp.
-  bool isAllocTerminal = isa<LocalAllocOp>(terminal.repOp);
-  bool isStoreTerminal = isa<LocalStoreOp>(terminal.repOp);
-  if (!isAllocTerminal && !isStoreTerminal)
-    return std::nullopt;
-  if (isAllocTerminal && !cast<LocalAllocOp>(terminal.repOp).getSrc())
+  auto repAlloc = dyn_cast<LocalAllocOp>(terminal.repOp);
+  bool isAllocTerminal = repAlloc && repAlloc.getSrc();
+  if (!isAllocTerminal && !isa<LocalStoreOp>(terminal.repOp))
     return std::nullopt;
 
   unsigned numTiles = terminal.perTileOps.size();
@@ -393,34 +391,25 @@ matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
   // Classify non-src operands (desc, coords) as captured vs varying.
   auto repCopy = cast<AsyncTMACopyLocalToGlobalOp>(match.perTileTMACopyOps[0]);
 
-  // desc
-  {
-    Value repDesc = repCopy.getDesc();
-    bool allSame = true;
+  // Returns repVal if the same across all subtiles, nullptr otherwise.
+  auto classifyOperand = [&](Value repVal,
+                             function_ref<Value(Operation *)> getVal) -> Value {
     for (unsigned t = 1; t < numTiles; ++t) {
-      auto otherCopy =
-          cast<AsyncTMACopyLocalToGlobalOp>(match.perTileTMACopyOps[t]);
-      if (otherCopy.getDesc() != repDesc) {
-        allSame = false;
-        break;
-      }
+      if (getVal(match.perTileTMACopyOps[t]) != repVal)
+        return nullptr;
     }
-    match.capturedOperands.push_back(allSame ? repDesc : nullptr);
-  }
+    return repVal;
+  };
 
-  // coords
+  match.capturedOperands.push_back(
+      classifyOperand(repCopy.getDesc(), [](Operation *op) {
+        return cast<AsyncTMACopyLocalToGlobalOp>(op).getDesc();
+      }));
   for (unsigned c = 0; c < repCopy.getCoord().size(); ++c) {
-    Value repCoord = repCopy.getCoord()[c];
-    bool allSame = true;
-    for (unsigned t = 1; t < numTiles; ++t) {
-      auto otherCopy =
-          cast<AsyncTMACopyLocalToGlobalOp>(match.perTileTMACopyOps[t]);
-      if (otherCopy.getCoord()[c] != repCoord) {
-        allSame = false;
-        break;
-      }
-    }
-    match.capturedOperands.push_back(allSame ? repCoord : nullptr);
+    match.capturedOperands.push_back(
+        classifyOperand(repCopy.getCoord()[c], [c](Operation *op) {
+          return cast<AsyncTMACopyLocalToGlobalOp>(op).getCoord()[c];
+        }));
   }
 
   // Collect async_task_ids from the TMA store ops and verify consistency.
@@ -625,157 +614,153 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
       /*barrierAnnotations=*/builder.getArrayAttr({}));
 
   // --- Setup region ---
-  {
-    Block *setupBlock = builder.createBlock(&subtileOp.getSetupRegion());
-    builder.setInsertionPointToStart(setupBlock);
+  Block *setupBlock = builder.createBlock(&subtileOp.getSetupRegion());
+  builder.setInsertionPointToStart(setupBlock);
 
-    // Collect all setup ops.
-    SmallVector<Operation *> setupOps;
-    collectSetupOps(setupRoot, rootSplit, setupOps);
+  // Collect all setup ops.
+  SmallVector<Operation *> setupOps;
+  collectSetupOps(setupRoot, rootSplit, setupOps);
 
-    // Clone setup ops into the setup region.
-    IRMapping setupMapping;
-    for (Operation *op : setupOps)
-      builder.clone(*op, setupMapping);
+  // Clone setup ops into the setup region.
+  IRMapping setupMapping;
+  for (Operation *op : setupOps)
+    builder.clone(*op, setupMapping);
 
-    // If TMA match, create the mutable buffer local_alloc (no src).
-    Value bufAllocResult;
-    if (tmaMatch) {
-      auto allocType = getTerminalBufferType(matchedOps.back().repOp);
-      bufAllocResult = builder.create<LocalAllocOp>(loc, allocType);
-    }
-
-    // Build setup yield operands: remap the flatSetupYields.
-    // Null values are buffer placeholders (replaced with bufAllocResult).
-    SmallVector<Value> remappedYields;
-    for (Value v : flatSetupYields) {
-      if (!v)
-        remappedYields.push_back(bufAllocResult);
-      else
-        remappedYields.push_back(setupMapping.lookupOrDefault(v));
-    }
-
-    builder.create<SubtiledRegionYieldOp>(loc, remappedYields);
+  // If TMA match, create the mutable buffer local_alloc (no src).
+  Value bufAllocResult;
+  if (tmaMatch) {
+    auto allocType = getTerminalBufferType(matchedOps.back().repOp);
+    bufAllocResult = builder.create<LocalAllocOp>(loc, allocType);
   }
+
+  // Build setup yield operands: remap the flatSetupYields.
+  // Null values are buffer placeholders (replaced with bufAllocResult).
+  SmallVector<Value> remappedYields;
+  for (Value v : flatSetupYields) {
+    if (!v)
+      remappedYields.push_back(bufAllocResult);
+    else
+      remappedYields.push_back(setupMapping.lookupOrDefault(v));
+  }
+
+  builder.create<SubtiledRegionYieldOp>(loc, remappedYields);
 
   // --- Tile region ---
-  {
-    Block *tileBlock = builder.createBlock(&subtileOp.getTileRegion());
+  Block *tileBlock = builder.createBlock(&subtileOp.getTileRegion());
 
-    // Add block arguments.
-    SmallVector<Location> argLocs(numTileArgs, loc);
-    tileBlock->addArguments(tileArgTypes, argLocs);
+  // Add block arguments.
+  SmallVector<Location> argLocs(numTileArgs, loc);
+  tileBlock->addArguments(tileArgTypes, argLocs);
 
-    builder.setInsertionPointToStart(tileBlock);
+  builder.setInsertionPointToStart(tileBlock);
 
-    // Clone matched ops into tile region, substituting:
-    // - The subtile leaf operand → block arg 0
-    // - Intra-tile flow (previous result) → result of previous cloned op
-    // - Extra varying operands → block args 1..N
-    // - Captured operands → outer-scope values (referenced directly)
+  // Clone matched ops into tile region, substituting:
+  // - The subtile leaf operand → block arg 0
+  // - Intra-tile flow (previous result) → result of previous cloned op
+  // - Extra varying operands → block args 1..N
+  // - Captured operands → outer-scope values (referenced directly)
 
-    Value prevTileResult = tileBlock->getArgument(0);
-    unsigned extraArgIdx = 1; // index into tile block args for extra varying
+  Value prevTileResult = tileBlock->getArgument(0);
+  unsigned extraArgIdx = 1; // index into tile block args for extra varying
 
-    for (unsigned mIdx = 0; mIdx < matchedOpsToClone; ++mIdx) {
-      auto &m = matchedOps[mIdx];
-      Operation *rep = m.repOp;
+  for (unsigned mIdx = 0; mIdx < matchedOpsToClone; ++mIdx) {
+    auto &m = matchedOps[mIdx];
+    Operation *rep = m.repOp;
 
-      // Build operand list for the cloned op.
-      SmallVector<Value> operands;
-      for (unsigned opIdx = 0; opIdx < rep->getNumOperands(); ++opIdx) {
-        if (m.capturedOperands[opIdx]) {
-          // Captured from outer scope.
-          operands.push_back(m.capturedOperands[opIdx]);
-          continue;
-        }
+    // Build operand list for the cloned op.
+    SmallVector<Value> operands;
+    for (unsigned opIdx = 0; opIdx < rep->getNumOperands(); ++opIdx) {
+      if (m.capturedOperands[opIdx]) {
+        // Captured from outer scope.
+        operands.push_back(m.capturedOperands[opIdx]);
+        continue;
+      }
 
-        // Check if this is an intra-tile operand (from prevTileResult).
-        bool isIntraTile = true;
-        for (unsigned t = 0; t < numTiles; ++t) {
-          Value expected;
-          if (mIdx == 0)
-            expected = subtileLeaves[t];
-          else if (matchedOps[mIdx - 1].repOp->getNumResults() == 1)
-            expected = matchedOps[mIdx - 1].perTileOps[t]->getResult(0);
-          else
-            expected = nullptr;
-          if (m.perTileOps[t]->getOperand(opIdx) != expected) {
-            isIntraTile = false;
-            break;
-          }
-        }
-
-        if (isIntraTile) {
-          operands.push_back(prevTileResult);
-        } else {
-          // Extra varying operand — use the next tile block arg.
-          operands.push_back(tileBlock->getArgument(extraArgIdx));
-          extraArgIdx++;
+      // Check if this is an intra-tile operand (from prevTileResult).
+      bool isIntraTile = true;
+      for (unsigned t = 0; t < numTiles; ++t) {
+        Value expected;
+        if (mIdx == 0)
+          expected = subtileLeaves[t];
+        else if (matchedOps[mIdx - 1].repOp->getNumResults() == 1)
+          expected = matchedOps[mIdx - 1].perTileOps[t]->getResult(0);
+        else
+          expected = nullptr;
+        if (m.perTileOps[t]->getOperand(opIdx) != expected) {
+          isIntraTile = false;
+          break;
         }
       }
 
-      // Clone the op with the new operands.
-      OperationState state(loc, rep->getName(), operands, rep->getResultTypes(),
-                           rep->getAttrs());
-      auto *cloned = builder.create(state);
-
-      if (cloned->getNumResults() == 1)
-        prevTileResult = cloned->getResult(0);
+      if (isIntraTile) {
+        operands.push_back(prevTileResult);
+      } else {
+        // Extra varying operand — use the next tile block arg.
+        operands.push_back(tileBlock->getArgument(extraArgIdx));
+        extraArgIdx++;
+      }
     }
 
-    // When TMA match is present, emit the TMA store sequence instead of
-    // the terminal local_alloc.
-    if (tmaMatch) {
-      // Buffer block arg comes after subtile leaf + extra varying args.
-      unsigned bufArgIdx = 1 + tileArgSources.size();
-      Value bufArg = tileBlock->getArgument(bufArgIdx);
+    // Clone the op with the new operands.
+    OperationState state(loc, rep->getName(), operands, rep->getResultTypes(),
+                         rep->getAttrs());
+    auto *cloned = builder.create(state);
 
-      // local_store %prev_result, %buf_arg
-      builder.create<LocalStoreOp>(loc, prevTileResult, bufArg);
+    if (cloned->getNumResults() == 1)
+      prevTileResult = cloned->getResult(0);
+  }
 
-      // Build tma_copy operands (desc, coords).
-      auto repCopy =
-          cast<AsyncTMACopyLocalToGlobalOp>(tmaMatch->perTileTMACopyOps[0]);
+  // When TMA match is present, emit the TMA store sequence instead of
+  // the terminal SMEM write op.
+  if (tmaMatch) {
+    // Buffer block arg comes after subtile leaf + extra varying args.
+    unsigned bufArgIdx = 1 + tileArgSources.size();
+    Value bufArg = tileBlock->getArgument(bufArgIdx);
 
-      unsigned tmaArgIdx = bufArgIdx + 1;
-      unsigned capturedIdx = 0;
+    // local_store %prev_result, %buf_arg
+    builder.create<LocalStoreOp>(loc, prevTileResult, bufArg);
 
-      // desc
-      Value desc;
+    // Build tma_copy operands (desc, coords).
+    auto repCopy =
+        cast<AsyncTMACopyLocalToGlobalOp>(tmaMatch->perTileTMACopyOps[0]);
+
+    unsigned tmaArgIdx = bufArgIdx + 1;
+    unsigned capturedIdx = 0;
+
+    // desc
+    Value desc;
+    if (tmaMatch->capturedOperands[capturedIdx]) {
+      desc = tmaMatch->capturedOperands[capturedIdx];
+    } else {
+      desc = tileBlock->getArgument(tmaArgIdx++);
+    }
+    capturedIdx++;
+
+    // coords
+    SmallVector<Value> coords;
+    for (unsigned c = 0; c < repCopy.getCoord().size(); ++c) {
       if (tmaMatch->capturedOperands[capturedIdx]) {
-        desc = tmaMatch->capturedOperands[capturedIdx];
+        coords.push_back(tmaMatch->capturedOperands[capturedIdx]);
       } else {
-        desc = tileBlock->getArgument(tmaArgIdx++);
+        coords.push_back(tileBlock->getArgument(tmaArgIdx++));
       }
       capturedIdx++;
-
-      // coords
-      SmallVector<Value> coords;
-      for (unsigned c = 0; c < repCopy.getCoord().size(); ++c) {
-        if (tmaMatch->capturedOperands[capturedIdx]) {
-          coords.push_back(tmaMatch->capturedOperands[capturedIdx]);
-        } else {
-          coords.push_back(tileBlock->getArgument(tmaArgIdx++));
-        }
-        capturedIdx++;
-      }
-
-      // async_tma_copy_local_to_global
-      auto tokenType = AsyncTokenType::get(builder.getContext());
-      auto tmaCopy = builder.create<AsyncTMACopyLocalToGlobalOp>(
-          loc, tokenType, desc, coords, bufArg, repCopy.getEvict());
-
-      // tma_store_token_wait
-      builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
-                                          /*barriers=*/ValueRange{},
-                                          /*barrier_preds=*/ValueRange{},
-                                          /*nvws_tokens=*/ValueRange{},
-                                          /*nvws_token_indices=*/ValueRange{});
     }
 
-    builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
+    // async_tma_copy_local_to_global
+    auto tokenType = AsyncTokenType::get(builder.getContext());
+    auto tmaCopy = builder.create<AsyncTMACopyLocalToGlobalOp>(
+        loc, tokenType, desc, coords, bufArg, repCopy.getEvict());
+
+    // tma_store_token_wait
+    builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
+                                        /*barriers=*/ValueRange{},
+                                        /*barrier_preds=*/ValueRange{},
+                                        /*nvws_tokens=*/ValueRange{},
+                                        /*nvws_token_indices=*/ValueRange{});
   }
+
+  builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
 
   // --- Teardown region (empty) ---
   // The teardown region is left empty (AnyRegion with 0 blocks).
@@ -886,59 +871,55 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
       /*barrierAnnotations=*/builder.getArrayAttr({}));
 
   // --- Setup region ---
-  {
-    Block *setupBlock = builder.createBlock(&subtileOp.getSetupRegion());
-    builder.setInsertionPointToStart(setupBlock);
-    // No ops to clone — just yield the values directly from outer scope.
-    builder.create<SubtiledRegionYieldOp>(loc, flatSetupYields);
-  }
+  Block *setupBlock = builder.createBlock(&subtileOp.getSetupRegion());
+  builder.setInsertionPointToStart(setupBlock);
+  // No ops to clone — just yield the values directly from outer scope.
+  builder.create<SubtiledRegionYieldOp>(loc, flatSetupYields);
 
   // --- Tile region ---
-  {
-    Block *tileBlock = builder.createBlock(&subtileOp.getTileRegion());
-    SmallVector<Location> argLocs(numTileArgs, loc);
-    tileBlock->addArguments(tileArgTypes, argLocs);
-    builder.setInsertionPointToStart(tileBlock);
+  Block *tileBlock = builder.createBlock(&subtileOp.getTileRegion());
+  SmallVector<Location> argLocs(numTileArgs, loc);
+  tileBlock->addArguments(tileArgTypes, argLocs);
+  builder.setInsertionPointToStart(tileBlock);
 
-    // arg 0 = memdesc from local_alloc
-    Value bufArg = tileBlock->getArgument(0);
-    unsigned argIdx = 1;
+  // arg 0 = memdesc from terminal op
+  Value bufArg = tileBlock->getArgument(0);
+  unsigned argIdx = 1;
 
-    // desc
-    capturedIdx = 0;
-    Value desc;
+  // desc
+  capturedIdx = 0;
+  Value desc;
+  if (tmaMatch.capturedOperands[capturedIdx]) {
+    desc = tmaMatch.capturedOperands[capturedIdx];
+  } else {
+    desc = tileBlock->getArgument(argIdx++);
+  }
+  capturedIdx++;
+
+  // coords
+  SmallVector<Value> coords;
+  for (unsigned c = 0; c < repCopy.getCoord().size(); ++c) {
     if (tmaMatch.capturedOperands[capturedIdx]) {
-      desc = tmaMatch.capturedOperands[capturedIdx];
+      coords.push_back(tmaMatch.capturedOperands[capturedIdx]);
     } else {
-      desc = tileBlock->getArgument(argIdx++);
+      coords.push_back(tileBlock->getArgument(argIdx++));
     }
     capturedIdx++;
-
-    // coords
-    SmallVector<Value> coords;
-    for (unsigned c = 0; c < repCopy.getCoord().size(); ++c) {
-      if (tmaMatch.capturedOperands[capturedIdx]) {
-        coords.push_back(tmaMatch.capturedOperands[capturedIdx]);
-      } else {
-        coords.push_back(tileBlock->getArgument(argIdx++));
-      }
-      capturedIdx++;
-    }
-
-    // async_tma_copy_local_to_global
-    auto tokenType = AsyncTokenType::get(builder.getContext());
-    auto tmaCopy = builder.create<AsyncTMACopyLocalToGlobalOp>(
-        loc, tokenType, desc, coords, bufArg, repCopy.getEvict());
-
-    // tma_store_token_wait
-    builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
-                                        /*barriers=*/ValueRange{},
-                                        /*barrier_preds=*/ValueRange{},
-                                        /*nvws_tokens=*/ValueRange{},
-                                        /*nvws_token_indices=*/ValueRange{});
-
-    builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
   }
+
+  // async_tma_copy_local_to_global
+  auto tokenType = AsyncTokenType::get(builder.getContext());
+  auto tmaCopy = builder.create<AsyncTMACopyLocalToGlobalOp>(
+      loc, tokenType, desc, coords, bufArg, repCopy.getEvict());
+
+  // tma_store_token_wait
+  builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
+                                      /*barriers=*/ValueRange{},
+                                      /*barrier_preds=*/ValueRange{},
+                                      /*nvws_tokens=*/ValueRange{},
+                                      /*nvws_token_indices=*/ValueRange{});
+
+  builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
 
   // Erase original TMA store ops.
   for (auto *op : tmaMatch.perTileTokenWaitOps)
