@@ -76,7 +76,7 @@ template <class T> struct AssignStagePhase {
   AssignStagePhase(Value aref, int partitionId)
       : aref(aref), partitionId(partitionId) {}
 
-  T getTypedOp(Operation *op) {
+  T isValidOp(Operation *op) {
     if (auto opT = dyn_cast<T>(op)) {
       if (opT.getAref() == aref) {
         auto opPartitionIds = getPartitionIds(op);
@@ -86,29 +86,19 @@ template <class T> struct AssignStagePhase {
     }
     return {};
   }
-  bool isBufferUsed(ArefBufferOp bufOp, Value token) {
-    if (!bufOp)
-      return false;
-    if (bufOp.getAref() != this->aref)
-      return false;
-    return token == bufOp.getToken();
-  }
 
-  bool analyzeArefUseInBlock(Block *block, Value token) {
+  bool analyzeArefUseInBlock(Block *block) {
     for (auto &op : *block) {
-      if (getTypedOp(&op) || isBufferUsed(dyn_cast<ArefBufferOp>(op), token)) {
+      if (isValidOp(&op) ||
+          (isa<ArefBufferOp>(op) && op.getOperand(0) == aref)) {
         return true;
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        Value newTok;
-        if (auto pos = findValuePosInRange(forOp.getInitArgs(), token)) {
-          newTok = forOp.getRegionIterArgs()[*pos];
-        }
-        if (analyzeArefUseInBlock(forOp.getBody(), newTok))
+        if (analyzeArefUseInBlock(forOp.getBody()))
           return true;
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        if (analyzeArefUseInBlock(ifOp.thenBlock(), token))
+        if (analyzeArefUseInBlock(ifOp.thenBlock()))
           return true;
-        if (ifOp.elseBlock() && analyzeArefUseInBlock(ifOp.elseBlock(), token))
+        if (ifOp.elseBlock() && analyzeArefUseInBlock(ifOp.elseBlock()))
           return true;
       }
     }
@@ -117,12 +107,8 @@ template <class T> struct AssignStagePhase {
 
   void assignArefIndexInForOp(scf::ForOp forOp, StagePhase &index) {
 
-    Value newTok;
-    if (auto pos = findValuePosInRange(forOp.getInitArgs(), index.token)) {
-      newTok = forOp.getRegionIterArgs()[*pos];
-    }
     // find uses of arefs in forOp body
-    if (!analyzeArefUseInBlock(forOp.getBody(), newTok))
+    if (!analyzeArefUseInBlock(forOp.getBody()))
       return;
 
     // add extra iterArgs to the forOp
@@ -171,10 +157,9 @@ template <class T> struct AssignStagePhase {
 
   void assignArefIndexInIfOp(scf::IfOp ifOp, StagePhase &index) {
 
-    auto useInThenBlock = analyzeArefUseInBlock(ifOp.thenBlock(), index.token);
+    auto useInThenBlock = analyzeArefUseInBlock(ifOp.thenBlock());
     auto useInElseBlock =
-        ifOp.elseBlock() ? analyzeArefUseInBlock(ifOp.elseBlock(), index.token)
-                         : false;
+        ifOp.elseBlock() ? analyzeArefUseInBlock(ifOp.elseBlock()) : false;
     if (!useInThenBlock && !useInElseBlock)
       return;
 
@@ -233,7 +218,7 @@ template <class T> struct AssignStagePhase {
 
   StagePhase assignArefIndexInBlock(Block *block, StagePhase index) {
     for (auto &op : llvm::make_early_inc_range(*block)) {
-      if (auto opT = getTypedOp(&op)) {
+      if (auto opT = isValidOp(&op)) {
         ImplicitLocOpBuilder builder(opT.getLoc(), opT);
         auto partitionIds = getPartitionIds(&op);
         auto stageCluster = getStageCluster(&op);

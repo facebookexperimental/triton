@@ -47,10 +47,6 @@ void AutomaticWarpSpecialization::runOnOperation() {
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
   pm.addPass(createNVWSInsertAref());
-  // TODO(triton-reactor): InsertTmemAref fails with Meta's partition layout
-  // (getInitialSchedule + schedulePostLoopOps). Keep disabled until partition
-  // scheduling is aligned with upstream. LoadMMASpecialization is retained
-  // locally as the fallback.
 #if 0
   pm.addPass(createNVWSInsertTmemAref());
 #else
