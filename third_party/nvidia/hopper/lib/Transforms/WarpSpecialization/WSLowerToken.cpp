@@ -244,11 +244,6 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
-        for (Operation *other : usersForToken) {
-          if (auto commitOp = dyn_cast<ttnvws::ProducerCommitOp>(other))
-            assert(!commitOp.getFenced() &&
-                   "TMAStoreTokenWaitOp token should never be fenced");
-        }
         Value truePred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
         for (auto [nvwsTok, nvwsIdx] :
              llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
