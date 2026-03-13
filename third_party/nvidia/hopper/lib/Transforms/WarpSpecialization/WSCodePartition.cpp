@@ -3035,6 +3035,8 @@ void insertAsyncComm(
             masterChannel->channelKind == DataChannelKind::SMEMPost) {
           Operation *consumerOp =
               getUniqueActualConsumer(masterChannel->getDstOp());
+          // Note: The only async producer is TMA and this is unreachable
+          // in that case because of the prior checks.
           if (isa<ttng::TCGen5MMAOp, ttng::WarpGroupDotOp,
                   ttng::AsyncTMACopyLocalToGlobalOp>(consumerOp))
             needsFence = true;
