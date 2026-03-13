@@ -145,22 +145,23 @@ static bool isInnermostLoop(scf::ForOp forOp) {
 
 /// Given a value, walk backwards through the SSA def-use chain, passing
 /// through "transparent" ops that don't generate new data (split, reshape,
-/// trans, type casts, layout conversions), and return the root "load-like"
-/// operation that originally produced the data. Returns nullptr if the value
-/// has no defining op (e.g., block arguments).
+/// trans, type casts, layout conversions), and return the root tmem_load
+/// operation that originally produced the data. Returns nullptr if the chain
+/// doesn't trace back to a tmem_load (e.g., block arguments or other sources).
 ///
-/// This is used to identify SMEM buffers that originate from the same load
-/// (e.g., a tmem_load whose result is split into multiple sub-tiles, each
+/// This is used to identify SMEM buffers that originate from the same
+/// tmem_load (e.g., its result is split into multiple sub-tiles, each
 /// stored to a separate SMEM buffer). Such buffers are candidates for
 /// buffer ID sharing when they have disjoint liveness.
 static Operation *findOriginalLoadOp(Value value) {
   Operation *op = value.getDefiningOp();
   while (op) {
-    // Load-like ops: these are data sources, stop tracing.
-    if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp,
-            tt::LoadOp>(op))
+    // TMEM load is the data source we trace back to.
+    if (isa<ttng::TMEMLoadOp>(op))
       return op;
 
+    // TODO: Generalize to support addmm.
+    // The SubtileOperator should hopefully simplify this work.
     // Transparent ops: trace through to their single tensor input.
     Value nextValue;
     if (isa<tt::SplitOp>(op)) {
@@ -194,6 +195,22 @@ static Operation *findOriginalLoadForChannel(Channel *ch) {
   if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp))
     return findOriginalLoadOp(storeOp.getSrc());
   return nullptr;
+}
+
+/// Check if a group of alloc ops all have the same element type and SMEM size.
+static bool allAllocsCompatible(ArrayRef<Operation *> allocs,
+                                ArrayRef<unsigned> sizes) {
+  assert(allocs.size() == sizes.size());
+  auto firstAlloc = cast<ttg::LocalAllocOp>(allocs[0]);
+  auto firstElemType = firstAlloc.getType().getElementType();
+  unsigned firstSize = sizes[0];
+  for (unsigned i = 1; i < allocs.size(); ++i) {
+    auto alloc = cast<ttg::LocalAllocOp>(allocs[i]);
+    if (alloc.getType().getElementType() != firstElemType ||
+        sizes[i] != firstSize)
+      return false;
+  }
+  return true;
 }
 
 /// Find the channel associated with a given allocation operation.
@@ -632,77 +649,73 @@ public:
     // tmem_load result into multiple sub-tiles stored to separate SMEM
     // buffers. Since they are used sequentially, their liveness is disjoint
     // and they can share the same buffer.id to save SMEM.
-    {
-      // Group non-innermost-loop buffers by original load op.
-      DenseMap<Operation *, SmallVector<BufferT *>> loadGroups;
-      for (auto &bufferIter : bufferRange) {
-        BufferT *buffer = bufferIter.first;
-        Operation *owner = buffer->owner;
-        if (usersInInnermostLoop(owner))
-          continue;
-        Channel *ch = findChannelForOp(owner, *channels);
-        Operation *origLoad = findOriginalLoadForChannel(ch);
-        if (!origLoad)
-          continue;
-        loadGroups[origLoad].push_back(buffer);
-      }
-
-      for (auto &[origLoad, group] : loadGroups) {
-        if (group.size() < 2)
-          continue;
-
-        // Verify all buffers have the same size and element type.
-        auto firstAlloc = cast<ttg::LocalAllocOp>(group[0]->owner);
-        auto firstElemType = firstAlloc.getType().getElementType();
-        unsigned firstSize = group[0]->size;
-        bool compatible = true;
-        for (unsigned i = 1; i < group.size(); ++i) {
-          auto alloc = cast<ttg::LocalAllocOp>(group[i]->owner);
-          if (alloc.getType().getElementType() != firstElemType ||
-              group[i]->size != firstSize) {
-            compatible = false;
-            break;
-          }
-        }
-        if (!compatible)
-          continue;
-
-        // Sort by liveness start for greedy interval packing.
-        llvm::sort(group, [&](BufferT *a, BufferT *b) {
-          return bufferRange[a].start() < bufferRange[b].start();
-        });
-
-        // Verify all liveness intervals are pairwise disjoint.
-        bool disjoint = true;
-        for (unsigned i = 0; i < group.size() && disjoint; ++i) {
-          for (unsigned j = i + 1; j < group.size(); ++j) {
-            if (bufferRange[group[i]].intersects(bufferRange[group[j]])) {
-              disjoint = false;
-              break;
-            }
-          }
-        }
-        if (!disjoint)
-          continue;
-
-        // All buffers share the first buffer's ID.
-        auto firstId = group[0]->owner->getAttrOfType<IntegerAttr>("buffer.id");
-        if (!firstId)
-          continue;
-        unsigned sharedId = firstId.getValue().getZExtValue();
-        auto i32Type = IntegerType::get(group[0]->owner->getContext(), 32);
-        for (unsigned i = 1; i < group.size(); ++i) {
-          group[i]->owner->setAttr("buffer.id",
-                                   IntegerAttr::get(i32Type, sharedId));
-          // Keep buffer.copy = 1 (no multi-buffering needed).
-        }
-        LDBG("Phase 2 (epilogue fusion): merged "
-             << group.size() << " buffers into buffer.id=" << sharedId);
-      }
-    }
+    fuseEpilogueBuffers();
 
     lastBufferId = bufferId;
     return success();
+  }
+
+  /// Group non-innermost-loop buffers by their original load op and assign
+  /// the same buffer.id to buffers within each group that have compatible
+  /// types/sizes and pairwise disjoint liveness intervals.
+  void fuseEpilogueBuffers() {
+    DenseMap<Operation *, SmallVector<BufferT *>> loadGroups;
+    for (auto &bufferIter : bufferRange) {
+      BufferT *buffer = bufferIter.first;
+      Operation *owner = buffer->owner;
+      if (usersInInnermostLoop(owner))
+        continue;
+      Channel *ch = findChannelForOp(owner, *channels);
+      Operation *origLoad = findOriginalLoadForChannel(ch);
+      if (!origLoad)
+        continue;
+      loadGroups[origLoad].push_back(buffer);
+    }
+
+    for (auto &[origLoad, group] : loadGroups) {
+      if (group.size() < 2)
+        continue;
+
+      SmallVector<Operation *> allocs;
+      SmallVector<unsigned> sizes;
+      for (auto *buf : group) {
+        allocs.push_back(buf->owner);
+        sizes.push_back(buf->size);
+      }
+      if (!allAllocsCompatible(allocs, sizes))
+        continue;
+
+      // Sort by liveness start for greedy interval packing.
+      llvm::sort(group, [&](BufferT *a, BufferT *b) {
+        return bufferRange[a].start() < bufferRange[b].start();
+      });
+
+      // Verify all liveness intervals are pairwise disjoint.
+      bool disjoint = true;
+      for (unsigned i = 0; i < group.size() && disjoint; ++i) {
+        for (unsigned j = i + 1; j < group.size(); ++j) {
+          if (bufferRange[group[i]].intersects(bufferRange[group[j]])) {
+            disjoint = false;
+            break;
+          }
+        }
+      }
+      if (!disjoint)
+        continue;
+
+      // All buffers share the first buffer's ID.
+      auto firstId = group[0]->owner->getAttrOfType<IntegerAttr>("buffer.id");
+      if (!firstId)
+        continue;
+      unsigned sharedId = firstId.getValue().getZExtValue();
+      auto i32Type = IntegerType::get(group[0]->owner->getContext(), 32);
+      for (unsigned i = 1; i < group.size(); ++i) {
+        group[i]->owner->setAttr("buffer.id",
+                                 IntegerAttr::get(i32Type, sharedId));
+      }
+      LDBG("Phase 2 (epilogue fusion): merged "
+           << group.size() << " buffers into buffer.id=" << sharedId);
+    }
   }
 
   void dumpBuffers() const {
@@ -875,6 +888,43 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   return total;
 }
 
+/// Group P2_Other WSBuffers by their original load op and assign the same
+/// buffer.id to buffers within each group that have compatible types/sizes.
+static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
+                                  SmallVector<Channel *> &channels) {
+  DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
+  for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+    auto &buf = wsBuffers[i];
+    if (buf.priority != WSBufferPriority::P2_Other)
+      continue;
+    Channel *ch = findChannelForOp(buf.allocOp, channels);
+    Operation *origLoad = findOriginalLoadForChannel(ch);
+    if (!origLoad)
+      continue;
+    loadGroups[origLoad].push_back(i);
+  }
+
+  for (auto &[origLoad, indices] : loadGroups) {
+    if (indices.size() < 2)
+      continue;
+
+    SmallVector<Operation *> allocs;
+    SmallVector<unsigned> sizes;
+    for (unsigned idx : indices) {
+      allocs.push_back(wsBuffers[idx].allocOp);
+      sizes.push_back(wsBuffers[idx].sizeBytes);
+    }
+    if (!allAllocsCompatible(allocs, sizes))
+      continue;
+
+    unsigned sharedId = wsBuffers[indices[0]].bufferId;
+    for (unsigned k = 1; k < indices.size(); ++k)
+      wsBuffers[indices[k]].bufferId = sharedId;
+    LDBG("Phase 3.5 (epilogue fusion): merged "
+         << indices.size() << " P2_Other buffers into bufferId=" << sharedId);
+  }
+}
+
 /// New SMEM allocation: Phases 1–5.
 ///
 /// Phase 1: Create one WSBuffer per local_alloc, all copy=1, unique IDs.
@@ -955,49 +1005,7 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
   // Epilogue buffers (e.g., from splitting a tmem_load result into sub-tiles
   // stored to separate SMEM buffers) have disjoint liveness and can share
   // the same buffer.id to reduce SMEM usage before the copy increase pass.
-  {
-    DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
-    for (unsigned i = 0; i < wsBuffers.size(); ++i) {
-      auto &buf = wsBuffers[i];
-      if (buf.priority != WSBufferPriority::P2_Other)
-        continue;
-      Channel *ch = findChannelForOp(buf.allocOp, channels);
-      Operation *origLoad = findOriginalLoadForChannel(ch);
-      if (!origLoad)
-        continue;
-      loadGroups[origLoad].push_back(i);
-    }
-
-    for (auto &[origLoad, indices] : loadGroups) {
-      if (indices.size() < 2)
-        continue;
-
-      // Verify all buffers have the same size and element type.
-      auto &first = wsBuffers[indices[0]];
-      auto firstAlloc = cast<ttg::LocalAllocOp>(first.allocOp);
-      auto firstElemType = firstAlloc.getType().getElementType();
-      bool compatible = true;
-      for (unsigned k = 1; k < indices.size(); ++k) {
-        auto &buf = wsBuffers[indices[k]];
-        auto alloc = cast<ttg::LocalAllocOp>(buf.allocOp);
-        if (alloc.getType().getElementType() != firstElemType ||
-            buf.sizeBytes != first.sizeBytes) {
-          compatible = false;
-          break;
-        }
-      }
-      if (!compatible)
-        continue;
-
-      // Assign all buffers in the group the same buffer.id.
-      unsigned sharedId = first.bufferId;
-      for (unsigned k = 1; k < indices.size(); ++k) {
-        wsBuffers[indices[k]].bufferId = sharedId;
-      }
-      LDBG("Phase 3.5 (epilogue fusion): merged "
-           << indices.size() << " P2_Other buffers into bufferId=" << sharedId);
-    }
-  }
+  fuseEpilogueWSBuffers(wsBuffers, channels);
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
