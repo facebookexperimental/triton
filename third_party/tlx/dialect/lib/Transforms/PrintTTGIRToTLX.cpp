@@ -60,6 +60,7 @@
 
 #include "IR/Dialect.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -351,6 +352,56 @@ llvm::StringMap<StringRef> buildOpNameMap() {
   return map;
 }
 
+// Format a raw SSA name from printAsOperand into a clean variable name.
+static std::string formatSSAName(StringRef raw) {
+  std::string name = raw.str();
+  size_t colonPos = name.find(':');
+  if (colonPos != std::string::npos)
+    name = name.substr(0, colonPos);
+  while (!name.empty() && name.back() == ' ')
+    name.pop_back();
+  if (!name.empty() && name[0] == '%')
+    name = name.substr(1);
+  if (!name.empty() && std::all_of(name.begin(), name.end(),
+                                   [](char c) { return std::isdigit(c); }))
+    name = "var_" + name;
+  return name;
+}
+
+// Thread-local pointer to the value name cache built once per module.
+static DenseMap<Value, std::string> *valueNameCacheStorage = nullptr;
+static DenseMap<Value, std::string> *getValueNameCachePtr() {
+  return valueNameCacheStorage;
+}
+
+// Build a cache mapping each Value to its formatted SSA name.
+// Uses AsmState to perform SSA numbering once for the entire module.
+static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
+  DenseMap<Value, std::string> cache;
+  AsmState asmState(rootOp, OpPrintingFlags().printNameLocAsPrefix(true));
+  rootOp->walk([&](Operation *op) {
+    for (Value result : op->getResults()) {
+      std::string buf;
+      llvm::raw_string_ostream os(buf);
+      result.printAsOperand(os, asmState);
+      os.flush();
+      cache[result] = formatSSAName(buf);
+    }
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (BlockArgument arg : block.getArguments()) {
+          std::string buf;
+          llvm::raw_string_ostream os(buf);
+          arg.printAsOperand(os, asmState);
+          os.flush();
+          cache[arg] = formatSSAName(buf);
+        }
+      }
+    }
+  });
+  return cache;
+}
+
 // Get simplified name for a value (just the SSA name)
 // If argSubstitutionMap is provided, substitute block args with their mapped
 // values
@@ -415,32 +466,13 @@ getValueName(Value v,
   }
 
 normal_name:
-  std::string name;
-  llvm::raw_string_ostream os(name);
-  // Use printNameLocAsPrefix to recover Python variable names from NameLoc
-  // metadata. The Triton frontend wraps value locations with NameLoc during
-  // code generation (e.g., `x = tl.load(ptr)` → NameLoc("x")), and this flag
-  // tells the MLIR printer to use those names as SSA name prefixes.
-  v.printAsOperand(os, OpPrintingFlags().printNameLocAsPrefix(true));
-  os.flush();
-  // Remove type info if present (after ':')
-  size_t colonPos = name.find(':');
-  if (colonPos != std::string::npos) {
-    name = name.substr(0, colonPos);
+  // Look up from pre-built cache to avoid O(N) SSA renumbering per call.
+  if (auto *cache = getValueNameCachePtr()) {
+    auto it = cache->find(v);
+    if (it != cache->end())
+      return it->second;
   }
-  // Trim whitespace
-  while (!name.empty() && name.back() == ' ')
-    name.pop_back();
-  // Remove % prefix
-  if (!name.empty() && name[0] == '%') {
-    name = name.substr(1);
-  }
-  // If name is all digits, prefix with "var_"
-  if (!name.empty() && std::all_of(name.begin(), name.end(),
-                                   [](char c) { return std::isdigit(c); })) {
-    name = "var_" + name;
-  }
-  return name;
+  return "unknown";
 }
 
 // Print a constant value
@@ -757,9 +789,13 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
      << getValueName(upperBound, argSubstitutionMap) << ", "
      << getValueName(step, argSubstitutionMap) << "):\n";
 
-  // Print the body
+  // Print the body, passing iter_args as yield targets so scf.yield prints
+  // assignments updating the iter_args at the end of each iteration.
+  SmallVector<Value> yieldTargets;
+  for (unsigned i = 0; i < numIterArgs; ++i)
+    yieldTargets.push_back(entryBlock.getArgument(1 + i));
   printRegion(bodyRegion, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-              argSubstitutionMap);
+              argSubstitutionMap, yieldTargets);
 }
 
 // Print scf.if with yield-to-assignment conversion
@@ -1757,6 +1793,11 @@ public:
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();
 
+    // Build value name cache once using AsmState (avoids O(N^2) SSA
+    // renumbering in getValueName).
+    auto cache = buildValueNameCache(m.getOperation());
+    valueNameCacheStorage = &cache;
+
     // Pre-analyze all local_alloc operations
     DenseMap<Operation *, LocalAllocInfo> allocInfoMap;
     m.walk([&](Operation *op) {
@@ -1772,6 +1813,8 @@ public:
     for (Region &region : m->getRegions()) {
       printRegion(region, llvm::outs(), opNameMap, allocInfoMap, skippedOps, 0);
     }
+
+    valueNameCacheStorage = nullptr;
   }
 };
 
