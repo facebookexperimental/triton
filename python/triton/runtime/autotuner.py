@@ -337,6 +337,10 @@ class Config:
         Unlike cluster_dims which spawns new CTAs, ctas_per_cga regroups existing grid CTAs into clusters.
         This matches CUDA's cuLaunchKernelEx CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION semantics.
     :type ctas_per_cga: tuple[int, int, int]
+    :ivar preferred_ctas_per_cga: preferred number of CTAs per cluster. Unlike ctas_per_cga which is
+        required, this is a hint: the driver may use a smaller cluster if resources are constrained.
+        Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
+    :type preferred_ctas_per_cga: tuple[int, int, int]
     """
 
     def __init__(
@@ -356,6 +360,7 @@ class Config:
         reg_dec_producer=0,
         reg_inc_consumer=0,
         ctas_per_cga=None,
+        preferred_ctas_per_cga=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -368,6 +373,7 @@ class Config:
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
+        self.preferred_ctas_per_cga = preferred_ctas_per_cga
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -381,6 +387,7 @@ class Config:
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
+        self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
 
     def all_kwargs(self):
         return {
@@ -397,6 +404,7 @@ class Config:
                     ("maxRegAutoWS", self.maxRegAutoWS),
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
+                    ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                 ) if v is not None
             },
         }
@@ -413,6 +421,7 @@ class Config:
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
+        res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         return ", ".join(res)
 
     def __hash__(self):

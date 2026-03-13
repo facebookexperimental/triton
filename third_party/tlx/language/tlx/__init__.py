@@ -76,6 +76,7 @@ from .utility import (
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
+    cluster_size_1d,
     dtype_of,
     get_fp8_format_name,
     size_of,
@@ -154,6 +155,7 @@ __all__ = [
     "tcgen05_commit",
     # utility
     "cluster_cta_rank",
+    "cluster_size_1d",
     "thread_id",
     "async_task_replica_id",
     "dtype_of",

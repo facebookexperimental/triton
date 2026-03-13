@@ -787,6 +787,11 @@ void init_triton_tlx_ir(py::module &&m) {
                  self.getBuilder().getI32Type());
              return rank;
            })
+      .def("create_cluster_size_1d",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<ttng::ClusterSize1DOp>(
+                 self.getBuilder().getI32Type());
+           })
       .def("create_map_to_remote_buffer",
            [](TritonOpBuilder &self, Value &src,
               Value &clusterCTARank) -> Value {

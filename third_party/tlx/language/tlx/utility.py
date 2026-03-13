@@ -26,6 +26,15 @@ def cluster_cta_rank(_semantic=None):
 
 
 @tl.builtin
+def cluster_size_1d(_semantic=None):
+    """
+    :return the total number of CTAs in the cluster across all dimensions
+    (equal to the product of sizes of every dimension).
+    """
+    return tl.tensor(_semantic.builder.create_cluster_size_1d(), tl.int32)
+
+
+@tl.builtin
 def thread_id(axis, _semantic=None):
     """
     Returns the id of the current thread instance along the given :code:`axis`.

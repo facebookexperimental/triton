@@ -462,6 +462,12 @@ class CompiledKernel:
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
         metadata = json.loads(metadata_path.read_text())
         metadata['cluster_dims'] = tuple(metadata['cluster_dims'])
+        if metadata.get('preferred_ctas_per_cga') is not None:
+            metadata['preferred_ctas_per_cga'] = tuple(metadata['preferred_ctas_per_cga'])
+            assert metadata['preferred_ctas_per_cga'][0] % metadata['cluster_dims'][0] == 0 and \
+                   metadata['preferred_ctas_per_cga'][1] % metadata['cluster_dims'][1] == 0 and \
+                   metadata['preferred_ctas_per_cga'][2] % metadata['cluster_dims'][2] == 0, "preferred_ctas_per_cga must be divisible by cluster_dims, but got " \
+                   f"{metadata['preferred_ctas_per_cga']} and {metadata['cluster_dims']}"
         # JSON serialization dumps the target as a dict. Restore it to a GPUTarget.
         target = metadata['target']
         metadata['target'] = GPUTarget(target['backend'], target['arch'], target['warp_size'])

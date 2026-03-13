@@ -100,6 +100,17 @@ def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
   let hasVerifier = 1;
 }
 
+def TTNG_ClusterSize1DOp : TTNG_Op<"cluster_size_1d", [Pure]> {
+  let summary = "Returns the number of CTAs in a cluster across all dimensions";
+  let description = [{
+    Returns the total number of CTAs in the current cluster, equal to the
+    product of the cluster dimensions across all axes. Maps to the PTX
+    special register `%cluster_nctarank`.
+  }];
+  let results = (outs I32:$result);
+  let assemblyFormat = "attr-dict";
+}
+
 def TTNG_MapToRemoteBufferOp : TTNG_Op<"map_to_remote_buffer", [Pure, MemDescViewTrait]> {
   let summary = "Map shared memory buffer to the corresponding buffer in the target CTA";
   let description = [{

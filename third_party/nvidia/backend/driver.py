@@ -319,11 +319,11 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   return cuLaunchKernelExHandle;
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{", " + arg_decls if len(arg_decls) > 0 else ""}) {{
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int preferredClusterDimX, int preferredClusterDimY, int preferredClusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{", " + arg_decls if len(arg_decls) > 0 else ""}) {{
   void *params[] = {{ {", ".join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
-    // 4 attributes that we can currently pass maximum
-    CUlaunchAttribute launchAttr[4];
+    // 5 attributes that we can currently pass maximum
+    CUlaunchAttribute launchAttr[5];
     static cuLaunchKernelEx_t cuLaunchKernelExHandle = NULL;
     if (cuLaunchKernelExHandle == NULL) {{
       cuLaunchKernelExHandle = getLaunchKernelExHandle();
@@ -359,7 +359,8 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       ++num_attrs;
     }}
 
-    if (launch_cluster !=0 || num_ctas != 1) {{
+    // preferred cluster dimension requires cluster dimension to also be set
+    if (launch_cluster !=0 || num_ctas != 1 || preferredClusterDimX > 0) {{
       CUlaunchAttribute clusterAttr = {{}};
       clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
       clusterAttr.value.clusterDim.x = clusterDimX;
@@ -372,6 +373,16 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       clusterSchedulingAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
       clusterSchedulingAttr.value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
       launchAttr[num_attrs] = clusterSchedulingAttr;
+      ++num_attrs;
+    }}
+
+    if (preferredClusterDimX > 0) {{
+      CUlaunchAttribute preferredClusterAttr = {{}};
+      preferredClusterAttr.id = CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
+      preferredClusterAttr.value.preferredClusterDim.x = preferredClusterDimX;
+      preferredClusterAttr.value.preferredClusterDim.y = preferredClusterDimY;
+      preferredClusterAttr.value.preferredClusterDim.z = preferredClusterDimZ;
+      launchAttr[num_attrs] = preferredClusterAttr;
       ++num_attrs;
     }}
 
@@ -539,8 +550,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     return NULL;
   }}
 
-  int num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ;
-  if (!PyArg_ParseTuple(kernel_metadata, \"iiiiii\", &num_warps, &num_ctas, &shared_memory, &clusterDimX, &clusterDimY, &clusterDimZ)) {{
+  int num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ, preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ;
+  if (!PyArg_ParseTuple(kernel_metadata, \"iiiiiiiii\", &num_warps, &num_ctas, &shared_memory, &clusterDimX, &clusterDimY, &clusterDimZ, &preferredClusterDimX, &preferredClusterDimY, &preferredClusterDimZ)) {{
     PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
     return NULL;
   }}
@@ -576,7 +587,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {newline.join(tma_decls)}
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{", " + ", ".join(internal_args_list) if len(internal_args_list) > 0 else ""});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{", " + ", ".join(internal_args_list) if len(internal_args_list) > 0 else ""});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;

@@ -116,6 +116,7 @@ class CUDAOptions:
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
     ctas_per_cga: Optional[tuple] = None  # Alias for cluster_dims with CUDA semantics
+    preferred_ctas_per_cga: Optional[tuple] = None  # Hint for preferred cluster size (CUDA 12.8+)
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
@@ -197,6 +198,10 @@ class CUDABackend(BaseBackend):
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
 
+        if args.get("preferred_ctas_per_cga") is not None and capability < 100:
+            raise ValueError((f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). "
+                              f"Current target is sm_{capability}."))
+
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)
             if capability >= 89:
@@ -215,6 +220,7 @@ class CUDABackend(BaseBackend):
         return CUDAOptions(**args)
 
     def pack_metadata(self, metadata):
+        preferred = getattr(metadata, "preferred_ctas_per_cga", None) or (0, 0, 0)
         return (
             metadata.num_warps,
             metadata.num_ctas,
@@ -222,6 +228,9 @@ class CUDABackend(BaseBackend):
             metadata.cluster_dims[0],
             metadata.cluster_dims[1],
             metadata.cluster_dims[2],
+            preferred[0],
+            preferred[1],
+            preferred[2],
         )
 
     def get_codegen_implementation(self, options):
@@ -388,6 +397,8 @@ class CUDABackend(BaseBackend):
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
+        metadata["preferred_ctas_per_cga"] = tuple(
+            opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
