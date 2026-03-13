@@ -65,6 +65,20 @@ struct ClusterWaitOpConversion
   }
 };
 
+struct ClusterSize1DOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ClusterSize1DOp> {
+  using ConvertOpToLLVMPattern<
+      triton::nvidia_gpu::ClusterSize1DOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::ClusterSize1DOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<NVVM::ClusterDim>(op, i32_ty);
+    return success();
+  }
+};
+
 // lower MapToRemoteBufferOp
 struct MapToRemoteBufferOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::MapToRemoteBufferOp> {
@@ -113,6 +127,7 @@ void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
     PatternBenefit benefit) {
   patterns.add<ClusterArriveOpConversion>(typeConverter, benefit);
   patterns.add<ClusterWaitOpConversion>(typeConverter, benefit);
+  patterns.add<ClusterSize1DOpConversion>(typeConverter, benefit);
   patterns.add<MapToRemoteBufferOpConversion>(typeConverter, benefit);
   return;
 }

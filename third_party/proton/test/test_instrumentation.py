@@ -1,6 +1,5 @@
 import json
 import pathlib
-
 from typing import NamedTuple
 import triton.profiler as proton
 
@@ -16,32 +15,17 @@ from triton._internal_testing import (
     is_hip,
     is_hip_cdna2,
     is_hip_cdna4,
-    # supports_tma,
-    # supports_ws,
+    supports_tma,
+    supports_ws,
 )
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 pl.enable_semantic("triton")
 
-
-def supports_tma():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-
-def supports_ws():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-
-def unsupport_amd():
-    return is_hip_cdna2()
-
-
 # Skip all tests if the AMD GPU version is not supported
-pytestmark = pytest.mark.skipif(unsupport_amd(), reason="old AMD GPUs are not supported")
+pytestmark = pytest.mark.skipif(is_hip_cdna2(), reason="old AMD GPUs are not supported")
 
-HAS_TENSOR_DESC = supports_tma() and hasattr(tl, "make_tensor_descriptor")
-HAS_HOST_TENSOR_DESC = supports_tma() and hasattr(triton.tools.tensor_descriptor, "TensorDescriptor")
-HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
+HAS_WARP_SPECIALIZE = supports_ws() and supports_tma()
 
 
 @pytest.mark.parametrize(
@@ -437,8 +421,8 @@ def test_autotune(tmp_path: pathlib.Path):
 
 
 def test_warp_spec(tmp_path: pathlib.Path):
-    if not HAS_WARP_SPECIALIZE:
-        pytest.skip("target backend does not support warp specialization")
+    if not supports_tma() or not supports_ws():
+        pytest.skip("target backend does not support warp specialization and TMA")
 
     @triton.jit
     def matmul_kernel_tma(a_desc, b_desc, c_desc,  #

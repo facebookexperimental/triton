@@ -116,6 +116,7 @@ class CUDAOptions:
     maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
     ctas_per_cga: Optional[tuple] = None  # Alias for cluster_dims with CUDA semantics
+    preferred_ctas_per_cga: Optional[tuple] = None  # Hint for preferred cluster size (CUDA 12.8+)
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
@@ -197,6 +198,10 @@ class CUDABackend(BaseBackend):
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
 
+        if args.get("preferred_ctas_per_cga") is not None and capability < 100:
+            raise ValueError((f"preferred_ctas_per_cga requires NVIDIA SM100+ (Blackwell). "
+                              f"Current target is sm_{capability}."))
+
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)
             if capability >= 89:
@@ -215,6 +220,7 @@ class CUDABackend(BaseBackend):
         return CUDAOptions(**args)
 
     def pack_metadata(self, metadata):
+        preferred = getattr(metadata, "preferred_ctas_per_cga", None) or (0, 0, 0)
         return (
             metadata.num_warps,
             metadata.num_ctas,
@@ -222,6 +228,9 @@ class CUDABackend(BaseBackend):
             metadata.cluster_dims[0],
             metadata.cluster_dims[1],
             metadata.cluster_dims[2],
+            preferred[0],
+            preferred[1],
+            preferred[2],
         )
 
     def get_codegen_implementation(self, options):
@@ -324,15 +333,20 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
+        use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled)
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            from triton.runtime.driver import driver as rt_driver
+            smem_budget = rt_driver.active.utils.get_device_properties(
+                rt_driver.active.get_current_device())["max_shared_mem"]
+            nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
+                                                     smem_budget)
+            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
+            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -342,15 +356,21 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
+            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
+            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                passes.ttgpuir.add_partition_scheduling(pm)
+                if knobs.nvidia.use_meta_partition:
+                    nvidia.passes.hopper.add_partition_scheduling_meta(pm)
+                else:
+                    passes.ttgpuir.add_partition_scheduling(pm)
+                from triton.runtime.driver import driver as rt_driver
+                smem_budget = rt_driver.active.utils.get_device_properties(
+                    rt_driver.active.get_current_device())["max_shared_mem"]
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled)
+                                                         dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
@@ -364,14 +384,17 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
+        if capability // 10 >= 9:
+            nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
+            nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        # TODO: Find the optimal place in the pipeline for this pass.
+        nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.common.add_symbol_dce(pm)
-        if capability // 10 >= 9:
-            nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
         if capability // 10 >= 10 and knobs.nvidia.use_meta_ws:
@@ -387,6 +410,8 @@ class CUDABackend(BaseBackend):
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
+        metadata["preferred_ctas_per_cga"] = tuple(
+            opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
         return mod
@@ -456,7 +481,7 @@ class CUDABackend(BaseBackend):
                 pm = ir.pass_manager(mod.context)
                 pm.enable_debug()
                 passes.llvmir.add_di_scope(pm)
-                pm.run(mod)
+                pm.run(mod, 'make_llir.disable_line_info')
 
             # insert dbg intrinsic with several DI Attribute including source
             # var name and type info note: unknown reason for now, but this
@@ -466,7 +491,7 @@ class CUDABackend(BaseBackend):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
             passes.llvmir.add_di_local_variable(pm)
-            pm.run(mod)
+            pm.run(mod, 'make_llir.dump_ir_extract_di_local_variables')
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
@@ -616,6 +641,8 @@ please share the reproducer above with Triton project.
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
         stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
         stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
+        if knobs.runtime.add_stages_inspection_hook is not None:
+            knobs.runtime.add_stages_inspection_hook(self, stages, options, language, capability)
 
     @functools.lru_cache()
     def hash(self):

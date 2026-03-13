@@ -63,6 +63,7 @@ class Gemm:
             "EPILOGUE_SUBTILE": 1,
             "NUM_CTAS": 1,
             "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 0,
         },
         "blackwell_gemm_clc": {
             "BLOCK_SIZE_M": 128,
@@ -97,6 +98,41 @@ class Gemm:
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": False,
+        },
+        "blackwell_gemm_ws_warp_barrier": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1,
+            "EPILOGUE_SUBTILE": 1,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 0,
+            "USE_WARP_BARRIER": True,
+        },
+        "blackwell_gemm_clc_warp_barrier": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "EPILOGUE_SUBTILE": True,
+            "USE_WARP_BARRIER": True,
+        },
+        "hopper_gemm_ws_warp_barrier": {
+            "BM": 128,
+            "BN": 256,
+            "BK": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_STAGES": 3,
+            "NUM_MMA_WARPS": 8,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": False,
+            "USE_WARP_BARRIER": True,
         },
     }
 
@@ -157,6 +193,17 @@ class FlashAttention:
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
             "GROUP_SIZE_N": 1,
+        },
+        "blackwell_fa_ws_pipelined_persistent_warp_barrier": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+            "USE_WARP_BARRIER": True,
         },
         "blackwell_fa_ws_pipelined_persistent_mxfp8": {
             "BLOCK_M": 256,
@@ -232,6 +279,18 @@ def test_blackwell_gemm_clc(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_warp_barrier(dtype):
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws_warp_barrier"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_clc_warp_barrier(dtype):
+    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc_warp_barrier"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_pipelined(dtype):
     Gemm.run_test(_blackwell_gemm_pipelined, Gemm.CONFIGS["blackwell_gemm_pipelined"], dtype=dtype)
 
@@ -283,11 +342,29 @@ def test_blackwell_fa_ws_pipelined():
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent():
-    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"]
+def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE):
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"].copy()
+    config["RESCALE_OPT"] = RESCALE_OPT
+    config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
-    causal = True
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+        tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, 64, 1, config=config)
+        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_warp_barrier(causal, RESCALE_OPT, USE_WHERE):
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_warp_barrier"].copy()
+    config["RESCALE_OPT"] = RESCALE_OPT
+    config["USE_WHERE"] = USE_WHERE
+    sm_scale = 0.5
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
@@ -345,6 +422,11 @@ def test_hopper_gemm_pipelined():
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
 def test_hopper_gemm_ws():
     Gemm.run_test(_hopper_gemm_ws, Gemm.CONFIGS["hopper_gemm_ws"])
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
+def test_hopper_gemm_ws_warp_barrier():
+    Gemm.run_test(_hopper_gemm_ws, Gemm.CONFIGS["hopper_gemm_ws_warp_barrier"])
 
 
 # =============================================================================

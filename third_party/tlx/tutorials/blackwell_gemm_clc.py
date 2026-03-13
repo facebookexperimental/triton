@@ -20,6 +20,7 @@ def get_cuda_autotune_config():
                 "NUM_SMEM_BUFFERS": s,
                 "NUM_TMEM_BUFFERS": t,
                 "EPILOGUE_SUBTILE": subtile,
+                "USE_WARP_BARRIER": uwb,
             },
             num_warps=4,
             num_stages=1,
@@ -31,6 +32,7 @@ def get_cuda_autotune_config():
         for s in [2, 3, 4]
         for t in [2, 3]
         for subtile in [True]
+        for uwb in [False, True]
     ]
 
 
@@ -70,6 +72,7 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
                                        NUM_SMS: tl.constexpr,  #
                                        NUM_CLC_STAGES: tl.constexpr,  #
                                        EPILOGUE_SUBTILE: tl.constexpr,  #
+                                       USE_WARP_BARRIER: tl.constexpr = False,  #
                                        ):
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
@@ -80,8 +83,12 @@ def matmul_kernel_tma_ws_blackwell_clc(a_desc, b_desc, c_desc, M, N, K, BLOCK_SI
     # allocate barriers
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+    if USE_WARP_BARRIER:
+        tmem_full_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS, num_warps=1)
+        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS, num_warps=4)
+    else:
+        tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     clc_context = tlx.clc_create_context(num_consumers=3)
 

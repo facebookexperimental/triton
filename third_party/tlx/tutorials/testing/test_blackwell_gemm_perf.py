@@ -73,8 +73,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
+        nargs="+",
         choices=list(MATMUL_METHODS.keys()),
-        help=f"Run only the specified version. Choices: {list(MATMUL_METHODS.keys())}",
+        help=f"Run only the specified version(s). Choices: {list(MATMUL_METHODS.keys())}",
     )
     parser.add_argument(
         "--dtype",
@@ -88,7 +89,7 @@ if __name__ == "__main__":
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
 
     if is_blackwell():
-        versions = [args.version] if args.version else list(MATMUL_METHODS.keys())
+        versions = args.version if args.version else list(MATMUL_METHODS.keys())
         print(f"Running benchmarks for: {versions} (dtype={args.dtype})")
         benchmark = create_benchmark(versions, dtype=dtype)
         benchmark.run(print_data=True)

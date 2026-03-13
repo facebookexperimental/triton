@@ -320,6 +320,12 @@ void init_triton_tlx_ir(py::module &&m) {
           [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
             self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
           })
+      .def("create_warp_barrier_arrive",
+           [](TritonOpBuilder &self, Value mbarrierLoc,
+              int arriveCount) -> void {
+             self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
+                                                /*perThread=*/true);
+           })
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);
@@ -448,21 +454,6 @@ void init_triton_tlx_ir(py::module &&m) {
              auto oldType = cast<ttg::MemDescType>(src.getType());
              assert(oldType && "Expect MemDescType for src");
              auto encoding = oldType.getEncoding();
-             if (!oldType.getShape().equals(newShape)) {
-               // Only accept unswizzled encoding for now.
-               if (auto mmaEncoding =
-                       dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding)) {
-                 if (mmaEncoding.getSwizzlingByteWidth() != 0)
-                   llvm_unreachable("Only accept unswizzled encoding");
-               } else if (auto swizzledEncoding =
-                              dyn_cast<ttg::SwizzledSharedEncodingAttr>(
-                                  encoding)) {
-                 if (!(swizzledEncoding.getVec() == 1 &&
-                       swizzledEncoding.getPerPhase() == 1 &&
-                       swizzledEncoding.getMaxPhase() == 1))
-                   llvm_unreachable("Only accept unswizzled encoding");
-               }
-             }
 
              auto newType = ttg::MemDescType::get(
                  newShape, newElementType, encoding, oldType.getMemorySpace(),
@@ -674,19 +665,41 @@ void init_triton_tlx_ir(py::module &&m) {
                  multicastTargetBitMask, desc, coord, mbarrier, result, pred,
                  cacheModifier, evictionPolicy, isVolatile);
            })
+      .def("create_async_TMA_prefetch",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
+              Value pred, EvictionPolicy evictionPolicy) -> void {
+             self.create<ttng::AsyncTMAPrefetchOp>(desc, coord, pred,
+                                                   evictionPolicy);
+           })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value source, tt::EvictionPolicy evictionPolicy) -> void {
              self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord, source,
                                                             evictionPolicy);
            })
+      .def("create_async_TMA_reduce",
+           [](TritonOpBuilder &self, tt::DescriptorReduceKind kind, Value desc,
+              std::vector<Value> &coord, Value source,
+              tt::EvictionPolicy evictionPolicy) -> void {
+             self.create<ttng::AsyncTMAReduceOp>(kind, desc, coord, source,
+                                                 evictionPolicy);
+           })
       .def("create_async_TMA_store_wait",
            [](TritonOpBuilder &self, int pendings) {
              self.create<ttng::TMAStoreWaitOp>(pendings);
            })
+      .def("create_async_store",
+           [](TritonOpBuilder &self, Value src, Value dst, Value size) -> void {
+             self.create<ttng::AsyncStoreOp>(src, dst, size);
+           })
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
+           })
+      .def("create_threadfence",
+           [](TritonOpBuilder &self, const std::string &scope) -> void {
+             self.create<ttng::FenceOp>(
+                 StringAttr::get(self.getContext(), scope));
            }) // Warp specialize ops
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
@@ -717,11 +730,13 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value ptrTensor, Value result,
               std::optional<Value> mask, std::optional<Value> other,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> mlir::Value {
+              bool isVolatile, std::optional<Value> bulkSize,
+              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
              return self.create<ttg::AsyncCopyGlobalToLocalOp>(
                  ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile);
+                 other.value_or(Value()), bulkSize.value_or(Value()),
+                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                 isVolatile, useBulk);
            })
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
@@ -754,6 +769,11 @@ void init_triton_tlx_ir(py::module &&m) {
              Value rank = self.create<triton::nvgpu::ClusterCTAIdOp>(
                  self.getBuilder().getI32Type());
              return rank;
+           })
+      .def("create_cluster_size_1d",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<ttng::ClusterSize1DOp>(
+                 self.getBuilder().getI32Type());
            })
       .def("create_map_to_remote_buffer",
            [](TritonOpBuilder &self, Value &src,

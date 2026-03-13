@@ -65,13 +65,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
+        nargs="+",
         choices=list(MATMUL_METHODS.keys()),
-        help=f"Run only the specified version. Choices: {list(MATMUL_METHODS.keys())}",
+        help=f"Run only the specified version(s). Choices: {list(MATMUL_METHODS.keys())}",
     )
     args = parser.parse_args()
 
     if is_hopper():
-        versions = [args.version] if args.version else list(MATMUL_METHODS.keys())
+        versions = args.version if args.version else list(MATMUL_METHODS.keys())
         print(f"Running benchmarks for: {versions}")
         benchmark = create_benchmark(versions)
         benchmark.run(print_data=True)

@@ -358,7 +358,7 @@ class HIPBackend(BaseBackend):
                 pm = ir.pass_manager(mod.context)
                 pm.enable_debug()
                 passes.llvmir.add_di_scope(pm)
-                pm.run(mod)
+                pm.run(mod, 'make_llir.disable_line_info')
 
             # insert dbg intrinsic with several DI Attribute including source
             # var name and type info note: unknown reason for now, but this
@@ -368,7 +368,7 @@ class HIPBackend(BaseBackend):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
             passes.llvmir.add_di_local_variable(pm)
-            pm.run(mod)
+            pm.run(mod, 'make_llir.dump_ir_extract_di_local_variables')
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
@@ -501,6 +501,8 @@ class HIPBackend(BaseBackend):
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
+        if knobs.runtime.add_stages_inspection_hook is not None:
+            knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     @functools.lru_cache()
     def hash(self):

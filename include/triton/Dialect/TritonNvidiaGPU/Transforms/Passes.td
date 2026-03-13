@@ -94,6 +94,21 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   ];
 }
 
+def TritonNvidiaGPUTMAStoreBufferReusePass
+    : Pass<"triton-nvidia-tma-store-buffer-reuse", "mlir::ModuleOp"> {
+  let summary = "Reuse SMEM buffers across sequential TMA stores";
+  let description = [{
+    After TMA lowering, sequential descriptor stores each allocate their own
+    shared memory buffer. When a tma_store_wait with pendings=0 guarantees
+    the buffer is safe to reuse, this pass merges compatible allocations
+    into a single mutable buffer with local_store writes.
+  }];
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 def TritonTensorMemoryAllocationPass : Pass<"triton-tensor-memory-allocation", "mlir::ModuleOp"> {
   let summary = "Assign tensor memory allocation";
 
@@ -172,6 +187,23 @@ def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-to
     The `triton-nvidia-gpu-remove-tmem-tokens` pass removes TMEM memory
     dependency tokens from the IR, after they are no longer needed.
   }];
+}
+
+def TritonNvidiaGPUPruneUnusedBarriersPass
+    : Pass<"triton-nvidia-gpu-prune-unused-barriers", "mlir::ModuleOp"> {
+  let summary = "Prune barriers with no wait uses after warp specialization";
+
+  let description = [{
+    After warp specialization materializes barriers for producer-consumer
+    communication channels, some barriers may have no corresponding wait ops.
+    This pass finds and removes such unused barriers and their associated
+    init/arrive/expect/commit ops.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
 }
 
 #endif

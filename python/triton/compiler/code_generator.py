@@ -687,6 +687,12 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_arg(self, node):
         ast.NodeVisitor.generic_visit(self, node)
+        param = next(p for p in self.jit_fn.params if p.name == node.arg)
+        if param.is_constexpr and (param.do_not_specialize or param.do_not_specialize_on_alignment):
+            raise CompilationError(
+                self.jit_fn.src, node,
+                f"{node.arg} marked as constexpr and listed in do_not_specialize/do_not_specialize_on_alignment. "
+                "Remove constexpr designation to skip specialization.")
         return node.arg
 
     def visit_AnnAssign(self, node):
@@ -763,7 +769,7 @@ class CodeGenerator(ast.NodeVisitor):
         args = [self.visit(x) for x in node.elts]
         return language.tuple(args)
 
-    def _apply_binary_method(self, method_name, lhs, rhs):
+    def _apply_binary_method(self, node, method_name, lhs, rhs):
         # TODO: raise something meaningful if getattr fails below, esp for reverse method
         if _is_triton_tensor(lhs):
             return getattr(lhs, method_name)(rhs, _semantic=self.semantic)
@@ -772,7 +778,11 @@ class CodeGenerator(ast.NodeVisitor):
             return getattr(rhs, reverse_method_name)(lhs, _semantic=self.semantic)
         if not isinstance(lhs, (constexpr, language.tuple)) and isinstance(rhs, constexpr):
             lhs = constexpr(lhs)
-        return getattr(lhs, method_name)(rhs)
+        if isinstance(lhs, constexpr):
+            fn = getattr(lhs, method_name)
+        else:
+            fn = self.get_Attribute(lhs, method_name)
+        return self.call_Function(node, fn, [rhs], {})
 
     def visit_BinOp(self, node):
         lhs = self.visit(node.left)
@@ -781,7 +791,7 @@ class CodeGenerator(ast.NodeVisitor):
         if method_name is None:
             raise self._unsupported(node,
                                     "AST binary operator '{}' is not (currently) implemented.".format(node.op.__name__))
-        return self._apply_binary_method(method_name, lhs, rhs)
+        return self._apply_binary_method(node, method_name, lhs, rhs)
 
     _method_name_for_bin_op: Dict[Type[ast.operator], str] = {
         ast.Add: "__add__",
@@ -1035,7 +1045,7 @@ class CodeGenerator(ast.NodeVisitor):
         if method_name is None:
             raise self._unsupported(
                 node, "AST comparison operator '{}' is not (currently) implemented.".format(node.ops[0].__name__))
-        return self._apply_binary_method(method_name, lhs, rhs)
+        return self._apply_binary_method(node, method_name, lhs, rhs)
 
     _method_name_for_comp_op: Dict[Type[ast.cmpop], str] = {
         ast.Eq: "__eq__",
@@ -1191,6 +1201,11 @@ class CodeGenerator(ast.NodeVisitor):
         loop_unroll_factor = None
         disallow_acc_multi_buffer = False
         data_partition_factor = None
+        merge_epilogue = False
+        tmem_alloc_algo = None
+        smem_alloc_algo = None
+        smem_budget = None
+        smem_circular_reuse = None
         flatten = False
         warp_specialize = False
         disable_licm = False
@@ -1206,6 +1221,11 @@ class CodeGenerator(ast.NodeVisitor):
             loop_unroll_factor = iterator.loop_unroll_factor
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
             data_partition_factor = iterator.data_partition_factor
+            merge_epilogue = iterator.merge_epilogue
+            tmem_alloc_algo = iterator.tmem_alloc_algo
+            smem_alloc_algo = iterator.smem_alloc_algo
+            smem_budget = iterator.smem_budget
+            smem_circular_reuse = iterator.smem_circular_reuse
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
@@ -1230,6 +1250,12 @@ class CodeGenerator(ast.NodeVisitor):
         # induction variable type
         if not lb.dtype.is_int() or not ub.dtype.is_int() or not step.dtype.is_int():
             raise TypeError(f"For loop bounds and step must all be ints, are ({lb.dtype}, {ub.dtype}, {step.dtype})")
+        if _is_non_scalar_tensor(lb):
+            raise TypeError(f"For lower bound must be a scalar, got {lb.type}")
+        if _is_non_scalar_tensor(ub):
+            raise TypeError(f"For upper bound must be a scalar, got {ub.type}")
+        if _is_non_scalar_tensor(step):
+            raise TypeError(f"For step must be a scalar, got {step.type}")
         iv_type = self.semantic.integer_promote_impl(lb.dtype, ub.dtype)
         iv_type = self.semantic.integer_promote_impl(iv_type, step.dtype)
         iv_ir_type = iv_type.to_ir(self.builder)
@@ -1267,6 +1293,16 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
+            if merge_epilogue:
+                for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
+            if tmem_alloc_algo is not None:
+                for_op.set_attr("tt.tmem_alloc_algo", self.builder.get_int32_attr(tmem_alloc_algo))
+            if smem_alloc_algo is not None:
+                for_op.set_attr("tt.smem_alloc_algo", self.builder.get_int32_attr(smem_alloc_algo))
+            if smem_budget is not None:
+                for_op.set_attr("tt.smem_budget", self.builder.get_int32_attr(smem_budget))
+            if smem_circular_reuse is not None:
+                for_op.set_attr("tt.smem_circular_reuse", self.builder.get_bool_attr(smem_circular_reuse))
             if disable_licm:
                 for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
 
@@ -1422,7 +1458,7 @@ class CodeGenerator(ast.NodeVisitor):
                 # be in core.py.
                 raise CompilationError(self.jit_fn.src, node, str(e)) from e
 
-        if fn in self.builtin_namespace.values():
+        if fn in self.builtin_namespace.values() or (hasattr(fn, '__self__') and not _is_triton_value(fn.__self__)):
             args = map(_unwrap_if_constexpr, args)
         ret = fn(*args, **kws)
 
@@ -1509,7 +1545,7 @@ class CodeGenerator(ast.NodeVisitor):
         while len(nontrivial_values) >= 2:
             rhs = nontrivial_values.pop()
             lhs = nontrivial_values.pop()
-            res = self._apply_binary_method(method_name, lhs, rhs)
+            res = self._apply_binary_method(node, method_name, lhs, rhs)
             nontrivial_values.append(res)
 
         assert len(nontrivial_values) == 1
@@ -1517,17 +1553,20 @@ class CodeGenerator(ast.NodeVisitor):
 
     _method_name_for_bool_op: Dict[Type[ast.boolop], str] = {ast.And: "logical_and", ast.Or: "logical_or"}
 
-    def visit_Attribute(self, node):
-        lhs = self.visit(node.value)
-        if _is_triton_tensor(lhs) and node.attr == "T":
+    def get_Attribute(self, lhs, attr):
+        if _is_triton_tensor(lhs) and attr == "T":
             return self.semantic.permute(lhs, (1, 0))
         # NOTE: special case ".value" for BC
-        if isinstance(lhs, constexpr) and node.attr not in ("value", "type"):
+        if isinstance(lhs, constexpr) and attr not in ("value", "type"):
             lhs = lhs.value
-        attr = getattr(lhs, node.attr)
+        attr = getattr(lhs, attr)
         if _is_triton_value(lhs) and isinstance(attr, JITFunction):
             return BoundJITMethod(lhs, attr)
         return attr
+
+    def visit_Attribute(self, node):
+        lhs = self.visit(node.value)
+        return self.get_Attribute(lhs, node.attr)
 
     def visit_Expr(self, node):
         node.value._is_unused = True

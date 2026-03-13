@@ -1321,7 +1321,7 @@ class tuple(base_value):
             v._flatten_ir(handles)
 
     def __repr__(self):
-        return f"({' ,'.join(repr(x) for x in self.values)})"
+        return f"({', '.join(repr(x) for x in self.values)})"
 
 
 class slice:
@@ -3271,7 +3271,8 @@ class range(base_value):
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
                  disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
-                 data_partition_factor=None):
+                 data_partition_factor=None, merge_epilogue=False, tmem_alloc_algo=None, smem_alloc_algo=None,
+                 smem_budget=None, smem_circular_reuse=None):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -3286,6 +3287,11 @@ class range(base_value):
         self.loop_unroll_factor = loop_unroll_factor
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.data_partition_factor = data_partition_factor
+        self.merge_epilogue = merge_epilogue
+        self.tmem_alloc_algo = tmem_alloc_algo
+        self.smem_alloc_algo = smem_alloc_algo
+        self.smem_budget = smem_budget
+        self.smem_circular_reuse = smem_circular_reuse
         self.flatten = flatten
         self.warp_specialize = warp_specialize
         self.disable_licm = disable_licm

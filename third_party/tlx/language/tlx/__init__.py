@@ -2,6 +2,7 @@ from . import compiler
 from .async_task_utils import async_task, async_tasks
 from .barrier import (
     alloc_barriers,
+    alloc_warp_barrier,
     barrier_arrive,
     barrier_expect_bytes,
     barrier_wait,
@@ -19,12 +20,15 @@ from .dynamic_launch import (
 )
 from .mem_ops import (
     allocate_tensor_descriptor,
+    async_store,
     async_descriptor_load,
+    async_descriptor_prefetch_tensor,
     async_descriptor_store,
     async_descriptor_store_wait,
     async_load,
     async_load_commit_group,
     async_load_wait_group,
+    fence,
     fence_async_shared,
     local_alloc,
     local_load,
@@ -71,6 +75,7 @@ from .utility import (
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
+    cluster_size_1d,
     dtype_of,
     get_fp8_format_name,
     size_of,
@@ -108,6 +113,7 @@ __all__ = [
     "tensor_descriptor_ptr",
     "tensor_descriptor_ptr_type",
     # mem_ops
+    "async_store",
     "local_alloc",
     "local_view",
     "remote_view",
@@ -122,8 +128,10 @@ __all__ = [
     "local_reinterpret",
     "allocate_tensor_descriptor",
     "async_descriptor_load",
+    "async_descriptor_prefetch_tensor",
     "async_descriptor_store",
     "async_descriptor_store_wait",
+    "fence",
     "fence_async_shared",
     "make_tensor_descriptor",
     "reinterpret_tensor_descriptor",
@@ -132,6 +140,7 @@ __all__ = [
     # barriers
     "cluster_barrier",
     "alloc_barriers",
+    "alloc_warp_barrier",
     "barrier_expect_bytes",
     "barrier_wait",
     "barrier_arrive",
@@ -144,6 +153,7 @@ __all__ = [
     "tcgen05_commit",
     # utility
     "cluster_cta_rank",
+    "cluster_size_1d",
     "thread_id",
     "async_task_replica_id",
     "dtype_of",

@@ -371,7 +371,23 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
   Operation *lookupPt = &rewriter.getInsertionBlock()->front();
   int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
   int numWarps = triton::gpu::lookupNumWarps(lookupPt);
+
+  // For the mask, use the total number of warps if available (for warp
+  // specialization). This ensures threads beyond the original numWarps are
+  // not incorrectly masked to lower thread IDs.
   int upperBound = numWarps * threadsPerWarp;
+  if (auto mod = lookupPt->getParentOfType<ModuleOp>()) {
+    if (auto totalNumWarps =
+            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {
+      upperBound = totalNumWarps.getInt() * threadsPerWarp;
+    }
+  }
+
+  // Round up to power of 2 for the mask (required for LLVM known bits
+  // analysis).
+  if (!llvm::isPowerOf2_32(upperBound)) {
+    upperBound = llvm::NextPowerOf2(upperBound);
+  }
 
   TritonLLVMOpBuilder b(loc, rewriter);
 
@@ -382,7 +398,6 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
     tid = rewriter.create<arith::SubIOp>(loc, tid, b.i32_val(*startId));
   }
 
-  assert(llvm::isPowerOf2_32(upperBound));
   // help LLVM's known bits analysis:
   tid = b.and_(tid, b.i32_val(upperBound - 1));
 
@@ -524,41 +539,6 @@ Value emitPadding(Location loc, RewriterBase &rewriter,
   }
   return padOffset;
 }
-
-namespace {
-std::pair<int, ColumnAction>
-largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
-                     std::optional<int> maybeMaxVecElems = std::nullopt) {
-  // Find the largest vectorisation we can use:
-  StringAttr kReg = str_attr("register");
-  StringAttr kOffset = str_attr("offset");
-  LinearLayout quot;
-  LinearLayout tile;
-  ColumnAction permutation;
-  // If there are restrictions on the vectorisation, we don't allow
-  // permutations.
-  auto allowPerm = !maybeMaxVecElems.has_value();
-  auto maxVecElems = maybeMaxVecElems.value_or(128 / bitwidth);
-  for (int v = maxVecElems; v >= 1; v /= 2) {
-    tile = LinearLayout::identity1D(v, kReg, kOffset);
-    auto maybePerm = regPermForDivide(cvt, tile, /*left=*/true);
-    if (!maybePerm) {
-      continue;
-    }
-    permutation = *maybePerm;
-    if (!allowPerm && !permutation.isIdentity()) {
-      continue;
-    }
-    auto newCvt = permutation.apply(cvt);
-    auto maybeQuot = divideLeft(newCvt, tile);
-    if (!maybeQuot) {
-      continue;
-    }
-    return {v, permutation};
-  }
-  llvm_unreachable("Vectorization < 1 is not valid");
-}
-} // namespace
 
 SmallVector<Value>
 lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,

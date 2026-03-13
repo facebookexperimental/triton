@@ -64,6 +64,7 @@ static PyObject *layout_attr = nullptr;
 static PyObject *has_native_tensor_spec_attr = nullptr;
 static PyObject *get_tensor_spec_attr = nullptr;
 static PyObject *align_kwarg = nullptr;
+static PyObject *tma_desc_cpu_ptr_attr = nullptr;
 
 static DtypePtr2Str dtype_ptr2str;
 static Dtype2Str dtype2str;
@@ -114,6 +115,7 @@ void init_interned_strings() {
   get_tensor_spec_attr = intern_from_string("get_tensor_specialization");
 
   align_kwarg = py::make_tuple("align").release().ptr();
+  tma_desc_cpu_ptr_attr = intern_from_string("tma_desc_cpu_ptr");
 }
 
 void init_type_handler_cache();
@@ -503,6 +505,11 @@ std::pair<py::object, py::object> specialize_arg(PyObject *backend,
   // fallback paths checking attributes directly
   if (PyObject_HasAttr(arg, data_ptr_attr)) {
     return handle_tensor(backend, arg, is_const, specialize_value, align);
+  }
+
+  // Handle TMA descriptors (objects with tma_desc_cpu_ptr attribute)
+  if (PyObject_HasAttr(arg, tma_desc_cpu_ptr_attr)) {
+    return {from_borrowed_ref(nvTmaDesc_str), py::none()};
   }
 
   // fallback for default types

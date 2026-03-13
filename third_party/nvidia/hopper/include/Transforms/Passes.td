@@ -21,15 +21,18 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
            "int32_t", /*default*/"3",
            "number of buffers for warp specialization">,
     Option<"capability", "capability",
-           "int32_t", /*default*/"10",
+           "int32_t", /*default*/"100",
            "NVIDIA compute capability">,
     Option<"pingpongAutoWS", "pingpong-auto-ws",
            "bool", /*default*/"false",
            "Enable ping pong barrier insertion around critical regions">,
     Option<"dumpIntermediateSteps", "dump-intermediate-steps",
-           "bool", /*default*/"false",
-           "Dump intermediate steps">
-  ];
+             "bool", /*default*/"false",
+             "Dump intermediate steps">,
+    Option<"smemBudget", "smem-budget",
+             "int32_t", /*default*/"0",
+             "SMEM budget in bytes (0 = auto-detect from target)">
+    ];
 }
 
 def NVGPUTestWSTaskPartition : Pass<"nvgpu-test-ws-task-partition", "mlir::ModuleOp"> {
@@ -55,6 +58,15 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
            "number of buffering for warp specialization">,
+    Option<"smemAllocAlgo", "smem-alloc-algo",
+           "int32_t", /*default*/"0",
+           "SMEM allocation algorithm: 0 = original, 1 = WSBuffer-based">,
+    Option<"smemBudget", "smem-budget",
+           "int32_t", /*default*/"0",
+           "SMEM budget in bytes (0 = auto-detect from target)">,
+    Option<"smemCircularReuse", "smem-circular-reuse",
+           "bool", /*default*/"false",
+           "Enable circular buffer reuse for SMEM allocation">,
     Option<"readDecisionFile", "read-decision-file",
            "std::string", /*default*/"\"\"",
            "path to JSON file containing buffer decisions to apply">,
@@ -169,6 +181,24 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
     Option<"numStages", "num-stages",
            "int32_t", /*default*/"3",
            "number of stages for software pipelining">,
+  ];
+}
+
+def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
+  let summary = "Meta warp specialization partitioning pass";
+
+  let description = [{
+    The `nvgpu-partition-scheduling-meta` is Meta's version of the partition
+    scheduling pass. It analyzes the loads, MMAs, and other operations in a loop
+    that is meant to be warp specialized and determines which partitions to
+    assign to each operation.
+  }];
+
+  let options = [
+    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue stores into the computation partition "
+           "instead of creating a separate epilogue partition">
   ];
 }
 

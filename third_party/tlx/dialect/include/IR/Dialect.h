@@ -68,7 +68,7 @@ getAllocationColumnsPerBuffer(triton::gpu::MemDescType memDescType) {
     // handle placeholder encodings.
     int64_t m = perBufferShape[perBufferShape.size() - 2];
     int64_t k = perBufferShape[perBufferShape.size() - 1];
-    return triton::nvidia_gpu::getTmemScalesColumnsPerBuffer(m, k);
+    return ((m + 31) / 32) * ((k + 3) / 4);
   }
 
   // For resolved encodings (TensorMemoryEncodingAttr,

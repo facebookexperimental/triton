@@ -417,17 +417,6 @@ def compile(src, target=None, options=None, _env_vars=None):
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
     fn_cache_manager.put_group(metadata_filename, metadata_group)
-    # Compilation completed, disabling multithreading in context.
-    # This is needed to safely finalize threads pool inside context: if current process forks before
-    # python GC deletes context object, thread pool in child process will be invalid, which could
-    # lead to child crash or hang.
-    #
-    # However disabling multithreading causes the code to hang if the ASAN pass is enabled
-    # this is likely due to the llvm-symbolizer forking a process
-    # TODO: Reconcile the difference here between the ASAN and non-ASAN path with enabling
-    # multithreading in the MLIR context
-    if not knobs.compilation.enable_asan:
-        context.disable_multithreading()
 
     # notify any listener
     if compilation_listener:
@@ -488,6 +477,12 @@ class CompiledKernel:
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
         metadata = json.loads(metadata_path.read_text())
         metadata['cluster_dims'] = tuple(metadata['cluster_dims'])
+        if metadata.get('preferred_ctas_per_cga') is not None:
+            metadata['preferred_ctas_per_cga'] = tuple(metadata['preferred_ctas_per_cga'])
+            assert metadata['preferred_ctas_per_cga'][0] % metadata['cluster_dims'][0] == 0 and \
+                   metadata['preferred_ctas_per_cga'][1] % metadata['cluster_dims'][1] == 0 and \
+                   metadata['preferred_ctas_per_cga'][2] % metadata['cluster_dims'][2] == 0, "preferred_ctas_per_cga must be divisible by cluster_dims, but got " \
+                   f"{metadata['preferred_ctas_per_cga']} and {metadata['cluster_dims']}"
         # JSON serialization dumps the target as a dict. Restore it to a GPUTarget.
         target = metadata['target']
         metadata['target'] = GPUTarget(target['backend'], target['arch'], target['warp_size'])

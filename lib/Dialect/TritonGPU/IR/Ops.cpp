@@ -548,56 +548,51 @@ LogicalResult MemDescReshapeOp::verify() {
   if (failed(inferReturnTypes(getContext(), getLoc(), srcType,
                               dstType.getShape(), expectedTy)))
     return failure();
-  // Check that the alloc shape separately to give a cleaner error, given that
-  // it's the most likely source of the error.
-  if (expectedTy.getAllocShape() != dstType.getAllocShape()) {
-    return emitError(
-        "The result alloc shape does not match the expected alloc shape.");
-  }
-  if (expectedTy != dstType) {
-    return emitError("source and destination layout are incompatible.");
-  }
-  return success();
+  return OpTrait::impl::verifyEquivalentType(expectedTy, dstType);
 }
 
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
                                                    Attribute srcEnc,
                                                    ArrayRef<int64_t> dstShape,
                                                    Attribute &dstEnc) {
+  // TODO Delete this once SharedLinearEncodingAttr is more widely supported.
   if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(srcEnc)) {
-    // TODO: supporting reshape of CTA layouts is non-trivial.
-    if (getNumCTAs(mmaEncoding) > 1)
-      return failure();
-    int innerDimDst =
-        mmaEncoding.getTransposed() ? dstShape.front() : dstShape.back();
-    int innerDimSrc =
-        mmaEncoding.getTransposed() ? srcShape.front() : srcShape.back();
-    // For now disallow reshape of the inner dimension.
-    if (innerDimDst != innerDimSrc)
-      return failure();
     auto *ctx = srcEnc.getContext();
-
-    // CTALayout can be all 1's because we bailed on multi-CTA layouts above.
-    auto CTALayout = CTALayoutAttr::get(
-        ctx,
-        /*CTAsPerCGA=*/SmallVector<unsigned>(dstShape.size(), 1),
-        /*CTASplitNum=*/SmallVector<unsigned>(dstShape.size(), 1),
-        /*CTAOrder=*/llvm::to_vector(llvm::seq<unsigned>(dstShape.size())));
-    dstEnc = NVMMASharedEncodingAttr::get(
-        ctx, mmaEncoding.getSwizzlingByteWidth(), mmaEncoding.getTransposed(),
-        mmaEncoding.getElementBitWidth(), mmaEncoding.getFp4Padded(),
-        CTALayout);
-    // Big guns, check linear layouts are equivalent
-    // We disallow reshaping memdesc_subslice in the verifier
-    // so allocShape == shape
-    auto srcLL = toLinearLayout(srcShape, srcEnc);
-    auto dstLL = toLinearLayout(dstShape, dstEnc);
-    if (reshapeLayout(ctx, srcLL, dstShape) != dstLL) {
-      return failure();
+    if (getNumCTAs(mmaEncoding) == 1) {
+      int innerDimDst =
+          mmaEncoding.getTransposed() ? dstShape.front() : dstShape.back();
+      int innerDimSrc =
+          mmaEncoding.getTransposed() ? srcShape.front() : srcShape.back();
+      // We can keep an NVMMAShared encoding only if the innermost dimension is
+      // preserved. Otherwise fall back to the generic shared-linear encoding
+      // logic below.
+      if (innerDimDst == innerDimSrc) {
+        auto CTALayout = CTALayoutAttr::get(
+            ctx,
+            /*CTAsPerCGA=*/SmallVector<unsigned>(dstShape.size(), 1),
+            /*CTASplitNum=*/SmallVector<unsigned>(dstShape.size(), 1),
+            /*CTAOrder=*/llvm::to_vector(llvm::seq<unsigned>(dstShape.size())));
+        auto candidateEncoding = NVMMASharedEncodingAttr::get(
+            ctx, mmaEncoding.getSwizzlingByteWidth(),
+            mmaEncoding.getTransposed(), mmaEncoding.getElementBitWidth(),
+            mmaEncoding.getFp4Padded(), CTALayout);
+        auto srcLL = toLinearLayout(srcShape, srcEnc);
+        auto dstLL = toLinearLayout(dstShape, candidateEncoding);
+        if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
+          dstEnc = candidateEncoding;
+          return success();
+        }
+      }
     }
-    return success();
   }
-  return failure();
+
+  // Generic LL case
+  auto sharedEnc = cast<SharedEncodingTrait>(srcEnc);
+  auto *ctx = srcEnc.getContext();
+  auto srcLL = toLinearLayout(srcShape, srcEnc);
+  auto dstLL = reshapeLayout(ctx, srcLL, dstShape);
+  dstEnc = SharedLinearEncodingAttr::get(ctx, dstLL, sharedEnc.getAlignment());
+  return success();
 }
 
 LogicalResult MemDescReshapeOp::inferReturnTypes(
@@ -622,6 +617,54 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   inferredReturnType = MemDescType::get(
       dstShape, srcTy.getElementType(), dstEncoding, srcTy.getMemorySpace(),
       srcTy.getMutableMemory(), dstAllocShape);
+  return success();
+}
+
+LogicalResult MemDescReinterpretOp::verify() {
+  auto oldType = getSrc().getType();
+  auto newType = getType();
+
+  if (oldType.getMemorySpace() != newType.getMemorySpace())
+    return emitError("source and destination memory space must match");
+
+  auto newShape = newType.getShape();
+  auto newEncoding = oldType.getEncoding();
+
+  if (!oldType.getShape().equals(newShape)) {
+    if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(newEncoding)) {
+      auto contigDimSize =
+          mmaEncoding.getTransposed() ? newShape.front() : newShape.back();
+      // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
+      // swizzling, the swizzling/contig dim has to be a multiple of it
+      // if swizzling mode is None, we still conservatively require at least 128
+      // bits
+      auto basicUnitBitWidth =
+          std::max(128U, 8 * mmaEncoding.getSwizzlingByteWidth());
+      if ((contigDimSize * mmaEncoding.getElementBitWidth()) %
+              basicUnitBitWidth !=
+          0) {
+        return emitError(
+            "New shape causes insufficient elements for swizzling");
+      }
+    } else if (auto swizzledEncoding =
+                   dyn_cast<SwizzledSharedEncodingAttr>(newEncoding)) {
+      auto contigDim = swizzledEncoding.getOrder()[0];
+      if (newShape.size() <= contigDim) {
+        return emitError("New shape incompatible with encoding");
+      }
+      if (swizzledEncoding.getVec() == 0) {
+        return emitError("Unexpected swizzled encoding with `vec` 0");
+      }
+      // conservatively reject cases where swizzling might be interfered
+      // new shape swizzling dim must be a multiple of getVec(), the basic
+      // swizzling unit
+      if (newShape[contigDim] % swizzledEncoding.getVec() != 0) {
+        return emitError(
+            "New shape causes insufficient elements for swizzling");
+      }
+    }
+  }
+
   return success();
 }
 
@@ -752,6 +795,22 @@ LogicalResult LocalLoadOp::verify() {
 LogicalResult AsyncCopyGlobalToLocalOp::verify() {
   if (!getResult().getType().getMutableMemory())
     return emitOpError("Cannot store into immutable memory");
+  if (getUseBulk()) {
+    if (!getBulkSize())
+      return emitOpError("bulk mode requires bulkSize");
+    if (!getBarrier())
+      return emitOpError("bulk mode requires barrier");
+    if (getMask())
+      return emitOpError("bulk mode does not support mask");
+    if (getOther())
+      return emitOpError("bulk mode does not support other");
+    if (getResult().getType().getRank() != 1)
+      return emitOpError("bulk mode requires 1D result memdesc");
+  } else {
+    if (!isa<RankedTensorType>(getSrc().getType()))
+      return emitOpError("non-bulk mode requires src to be a ranked tensor of "
+                         "pointers");
+  }
   return success();
 }
 

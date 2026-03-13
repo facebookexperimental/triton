@@ -46,9 +46,16 @@ void AutomaticWarpSpecialization::runOnOperation() {
     return;
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
-  // TODO: re-enable once the regression is fixed.
-  // pm.addPass(createNVWSInsertAref());
+  pm.addPass(createNVWSInsertAref());
+  // TODO(triton-reactor): InsertTmemAref fails with Meta's partition layout
+  // (getInitialSchedule + schedulePostLoopOps). Keep disabled until partition
+  // scheduling is aligned with upstream. LoadMMASpecialization is retained
+  // locally as the fallback.
+#if 0
+  pm.addPass(createNVWSInsertTmemAref());
+#else
   pm.addPass(createTritonGPULoadMMASpecialization({numStages}));
+#endif
   pm.addPass(createTritonGPURewritePartitionDependencies());
   // `int-range-optimizations` and SCCP are good at cleaning up loop arithmetic.
   // FIXME: Re-enable integer range analysis once it is fixed.

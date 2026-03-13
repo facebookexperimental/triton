@@ -1,6 +1,8 @@
 #include "TaskIdPropagation.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
@@ -103,7 +105,8 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
       ChangeResult changed = condLattice->meet(taskId);
       propagateIfChanged(condLattice, changed);
     } else {
-      if (!isa<triton::FuncOp, triton::ReduceOp>(parentOp))
+      if (!isa<triton::FuncOp, triton::ReduceOp, triton::MapElementwiseOp>(
+              parentOp))
         llvm_unreachable("Other parent ops are not supported.");
     }
     parentOp = parentOp->getParentOp();
@@ -113,30 +116,53 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
 LogicalResult TaskIdBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<TaskIdLattice *> operands,
     ArrayRef<const TaskIdLattice *> results) {
-  // Already annotated
   // TODO(Arda): Replace the following with getAsyncTaskIds when we no longer
   // need to dump the task ids into the IR.
   auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
-  if (taskIdAttr) {
+
+  // An op is a non-anchor (allows backward propagation to flow through) only
+  // if it is a scalar arithmetic/math op. These ops compute shared addresses
+  // or indices used across tasks and need the union of consumer task IDs.
+  // All other annotated ops (Triton ops, tensor ops, control flow) are anchors
+  // whose task IDs define the computation partition and must not be overridden.
+  bool isScalarArithOrMath =
+      isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
+      llvm::none_of(op->getResultTypes(),
+                    [](Type t) { return isa<RankedTensorType>(t); });
+  bool isAnchor = taskIdAttr && !isScalarArithOrMath;
+
+  if (isAnchor) {
     const auto annotated = TaskId(taskIdAttr);
     for (auto operandLattice : operands) {
       ChangeResult changed = operandLattice->meet(annotated);
       propagateIfChanged(operandLattice, changed);
     }
-    // Propagate to the parent ops such as control flows
     propagateToParent(op, annotated);
 
     if (op->getNumRegions() == 1) {
       if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
         propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
                               results);
+      } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
+        // MapElementwiseOp's region terminator may have pack * num_results
+        // operands, so propagate all result task IDs to every terminator
+        // operand.
+        auto *terminator = mapOp.getScalarOp().front().getTerminator();
+        for (auto terminatorOperand : terminator->getOperands()) {
+          auto terminatorLattice = getLatticeElement(terminatorOperand);
+          for (auto resultLattice : results) {
+            ChangeResult changed =
+                terminatorLattice->meet(resultLattice->getValue());
+            propagateIfChanged(terminatorLattice, changed);
+          }
+        }
       }
     }
 
     return success();
   }
-  // If it is not annotated by the user, propagate from results to the
-  // operands
+
+  // Non-anchor: propagate from results to operands (standard backward flow).
   for (const auto resultLattice : results) {
     for (auto operandLattice : operands) {
       ChangeResult changed = operandLattice->meet(resultLattice->getValue());
@@ -147,10 +173,31 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
   for (const auto resultLattice : results)
     propagateToParent(op, resultLattice->getValue());
 
+  // For non-anchor ops with existing annotations, also propagate the
+  // annotation backward so it contributes to operand lattices.
+  if (taskIdAttr) {
+    const auto annotated = TaskId(taskIdAttr);
+    for (auto operandLattice : operands) {
+      ChangeResult changed = operandLattice->meet(annotated);
+      propagateIfChanged(operandLattice, changed);
+    }
+    propagateToParent(op, annotated);
+  }
+
   if (op->getNumRegions() == 1) {
     if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       propagateToTerminator(reduceOp.getCombineOp().front().getTerminator(),
                             results);
+    } else if (auto mapOp = dyn_cast<triton::MapElementwiseOp>(op)) {
+      auto *terminator = mapOp.getScalarOp().front().getTerminator();
+      for (auto terminatorOperand : terminator->getOperands()) {
+        auto terminatorLattice = getLatticeElement(terminatorOperand);
+        for (auto resultLattice : results) {
+          ChangeResult changed =
+              terminatorLattice->meet(resultLattice->getValue());
+          propagateIfChanged(terminatorLattice, changed);
+        }
+      }
     }
   }
 

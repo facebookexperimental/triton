@@ -169,7 +169,8 @@ struct TMAReduceLowering : public OpRewritePattern<DescriptorReduceOp> {
           rewriter, op.getLoc(),
           op.getDesc().getType().getBlockType().getEncoding(), op.getIndices());
       rewriter.create<triton::nvidia_gpu::AsyncTMAReduceOp>(
-          op.getLoc(), op.getKind(), tmaPtr, indices, alloc);
+          op.getLoc(), op.getKind(), tmaPtr, indices, alloc,
+          triton::EvictionPolicy::NORMAL);
     };
     lowerTMAStore(op, op.getSrc(), op.getDesc(), createStore, rewriter);
     return success();

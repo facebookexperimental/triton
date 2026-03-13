@@ -132,5 +132,48 @@ private:
 // where the dependency exists without a direct "user".
 void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp);
 
+// Append a suffix to the innermost NameLoc in a Location hierarchy.
+// Handles NameLoc, CallSiteLoc wrapping, and falls back to creating a new
+// NameLoc if no NameLoc is found.
+static Location appendToNameLoc(Location loc, StringRef suffix,
+                                MLIRContext *ctx) {
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    auto newName = (nameLoc.getName().getValue() + suffix).str();
+    return NameLoc::get(StringAttr::get(ctx, newName), nameLoc.getChildLoc());
+  }
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    auto newCallee = appendToNameLoc(callSiteLoc.getCallee(), suffix, ctx);
+    return CallSiteLoc::get(newCallee, callSiteLoc.getCaller());
+  }
+  // No NameLoc found — wrap with a new NameLoc.
+  return NameLoc::get(StringAttr::get(ctx, suffix), loc);
+}
+
+// Extract the outermost NameLoc name, unwrapping CallSiteLoc.
+static std::string getOutermostNameFromLoc(Location loc) {
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
+    return getOutermostNameFromLoc(callSiteLoc.getCallee());
+  if (auto nameLoc = dyn_cast<NameLoc>(loc))
+    return nameLoc.getName().str();
+  return "";
+}
+
+// Replace the outermost NameLoc name (or wrap with one), stripping any
+// intermediate NameLoc layers. Preserves CallSiteLoc wrapping and the
+// innermost non-NameLoc child (FileLineColLoc etc.).
+static Location replaceOutermostNameLoc(Location loc, StringRef name) {
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    auto newCallee = replaceOutermostNameLoc(callSiteLoc.getCallee(), name);
+    return CallSiteLoc::get(newCallee, callSiteLoc.getCaller());
+  }
+  Location child = loc;
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    child = nameLoc.getChildLoc();
+    while (auto inner = dyn_cast<NameLoc>(child))
+      child = inner.getChildLoc();
+  }
+  return NameLoc::get(StringAttr::get(loc.getContext(), name), child);
+}
+
 } // namespace mlir
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_UTILITY_H_

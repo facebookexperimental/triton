@@ -4,6 +4,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
@@ -21,6 +22,7 @@ namespace mlir {
 static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   OpPrintingFlags flags;
   flags.enableDebugInfo();
+  flags.printNameLocAsPrefix(true);
   return flags;
 }
 
@@ -28,7 +30,9 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "");
+                              StringRef writeDecisionFile = "",
+                              int smemAllocAlgo = 0, unsigned smemBudget = 0,
+                              bool smemCircularReuse = false);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers);
@@ -53,7 +57,7 @@ public:
     funcOp->walk([&](Operation *op) {
       if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
         enabled = true;
-      if (auto attr = op->getAttrOfType<IntegerAttr>("ttg.partition"))
+      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName))
         enabled = true;
     });
     if (!enabled) {
@@ -88,7 +92,6 @@ public:
 
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-    // FIXME: skip data partitioning with on-host TMA.
     // FIXME: skip data partitioning for Blackwell.
     bool ForBlackWell = (capability / 10) > 9;
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;
@@ -161,7 +164,9 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    if (failed(doMemoryPlanner(funcOp, numStages))) {
+    if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
+                               /*writeDecisionFile=*/"",
+                               /*smemAllocAlgo=*/0, smemBudget))) {
       signalPassFailure();
       return;
     }

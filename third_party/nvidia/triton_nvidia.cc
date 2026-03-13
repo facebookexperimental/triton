@@ -57,6 +57,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      createTritonGPUProxyFenceInsertionWrapper, int32_t);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
+  ADD_PASS_WRAPPER_0("add_tma_store_buffer_reuse",
+                     ttng::createTritonNvidiaGPUTMAStoreBufferReusePass);
   ADD_PASS_WRAPPER_0("add_promote_lhs_to_tmem",
                      ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
   ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
@@ -75,6 +77,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUOptimizeTMemLayoutsPass);
   ADD_PASS_WRAPPER_0("add_interleave_tmem",
                      ttng::createTritonNvidiaGPUInterleaveTMemPass);
+  ADD_PASS_WRAPPER_0("add_prune_unused_barriers",
+                     ttng::createTritonNvidiaGPUPruneUnusedBarriersPass);
 }
 
 void init_triton_nvidia_passes_nvws(py::module &&m) {
@@ -83,15 +87,19 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_aref", mlir::triton::createNVWSLowerAref);
   ADD_PASS_WRAPPER_0("add_assign_stage_phase",
                      mlir::triton::createNVWSAssignStagePhase);
+  ADD_PASS_WRAPPER_0("add_insert_tmem_aref",
+                     mlir::triton::createNVWSInsertTmemAref);
 }
 
 void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
-  ADD_PASS_OPTION_WRAPPER_4("add_hopper_warpspec",
+  ADD_PASS_OPTION_WRAPPER_5("add_hopper_warpspec",
                             mlir::createNVGPUWarpSpecialization, int, int, bool,
-                            bool);
+                            bool, int);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
+  ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
+                     mlir::createNVGPUPartitionSchedulingMeta);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,
