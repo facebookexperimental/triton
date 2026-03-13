@@ -303,8 +303,17 @@ struct TMAStoreMatch {
   SmallVector<AsyncTaskId> asyncTaskIds;
 };
 
-/// Check whether the terminal local_alloc ops from the matched pattern have
-/// TMA store consumers (tma_copy → token_wait).
+/// Return the SMEM buffer type from the terminal op in a TMA store pattern.
+/// The terminal is either a LocalAllocOp (with src) or a LocalStoreOp.
+static Type getTerminalBufferType(Operation *termOp) {
+  if (auto alloc = dyn_cast<LocalAllocOp>(termOp))
+    return alloc.getResult().getType();
+  return cast<LocalStoreOp>(termOp).getDst().getType();
+}
+
+/// Check whether the terminal ops from the matched pattern have TMA store
+/// consumers (tma_copy → token_wait). The terminal can be a LocalAllocOp
+/// (with src) or a LocalStoreOp.
 static std::optional<TMAStoreMatch>
 matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
   if (matchedOps.empty())
@@ -314,26 +323,41 @@ matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
   if (!terminal.isTerminal)
     return std::nullopt;
 
-  // Verify terminal is a LocalAllocOp with src.
-  if (!isa<LocalAllocOp>(terminal.repOp))
+  // The terminal must be a store to SMEM: either a LocalAllocOp with src
+  // or a LocalStoreOp.
+  bool isAllocTerminal = isa<LocalAllocOp>(terminal.repOp);
+  bool isStoreTerminal = isa<LocalStoreOp>(terminal.repOp);
+  if (!isAllocTerminal && !isStoreTerminal)
     return std::nullopt;
-  auto repAlloc = cast<LocalAllocOp>(terminal.repOp);
-  if (!repAlloc.getSrc())
+  if (isAllocTerminal && !cast<LocalAllocOp>(terminal.repOp).getSrc())
     return std::nullopt;
 
   unsigned numTiles = terminal.perTileOps.size();
   TMAStoreMatch match;
 
   for (unsigned t = 0; t < numTiles; ++t) {
-    auto *allocOp = terminal.perTileOps[t];
-    Value allocResult = allocOp->getResult(0);
+    auto *termOp = terminal.perTileOps[t];
 
-    // Find the single user of the memdesc result — must be
-    // AsyncTMACopyLocalToGlobalOp.
-    if (!allocResult.hasOneUse())
-      return std::nullopt;
-    auto tmaCopy =
-        dyn_cast<AsyncTMACopyLocalToGlobalOp>(*allocResult.getUsers().begin());
+    // Find the AsyncTMACopyLocalToGlobalOp that consumes the SMEM buffer.
+    AsyncTMACopyLocalToGlobalOp tmaCopy;
+    if (isAllocTerminal) {
+      // LocalAllocOp: the memdesc result should have a single tma_copy user.
+      Value allocResult = termOp->getResult(0);
+      if (!allocResult.hasOneUse())
+        return std::nullopt;
+      tmaCopy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(
+          *allocResult.getUsers().begin());
+    } else {
+      // LocalStoreOp: find the tma_copy that uses the same dst memdesc.
+      Value memdesc = cast<LocalStoreOp>(termOp).getDst();
+      for (auto *user : memdesc.getUsers()) {
+        if (user == termOp)
+          continue;
+        tmaCopy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(user);
+        if (tmaCopy)
+          break;
+      }
+    }
     if (!tmaCopy)
       return std::nullopt;
 
@@ -490,7 +514,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
   SmallVector<SmallVector<Value>> setupYieldValues(numTiles);
 
   // Number of matched ops to include in the tile body clone loop.
-  // When TMA match is present, we exclude the terminal local_alloc.
+  // When TMA match is present, we exclude the terminal SMEM write op.
   unsigned matchedOpsToClone =
       tmaMatch ? matchedOps.size() - 1 : matchedOps.size();
 
@@ -578,8 +602,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
 
   if (tmaMatch) {
     // Buffer memdesc type.
-    tileArgTypes.push_back(
-        cast<LocalAllocOp>(matchedOps.back().repOp).getResult().getType());
+    tileArgTypes.push_back(getTerminalBufferType(matchedOps.back().repOp));
 
     // Varying TMA operand types.
     auto repCopy =
@@ -618,8 +641,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
     // If TMA match, create the mutable buffer local_alloc (no src).
     Value bufAllocResult;
     if (tmaMatch) {
-      auto allocType =
-          cast<LocalAllocOp>(matchedOps.back().repOp).getResult().getType();
+      auto allocType = getTerminalBufferType(matchedOps.back().repOp);
       bufAllocResult = builder.create<LocalAllocOp>(loc, allocType);
     }
 
@@ -810,12 +832,17 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
   SmallVector<SmallVector<Value>> setupYieldValues(numTiles);
   SmallVector<Type> tileArgTypes;
 
-  // First arg: memdesc from the original (surviving) local_alloc.
+  // First arg: memdesc from the original (surviving) terminal op.
+  auto getTerminalMemdesc = [](Operation *op) -> Value {
+    if (auto alloc = dyn_cast<LocalAllocOp>(op))
+      return alloc.getResult();
+    return cast<LocalStoreOp>(op).getDst();
+  };
   tileArgTypes.push_back(
-      matchedOps.back().perTileOps[0]->getResult(0).getType());
+      getTerminalMemdesc(matchedOps.back().perTileOps[0]).getType());
   for (unsigned t = 0; t < numTiles; ++t)
     setupYieldValues[t].push_back(
-        matchedOps.back().perTileOps[t]->getResult(0));
+        getTerminalMemdesc(matchedOps.back().perTileOps[t]));
 
   // Varying TMA operands.
   auto repCopy =
