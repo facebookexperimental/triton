@@ -89,13 +89,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
+        nargs="+",
         choices=list(ATTENTION_METHODS.keys()),
-        help=f"Run only the specified version. Choices: {list(ATTENTION_METHODS.keys())}",
+        help=f"Run only the specified version(s). Choices: {list(ATTENTION_METHODS.keys())}",
     )
     args = parser.parse_args()
 
     if is_blackwell():
-        versions = [args.version] if args.version else list(ATTENTION_METHODS.keys())
+        versions = args.version if args.version else list(ATTENTION_METHODS.keys())
         print(f"Running benchmarks for: {versions}")
         benchmark = create_benchmark(versions)
         benchmark.run(print_data=True)
