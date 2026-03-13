@@ -861,7 +861,7 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
         groupStart = maxCrossStageMin * 2 - 1; // e.g., 3
 
       // Clamp to the reuse group limit (numBuffers per channel).
-      unsigned reuseGroupLimit = numBuffers * 2;
+      unsigned reuseGroupLimit = numBuffers * candidateIndices.size();
       if (groupStart > reuseGroupLimit)
         groupStart = reuseGroupLimit;
 
