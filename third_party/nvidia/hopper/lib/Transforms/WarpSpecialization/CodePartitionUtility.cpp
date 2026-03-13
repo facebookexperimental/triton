@@ -458,6 +458,50 @@ void getReuseChannels(ReuseGroup *group, Operation *regionOp,
   assert(false);
 }
 
+// Like getReuseChannels, but outputs Channel* pointers instead of Operation*.
+// For control flow ops (ForOp/IfOp), pushes nullptr since they are not
+// channels.
+void getReuseChannelPtrs(ReuseGroup *group, Operation *regionOp,
+                         SmallVector<Channel *> &chPtrList) {
+  if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp))
+    return;
+  if (group->channels.size() <= 1 || group->channels[0]->getNumBuffers() <= 1)
+    return;
+  if (auto ifOp = dyn_cast<scf::IfOp>(regionOp)) {
+    for (Operation &op : ifOp.thenBlock()->getOperations()) {
+      if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
+        if (needAccumCntForReuse(&op, group)) {
+          chPtrList.push_back(nullptr);
+        }
+      } else {
+        for (auto *ch : group->channels) {
+          if (&op == ch->getDstOp()) {
+            chPtrList.push_back(ch);
+          }
+        }
+      }
+    }
+    return;
+  }
+  if (auto forOp = dyn_cast<scf::ForOp>(regionOp)) {
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      if (isa<scf::ForOp>(&op) || isa<scf::IfOp>(&op)) {
+        if (needAccumCntForReuse(&op, group)) {
+          chPtrList.push_back(nullptr);
+        }
+      } else {
+        for (auto *ch : group->channels) {
+          if (&op == ch->getDstOp()) {
+            chPtrList.push_back(ch);
+          }
+        }
+      }
+    }
+    return;
+  }
+  assert(false);
+}
+
 // regionOp must contains channels in config[idx].
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,
@@ -614,20 +658,15 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // parentForOp.
   // Go through chList in the parentForOp, assume ch is directly in parentForOp.
   // FIXME: handle the case where ch is inside in IfOp.
-  SmallVector<Operation *> chList;
+  // Use Channel* list to correctly distinguish channels that share a dstOp.
+  SmallVector<Channel *> chPtrList;
   auto parentForOp = op->getParentOfType<scf::ForOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
-                   chList);
-  assert(chList.size() >= 1);
-  int vecIdx = 0, theIdx = -1;
-  for (auto *tCh : chList) {
-    if (tCh == ch->getDstOp()) {
-      theIdx = vecIdx;
-      break;
-    }
-    ++vecIdx;
-  }
-  assert(theIdx >= 0);
+  getReuseChannelPtrs(config->getGroup(reuseGroupIdx),
+                      parentForOp.getOperation(), chPtrList);
+  assert(chPtrList.size() >= 1);
+  auto it = llvm::find(chPtrList, ch);
+  assert(it != chPtrList.end());
+  int theIdx = std::distance(chPtrList.begin(), it);
   if (theIdx == 0) {
     std::tie(bufferIdx, phase) =
         getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
