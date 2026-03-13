@@ -50,10 +50,6 @@ namespace nvidia_gpu {
 
 static constexpr int numTmemRows = 128;
 
-int getTmemScalesColumnsPerBuffer(int m, int k) {
-  return ceil<int>(m, 32) * ceil<int>(k, 4);
-}
-
 TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
   auto *ctx = memDescType.getContext();
   auto S = [&](StringRef str) { return StringAttr::get(ctx, str); };
