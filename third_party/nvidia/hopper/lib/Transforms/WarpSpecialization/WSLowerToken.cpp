@@ -6,6 +6,7 @@
 
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
