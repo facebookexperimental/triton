@@ -3503,6 +3503,97 @@ def test_descriptor_load_multicast(device):
     torch.testing.assert_close(x3, y3)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell for 2-CTA cluster with cta_group::2")
+def test_descriptor_load_two_cta(device):
+    """Test that async_descriptor_load with two_cta=True uses .cta_group::2.
+
+    Two CTAs in a cluster each load their own tile independently. With two_cta=True,
+    the TMA instruction uses .cta_group::2 so the mbarrier completion signal is
+    automatically routed to the leader CTA's barrier based on %cluster_ctarank parity.
+    The leader's barrier expects both CTAs' worth of bytes and only completes when
+    both loads finish.
+    """
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def two_cta_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        NUM_CTAS: tl.constexpr = 2
+        cta_rank = tlx.cluster_cta_rank()
+        is_leader = cta_rank == 0
+
+        pid = tl.program_id(0)
+
+        desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // NUM_CTAS],
+        )
+        desc_out = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // NUM_CTAS],
+        )
+
+        # Each CTA has its own SMEM buffer for its portion of the tile
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N // NUM_CTAS), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+
+        # Leader's barrier tracks BOTH CTAs' TMA loads via cta_group::2
+        bars = tlx.alloc_barriers(tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+
+        TILE_BYTES: tl.constexpr = BLOCK_SIZE_M * BLOCK_SIZE_N * tlx.size_of(tlx.dtype_of(desc_in))
+        if is_leader:
+            # Leader expects both CTAs' worth of bytes
+            tlx.barrier_expect_bytes(bar, TILE_BYTES)
+        tlx.cluster_barrier()
+
+        # Cluster index: each cluster of NUM_CTAS CTAs processes one row tile
+        cluster_id = pid // NUM_CTAS
+        off_m = cluster_id * BLOCK_SIZE_M
+
+        # Each CTA loads a portion of column-tile; cta_group::2 routes both
+        # completions to the leader's barrier automatically
+        off_n = cta_rank * BLOCK_SIZE_N // NUM_CTAS
+
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar, two_ctas=True)
+
+        # Leader waits for both loads to complete
+        if is_leader:
+            tlx.barrier_wait(bar=bar, phase=0)
+
+        # Cluster-wide sync: CTA 1 waits here until CTA 0 has confirmed both loads are done
+        tlx.cluster_barrier()
+        tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 128, 128
+    x = torch.rand((M, N), dtype=torch.float16, device=device)
+    y = torch.zeros_like(x)
+    grid = lambda meta: (2, )
+
+    kernel = two_cta_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                       ctas_per_cga=(2, 1, 1))
+
+    # Verify the PTX uses .cta_group::2
+    ptx = kernel.asm["ptx"]
+    assert ptx.count("cta_group::2") >= 1
+    # Should NOT be multicast — each CTA loads its own tile
+    assert "multicast::cluster" not in ptx
+
+    # CTA 0 loaded x[0:128, 0:64] → y[0:128, 0:64]
+    # CTA 1 loaded x[0:128, 64:128] → y[0:128, 64:128]
+    torch.testing.assert_close(x, y)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_local_gather(device):
 

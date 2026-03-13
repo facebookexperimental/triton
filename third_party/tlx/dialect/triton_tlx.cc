@@ -644,7 +644,8 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, std::vector<Value> &multicastTargets,
               Value desc, std::vector<Value> &coord, Value mbarrier, Value pred,
               Value result, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> void {
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              bool twoCta) -> void {
              Value multicastTargetBitMask;
              if (multicastTargets.empty()) {
                multicastTargetBitMask = Value();
@@ -663,7 +664,7 @@ void init_triton_tlx_ir(py::module &&m) {
              }
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
                  multicastTargetBitMask, desc, coord, mbarrier, result, pred,
-                 cacheModifier, evictionPolicy, isVolatile);
+                 cacheModifier, evictionPolicy, isVolatile, twoCta);
            })
       .def("create_async_TMA_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,

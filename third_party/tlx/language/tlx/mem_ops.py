@@ -762,8 +762,29 @@ def async_descriptor_load(
     cache_modifier: str = "",
     eviction_policy: str = "",
     multicast_targets: list[tl.tensor] = [],
+    two_ctas: bool = False,
     _semantic=None,
 ) -> None:
+    """
+    Async TMA load from global memory to shared memory, tracked by a barrier.
+
+    Args:
+        desc: TMA tensor descriptor.
+        result: Destination buffered tensor in SMEM.
+        offsets: Coordinates in the global tensor.
+        barrier: The mbarrier to signal upon TMA completion.
+        pred: Optional predicate for conditional load.
+        cache_modifier: Cache modifier hint.
+        eviction_policy: L2 eviction policy.
+        multicast_targets: List of CTA indices for multicast TMA.
+        two_ctas: If True, uses .cta_group::2 on the TMA instruction and
+                 automatically applies remote_view to map the barrier to the
+                 leader CTA (rank 0) via mapa.shared::cluster. The .cta_group::2
+                 modifier routes the mbarrier completion signal based on the
+                 %cluster_ctarank parity of the barrier address. Together with
+                 the remote_view to rank 0 (even parity), this ensures both CTAs'
+                 TMA loads signal the leader's barrier.
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
     assert eviction_policy in ("", "evict_first", "evict_last"), \
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'"
@@ -778,6 +799,8 @@ def async_descriptor_load(
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
+    if two_ctas:
+        barrier = remote_view(barrier, 0, _semantic=_semantic)
     _semantic.builder.create_async_TMA_load(
         multicast_targets,
         desc.handle,
@@ -788,6 +811,7 @@ def async_descriptor_load(
         cache,
         eviction,
         False,
+        two_ctas,
     )
 
 
