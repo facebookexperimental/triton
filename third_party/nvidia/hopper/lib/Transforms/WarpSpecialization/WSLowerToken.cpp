@@ -66,6 +66,8 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   ttng::ArriveBarrierOp arriveOp;
 
   assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
+  if (op.getFenced())
+    builder.create<ttng::FenceAsyncSharedOp>(loc, /*bCluster=*/false);
   arriveOp =
       builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, 1); // fullCnt);
 
@@ -241,6 +243,11 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+        for (Operation *other : usersForToken) {
+          if (auto commitOp = dyn_cast<ttnvws::ProducerCommitOp>(other))
+            assert(!commitOp.getFenced() &&
+                   "TMAStoreTokenWaitOp token should never be fenced");
+        }
         Value truePred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
         for (auto [nvwsTok, nvwsIdx] :
              llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
@@ -341,5 +348,24 @@ void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   // lowerGetAsyncTaskIdOp(mod, numConsumerGroups);
   lowerTokenOperations(mod, numCTAs, numConsumerGroups);
 }
+
+// ---------------------------------------------------------------------------
+// Test-only pass wrapper
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUTESTWSLOWERTOKEN
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestWSLowerTokenPass
+    : public impl::NVGPUTestWSLowerTokenBase<NVGPUTestWSLowerTokenPass> {
+public:
+  using impl::NVGPUTestWSLowerTokenBase<
+      NVGPUTestWSLowerTokenPass>::NVGPUTestWSLowerTokenBase;
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      doTokenLowering(funcOp, numConsumerGroups);
+    });
+  }
+};
 
 } // namespace mlir
