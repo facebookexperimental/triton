@@ -620,6 +620,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                    chList);
   assert(chList.size() >= 1);
   int vecIdx = 0, theIdx = -1;
+  // TODO: Cause of issues.
   for (auto *tCh : chList) {
     if (tCh == ch->getDstOp()) {
       theIdx = vecIdx;

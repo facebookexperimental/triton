@@ -6,7 +6,7 @@ import triton.language.extra.tlx as tlx
 
 from typing import Optional
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+# DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 def alloc_fn(size: int, align: int, stream: Optional[int]):

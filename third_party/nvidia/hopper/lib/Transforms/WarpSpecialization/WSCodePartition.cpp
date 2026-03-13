@@ -3602,6 +3602,26 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
         continue;
       if (ch->getDstOp() != rep->getDstOp())
         continue;
+      // Also check that the full consumer sets match.
+      // getDstOp() only returns the first consumer, but channels can have
+      // multiple consumers (e.g., B feeds both MMA_0 and MMA_1).
+      // Only merge when ALL consumers are the same.
+      {
+        SmallVector<Operation *> chDsts, repDsts;
+        ch->getDstOps(chDsts);
+        rep->getDstOps(repDsts);
+        // getDstOps returns empty for base Channel (single consumer) —
+        // in that case getDstOp() check above is sufficient.
+        if (!chDsts.empty() || !repDsts.empty()) {
+          if (chDsts.size() != repDsts.size()) {
+            continue;
+          }
+          llvm::sort(chDsts, [](Operation *a, Operation *b) { return a < b; });
+          llvm::sort(repDsts, [](Operation *a, Operation *b) { return a < b; });
+          if (chDsts != repDsts)
+            continue;
+        }
+      }
       // Skip if either producer is a TCGen5MMAOp: commit handling for
       // MMA-produced TMEM channels doesn't work when fused into one group.
       //
