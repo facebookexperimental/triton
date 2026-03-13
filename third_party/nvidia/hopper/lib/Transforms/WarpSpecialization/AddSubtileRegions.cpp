@@ -294,7 +294,6 @@ static SmallVector<MatchedOp> matchForwardOps(ArrayRef<Value> subtileLeaves) {
 
 /// Describes a matched TMA store sequence across all subtiles.
 struct TMAStoreMatch {
-  SmallVector<Operation *> perTileFenceOps;
   SmallVector<Operation *> perTileTMACopyOps;
   SmallVector<Operation *> perTileTokenWaitOps;
   /// For each non-src operand of the tma_copy (desc, coords):
@@ -305,8 +304,7 @@ struct TMAStoreMatch {
 };
 
 /// Check whether the terminal local_alloc ops from the matched pattern have
-/// TMA store consumers (fence → tma_copy → token_wait). This is a separate
-/// post-match phase because the fence is positional, not in the use chain.
+/// TMA store consumers (tma_copy → token_wait).
 static std::optional<TMAStoreMatch>
 matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
   if (matchedOps.empty())
@@ -339,19 +337,6 @@ matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
     if (!tmaCopy)
       return std::nullopt;
 
-    // Walk forward from local_alloc to find a FenceAsyncSharedOp between
-    // it and the tma_copy.
-    Operation *fence = nullptr;
-    for (auto *node = allocOp->getNextNode();
-         node && node != tmaCopy.getOperation(); node = node->getNextNode()) {
-      if (isa<FenceAsyncSharedOp>(node)) {
-        fence = node;
-        break;
-      }
-    }
-    if (!fence)
-      return std::nullopt;
-
     // Find TMAStoreTokenWaitOp that uses the tma_copy token.
     Value token = tmaCopy.getToken();
     if (!token || !token.hasOneUse())
@@ -364,16 +349,12 @@ matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
     if (!tokenWait.getBarriers().empty())
       return std::nullopt;
 
-    match.perTileFenceOps.push_back(fence);
     match.perTileTMACopyOps.push_back(tmaCopy);
     match.perTileTokenWaitOps.push_back(tokenWait);
   }
 
   // Verify structural identity across all subtiles.
   for (unsigned t = 1; t < numTiles; ++t) {
-    if (match.perTileFenceOps[0]->getAttrs() !=
-        match.perTileFenceOps[t]->getAttrs())
-      return std::nullopt;
     if (match.perTileTMACopyOps[0]->getAttrs() !=
         match.perTileTMACopyOps[t]->getAttrs())
       return std::nullopt;
@@ -476,16 +457,11 @@ verifyAsyncPartitionConsistency(Operation *setupRoot, SplitOp rootSplit,
 ///
 /// When \p tmaMatch is provided (same-task case), the tile body is extended
 /// to include TMA store ops with SMEM buffer reuse: the terminal local_alloc
-/// is replaced by local_store + fence + tma_copy + wait.
-///
-/// When \p fenceOps is non-empty (different-task case), a fence is appended
-/// after the terminal matched op in the tile body, and the original fence ops
-/// are erased.
+/// is replaced by local_store + tma_copy + wait.
 static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
                                 ArrayRef<Value> subtileLeaves,
                                 ArrayRef<MatchedOp> matchedOps,
-                                const TMAStoreMatch *tmaMatch = nullptr,
-                                ArrayRef<Operation *> fenceOps = {}) {
+                                const TMAStoreMatch *tmaMatch = nullptr) {
   unsigned numTiles = subtileLeaves.size();
   if (matchedOps.empty())
     return;
@@ -736,9 +712,6 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
       // local_store %prev_result, %buf_arg
       builder.create<LocalStoreOp>(loc, prevTileResult, bufArg);
 
-      // fence_async_shared {bCluster = false}
-      builder.create<FenceAsyncSharedOp>(loc, /*bCluster=*/false);
-
       // Build tma_copy operands (desc, coords).
       auto repCopy =
           cast<AsyncTMACopyLocalToGlobalOp>(tmaMatch->perTileTMACopyOps[0]);
@@ -779,12 +752,6 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
                                           /*nvws_token_indices=*/ValueRange{});
     }
 
-    // When fence ops are provided (different-task case), append a fence
-    // after the terminal matched op. The fence orders the SMEM write
-    // (local_alloc with src) before the TMA hardware read.
-    if (!fenceOps.empty())
-      builder.create<FenceAsyncSharedOp>(loc, /*bCluster=*/false);
-
     builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
   }
 
@@ -800,15 +767,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
     for (auto *op : tmaMatch->perTileTMACopyOps)
       if (op->use_empty())
         op->erase();
-    for (auto *op : tmaMatch->perTileFenceOps)
-      if (op->use_empty())
-        op->erase();
   }
-
-  // When fence ops are provided (different-task case), erase the originals.
-  for (auto *op : fenceOps)
-    if (op->use_empty())
-      op->erase();
 
   // Erase per-tile ops in reverse order (last matched op first) so that
   // uses are removed before defs. Skip ops that still have external uses.
@@ -918,7 +877,7 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
     Value bufArg = tileBlock->getArgument(0);
     unsigned argIdx = 1;
 
-    // desc (fence is in the first subtile region, not here)
+    // desc
     capturedIdx = 0;
     Value desc;
     if (tmaMatch.capturedOperands[capturedIdx]) {
@@ -954,8 +913,7 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
     builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
   }
 
-  // Erase original TMA store ops (fence ops are erased by the first subtile
-  // region builder since the fence belongs with the store).
+  // Erase original TMA store ops.
   for (auto *op : tmaMatch.perTileTokenWaitOps)
     op->erase();
   for (auto *op : tmaMatch.perTileTMACopyOps)
@@ -1031,11 +989,9 @@ void doAddSubtileRegions(triton::FuncOp &funcOp) {
         buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps,
                             &*tmaMatch);
       } else {
-        // Build first subtile region with fence appended (local_allocs
-        // survive).
-        buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps,
-                            /*tmaMatch=*/nullptr, tmaMatch->perTileFenceOps);
-        // Build second subtile region for TMA stores (no fence).
+        // Build first subtile region (local_allocs survive).
+        buildSubtiledRegion(setupRoot, rootSplit, leaves, matchedOps);
+        // Build second subtile region for TMA stores.
         buildTMAStoreSubtiledRegion(matchedOps, *tmaMatch);
       }
     } else {
