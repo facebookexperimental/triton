@@ -860,9 +860,10 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
       if (maxCrossStageMin >= 2)
         groupStart = maxCrossStageMin * 2 - 1; // e.g., 3
 
-      // Clamp to num_buffers.
-      if (groupStart > numBuffers)
-        groupStart = numBuffers;
+      // Clamp to the reuse group limit (numBuffers per channel).
+      unsigned reuseGroupLimit = numBuffers * 2;
+      if (groupStart > reuseGroupLimit)
+        groupStart = reuseGroupLimit;
 
       bufA.numCopies = groupStart;
       bufB.numCopies = groupStart;
@@ -887,7 +888,8 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
 
     bool foundValidSolution = false;
 
-    while (currentGroupCopies <= numBuffers) {
+    unsigned reuseGroupLimit = numBuffers * candidateIndices.size();
+    while (currentGroupCopies <= reuseGroupLimit) {
       if (isReuseGroup) {
         // Reuse group path: set group copies and check budget.
         auto &bufA = wsBuffers[candidateIndices[0]];
