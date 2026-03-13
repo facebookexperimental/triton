@@ -2775,6 +2775,46 @@ void insertAsyncComm(
         producerAcquireForChannelLoop = bwdCh->getDstOp();
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
+
+    // 2-buffer reuse group handling: determine if producer_acquire needs to
+    // be moved for correct synchronization across reused buffers.
+    // Use reuseBarrier=false to find reuse groups even with single-copy
+    // buffers.
+    int reuseGrp2 = channelInReuseGroup(masterChannel, config,
+                                        /*reuseBarrier=*/false);
+    if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
+      auto *group = config->getGroup(reuseGrp2);
+      if (group->channels.size() == 2 && verifyReuseGroup2(group)) {
+        auto [earlyChannel, lateChannel] = orderReuseGroup2(group);
+        if (masterChannel == lateChannel &&
+            needExplicitReuseWait(earlyChannel, lateChannel)) {
+          // Move the late buffer's producer_acquire to before the early
+          // buffer's producer so that the shared token ensures the late
+          // buffer's consumer_release completes before the early buffer is
+          // overwritten. The early channel's producer must be in the same
+          // block and appear before the late channel's head producer.
+          // Additionally, the late channel's consumer must be in the same
+          // block as the early channel's producer — otherwise they are in
+          // different partitions and the reuse ordering is already handled
+          // implicitly (e.g., in the FWD persistent kernel where the
+          // tmem_store and MMA are in separate task partitions).
+          auto *earlyProducer = earlyChannel->getSrcOp();
+          auto *lateConsumer = lateChannel->getDstOp();
+          if (earlyProducer->getBlock() == headProducer->getBlock() &&
+              lateConsumer->getBlock() == earlyProducer->getBlock() &&
+              appearsBefore(earlyProducer, headProducer)) {
+            producerAcquireForChannelLoop = earlyProducer;
+            LLVM_DEBUG({
+              LDBG("reuse group: move producer_acquire for late channel "
+                   << masterChannel->uniqID << " before early channel "
+                   << earlyChannel->uniqID << " producer");
+              producerAcquireForChannelLoop->dump();
+            });
+          }
+        }
+      }
+    }
+
     builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
@@ -2935,11 +2975,124 @@ void insertAsyncComm(
                                                                consumerBarrier);
           builder.clearLoopScheduleInfo();
         }
-        auto tmemWaitBarrier = desyncTCGen5MMAOp(
-            builder, mmaOp, consumerBarrier, bufferIdx, phase,
-            masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config, addCompletionBarrier);
-        tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+
+        // For operand D TMEM channels where the producer is a TMEMStoreOp
+        // (e.g., reduction partition zeroing dk/dv), we must not use the
+        // gen5 inline barrier (consumerBarrier) as the producer_acquire
+        // for the TMEMStoreOp. That barrier fires when the MMA commits
+        // (tc_gen5_commit), but the TMEMStoreOp must wait until the
+        // sibling channel's consumer (tmem_load in the computation
+        // partition) finishes reading the TMEM. Otherwise, the
+        // TMEMStoreOp races with the tmem_load, corrupting the result.
+        //
+        // Fix: Find the sibling channel (gen5 MMA → tmem_load, same TMEM
+        // alloc) and create a token-based dependency:
+        //   tmem_load → ConsumerRelease(tok) → ProducerAcquire(tok) →
+        //   tmem_store
+        // This ensures the TMEMStoreOp waits for the tmem_load to finish.
+        bool useTokenForProducerAcquire = false;
+        if (masterChannel->channelKind == DataChannelKind::TMEMPost &&
+            isa<ttng::TMEMStoreOp>(headProducer)) {
+          auto *tmemPostCh =
+              static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+          if (tmemPostCh->isOperandD) {
+            // Find sibling Channel B: same TMEM alloc, gen5 MMA as
+            // producer, tmem_load as consumer.
+            for (auto *sibCh : orderedChannels) {
+              if (sibCh == masterChannel ||
+                  sibCh->channelKind != DataChannelKind::TMEMPost)
+                continue;
+              if (sibCh->getAllocOp() != masterChannel->getAllocOp())
+                continue;
+              // Sibling's producer should be gen5 MMA, consumer tmem_load.
+              if (!isa<ttng::TCGen5MMAOp>(sibCh->getSrcOp()))
+                continue;
+              if (!isa<ttng::TMEMLoadOp>(sibCh->getDstOp()))
+                continue;
+
+              // Only apply the token-based fix when the tmem_store and
+              // sibling tmem_load are in different tasks. When they are
+              // in the same partition (e.g., FA fwd where both the
+              // rescaled acc write-back and acc read are in the
+              // computation partition), program order within the warp
+              // group already guarantees correctness and the original
+              // gen5 inline barrier is sufficient. Applying the token
+              // fix in the same-task case causes a deadlock.
+              int storeTaskId = masterChannel->relation.first;
+              auto &loadTaskIds = sibCh->relation.second;
+              if (llvm::is_contained(loadTaskIds, storeTaskId))
+                continue;
+
+              // Found sibling Channel B. Create a new token for the
+              // tmem_load → tmem_store dependency.
+              OpBuilder tokenBuilder(funcOp);
+              tokenBuilder.setInsertionPointToStart(
+                  &(funcOp.getBody().front()));
+              Value consumedToken = tokenBuilder.create<ttnvws::CreateTokenOp>(
+                  funcOp.getLoc(), masterChannel->getNumBuffers(),
+                  ttnvws::TokenLoadType::TmemLoadOp);
+
+              // Insert ProducerAcquireOp before the tmem_store.
+              builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+              builder.setInsertionPoint(producerAcquirePoint);
+              builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
+              builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                  headProducer->getLoc(), consumedToken, bufferIdx, phase);
+
+              // Insert ConsumerReleaseOp after the sibling's tmem_load.
+              auto *sibTmemLoad = sibCh->getDstOp();
+              // Find the actual last consumer of tmem_load in the
+              // sibling's consumer task.
+              auto sibConsumerTaskId = sibCh->relation.second.front();
+              auto sibConsumerReleasePoint = consumerReleaseHeuristic(
+                  sibCh->getSrcOp(), sibTmemLoad, sibConsumerTaskId);
+              builder.setAsynTaskIdsFromArray(sibCh->relation.second);
+              builder.setInsertionPointAfter(sibConsumerReleasePoint);
+              builder.setLoopScheduleInfoFromOp(sibConsumerReleasePoint);
+              // Create a local bufferIdx for the consumer release in the
+              // sibling consumer's task.  The outer bufferIdx lives in the
+              // master channel's producer task and would become a dangling
+              // reference after code partition splits the tasks into
+              // separate warp groups.
+              Value sibBufIdx =
+                  builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                      sibConsumerReleasePoint->getLoc(), 0, 32);
+              builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  sibConsumerReleasePoint->getLoc(), consumedToken, sibBufIdx);
+
+              useTokenForProducerAcquire = true;
+              LLVM_DEBUG({
+                LDBG("operand D race fix: using token-based "
+                     "producer_acquire for tmem_store channel "
+                     << masterChannel->uniqID << " with sibling channel "
+                     << sibCh->uniqID);
+              });
+              break;
+            }
+          }
+        }
+
+        if (useTokenForProducerAcquire) {
+          // Only add completion barrier to MMA, skip WaitBarrierOp
+          // before tmem_store (token-based acquire handles it).
+          builder.setInsertionPoint(mmaOp);
+          builder.setAsyncTaskIdsFromOp(mmaOp);
+          builder.setLoopScheduleInfoFromOp(mmaOp);
+          if (addCompletionBarrier) {
+            auto barrierForStage =
+                getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+            auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                mmaOp->getLoc(), true, 1);
+            mmaOp.addCompletionBarrier(barrierForStage, pred);
+          }
+          mmaOp.setIsAsync(true);
+        } else {
+          auto tmemWaitBarrier = desyncTCGen5MMAOp(
+              builder, mmaOp, consumerBarrier, bufferIdx, phase,
+              masterChannel->getNumBuffers(), producerAcquirePoint,
+              regionsWithChannels, dom, true, config, addCompletionBarrier);
+          tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+        }
       }
     }
 
