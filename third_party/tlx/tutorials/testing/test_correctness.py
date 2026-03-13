@@ -5,13 +5,9 @@ import torch
 import triton
 
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
-    matmul as _blackwell_gemm_ws,
-    matmul_warp_barrier as _blackwell_gemm_ws_warp_barrier,
-)
+    matmul as _blackwell_gemm_ws, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_clc import (
-    matmul as _blackwell_gemm_clc,
-    matmul_warp_barrier as _blackwell_gemm_clc_warp_barrier,
-)
+    matmul as _blackwell_gemm_clc, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
     matmul as _blackwell_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
@@ -31,9 +27,7 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws import (
 from triton.language.extra.tlx.tutorials.hopper_gemm_pipelined import (
     matmul as _hopper_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
-    matmul as _hopper_gemm_ws,
-    matmul_warp_barrier as _hopper_gemm_ws_warp_barrier,
-)
+    matmul as _hopper_gemm_ws, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
     attention as _hopper_fa_ws_pipelined_pingpong_persistent, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
@@ -104,6 +98,41 @@ class Gemm:
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": False,
+        },
+        "blackwell_gemm_ws_warp_barrier": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1,
+            "EPILOGUE_SUBTILE": 1,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 0,
+            "USE_WARP_BARRIER": True,
+        },
+        "blackwell_gemm_clc_warp_barrier": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "EPILOGUE_SUBTILE": True,
+            "USE_WARP_BARRIER": True,
+        },
+        "hopper_gemm_ws_warp_barrier": {
+            "BM": 128,
+            "BN": 256,
+            "BK": 64,
+            "GROUP_SIZE_M": 8,
+            "NUM_STAGES": 3,
+            "NUM_MMA_WARPS": 8,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": False,
+            "USE_WARP_BARRIER": True,
         },
     }
 
@@ -251,13 +280,13 @@ def test_blackwell_gemm_clc(dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws_warp_barrier(dtype):
-    Gemm.run_test(_blackwell_gemm_ws_warp_barrier, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws_warp_barrier"], dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_clc_warp_barrier(dtype):
-    Gemm.run_test(_blackwell_gemm_clc_warp_barrier, Gemm.CONFIGS["blackwell_gemm_clc"], dtype=dtype)
+    Gemm.run_test(_blackwell_gemm_clc, Gemm.CONFIGS["blackwell_gemm_clc_warp_barrier"], dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
@@ -387,7 +416,7 @@ def test_hopper_gemm_ws():
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
 def test_hopper_gemm_ws_warp_barrier():
-    Gemm.run_test(_hopper_gemm_ws_warp_barrier, Gemm.CONFIGS["hopper_gemm_ws"])
+    Gemm.run_test(_hopper_gemm_ws, Gemm.CONFIGS["hopper_gemm_ws_warp_barrier"])
 
 
 # =============================================================================
