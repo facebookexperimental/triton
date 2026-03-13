@@ -281,6 +281,8 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
 #define GET_ATTRDEF_CLASSES
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUAttrDefs.cpp.inc"
 
+#include "triton/Dialect/TritonNvidiaGPU/IR/OpsEnums.cpp.inc"
+
 //===----------------------------------------------------------------------===//
 // ASM Interface (i.e.: alias)
 //===----------------------------------------------------------------------===//
