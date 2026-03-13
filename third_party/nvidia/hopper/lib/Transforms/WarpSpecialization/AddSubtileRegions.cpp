@@ -424,41 +424,74 @@ matchTMAStoreOps(ArrayRef<MatchedOp> matchedOps) {
 }
 
 //===----------------------------------------------------------------------===//
-// Async partition consistency
+// Partition and schedule consistency
 //===----------------------------------------------------------------------===//
 
-/// Verify that all setup and matched ops share the same async_task_id
-/// partition. Emits an error on \p rootSplit and returns failure if not.
+/// Verify that all setup and matched ops share the same async_task_id,
+/// loop.stage, and loop.cluster. Emits an error on \p rootSplit and returns
+/// failure if not.
 static LogicalResult
-verifyAsyncPartitionConsistency(Operation *setupRoot, SplitOp rootSplit,
-                                ArrayRef<MatchedOp> matchedOps) {
+verifyPartitionAndScheduleConsistency(Operation *setupRoot, SplitOp rootSplit,
+                                      ArrayRef<MatchedOp> matchedOps) {
   SmallVector<Operation *> setupOps;
   collectSetupOps(setupRoot, rootSplit, setupOps);
 
   SmallVector<AsyncTaskId> referenceIds;
-  bool foundReference = false;
+  bool foundAsyncRef = false;
 
-  auto checkOp = [&](Operation *op) -> bool {
+  IntegerAttr referenceStage;
+  bool foundStageRef = false;
+
+  IntegerAttr referenceCluster;
+  bool foundClusterRef = false;
+
+  auto checkOp = [&](Operation *op) -> std::optional<std::string> {
+    // Check async_task_id.
     auto ids = getAsyncTaskIds(op);
-    if (ids.empty())
-      return true;
-    if (!foundReference) {
-      referenceIds = std::move(ids);
-      foundReference = true;
-      return true;
+    if (!ids.empty()) {
+      if (!foundAsyncRef) {
+        referenceIds = std::move(ids);
+        foundAsyncRef = true;
+      } else if (ids != referenceIds) {
+        return std::string(
+            "ops in subtile region have inconsistent async_task_id partitions");
+      }
     }
-    return ids == referenceIds;
+
+    // Check loop.stage.
+    if (op->hasAttr(tt::kLoopStageAttrName)) {
+      auto stage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+      if (!foundStageRef) {
+        referenceStage = stage;
+        foundStageRef = true;
+      } else if (stage != referenceStage) {
+        return std::string(
+            "ops in subtile region have inconsistent loop.stage attributes");
+      }
+    }
+
+    // Check loop.cluster.
+    if (op->hasAttr(tt::kLoopClusterAttrName)) {
+      auto cluster = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+      if (!foundClusterRef) {
+        referenceCluster = cluster;
+        foundClusterRef = true;
+      } else if (cluster != referenceCluster) {
+        return std::string(
+            "ops in subtile region have inconsistent loop.cluster attributes");
+      }
+    }
+
+    return std::nullopt;
   };
 
   for (Operation *op : setupOps)
-    if (!checkOp(op))
-      return rootSplit.emitError(
-          "ops in subtile region have inconsistent async_task_id partitions");
+    if (auto err = checkOp(op))
+      return rootSplit.emitError(*err);
   for (auto &m : matchedOps)
     for (Operation *op : m.perTileOps)
-      if (!checkOp(op))
-        return rootSplit.emitError(
-            "ops in subtile region have inconsistent async_task_id partitions");
+      if (auto err = checkOp(op))
+        return rootSplit.emitError(*err);
   return success();
 }
 
@@ -481,6 +514,42 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
 
   OpBuilder builder(matchedOps.front().perTileOps[0]);
   Location loc = setupRoot->getLoc();
+
+  // Collect reference attributes (async_task_id, loop.stage, loop.cluster)
+  // from the first element that has them.
+  SmallVector<AsyncTaskId> refAsyncTaskIds;
+  IntegerAttr refLoopStage;
+  IntegerAttr refLoopCluster;
+  {
+    SmallVector<Operation *> allRefOps;
+    SmallVector<Operation *> setupOps;
+    collectSetupOps(setupRoot, rootSplit, setupOps);
+    allRefOps.append(setupOps.begin(), setupOps.end());
+    for (auto &m : matchedOps)
+      allRefOps.append(m.perTileOps.begin(), m.perTileOps.end());
+    for (Operation *op : allRefOps) {
+      if (refAsyncTaskIds.empty()) {
+        auto ids = getAsyncTaskIds(op);
+        if (!ids.empty())
+          refAsyncTaskIds = std::move(ids);
+      }
+      if (!refLoopStage && op->hasAttr(tt::kLoopStageAttrName))
+        refLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+      if (!refLoopCluster && op->hasAttr(tt::kLoopClusterAttrName))
+        refLoopCluster =
+            op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+    }
+  }
+
+  // Helper to apply reference attributes to a newly created op.
+  auto applyRefAttrs = [&](Operation *op) {
+    if (!refAsyncTaskIds.empty())
+      setAsyncTaskIds(op, refAsyncTaskIds);
+    if (refLoopStage)
+      op->setAttr(tt::kLoopStageAttrName, refLoopStage);
+    if (refLoopCluster)
+      op->setAttr(tt::kLoopClusterAttrName, refLoopCluster);
+  };
 
   // Determine tile block arguments: for each matched op, collect the varying
   // operand values per tile. These become setup yields and tile block args.
@@ -612,6 +681,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
       loc, /*resultTypes=*/TypeRange{},
       /*barriers=*/ValueRange{}, /*barrierPhases=*/ValueRange{},
       /*barrierAnnotations=*/builder.getArrayAttr({}));
+  applyRefAttrs(subtileOp);
 
   // --- Setup region ---
   Block *setupBlock = builder.createBlock(&subtileOp.getSetupRegion());
@@ -630,7 +700,9 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
   Value bufAllocResult;
   if (tmaMatch) {
     auto allocType = getTerminalBufferType(matchedOps.back().repOp);
-    bufAllocResult = builder.create<LocalAllocOp>(loc, allocType);
+    auto allocOp = builder.create<LocalAllocOp>(loc, allocType);
+    applyRefAttrs(allocOp);
+    bufAllocResult = allocOp;
   }
 
   // Build setup yield operands: remap the flatSetupYields.
@@ -643,7 +715,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
       remappedYields.push_back(setupMapping.lookupOrDefault(v));
   }
 
-  builder.create<SubtiledRegionYieldOp>(loc, remappedYields);
+  applyRefAttrs(builder.create<SubtiledRegionYieldOp>(loc, remappedYields));
 
   // --- Tile region ---
   Block *tileBlock = builder.createBlock(&subtileOp.getTileRegion());
@@ -718,7 +790,7 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
     Value bufArg = tileBlock->getArgument(bufArgIdx);
 
     // local_store %prev_result, %buf_arg
-    builder.create<LocalStoreOp>(loc, prevTileResult, bufArg);
+    applyRefAttrs(builder.create<LocalStoreOp>(loc, prevTileResult, bufArg));
 
     // Build tma_copy operands (desc, coords).
     auto repCopy =
@@ -751,16 +823,19 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
     auto tokenType = AsyncTokenType::get(builder.getContext());
     auto tmaCopy = builder.create<AsyncTMACopyLocalToGlobalOp>(
         loc, tokenType, desc, coords, bufArg, repCopy.getEvict());
+    applyRefAttrs(tmaCopy);
 
     // tma_store_token_wait
-    builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
-                                        /*barriers=*/ValueRange{},
-                                        /*barrier_preds=*/ValueRange{},
-                                        /*nvws_tokens=*/ValueRange{},
-                                        /*nvws_token_indices=*/ValueRange{});
+    auto tokenWait = builder.create<TMAStoreTokenWaitOp>(
+        loc, tmaCopy.getToken(),
+        /*barriers=*/ValueRange{},
+        /*barrier_preds=*/ValueRange{},
+        /*nvws_tokens=*/ValueRange{},
+        /*nvws_token_indices=*/ValueRange{});
+    applyRefAttrs(tokenWait);
   }
 
-  builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
+  applyRefAttrs(builder.create<SubtiledRegionYieldOp>(loc, ValueRange{}));
 
   // --- Teardown region (empty) ---
   // The teardown region is left empty (AnyRegion with 0 blocks).
@@ -788,9 +863,9 @@ static void buildSubtiledRegion(Operation *setupRoot, SplitOp rootSplit,
   // Erase setup ops in reverse topological order. Skip ops that still have
   // uses outside the setup chain (e.g. a tmem_load whose token result is
   // consumed elsewhere).
-  SmallVector<Operation *> setupOps;
-  collectSetupOps(setupRoot, rootSplit, setupOps);
-  for (auto it = setupOps.rbegin(); it != setupOps.rend(); ++it) {
+  SmallVector<Operation *> setupOpsToErase;
+  collectSetupOps(setupRoot, rootSplit, setupOpsToErase);
+  for (auto it = setupOpsToErase.rbegin(); it != setupOpsToErase.rend(); ++it) {
     if ((*it)->use_empty())
       (*it)->erase();
   }
@@ -812,6 +887,29 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
   OpBuilder builder(lastTMAOp);
   builder.setInsertionPointAfter(lastTMAOp);
   Location loc = matchedOps.back().repOp->getLoc();
+
+  // Collect reference attributes from TMA store ops.
+  SmallVector<AsyncTaskId> refAsyncTaskIds = tmaMatch.asyncTaskIds;
+  IntegerAttr refLoopStage;
+  IntegerAttr refLoopCluster;
+  for (auto *op : tmaMatch.perTileTMACopyOps) {
+    if (!refLoopStage && op->hasAttr(tt::kLoopStageAttrName))
+      refLoopStage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+    if (!refLoopCluster && op->hasAttr(tt::kLoopClusterAttrName))
+      refLoopCluster = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+    if (refLoopStage && refLoopCluster)
+      break;
+  }
+
+  // Helper to apply reference attributes to a newly created op.
+  auto applyRefAttrs = [&](Operation *op) {
+    if (!refAsyncTaskIds.empty())
+      setAsyncTaskIds(op, refAsyncTaskIds);
+    if (refLoopStage)
+      op->setAttr(tt::kLoopStageAttrName, refLoopStage);
+    if (refLoopCluster)
+      op->setAttr(tt::kLoopClusterAttrName, refLoopCluster);
+  };
 
   // Setup yields per tile: local_alloc memdesc + varying TMA operands.
   SmallVector<SmallVector<Value>> setupYieldValues(numTiles);
@@ -869,12 +967,13 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
       loc, /*resultTypes=*/TypeRange{},
       /*barriers=*/ValueRange{}, /*barrierPhases=*/ValueRange{},
       /*barrierAnnotations=*/builder.getArrayAttr({}));
+  applyRefAttrs(subtileOp);
 
   // --- Setup region ---
   Block *setupBlock = builder.createBlock(&subtileOp.getSetupRegion());
   builder.setInsertionPointToStart(setupBlock);
   // No ops to clone — just yield the values directly from outer scope.
-  builder.create<SubtiledRegionYieldOp>(loc, flatSetupYields);
+  applyRefAttrs(builder.create<SubtiledRegionYieldOp>(loc, flatSetupYields));
 
   // --- Tile region ---
   Block *tileBlock = builder.createBlock(&subtileOp.getTileRegion());
@@ -911,15 +1010,18 @@ static void buildTMAStoreSubtiledRegion(ArrayRef<MatchedOp> matchedOps,
   auto tokenType = AsyncTokenType::get(builder.getContext());
   auto tmaCopy = builder.create<AsyncTMACopyLocalToGlobalOp>(
       loc, tokenType, desc, coords, bufArg, repCopy.getEvict());
+  applyRefAttrs(tmaCopy);
 
   // tma_store_token_wait
-  builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
-                                      /*barriers=*/ValueRange{},
-                                      /*barrier_preds=*/ValueRange{},
-                                      /*nvws_tokens=*/ValueRange{},
-                                      /*nvws_token_indices=*/ValueRange{});
+  auto tokenWait =
+      builder.create<TMAStoreTokenWaitOp>(loc, tmaCopy.getToken(),
+                                          /*barriers=*/ValueRange{},
+                                          /*barrier_preds=*/ValueRange{},
+                                          /*nvws_tokens=*/ValueRange{},
+                                          /*nvws_token_indices=*/ValueRange{});
+  applyRefAttrs(tokenWait);
 
-  builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
+  applyRefAttrs(builder.create<SubtiledRegionYieldOp>(loc, ValueRange{}));
 
   // Erase original TMA store ops.
   for (auto *op : tmaMatch.perTileTokenWaitOps)
@@ -971,9 +1073,9 @@ void doAddSubtileRegions(triton::FuncOp &funcOp) {
     if (matchedOps.empty())
       continue;
 
-    // Step 3.5: Verify async partition consistency.
-    if (failed(
-            verifyAsyncPartitionConsistency(setupRoot, rootSplit, matchedOps)))
+    // Step 3.5: Verify partition and schedule consistency.
+    if (failed(verifyPartitionAndScheduleConsistency(setupRoot, rootSplit,
+                                                     matchedOps)))
       continue;
 
     // Step 3.6: Check for TMA store consumers of the terminal local_alloc.
