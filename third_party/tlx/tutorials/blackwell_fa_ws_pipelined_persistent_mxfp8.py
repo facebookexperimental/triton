@@ -298,6 +298,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
 
+    # Define if we need to do buffer sharing for the scales.
+    SHARE_SCALE_BUFFERS: tl.constexpr = (HEAD_DIM == 128) and (BLOCK_N == 128)
+
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
 
     # Compute p_dtype from V descriptor
@@ -354,13 +357,17 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     # Single allocation with NUM_MMA_GROUPS * NUM_BUFFERS_Q buffers for q_scale
     q_scale_tiles = tlx.local_alloc((1, REP_M, REP_HEAD, 2, 256), tl.uint8, NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_tiles = tlx.local_alloc((1, REP_N, REP_HEAD, 2, 256), tl.uint8, NUM_BUFFERS_KV)
-    p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
-                                    tlx.storage_kind.tmem)
 
     q_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     q_scale_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_scale_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     kv_scale_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+
+    p_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BLOCK_N),
+        tlx.dtype_of(desc_v),
+        NUM_MMA_GROUPS,
+    )
 
     # Calculate scale bytes for barrier expect
     Q_SCALE_BYTES: tl.constexpr = REP_M * REP_HEAD * 2 * 256
@@ -371,37 +378,126 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     Q_SCALE_TMEM_COLS: tl.constexpr = Q_SCALE_BYTES // BLOCK_M_SPLIT
     K_SCALE_TMEM_COLS: tl.constexpr = K_SCALE_BYTES // BLOCK_N
     V_SCALE_TMEM_COLS: tl.constexpr = V_SCALE_BYTES // HEAD_DIM
-    q_scale_tmem = tlx.local_alloc((BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS), tl.uint8, 2 * NUM_Q_SCALE_TMEM_BUFFERS,
-                                   tlx.storage_kind.tmem)
-    k_scale_tmem = tlx.local_alloc((BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
-                                   tlx.storage_kind.tmem)
-    v_scale_tmem = tlx.local_alloc((HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
-                                   tlx.storage_kind.tmem)
+    if SHARE_SCALE_BUFFERS:
+        # We don't have enough TMEM space to hold the scale transfer. We need to have a creative
+        # reuse strategy that so QK[0] can share space with Q_SCALES
+        tl.static_assert(NUM_Q_SCALE_TMEM_BUFFERS == 1)
+        tl.static_assert(NUM_KV_SCALE_TMEM_BUFFERS == 2)
+        # Define the shared buffer.
+        qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+        qk_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N),
+            qk_dtype,
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        alpha_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        l_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        m_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        q_scale_tmem = tlx.local_alloc(
+            (BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS),
+            tl.uint8,
+            2 * NUM_Q_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        k_scale_tmem = tlx.local_alloc(
+            (BLOCK_N, K_SCALE_TMEM_COLS),
+            tl.uint8,
+            NUM_KV_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        v_scale_tmem = tlx.local_alloc(
+            (HEAD_DIM, V_SCALE_TMEM_COLS),
+            tl.uint8,
+            NUM_KV_SCALE_TMEM_BUFFERS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        p_scale_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE),
+            tl.uint8,
+            NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem,
+            reuse=qk_storage_alias,
+        )
+        # Define the reuse strategy.
+        # Here we share 1 buffer of QK with all other buffers. However,
+        # because Q_SCALES is needed to compute QK we must store the opposite
+        # scale index.
+        # QK[0] : |                              BLK_M/2 * BLOCK_N * fp32                                       |
+        # Alpha[0]: |BLK_M/2*1*fp32|
+        # L[0]:                    |BLK_M/2*1*fp32|
+        # M[0]:                                   |BLK_M/2*1*fp32|
+        # Q_SCALES[1]:                                           |512*uint8|
+        # K_SCALES[1]:                                                     |512*uint8|
+        # V_SCALES[0]:                                                               |512*uint8|
+        # P_SCALES[0]:                                                                         |BLK_M/2*32*uint8|
+        qk_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                qk_tiles,
+                tlx.reuse_group(
+                    alpha_tiles,
+                    l_tiles,
+                    m_tiles,
+                    q_scale_tmem,
+                    v_scale_tmem,
+                    k_scale_tmem,
+                    p_scale_tiles,
+                    group_type=tlx.reuse_group_type.distinct,
+                ),
+                group_type=tlx.reuse_group_type.shared,
+            ))
 
-    qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
-    p_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_N),
-        tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS,
-    )
-    alpha_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-    )
-    l_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-    )
-    m_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, 1),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-    )
+    else:
+        # We have enough TMEM space to isolate every buffer.
+        qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
+        alpha_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+        )
+        l_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+        )
+        m_tiles = tlx.local_alloc(
+            (BLOCK_M_SPLIT, 1),
+            tl.float32,
+            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+            tlx.storage_kind.tmem,
+        )
+        q_scale_tmem = tlx.local_alloc((BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS), tl.uint8, 2 * NUM_Q_SCALE_TMEM_BUFFERS,
+                                       tlx.storage_kind.tmem)
+        k_scale_tmem = tlx.local_alloc((BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
+                                       tlx.storage_kind.tmem)
+        v_scale_tmem = tlx.local_alloc((HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, NUM_KV_SCALE_TMEM_BUFFERS,
+                                       tlx.storage_kind.tmem)
+        p_scale_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, NUM_MMA_GROUPS,
+                                        tlx.storage_kind.tmem)
 
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
@@ -555,7 +651,9 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # prepare l_i for the epilog
                 _, phase = _get_bufidx_phase(i, 1)
-                tlx.barrier_wait(l_empties[cid], phase ^ 1)
+                if not SHARE_SCALE_BUFFERS:
+                    # Wait for L to be empty if it has its own buffer.
+                    tlx.barrier_wait(l_empties[cid], phase ^ 1)
                 tlx.local_store(l_tiles[cid], l_i[:, None])
                 tlx.local_store(m_tiles[cid], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
@@ -580,7 +678,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 )
 
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
-                q_tmem_base = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
+                _, l_phase = _get_bufidx_phase(j, 1)
+                if SHARE_SCALE_BUFFERS:
+                    # With 2 buffers we always swap index 1/0
+                    q0_tmem = 1
+                    q1_tmem = 0
+                else:
+                    q0_tmem = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
+                    q1_tmem = q0_tmem + 1
                 k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
@@ -593,22 +698,45 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # -- compute q0 @ k ----
                 k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
                 _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
-                kv_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
-                tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
+                if SHARE_SCALE_BUFFERS:
+                    # Indices based on which value of QK must be live/dead.
+                    k0_tmem = 1
+                    k1_tmem = 0
+                    v0_tmem = 0
+                else:
+                    # All buffers are the same.
+                    kv_scale_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
+                    k0_tmem = kv_scale_tmem_idx
+                    k1_tmem = kv_scale_tmem_idx
+                    v0_tmem = kv_scale_tmem_idx
                 # Wait for Q and K scales to be loaded by the load group
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx], q_phase)
                 tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+                if SHARE_SCALE_BUFFERS:
+                    # If we share scale buffers q_scale_tmem[q0_tmem] overlaps
+                    # with qk[1], so we must wait for the previous qk[1] to be
+                    # done.
+                    tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+
                 # Explicit SMEM->TMEM scale transfer
-                tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q_tmem_base])
-                tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
-                tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
+                tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
+                if not SHARE_SCALE_BUFFERS:
+                    # If we have isolated TMEM buffers we can transfer the Q scale once.
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
+                tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k0_tmem])
+                # Wait for the QK output to be available.
+                if SHARE_SCALE_BUFFERS:
+                    tlx.barrier_wait(p_empties[0], qk_phase ^ 1)
+                    tlx.barrier_wait(l_empties[0], l_phase ^ 1)
+                else:
+                    tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
                 tlx.async_dot_scaled(
                     q_tiles[0],
                     k_tile,
                     qk_tiles[0],
-                    q_scale_tmem[q_tmem_base],
+                    q_scale_tmem[q0_tmem],
                     Q_FP8_FORMAT,
-                    k_scale_tmem[kv_tmem_idx],
+                    k_scale_tmem[k0_tmem],
                     K_FP8_FORMAT,
                     use_acc=False,
                     mBarriers=[qk_fulls[0]],
@@ -616,19 +744,37 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 # -- compute q1 @ k ----
                 tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
-                tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                 # Wait for Q1 scale
                 tlx.barrier_wait(q_scale_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
+
+                if SHARE_SCALE_BUFFERS:
+                    # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
+                    # with qk[0], so we must wait for the previous qk[0] to be
+                    # done.
+                    tlx.barrier_wait(qk_empties[0], qk_phase)
+
                 # Explicit SMEM->TMEM scale transfer
-                tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q_tmem_base + 1])
-                tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
+                tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
+                if SHARE_SCALE_BUFFERS:
+                    # K_Scale must be copied to the new buffer
+                    tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k1_tmem])
+                else:
+                    # If we have isolated TMEM buffers we can transfer the Q scale once.
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
+
+                # Wait for the QK output to be available.
+                if SHARE_SCALE_BUFFERS:
+                    tlx.barrier_wait(p_empties[1], qk_phase ^ 1)
+                    tlx.barrier_wait(l_empties[1], l_phase ^ 1)
+                else:
+                    tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
                 tlx.async_dot_scaled(
                     q_tiles[1],
                     k_tile,
                     qk_tiles[1],
-                    q_scale_tmem[q_tmem_base + 1],
+                    q_scale_tmem[q1_tmem],
                     Q_FP8_FORMAT,
-                    k_scale_tmem[kv_tmem_idx],
+                    k_scale_tmem[k1_tmem],
                     K_FP8_FORMAT,
                     use_acc=False,
                     mBarriers=[
@@ -645,7 +791,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 # Wait for V scale
                 tlx.barrier_wait(kv_scale_fulls[v_bufIdx], v_phase)
                 # Explicit SMEM->TMEM scale transfer
-                tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[kv_tmem_idx])
+                tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[v0_tmem])
                 tlx.barrier_wait(p_fulls[0], qk_phase)
                 tlx.async_dot_scaled(
                     p_tiles[0],
@@ -653,7 +799,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     acc_tiles[0],
                     p_scale_tiles[0],
                     P_FP8_FORMAT,
-                    v_scale_tmem[kv_tmem_idx],
+                    v_scale_tmem[v0_tmem],
                     V_FP8_FORMAT,
                     use_acc=False,
                     mBarriers=[p_empties[0]],
@@ -664,32 +810,56 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 for i in tl.range(lo + BLOCK_N, hi, BLOCK_N):
                     v_bufIdx_prev = v_bufIdx
                     qk_phase_prev = qk_phase
-                    kv_tmem_idx_prev = kv_tmem_idx
 
                     accum_cnt_qk += 1
                     accum_cnt_kv += 2
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
-                    kv_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
+                    if SHARE_SCALE_BUFFERS:
+                        # Indices based on which value of QK must be live/dead.
+                        k0_tmem = 1
+                        v1_tmem = 1
+                        k1_tmem = 0
+                        v0_tmem = 0
+                    else:
+                        # All buffers are the same for the same iteration.
+                        kv_scale_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
+                        k0_tmem = kv_scale_tmem_idx
+                        # V1 uses the previous location.
+                        v1_tmem = v0_tmem
+                        k1_tmem = kv_scale_tmem_idx
+                        v0_tmem = kv_scale_tmem_idx
 
                     # -- compute q0 @ k ----
                     # wait for the K buffer to be populated by the producer
                     tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
                     k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
-                    _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
 
                     # Wait for K scale to be loaded by the load group
                     tlx.barrier_wait(kv_scale_fulls[k_bufIdx], k_phase)
+
+                    _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
+                    if SHARE_SCALE_BUFFERS:
+                        # If we share scale buffers q_scale_tmem[q0_tmem] overlaps
+                        # with qk[1], so we must wait for the previous qk[1] to be
+                        # done.
+                        tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+                        tlx.tmem_copy(q_scale_tiles[0], q_scale_tmem[q0_tmem])
+
                     # Explicit SMEM->TMEM scale transfer
-                    tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[kv_tmem_idx])
-                    tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
+                    tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k0_tmem])
+                    # Wait for the QK output to be available.
+                    if SHARE_SCALE_BUFFERS:
+                        tlx.barrier_wait(p_empties[0], qk_phase ^ 1)
+                    else:
+                        tlx.barrier_wait(qk_empties[0], qk_phase ^ 1)
                     tlx.async_dot_scaled(
                         q_tiles[0],
                         k_tile,
                         qk_tiles[0],
-                        q_scale_tmem[q_tmem_base],
+                        q_scale_tmem[q0_tmem],
                         Q_FP8_FORMAT,
-                        k_scale_tmem[kv_tmem_idx],
+                        k_scale_tmem[k0_tmem],
                         K_FP8_FORMAT,
                         use_acc=False,
                         mBarriers=[qk_fulls[0]],
@@ -698,13 +868,16 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # -- compute p1 @ v from the previous iteration----
                     tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
                     tlx.barrier_wait(p_fulls[1], qk_phase_prev)
+                    if SHARE_SCALE_BUFFERS:
+                        # Need to copy V back into the new location.
+                        tlx.tmem_copy(kv_scale_tiles[v_bufIdx_prev], v_scale_tmem[v1_tmem])
                     tlx.async_dot_scaled(
                         p_tiles[1],
                         kv_tiles[v_bufIdx_prev],
                         acc_tiles[1],
                         p_scale_tiles[1],
                         P_FP8_FORMAT,
-                        v_scale_tmem[kv_tmem_idx_prev],
+                        v_scale_tmem[v1_tmem],
                         V_FP8_FORMAT,
                         use_acc=acc1_init,
                         mBarriers=[kv_empties[v_bufIdx_prev], kv_scale_empties[v_bufIdx_prev], p_empties[1]],
@@ -713,14 +886,28 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     acc1_init = True
 
                     # -- compute q1 @ k ----
-                    tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+                    if SHARE_SCALE_BUFFERS:
+                        # If we share scale buffers q_scale_tmem[q1_tmem] overlaps
+                        # with qk[0], so we must wait for the previous qk[0] to be
+                        # done.
+                        tlx.barrier_wait(qk_empties[0], qk_phase)
+                        tlx.tmem_copy(q_scale_tiles[1], q_scale_tmem[q1_tmem])
+                        # Copy k into the new buffer space
+                        tlx.tmem_copy(kv_scale_tiles[k_bufIdx], k_scale_tmem[k1_tmem])
+
+                    # Wait for the QK output to be available.
+                    if SHARE_SCALE_BUFFERS:
+                        tlx.barrier_wait(p_empties[1], qk_phase ^ 1)
+                    else:
+                        tlx.barrier_wait(qk_empties[1], qk_phase ^ 1)
+
                     tlx.async_dot_scaled(
                         q_tiles[1],
                         k_tile,
                         qk_tiles[1],
-                        q_scale_tmem[q_tmem_base + 1],
+                        q_scale_tmem[q1_tmem],
                         Q_FP8_FORMAT,
-                        k_scale_tmem[kv_tmem_idx],
+                        k_scale_tmem[k1_tmem],
                         K_FP8_FORMAT,
                         use_acc=False,
                         mBarriers=[qk_fulls[1], kv_empties[k_bufIdx], kv_scale_empties[k_bufIdx]],
@@ -734,7 +921,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     # Wait for V scale
                     tlx.barrier_wait(kv_scale_fulls[v_bufIdx], v_phase)
                     # Explicit SMEM->TMEM scale transfer
-                    tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[kv_tmem_idx])
+                    tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[v0_tmem])
                     tlx.barrier_wait(p_fulls[0], qk_phase)
                     tlx.async_dot_scaled(
                         p_tiles[0],
@@ -742,7 +929,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                         acc_tiles[0],
                         p_scale_tiles[0],
                         P_FP8_FORMAT,
-                        v_scale_tmem[kv_tmem_idx],
+                        v_scale_tmem[v0_tmem],
                         V_FP8_FORMAT,
                         use_acc=True,
                         mBarriers=[p_empties[0]],
@@ -750,18 +937,27 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
 
                 tlx.tcgen05_commit(q_empties[q_bufIdx])
                 tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
+                if SHARE_SCALE_BUFFERS:
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx])
+                    tlx.tcgen05_commit(q_scale_empties[q_bufIdx + NUM_BUFFERS_Q])
                 tlx.tcgen05_commit(acc_empties[0])
 
                 # -- compute p1 @ v ----
                 tlx.barrier_wait(acc_fulls[1], qk_phase)
                 tlx.barrier_wait(p_fulls[1], qk_phase)
+                if SHARE_SCALE_BUFFERS:
+                    v1_tmem = 1
+                    tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[v1_tmem])
+                else:
+                    # Use the previous value of the buffer index
+                    v1_tmem = v0_tmem
                 tlx.async_dot_scaled(
                     p_tiles[1],
                     kv_tiles[v_bufIdx],
                     acc_tiles[1],
                     p_scale_tiles[1],
                     P_FP8_FORMAT,
-                    v_scale_tmem[kv_tmem_idx],
+                    v_scale_tmem[v1_tmem],
                     V_FP8_FORMAT,
                     use_acc=acc1_init,
                     mBarriers=[acc_empties[1], kv_empties[v_bufIdx], kv_scale_empties[v_bufIdx], p_empties[1]],
