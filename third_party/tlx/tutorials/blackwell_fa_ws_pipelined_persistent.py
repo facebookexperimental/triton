@@ -24,14 +24,26 @@ def _host_descriptor_pre_hook(nargs):
 configs = [
     triton.Config(
         {
-            "BLOCK_M": 256, "BLOCK_N": 128, "NUM_BUFFERS_Q": 1, "NUM_BUFFERS_KV": kv, "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2, "NUM_MMA_SLICES": 2, "GROUP_SIZE_N": grp_n, "RESCALE_OPT": rescale_opt, "USE_WHERE":
-            where,  # used when RESCALE_OPT is True
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": kv,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": grp_n,
+            "RESCALE_OPT": rescale_opt,
+            "USE_WHERE": where,  # used when RESCALE_OPT is True
+            "USE_WARP_BARRIER": uwb,
         },
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    ) for kv in [3, 6] for grp_n in [1, 4] for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
+    )
+    for kv in [3, 6]
+    for grp_n in [1, 4]
+    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
+    for uwb in [False, True]
 ]
 
 
@@ -316,21 +328,30 @@ def _softmax_inner_loop(
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
-def _attn_fwd_ws(sm_scale, M,  #
-                 Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-                 HEAD_DIM: tl.constexpr,  #
-                 BLOCK_M: tl.constexpr,  #
-                 BLOCK_N: tl.constexpr,  #
-                 STAGE: tl.constexpr,  #
-                 NUM_BUFFERS_Q: tl.constexpr,  #
-                 NUM_BUFFERS_KV: tl.constexpr,  #
-                 NUM_BUFFERS_QK: tl.constexpr,  #
-                 NUM_MMA_GROUPS: tl.constexpr,  #
-                 NUM_MMA_SLICES: tl.constexpr,  #
-                 GROUP_SIZE_N: tl.constexpr,  #
-                 RESCALE_OPT: tl.constexpr,  #
-                 USE_WHERE: tl.constexpr,  #
-                 ):
+def _attn_fwd_ws(
+    sm_scale,
+    M,  #
+    Z,
+    H,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    N_CTX,  #
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    NUM_BUFFERS_Q: tl.constexpr,  #
+    NUM_BUFFERS_KV: tl.constexpr,  #
+    NUM_BUFFERS_QK: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    NUM_MMA_SLICES: tl.constexpr,  #
+    GROUP_SIZE_N: tl.constexpr,  #
+    RESCALE_OPT: tl.constexpr,  #
+    USE_WHERE: tl.constexpr,  #
+    USE_WARP_BARRIER: tl.constexpr = False,
+):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -368,7 +389,6 @@ def _attn_fwd_ws(sm_scale, M,  #
     q_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_BUFFERS_Q)
     kv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     kv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    o_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     # Define the buffer for sharing. Offsets are currently manually specified
@@ -429,14 +449,24 @@ def _attn_fwd_ws(sm_scale, M,  #
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
-    qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
-    p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES)
-    acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
-    alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
-    l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    if USE_WARP_BARRIER:
+        qk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES, num_warps=4)
+        acc_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+        alpha_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+        alpha_empties = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+        l_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+        o_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+    else:
+        qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES)
+        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+        alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+        alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+        l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+        o_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     with tlx.async_tasks():
         # correction group
@@ -990,11 +1020,12 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
+            "USE_WARP_BARRIER": uwb,
         },
         num_warps=4,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    )
+    ) for uwb in [False, True]
 ]
 
 
@@ -1108,6 +1139,7 @@ def _attn_bwd_ws(
     EPILOGUE_SUBTILE: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_WARP_BARRIER: tl.constexpr = False,
 ):
     # Kernel hangs if NUM_BUFFERS_Q != 2.
     tl.static_assert(NUM_BUFFERS_Q == 2)
@@ -1183,16 +1215,29 @@ def _attn_bwd_ws(
 
     # allocate barriers for tmem buffers
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    if USE_WARP_BARRIER:
+        qk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+    else:
+        qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    if USE_WARP_BARRIER:
+        dq_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=4)
+    else:
+        dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
     dv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    if USE_WARP_BARRIER:
+        dv_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
+    else:
+        dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    if USE_WARP_BARRIER:
+        dk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
+    else:
+        dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
     # Establish the barriers and allocations we will use if we need to
     # share TMEM for dq and dp. For barriers we cannot modify the definition
@@ -1213,7 +1258,10 @@ def _attn_bwd_ws(
             NUM_BUFFERS_TMEM,
             tlx.storage_kind.tmem,
         )
-        dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+        if USE_WARP_BARRIER:
+            dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+        else:
+            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -1848,7 +1896,7 @@ class _attention(torch.autograd.Function):
             GROUP_SIZE_M=ctx.GROUP_SIZE_M,  #
         )
 
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M, config=None):

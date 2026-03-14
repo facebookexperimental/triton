@@ -1463,6 +1463,24 @@ def test_cluster_dims(device):
             in k.asm["ttgir"])
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
+def test_cluster_size_1d(device):
+
+    @triton.jit
+    def cluster_size_kernel(out_ptr, GRID_SIZE_X: tl.constexpr, GRID_SIZE_Y: tl.constexpr):
+        size = tlx.cluster_size_1d()
+        pid_x = tl.program_id(0)
+        pid_y = tl.program_id(1)
+        pid_z = tl.program_id(2)
+        offset = pid_x + GRID_SIZE_X * (pid_y + GRID_SIZE_Y * pid_z)
+        tl.store(out_ptr + offset, size)
+
+    GRID_SIZE = (10, 8, 12)
+    out = torch.full(GRID_SIZE, -1, device=device, dtype=torch.int32)
+    cluster_size_kernel[GRID_SIZE](out, GRID_SIZE[0], GRID_SIZE[1], ctas_per_cga=(2, 1, 3))
+    assert torch.all(out == 6)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for DSM")
 def test_remote_shmem_store(device):
 
@@ -5051,6 +5069,51 @@ def test_ctas_per_cga(device):
         f"expecting cluster dim to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
     assert kernel.metadata.num_ctas == 1, (
         f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell or newer for preferred cluster dimension")
+def test_preferred_ctas_per_cga(device):
+    """Test launching kernels with preferred_ctas_per_cga hint."""
+
+    @triton.jit
+    def copy_kernel(x_ptr, log_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tl.store(x_ptr + offsets, offsets, mask=mask)
+
+        # allocate 128x512 TMEM to force an occupancy of 1 (works on B200)
+        tmem_buf = tlx.local_alloc((128, 512), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        acc_init = tl.full((128, 512), 1, dtype=tl.float32)
+        tlx.local_store(tmem_buf[0], acc_init)
+
+        # assuming log_ptr tensor has size equal to number of programs
+        tl.store(log_ptr + pid, tlx.cluster_size_1d())
+
+    # setting up grid in a way that there's exactly one wave (one CTA per SM)
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    GRID_SIZE = NUM_SMS
+    BLOCK_SIZE = 4
+    NUM_ELEMENT = GRID_SIZE * BLOCK_SIZE
+    x = torch.zeros(NUM_ELEMENT, dtype=torch.float32, device=device)
+    # each value is the cluster size of a CTA
+    cluster_size_log = torch.full((GRID_SIZE, ), -1, dtype=torch.int16, device=device)
+    kern_kwargs = {
+        "BLOCK_SIZE": BLOCK_SIZE, "num_warps": 4, "preferred_ctas_per_cga": (4, 1, 1), "ctas_per_cga": (2, 1, 1)
+    }
+    # due to B200 number of SMS and number of GPCs limitation, 4x1 clusters cannot fully
+    # tile the 148 SMs (e.g. a GPC could possible has 18 SMs hypothetically), so we will
+    # have bubbles of 2 SMs that can be leveraged to fill a 2x1 cluster
+    kernel = copy_kernel[(GRID_SIZE, )](x, cluster_size_log, NUM_ELEMENT, **kern_kwargs)
+    assert kernel.metadata.preferred_ctas_per_cga == (4, 1, 1), (
+        f"expecting preferred_ctas_per_cga to be (4, 1, 1), got {kernel.metadata.preferred_ctas_per_cga}")
+    assert kernel.metadata.cluster_dims == (2, 1, 1), (
+        f"expecting cluster_dims to be (2, 1, 1), got {kernel.metadata.cluster_dims}")
+
+    sizes, counts = cluster_size_log.unique(return_counts=True)
+    d = dict(zip(sizes.tolist(), counts.tolist()))
+    assert len(d) == 2 and 2 in d and 4 in d, f"expecting exactly two cluster sizes as specified, got {d}"
+    assert 0 < d[2] and d[2] < d[4], f"expecting most clusters to have preferred sizes, got {d}"
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell for TMEM")
