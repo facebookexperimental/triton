@@ -205,6 +205,7 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 
 void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
                       SmallVector<Operation *> &chList);
+
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,

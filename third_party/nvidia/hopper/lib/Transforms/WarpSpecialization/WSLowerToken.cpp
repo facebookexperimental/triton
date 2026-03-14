@@ -6,6 +6,7 @@
 
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -66,6 +67,8 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
   ttng::ArriveBarrierOp arriveOp;
 
   assert(loadType != ttnvws::TokenLoadType::AsyncLoadOp);
+  if (op.getFenced())
+    builder.create<ttng::FenceAsyncSharedOp>(loc, /*bCluster=*/false);
   arriveOp =
       builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, 1); // fullCnt);
 
@@ -341,5 +344,24 @@ void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   // lowerGetAsyncTaskIdOp(mod, numConsumerGroups);
   lowerTokenOperations(mod, numCTAs, numConsumerGroups);
 }
+
+// ---------------------------------------------------------------------------
+// Test-only pass wrapper
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUTESTWSLOWERTOKEN
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestWSLowerTokenPass
+    : public impl::NVGPUTestWSLowerTokenBase<NVGPUTestWSLowerTokenPass> {
+public:
+  using impl::NVGPUTestWSLowerTokenBase<
+      NVGPUTestWSLowerTokenPass>::NVGPUTestWSLowerTokenBase;
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      doTokenLowering(funcOp, numConsumerGroups);
+    });
+  }
+};
 
 } // namespace mlir

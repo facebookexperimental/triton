@@ -747,13 +747,16 @@ getTaskTopRegion(triton::FuncOp funcOp,
 }
 
 // Create an allocation to hold the mbarriers.
-static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
+static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
+                                StringRef srcName = "") {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
       triton::gpu::SharedMemorySpaceAttr::get(funcOp.getContext());
   Location loc = funcOp.getLoc();
   auto context = funcOp.getContext();
+  if (!srcName.empty())
+    loc = NameLoc::get(StringAttr::get(context, srcName), loc);
   auto barrierCTALayout =
       ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
                               /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
@@ -855,14 +858,14 @@ void createToken(
       }
     }
     if (hasTMAProducer) {
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // Pattern matching for tmem_store --> getD --> tmem_load (gen5 is the
     // actual producer) or gen5 --> tmem_load
     if (ProducerIsGen5(producerOp))
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
 
     for (auto consumerAsyncTaskId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
@@ -910,17 +913,21 @@ void createToken(
           llvm_unreachable("Unexpected load type");
         }
         Value v;
+        Location tokenLoc = funcOp.getLoc();
+        if (!channel->srcName.empty())
+          tokenLoc = NameLoc::get(
+              StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
           v = builder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
+              tokenLoc, channel->getNumBuffers(), tokenLoadType);
         else
-          v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
-                                                    tokenLoadType);
+          v = builder.create<ttnvws::CreateTokenOp>(tokenLoc, 1, tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                                     channel->srcName);
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
         gen5Barriers[cast<ttng::TCGen5MMAOp>(consumerOp)] = channel;
       }
@@ -1317,14 +1324,14 @@ void createTokenPost(
       }
     }
     if (hasTMAProducer) {
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // If channel is from a gen5, pre-allocate gen5 barrier.
     bool hasProdBar = false;
     if (isa<ttng::TCGen5MMAOp>(producerOp)) {
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers());
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
       hasProdBar = true;
     }
     // Check if this channel needs token-based synchronization.
@@ -1407,13 +1414,18 @@ void createTokenPost(
           llvm_unreachable("Unexpected load type");
         }
         Value v;
+        Location tokenLoc = funcOp.getLoc();
+        if (!channel->srcName.empty())
+          tokenLoc = NameLoc::get(
+              StringAttr::get(funcOp.getContext(), channel->srcName), tokenLoc);
         v = builder.create<ttnvws::CreateTokenOp>(
-            funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
+            tokenLoc, channel->getNumBuffers(), tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
       if (useGen5Barrier) {
-        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers());
+        Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                                     channel->srcName);
         commChannel.consumerBarriers[consumerAsyncTaskId] = v;
       }
     }
@@ -3098,9 +3110,22 @@ void insertAsyncComm(
         });
         builder.setInsertionPointAfter(producerCommitPoint);
         builder.setLoopScheduleInfoFromOp(producerCommitPoint);
+        bool needsFence = false;
+        if (masterChannel->channelKind == DataChannelKind::SMEM ||
+            masterChannel->channelKind == DataChannelKind::SMEMPost) {
+          Operation *consumerOp =
+              getUniqueActualConsumer(masterChannel->getDstOp());
+          // Note: The only async producer is TMA and this is unreachable
+          // in that case because of the prior checks.
+          if (isa<ttng::TCGen5MMAOp, ttng::WarpGroupDotOp,
+                  ttng::AsyncTMACopyLocalToGlobalOp>(consumerOp))
+            needsFence = true;
+        }
         auto commitOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
                 tailProducer->getLoc(), token.second, bufferIdx);
+        if (needsFence)
+          commitOp->setAttr("fenced", builder.getUnitAttr());
       }
     }
 
@@ -3659,6 +3684,27 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Merge consumer groups for channels in the same reuse group.
   // All channels in a reuse group share a barrier, so they must be processed
   // together in insertAsyncComm to produce a single barrier_expect + wait.
+  // Check whether two channels have the same full set of consumers.
+  // TMEMPost channels are skipped because getDstOps() is not safe to call on
+  // isOperandD channels, and TMEMPost always has a single consumer so the
+  // getDstOp() equality check alone is sufficient.
+  auto haveMatchingConsumers = [](Channel *a, Channel *b) -> bool {
+    if (a->channelKind == DataChannelKind::TMEMPost)
+      return true;
+    SmallVector<Operation *> aDsts, bDsts;
+    a->getDstOps(aDsts);
+    b->getDstOps(bDsts);
+    // getDstOps returns empty for base Channel (single consumer) —
+    // in that case the caller's getDstOp() check is sufficient.
+    if (aDsts.empty() && bDsts.empty())
+      return true;
+    if (aDsts.size() != bDsts.size())
+      return false;
+    llvm::sort(aDsts, [](Operation *x, Operation *y) { return x < y; });
+    llvm::sort(bDsts, [](Operation *x, Operation *y) { return x < y; });
+    return aDsts == bDsts;
+  };
+
   DenseSet<Channel *> mergedChannels;
   for (auto &group : config.groups) {
     if (group.channels.size() <= 1)
@@ -3669,6 +3715,12 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       if (ch->relation.second != rep->relation.second)
         continue;
       if (ch->getDstOp() != rep->getDstOp())
+        continue;
+      // Also check that the full consumer sets match.
+      // getDstOp() only returns the first consumer, but channels can have
+      // multiple consumers (e.g., B feeds both MMA_0 and MMA_1).
+      // Only merge when ALL consumers are the same.
+      if (!haveMatchingConsumers(ch, rep))
         continue;
       // Skip if either producer is a TCGen5MMAOp: commit handling for
       // MMA-produced TMEM channels doesn't work when fused into one group.
@@ -3800,6 +3852,24 @@ public:
       else
         doCodePartition(funcOp, numBuffers);
     }
+    // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
+    // yield operand already has an "accum_cnt" NameLoc. This must be done at
+    // the end because earlier steps may replace ForOps and lose block arg locs.
+    funcOp.walk([&](scf::ForOp forOp) {
+      auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      unsigned numIterArgs = forOp.getNumRegionIterArgs();
+      for (unsigned i = 0; i < numIterArgs; ++i) {
+        Value yieldVal = yieldOp.getOperand(i);
+        if (auto nameLoc = llvm::dyn_cast<NameLoc>(yieldVal.getLoc())) {
+          if (nameLoc.getName().getValue() == "accum_cnt") {
+            // The iter arg is block arg at index i+1 (skip induction var).
+            auto arg = forOp.getRegionIterArg(i);
+            arg.setLoc(NameLoc::get(
+                StringAttr::get(funcOp.getContext(), "accum_cnt")));
+          }
+        }
+      }
+    });
   }
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });

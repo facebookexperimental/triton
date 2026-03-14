@@ -750,6 +750,7 @@ createChannelsForProducers(SmallVector<Operation *> &currentProds,
     channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
         producerTaskId, consumerIds, allocOp, true /*isOperandD*/, true,
         channelID));
+    channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
     setTmemChannelAttr(prod, channelID, "tmem.start");
     setTmemChannelAttr(consumerOp, channelID, "tmem.end");
   }
@@ -2281,6 +2282,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
             -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
             true, channels.size()));
+        channels.back()->srcName =
+            getOutermostNameFromLoc(tmemAllocOp->getLoc());
         // Mark producer and consumer.
         setTmemChannelAttr(&op, channelID, "tmem.end");
       }
@@ -2477,10 +2480,13 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
           producerTaskId, consumerTaskIds, allocOp, false, isOperandDNoAcc,
           channels.size()));
+      channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
     }
-  } else
+  } else {
     channels.push_back(std::make_unique<ChannelPost>(
         producerTaskIds.front(), consumerTaskIds, allocOp, channels.size()));
+    channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+  }
 }
 
 void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
