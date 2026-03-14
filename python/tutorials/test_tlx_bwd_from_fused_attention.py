@@ -202,6 +202,21 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
     if persistent:
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
+        desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                  block_shape=dummy_block)
+        desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                  block_shape=dummy_block)
+        desc_v = TensorDescriptor(v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                  block_shape=dummy_block)
+        desc_do = TensorDescriptor(do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_dq = TensorDescriptor(dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_dk = TensorDescriptor(dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+
         def grid_persist_bwd(meta):
             return (
                 min(NUM_SMS,
@@ -211,14 +226,14 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
             )
 
         _attn_bwd_persist_orig[grid_persist_bwd](
-            q,
-            arg_k,
-            v,
+            desc_q,
+            desc_k,
+            desc_v,
             sm_scale,
-            do,
-            dq,
-            dk,
-            dv,
+            desc_do,
+            desc_dq,
+            desc_dk,
+            desc_dv,
             M,
             delta,
             q.stride(0),
