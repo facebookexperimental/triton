@@ -649,6 +649,7 @@ def _attn_bwd_dkdv_inner(
     dtype: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     LN2: tl.constexpr,
+    RESCHED: tl.constexpr,
 ):
     q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
     qT = tl.trans(q)
@@ -662,13 +663,22 @@ def _attn_bwd_dkdv_inner(
     do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
     ppT = pT
     ppT = ppT.to(dtype)
-    dv += tl.dot(ppT, do)
-    Di = tl.load(D + offs_m)
-    dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+    if RESCHED:
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        Di = tl.load(D + offs_m)
+        dv += tl.dot(ppT, do)
+    else:
+        dv += tl.dot(ppT, do)
+        Di = tl.load(D + offs_m)
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
-    dk += tl.dot(dsT, tl.trans(qT))
-    dq = tl.dot(tl.trans(dsT), k)
+    if RESCHED:
+        dq = tl.dot(tl.trans(dsT), k)
+        dk += tl.dot(dsT, tl.trans(qT))
+    else:
+        dk += tl.dot(dsT, tl.trans(qT))
+        dq = tl.dot(tl.trans(dsT), k)
     dqs = _split_n(dq, EPILOGUE_SUBTILE)
     slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
@@ -740,6 +750,7 @@ def _attn_bwd_dkdv(
                 dtype,
                 EPILOGUE_SUBTILE,
                 LN2,
+                True,
             )
     else:
         for blk_idx in tl.range(0, num_steps):
@@ -764,6 +775,7 @@ def _attn_bwd_dkdv(
                 dtype,
                 EPILOGUE_SUBTILE,
                 LN2,
+                True,
             )
 
     return dk, dv
