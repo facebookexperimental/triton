@@ -24,19 +24,33 @@
 // Load partition (partition1, task 2):
 // CHECK: partition1
 // CHECK: scf.for
-// -- a0 load: wait_barrier, barrier_expect on memdesc_index, then TMA copy --
+// Inner k-loop:
+// CHECK: scf.for
+//
+// -- a0 load: buffer index = (accumCnt + 1) % 3 --
+// CHECK: arith.constant{{.*}} 1 : i64
+// CHECK: [[A0_OFF:%.*]] = arith.addi
+// CHECK: arith.divui [[A0_OFF]],
+// CHECK: [[A0_IDX:%.*]] = arith.trunci
 // CHECK: ttng.wait_barrier
-// CHECK: [[A0_BAR:%.*]] = ttg.memdesc_index [[BAR:%.*]][[[A0_IDX:%.*]]]
+// CHECK: [[A0_BAR:%.*]] = ttg.memdesc_index [[BAR:%.*]][[[A0_IDX]]]
 // CHECK: ttng.barrier_expect [[A0_BAR]], 16384
 // CHECK: ttng.async_tma_copy_global_to_local
-// -- a1 load: wait_barrier, barrier_expect with different index, then TMA copy --
+//
+// -- a1 load: buffer index = (accumCnt + 2) % 3 --
+// CHECK: arith.constant{{.*}} 2 : i64
+// CHECK: [[A1_OFF:%.*]] = arith.addi
+// CHECK: arith.divui [[A1_OFF]],
+// CHECK: [[A1_IDX:%.*]] = arith.trunci
 // CHECK: ttng.wait_barrier
-// CHECK: [[A1_BAR:%.*]] = ttg.memdesc_index [[BAR]][[[A1_IDX:%.*]]]
+// CHECK: [[A1_BAR:%.*]] = ttg.memdesc_index [[BAR]][[[A1_IDX]]]
 // CHECK: ttng.barrier_expect [[A1_BAR]], 16384
 // CHECK: ttng.async_tma_copy_global_to_local
-// -- b load: wait_barrier, barrier_expect with yet another index, then TMA copy --
+//
+// -- b load: buffer index = accumCnt % 3 (no stagger offset) --
+// CHECK: [[B_IDX:%.*]] = arith.trunci
 // CHECK: ttng.wait_barrier
-// CHECK: [[B_BAR:%.*]] = ttg.memdesc_index [[BAR]][[[B_IDX:%.*]]]
+// CHECK: [[B_BAR:%.*]] = ttg.memdesc_index [[BAR]][[[B_IDX]]]
 // CHECK: ttng.barrier_expect [[B_BAR]], 16384
 // CHECK: ttng.async_tma_copy_global_to_local
 
