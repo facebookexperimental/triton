@@ -84,7 +84,13 @@ def addmm_kernel_tma_persistent_ws(
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
-        if EPILOGUE_SUBTILE:
+        if EPILOGUE_SUBTILE == 1:
+            # Load full bias tile via TMA, add in float32, then downcast
+            bias = bias_desc.load([offs_cm, offs_cn]).to(tl.float32)
+            accumulator = accumulator + bias
+            c = accumulator.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 2:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
@@ -97,12 +103,29 @@ def addmm_kernel_tma_persistent_ws(
             acc1 = acc1 + bias1
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
-        else:
-            # Load full bias tile via TMA, add in float32, then downcast
-            bias = bias_desc.load([offs_cm, offs_cn]).to(tl.float32)
-            accumulator = accumulator + bias
-            c = accumulator.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            # Load bias quarters via TMA, add in float32, then downcast
+            bias00 = bias_desc.load([offs_cm, offs_cn]).to(tl.float32)
+            acc00 = acc00 + bias00
+            c00 = acc00.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c00)
+            bias01 = bias_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 4]).to(tl.float32)
+            acc01 = acc01 + bias01
+            c01 = acc01.to(dtype)
+            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 4], c01)
+            bias10 = bias_desc.load([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)]).to(tl.float32)
+            acc10 = acc10 + bias10
+            c10 = acc10.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)], c10)
+            bias11 = bias_desc.load([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)]).to(tl.float32)
+            acc11 = acc11 + bias11
+            c11 = acc11.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)], c11)
 
 
 @pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
@@ -112,7 +135,7 @@ def addmm_kernel_tma_persistent_ws(
 @pytest.mark.parametrize("num_stages", [2, 3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
-@pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
@@ -188,13 +211,13 @@ def test_autows_addmm_tma_persistent(
             C,
             C.shape,
             C.stride(),
-            [BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if EPILOGUE_SUBTILE else BLOCK_SIZE_N],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
         )
         bias_desc = TensorDescriptor(
             bias,
             [M, N],
             [N, 1],
-            [BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if EPILOGUE_SUBTILE else BLOCK_SIZE_N],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
         )
 
         grid = lambda META: (min(
