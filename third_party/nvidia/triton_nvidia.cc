@@ -98,8 +98,9 @@ void init_triton_hopper_passes(py::module &&m) {
                             bool, int);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
-  ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
-                     mlir::createNVGPUPartitionSchedulingMeta);
+  ADD_PASS_OPTION_WRAPPER_2("add_partition_scheduling_meta",
+                            mlir::createNVGPUPartitionSchedulingMeta, bool,
+                            const std::string &);
 }
 
 static void checkMatmulConstraints(const std::string &A_dtype,

@@ -198,7 +198,10 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
     Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
            "bool", /*default*/"false",
            "If true, merge epilogue stores into the computation partition "
-           "instead of creating a separate epilogue partition">
+           "instead of creating a separate epilogue partition">,
+    Option<"computePartitionGranularity", "compute-partition-granularity",
+           "std::string", /*default*/"\"auto\"",
+           "Compute partition granularity: auto, merged, separate, or cluster">
   ];
 }
 
