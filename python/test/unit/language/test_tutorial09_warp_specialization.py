@@ -289,8 +289,19 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps,
-                                               A_col_major, B_col_major, use_early_tma_store_lowering):
+def test_tutorial09_matmul_tma_warp_specialize(
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    num_stages,
+    num_warps,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # Early TMA store lowering not yet supported for non-persistent kernels
     # (store is outside WS loop; partition scheduling can't handle TMAStoreTokenWaitOp)
@@ -400,11 +411,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     use_early_tma_store_lowering,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
-    # Early TMA store lowering not yet supported with loop flattening
-    # (FuseNestedLoops nests stores inside scf.if; partition scheduling can't handle TMAStoreTokenWaitOp)
-    if use_early_tma_store_lowering and FLATTEN:
-        pytest.skip("Early TMA store lowering not supported with flatten=True")
-
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
@@ -523,11 +529,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     use_early_tma_store_lowering,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
-    # Early TMA store lowering not yet supported with loop flattening
-    # (FuseNestedLoops nests stores inside scf.if; partition scheduling can't handle TMAStoreTokenWaitOp)
-    if use_early_tma_store_lowering and FLATTEN:
-        pytest.skip("Early TMA store lowering not supported with flatten=True")
-
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
