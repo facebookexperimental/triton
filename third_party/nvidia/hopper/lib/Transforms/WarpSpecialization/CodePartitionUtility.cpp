@@ -615,6 +615,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // Go through chList in the parentForOp, assume ch is directly in parentForOp.
   // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
   getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
