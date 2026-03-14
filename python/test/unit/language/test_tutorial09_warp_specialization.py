@@ -105,6 +105,8 @@ def matmul_kernel_tma_persistent_ws(
     FLATTEN: tl.constexpr,
     A_COL_MAJOR: tl.constexpr,
     B_COL_MAJOR: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
@@ -125,6 +127,8 @@ def matmul_kernel_tma_persistent_ws(
             flatten=FLATTEN,
             warp_specialize=True,
             disallow_acc_multi_buffer=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -412,7 +416,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
-@pytest.mark.parametrize("BLOCK_SIZE_M", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
@@ -422,6 +426,8 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -437,8 +443,14 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     A_col_major,
     B_col_major,
     use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
+    # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
@@ -510,6 +522,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             FLATTEN=FLATTEN,
             A_COL_MAJOR=A_col_major,
             B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
         )
