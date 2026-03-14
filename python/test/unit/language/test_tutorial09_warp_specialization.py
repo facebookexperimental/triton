@@ -287,9 +287,10 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps,
-                                               A_col_major, B_col_major):
+                                               A_col_major, B_col_major, use_early_tma_store_lowering):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
@@ -299,6 +300,7 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -375,6 +377,7 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -389,6 +392,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
+    use_early_tma_store_lowering,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
     # Skip configurations that exceed hardware resource limits
@@ -402,6 +406,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -490,6 +495,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -504,6 +510,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     EPILOGUE_SUBTILE,
     A_col_major,
     B_col_major,
+    use_early_tma_store_lowering,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
     # Skip configurations that exceed hardware resource limits
@@ -517,6 +524,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
