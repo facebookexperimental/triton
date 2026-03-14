@@ -3272,7 +3272,7 @@ class range(base_value):
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
                  disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
                  data_partition_factor=None, merge_epilogue=False, tmem_alloc_algo=None, smem_alloc_algo=None,
-                 smem_budget=None, smem_circular_reuse=None):
+                 smem_budget=None, smem_circular_reuse=None, split_mma=False):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -3295,6 +3295,7 @@ class range(base_value):
         self.flatten = flatten
         self.warp_specialize = warp_specialize
         self.disable_licm = disable_licm
+        self.split_mma = split_mma
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")
