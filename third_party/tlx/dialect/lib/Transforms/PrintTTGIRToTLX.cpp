@@ -126,7 +126,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttg.memdesc_reinterpret", "tlx.local_reinterpret",
      "Reinterpret buffer dtype/shape"},
     {"ttng.tmem_subslice", "tlx.subslice", "TMEM subslice (Blackwell)"},
-    {"ttg.memdesc_index", "tlx.memdesc_index", "Index into memdesc"},
+    {"ttg.memdesc_index", "tlx.local_view", "Index into memdesc (buffer view)"},
 
     // Async copy operations (cp.async)
     {"ttg.async_load", "tlx.async_load",
