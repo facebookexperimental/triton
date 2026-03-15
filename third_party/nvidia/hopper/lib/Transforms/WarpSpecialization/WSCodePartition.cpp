@@ -1364,11 +1364,7 @@ void createTokenPost(
     }
     // For channels in the same reuse group as channel, use the same token.
     // If the channel has a single buffer, still uses different tokens.
-    // Only propagate to the full reuse group for the representative channel.
-    // Non-representative channels that are incompatible with the representative
-    // create their own CommChannel and should not overwrite the group's
-    // entries.
-    if (reuseGrp >= 0 && isRepresentative) {
+    if (reuseGrp >= 0) {
       for (auto *reuse : config->getGroup(reuseGrp)->channels)
         tokenMap[reuse] = commChannel;
     }
