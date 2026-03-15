@@ -186,9 +186,6 @@ struct TmemDataChannelPost : Channel {
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 
-// Check if ctrlOp needs an accumulation counter for the given reuse group.
-bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group);
-
 // Return number of AccumCnts for the given ctrlOp. AccumCnts due to reuses
 // will be at the end, we go through all ReuseGroups and if any channel in
 // the group is nested under ctrlOp, we add one accumCnt for this group.

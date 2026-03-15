@@ -3664,6 +3664,24 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   }
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
+      // If all channels reference the same alloc op, they are lifecycle
+      // phases of one buffer, not distinct buffers reusing memory.
+      Operation *firstAlloc;
+      if (kv.second[0]->channelKind == DataChannelKind::TMEMPost)
+        firstAlloc =
+            static_cast<ttng::TmemDataChannelPost *>(kv.second[0])->allocOp;
+      else
+        firstAlloc = static_cast<ChannelPost *>(kv.second[0])->allocOp;
+      bool allSameAlloc = llvm::all_of(kv.second, [&](Channel *ch) {
+        Operation *alloc =
+            (ch->channelKind == DataChannelKind::TMEMPost)
+                ? static_cast<ttng::TmemDataChannelPost *>(ch)->allocOp
+                : static_cast<ChannelPost *>(ch)->allocOp;
+        return alloc == firstAlloc;
+      });
+      if (allSameAlloc)
+        continue;
+
       ReuseGroup group;
       // make sure the channel without buffer.offset is the first one (i.e the
       // representative channel)

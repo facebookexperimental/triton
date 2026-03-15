@@ -573,22 +573,7 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
-  scf::ForOp parentForOp;
-  if (reuseGroupIdx < 0) {
-    parentForOp = op->getParentOfType<scf::ForOp>();
-  } else {
-    // For reuse groups, walk up the loop nest to find the ForOp that owns
-    // the accum counter (where needAccumCntForReuse returns true). For TMEM
-    // operandD, this skips the inner accumulation loop and finds the outer
-    // tile loop.
-    parentForOp = op->getParentOfType<scf::ForOp>();
-    while (parentForOp &&
-           !needAccumCntForReuse(parentForOp.getOperation(),
-                                 config->getGroup(reuseGroupIdx))) {
-      parentForOp = parentForOp->getParentOfType<scf::ForOp>();
-    }
-  }
-
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
   // Handle operations outside loops (e.g., epilogue operations).
   // These operations don't participate in buffer cycling, so return constant 0.
   if (!parentForOp) {
@@ -596,14 +581,7 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return builder.create<arith::ConstantIndexOp>(op->getLoc(), 0);
   }
 
-  // Walk up from op to find the immediate child of parentForOp.
-  // This is to handle when a channel has a loop carried dependency.
   auto *pOp = op->getParentOp();
-  while (pOp && pOp->getParentOp() != parentForOp.getOperation())
-    pOp = pOp->getParentOp();
-  if (!pOp)
-    pOp = op->getParentOp();
-
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
@@ -646,15 +624,12 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return;
   }
   // op is a user of the channel. accumCnt is the corresponding argument of the
-  // accum-owning loop.
-  // Use the accum-owning loop (not just the immediate parent) to find the
-  // channel list. For TMEM operandD, this is the outer tile loop.
+  // parentForOp.
+  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
+  // FIXME: handle the case where ch is inside in IfOp.
   SmallVector<Operation *> chList;
-  auto accumLoop = op->getParentOfType<scf::ForOp>();
-  while (accumLoop && !needAccumCntForReuse(accumLoop.getOperation(),
-                                            config->getGroup(reuseGroupIdx)))
-    accumLoop = accumLoop->getParentOfType<scf::ForOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), accumLoop.getOperation(),
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
   int vecIdx = 0, theIdx = -1;
@@ -665,17 +640,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     }
     ++vecIdx;
   }
-  // When the dstOp is inside a nested loop (not a direct child of the accum
-  // loop), it won't appear in chList. For example, the MMA op lives inside
-  // the inner k-loop but the accum-owning loop is the outer tile loop. Since
-  // tmem_store initializes the buffer, the MMA accumulates into it, and
-  // tmem_load reads the result — all within the same outer-loop iteration —
-  // they all share the same buffer slot. Use offset 0 (no additional offset
-  // beyond accumCnt).
-  // TODO: Verify this is safe for all cases where dstOp is in a nested loop,
-  // not just the TMEM operandD accumulation pattern.
-  if (theIdx < 0)
-    theIdx = 0;
+  assert(theIdx >= 0);
   if (theIdx == 0) {
     std::tie(bufferIdx, phase) =
         getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
