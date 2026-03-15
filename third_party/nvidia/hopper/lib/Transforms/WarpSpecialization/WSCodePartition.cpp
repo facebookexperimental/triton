@@ -1144,68 +1144,6 @@ static bool checkConsumersInLoops(Channel *channel) {
   return false;
 }
 
-/// Check if a channel is compatible with its reuse group representative for
-/// sharing a CommChannel. Returns false if they have different barrier
-/// requirements (gen5 producer/consumer status), which would cause incorrect
-/// synchronization when one channel needs producer-side barriers and the other
-/// needs consumer-side barriers.
-static bool
-checkBarrierCompatibility(Channel *channel, Channel *repChannel,
-                          const CommChannel &repCommChannel,
-                          const DenseMap<Channel *, SmallVector<Channel *>>
-                              &channelsGroupedByConsumers) {
-  // Check producer compatibility: both must agree on whether the producer
-  // is a TCGen5MMAOp (which determines hasProdBar).
-  bool hasProdBar = isa<ttng::TCGen5MMAOp>(channel->getSrcOp());
-  bool repHasProdBar = isa<ttng::TCGen5MMAOp>(repChannel->getSrcOp());
-  if (hasProdBar != repHasProdBar)
-    return false;
-
-  // Check consumer compatibility: both must agree on whether all actual
-  // consumers are TCGen5MMAOp (which determines useGen5Barrier).
-  // For the representative, infer from its CommChannel.
-  bool repUseGen5Barrier = !repCommChannel.consumerBarriers.empty();
-
-  // Compute useGen5Barrier for the current channel by checking actual
-  // consumers.
-  auto it = channelsGroupedByConsumers.find(channel);
-  if (it == channelsGroupedByConsumers.end())
-    return true;
-
-  auto *dstOp = it->second.front()->getDstOp();
-  SmallVector<Operation *> dstOps;
-  if (channel->channelKind == DataChannelKind::SMEMPost) {
-    auto *cPost = static_cast<ChannelPost *>(channel);
-    cPost->getDstOps(dstOps);
-  } else {
-    dstOps.push_back(dstOp);
-  }
-
-  bool useGen5Barrier = true;
-  bool foundConsumer = false;
-  for (auto consumerAsyncTaskId : channel->relation.second) {
-    for (auto *dst : dstOps) {
-      auto consumers = getActualConsumers(dst);
-      for (auto *t : consumers) {
-        SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
-        if (asyncTasks.empty())
-          continue;
-        if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                      consumerAsyncTaskId) != asyncTasks.end()) {
-          foundConsumer = true;
-          if (!isa<ttng::TCGen5MMAOp>(t))
-            useGen5Barrier = false;
-        }
-      }
-    }
-  }
-
-  if (!foundConsumer)
-    return true;
-
-  return useGen5Barrier == repUseGen5Barrier;
-}
-
 void createTokenPost(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -1265,9 +1203,11 @@ void createTokenPost(
     assert(it != channelsGroupedByConsumers.end());
 
     // For each reuse group, choose a representative channel.
-    bool isRepresentative = false;
     int reuseGrp = channelInReuseGroup(channel, config);
     if (reuseGrp >= 0) {
+      // FIXME: check that the other channels in the reuse group have the same
+      // choice about producerBarrier, and consumerBarriers. If not, we should
+      // not set producerBarrier, and consumerBarriers.
       auto *repChannel = config->getGroup(reuseGrp)->channels[0];
       if (channel != repChannel) {
         // This channel is in a reuse group but is not the representative.
@@ -1276,25 +1216,13 @@ void createTokenPost(
         auto repIt = tokenMap.find(repChannel);
         assert(repIt != tokenMap.end() &&
                "Representative channel should have been processed first");
-
-        // Check barrier compatibility before sharing. If the channels have
-        // different gen5 producer/consumer status, they need separate
-        // CommChannels to avoid mixing up barrier semantics.
-        if (checkBarrierCompatibility(channel, repChannel, repIt->second,
-                                      channelsGroupedByConsumers)) {
-          tokenMap[channel] = repIt->second;
-          LDBG("createToken: channel "
-               << channel->uniqID
-               << " shares CommChannel from representative channel "
-               << repChannel->uniqID);
-          continue;
-        }
+        // Share the representative's CommChannel
+        tokenMap[channel] = repIt->second;
         LDBG("createToken: channel "
-             << channel->uniqID << " incompatible with representative "
-             << repChannel->uniqID << ", creating own CommChannel");
-        // Fall through to create own CommChannel
-      } else {
-        isRepresentative = true;
+             << channel->uniqID
+             << " shares CommChannel from representative channel "
+             << repChannel->uniqID);
+        continue;
       }
     }
 
