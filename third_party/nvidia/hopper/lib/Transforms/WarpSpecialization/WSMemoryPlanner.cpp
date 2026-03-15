@@ -1415,8 +1415,23 @@ public:
       unsigned copy = 1;
       if (auto copyAttr = alloc->getAttrOfType<IntegerAttr>("buffer.copy"))
         copy = copyAttr.getInt();
-      allocInfos.push_back({alloc, baseCols, copy});
       totalCols += baseCols * copy;
+      // TODO: Remove this restriction once buffer index constraints are
+      // tested for TMEM allocs that are not loop-carried MMA accumulators.
+      // Currently only allocs with a loop-carried acc token have correct
+      // multi-buffer index logic in createBufferPost.
+      bool hasLoopCarriedMMA = false;
+      for (auto *user : alloc.getResult().getUsers()) {
+        if (auto forOp = user->getParentOfType<scf::ForOp>()) {
+          if (hasLoopCarriedAccToken(alloc, forOp)) {
+            hasLoopCarriedMMA = true;
+            break;
+          }
+        }
+      }
+      if (!hasLoopCarriedMMA)
+        continue;
+      allocInfos.push_back({alloc, baseCols, copy});
     }
 
     while (totalCols < tmemColLimit && !allocInfos.empty()) {
