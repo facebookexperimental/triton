@@ -376,6 +376,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       ++num_attrs;
     }}
 
+    #if CUDA_VERSION >= 12080
     if (preferredClusterDimX > 0) {{
       CUlaunchAttribute preferredClusterAttr = {{}};
       preferredClusterAttr.id = CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION;
@@ -385,6 +386,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       launchAttr[num_attrs] = preferredClusterAttr;
       ++num_attrs;
     }}
+    #endif
 
     config.numAttrs = num_attrs;
 
