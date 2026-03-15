@@ -2125,7 +2125,13 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   // is false this wait_barrier serves as consumer_wait.
   builder.setInsertionPoint(producerOrConsumer);
   builder.setAsyncTaskIdsFromOp(producerOrConsumer);
-  builder.setLoopScheduleInfoFromOp(producerOrConsumer);
+  // Use the actual consumer's stage/cluster, not the memdesc_trans prep op's.
+  // producerOrConsumer may be a memdesc_trans/memdesc_index at stage 0, but
+  // the real consumer (e.g. dQ/dK MMA) may be at stage 1. The wait_barrier
+  // must be in the same SWP stage as the actual consumer to avoid off-by-one
+  // barrier count mismatches that cause deadlock.
+  auto *actualConsumer = getUniqueActualConsumer(producerOrConsumer);
+  builder.setLoopScheduleInfoFromOp(actualConsumer);
   auto producerBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   // curPhase = curPhase xor True for emptyBarrier.
@@ -3206,9 +3212,39 @@ void insertAsyncComm(
       if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
-        builder.setLoopScheduleInfoFromOp(consumerWaitPoint);
+        // Use the actual consumer's stage/cluster instead of the prep op's.
+        // consumerWaitPoint may be a memdesc_trans at stage 0, but the real
+        // consumer (e.g. dQ/dK MMA) may be at stage 1.
+        auto *actualCons = getUniqueActualConsumer(consumerWaitPoint);
+        builder.setLoopScheduleInfoFromOp(actualCons);
         auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
+        // Propagate the actual consumer's loop schedule to the phase/bufferIdx
+        // value ops. These were computed earlier (by getBufferIdxAndPhase) with
+        // no loop.stage/loop.cluster, but they must match the consumer_wait's
+        // stage so SWP pipelines them together.
+        auto schedInfo = builder.getLoopScheduleInfo();
+        for (Value v : {bufferIdx, phase}) {
+          SmallVector<Value> worklist = {v};
+          DenseSet<Value> visited;
+          while (!worklist.empty()) {
+            Value cur = worklist.pop_back_val();
+            if (!visited.insert(cur).second)
+              continue;
+            auto *defOp = cur.getDefiningOp();
+            if (!defOp || defOp->getBlock() != waitOp->getBlock())
+              continue;
+            if (!defOp->hasAttr(triton::kLoopStageAttrName)) {
+              if (schedInfo.stage)
+                defOp->setAttr(triton::kLoopStageAttrName, schedInfo.stage);
+              if (schedInfo.cluster)
+                defOp->setAttr(triton::kLoopClusterAttrName,
+                               schedInfo.cluster);
+              for (Value operand : defOp->getOperands())
+                worklist.push_back(operand);
+            }
+          }
+        }
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
       }
 
