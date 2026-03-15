@@ -186,6 +186,13 @@ struct TmemDataChannelPost : Channel {
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 
+/// Returns true if \p tmemAlloc has a MMAv5OpInterface user inside \p forOp
+/// whose acc_dep token is a loop iter_arg of \p forOp and whose output
+/// token is yielded back to the same iter_arg position. This indicates
+/// the accumulator is reused across iterations and the buffer index
+/// should not rotate within this loop.
+bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp);
+
 // Return number of AccumCnts for the given ctrlOp. AccumCnts due to reuses
 // will be at the end, we go through all ReuseGroups and if any channel in
 // the group is nested under ctrlOp, we add one accumCnt for this group.

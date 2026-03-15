@@ -1976,12 +1976,39 @@ DenseMap<Channel *, Value> createBufferPost(
       users.push_back(user);
     DenseMap<Operation *, Value> userToBufIdx;
     int reuseGrp = channelInReuseGroup(channel, config);
+
+    bool isOperandDTmem = false;
+    if (channel->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(channel);
+      isOperandDTmem = tmemCh->isOperandD;
+    }
+
     for (auto *user : users) {
       Value bufferIdx;
       Value _phase = Value();
       OpBuilderWithAsyncTaskIds builder(user);
       builder.clearLoopScheduleInfo();
-      if (auto forOp = user->getParentOfType<scf::ForOp>()) {
+      if (isOperandDTmem) {
+        // For operandD TMEM users inside a loop with a loop-carried
+        // accumulator token (inner k-loop), the buffer index should not
+        // rotate within that loop. Pass the inner ForOp itself as the 'op'
+        // to getBufferIdxAndPhase so that getAccumCount looks up to the
+        // outer loop for the accumCnt. The builder stays at the user's
+        // position with its task IDs, so arith ops are per-task.
+        auto innerFor = user->getParentOfType<scf::ForOp>();
+        if (innerFor && hasLoopCarriedAccToken(oldAllocOp, innerFor)) {
+          getBufferIdxAndPhase(builder, innerFor.getOperation(), numBuffers,
+                               regionsWithChannels, bufferIdx, _phase, config,
+                               reuseGrp, channel);
+        } else if (innerFor) {
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
+        } else {
+          std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
+              builder, user, channel, oldAllocOp, numBuffers,
+              regionsWithChannels, config, reuseGrp);
+        }
+      } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
