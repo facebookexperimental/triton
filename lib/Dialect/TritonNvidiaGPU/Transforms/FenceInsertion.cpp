@@ -121,6 +121,17 @@ private:
     if (!isa<triton::gpu::MemDescType>(operand.getType()))
       return;
 
+    // Check if any user of this memdesc is a LocalStoreOp, indicating
+    // a generic-proxy write to this buffer. This handles the case where
+    // the buffer was pre-allocated (e.g. by NVGPUWSTMAStoreLowering) and
+    // written via a separate local_store rather than local_alloc with source.
+    for (auto *user : operand.getUsers()) {
+      if (isa<ttg::LocalStoreOp>(user)) {
+        result.insert(user);
+        return;
+      }
+    }
+
     auto op = operand.getDefiningOp();
     if (op) {
       // reach an alloc copying from register, we need a fence.
