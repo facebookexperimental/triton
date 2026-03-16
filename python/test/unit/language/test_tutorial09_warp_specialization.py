@@ -486,6 +486,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
+    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded")
+
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
@@ -623,6 +626,9 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
 
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
