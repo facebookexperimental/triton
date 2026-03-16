@@ -261,8 +261,7 @@ def NVWS_ProducerCommitOp : NVWS_Op<"producer_commit"> {
     that the buffers are ready to be consumed.
   }];
 
-  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx,
-                       UnitAttr:$fenced);
+  let arguments = (ins TensorOf<[NVWS_TokenType]>:$token, I32:$idx);
 
   let assemblyFormat = "$token `,` $idx attr-dict `:` type(operands)";
 }

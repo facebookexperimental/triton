@@ -3030,22 +3030,9 @@ void insertAsyncComm(
         });
         builder.setInsertionPointAfter(producerCommitPoint);
         builder.setLoopScheduleInfoFromOp(producerCommitPoint);
-        bool needsFence = false;
-        if (masterChannel->channelKind == DataChannelKind::SMEM ||
-            masterChannel->channelKind == DataChannelKind::SMEMPost) {
-          Operation *consumerOp =
-              getUniqueActualConsumer(masterChannel->getDstOp());
-          // Note: The only async producer is TMA and this is unreachable
-          // in that case because of the prior checks.
-          if (isa<ttng::TCGen5MMAOp, ttng::WarpGroupDotOp,
-                  ttng::AsyncTMACopyLocalToGlobalOp>(consumerOp))
-            needsFence = true;
-        }
         auto commitOp =
             builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
                 tailProducer->getLoc(), token.second, bufferIdx);
-        if (needsFence)
-          commitOp->setAttr("fenced", builder.getUnitAttr());
       }
     }
 
