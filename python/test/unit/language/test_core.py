@@ -1,5 +1,6 @@
 # ruff: noqa: F821,F841
 import contextlib
+import os
 import itertools
 import re
 from typing import Optional
@@ -3096,67 +3097,77 @@ def _mul_combine(a, b):
 
 
 @pytest.mark.parametrize("N_ROWS", [1, 4, 16, 32])
-def test_reduction_ordering_sum(N_ROWS, device):
+@pytest.mark.parametrize("row_major", [True, False], ids=["row_major", "col_major"])
+def test_reduction_ordering_sum(N_ROWS, row_major, device):
     """Verify that tl.sum with INNER_TREE ordering produces bitwise-identical
     results across different num_warps configurations on 2D data.
     The reduction dimension (axis=1) uses a realistic tile size while the
-    non-reduction dimension parametrizes over a range of row counts."""
+    non-reduction dimension parametrizes over a range of row counts.
+    Tests both row-major and column-major memory layouts."""
     BLOCK_N = 1024
+    data_dir = os.path.join(os.path.dirname(__file__), "test_data")
 
     @triton.jit
-    def sum_kernel(X, Z, stride_x, N_ROWS: tl.constexpr, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+    def sum_kernel(X, Z, stride_row, stride_col, N_ROWS: tl.constexpr, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
         offs_m = tl.arange(0, N_ROWS)
         offs_n = tl.arange(0, BLOCK_N)
-        x = tl.load(X + offs_m[:, None] * stride_x + offs_n[None, :])
+        x = tl.load(X + offs_m[:, None] * stride_row + offs_n[None, :] * stride_col)
         z = tl.sum(x, axis=1, reduction_ordering=ORDERING)
         tl.store(Z + offs_m, z)
 
-    torch.manual_seed(42)
-    x = torch.randn((N_ROWS, BLOCK_N), device=device, dtype=torch.float32)
+    x_row = torch.load(os.path.join(data_dir, f"reduction_ordering_input_{N_ROWS}.pt")).to(device)
+    reference = torch.load(os.path.join(data_dir, f"reduction_ordering_sum_ref_{N_ROWS}.pt")).to(device)
 
-    reference = None
+    if row_major:
+        x = x_row
+    else:
+        x = torch.empty((BLOCK_N, N_ROWS), device=device, dtype=torch.float32).t()
+        x.copy_(x_row)
+
     for nw in [1, 2, 4, 8]:
         out = torch.empty(N_ROWS, device=device, dtype=torch.float32)
-        sum_kernel[(1, )](x, out, x.stride(0), N_ROWS=N_ROWS, BLOCK_N=BLOCK_N, ORDERING=tl.ReductionOrdering.INNER_TREE,
-                          num_warps=nw)
-        if reference is None:
-            reference = out.clone()
-        else:
-            assert torch.equal(out, reference), (f"INNER_TREE sum not bitwise equal across num_warps: "
-                                                 f"num_warps={nw} differs from reference (num_warps=1)")
+        sum_kernel[(1, )](x, out, x.stride(0), x.stride(1), N_ROWS=N_ROWS, BLOCK_N=BLOCK_N,
+                          ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=nw)
+        assert torch.equal(out, reference), (f"INNER_TREE sum not bitwise equal to reference: "
+                                             f"num_warps={nw}, row_major={row_major} differs from saved reference")
 
 
 @pytest.mark.parametrize("N_ROWS", [1, 4, 16, 32])
-def test_reduction_ordering_reduce_mul(N_ROWS, device):
+@pytest.mark.parametrize("row_major", [True, False], ids=["row_major", "col_major"])
+def test_reduction_ordering_reduce_mul(N_ROWS, row_major, device):
     """Verify that tl.reduce with a multiply combine and INNER_TREE ordering
     produces bitwise-identical results across different num_warps
     configurations on 2D data.
     The reduction dimension (axis=1) uses a realistic tile size while the
-    non-reduction dimension parametrizes over a range of row counts."""
+    non-reduction dimension parametrizes over a range of row counts.
+    Tests both row-major and column-major memory layouts."""
     BLOCK_N = 1024
+    data_dir = os.path.join(os.path.dirname(__file__), "test_data")
 
     @triton.jit
-    def mul_reduce_kernel(X, Z, stride_x, N_ROWS: tl.constexpr, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+    def mul_reduce_kernel(X, Z, stride_row, stride_col, N_ROWS: tl.constexpr, BLOCK_N: tl.constexpr,
+                          ORDERING: tl.constexpr):
         offs_m = tl.arange(0, N_ROWS)
         offs_n = tl.arange(0, BLOCK_N)
-        x = tl.load(X + offs_m[:, None] * stride_x + offs_n[None, :])
+        x = tl.load(X + offs_m[:, None] * stride_row + offs_n[None, :] * stride_col)
         z = tl.reduce(x, axis=1, combine_fn=_mul_combine, reduction_ordering=ORDERING)
         tl.store(Z + offs_m, z)
 
-    # Use values near 1.0 to avoid overflow/underflow with multiplication.
-    torch.manual_seed(42)
-    x = 0.99 + 0.02 * torch.rand((N_ROWS, BLOCK_N), device=device, dtype=torch.float32)
+    x_row = torch.load(os.path.join(data_dir, f"reduction_ordering_mul_input_{N_ROWS}.pt")).to(device)
+    reference = torch.load(os.path.join(data_dir, f"reduction_ordering_mul_ref_{N_ROWS}.pt")).to(device)
 
-    reference = None
+    if row_major:
+        x = x_row
+    else:
+        x = torch.empty((BLOCK_N, N_ROWS), device=device, dtype=torch.float32).t()
+        x.copy_(x_row)
+
     for nw in [1, 2, 4, 8]:
         out = torch.empty(N_ROWS, device=device, dtype=torch.float32)
-        mul_reduce_kernel[(1, )](x, out, x.stride(0), N_ROWS=N_ROWS, BLOCK_N=BLOCK_N,
+        mul_reduce_kernel[(1, )](x, out, x.stride(0), x.stride(1), N_ROWS=N_ROWS, BLOCK_N=BLOCK_N,
                                  ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=nw)
-        if reference is None:
-            reference = out.clone()
-        else:
-            assert torch.equal(out, reference), (f"INNER_TREE mul reduce not bitwise equal across num_warps: "
-                                                 f"num_warps={nw} differs from reference (num_warps=1)")
+        assert torch.equal(out, reference), (f"INNER_TREE mul reduce not bitwise equal to reference: "
+                                             f"num_warps={nw}, row_major={row_major} differs from saved reference")
 
 
 # ---------------
