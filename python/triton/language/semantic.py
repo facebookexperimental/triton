@@ -1874,7 +1874,8 @@ class TritonSemantic(Generic[TensorTy]):
             res_ty = scalar_ty
         return self.tensor(x, res_ty)
 
-    def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn) -> Tuple[TensorTy, ...]:
+    def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
+                  reduction_ordering=None) -> Tuple[TensorTy, ...]:
         if axis is None:
             inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=True) for t in inputs)
             axis = 0
