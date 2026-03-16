@@ -55,6 +55,7 @@ class ReductionOrdering(ReductionOrderingBase):
         return f"ReductionOrdering.{self.name.upper()}"
 
 
+ReductionOrdering.UNORDERED = ReductionOrdering("unordered")
 ReductionOrdering.INNER_TREE = ReductionOrdering("inner_tree")
 
 
@@ -2725,6 +2726,12 @@ def reduce(input, axis, combine_fn, keep_dims=False, reduction_ordering=None, _s
     axis = _unwrap_if_constexpr(axis)
     keep_dims = _unwrap_if_constexpr(keep_dims)
     reduction_ordering = _unwrap_if_constexpr(reduction_ordering)
+    if reduction_ordering is None:
+        reduction_ordering = ReductionOrdering.UNORDERED
+    if isinstance(reduction_ordering, CompositeReductionOrdering):
+        raise TypeError("CompositeReductionOrdering is not yet supported")
+    if not isinstance(reduction_ordering, ReductionOrdering):
+        raise TypeError(f"reduction_ordering must be None or a ReductionOrdering, got {type(reduction_ordering)}")
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
     ret = _semantic.reduction(input, axis, make_combine_region, reduction_ordering=reduction_ordering)
