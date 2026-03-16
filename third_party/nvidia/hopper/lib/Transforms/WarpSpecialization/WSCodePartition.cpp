@@ -3238,8 +3238,7 @@ void insertAsyncComm(
               if (schedInfo.stage)
                 defOp->setAttr(triton::kLoopStageAttrName, schedInfo.stage);
               if (schedInfo.cluster)
-                defOp->setAttr(triton::kLoopClusterAttrName,
-                               schedInfo.cluster);
+                defOp->setAttr(triton::kLoopClusterAttrName, schedInfo.cluster);
               for (Value operand : defOp->getOperands())
                 worklist.push_back(operand);
             }
