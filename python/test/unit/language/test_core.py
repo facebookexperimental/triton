@@ -3085,6 +3085,80 @@ def test_generic_reduction(device):
     torch.testing.assert_close(sum1, sum_ref)
 
 
+# ------------------------------------------
+# test reduction ordering (bitwise equivalence)
+# ------------------------------------------
+
+
+@triton.jit
+def _mul_combine(a, b):
+    return a * b
+
+
+@pytest.mark.parametrize("N_ROWS", [1, 4, 16, 32])
+def test_reduction_ordering_sum(N_ROWS, device):
+    """Verify that tl.sum with INNER_TREE ordering produces bitwise-identical
+    results across different num_warps configurations on 2D data.
+    The reduction dimension (axis=1) uses a realistic tile size while the
+    non-reduction dimension parametrizes over a range of row counts."""
+    BLOCK_N = 1024
+
+    @triton.jit
+    def sum_kernel(X, Z, stride_x, N_ROWS: tl.constexpr, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+        offs_m = tl.arange(0, N_ROWS)
+        offs_n = tl.arange(0, BLOCK_N)
+        x = tl.load(X + offs_m[:, None] * stride_x + offs_n[None, :])
+        z = tl.sum(x, axis=1, reduction_ordering=ORDERING)
+        tl.store(Z + offs_m, z)
+
+    torch.manual_seed(42)
+    x = torch.randn((N_ROWS, BLOCK_N), device=device, dtype=torch.float32)
+
+    reference = None
+    for nw in [1, 2, 4, 8]:
+        out = torch.empty(N_ROWS, device=device, dtype=torch.float32)
+        sum_kernel[(1, )](x, out, x.stride(0), N_ROWS=N_ROWS, BLOCK_N=BLOCK_N, ORDERING=tl.ReductionOrdering.INNER_TREE,
+                          num_warps=nw)
+        if reference is None:
+            reference = out.clone()
+        else:
+            assert torch.equal(out, reference), (f"INNER_TREE sum not bitwise equal across num_warps: "
+                                                 f"num_warps={nw} differs from reference (num_warps=1)")
+
+
+@pytest.mark.parametrize("N_ROWS", [1, 4, 16, 32])
+def test_reduction_ordering_reduce_mul(N_ROWS, device):
+    """Verify that tl.reduce with a multiply combine and INNER_TREE ordering
+    produces bitwise-identical results across different num_warps
+    configurations on 2D data.
+    The reduction dimension (axis=1) uses a realistic tile size while the
+    non-reduction dimension parametrizes over a range of row counts."""
+    BLOCK_N = 1024
+
+    @triton.jit
+    def mul_reduce_kernel(X, Z, stride_x, N_ROWS: tl.constexpr, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+        offs_m = tl.arange(0, N_ROWS)
+        offs_n = tl.arange(0, BLOCK_N)
+        x = tl.load(X + offs_m[:, None] * stride_x + offs_n[None, :])
+        z = tl.reduce(x, axis=1, combine_fn=_mul_combine, reduction_ordering=ORDERING)
+        tl.store(Z + offs_m, z)
+
+    # Use values near 1.0 to avoid overflow/underflow with multiplication.
+    torch.manual_seed(42)
+    x = 0.99 + 0.02 * torch.rand((N_ROWS, BLOCK_N), device=device, dtype=torch.float32)
+
+    reference = None
+    for nw in [1, 2, 4, 8]:
+        out = torch.empty(N_ROWS, device=device, dtype=torch.float32)
+        mul_reduce_kernel[(1, )](x, out, x.stride(0), N_ROWS=N_ROWS, BLOCK_N=BLOCK_N,
+                                 ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=nw)
+        if reference is None:
+            reference = out.clone()
+        else:
+            assert torch.equal(out, reference), (f"INNER_TREE mul reduce not bitwise equal across num_warps: "
+                                                 f"num_warps={nw} differs from reference (num_warps=1)")
+
+
 # ---------------
 # test permute
 # ---------------
