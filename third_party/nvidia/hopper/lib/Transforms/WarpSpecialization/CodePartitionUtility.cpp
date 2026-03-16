@@ -598,6 +598,123 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
   return -1;
 }
 
+// Check whether there is a dependency chain from the consumer of channel A
+// to the producer of channel B: A.dstOp -> ... -> B.srcOp.
+// We check whether B.srcOp is a transitive user of A.dstOp's result.
+static bool hasDependencyChain(Channel *A, Channel *B) {
+  Operation *aConsumer = A->getDstOp();
+  Operation *bProducer = B->getSrcOp();
+  if (!aConsumer || !bProducer)
+    return false;
+
+  // Walk transitive users of aConsumer's results.
+  DenseSet<Operation *> visited;
+  SmallVector<Operation *> worklist;
+  for (auto result : aConsumer->getResults()) {
+    for (auto *user : result.getUsers())
+      worklist.push_back(user);
+  }
+  while (!worklist.empty()) {
+    auto *op = worklist.pop_back_val();
+    if (!visited.insert(op).second)
+      continue;
+    if (op == bProducer)
+      return true;
+    for (auto result : op->getResults()) {
+      for (auto *user : result.getUsers())
+        worklist.push_back(user);
+    }
+  }
+
+  // Also check program order: if both are in the same block and aConsumer
+  // appears before bProducer, there is an implicit dependency via ordering.
+  if (aConsumer->getBlock() == bProducer->getBlock())
+    return appearsBefore(aConsumer, bProducer);
+
+  return false;
+}
+
+bool verifyReuseGroup2(ReuseGroup *group) {
+  assert(group->channels.size() == 2 &&
+         "verifyReuseGroup2 requires exactly 2 channels");
+  auto *chA = group->channels[0];
+  auto *chB = group->channels[1];
+
+  // Only handle single-copy buffers.
+  if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
+    return false;
+
+  bool hasAtoB = hasDependencyChain(chA, chB);
+  bool hasBtoA = hasDependencyChain(chB, chA);
+  LDBG("verifyReuseGroup2: channel " << chA->uniqID << " -> channel "
+                                     << chB->uniqID << ": " << hasAtoB);
+  LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
+                                     << chA->uniqID << ": " << hasBtoA);
+  if (!hasAtoB && !hasBtoA) {
+    LDBG("verifyReuseGroup2: no dependency chain between channels");
+    return false;
+  }
+  return true;
+}
+
+std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
+  assert(group->channels.size() == 2);
+  auto *chA = group->channels[0];
+  auto *chB = group->channels[1];
+
+  // The early channel is the one whose consumer feeds into the other's
+  // producer. If A.consumer -> B.producer dependency exists, A is early.
+  if (hasDependencyChain(chA, chB))
+    return {chA, chB};
+  assert(hasDependencyChain(chB, chA) &&
+         "No dependency chain found in either direction");
+  return {chB, chA};
+}
+
+bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
+  Operation *earlyProducer = earlyChannel->getSrcOp();
+  Operation *lateConsumer = lateChannel->getDstOp();
+  if (!earlyProducer || !lateConsumer)
+    return true;
+
+  // Get the actual consumer op (e.g., resolve through memdesc_trans).
+  auto actualConsumers = getActualConsumers(lateConsumer);
+
+  auto earlyProducerTasks = getAsyncTaskIds(earlyProducer);
+
+  for (auto *consumer : actualConsumers) {
+    auto consumerTasks = getAsyncTaskIds(consumer);
+    // Check if any task ID is shared between earlyProducer and this consumer.
+    bool samePartition = false;
+    for (auto tid : earlyProducerTasks) {
+      if (std::find(consumerTasks.begin(), consumerTasks.end(), tid) !=
+          consumerTasks.end()) {
+        samePartition = true;
+        break;
+      }
+    }
+    if (!samePartition)
+      continue;
+
+    // Same partition: check if earlyProducer appears before lateConsumer.
+    // If so, partition-internal ordering guarantees that lateConsumer's
+    // consumer_release will happen before earlyProducer's next
+    // producer_acquire.
+    if (earlyProducer->getBlock() == consumer->getBlock() &&
+        appearsBefore(earlyProducer, consumer)) {
+      LDBG("needExplicitReuseWait: no explicit wait needed, "
+           << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
+           << lateChannel->uniqID << " have same-partition ordering");
+      return false;
+    }
+  }
+
+  LDBG("needExplicitReuseWait: explicit wait needed for "
+       << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
+       << lateChannel->uniqID);
+  return true;
+}
+
 void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
@@ -2313,6 +2430,44 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         createChannelsForProducers(prods, firstProdTaskId, lastConsumerIds,
                                    tmemAllocOp.getOperation(), lastConsumer,
                                    channels);
+      }
+    }
+
+    // Create a guard channel in the reverse direction: tmem_load (last
+    // consumer) → tmem_store (first producer). This prevents the next
+    // iteration's tmem_store from overwriting TMEM before the current
+    // iteration's tmem_load finishes reading.
+    //
+    // Without this, a TMEMStoreOp producer (e.g., reduction partition
+    // zeroing dk/dv) would use the gen5 inline barrier for its
+    // producer_acquire, but that barrier fires when the MMA commits —
+    // too early. The tmem_store must wait until the sibling tmem_load
+    // finishes reading. This guard channel provides that dependency
+    // through the normal token infrastructure:
+    //   ProducerCommit (after tmem_load) → ConsumerWait (before tmem_store)
+    //
+    // The needsChannel check naturally skips the same-task case (e.g.,
+    // FA fwd where both ops are in the computation partition), avoiding
+    // deadlocks.
+    if (lastConsumerIds.size() == 1 && isa<ttng::TMEMLoadOp>(lastConsumer) &&
+        isa<ttng::TMEMStoreOp>(firstProducer)) {
+      int lastConsTaskId = lastConsumerIds.front();
+      if (needsChannel(lastConsTaskId, firstProdTaskIds)) {
+        auto channelID = channels.size();
+        auto guardCh = std::make_unique<ttng::TmemDataChannelPost>(
+            lastConsTaskId, firstProdTaskIds, tmemAllocOp.getOperation(),
+            true /*isOperandD*/, false, channelID);
+        guardCh->isSameIterGuard = true;
+        guardCh->srcName = getOutermostNameFromLoc(tmemAllocOp->getLoc());
+        channels.push_back(std::move(guardCh));
+        setTmemChannelAttr(lastConsumer, channelID, "tmem.start");
+        setTmemChannelAttr(firstProducer, channelID, "tmem.end");
+        LLVM_DEBUG({
+          LDBG("guard channel " << channelID << ": tmem_load (task "
+                                << lastConsTaskId << ") -> tmem_store (task "
+                                << firstProdTaskIds.front()
+                                << ") for operand D race protection");
+        });
       }
     }
   }

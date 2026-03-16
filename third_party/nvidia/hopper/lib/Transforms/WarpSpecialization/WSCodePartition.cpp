@@ -904,6 +904,10 @@ void createToken(
           tokenLoadType = ttnvws::TokenLoadType::TMALoadOp;
         } else if (isa<ttg::LocalStoreOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::LocalStoreOp;
+        } else if (isa<ttng::TMEMLoadOp>(copyOp)) {
+          // Wrap-around channel: tmem_load signals tmem_store that the
+          // buffer has been consumed and can be overwritten.
+          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
         } else if (isa<ttng::TMEMLoadOp>(consumerOp)) {
           tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
         } else if (isa<ttng::TCGen5MMAOp>(consumerOp)) {
@@ -1333,6 +1337,11 @@ void createTokenPost(
           tokenLoadType = ttnvws::TokenLoadType::TMALoadOp;
         } else if (isa<ttg::LocalStoreOp>(copyOp)) {
           tokenLoadType = ttnvws::TokenLoadType::LocalStoreOp;
+        } else if (isa<ttng::TMEMLoadOp>(copyOp) ||
+                   isa<ttng::TMEMStoreOp>(consumerOp)) {
+          // Wrap-around channel: tmem_load signals tmem_store that the
+          // buffer has been consumed and can be overwritten.
+          tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
         } else if (isa<ttng::TMEMLoadOp>(consumerOp)) {
           tokenLoadType = ttnvws::TokenLoadType::TmemLoadOp;
         } else if (isa<ttng::TCGen5MMAOp>(consumerOp)) {
@@ -2743,6 +2752,21 @@ void insertAsyncComm(
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
       if (!appearsBefore(headProducer, headConsumer)) {
+        // Guard channels (isSameIterGuard) are loop-carried backward edges
+        // (tmem_load → tmem_store) that don't have a matching forward
+        // channel in the operand D forward/backward pair pattern.
+        // Skip them here; their synchronization is handled in the
+        // hasGuardChannel block when processing the tmem_store's main
+        // operand D channel.
+        if (masterChannel->channelKind == DataChannelKind::TMEMPost) {
+          auto *tmemCh =
+              static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+          if (tmemCh->isSameIterGuard) {
+            LDBG("Skip guard channel " << masterChannel->uniqID
+                                       << " (handled via hasGuardChannel)");
+            continue;
+          }
+        }
         // We will combine this channel with the other channel associated with
         // the same value (gen5 operandD).
         // -- Both channels are in the same block
@@ -2775,6 +2799,46 @@ void insertAsyncComm(
         producerAcquireForChannelLoop = bwdCh->getDstOp();
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
+
+    // 2-buffer reuse group handling: determine if producer_acquire needs to
+    // be moved for correct synchronization across reused buffers.
+    // Use reuseBarrier=false to find reuse groups even with single-copy
+    // buffers.
+    int reuseGrp2 = channelInReuseGroup(masterChannel, config,
+                                        /*reuseBarrier=*/false);
+    if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
+      auto *group = config->getGroup(reuseGrp2);
+      if (group->channels.size() == 2 && verifyReuseGroup2(group)) {
+        auto [earlyChannel, lateChannel] = orderReuseGroup2(group);
+        if (masterChannel == lateChannel &&
+            needExplicitReuseWait(earlyChannel, lateChannel)) {
+          // Move the late buffer's producer_acquire to before the early
+          // buffer's producer so that the shared token ensures the late
+          // buffer's consumer_release completes before the early buffer is
+          // overwritten. The early channel's producer must be in the same
+          // block and appear before the late channel's head producer.
+          // Additionally, the late channel's consumer must be in the same
+          // block as the early channel's producer — otherwise they are in
+          // different partitions and the reuse ordering is already handled
+          // implicitly (e.g., in the FWD persistent kernel where the
+          // tmem_store and MMA are in separate task partitions).
+          auto *earlyProducer = earlyChannel->getSrcOp();
+          auto *lateConsumer = lateChannel->getDstOp();
+          if (earlyProducer->getBlock() == headProducer->getBlock() &&
+              lateConsumer->getBlock() == earlyProducer->getBlock() &&
+              appearsBefore(earlyProducer, headProducer)) {
+            producerAcquireForChannelLoop = earlyProducer;
+            LLVM_DEBUG({
+              LDBG("reuse group: move producer_acquire for late channel "
+                   << masterChannel->uniqID << " before early channel "
+                   << earlyChannel->uniqID << " producer");
+              producerAcquireForChannelLoop->dump();
+            });
+          }
+        }
+      }
+    }
+
     builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
@@ -2935,11 +2999,111 @@ void insertAsyncComm(
                                                                consumerBarrier);
           builder.clearLoopScheduleInfo();
         }
-        auto tmemWaitBarrier = desyncTCGen5MMAOp(
-            builder, mmaOp, consumerBarrier, bufferIdx, phase,
-            masterChannel->getNumBuffers(), producerAcquirePoint,
-            regionsWithChannels, dom, true, config, addCompletionBarrier);
-        tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+
+        // For operand D TMEM channels where the producer is a TMEMStoreOp
+        // (e.g., reduction partition zeroing dk/dv), we must not use the
+        // gen5 inline barrier (consumerBarrier) as the producer_acquire
+        // for the TMEMStoreOp. That barrier fires when the MMA commits
+        // (tc_gen5_commit), but the TMEMStoreOp must wait until the
+        // sibling channel's consumer (tmem_load in the computation
+        // partition) finishes reading the TMEM. Otherwise, the
+        // TMEMStoreOp races with the tmem_load, corrupting the result.
+        //
+        // When a guard channel (isSameIterGuard) exists for this TMEM
+        // alloc, the tmem_load → tmem_store dependency is handled by
+        // the guard channel's token through the normal insertAsyncComm
+        // flow. Skip desyncTCGen5MMAOp (which would insert a wrong
+        // WaitBarrierOp before the tmem_store) and only add the MMA's
+        // completion barrier.
+        bool hasGuardChannel = false;
+        ttng::TmemDataChannelPost *foundGuardCh = nullptr;
+        if (masterChannel->channelKind == DataChannelKind::TMEMPost &&
+            isa<ttng::TMEMStoreOp>(headProducer)) {
+          auto *tmemPostCh =
+              static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+          if (tmemPostCh->isOperandD) {
+            for (auto *sibCh : orderedChannels) {
+              if (sibCh == masterChannel ||
+                  sibCh->channelKind != DataChannelKind::TMEMPost)
+                continue;
+              auto *guardCh = static_cast<ttng::TmemDataChannelPost *>(sibCh);
+              if (guardCh->isSameIterGuard &&
+                  guardCh->getAllocOp() == masterChannel->getAllocOp()) {
+                hasGuardChannel = true;
+                foundGuardCh = guardCh;
+                LLVM_DEBUG({
+                  LDBG("operand D: guard channel "
+                       << guardCh->uniqID << " protects tmem_store channel "
+                       << masterChannel->uniqID
+                       << ", skipping desyncTCGen5MMAOp");
+                });
+                break;
+              }
+            }
+          }
+        }
+
+        if (hasGuardChannel) {
+          // The guard channel provides the tmem_load → tmem_store
+          // dependency. Create a token-based synchronization:
+          //   ProducerAcquire (before tmem_store) waits for
+          //   ConsumerRelease (after tmem_load) to ensure the
+          //   tmem_load finishes reading before the next iteration's
+          //   tmem_store overwrites the buffer.
+          OpBuilder tokenBuilder(funcOp);
+          tokenBuilder.setInsertionPointToStart(&(funcOp.getBody().front()));
+          Value guardToken = tokenBuilder.create<ttnvws::CreateTokenOp>(
+              funcOp.getLoc(), masterChannel->getNumBuffers(),
+              ttnvws::TokenLoadType::TmemLoadOp);
+
+          // Insert ProducerAcquireOp before the tmem_store.
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+          builder.setInsertionPoint(producerAcquirePoint);
+          builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
+          builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+              headProducer->getLoc(), guardToken, bufferIdx, phase);
+
+          // Insert ConsumerReleaseOp after the guard channel's
+          // tmem_load (srcOp).
+          auto *guardTmemLoad = foundGuardCh->getSrcOp();
+          auto guardConsumerTaskId = foundGuardCh->relation.first;
+          auto guardConsumerReleasePoint = consumerReleaseHeuristic(
+              foundGuardCh->getDstOp(), guardTmemLoad, guardConsumerTaskId);
+          builder.setAsynTaskIdsFromArray(foundGuardCh->relation.first);
+          builder.setInsertionPointAfter(guardConsumerReleasePoint);
+          builder.setLoopScheduleInfoFromOp(guardConsumerReleasePoint);
+          Value guardBufIdx =
+              builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                  guardConsumerReleasePoint->getLoc(), 0, 32);
+          builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+              guardConsumerReleasePoint->getLoc(), guardToken, guardBufIdx);
+
+          LLVM_DEBUG({
+            LDBG("operand D race fix: guard channel "
+                 << foundGuardCh->uniqID
+                 << " token-based sync for tmem_store channel "
+                 << masterChannel->uniqID);
+          });
+
+          // Add completion barrier to MMA.
+          builder.setInsertionPoint(mmaOp);
+          builder.setAsyncTaskIdsFromOp(mmaOp);
+          builder.setLoopScheduleInfoFromOp(mmaOp);
+          if (addCompletionBarrier) {
+            auto barrierForStage =
+                getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+            auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                mmaOp->getLoc(), true, 1);
+            mmaOp.addCompletionBarrier(barrierForStage, pred);
+          }
+          mmaOp.setIsAsync(true);
+        } else {
+          auto tmemWaitBarrier = desyncTCGen5MMAOp(
+              builder, mmaOp, consumerBarrier, bufferIdx, phase,
+              masterChannel->getNumBuffers(), producerAcquirePoint,
+              regionsWithChannels, dom, true, config, addCompletionBarrier);
+          tmemWaitBarriers[mmaOp] = tmemWaitBarrier;
+        }
       }
     }
 
