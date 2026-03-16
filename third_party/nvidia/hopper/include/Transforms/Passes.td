@@ -184,22 +184,6 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
   ];
 }
 
-def NVGPUTestWSLowerToken : Pass<"nvgpu-test-ws-lower-token", "mlir::ModuleOp"> {
-  let summary = "test warp specialization token lowering";
-
-  let description = "This pass lowers NVWS token operations into mbarrier-based synchronization.";
-
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-                           "mlir::triton::nvws::NVWSDialect"];
-  let options = [
-    Option<"numConsumerGroups", "num-consumer-groups",
-           "int32_t", /*default*/"1",
-           "number of consumer groups for warp specialization">
-  ];
-}
-
 def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
   let summary = "Lower descriptor stores to async TMA copies via shared memory";
 
