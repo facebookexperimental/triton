@@ -1886,7 +1886,9 @@ class TritonSemantic(Generic[TensorTy]):
         ret_shape = [s for i, s in enumerate(shape) if i != axis]
         assert all(t.type.shape == shape for t in inputs), "all reduction inputs must have the same shape"
 
-        reduce_op = self.builder.create_reduce([t.handle for t in inputs], axis)
+        reduce_op = self.builder.create_reduce(
+            [t.handle for t in inputs], axis,
+            reduction_ordering=reduction_ordering.name if reduction_ordering is not None else "")
         region_builder_fn(reduce_op)
         assert reduce_op.verify()
 
