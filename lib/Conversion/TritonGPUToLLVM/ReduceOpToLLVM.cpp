@@ -31,6 +31,23 @@ public:
            "Unexpected srcLayout in ReduceOpConversion");
     Location loc = op->getLoc();
 
+    // Check for reduction ordering attribute from the frontend.
+    // See D93508170 for the proof-of-concept implementation of inner/outer
+    // tree reduction strategies.
+    auto reductionOrderingAttr =
+        op->getAttrOfType<StringAttr>("reduction_ordering");
+    if (reductionOrderingAttr) {
+      auto ordering = reductionOrderingAttr.getValue();
+      if (ordering == "inner_tree") {
+        // TODO: Implement inner tree reduction strategy.
+        // Inner tree reduces neighboring (contiguous) elements first within
+        // each thread, then uses count-up shuffle order for warp reduction,
+        // producing a deterministic, layout-independent reduction order.
+        // For now, fall through to the default unordered implementation.
+      }
+      // "unordered" falls through to the default implementation below.
+    }
+
     auto srcValues = unpackInputs(loc, op, adaptor, rewriter);
     std::map<SmallVector<unsigned>, SmallVector<Value>> accs;
     std::map<SmallVector<unsigned>, SmallVector<Value>> indices;
