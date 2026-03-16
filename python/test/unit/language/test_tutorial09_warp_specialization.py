@@ -348,7 +348,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256:
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Early TMA store lowering not yet supported for non-persistent kernels
@@ -469,7 +469,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256:
+    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
+            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     if DATA_PARTITION_FACTOR == 2:
@@ -610,7 +611,11 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256:
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
+            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     if DATA_PARTITION_FACTOR == 2:
