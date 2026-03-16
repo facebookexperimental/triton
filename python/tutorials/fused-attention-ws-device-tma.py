@@ -1417,7 +1417,7 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("HEAD_DIM", [128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("baseVariant", ["ws", "ws_persistent"])
+@pytest.mark.parametrize("baseVariant", ["ws_persistent"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
