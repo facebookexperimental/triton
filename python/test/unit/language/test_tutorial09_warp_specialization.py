@@ -348,6 +348,9 @@ def test_tutorial09_matmul_tma_warp_specialize(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
     # Early TMA store lowering not yet supported for non-persistent kernels
     # (store is outside WS loop; partition scheduling can't handle TMAStoreTokenWaitOp)
     if use_early_tma_store_lowering:
@@ -465,6 +468,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     if DATA_PARTITION_FACTOR == 2:
         pytest.skip("TODO: FIX CORRECTNESS ISSUES")
@@ -600,6 +606,9 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     if DATA_PARTITION_FACTOR == 2:
         pytest.skip("TODO: FIX CORRECTNESS ISSUES")
