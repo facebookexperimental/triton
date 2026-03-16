@@ -772,18 +772,16 @@ scheduleKeyOpsSplitMMA(scf::ForOp forOp,
 
   // Sort current-iter MMAs: tt.latency=1 first (qkT, dpT), then
   // tt.latency=0 (dV). Within same latency, preserve program order.
-  llvm::stable_sort(currentMMAs,
-                    [](ttng::MMAv5OpInterface a, ttng::MMAv5OpInterface b) {
-                      int la = a->hasAttr("tt.latency")
-                                   ? cast<IntegerAttr>(a->getAttr("tt.latency"))
-                                         .getInt()
-                                   : 0;
-                      int lb = b->hasAttr("tt.latency")
-                                   ? cast<IntegerAttr>(b->getAttr("tt.latency"))
-                                         .getInt()
-                                   : 0;
-                      return la > lb;
-                    });
+  llvm::stable_sort(
+      currentMMAs, [](ttng::MMAv5OpInterface a, ttng::MMAv5OpInterface b) {
+        int la = a->hasAttr("tt.latency")
+                     ? cast<IntegerAttr>(a->getAttr("tt.latency")).getInt()
+                     : 0;
+        int lb = b->hasAttr("tt.latency")
+                     ? cast<IntegerAttr>(b->getAttr("tt.latency")).getInt()
+                     : 0;
+        return la > lb;
+      });
 
   // Build schedule: 2 stages (stage 0 = iter i, stage 1 = iter i-1).
   // Stage 0 ops are "one iteration ahead"; stage 1 ops are "current".
@@ -943,6 +941,18 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
 
 void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
                   int defaultNumStages, bool useMetaWS, bool useSplitMMA) {
+  // If the loop already has loop.stage assignments (from a prior pass such as
+  // partition scheduling), disable split-MMA scheduling so that the existing
+  // schedule is deserialized and respected rather than rebuilt from scratch.
+  if (useSplitMMA) {
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      if (op.hasAttr(kLoopStageAttrName)) {
+        useSplitMMA = false;
+        break;
+      }
+    }
+  }
+
   // Based on the latencies, schedule the key ops to the stages.
   CoarseSchedule schedule = getInitialSchedule(
       forOp, opLatency, defaultNumStages, useMetaWS, useSplitMMA);
