@@ -1333,6 +1333,7 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=ctx.HEAD_DIM,  #
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
             )
         else:
             _attn_bwd[grid](
@@ -1357,6 +1358,7 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=ctx.HEAD_DIM,  #
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
             )
 
         return dq, dk, dv, None, None, None, None, None, None
