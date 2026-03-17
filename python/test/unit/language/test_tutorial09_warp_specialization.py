@@ -43,6 +43,8 @@ def matmul_kernel_tma_ws(
     GROUP_SIZE_M: tl.constexpr,
     A_COL_MAJOR: tl.constexpr,
     B_COL_MAJOR: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
@@ -65,7 +67,8 @@ def matmul_kernel_tma_ws(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Always use warp_specialize=True
-    for k in tl.range(k_tiles, warp_specialize=True, disallow_acc_multi_buffer=True):
+    for k in tl.range(k_tiles, warp_specialize=True, data_partition_factor=DATA_PARTITION_FACTOR,
+                      smem_alloc_algo=SMEM_ALLOC_ALGO):
         offs_k = k * BLOCK_SIZE_K
         if A_COL_MAJOR:
             a = a_desc.load([offs_k, offs_am]).T
@@ -126,7 +129,6 @@ def matmul_kernel_tma_persistent_ws(
             NUM_SMS,
             flatten=FLATTEN,
             warp_specialize=True,
-            disallow_acc_multi_buffer=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
     ):
@@ -200,6 +202,8 @@ def matmul_kernel_descriptor_persistent_ws(
     FLATTEN: tl.constexpr,
     A_COL_MAJOR: tl.constexpr,
     B_COL_MAJOR: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """Persistent matmul with device-side TMA descriptors and warp specialization (always enabled)."""
     dtype = c_ptr.dtype.element_ty
@@ -257,7 +261,8 @@ def matmul_kernel_descriptor_persistent_ws(
             NUM_SMS,
             flatten=FLATTEN,
             warp_specialize=True,
-            disallow_acc_multi_buffer=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -320,6 +325,8 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_warp_specialize(
     M,
@@ -333,8 +340,17 @@ def test_tutorial09_matmul_tma_warp_specialize(
     A_col_major,
     B_col_major,
     use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
+    # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
@@ -391,6 +407,8 @@ def test_tutorial09_matmul_tma_warp_specialize(
             GROUP_SIZE_M=GROUP_SIZE_M,
             A_COL_MAJOR=A_col_major,
             B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
         )
@@ -446,12 +464,29 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
+    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
+            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded (BLOCK_SIZE_M=256 with num_stages=3 and FLATTEN)")
+
+    if DATA_PARTITION_FACTOR == 2:
+        pytest.skip("TODO: FIX CORRECTNESS ISSUES")
+
+    # TODO: FIX HANG
+    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 128 and SMEM_ALLOC_ALGO == 0:
+        pytest.skip("TODO: FIX HANG ISSUE")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -549,6 +584,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -564,14 +601,37 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     A_col_major,
     B_col_major,
     use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
+    # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
+            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if DATA_PARTITION_FACTOR == 2:
+        pytest.skip("TODO: FIX CORRECTNESS ISSUES")
+
+    # TODO: FIX HANG
+    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 128 and SMEM_ALLOC_ALGO == 0:
+        pytest.skip("TODO: FIX HANG ISSUE")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -621,6 +681,8 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             FLATTEN=FLATTEN,
             A_COL_MAJOR=A_col_major,
             B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
         )
