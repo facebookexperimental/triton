@@ -153,6 +153,13 @@ static Channel *findChannelForOp(Operation *op,
   for (auto *ch : channels) {
     Operation *alloc = ch->getAllocOp();
     if (alloc == op) {
+      // Skip guard channels (isSameIterGuard) — they are auxiliary
+      // synchronization channels and should not influence memory planning.
+      if (ch->channelKind == DataChannelKind::TMEMPost) {
+        auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+        if (tmemCh->isSameIterGuard)
+          continue;
+      }
       TheCh = ch;
       break;
     }
@@ -2290,6 +2297,14 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   collectPostChannels(channelsOrigin, funcOp);
   SmallVector<Channel *> channels;
   for (const auto &c : channelsOrigin) {
+    // Skip guard channels (isSameIterGuard) — they are auxiliary
+    // synchronization channels used by the code partition pass and
+    // should not influence memory planning decisions.
+    if (c->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(c.get());
+      if (tmemCh->isSameIterGuard)
+        continue;
+    }
     channels.push_back(c.get());
   }
   if (channels.empty()) {

@@ -10,20 +10,18 @@
 // overwrites the buffer.
 //
 // Verify that:
-// - default partition (T0) has 2 wait + 2 arrive barriers around tmem_store
+// - default partition (T0) has 2 acquire barriers around tmem_store
 // - partition with tmem_load (T4) has 2 wait + 2 arrive barriers around tmem_load
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 // CHECK: ttg.warp_specialize
 //
 // default partition (T0): tmem_store with barriers for channels 6 (T0→T1)
-// and 8 (T0→T4 wrap-around). One channel uses mbarrier, the other uses
-// nvws tokens.
+// and 8 (T0→T4 wrap-around). Both channels use nvws tokens.
 // CHECK: default
-// CHECK: ttng.wait_barrier
+// CHECK: nvws.producer_acquire
 // CHECK: nvws.producer_acquire
 // CHECK: ttng.tmem_store
-// CHECK: nvws.producer_commit
 // CHECK: nvws.producer_commit
 //
 // partition0 (T1): MMA consumer

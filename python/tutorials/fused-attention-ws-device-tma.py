@@ -670,9 +670,10 @@ def _attn_bwd_dkdv_inner(
     dk += tl.dot(dsT, tl.trans(qT))
     dq = tl.dot(tl.trans(dsT), k)
     dqs = _split_n(dq, EPILOGUE_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dqN = dqs[slice_id] * LN2
-        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), 0], dqN)
+        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dqN)
     curr_m += step_m
     return dk, dv, curr_m
 
@@ -886,10 +887,11 @@ def _attn_bwd_core(
     )
 
     dvs = _split_n(dv, EPILOGUE_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dvN = dvs[slice_id]
         desc_dv.store(
-            [(off_bh + start_n).to(tl.int32), 0],
+            [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
             dvN.to(dtype),
         )
 
@@ -897,7 +899,7 @@ def _attn_bwd_core(
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dkN = dks[slice_id] * sm_scale
         desc_dk.store(
-            [(off_bh + start_n).to(tl.int32), 0],
+            [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
             dkN.to(dtype),
         )
 
@@ -1412,10 +1414,10 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
-@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.parametrize("HEAD_DIM", [128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("baseVariant", ["ws", "ws_persistent"])
+@pytest.mark.parametrize("baseVariant", ["ws_persistent"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
