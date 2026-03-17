@@ -1,5 +1,6 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
@@ -328,6 +329,25 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+class LocalBarrierOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp> {
+public:
+  LocalBarrierOpConversion(const LLVMTypeConverter &converter,
+                           PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp>(converter,
+                                                            benefit) {}
+  using OpAdaptor = typename triton::gpu::LocalBarrierOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::LocalBarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
+
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::populateMemoryOpToLLVMPatterns(
@@ -343,4 +363,5 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
                                              benefit);
   patterns.add<AsyncRemoteShmemStoreOpConversion>(typeConverter, targetInfo,
                                                   benefit);
+  patterns.add<LocalBarrierOpConversion>(typeConverter, benefit);
 }
