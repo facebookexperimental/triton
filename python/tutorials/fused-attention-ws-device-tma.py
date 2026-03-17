@@ -815,11 +815,8 @@ configs_bwd = [
 configs_bwd_persist = [
     triton.Config(
         {
-            "BLOCK_M1": 128,
-            "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 4,
+            "BLOCK_M1": 128,  #128,
+            "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4,  #4,
         },
         num_warps=4,
         num_stages=2,
@@ -1333,6 +1330,7 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=ctx.HEAD_DIM,  #
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
             )
         else:
             _attn_bwd[grid](
@@ -1357,6 +1355,7 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=ctx.HEAD_DIM,  #
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
             )
 
         return dq, dk, dv, None, None, None, None, None, None
