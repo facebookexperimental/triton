@@ -6,7 +6,7 @@ AutoWS memory planner. For SMEM allocation, see
 shared between SMEM and TMEM, see [ReuseGroups.md](ReuseGroups.md). For debug
 visualization, see [MemoryPlannerVisualization.md](MemoryPlannerVisualization.md).
 
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlanner.cpp`
+**File**: `WSMemoryPlanner.cpp`
 
 ## TMEM vs SMEM Classification
 

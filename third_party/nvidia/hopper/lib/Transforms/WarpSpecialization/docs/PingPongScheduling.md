@@ -27,7 +27,7 @@ doTaskPartition / PartitionScheduling
 `async_task_id` but are not physically separated). `doPingPongSync` runs
 **after** code partitioning (ops are inside `WarpSpecializeOp` regions).
 
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/PingPong.cpp`
+**File**: `PingPong.cpp`
 
 ## Expensive Op Identification
 

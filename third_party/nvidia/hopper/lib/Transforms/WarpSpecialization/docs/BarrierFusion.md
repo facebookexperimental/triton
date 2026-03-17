@@ -44,6 +44,8 @@ The **ready barriers** ("full barriers") signal that data is available. The
 
 ## TMA Barrier Fusion
 
+**File**: `WSLowerMem.cpp` (`optimizeTMALoads`)
+
 TMA (Tensor Memory Accelerator) barrier fusion is the most common form of
 barrier fusion. When multiple TMA loads share the same dominant consumer
 operation (e.g., they all feed into the same MMA), they are fused onto a
@@ -58,38 +60,30 @@ number of bytes transferred. No software arrive is needed. By pointing
 multiple TMA loads at the same barrier and setting the expected byte count
 to their sum, a single barrier wait covers all loads.
 
-### New Pipeline: `LoadMMASpecialization`
+### Algorithm (`optimizeTMALoads`)
 
-**File**: `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/LoadMMASpecialization.cpp`
+1. **Group channels by consumer**: Channels with the same consumer operation
+   are grouped together. Each group gets a single barrier pair (ready + empty).
 
-In `PipelinedLoadGroup::lowerLoads()` (lines 369-468):
+2. **Compute combined byte count**: `BarrierExpectOp` is emitted once with
+   the total `txCount` summed across all TMA loads in the group.
 
-1. **Group loads**: Loads are grouped by common dominant consumer ops
-   (lines 866-875 in `lowerLoops`).
-2. **Share barriers**: A single pair of `emptyBars` / `readyBars` is allocated
-   for all loads in the group (lines 337-338).
-3. **Accumulate byte counts**: `loadSizeInBytes` sums across all loads
-   (lines 386-388).
-4. **Single expect**: One `BarrierExpectOp` is emitted with the combined size
-   (lines 389-391).
-5. **TMA copies point to shared barrier**: All copies via `lowerTMACopy()`
-   reference the same `curLoadBar` (lines 349-367, 439).
+3. **Issue TMA copies**: All `AsyncTMACopyGlobalToLocalOp` operations in the
+   group reference the same ready barrier. The hardware auto-arrives on this
+   barrier when each copy completes.
 
-### Legacy Pipeline: `LowerAref`
+4. **Single wait**: The consumer issues a single `WaitBarrierOp` on the ready
+   barrier, which completes when all TMA copies have arrived.
 
-**File**: `third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp`
+### Where It's Called
 
-In `lowerTMALoad()` (lines 287-324):
-
-1. When an `ArefPutEnterOp` has TMA loads as users, accumulate `txCount`
-   across all loads (line 299).
-2. Create a single `BarrierExpectOp` with the combined byte count on the
-   **full barrier** (lines 307-310).
-3. Issue all TMA copies pointing to the same barrier.
-4. In `insertArriveBarrier()` (line 454): for `AsyncOp::TMALoad`, **nothing
-   is emitted** — the arrive is done by hardware.
+`optimizeTMALoads` is called from `insertAsyncCopy` in `WSCodePartition.cpp`
+during the `doCodePartitionPost` pass. It processes groups of channels whose
+producers are TMA descriptor loads.
 
 ## tcgen05_commit Barrier Fusion
+
+**File**: `CodePartitionUtility.cpp` (`fuseTcgen05CommitBarriers`)
 
 `TCGen5CommitOp` is the instruction that makes an mbarrier track the
 completion of all prior asynchronous tcgen05 operations (MMA and TMEM copy).
@@ -104,115 +98,51 @@ arrive count is decremented when all preceding async tcgen05 operations
 complete. A subsequent `TCGen5CommitOp` with barrier B is guaranteed to
 arrive after barrier A, preserving ordering.
 
-### New Pipeline: Completion Barriers on MMA
+### Fusion Algorithm (`fuseTcgen05CommitBarriers`)
 
-In `LoadMMASpecialization.cpp` (lines 770-786):
+When multiple `TCGen5CommitOp`s in the same block share the same barrier,
+they can be fused into a single commit:
 
-MMA operations directly carry completion barriers:
-```cpp
-mmaOp.addCompletionBarrier(bar, userPred);
-mmaOp.setIsAsync(true);
-```
+1. **Collect commit groups** (`collectCommitGroup`): Walk the block and group
+   `TCGen5CommitOp`s that reference the same barrier value. Operations between
+   commits are checked for interference — if an intervening op uses a different
+   barrier, the group is split.
 
-The MMA op definition (`TritonNvidiaGPUOps.td`, line 649) accepts variadic
-barrier operands (`Variadic<TTG_MemDescType>:$barriers`). At LLVM lowering,
-this generates `tcgen05.commit` followed by arrive on those barriers.
+2. **Match phases** (`hasMatchingPhase`): Verify that the commit ops being
+   fused operate on the same phase of the barrier. Phases are tracked through
+   `MemDescIndexOp` chains to ensure correctness.
 
-This is used to signal the empty barrier — when the MMA finishes reading from
-a buffer, it signals the producer that the buffer slot is free.
+3. **Merge subgroups** (`mergeSubgroups`): For commit ops that can be safely
+   combined, keep only the last one in program order and erase the others.
+   The last commit subsumes all preceding ones because tcgen05_commit is
+   cumulative — it covers all async ops issued since the previous commit.
 
-### Legacy Pipeline: Arrive Dispatch
+### Where It's Used
 
-In `LowerAref.cpp`, `insertArriveBarrier()` (lines 438-463) dispatches based
-on the `AsyncOp` type:
+`fuseTcgen05CommitBarriers` is called from `doCodePartitionPost` in
+`WSCodePartition.cpp` after channels and barriers have been created. It is
+also used for operand D synchronization, where `desyncTCGen5MMAOp` (in
+`WSCodePartition.cpp`) adds completion barriers to MMA ops, and the resulting
+`tcgen05_commit` operations are then fused by this pass.
 
-| `AsyncOp` | Barrier Mechanism | Software/Hardware |
-|-----------|------------------|-------------------|
-| `NONE` | `ArriveBarrierOp` (count=1) | Software arrive |
-| `WGMMA` | `ArriveBarrierOp` (count=1) | Software arrive |
-| `TMALoad` | Nothing emitted | Hardware auto-arrive |
-| `TC5MMA` | `TCGen5CommitOp` | Hardware-tracked commit |
-| `TMEMCopy` | `TCGen5CommitOp` | Hardware-tracked commit |
+## Token Lowering: Barrier Materialization
 
-## Aref Combining
+**File**: `WSLowerToken.cpp`
 
-Aref (Async Reference) combining is a barrier fusion optimization at the
-abstraction level.
+Barrier fusion interacts with token lowering. `CreateTokenOp` produces
+abstract synchronization tokens that are lowered to concrete mbarrier
+allocations by `doTokenLowering`. Each token becomes two barrier arrays
+(ready and empty), each with `numBuffers` entries. When channels share
+tokens (from the grouping in `doCodePartitionPost`), they share the
+materialized barriers, which is another form of barrier reduction.
 
-**File**: `third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp`,
-`combineArefs()` (lines 744-824)
-
-### Algorithm
-
-1. **Group by dominant consumer**: Collect all `ArefGetEnterOp` operations
-   and group them by their dominant consumer operation (lines 750-756).
-
-2. **Check combinability**: Multiple arefs feeding the same consumer can be
-   combined if their producers are in the same partition.
-
-3. **Merge enter/exit pairs**: `createCombinedArefOps()` (lines 648-715)
-   merges multiple enter/exit pairs into single combined enter/exit
-   operations.
-
-4. **Union async ops**: The combined exit's `async_ops` attribute is the
-   union of all individual arefs' async ops (lines 668-671). For example,
-   if one aref tracks `TMALoad` and another tracks `TC5MMA`, the combined
-   aref tracks both.
-
-### Impact
-
-This directly reduces:
-- The number of mbarrier allocations (fewer arefs = fewer barriers)
-- The number of arrive/wait operations
-- The number of `BarrierExpectOp` / `TCGen5CommitOp` instructions
-
-## Arrive Count Computation
-
-**File**: `LowerAref.cpp`, `getArrivalCount()` (lines 142-195)
-
-The arrive count determines how many arrivals are needed before a barrier
-completes. It is computed per-partition:
-
-### Empty Barriers (producer-side)
-
-`producerPendingCount` = number of distinct consumer partition groups. Each
-consumer partition arrives once when it finishes reading from the buffer slot.
-
-Different `AsyncOp` types contribute to the producer pending count:
-- `TC5MMA`, `WGMMA`, `NONE`: each consumer partition group adds 1
-- `TMALoad`: does not contribute (TMA is a producer, not a consumer)
-
-### Ready Barriers (consumer-side)
-
-`consumerPendingCount` = number of distinct producer partition groups. Each
-producer partition arrives once when it finishes filling the buffer slot.
-
-Different `AsyncOp` types contribute to the consumer pending count:
-- `TC5MMA`, `TMALoad`, `NONE`: each producer partition group adds 1
-- `WGMMA`: does not contribute to consumer count
-
-## Phase Tracking
-
-**File**: `third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp`
-
-Each aref enter/exit operation carries a **stage** (buffer index) and **phase**
-(parity bit). `AssignStagePhase` assigns these through control flow:
-
-- **Stage**: which buffer slot to use (0 to numStages-1, wrapping)
-- **Phase**: parity bit that flips each time a stage wraps around
-
-Producers and consumers use **opposite initial phases** (producer=0,
-consumer=1) to ensure proper synchronization — the consumer must not read a
-slot until the producer has filled it.
-
-For `scf::ForOp`, stage and phase are threaded as loop-carried values,
-advancing on each iteration. For `scf::IfOp`, both branches receive the same
-stage/phase.
+See [Token & Barrier Lowering](TokenBarrierLowering.md) for the full
+lowering algorithm.
 
 ## Summary: Forms of Barrier Fusion
 
 | Fusion Type | What Gets Fused | Result | Where |
 |------------|----------------|--------|-------|
-| **TMA fusion** | Multiple TMA loads to same consumer | Single mbarrier, single `BarrierExpectOp` with summed bytes | `LoadMMASpecialization`, `LowerAref::lowerTMALoad` |
-| **tcgen05_commit** | MMA/TMEM completion signaling | `TCGen5CommitOp` replaces software `ArriveBarrierOp` | `LoadMMASpecialization` (completion barriers), `LowerAref::insertArriveBarrier` |
-| **Aref combining** | Multiple arefs to same consumer | Single combined aref with union of async ops | `LowerAref::combineArefs` |
+| **TMA fusion** | Multiple TMA loads to same consumer | Single mbarrier, single `BarrierExpectOp` with summed bytes | `WSLowerMem.cpp::optimizeTMALoads` |
+| **tcgen05_commit** | Multiple commits to same barrier | Single `TCGen5CommitOp` (last one kept) | `CodePartitionUtility.cpp::fuseTcgen05CommitBarriers` |
+| **Token sharing** | Channels grouped by consumer | Shared `CreateTokenOp` → shared barrier pair | `WSCodePartition.cpp::doCodePartitionPost` |

@@ -2,7 +2,7 @@
 
 This document explains how operations in a kernel are assigned to warp groups
 (partitions) for warp specialization. Task partitioning is the first step in
-both AutoWS pipelines — it decides which ops run on producer warp groups versus
+the AutoWS pipeline — it decides which ops run on producer warp groups versus
 consumer warp groups.
 
 ## Concepts
@@ -17,86 +17,33 @@ consumer warp groups.
 - **Data partitioning**: After task assignment, consumer ops can be further
   split along spatial dimensions (M/N) across multiple consumer warp groups.
 
-## New Pipeline: `PartitionScheduling`
+## Partition Scheduling: `PartitionSchedulingMeta`
 
-**File**: `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionScheduling.cpp`
+**File**: `PartitionSchedulingMeta.cpp`
 
-This pass runs on `scf.for` loops annotated with `tt.warp_specialize`. It
-creates a `PartitionSet` and assigns each op to one or more partitions.
+An extended partition scheduling pass with template-based scheduling for Flash
+Attention and GEMM patterns. This pass runs before the main WS pipeline on
+Blackwell, assigning `ttg.partition` attributes that are later converted to
+`async_task_id` by `WSTaskIdPropagate`.
 
-### Op Classification
+### Op Categorizer
 
-| Category | Ops | Default Partition |
-|----------|-----|------------------|
-| Load | `DescriptorLoadOp`, `DescriptorGatherOp` | `loadPartition` (stage 0) |
-| MMA | `MMAv5OpInterface` | `mmaPartition` (stage 1) |
-| Store | `DescriptorStoreOp` | `epiloguePartition` (stage 0) |
-| View | Ops with `MemDescViewTrait` | Cloned into `mmaPartition` if shared |
-| Other | Everything else | Determined by propagation |
+Ops are classified into rich categories:
 
-### Algorithm
+| Category | Description |
+|----------|-------------|
+| `TMALoad` | `DescriptorLoadOp`, `AsyncTMACopyGlobalToLocalOp` |
+| `MMA` | `TCGen5MMAOp`, `WarpGroupDotOp` |
+| `EpilogueStore` | `DescriptorStoreOp`, stores at loop end |
+| `TMEMStore` | `TMEMStoreOp` |
+| `TMEMLoad` | `TMEMLoadOp` |
+| `BlockPointerAdvance` | `AdvanceOp` for TMA descriptors |
+| `DataPartition` | Ops exclusive to one MMA's backward slice (detected via union-find grouping of dependent MMAs) |
+| `Correction` | Cross-iteration MMA users (e.g., softmax rescaling) |
+| `TMAReduction` | `DescriptorReduceOp`, `AsyncTMAReduceOp` |
 
-1. **Create partitions**: Four initial partitions — `defaultPartition` (stage 0),
-   `mmaPartition` (stage 1), `loadPartition` (stage 0), `epiloguePartition`
-   (stage 0).
+### Scheduling Templates
 
-2. **Schedule anchors**:
-   - TMA loads → `loadPartition`. Their `LocalAllocOp` / `TMEMAllocOp` users
-     with matching shared encoding also go to `loadPartition`.
-   - MMA ops → `mmaPartition`. Accumulator-initializing `TMEMStoreOp` (value
-     defined outside loop, no read-modify-write) also goes to `mmaPartition`.
-   - Stores → `epiloguePartition`.
-
-3. **Schedule load users**: Transitively place users of load results into
-   `defaultPartition`.
-
-4. **Schedule cross-iteration MMA users** ("correction" pattern, e.g., online
-   softmax rescaling): ops that consume the MMA result yielded from the previous
-   iteration go to `defaultPartition`.
-
-5. **Per-MMA computation partitions**: For each MMA, `scheduleUsers(nullptr)`
-   creates a new dynamic partition for ops that exclusively use that MMA's
-   results. This enables distinct computation partitions for different MMA
-   operations (useful in multi-MMA kernels like Flash Attention).
-
-6. **Propagate to remaining ops** (`propagatePartitions`):
-   - Builds `OpCluster` objects — sets of adjacent unscheduled ops in the SSA
-     graph, tracking which partitions provide definitions (`defPartitions`) and
-     which consume results (`sinkPartitions`).
-   - For clusters with multiple def/sink partitions: create a new partition.
-   - For clusters with a single def and single sink: analyze the critical path.
-     If all ops are on the critical path, assign to the def partition. Otherwise,
-     rematerialize critical-path ops into the sink partition and assign the rest
-     to the def partition.
-
-7. **Optimize schedule**: Clone `BroadcastOp`, `ExpandDimsOp`, `ConvertLayoutOp`
-   into each consuming partition to transfer smaller pre-broadcast values through
-   shared memory.
-
-8. **Assign root partition**: Any still-unscheduled ops are assigned to all
-   partitions (they are needed everywhere).
-
-### Output
-
-Ops are tagged with `ttg.partition` attributes (integer indices into the
-`PartitionSet`). These are later converted to `async_task_id` by
-`WSTaskIdPropagate`.
-
-## Meta Variant: `PartitionSchedulingMeta`
-
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/PartitionSchedulingMeta.cpp`
-
-An extended version with template-based scheduling for Flash Attention and GEMM.
-
-### Additions Over Upstream
-
-**Op categorizer** with richer categories:
-- `DataPartition`: ops exclusive to one MMA's backward slice (detected via
-  union-find grouping of dependent MMAs)
-- `Correction`: cross-iteration MMA users
-- `TMAReduction`: `DescriptorReduceOp`, `AsyncTMAReduceOp`
-
-**Scheduling templates**:
 - **`UnifiedFATemplate`**: For Flash Attention patterns (correction ops, multiple
   MMAs, or data partition factor > 1). Creates reduction partition (BWD) or
   correction partition (FWD) in addition to load/MMA/epilogue.
@@ -105,13 +52,34 @@ An extended version with template-based scheduling for Flash Attention and GEMM.
 Template selection: use `UnifiedFATemplate` if correction ops exist, multiple
 MMAs exist, or `dpFactor > 1`. Otherwise `GEMMTemplate`.
 
-**Key difference in propagation**: For BWD-like kernels (has reduction, no
-epilogue), ambiguous clusters reuse the existing computation partition rather
-than creating new ones.
+### Partition Assignment
 
-## Legacy Pipeline: `WSTaskPartition`
+| Op Type | Partition |
+|---------|-----------|
+| TMA loads, block pointer advances | Partition 0 (producer) |
+| MMA ops | Partition 1+ (consumer) |
+| Epilogue stores | Epilogue partition |
+| Correction ops | Correction/reduction partition |
 
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSTaskPartition.cpp`
+### Key Differences From Upstream
+
+**Propagation**: For BWD-like kernels (has reduction, no epilogue), ambiguous
+clusters reuse the existing computation partition rather than creating new ones.
+
+**Operand D handling**: Inserts `tmem.start`/`tmem.end` marker attributes and
+creates operand-D channels for MMA accumulator lifecycle management.
+
+**Partition type annotation**: Tags loops with `tt.partition_types` (producer,
+compute, epilogue).
+
+### Output
+
+Ops are tagged with `ttg.partition` attributes. The pass skips if manual TLX
+`async_tasks` are present.
+
+## Task Partition: `WSTaskPartition`
+
+**File**: `WSTaskPartition.cpp`
 
 A simpler approach using backward slicing from dot/MMA ops. Used on Hopper.
 
@@ -130,10 +98,8 @@ its accumulator / operand D) always stays in the consumer partition.
 ## Task ID Propagation
 
 **Files**:
-- `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/TaskIdPropagation.cpp`
-  (analysis)
-- `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSTaskIdPropagate.cpp`
-  (materialization)
+- `TaskIdPropagation.cpp` (analysis)
+- `WSTaskIdPropagate.cpp` (materialization)
 
 After anchors are assigned task IDs, many intermediate ops remain unannotated.
 Task ID propagation fills these gaps.
@@ -173,7 +139,7 @@ analysis framework.
 
 ## Data Partitioning
 
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSDataPartition.cpp`
+**File**: `WSDataPartition.cpp`
 
 After task assignment, data partitioning physically splits tensor dimensions
 across multiple consumer warp groups. For example, an M=256 accumulator is split

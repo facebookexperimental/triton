@@ -23,95 +23,9 @@ by other partitions) and it carries state across loop iterations (accumulation).
    (e.g., rescaled), and stored back, multi-buffering of the accumulator is
    not possible because the value must be in-place.
 
-## New Pipeline: `LoadMMASpecialization`
+## Channel Creation: `CodePartitionUtility`
 
-**File**: `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/LoadMMASpecialization.cpp`
-
-The core handler is `pipelineMMA()` (lines 474-851), which processes each MMA
-operation in the loop.
-
-### Accumulator Multi-Buffering Decision
-
-Before creating multi-buffered TMEM, the pass checks whether multi-buffering
-is safe:
-
-| Function | File | What It Checks |
-|----------|------|---------------|
-| `hasAccReadModifyWrite()` | `MMAv5PipelineUtility.cpp` | Traces `tmem_load` results through the loop body. Returns true if they flow back to a `tmem_store` to the same allocation (a read-modify-write cycle). |
-| `isAccMultibufferingPossible()` | `MMAv5PipelineUtility.cpp` | Returns true if `use_acc` is false OR the accumulator is overwritten each iteration. |
-| `disallow_acc_multi_buffer` | Loop attribute | An explicit opt-out on the `scf.for`. |
-
-Multi-buffering is enabled when:
-- `isAccMultibufferingPossible()` returns true, AND
-- `disallow_acc_multi_buffer` is not set, AND
-- The accumulator is actually read within the loop (`requiresAccMultiBuffering`).
-
-When enabled, `createTMemAlloc()` prepends an extra leading dimension to the
-TMEM allocation shape, giving `numMmaStages` copies of the accumulator buffer.
-
-### The 3-Node Chain
-
-`pipelineMMA()` models the accumulator lifecycle as three operations:
-
-```cpp
-struct Node {
-  Operation *op;
-  Value barPrev;  // barrier from previous node
-  Value barNext;  // barrier to next node
-  Value index;    // buffer index (for multi-buffering)
-  Value phase;    // phase (parity bit for mbarrier wait)
-};
-SmallVector<Node, 3> nodes{Node{overwriteOp}, Node{mmaOp}, Node{readOp}};
-```
-
-| Node | Operation | Description |
-|------|-----------|-------------|
-| `overwriteOp` | `TMEMStoreOp` | Writes/initializes the accumulator (producer) |
-| `mmaOp` | `TCGen5MMAOp` | The MMA operation that reads and writes the accumulator |
-| `readOp` | `TMEMLoadOp` | Reads the MMA result (consumer) |
-
-### Barrier Insertion at Partition Boundaries
-
-Barriers are only inserted between adjacent nodes that are in **different
-partitions** (different `async_task_id`). For example:
-
-- If `overwriteOp` and `mmaOp` are in the same partition but `readOp` is in
-  a different partition, a barrier is inserted between `mmaOp` and `readOp`.
-- If all three are in the same partition, no barriers are needed.
-
-Each barrier pair consists of:
-- A **ready barrier** (signaling data is available to read)
-- An **empty barrier** (signaling the buffer slot is available to write)
-
-### Loop-Carried Dependencies
-
-When the accumulator carries state across iterations (accumulation mode), the
-loop-carried dependency is handled through TMEM buffer views:
-
-- The `index` and `phase` values are threaded as loop-carried arguments.
-- On each iteration, the index advances to the next buffer slot (modular
-  arithmetic for circular buffering).
-- The `overwriteOp` uses the next buffer slot while the `readOp` uses the
-  current slot, allowing overlap.
-
-### TMEM Allocation Shape Change
-
-When multi-buffering is enabled, the TMEM allocation changes from:
-
-```
-tmem_alloc [M, N] → tmem_alloc [numStages, M, N]
-```
-
-Buffer views (`MemDescSubsliceOp`) index into the leading dimension to select
-the current buffer slot.
-
-## Legacy Pipeline: `CodePartitionUtility`
-
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.cpp`
-
-The core handler is `handleOperandD()` (lines 2173-2479).
-
-### Channel Creation
+**File**: `CodePartitionUtility.cpp`
 
 Operand D channels are `TmemDataChannelPost` objects with special flags:
 
@@ -172,14 +86,14 @@ between the load and the store within the same iteration.
 
 ## Memory Planner: Operand D Priority
 
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlanner.cpp`
+**File**: `WSMemoryPlanner.cpp`
 
 Operand D receives special treatment in the TMEM memory planner:
 
 ### Allocation Priority
 
 TMEM allocations are sorted before allocation with operand D getting the
-**highest priority** (line 1235):
+**highest priority**:
 
 ```cpp
 if (aCh->isOperandD && !bCh->isOperandD)
@@ -193,17 +107,16 @@ largest TMEM footprint — are allocated first, getting the best row positions.
 
 For operand D channels, **all users** of the `TMEMAllocOp` result are
 collected for liveness analysis, not just the channel's source and destination
-ops (line 1022-1025 in `getAllTmemUsers`). This is because the accumulator is
-both written by MMA and read by `tmem_load`, potentially across different
-partitions, and all these uses must be accounted for to compute correct
-liveness intervals.
+ops (in `getAllTmemUsers`). This is because the accumulator is both written by
+MMA and read by `tmem_load`, potentially across different partitions, and all
+these uses must be accounted for to compute correct liveness intervals.
 
 ### Region Collection
 
-In `collectRegionsWithChannelsPost()` (line 577), for operand D, the function
-iterates over **all users** of the alloc op to find enclosing regions. This
-ensures correct accumulation counter tracking when the accumulator is used in
-multiple nested regions.
+In `collectRegionsWithChannelsPost()`, for operand D, the function iterates
+over **all users** of the alloc op to find enclosing regions. This ensures
+correct accumulation counter tracking when the accumulator is used in multiple
+nested regions.
 
 ## Task Partition: Operand D Assignment
 
@@ -222,7 +135,7 @@ mechanism described above.
 
 ## Code Partitioning: Operand D Synchronization
 
-**File**: `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSCodePartition.cpp`
+**File**: `WSCodePartition.cpp`
 
 ### `ProducerIsGen5()`
 
@@ -242,3 +155,12 @@ function:
 
 See also [Barrier Fusion](BarrierFusion.md) for how `tcgen05_commit` is used
 for operand D synchronization.
+
+## Partition Scheduling: Operand D Markers
+
+**File**: `PartitionSchedulingMeta.cpp`
+
+The partition scheduling pass inserts `tmem.start` and `tmem.end` marker
+attributes on operations to delineate the MMA accumulator's lifecycle. These
+markers are used later by `TmemDataChannelPost` to identify the source
+(`tmem.start`) and destination (`tmem.end`) operations of operand D channels.
