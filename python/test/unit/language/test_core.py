@@ -1,6 +1,7 @@
 # ruff: noqa: F821,F841
 import contextlib
 import itertools
+import os
 import re
 from typing import Optional
 import math
@@ -3100,9 +3101,9 @@ def test_reduction_ordering_sum(BLOCK_M, device):
     """Verify that tl.sum with INNER_TREE ordering produces bitwise-identical
     results across different num_warps configurations and memory layouts on 2D
     data.  A single fixed input tensor is used for all BLOCK_M tile sizes; the
-    grid launches TOTAL_ROWS / BLOCK_M blocks.  A single reference is computed
-    at test time (num_warps=1, row-major) and every other configuration is
-    compared against it."""
+    grid launches TOTAL_ROWS / BLOCK_M blocks.  A precomputed reference
+    (num_warps=1, row-major, single grid block) is loaded and every
+    configuration is compared against it."""
     TOTAL_ROWS = 32
     BLOCK_N = 1024
 
@@ -3115,14 +3116,10 @@ def test_reduction_ordering_sum(BLOCK_M, device):
         z = tl.sum(x, axis=1, reduction_ordering=ORDERING)
         tl.store(Z + offs_m, z)
 
-    torch.manual_seed(42)
-    x_row = torch.randn(TOTAL_ROWS, BLOCK_N, device=device, dtype=torch.float32)
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data")
+    x_row = torch.load(os.path.join(data_dir, "reduction_ordering_sum_input.pt"), weights_only=True).to(device)
+    reference = torch.load(os.path.join(data_dir, "reduction_ordering_sum_ref.pt"), weights_only=True).to(device)
     grid = (TOTAL_ROWS // BLOCK_M, )
-
-    # Compute reference once with num_warps=1, row-major layout
-    reference = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
-    sum_kernel[grid](x_row, reference, x_row.stride(0), x_row.stride(1), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                     ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=1)
 
     for row_major in [True, False]:
         if row_major:
@@ -3145,8 +3142,8 @@ def test_reduction_ordering_reduce_mul(BLOCK_M, device):
     produces bitwise-identical results across different num_warps
     configurations and memory layouts on 2D data.  A single fixed input tensor
     is used for all BLOCK_M tile sizes; the grid launches TOTAL_ROWS / BLOCK_M
-    blocks.  A single reference is computed at test time (num_warps=1,
-    row-major) and every other configuration is compared against it."""
+    blocks.  A precomputed reference (num_warps=1, row-major, single grid
+    block) is loaded and every configuration is compared against it."""
     TOTAL_ROWS = 32
     BLOCK_N = 1024
 
@@ -3160,15 +3157,10 @@ def test_reduction_ordering_reduce_mul(BLOCK_M, device):
         z = tl.reduce(x, axis=1, combine_fn=_mul_combine, reduction_ordering=ORDERING)
         tl.store(Z + offs_m, z)
 
-    # Values near 1.0 to avoid overflow with 1024-element products
-    torch.manual_seed(42)
-    x_row = 1.0 + 0.01 * torch.randn(TOTAL_ROWS, BLOCK_N, device=device, dtype=torch.float32)
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data")
+    x_row = torch.load(os.path.join(data_dir, "reduction_ordering_mul_input.pt"), weights_only=True).to(device)
+    reference = torch.load(os.path.join(data_dir, "reduction_ordering_mul_ref.pt"), weights_only=True).to(device)
     grid = (TOTAL_ROWS // BLOCK_M, )
-
-    # Compute reference once with num_warps=1, row-major layout
-    reference = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
-    mul_reduce_kernel[grid](x_row, reference, x_row.stride(0), x_row.stride(1), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                            ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=1)
 
     for row_major in [True, False]:
         if row_major:
