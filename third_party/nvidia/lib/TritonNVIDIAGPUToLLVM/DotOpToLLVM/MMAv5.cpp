@@ -482,9 +482,9 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   }
 
   auto allocShapeB = getAllocShape(bTensorTy, 0);
-  DotOpMmaSmemLoader bLoader = DotOpMmaSmemLoader::build(
-      loc, rewriter, bTensorTy, baseB,
-      {mmaSizeK, mmaSizeN / (twoCTAs ? 2u : 1u)}, 5);
+  DotOpMmaSmemLoader bLoader =
+      DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
+                                {mmaSizeK, mmaSizeN / (twoCTAs ? 2u : 1u)}, 5);
 
   DotConversion::InstDesc desc{mmaSizeM, mmaSizeN, {numRepM, numRepN, numRepK},
                                transA,   transB,   interleaved,

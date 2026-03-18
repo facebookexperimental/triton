@@ -81,7 +81,7 @@ ask() {
 }
 if [ "$(ask)" == "yes" ]; then
     echo "Running TLX Unit Tests"
-    pytest python/test/unit/language/test_tlx.py
+    pytest python/test/unit/language/test_tlx_*.py
 fi
 
 echo "Run TLX tutorial kernels (correctness|performance|no)? {c|p|n}"
