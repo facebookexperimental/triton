@@ -1572,9 +1572,10 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   fixTaskId(funcOp);
 
   // Handle unpartitioned descriptor_store ops that reference func args we're
-  // about to modify. This can happen when the same descriptor func arg is used
-  // in a code path that has no dot ops (e.g., the k_tiles==0 zero-store path
-  // in flattened persistent kernels).
+  // about to modify. This can happen when there are multiple store paths and
+  // only one of them includes the dot. For example, with FLATTEN=True the
+  // persistent GEMM kernel creates an if condition when k_tiles==0 that
+  // is just a store.
   for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
     auto &entryBlock = funcOp.getBlocks().front();
     auto bbArg = entryBlock.getArgument(argIndex);
@@ -1610,10 +1611,11 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       if (auto constOp = src.getDefiningOp<arith::ConstantOp>()) {
         auto valAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
         if (valAttr && valAttr.isSplat()) {
-          auto slicedValType = cast<ShapedType>(valAttr.getType()).clone(slicedShape);
+          auto slicedValType =
+              cast<ShapedType>(valAttr.getType()).clone(slicedShape);
           auto slicedValAttr = valAttr.resizeSplat(slicedValType);
-          slicedSrc = builder.create<arith::ConstantOp>(
-              descStoreOp.getLoc(), slicedValAttr);
+          slicedSrc = builder.create<arith::ConstantOp>(descStoreOp.getLoc(),
+                                                        slicedValAttr);
         }
       }
 
@@ -1628,12 +1630,11 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
         if (i > 0) {
           Value offset = builder.create<arith::ConstantIntOp>(
               descStoreOp.getLoc(), i * slicedSize, 32);
-          indices[dim] = builder.create<arith::AddIOp>(
-              descStoreOp.getLoc(), indices[dim], offset);
+          indices[dim] = builder.create<arith::AddIOp>(descStoreOp.getLoc(),
+                                                       indices[dim], offset);
         }
-        builder.create<DescriptorStoreOp>(descStoreOp.getLoc(),
-                                          descStoreOp.getDesc(), slicedSrc,
-                                          indices);
+        builder.create<DescriptorStoreOp>(
+            descStoreOp.getLoc(), descStoreOp.getDesc(), slicedSrc, indices);
       }
 
       descStoreOp.erase();
