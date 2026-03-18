@@ -160,7 +160,6 @@ std::vector<int> assignLineIds(
 
 } // namespace
 
-
 void StreamChromeTraceWriter::writeKernel(json &object,
                                           const KernelTrace &kernelTrace,
                                           const uint64_t minInitTime) {
