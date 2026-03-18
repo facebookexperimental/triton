@@ -148,7 +148,10 @@ def matmul_kernel_tma_persistent_ws(
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
-        if EPILOGUE_SUBTILE:
+        if EPILOGUE_SUBTILE == 1:
+            accumulator = accumulator.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c], accumulator)
+        elif EPILOGUE_SUBTILE == 2:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
@@ -156,9 +159,20 @@ def matmul_kernel_tma_persistent_ws(
             c_desc.store([offs_am_c, offs_bn_c], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-        else:
-            accumulator = accumulator.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], accumulator)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            c00 = acc00.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c], c00)
+            c01 = acc01.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c01)
+            c10 = acc10.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c + 2 * (BLOCK_SIZE_N // 4)], c10)
+            c11 = acc11.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c + 3 * (BLOCK_SIZE_N // 4)], c11)
 
 
 # ============================================================================
@@ -225,7 +239,7 @@ def matmul_kernel_descriptor_persistent_ws(
         strides=[N, 1],
         block_shape=[
             BLOCK_SIZE_M,
-            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+            BLOCK_SIZE_N // EPILOGUE_SUBTILE,
         ],
     )
 
@@ -263,7 +277,10 @@ def matmul_kernel_descriptor_persistent_ws(
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
-        if EPILOGUE_SUBTILE:
+        if EPILOGUE_SUBTILE == 1:
+            c = accumulator.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 2:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
@@ -271,9 +288,20 @@ def matmul_kernel_descriptor_persistent_ws(
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
-        else:
-            c = accumulator.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            c00 = acc00.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c00)
+            c01 = acc01.to(dtype)
+            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 4], c01)
+            c10 = acc10.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)], c10)
+            c11 = acc11.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)], c11)
 
 
 # ============================================================================
@@ -390,7 +418,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 @pytest.mark.parametrize("num_stages", [2, 3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
-@pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
@@ -415,7 +443,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and not EPILOGUE_SUBTILE:
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
@@ -458,7 +486,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             C,
             C.shape,
             C.stride(),
-            [BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if EPILOGUE_SUBTILE else BLOCK_SIZE_N],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
         )
 
         grid = lambda META: (min(
@@ -508,7 +536,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("num_stages", [2, 3])
 @pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
-@pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
@@ -533,7 +561,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and not EPILOGUE_SUBTILE:
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
