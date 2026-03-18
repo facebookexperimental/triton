@@ -138,7 +138,7 @@ import triton.profiler.mode as pmode
 proton.start(
     name="profile_name",
     backend="instrumentation",
-    mode=pmode.Default(granularity="warp_2") # collect metrics from every 2 warps
+    mode=pmode.Default() # collect metrics from every warp
 )
 ```
 
