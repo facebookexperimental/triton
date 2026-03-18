@@ -13,7 +13,7 @@ mlir_tablegen(OpsEnums.h.inc -gen-enum-decls)
 mlir_tablegen(OpsEnums.cpp.inc -gen-enum-defs)
 
 add_mlir_doc(TLXDialect TLXDialect dialects/ -gen-dialect-doc)
-add_mlir_doc(TLXOps TLXOps dialects/ -gen-op-doc)
+add_mlir_doc(TLXOps TLXOps dialects/ -gen-op-doc -dialect=tlx)
 add_public_tablegen_target(TLXTableGen)
 
 

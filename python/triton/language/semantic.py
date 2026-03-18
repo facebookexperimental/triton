@@ -1622,10 +1622,10 @@ class TritonSemantic(Generic[TensorTy]):
                 raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
         return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
-    def dot(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], allow_tf32,
+    def dot(self, lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str],
             max_num_imprecise_acc: int, out_dtype: tl.dtype) -> tl.tensor:
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
-         ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
+         ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, None, max_num_imprecise_acc, out_dtype)
 
         return tl.tensor(
             self.builder.create_dot(

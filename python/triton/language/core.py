@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import builtins
 from ..runtime.jit import JITCallable
 import inspect
-
+from .. import knobs
 from .._C.libtriton import ir
 from .._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth, _tuple_create
 

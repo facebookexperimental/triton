@@ -494,6 +494,10 @@ struct CLCIsCanceledOpConversion
         ptxBuilder.launch(rewriter, loc, i1_ty, /*hasSideEffects=*/false);
     rewriter.replaceOp(op, result);
 
+    return success();
+  }
+};
+
 struct NamedBarrierArriveOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::NamedBarrierArriveOp> {
   using ConvertOpToLLVMPattern<
@@ -575,6 +579,11 @@ struct CLCGetProgramIdOpConversion
     }
 
     rewriter.replaceOp(op, result);
+
+    return success();
+  }
+};
+
 struct NamedBarrierWaitOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::NamedBarrierWaitOp> {
   using ConvertOpToLLVMPattern<

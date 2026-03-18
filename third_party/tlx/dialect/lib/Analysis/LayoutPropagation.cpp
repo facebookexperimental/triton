@@ -87,7 +87,7 @@ void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
             op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
       auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
       auto blockArgumentLattice = getLatticeElement(
-          warpSpecializeOp.getExplicitCaptures()[arg.getArgNumber()]);
+          warpSpecializeOp->getOperands()[arg.getArgNumber()]);
       ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
       propagateIfChanged(blockArgumentLattice, changed);
       // Propagate to all the partition regions
@@ -125,7 +125,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
             mmaEncoding.getContext(),
             memDescTransOp.getSrc().getType().getShape(), newOrder,
-            mmaEncoding.getCTALayout(),
+            ttg::getCGALayout(memDescTransOp.getSrc().getType().getEncoding()),
             memDescTransOp.getSrc().getType().getElementType(),
             mmaEncoding.getFp4Padded());
         const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
@@ -153,8 +153,10 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
             dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
         auto newTmemEncoding = ttng::TensorMemoryEncodingAttr::get(
             tmemEncoding.getContext(), srcEncoding.getBlockM(),
-            srcEncoding.getBlockN(), tmemEncoding.getUnpacked(),
-            tmemEncoding.getCTASplitM(), tmemEncoding.getCTASplitN());
+            srcEncoding.getBlockN(),
+            /*colStride=*/1,
+            ttg::getCGALayout(srcTy.getEncoding()),
+            /*useTwoCTAs=*/false);
         const auto updatedResultLayoutEncoding =
             LayoutEncoding(newTmemEncoding);
         auto operandLattice = operands[0];
@@ -199,6 +201,9 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
   }
   return success();
 }
+
+void LayoutBackwardPropagation::visitNonControlFlowArguments(
+    RegionSuccessor &successor, ArrayRef<BlockArgument> arguments) {}
 
 void LayoutBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto branchOp = operand.getOwner();
@@ -246,8 +251,9 @@ LogicalResult LayoutForwardPropagation::visitOperation(
             operandLayoutEncoding.getLayoutEncoding());
         auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
             op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
-            encoding.getUnpacked(), encoding.getCTASplitM(),
-            encoding.getCTASplitN());
+            /*colStride=*/1,
+            ttg::getCGALayout(cast<ttg::MemDescType>(sliceOp.getSrc().getType()).getEncoding()),
+            /*useTwoCTAs=*/false);
         operandLayoutEncoding = LayoutEncoding(newEncoding);
       }
     }

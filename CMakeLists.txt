@@ -325,17 +325,6 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endforeach()
   endif()
 
-  foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
-    add_subdirectory(third_party/${CODEGEN_BACKEND})
-  endforeach()
-
-  if (TRITON_BUILD_PROTON)
-    add_subdirectory(third_party/proton)
-  endif()
-  # We always build proton dialect
-  list(APPEND TRITON_PLUGIN_NAMES "proton")
-  add_subdirectory(third_party/proton/Dialect)
-
   if (TRITON_BUILD_TLX)
     add_subdirectory(third_party/tlx)
   endif()

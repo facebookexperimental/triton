@@ -136,7 +136,7 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       // Need a new alloc with the larger type.
       builder.setInsertionPoint(baseAllocOp);
       auto newAllocOp =
-          builder.create<ttg::LocalAllocOp>(baseAllocOp->getLoc(), maxType);
+          ttg::LocalAllocOp::create(builder, baseAllocOp->getLoc(), maxType);
       // Save mapping so we can rewrite uses later.
       allocToNewAlloc[baseAllocOp] = newAllocOp;
     }
@@ -163,7 +163,7 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
           dyn_cast<ttg::MemDescType>(newAllocOp->getResult(0).getType());
       auto baseAllocType =
           dyn_cast<ttg::MemDescType>(baseAllocOp->getResult(0).getType());
-      auto newAllocToBaseAllocOp = builder.create<ttg::MemDescReinterpretOp>(
+      auto newAllocToBaseAllocOp = ttg::MemDescReinterpretOp::create(builder, 
           baseAllocOp->getLoc(), baseAllocType, newAllocOp->getResult(0));
       baseAllocOp->getResult(0).replaceAllUsesWith(
           newAllocToBaseAllocOp.getResult());
@@ -181,7 +181,7 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       });
       builder.setInsertionPoint(aliasOp);
       auto aliasType = aliasOp.getResult().getType();
-      auto baseAllocToAliasOp = builder.create<ttg::MemDescReinterpretOp>(
+      auto baseAllocToAliasOp = ttg::MemDescReinterpretOp::create(builder, 
           baseAllocOp->getLoc(), aliasType, baseAllocOp->getResult(0));
       aliasOp.getResult().replaceAllUsesWith(baseAllocToAliasOp.getResult());
       aliasOp->erase();

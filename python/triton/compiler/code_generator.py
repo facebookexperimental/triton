@@ -258,12 +258,6 @@ class ASTFunction:
             return language.constexpr(None)
 
         vals = make_template(self.arg_types)
-        is_val = lambda path, _: path not in self.constants and _ is not None
-        val_paths = list(find_paths_if(self.arg_types, is_val))
-        for i, path in enumerate(val_paths):
-            ty = get_iterable_path(self.arg_types, path)
-            if isinstance(ty, nv_tma_desc_type):
-                fn.set_arg_attr(i, "tt.nv_tma_desc", 1)
         # > add IR values to the template
         handles = [fn.args(i) for i in range(fn.get_num_args())]
         cursor = 0

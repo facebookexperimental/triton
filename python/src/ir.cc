@@ -1909,7 +1909,6 @@ void init_triton_ir(py::module &&m) {
              return self.create<MakeTensorDescOp>(base, shape, strides,
                                                   tensorShape, isSignedInteger,
                                                   paddingOption);
-                                                  tensorShape, isSignedInteger);
            })
       // Warp specialize ops
       .def("create_warp_specialize_op",
