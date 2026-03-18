@@ -391,7 +391,7 @@ def get_cuda_autotune_config():
         for m in [1, 2]
         for subtile in [1, 2, 4, 8]
         for num_ctas in [1, 2]
-        for split_k in [1, 2, 3, 4, 5, 6]  # pruning selects one optimal SPLIT_K per tile group
+        for split_k in [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 19, 24]  # pruning selects one optimal SPLIT_K per tile group
         for interleave in [0, 1]
         for g in [1, 8, 64]
         for uwb in [False, True]
