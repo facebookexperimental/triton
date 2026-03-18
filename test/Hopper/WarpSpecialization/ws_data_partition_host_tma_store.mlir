@@ -1,13 +1,15 @@
-// RUN: not triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=1 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=1 | FileCheck %s
 
-// Reproducer for data partition with host-side TMA descriptor_store.
-// When DATA_PARTITION_FACTOR=2, the pass slices the a_desc func arg
-// (256x64 -> 128x64) but must also slice the c_desc func arg
-// (256x128 -> 128x128) AND the stored tensor value consistently.
-// Previously, the c_desc type was updated but the stored value was not
-// partitioned, causing a type mismatch verification failure.
+// Test that data partition correctly handles host-side TMA descriptor_store
+// ops outside the warp-specialized loop. When DATA_PARTITION_FACTOR=2 with
+// FLATTEN=True, the flattened loop creates an scf.if with a k_tiles==0
+// zero-store path that also uses c_desc. The pass must partition the
+// descriptor_store in that path alongside updating the func arg type.
 
-// CHECK: error: 'tt.descriptor_store' op tensor descriptor block and tensor types must match
+// CHECK-LABEL: @host_tma_dp_store
+// Function signature should show sliced a_desc (256x64 -> 128x64) and c_desc (256x128 -> 128x128):
+// CHECK-SAME: !tt.tensordesc<tensor<128x64xf16
+// CHECK-SAME: !tt.tensordesc<tensor<128x128xf16
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -64,6 +66,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %13 = arith.divsi %12, %9 : i32
         %offs_am_c = arith.muli %11, %c256_i32 : i32
         %offs_bn_c = arith.muli %13, %c128_i32 : i32
+        // The original 256x128 descriptor_store should be replaced by two 128x128 stores:
+        // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<tensor<128x128xf16{{.*}}>>, tensor<128x128xf16
+        // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<tensor<128x128xf16{{.*}}>>, tensor<128x128xf16
         tt.descriptor_store %c_desc[%offs_am_c, %offs_bn_c], %cst : !tt.tensordesc<tensor<256x128xf16, #shared>>, tensor<256x128xf16, #blocked>
         scf.yield %5 : i32
       } {tt.data_partition_factor = 2 : i32, tt.flatten, tt.smem_alloc_algo = 1 : i32}

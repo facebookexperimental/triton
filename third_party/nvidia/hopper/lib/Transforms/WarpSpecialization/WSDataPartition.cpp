@@ -1571,6 +1571,75 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
 
   fixTaskId(funcOp);
 
+  // Handle unpartitioned descriptor_store ops that reference func args we're
+  // about to modify. This can happen when the same descriptor func arg is used
+  // in a code path that has no dot ops (e.g., the k_tiles==0 zero-store path
+  // in flattened persistent kernels).
+  for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
+    auto &entryBlock = funcOp.getBlocks().front();
+    auto bbArg = entryBlock.getArgument(argIndex);
+    auto descType = cast<TensorDescType>(bbArg.getType());
+    auto blockType = descType.getBlockType();
+    int64_t slicedSize =
+        blockType.getShape()[dim] / partitionScheme.numPartitions;
+
+    SmallVector<DescriptorStoreOp> unpartitionedStores;
+    for (Operation *user : bbArg.getUsers()) {
+      if (auto descStoreOp = dyn_cast<DescriptorStoreOp>(user)) {
+        if (!partitionScheme.isPartitioned(descStoreOp)) {
+          unpartitionedStores.push_back(descStoreOp);
+        }
+      }
+    }
+
+    for (auto descStoreOp : unpartitionedStores) {
+      OpBuilder builder(descStoreOp);
+      Value src = descStoreOp.getSrc();
+      auto srcType = cast<RankedTensorType>(src.getType());
+      SmallVector<int64_t> srcShape(srcType.getShape());
+
+      // Compute the sliced source type.
+      SmallVector<int64_t> slicedShape(srcShape);
+      slicedShape[dim] = slicedSize;
+      auto slicedSrcType = RankedTensorType::get(
+          slicedShape, srcType.getElementType(), srcType.getEncoding());
+
+      // Create sliced source value. For splat constants, create a new constant
+      // with the sliced shape. For other sources, bail out.
+      Value slicedSrc;
+      if (auto constOp = src.getDefiningOp<arith::ConstantOp>()) {
+        auto valAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
+        if (valAttr && valAttr.isSplat()) {
+          auto slicedValType = cast<ShapedType>(valAttr.getType()).clone(slicedShape);
+          auto slicedValAttr = valAttr.resizeSplat(slicedValType);
+          slicedSrc = builder.create<arith::ConstantOp>(
+              descStoreOp.getLoc(), slicedValAttr);
+        }
+      }
+
+      if (!slicedSrc) {
+        LDBG("Cannot slice non-splat source of unpartitioned descriptor_store");
+        return false;
+      }
+
+      // Create numPartitions replacement stores with adjusted coordinates.
+      for (int i = 0; i < partitionScheme.numPartitions; i++) {
+        SmallVector<Value> indices(descStoreOp.getIndices());
+        if (i > 0) {
+          Value offset = builder.create<arith::ConstantIntOp>(
+              descStoreOp.getLoc(), i * slicedSize, 32);
+          indices[dim] = builder.create<arith::AddIOp>(
+              descStoreOp.getLoc(), indices[dim], offset);
+        }
+        builder.create<DescriptorStoreOp>(descStoreOp.getLoc(),
+                                          descStoreOp.getDesc(), slicedSrc,
+                                          indices);
+      }
+
+      descStoreOp.erase();
+    }
+  }
+
   // Update function argument types for host-side TMA descriptors.
   if (!partitionScheme.funcArgPartitionDims.empty()) {
     auto &entryBlock = funcOp.getBlocks().front();
