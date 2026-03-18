@@ -27,8 +27,21 @@ public:
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     ReduceOpHelper helper(op);
-    assert(helper.isReduceWithinCTA() &&
-           "Unexpected srcLayout in ReduceOpConversion");
+    // Multi-CTA reduction pass generates tt.reduce on 1-element tensors
+    // loaded from DSM buffers. These are within-CTA (each CTA has its own
+    // buffer copy), but the encoding may not reflect this if cluster_dims > 1.
+    // Only allow these specific 1-element cases through.
+    if (!helper.isReduceWithinCTA()) {
+      auto srcTy = cast<RankedTensorType>(op.getOperands()[0].getType());
+      if (srcTy.getShape()[op.getAxis()] != 1) {
+        return op.emitError(
+            "cross-CTA reduce on tensor with reduction axis size > 1 is not "
+            "supported; only 1-element tensors from multi-CTA DSM exchange "
+            "are allowed");
+      }
+      LDBG("Cross-CTA reduce on 1-element tensor (multi-CTA DSM exchange), "
+           "proceeding with within-CTA lowering");
+    }
     Location loc = op->getLoc();
 
     auto srcValues = unpackInputs(loc, op, adaptor, rewriter);
@@ -37,12 +50,23 @@ public:
     // First reduce all the values along axis within each thread.
     reduceWithinThreads(helper, srcValues, accs, indices, rewriter);
 
+    // For 1-element tensors (e.g., from multi-CTA DSM exchange), skip ALL
+    // cross-thread and cross-warp communication — only thread 0 has data.
+    if (cast<RankedTensorType>(op.getOperands()[0].getType())
+            .getShape()[op.getAxis()] == 1) {
+      packResults(helper, accs, rewriter);
+      return success();
+    }
+
     // Then reduce across threads within a warp.
     reduceWithinWarps(helper, accs, rewriter);
 
-    if (helper.isWarpSynchronous()) {
-      // If all the values to be reduced are within the same warp there is
-      // nothing left to do.
+    if (helper.isWarpSynchronous() ||
+        cast<RankedTensorType>(op.getOperands()[0].getType())
+                .getShape()[op.getAxis()] == 1) {
+      // If all the values to be reduced are within the same warp, or if there's
+      // only 1 element along the reduce axis (multi-CTA DSM exchange case),
+      // there is nothing left to do.
       packResults(helper, accs, rewriter);
       return success();
     }
