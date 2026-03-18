@@ -34,20 +34,40 @@ Barrier Dependency Graph
 
   partition0 (TMA loads)
       |
-      | mbarrier (TMA): barrier_expect 49152 bytes
+      | mbarrier (TMA, forward): barrier_expect 49152 bytes
       |   async_tma_copy_global_to_local x2 (A: 128x64xf16, B: 64x256xf16)
       |   [merged barrier -- single expect for both buffers]
       v
   default (MMA)
       |
-      | TMEM token chain: tc_gen5_mma produces %token,
+      | TMEM token chain (forward): tc_gen5_mma produces %token,
       |   tmem_load consumes %token
       v
   partition1 (Epilogue)
       |
-      | (no downstream barrier -- writes to global via descriptor_store)
+      | (forward) writes to global via descriptor_store
       v
   [global memory]
+
+  Backwards barriers (persistent loop, next-iteration dependencies):
+  -------------------------------------------------------------------
+
+  partition1 (Epilogue)
+      |
+      | TMEM token (backward): tmem_load produces %token_1;
+      |   next iteration's tmem_store (acc zeroing) should consume it
+      |   *** NOT LOOP-CARRIED in this IR -- %token from tmem_alloc reused ***
+      |   *** Potential issue: missing backward sync for accumulator reuse ***
+      v
+  default (MMA, next iteration)
+
+  default (MMA)
+      |
+      | mbarrier phase (backward, implicit): MMA's wait_barrier advances phase,
+      |   preventing TMA from re-arriving on the same slot until MMA has consumed it.
+      |   Handled automatically by triple-buffering (depth=3) + phase tracking.
+      v
+  partition0 (TMA loads, next iteration)
 ```
 
 ### Section 3: Index and Phase Analysis

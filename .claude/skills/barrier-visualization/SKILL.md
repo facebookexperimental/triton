@@ -55,6 +55,8 @@ barrier. Use arrows to show data flow direction.
 Barrier Dependency Graph
 ========================
 
+  Forward barriers:
+
   partition1 (TMA loads)
       |
       | barrier_expect + async_tma_copy (mbarrier, SMEM buffers A, B)
@@ -72,11 +74,48 @@ Barrier Dependency Graph
       | tc_gen5_commit
       v
   partition2 (Output store)
+
+  Backwards barriers (next-iteration dependencies):
+
+  partition2 (Output store)
+      |
+      | TMEM token (backward): tmem_load token → next iter's tmem_store
+      v
+  partition0 (MMA, next iteration)
+
+  partition0 (MMA)
+      |
+      | mbarrier phase (backward, implicit): phase tracking prevents
+      |   TMA re-arrival until MMA has consumed the buffer
+      v
+  partition1 (TMA loads, next iteration)
 ```
 
 For each arrow, annotate:
 - The barrier mechanism type (see table below)
 - What data flows across (buffer name or tensor shape)
+- The direction: **forward** (producer → consumer) or **backward** (consumer →
+  producer, signaling resource reuse)
+
+#### Backwards-Direction Barriers
+
+In persistent kernels (those with an outer tile loop), downstream partitions
+often need to signal upstream partitions that shared resources can be reused.
+These "backwards" barriers create cycles in the dependency graph.
+
+Common backwards barriers:
+- **TMEM token chain**: `tmem_load` (epilogue) produces a token consumed by
+  `tmem_store` (MMA) in the next iteration — prevents zeroing the accumulator
+  before the epilogue finishes reading it.
+- **consumer_release** (legacy WS): Consumer releases the mbarrier slot,
+  allowing the producer to re-acquire it for the next iteration.
+- **Phase-based mbarrier**: Multi-buffered SMEM implicitly handles backwards
+  sync — the producer can't re-arrive on a slot until the consumer has waited
+  on it (phase flip).
+
+Show backwards barriers as upward arrows or annotated return edges in the
+dependency graph. When a backwards token chain is expected but the SSA token
+is unused (not loop-carried), flag it as a potential issue.
 
 #### Barrier Mechanism Types
 
@@ -209,6 +248,15 @@ Include:
 7. **Look for loc metadata** (e.g., `loc("a_desc")`, `loc("K")`) to name buffers.
 8. **Check async_task_id attributes** on ops to determine partition membership
    when analyzing pre-code-partition IR.
+9. **Identify backwards-direction barriers** in persistent kernels (outer tile
+   loops). Check whether downstream partitions produce tokens or release barriers
+   that upstream partitions consume in the next iteration:
+   - TMEM: Does `tmem_load`'s output token feed back (via iter_arg) to the next
+     iteration's `tmem_store`? If not, flag as a potential missing backward sync.
+   - SMEM mbarrier: Is the buffer multi-buffered (depth > 1) with phase tracking?
+     If so, backwards sync is implicit. If single-buffered, check for explicit
+     backward barriers.
+   - Legacy WS: Does `consumer_release` pair with the next `producer_acquire`?
 
 ## Example Reports
 
