@@ -1406,12 +1406,22 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       }
     }
   } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+    // For ForOp yields, only append sliced yield operands for positions where
+    // the parent ForOp actually added a new init arg. The ForOp slicing records
+    // new args via mappings on ForOp results. If a yield value was mapped
+    // (sliced inside the loop) but the corresponding ForOp init arg was NOT
+    // mapped (not sliced outside the loop), appending would create a
+    // type/ordering mismatch between init args and yield operands.
+    auto parentForOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
     int num = yieldOp.getNumOperands();
     for (int i = 0; i < num; i++) {
       auto operand = yieldOp.getOperand(i);
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
-      if (auto newV = mappings.lookupOrNull(operand))
-        yieldOp->insertOperands(op->getNumOperands(), newV);
+      if (auto newV = mappings.lookupOrNull(operand)) {
+        // Only append if the parent ForOp also has a corresponding new result.
+        if (!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i)))
+          yieldOp->insertOperands(op->getNumOperands(), newV);
+      }
     }
     newOp = op;
   } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
@@ -1482,6 +1492,14 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
       if (!isMemoryEffectFree(op))
         opsCanBeTriviallyDead.insert(op);
 
+      // Don't delete ForOps or IfOps directly. After slicing, the only
+      // ForOps/IfOps remaining in the partition scheme are the final sliced
+      // versions (originals were erased via "to_be_removed"). These contain
+      // the partitioned ops and must be preserved. Let the canonicalization
+      // patterns handle dead argument elimination instead.
+      if (isa<scf::ForOp, scf::IfOp>(op))
+        return;
+
       bool notUsed = true;
       for (auto result : op->getResults()) {
         if (!result.getUsers().empty()) {
@@ -1529,6 +1547,58 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
     }
   } while (!opsToDelete.empty());
   return true;
+}
+
+/// Check if a value is effectively a splat constant by tracing through
+/// element-preserving ops (convert_layout, truncf, extf, split). Returns the
+/// splat element Attribute in the target value's element type, or nullopt.
+static std::optional<Attribute> getEffectiveSplatAttr(Value v) {
+  // Direct constant.
+  if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+    auto valAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
+    if (valAttr && valAttr.isSplat())
+      return valAttr.getSplatValue<Attribute>();
+    return std::nullopt;
+  }
+  // convert_layout preserves values and element type.
+  if (auto convertOp = v.getDefiningOp<ConvertLayoutOp>())
+    return getEffectiveSplatAttr(convertOp.getSrc());
+  // truncf preserves splatness; convert the element value.
+  if (auto truncOp = v.getDefiningOp<arith::TruncFOp>()) {
+    auto srcAttr = getEffectiveSplatAttr(truncOp.getIn());
+    if (!srcAttr)
+      return std::nullopt;
+    auto srcFloat = dyn_cast<FloatAttr>(*srcAttr);
+    if (!srcFloat)
+      return std::nullopt;
+    auto dstElemType = cast<FloatType>(
+        cast<RankedTensorType>(truncOp.getType()).getElementType());
+    bool losesInfo;
+    APFloat trunced = srcFloat.getValue();
+    trunced.convert(dstElemType.getFloatSemantics(),
+                    APFloat::rmNearestTiesToEven, &losesInfo);
+    return FloatAttr::get(dstElemType, trunced);
+  }
+  // extf preserves splatness; convert the element value.
+  if (auto extOp = v.getDefiningOp<arith::ExtFOp>()) {
+    auto srcAttr = getEffectiveSplatAttr(extOp.getIn());
+    if (!srcAttr)
+      return std::nullopt;
+    auto srcFloat = dyn_cast<FloatAttr>(*srcAttr);
+    if (!srcFloat)
+      return std::nullopt;
+    auto dstElemType = cast<FloatType>(
+        cast<RankedTensorType>(extOp.getType()).getElementType());
+    bool losesInfo;
+    APFloat extended = srcFloat.getValue();
+    extended.convert(dstElemType.getFloatSemantics(),
+                     APFloat::rmNearestTiesToEven, &losesInfo);
+    return FloatAttr::get(dstElemType, extended);
+  }
+  // split preserves values and element type.
+  if (auto splitOp = v.getDefiningOp<SplitOp>())
+    return getEffectiveSplatAttr(splitOp.getSrc());
+  return std::nullopt;
 }
 
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
@@ -1657,18 +1727,17 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       auto slicedSrcType = RankedTensorType::get(
           slicedShape, srcType.getElementType(), srcType.getEncoding());
 
-      // Create sliced source value. For splat constants, create a new constant
-      // with the sliced shape. For other sources, bail out.
+      // Create sliced source value. For splat constants (including values
+      // derived from splat constants through element-preserving ops like
+      // convert_layout, truncf, and split), create a new constant with the
+      // sliced shape. For other sources, bail out.
       Value slicedSrc;
-      if (auto constOp = src.getDefiningOp<arith::ConstantOp>()) {
-        auto valAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
-        if (valAttr && valAttr.isSplat()) {
-          auto slicedValType =
-              cast<ShapedType>(valAttr.getType()).clone(slicedShape);
-          auto slicedValAttr = valAttr.resizeSplat(slicedValType);
-          slicedSrc = builder.create<arith::ConstantOp>(descStoreOp.getLoc(),
-                                                        slicedValAttr);
-        }
+      if (auto splatAttr = getEffectiveSplatAttr(src)) {
+        auto slicedValType = RankedTensorType::get(
+            slicedShape, srcType.getElementType(), srcType.getEncoding());
+        auto slicedValAttr = DenseElementsAttr::get(slicedValType, *splatAttr);
+        slicedSrc = builder.create<arith::ConstantOp>(descStoreOp.getLoc(),
+                                                      slicedValAttr);
       }
 
       if (!slicedSrc) {
