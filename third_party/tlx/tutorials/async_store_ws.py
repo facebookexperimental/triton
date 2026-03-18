@@ -56,7 +56,7 @@ def test_store_ws():
 
     output = torch.empty(n_elements, device=DEVICE, dtype=torch.float32)
     # num_ctas=2 ensures PlanCTA runs (it skips when num_ctas=1).
-    store_ws_kernel[(n_blocks,)](output, BLOCK_SIZE=BLOCK_SIZE, num_ctas=2)
+    store_ws_kernel[(n_blocks, )](output, BLOCK_SIZE=BLOCK_SIZE, num_ctas=2)
 
     expected = torch.arange(n_elements, device=DEVICE, dtype=torch.float32)
     torch.testing.assert_close(output, expected)
