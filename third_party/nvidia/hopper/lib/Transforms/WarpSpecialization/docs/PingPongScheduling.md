@@ -8,20 +8,9 @@ than competing simultaneously.
 
 ## Pipeline Integration
 
-Both passes are gated by the `pingpongAutoWS` option (`--pingpong-auto-ws`):
-
-```
-doTaskPartition / PartitionScheduling
-  → doTaskIdPropagate
-  → doDataPartition
-  → doPingPongPrep          ← Groups expensive ops, assigns pingpong_id
-  → doBufferAllocation
-  → doMemoryPlanner
-  → doCodePartitionPost     ← Creates WarpSpecializeOp regions
-  → doPingPongSync          ← Inserts barrier ops into partition regions
-  → doTokenLowering
-  → scheduleLoops
-```
+Both passes are gated by the `pingpongAutoWS` option (`--pingpong-auto-ws`).
+See [Overview.md](Overview.md) for the full pipeline and Hopper/Blackwell
+differences.
 
 `doPingPongPrep` runs **before** code partitioning (ops still have
 `async_task_id` but are not physically separated). `doPingPongSync` runs
