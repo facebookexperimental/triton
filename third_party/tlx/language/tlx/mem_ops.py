@@ -803,7 +803,7 @@ def async_descriptor_load(
         # Both CTAs signal the leader's barrier via .cta_group::2.
         # Round cta_rank down to even to get the leader of the CTA pair.
         cta_rank = tl.tensor(_semantic.builder.create_cluster_cta_rank(), tl.int32)
-        leader_rank = cta_rank & ~1
+        leader_rank = cta_rank.__and__(~1, _semantic=_semantic)
         barrier = remote_view(barrier, leader_rank, _semantic=_semantic)
     _semantic.builder.create_async_TMA_load(
         multicast_targets,
