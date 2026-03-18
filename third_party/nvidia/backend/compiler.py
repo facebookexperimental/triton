@@ -102,6 +102,39 @@ def sm_arch_from_capability(capability: int):
     return f"sm_{capability}{suffix}"
 
 
+def _max_shared_mem_for_capability(capability: int) -> int:
+    """Return CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN for a given SM capability.
+
+    Tries querying the GPU driver first. Falls back to a static table for
+    offline compilation environments (e.g. Triton CC on RE) where no GPU is present.
+    """
+    try:
+        from triton.runtime.driver import driver as rt_driver
+        return rt_driver.active.utils.get_device_properties(rt_driver.active.get_current_device())["max_shared_mem"]
+    except (RuntimeError, Exception):
+        pass
+    # Fallback for offline compilation (no GPU present).
+    # Values are CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN per
+    # the CUDA Programming Guide "Technical Specifications per Compute Capability".
+    _SMEM_SIZES = {
+        70: 98304,  # V100:    96 KB per SM, optin = 96 KB
+        75: 65536,  # Turing:  64 KB per SM, optin = 64 KB
+        80: 166912,  # A100:   164 KB per SM, optin = 163 KB
+        86: 101376,  # GA10x:  100 KB per SM, optin = 99 KB
+        87: 166912,  # Orin:   164 KB per SM, optin = 163 KB
+        89: 101376,  # AD10x:  100 KB per SM, optin = 99 KB
+        90: 232448,  # H100:   228 KB per SM, optin = 227 KB
+        100: 232448,  # B200:   228 KB per SM, optin = 227 KB
+        103: 232448,  # GB300:  228 KB per SM, optin = 227 KB
+        110: 232448,  # SM110: 228 KB per SM, optin = 227 KB
+        120: 101376,  # SM120: 100 KB per SM, optin = 99 KB
+    }
+    # Try exact capability first (e.g. 86), then round to family base
+    # (e.g. 86 -> 80) for unknown sub-variants, then fall back to 48 KB
+    # (the default max shared mem per block without optin).
+    return _SMEM_SIZES.get(capability, _SMEM_SIZES.get(capability // 10 * 10, 49152))
+
+
 @dataclass(frozen=True)
 class CUDAOptions:
     num_warps: int = 4
@@ -340,9 +373,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            from triton.runtime.driver import driver as rt_driver
-            smem_budget = rt_driver.active.utils.get_device_properties(
-                rt_driver.active.get_current_device())["max_shared_mem"]
+            smem_budget = _max_shared_mem_for_capability(capability)
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
                                                      smem_budget)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
@@ -366,9 +397,7 @@ class CUDABackend(BaseBackend):
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
                     passes.ttgpuir.add_partition_scheduling(pm)
-                from triton.runtime.driver import driver as rt_driver
-                smem_budget = rt_driver.active.utils.get_device_properties(
-                    rt_driver.active.get_current_device())["max_shared_mem"]
+                smem_budget = _max_shared_mem_for_capability(capability)
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
