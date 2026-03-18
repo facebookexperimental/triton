@@ -9,7 +9,6 @@ import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple
 from dataclasses import dataclass
 import builtins
-from .. import knobs
 from ..runtime.jit import JITCallable
 import inspect
 
@@ -701,6 +700,13 @@ class pointer_type(dtype):
 
     def mangle(self) -> str:
         return f"P{self.element_ty.mangle()}"
+
+
+class nv_tma_desc_type(pointer_type):
+
+    def __init__(self, const=True, address_space=0):
+        super().__init__(uint8, const=const, address_space=address_space)
+        self.name = 'nv_tma_desc_type'
 
 
 class block_type(dtype):
@@ -1431,14 +1437,14 @@ class tensor_descriptor_base(base_value):
         return _semantic.descriptor_load(self, offsets, "", "")
 
     @builtin
-    def store(self, offsets: Sequence[constexpr | tensor], value: tensor, _semantic=None) -> tensor:
+    def store(self, offsets: Sequence[constexpr | tensor], value: tensor, store_reduce="", _semantic=None) -> tensor:
         """Store a block from the descriptor starting at the given element offsets.
 
         Values outside of the tensor bounds will be ignored.
 
         :note: Offset must be a multiple of 16-bytes
         """
-        return _semantic.descriptor_store(self, value, offsets)
+        return _semantic.descriptor_store(self, value, offsets, store_reduce)
 
     @builtin
     def atomic_add(self, offsets: Sequence[constexpr | tensor], value: tensor, _semantic=None) -> tensor:
@@ -2445,6 +2451,40 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
     volatile = _unwrap_if_constexpr(volatile)
     return _semantic.load(pointer, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy,
                           volatile)
+
+
+@builtin
+def _experimental_reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype, _semantic=None) -> tensor_descriptor_base:
+    """
+    Reinterpret a generic pointer as a TMA-backed tensor descriptor object.
+    """
+    block_ty = block_type(_unwrap_if_constexpr(dtype), block_shape)
+    return _semantic.reinterpret_tensor_descriptor(desc_ptr, block_ty)
+
+
+@builtin
+def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _semantic=None):
+    """
+    Experimental feature to access TMA descriptors loads. This is an escape hatch to easily exercise TTGIR operations.
+    This will be removed in the future and shouldn't be used in production code.
+
+    This loads a tensor of data based on the descriptor and offsets.
+    """
+    desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, shape, dtype, _semantic=_semantic)
+    return desc.load(offsets, _semantic=_semantic)
+
+
+@builtin
+def _experimental_descriptor_store(desc_pointer, value, offsets, store_reduce="", _semantic=None):
+    """
+    Experimental feature to access TMA descriptors stores. This is an escape hatch to easily exercise TTGIR operations.
+    This will be removed in the future and shouldn't be used in production code.
+
+    This stores a tensor of data based on the descriptor and offsets.
+    """
+    store_reduce = _unwrap_if_constexpr(store_reduce)
+    desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, value.shape, value.dtype, _semantic=_semantic)
+    return desc.store(offsets, value, store_reduce=store_reduce, _semantic=_semantic)
 
 
 @builtin

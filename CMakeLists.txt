@@ -24,6 +24,7 @@ option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 option(TRITON_OFFLINE_BUILD "Build without downloading dependencies" OFF)
 option(LLVM_BUILD_SHARED_LIBS
   "Build all libraries as shared libraries instead of static" OFF)
+option(TRITON_BUILD_TLX "Build Triton TLX" ON)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 
 set(TRITON_CACHE_PATH "" CACHE PATH "Path to triton cache")
@@ -324,6 +325,23 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endforeach()
   endif()
 
+  foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
+    add_subdirectory(third_party/${CODEGEN_BACKEND})
+  endforeach()
+
+  if (TRITON_BUILD_PROTON)
+    add_subdirectory(third_party/proton)
+  endif()
+  # We always build proton dialect
+  list(APPEND TRITON_PLUGIN_NAMES "proton")
+  add_subdirectory(third_party/proton/Dialect)
+
+  if (TRITON_BUILD_TLX)
+    add_subdirectory(third_party/tlx)
+  endif()
+  list(APPEND TRITON_PLUGIN_NAMES "tlx")
+  add_subdirectory(third_party/tlx/dialect)
+
   get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
   get_property(triton_plugins GLOBAL PROPERTY TRITON_PLUGINS)
   set(TRITON_LIBRARIES
@@ -457,7 +475,8 @@ if(NOT TRITON_BUILD_PYTHON_MODULE)
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
-  add_subdirectory(third_party/proton/Dialect)
+  add_subdirectory(third_party/proton/dialect)
+  add_subdirectory(third_party/tlx/dialect)
 endif()
 
 find_package(Threads REQUIRED)

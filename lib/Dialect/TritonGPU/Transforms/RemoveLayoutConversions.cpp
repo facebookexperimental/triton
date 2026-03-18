@@ -20,6 +20,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <deque>
@@ -195,6 +196,93 @@ void LayoutRematerialization::addRematValue(Value old, Attribute encoding,
   mappedValues[old] = encoding;
 }
 
+// Remove unneeded values now that we are done with the rematMapping.
+void LayoutRematerialization::cleanup() {
+  for (Operation *op : llvm::reverse(opToDelete))
+    op->erase();
+}
+
+// Facebook begin
+// Look ahead to at the transitive uses and see if there is a convert to mma
+// operations.
+static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
+  SmallVector<Value> queue = {op->getResult(0)};
+  SetVector<Operation *> forwardSlice;
+  llvm::SmallDenseSet<Value> seen;
+  while (!queue.empty()) {
+    Value currentValue = queue.back();
+    queue.pop_back();
+    getForwardSlice(currentValue, &forwardSlice);
+    for (Operation *op : forwardSlice) {
+      // HACK: Stop propagation if the ReduceOp is using mma layout but is
+      // producing tensor smaller than the layout we would like to propagate.
+      // This is to avoid stepping into the known bug.
+      if (isa<mlir::triton::ReduceOp>(op)) {
+        auto tensorType =
+            dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+        if (tensorType &&
+            isa<NvidiaMmaEncodingAttr>(tensorType.getEncoding())) {
+          auto mmaInstrShape =
+              cast<NvidiaMmaEncodingAttr>(encoding).getInstrShape();
+          if (tensorType.getShape()[tensorType.getRank() - 2] <
+                  mmaInstrShape[0] ||
+              tensorType.getShape()[tensorType.getRank() - 1] <
+                  mmaInstrShape[1]) {
+            return false;
+          }
+        }
+      }
+
+      if (auto convertOp = dyn_cast<ConvertLayoutOp>(op)) {
+        Attribute dstEncoding = convertOp.getType().getEncoding();
+        if (auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(dstEncoding))
+          return (mmaLayout.getVersionMajor() > 1) ? true
+                                                   : mmaLayout == encoding;
+        if (isa<triton::gpu::AMDMfmaEncodingAttr,
+                triton::gpu::AMDWmmaEncodingAttr>(dstEncoding))
+          return true;
+        if (isa<triton::gpu::DotOperandEncodingAttr>(dstEncoding)) {
+          if (auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(encoding)) {
+            return mmaLayout.getVersionMajor() > 1;
+          } else {
+            assert((mlir::isa<triton::gpu::AMDMfmaEncodingAttr,
+                              triton::gpu::AMDWmmaEncodingAttr>(encoding)));
+            return true;
+          }
+        }
+      }
+      bool isMMAV3 =
+          isa<NvidiaMmaEncodingAttr>(encoding) &&
+          cast<NvidiaMmaEncodingAttr>(encoding).getVersionMajor() == 3;
+      if (isMMAV3 && (isa<LocalAllocOp>(op) || isa<LocalStoreOp>(op)))
+        return true;
+      auto yield = dyn_cast<scf::YieldOp>(op);
+      if (!yield)
+        continue;
+      if (auto ifOp = dyn_cast<scf::IfOp>(yield->getParentOp())) {
+        for (OpOperand &operand : yield->getOpOperands()) {
+          Operation *def = operand.get().getDefiningOp();
+          if (def &&
+              (forwardSlice.count(def) || operand.get() == currentValue) &&
+              (seen.insert(operand.get()).second == true))
+            queue.push_back(ifOp.getResult(operand.getOperandNumber()));
+        }
+      }
+      auto forOp = dyn_cast<scf::ForOp>(yield.getOperation()->getParentOp());
+      if (!forOp)
+        continue;
+      for (OpOperand &operand : yield->getOpOperands()) {
+        Operation *def = operand.get().getDefiningOp();
+        if (def && (forwardSlice.count(def) || operand.get() == currentValue) &&
+            (seen.insert(operand.get()).second == true))
+          queue.push_back(forOp.getRegionIterArg(operand.getOperandNumber()));
+      }
+    }
+  }
+  return false;
+}
+// Facebook end
+
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
@@ -222,6 +310,18 @@ bool isLayoutAnchor(Operation *op) {
 void LayoutPropagation::initAnchorLayout() {
   auto addAnchor = [&](Value v) {
     if (auto tensorType = dyn_cast<RankedTensorType>(v.getType())) {
+      // Facebook begin
+      // Workaround, don't popagate MMA layout unless there is a convert
+      // back to mma further down to avoid generating reduction with MMA
+      // layout that may have lower performance.
+      // This can be improved with more aggressive backward propagation.
+      if (isa<MmaEncodingTrait>(tensorType.getEncoding()) &&
+          v.getDefiningOp() &&
+          !hasConvertToMMATransisitiveUse(v.getDefiningOp(),
+                                          tensorType.getEncoding())) {
+        return;
+      }
+      // Facebook end
       layouts.insert({v, LayoutInfo(tensorType.getEncoding())});
     }
   };
@@ -1029,6 +1129,44 @@ int64_t getConvertCost(Value convertSrc) {
   // it to account for extra cost due to synchronisation.
   return 32 * convertLayoutBytes;
 }
+void LayoutRematerialization::backwardRematerialization(
+    ConvertLayoutOp convertOp) {
+  RankedTensorType targetType = convertOp.getType();
+  if (isa<DotOperandEncodingAttr>(targetType.getEncoding())) {
+    // DotOperand is hoisted by hoistDotOperand for pipelining purposes.
+    if (auto parentForOp = convertOp->getParentOfType<scf::ForOp>()) {
+      if (getNumStagesOrDefault(parentForOp, 3) > 1) {
+        return;
+      }
+    }
+  }
+
+  Value oldV = convertOp.getSrc();
+  LDBG("check backward remat with source " << oldV << " encoding "
+                                           << targetType.getEncoding());
+  // Check to see if there are existing remat'ed values for the pair of oldValue
+  // and encoding. Make sure it dominates the current conversion.
+  Value newV = getRematValue(oldV, targetType.getEncoding());
+  if (newV && domInfo.properlyDominates(newV, convertOp)) {
+    // Replace it with the remat'ed value.
+    convertOp.replaceAllUsesWith(newV);
+    opToDelete.insert(convertOp);
+    LDBG("found remat'ed value" << newV);
+    return;
+  }
+
+  // 1. Take a backward slice of all the tensor dependencies that can be
+  // rematerialized.
+  SetVector<Value> slice;
+  DenseMap<Value, Attribute> layout;
+  LogicalResult result = getRematerializableSlice(
+      convertOp.getSrcMutable(), targetType.getEncoding(), slice, layout);
+  if (result.failed()) {
+    LDBG("  getRematerializableSlice failed");
+    return;
+  }
+
+  // 2. Determine whether rematerialisation is beneficial.
 
 /// Determine whether rematerializing \p slice is beneficial given that it will
 /// eliminate \p convertOp and require creating new convert ops with cost \p

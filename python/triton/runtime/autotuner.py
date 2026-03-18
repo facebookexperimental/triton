@@ -225,10 +225,30 @@ class Autotuner(KernelInterface):
                 pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
+                    # facebook begin
+                    import importlib
+                    if importlib.util.find_spec("torch.monitor") is not None:
+                        from torch.monitor import _WaitCounter
+                        waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
+                        waitcounter.__enter__()
+
+                    # facebook end
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
                     self.bench_time = bench_end - bench_start
+                    # facebook begin T203283446
+                    if importlib.util.find_spec("torch.monitor") is not None:
+                        waitcounter.__exit__()
+                    if knobs.autotuning.print:
+                        print(
+                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
+                            flush=True)
+                        sorted_configs = builtins.sorted(timings, key=timings.get)
+                        for config in sorted_configs:
+                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
+                                  flush=True)
+                    # facebook end T203283446
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                     self.pre_hook(full_nargs, reset_only=True)

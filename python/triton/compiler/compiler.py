@@ -223,6 +223,16 @@ class CompileTimer:
         )
 
 
+# Facebook begin T207797237
+def _sanitize_extern_libs(options):
+    options = dict(options)
+    options["extern_libs"] = [name for name, path in options.get("extern_libs", [])]
+    return options
+
+
+# Facebook end T207797237
+
+
 def compile(src, target=None, options=None, _env_vars=None):
     compilation_listener = knobs.compilation.listener
     if compilation_listener:
@@ -330,6 +340,7 @@ def compile(src, target=None, options=None, _env_vars=None):
             # Users can override kernels at scale by setting `ir_override` in autotune config
             # without TRITON_KERNEL_OVERRIDE
             if (ir_override := metadata.get("ir_override", None)) and ir_override.endswith(f".{ext}"):
+                print(f"\nOverriding IR with filename set in triton config {src.constants}: {ir_override}")
                 next_module = parse(ir_override, ext, context)
         elif full_name := fn_override_manager.get_file(ir_filename):
             print(f"\nOverriding kernel with file {full_name}")
@@ -351,6 +362,11 @@ def compile(src, target=None, options=None, _env_vars=None):
         if compilation_listener:
             timer.stage_finished(ext)
     # write-back metadata
+    # facebook begin T207797237
+    # Sanitize the metadata; extern_libs comes in (name, path) pairs, but the path is
+    # some semi-random temporary location that we do not want to write to cache.
+    metadata = _sanitize_extern_libs(metadata)
+    # facebook end T207797237
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
     fn_cache_manager.put_group(metadata_filename, metadata_group)

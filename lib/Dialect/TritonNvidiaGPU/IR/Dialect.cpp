@@ -577,6 +577,7 @@ void TritonNvidiaGPUDialect::initialize() {
 #include "triton/Dialect/TritonNvidiaGPU/IR/Types.cpp.inc"
       >();
   addInterfaces<TritonNvidiaGPUVerifyTensorLayoutInterface>();
+  addInterfaces<TritonInlinerInterface>();
   addInterfaces<TritonGPUOpAsmInterface>();
   addInterfaces<TritonInlinerInterface>();
 }

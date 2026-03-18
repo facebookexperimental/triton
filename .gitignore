@@ -90,6 +90,9 @@ docs/sg_execution_times.rst
 .vs
 .cursor
 
+# Symlink after pip install
+python/triton/tlx
+
 # Vim
 *.swp
 

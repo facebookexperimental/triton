@@ -39,6 +39,7 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace tt = mlir::triton;
+namespace ttg = mlir::triton::gpu;
 
 namespace mlir {
 
@@ -1240,6 +1241,49 @@ static void convertSimpleBlockSignature(Block *oldBlock,
   }
 }
 
+/// Rewrite warp parition args.
+class ConvertWarpSpecializeOp
+    : public PointerCanonicalizationPattern<ttg::WarpSpecializeOp> {
+  using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite_(ttg::WarpSpecializeOp wsOp, OneToNOpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+    ArrayRef<ValueRange> remappedOperands = adaptor.getOperands();
+
+    // TODO: handle the case where the result type is a pointer
+#ifndef NDEBUG
+    // Check that the result types do not contain pointers
+    for (auto resultType : wsOp.getResultTypes()) {
+      assert(!isa<triton::PointerType>(resultType) &&
+             "expected WarpSpecializeOp result type to not be a pointer");
+    }
+#endif
+
+    auto newWsOp = rewriter.create<ttg::WarpSpecializeOp>(
+        wsOp.getLoc(), wsOp.getResultTypes(), wsOp.getPartitionNumWarps(),
+        wsOp.getPartitionRegions().size());
+    newWsOp->setAttrs(wsOp->getAttrs());
+    newWsOp->setOperands(flattenValues(remappedOperands));
+
+    // The default region doesn't capture anything, so no need to rewrite it.
+    rewriter.inlineRegionBefore(wsOp.getDefaultRegion(),
+                                newWsOp.getDefaultRegion(),
+                                newWsOp.getDefaultRegion().end());
+
+    for (auto [oldRegion, newRegion] : llvm::zip_equal(
+             wsOp.getPartitionRegions(), newWsOp.getPartitionRegions())) {
+      convertSimpleBlockSignature(&oldRegion->front(), remappedOperands,
+                                  rewriter, fatPtrs);
+      rewriter.inlineRegionBefore(*oldRegion, *newRegion, newRegion->end());
+    }
+
+    rewriter.replaceOp(wsOp, newWsOp.getResults());
+    return success();
+  }
+};
+
 /// Rewrite init_args, result type, before region bb args, after region bb args.
 class ConvertSCFWhileOp : public PointerCanonicalizationPattern<scf::WhileOp> {
 public:
@@ -1902,6 +1946,11 @@ static void getForwardSliceImpl(OpOperand *use, Operation *op,
     forwardSlice->insert(yield);
     if (auto ifOp = llvm::dyn_cast<scf::IfOp>(yield->getParentOp()))
       op = ifOp;
+  } else if (auto wsOp = llvm::dyn_cast<ttg::WarpSpecializeOp>(op)) {
+    // track ws partition region args
+    for (auto region : wsOp.getPartitionRegions()) {
+      addBlockArgUses(region->getArguments());
+    }
   }
 
   for (auto result : op->getResults())
@@ -2009,8 +2058,8 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       MaterializeFatPointerVariadic<tt::PrintOp>, ConvertSCFForOp,
       ConvertExpandDims, ConvertSCFYieldOp, ConvertSCFIfOp,
       ConvertSCFConditionOp, ConvertSCFWhileOp, ConvertCFCondBranch,
-      ConvertCFBranch, ConvertArithSelectOp, ConvertReturnOp>(
-      patterns.getContext(), opsToRewrite, fatPrs);
+      ConvertCFBranch, ConvertArithSelectOp, ConvertReturnOp,
+      ConvertWarpSpecializeOp>(patterns.getContext(), opsToRewrite, fatPrs);
   if (failed(applyPartialConversion(func, target, std::move(patterns), config)))
     return signalPassFailure();
 

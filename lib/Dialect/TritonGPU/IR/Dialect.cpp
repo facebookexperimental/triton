@@ -4149,6 +4149,15 @@ int TritonGPUDialect::getThreadsPerWarp(ModuleOp module) {
   return 32;
 }
 
+std::optional<int> triton::gpu::maybeLookupNumWarps(Block *block) {
+  if (auto partitions =
+          dyn_cast<WarpSpecializePartitionsOp>(block->getParentOp())) {
+    unsigned idx = block->getParent()->getRegionNumber();
+    return partitions.getParentOp().getPartitionNumWarps()[idx];
+  }
+  return maybeLookupNumWarps(block->getParentOp());
+}
+
 std::optional<int> triton::gpu::maybeLookupNumWarps(Operation *op) {
   if (isa<ModuleOp, FuncOp>(op)) {
     if (auto attr = op->getAttrOfType<IntegerAttr>(AttrNumWarpsName))

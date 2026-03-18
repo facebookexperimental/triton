@@ -37,6 +37,12 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit);
 
+void populateBarrierOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                     const TargetInfo &targetInfo,
+                                     RewritePatternSet &patterns,
+                                     ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                     PatternBenefit benefit);
+
 void populateSPMDOpToLLVMPattern(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,
                                  PatternBenefit benefit);

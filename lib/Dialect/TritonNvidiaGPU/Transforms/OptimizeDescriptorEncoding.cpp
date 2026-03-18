@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 namespace ttg = mlir::triton::gpu;
+namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace {
 
@@ -92,6 +93,26 @@ std::optional<UseInfo> getUseInfo(Operation *op) {
     info.shape = expandToRank(shape, rank);
     return info;
   }
+  if (auto load = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+    info.descriptor = load.getDesc();
+    info.desiredSharedEncoding = load.getResult().getType().getEncoding();
+    assert(isTMACompatibleEncoding(info.desiredSharedEncoding) &&
+           "expecting TMA compatible encoding");
+    info.ctaLayout = ttg::getCTALayout(info.desiredSharedEncoding);
+    auto shape = load.getResult().getType().getShape();
+    auto rank = load.getDesc().getType().getBlockType().getRank();
+    info.shape = expandToRank(shape, rank);
+    return info;
+  }
+  if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+    info.descriptor = store.getDesc();
+    auto encoding = store.getSrc().getType().getEncoding();
+    info.ctaLayout = ttg::getCTALayout(encoding);
+    auto shape = store.getSrc().getType().getShape();
+    auto rank = store.getDesc().getType().getBlockType().getRank();
+    info.shape = expandToRank(shape, rank);
+    return info;
+  }
   return std::nullopt;
 }
 
@@ -128,6 +149,53 @@ namespace nvidia_gpu {
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace {
+
+SmallVector<Value> getTiedArgs(Operation *op, int resultIdx) {
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    auto iterArg = forOp.getRegionIterArg(resultIdx);
+    auto result = forOp.getResult(resultIdx);
+    auto yieldVal = forOp.getBody()->getTerminator()->getOperand(resultIdx);
+    auto initVal = forOp.getInitArgs()[resultIdx];
+    return {iterArg, result, yieldVal, initVal};
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    auto iterArg = whileOp.getBeforeArguments()[resultIdx];
+    auto result = whileOp.getResults()[resultIdx];
+    auto yieldVal =
+        whileOp.getBeforeBody()->getTerminator()->getOperand(resultIdx);
+    auto initVal = whileOp.getOperands()[resultIdx];
+    return {iterArg, result, iterArg, initVal};
+  } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    SmallVector<Value> values;
+    for (auto &block : ifOp.getThenRegion().getBlocks()) {
+      auto terminator = block.getTerminator();
+      if (isa<scf::YieldOp>(terminator))
+        values.push_back(terminator->getOperands()[resultIdx]);
+    }
+    for (auto &block : ifOp.getElseRegion().getBlocks()) {
+      auto terminator = block.getTerminator();
+      if (isa<scf::YieldOp>(terminator))
+        values.push_back(terminator->getOperands()[resultIdx]);
+    }
+    values.push_back(ifOp->getResults()[resultIdx]);
+    return values;
+  } else if (auto warpSpecializeOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
+    // add arg for every partition including default partition
+    SmallVector<Value> values = {warpSpecializeOp.getOperands()[resultIdx]};
+    for (auto region : warpSpecializeOp.getPartitionRegions()) {
+      auto &firstBlock = region->getBlocks().front();
+      values.push_back(firstBlock.getArguments()[resultIdx]);
+    }
+    return values;
+  } else if (auto warpSpecializePartitionsOp =
+                 dyn_cast<ttg::WarpSpecializePartitionsOp>(op)) {
+    auto warpSpecializeOp = dyn_cast<ttg::WarpSpecializeOp>(
+        warpSpecializePartitionsOp->getParentOp());
+    assert(warpSpecializeOp && "expected WarpSpecializeOp");
+    // delegate to parent op
+    return getTiedArgs(warpSpecializeOp, resultIdx);
+  }
+  return {};
+}
 
 const EncodingInfo *internEncoding(std::unordered_set<EncodingInfo> &encodings,
                                    EncodingInfo info) {
@@ -319,6 +387,9 @@ void assignMemoryLayouts(FuncOp &func) {
       } else if (isa<scf::YieldOp>(op)) {
         auto vals = getTiedArgs(op->getParentOp(), use.getOperandNumber());
         updateEncoding(vals, EncodingInfo{});
+      } else if (isa<ttg::WarpSpecializeOp>(op)) {
+        auto vals = getTiedArgs(op, use.getOperandNumber());
+        updateEncoding(vals, EncodingInfo{});
       }
     }
 
@@ -331,7 +402,8 @@ void assignMemoryLayouts(FuncOp &func) {
       }
     } else if (auto blockArg = dyn_cast<BlockArgument>(desc)) {
       auto parentOp = blockArg.getOwner()->getParentOp();
-      if (isa<scf::ForOp, scf::WhileOp>(parentOp)) {
+      if (isa<scf::ForOp, scf::WhileOp, ttg::WarpSpecializePartitionsOp>(
+              parentOp)) {
         auto offset = isa<scf::ForOp>(parentOp);
         auto vals = getTiedArgs(parentOp, blockArg.getArgNumber() - offset);
         updateEncoding(vals, EncodingInfo{});

@@ -6,9 +6,11 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
@@ -88,6 +90,45 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       return true;
     return false;
   });
+
+  addDynamicallyLegalOp<WarpSpecializeOp>([&](WarpSpecializeOp wsOp) -> bool {
+    bool hasLegalRegions = true;
+    hasLegalRegions =
+        hasLegalRegions && typeConverter.isLegal(&wsOp.getDefaultRegion());
+    for (auto *region : wsOp.getPartitionRegions()) {
+      hasLegalRegions = hasLegalRegions && typeConverter.isLegal(region);
+    }
+    if (hasLegalRegions && typeConverter.isLegal(wsOp)) {
+      return true;
+    }
+    return false;
+  });
+
+  addDynamicallyLegalOp<
+      triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
+      triton::gpu::LocalStoreOp, triton::nvidia_gpu::WarpGroupDotWaitOp,
+      triton::tlx::RequireLayoutOp, triton::tlx::ReleaseLayoutOp,
+      triton::tlx::LocalAliasOp>([&](Operation *op) -> bool {
+    // make sure every RankedTensorType operand has encoding
+    for (auto operandType : op->getOperandTypes()) {
+      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+        if (rankedTensorType.getEncoding() == nullptr) {
+          return false;
+        }
+      }
+    }
+
+    // make sure result type has encoding if it is RankedTensorType
+    for (auto resultType : op->getResultTypes()) {
+      if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+        if (rankedTensorType.getEncoding() == nullptr) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     for (auto arg : funcOp.getArguments()) {
       if (auto tensor = dyn_cast<RankedTensorType>(arg.getType())) {

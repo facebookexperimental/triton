@@ -70,6 +70,7 @@ def TT_AtomicRMWAttr : I32EnumAttr<
 def TT_DescriptorReduceKindAttr : I32EnumAttr<
     "DescriptorReduceKind", "",
     [
+        I32EnumAttrCase<"NONE", 0, "">,
         I32EnumAttrCase<"ADD", 1, "add">,
         I32EnumAttrCase<"MIN", 2, "min">,
         I32EnumAttrCase<"MAX", 3, "max">,

@@ -14,12 +14,18 @@ from typing import Any, Callable, Dict, Optional, Tuple, Type, Union, Iterable, 
 from .. import knobs, language
 from .._C.libtriton import ir, gluon_ir
 from ..language import constexpr, str_to_ty, tensor, tuple as tl_tuple
-from ..language.core import _unwrap_if_constexpr, base_value, base_type
+from ..language.core import _unwrap_if_constexpr, base_value, base_type, nv_tma_desc_type
 # ideally we wouldn't need any runtime component
 from ..runtime.jit import get_full_name, JITCallable, BoundConstexprFunction, ConstexprFunction, JITFunction
 from .._utils import apply_with_path, set_iterable_path, is_namedtuple
 
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
+
+from triton.language.extra.tlx.compiler.dispatch import TLX_WITH_DISPATCH
+
+WITH_DISPATCH = {}  # central registry for all 'with' handlers
+
+WITH_DISPATCH.update(TLX_WITH_DISPATCH)
 
 
 def check_identifier_legality(name, type):
@@ -115,9 +121,12 @@ class enter_sub_region:
 
     def __enter__(self):
         # record lscope & local_defs in the parent scope
-        self.liveins = dict(self.generator.lscope)
-        self.prev_defs = dict(self.generator.local_defs)
+        # TODO. TLX. mbarrier doesn't define `_unflatten_ir`
+        self.liveins = self.generator.lscope.copy()
+        self.prev_defs = self.generator.local_defs.copy()
         self.generator.local_defs = {}
+        self.used_vars = self.generator.used_vars.copy()
+        self.generator.used_vars = set()
         self.insert_block = self.generator.builder.get_insertion_block()
         self.insert_point = self.generator.builder.get_insertion_point()
         return self.liveins, self.insert_block
@@ -126,6 +135,7 @@ class enter_sub_region:
         self.generator.builder.restore_insertion_point(self.insert_point)
         self.generator.lscope = self.liveins
         self.generator.local_defs = self.prev_defs
+        self.generator.used_vars |= self.used_vars
 
 
 # Check if the given syntax node has an "early" return
@@ -248,6 +258,13 @@ class ASTFunction:
             return language.constexpr(None)
 
         vals = make_template(self.arg_types)
+        is_val = lambda path, _: path not in self.constants and _ is not None
+        val_paths = list(find_paths_if(self.arg_types, is_val))
+        for i, path in enumerate(val_paths):
+            ty = get_iterable_path(self.arg_types, path)
+            if isinstance(ty, nv_tma_desc_type):
+                fn.set_arg_attr(i, "tt.nv_tma_desc", 1)
+        # > add IR values to the template
         handles = [fn.args(i) for i in range(fn.get_num_args())]
         cursor = 0
 
@@ -334,6 +351,7 @@ class CodeGenerator(ast.NodeVisitor):
         # SSA-construction
         # name => language.tensor
         self.local_defs: Dict[str, tensor] = {}
+        self.used_vars = set()
         self.dereference_name: Callable[[str], Any] = self._define_name_lookup()
         self.fn = None
         # Are we currently visiting an ast.arg's default value?  These have some
@@ -741,6 +759,8 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_Name(self, node):
         if type(node.ctx) is ast.Store:
             return node.id
+        if isinstance(node.ctx, (ast.Load, ast.Store)):
+            self.used_vars.add(node.id)
         return self.dereference_name(node.id)
 
     def visit_Store(self, node):
@@ -1007,28 +1027,6 @@ class CodeGenerator(ast.NodeVisitor):
             else:
                 return self.visit(node.orelse)
 
-    def visit_With(self, node):
-        # Lower `with` statements by constructing context managers and calling their enter/exit hooks
-        # Instantiate each context manager with builder injection
-        cm_list = []
-        for item in node.items:
-            call = item.context_expr
-            fn = self.visit(call.func)
-            args = [self.visit(arg) for arg in call.args]
-            kws = dict(self.visit(kw) for kw in call.keywords)
-            cm = fn(*args, _semantic=self.semantic, **kws)
-            cm_list.append(cm)
-        for cm, item in zip(cm_list, node.items):
-            res = cm.__enter__()
-            if item.optional_vars is not None:
-                var_name = self.visit(item.optional_vars)
-                self.set_value(var_name, res)
-        if ContainsReturnChecker(self.gscope).visit(node):
-            raise self._unsupported(node, "Cannot have `return` statements inside `with` statements in triton ")
-        self.visit_compound_statement(node.body)
-        for cm in reversed(cm_list):
-            cm.__exit__(None, None, None)
-
     def visit_Pass(self, node):
         pass
 
@@ -1075,12 +1073,35 @@ class CodeGenerator(ast.NodeVisitor):
     def _verify_loop_carried_variable(self, name, loop_val, live_val):
         assert _is_triton_value(loop_val), f'cannot reassign constexpr {name} in the loop'
         assert _is_triton_value(live_val), f'cannot reassign constexpr {name} in the loop'
-        assert type(loop_val) is type(live_val), (
-            f'Loop carried variable {name} changed type, was {type(loop_val)} but is now {type(live_val)}')
-        assert not _is_triton_tensor(loop_val) or loop_val.type == live_val.type, \
+        assert type(loop_val) is type(live_val), f'Loop carried variable {name} changed type'
+        # Facebook begin:
+        # if tl.constexpr: skip to avoid false alarm such as \
+        # Loop-carried variable "i" has initial type constexpr_type[0] but is re-assigned to constexpr_type[1] in loop
+        # if tl.tensor or buffered_tensor(tl.base_value): assert type persists
+        if not _is_constexpr(loop_val) and hasattr(loop_val, 'type'):
+            assert loop_val.type == live_val.type, \
             f'Loop-carried variable {name} has initial type {live_val.type} '\
             f'but is re-assigned to {loop_val.type} in loop! '\
             f'Please make sure that the type stays consistent.'
+        # Facebook end:
+
+    def visit_withitem(self, node):
+        return self.visit(node.context_expr)
+
+    def visit_With(self, node):
+        assert len(node.items) == 1
+        context = node.items[0].context_expr
+        # Facebook begins
+        # In upstream repo, `with` statements are lowered by constructing context managers
+        # and it will require non-trivial changes in TLX dispatcher for async_task
+        # which will be done later
+        if isinstance(context, ast.Call):
+            withitemClass = self.visit(context.func)
+            handler = WITH_DISPATCH.get(withitemClass)
+            if handler:
+                return handler(self, node)
+        return self.visit_compound_statement(node.body)
+        # Facebook ends
 
     def visit_While(self, node):
         with enter_sub_region(self) as sr:

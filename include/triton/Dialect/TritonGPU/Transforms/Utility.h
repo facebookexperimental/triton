@@ -100,6 +100,8 @@ public:
   std::string dump(triton::FuncOp func) const;
   void dumpToFile(triton::FuncOp func, const std::string &filename) const;
 
+  virtual ~GraphDumper() = default; // Facebook
+
 protected:
   std::string getShapeStr(const Type &type) const;
 
