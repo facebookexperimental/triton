@@ -4109,8 +4109,8 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
 
     CTA 1 is held with a busy-wait before its last clc_consumer call,
     ensuring CTA 0 finishes first. Without the predicated barrier_arrive skip,
-    CTA 0 would arrive at bar_empty with tile_id == -1, potentially corrupting
-    the mbarrier state while CTA 1 is still active.
+    CTA 1 would arrive at CTA 0's bar with tile_id == -1, when CTA 0 already exits,
+    and thus cause errors.
     """
     CLUSTER_SIZE = 2
 
@@ -4120,7 +4120,6 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
         y_ptr,
         z_ptr,
         n_elements,
-        iteration_count_ptr,
         BLOCK_SIZE: tl.constexpr,
         CLUSTER_SIZE: tl.constexpr,
     ):
@@ -4131,12 +4130,11 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
         clc_phase_consumer = 0
         clc_context = tlx.clc_create_context(CLUSTER_SIZE)
 
-        iteration = 0
-
         while tile_id != -1:
             tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=True)
             clc_phase_producer ^= 1
 
+            # just do some regular processing
             block_start = tile_id * BLOCK_SIZE
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
             mask = offsets < n_elements
@@ -4145,8 +4143,6 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
             y = tl.load(y_ptr + offsets, mask=mask)
             output = x + y
             tl.store(z_ptr + offsets, output, mask=mask)
-
-            iteration += 1
 
             # On the last real iteration, hold CTA 1 before it calls clc_consumer.
             # This ensures CTA 0 finishes and exits first, exercising the
@@ -4159,22 +4155,16 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
             tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
             clc_phase_consumer ^= 1
 
-        # Record how many iterations each CTA ran (for debugging)
-        tl.atomic_add(iteration_count_ptr + cta_rank, iteration)
-
     torch.manual_seed(0)
     BLOCK_SIZE = 1024
-    # 4 tiles total = 2 try_cancel rounds for a 2-CTA cluster
-    size = BLOCK_SIZE * CLUSTER_SIZE * 2
-    x = torch.ones(size, device=device)
-    y = torch.ones(size, device=device)
+    # just launch 1 cluster, grid size is 2
+    n_elements = BLOCK_SIZE * CLUSTER_SIZE
+    x = torch.ones(n_elements, device=device)
+    y = torch.ones(n_elements, device=device)
     output = torch.zeros_like(x)
     ref_out = x + y
-    iteration_counts = torch.zeros(CLUSTER_SIZE, dtype=torch.int32, device=device)
 
-    n_elements = output.numel()
     num_tiles = triton.cdiv(n_elements, BLOCK_SIZE)
-    num_tiles = (num_tiles + CLUSTER_SIZE - 1) // CLUSTER_SIZE * CLUSTER_SIZE
     grid = (num_tiles, )
 
     mul2_clc_delayed[grid](
@@ -4182,10 +4172,8 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
         y,
         output,
         n_elements,
-        iteration_counts,
         BLOCK_SIZE=BLOCK_SIZE,
         CLUSTER_SIZE=CLUSTER_SIZE,
-        launch_cluster=True,
         ctas_per_cga=(CLUSTER_SIZE, 1, 1),
     )
 
