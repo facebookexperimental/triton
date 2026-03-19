@@ -676,6 +676,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
                                                  False) or knobs.runtime.sanitize_overflow or kwargs["debug"]
+        kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
 
         # parse options
         device = driver.active.get_current_device()
