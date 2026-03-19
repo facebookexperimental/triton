@@ -283,7 +283,7 @@ def _process_tile_producer_inner(
         offs_k = k * BLOCK_SIZE_K
 
         # Load A always. Be only loads for the first iteration.
-        tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
+        tlx.barrier_wait(A_smem_empty_bars[buf], phase ^ 1)
         offs_am = pid_m * BLOCK_SIZE_M
         # We persist over B, so we only load in the first iteration.
         A_SIZE: tl.constexpr = dsize * BLOCK_SIZE_M * BLOCK_SIZE_K
@@ -316,7 +316,6 @@ TORCH_DTYPE_TO_TRITON = {
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=["M", "N", "K"],
-    post_hook=reduce_post_hook,
 )
 @triton.jit
 def matmul_kernel_tma_ws_blackwell(
@@ -570,12 +569,6 @@ def matmul(a, b):
     Args:
         a: Input matrix A of shape (M, K)
         b: Input matrix B of shape (K, N)
-        config: Optional dict with kernel config. If None and use_heuristic=True,
-                uses shape-dependent heuristic selection. If heuristic fails,
-                falls back to full autotuning.
-        use_heuristic: When config is None, try heuristic config selection first.
-                      Default True for faster kernel launch.
-
     Returns:
         Output matrix C of shape (M, N)
     """
@@ -595,14 +588,10 @@ def matmul(a, b):
 
     NUM_SMS = _get_num_sms()
 
-    def grid(META) -> tuple[Unknown]:
-        NUM_CTAS = META["NUM_CTAS"]
+    def grid(META):
         num_pid_m = triton.cdiv(M, META["BLOCK_SIZE_M"])
         num_pid_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
-        # Pad num_pid_m to multiple of NUM_CTAS so CTA clusters tile evenly along M.
-        num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
-        mn_tiles = num_pid_m * num_pid_n
-        total_tiles = mn_tiles * META["SPLIT_K"]
+        total_tiles = num_pid_m * num_pid_n
         return (min(NUM_SMS, total_tiles), )
 
     matmul_kernel_tma_ws_blackwell[grid](
@@ -614,5 +603,4 @@ def matmul(a, b):
         K,
         NUM_SMS=NUM_SMS,
     )
-    # post_hook handles reduction for split-K > 1
     return c
