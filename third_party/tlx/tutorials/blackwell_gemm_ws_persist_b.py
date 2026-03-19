@@ -31,6 +31,7 @@ def get_cuda_autotune_config():
                 "NUM_SMEM_BUFFERS": s,
                 "NUM_TMEM_BUFFERS": t,
                 "EPILOGUE_SUBTILE": subtile,
+                "NUM_EPILOGUE_SMEM_BUFFERS": esb,
                 "USE_WARP_BARRIER": uwb,
             },
             num_warps=4,
@@ -41,9 +42,10 @@ def get_cuda_autotune_config():
         for BN in [64, 128, 256]
         for BK in [64, 128]
         for g in [1, 4, 8]
-        for s in [2, 3, 4, 5, 6, 7]
+        for s in [3, 4, 5, 6, 7, 8]
         for t in [1, 2, 3, 4]
         for subtile in [1, 2, 4, 8]
+        for esb in [1, 2, 3, 4]
         for uwb in [False, True]
     ]
 
@@ -102,6 +104,8 @@ def _process_tile_epilogue_inner(
     tmem_empty_bars,
     cur_tmem_buf,
     tmem_read_phase,
+    smem_epilogue_cnt,
+    TOTAL_SMEM_SLICES: tl.constexpr,
 ):
     """Process epilogue for a single tile."""
     offs_bn = pid_n * BLOCK_SIZE_N
@@ -122,8 +126,9 @@ def _process_tile_epilogue_inner(
         result = tlx.local_load(acc_tmem_subslice)
         tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
         c = result.to(tlx.dtype_of(c_desc))
-        c_smem = c_smem_buffers[slice_id % 2]
-        tlx.async_descriptor_store_wait(1)
+        # TODO: Can peel the first few iterations to omit.
+        c_smem = c_smem_buffers[smem_epilogue_cnt % TOTAL_SMEM_SLICES]
+        tlx.async_descriptor_store_wait(TOTAL_SMEM_SLICES - 1)
         tlx.local_store(c_smem, c)
         tlx.fence_async_shared()
         tlx.async_descriptor_store(
@@ -132,9 +137,9 @@ def _process_tile_epilogue_inner(
             [offs_am, offs_bn + slice_id * slice_size],
             eviction_policy="evict_first",
         )
+        smem_epilogue_cnt += 1
 
-    # Wait for all TMA stores to complete
-    tlx.async_descriptor_store_wait(0)
+    return smem_epilogue_cnt
 
 
 @triton.jit
@@ -278,6 +283,7 @@ def matmul_kernel_tma_ws_blackwell(
     NUM_SMEM_BUFFERS: tl.constexpr,
     NUM_TMEM_BUFFERS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr,
     NEXT_POW2_K: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
     NUM_SMS: tl.constexpr = 1,
@@ -302,13 +308,13 @@ def matmul_kernel_tma_ws_blackwell(
         tlx.storage_kind.tmem,
     )
 
-    # Allocate SMEM buffers for epilogue TMA store (at least 2 for multi-buffering)
-    NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = 2
+    # Allocate SMEM buffers for epilogue TMA store
     slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    TOTAL_SMEM_SLICES: tl.constexpr = NUM_EPILOGUE_SMEM_BUFFERS * EPILOGUE_SUBTILE
     c_smem_buffers = tlx.local_alloc(
         (BLOCK_SIZE_M, slice_size),
         tlx.dtype_of(c_desc),
-        NUM_EPILOGUE_SMEM_BUFFERS,
+        TOTAL_SMEM_SLICES,
     )
 
     # allocate barriers - each subtile needs its own barriers
@@ -330,13 +336,14 @@ def matmul_kernel_tma_ws_blackwell(
                                                                           BLOCK_SIZE_K)
 
             tmem_accum_cnt = 0
+            smem_epilogue_cnt = 0
             pid_n = start_pid // num_pid_m
             pid_m = start_pid % num_pid_m
 
             while pid_m < num_pid_m:
                 swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
                 cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                _process_tile_epilogue_inner(
+                smem_epilogue_cnt = _process_tile_epilogue_inner(
                     pid_m=swizzled_pid_m,
                     pid_n=pid_n,
                     BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -349,9 +356,14 @@ def matmul_kernel_tma_ws_blackwell(
                     tmem_empty_bars=tmem_empty_bars,
                     cur_tmem_buf=cur_tmem_buf,
                     tmem_read_phase=tmem_read_phase,
+                    smem_epilogue_cnt=smem_epilogue_cnt,
+                    TOTAL_SMEM_SLICES=TOTAL_SMEM_SLICES,
                 )
                 tmem_accum_cnt += 1
                 pid_m += NUM_SMS
+
+            # Wait for the final TMA store.
+            tlx.async_descriptor_store_wait(0)
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             start_pid, num_pid_m, num_pid_n, k_tiles = _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N,
