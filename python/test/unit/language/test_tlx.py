@@ -4115,7 +4115,7 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
     CLUSTER_SIZE = 2
 
     @triton.jit
-    def mul2_clc_delayed(
+    def clc_delayed(
         x_ptr,
         y_ptr,
         z_ptr,
@@ -4144,13 +4144,21 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
             output = x + y
             tl.store(z_ptr + offsets, output, mask=mask)
 
-            # On the last real iteration, hold CTA 1 before it calls clc_consumer.
+            # Hold CTA 1 before it calls clc_consumer.
             # This ensures CTA 0 finishes and exits first, exercising the
             # predicated barrier_arrive skip (tile_id == -1 should NOT arrive).
             if cta_rank == 1:
-                start = tlx.clock64()
-                while tlx.clock64() - start < 10000000:
-                    pass
+                # sleep 500ms
+                for i in range(500):
+                    # nanosleep instruction can sleep max 1ms: https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-nanosleep
+                    tl.inline_asm_elementwise(
+                        "nanosleep.u32 1000000;  mov.u32 $0, 0;",
+                        "=r",
+                        [],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
 
             tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
             clc_phase_consumer ^= 1
@@ -4167,7 +4175,7 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
     num_tiles = triton.cdiv(n_elements, BLOCK_SIZE)
     grid = (num_tiles, )
 
-    mul2_clc_delayed[grid](
+    clc_delayed[grid](
         x,
         y,
         output,
