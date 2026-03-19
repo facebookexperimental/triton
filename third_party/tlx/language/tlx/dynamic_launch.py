@@ -175,6 +175,8 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
     pred_has_tile_handle = _semantic.builder.create_icmpSGE(stolen_tile_id.handle, zero)
     pred_has_tile = tl.tensor(pred_has_tile_handle, tl.int1)
     if multi_ctas:
+        # Arrive at CTA 0's bar_empty via remote_cta_rank=0
+        # (barrier_arrive handles remote_view internally)
         barrier_arrive(bar_empty, tl.constexpr(1), 0, pred=pred_has_tile, _semantic=_semantic)
     else:
         barrier_arrive(bar_empty, pred=pred_has_tile, _semantic=_semantic)

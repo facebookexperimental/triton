@@ -164,7 +164,7 @@ def barrier_arrive(
     pred_handle = pred.handle if pred is not None else None
 
     if is_warp_bar:
-        _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value)
+        _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
     else:
         _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
 
