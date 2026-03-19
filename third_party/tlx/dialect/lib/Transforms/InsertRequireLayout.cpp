@@ -19,10 +19,8 @@ namespace ttg = ::mlir::triton::gpu;
 namespace tlx = ::mlir::triton::tlx;
 
 namespace mlir {
-namespace amdpipeliner {
 std::optional<ttg::SwizzledSharedEncodingAttr>
 getSharedEncIfAllUsersAreDotEnc(Value loadedValue);
-}
 
 namespace triton {
 namespace tlx {
@@ -53,7 +51,7 @@ LogicalResult insertRequireLayout(ModuleOp m) {
           localLoadOp.dump();
         });
         // Get the shared encoding for this local load op based on the dot op
-        auto encoding = mlir::amdpipeliner::getSharedEncIfAllUsersAreDotEnc(
+        auto encoding = mlir::getSharedEncIfAllUsersAreDotEnc(
                             localLoadOp->getResult(0))
                             .value_or(nullptr);
         if (encoding) {

@@ -11,6 +11,7 @@ add_triton_library(TritonAMDGPUTransforms
   ReorderInstructions.cpp
   Pipeline.cpp
   ScheduleLoops.cpp
+  LowerLoops.cpp
   MfmaGroup.cpp
   WmmaGroup.cpp
   InThreadTranspose.cpp
