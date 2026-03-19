@@ -655,7 +655,10 @@ def _attn_bwd_dkdv_inner(
     qT = tl.trans(q)
     offs_m = curr_m + tl.arange(0, BLOCK_M1)
     m = tl.load(M + offs_m)
-    qkT = tl.dot(k, qT)
+    if RESCHED:
+        qkT = tl.dot(k, qT, attrs={"stage": "0", "cluster": "0"})
+    else:
+        qkT = tl.dot(k, qT)
     pT = tl.math.exp2(qkT - m[None, :])
     if MASK:
         mask = offs_m[None, :] >= offs_n[:, None]
@@ -664,9 +667,9 @@ def _attn_bwd_dkdv_inner(
     ppT = pT
     ppT = ppT.to(dtype)
     if RESCHED:
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        dpT = tl.dot(v, tl.trans(do), attrs={"stage": "0", "cluster": "2"}).to(tl.float32)
         Di = tl.load(D + offs_m)
-        dv += tl.dot(ppT, do)
+        dv += tl.dot(ppT, do, attrs={"stage": "0", "cluster": "2"})
     else:
         dv += tl.dot(ppT, do)
         Di = tl.load(D + offs_m)
@@ -674,8 +677,8 @@ def _attn_bwd_dkdv_inner(
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
     if RESCHED:
-        dq = tl.dot(tl.trans(dsT), k)
-        dk += tl.dot(dsT, tl.trans(qT))
+        dq = tl.dot(tl.trans(dsT), k, attrs={"stage": "1", "cluster": "1"})
+        dk += tl.dot(dsT, tl.trans(qT), attrs={"stage": "1", "cluster": "1"})
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
@@ -728,7 +731,7 @@ def _attn_bwd_dkdv(
     step_m = BLOCK_M1
     if warp_specialize:
         for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2,
-                                smem_alloc_algo=1, smem_budget=200000, split_mma=True):
+                                smem_alloc_algo=1, smem_budget=200000, split_mma=False):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -1064,7 +1067,7 @@ def _attn_bwd_persist(
     )
 
     for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1,
-                      smem_budget=200000, split_mma=True):
+                      smem_budget=200000, split_mma=False):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(

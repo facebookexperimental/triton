@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/JSON.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -681,7 +682,78 @@ scheduleKeyOpsUpstream(scf::ForOp forOp,
 // Desired schedule (3 clusters, 2 stages):
 //   cluster 0: qkT at stage 0 (first current MMA with latency)
 //   cluster 1: dQ, dK at stage 1 (deferred MMAs)
-//   cluster 2: dpT, dV at stage 0 (remaining current MMAs)
+// Schedule key ops based on user-provided tt.autows annotations on MMA ops.
+// The tt.autows attribute is a JSON string like {"stage": "0", "cluster": "2"}
+// that specifies the desired stage and cluster for each MMA.
+// Returns an empty schedule if no MMA has tt.autows annotations.
+CoarseSchedule
+scheduleKeyOpsAnnotation(scf::ForOp forOp,
+                         const DenseMap<Operation *, int> &opLatency,
+                         int defaultNumStages) {
+  // Collect all latency ops and MMA ops with annotations.
+  SmallVector<Operation *> latOps;
+  SmallVector<std::tuple<ttng::MMAv5OpInterface, int, int>> annotatedMMAs;
+
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (opLatency.count(&op))
+      latOps.push_back(&op);
+    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
+      if (auto attr = op.getAttrOfType<StringAttr>("tt.autows")) {
+        auto parsed = llvm::json::parse(attr.getValue());
+        if (!parsed) {
+          llvm::consumeError(parsed.takeError());
+          continue;
+        }
+        auto *obj = parsed->getAsObject();
+        if (!obj)
+          continue;
+        auto stageStr = obj->getString("stage");
+        auto clusterStr = obj->getString("cluster");
+        if (!stageStr || !clusterStr)
+          continue;
+        int stage = std::stoi(stageStr->str());
+        int cluster = std::stoi(clusterStr->str());
+        annotatedMMAs.push_back({mmaOp, stage, cluster});
+      }
+    }
+  }
+
+  if (annotatedMMAs.empty())
+    return CoarseSchedule(0);
+
+  // Determine the number of stages and clusters from annotations.
+  int numStages = 0;
+  int numClusters = 0;
+  for (auto &[mma, stage, cluster] : annotatedMMAs) {
+    numStages = std::max(numStages, stage + 1);
+    numClusters = std::max(numClusters, cluster + 1);
+  }
+
+  CoarseSchedule schedule(numStages);
+  SmallVector<CoarseSchedule::Cluster> clusters;
+  for (int i = 0; i < numClusters; ++i)
+    clusters.push_back(schedule.clusters.newAtBack());
+
+  // Assign annotated MMAs to their specified stage/cluster.
+  for (auto &[mma, stage, cluster] : annotatedMMAs) {
+    schedule.insert(mma, stage, clusters[cluster]);
+  }
+
+  // Schedule latency ops (loads, etc.) to stage 0, cluster 0.
+  for (auto *op : latOps) {
+    if (schedule.count(op))
+      continue;
+    schedule.insert(op, 0, clusters[0]);
+  }
+
+  LDBG("scheduleKeyOpsAnnotation: scheduled "
+       << annotatedMMAs.size() << " annotated MMAs with " << numStages
+       << " stages and " << numClusters << " clusters");
+
+  return schedule;
+}
+
+// Schedule key ops using split-MMA heuristics for backward attention.
 //
 // Execution order in steady state:
 //   qkT(iter i) -> dQ(iter i-1) -> dK(iter i-1) -> dpT(iter i) -> dV(iter i)
@@ -822,7 +894,15 @@ scheduleKeyOpsSplitMMA(scf::ForOp forOp,
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency,
                               int defaultNumStages, bool useMetaWS,
-                              bool useSplitMMA) {
+                              bool useSplitMMA, bool useAnnotation) {
+  // Try annotation-based scheduling first (user-provided tt.autows attrs).
+  // This takes priority over all other scheduling strategies.
+  if (useAnnotation) {
+    auto annotatedSchedule =
+        scheduleKeyOpsAnnotation(forOp, opLatency, defaultNumStages);
+    if (!annotatedSchedule.empty())
+      return annotatedSchedule;
+  }
   if (useSplitMMA) {
     return scheduleKeyOpsSplitMMA(forOp, opLatency, defaultNumStages);
   } else if (useMetaWS) {
@@ -837,7 +917,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency,
                                   int defaultNumStages, bool useMetaWS,
-                                  bool useSplitMMA) {
+                                  bool useSplitMMA, bool useAnnotation) {
   if (!isSafeToPipeline(forOp))
     return CoarseSchedule(0);
 
@@ -845,7 +925,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
   // schedule.
   if (hasLatenciesAssigned(forOp, opLatency))
     return scheduleKeyOps(forOp, opLatency, defaultNumStages, useMetaWS,
-                          useSplitMMA);
+                          useSplitMMA, useAnnotation);
 
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
@@ -944,26 +1024,40 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
   // If the loop already has loop.stage assignments (from a prior pass such as
   // partition scheduling), disable split-MMA scheduling so that the existing
   // schedule is deserialized and respected rather than rebuilt from scratch.
-  if (useSplitMMA) {
-    for (auto &op : forOp.getBody()->without_terminator()) {
-      if (op.hasAttr(kLoopStageAttrName)) {
-        useSplitMMA = false;
-        break;
-      }
+  bool stageAssigned = false;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (op.hasAttr(kLoopStageAttrName)) {
+      stageAssigned = true;
+      break;
     }
   }
 
+  // Check if any MMA op has tt.autows annotations.
+  bool hasAnnotations = false;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (isa<ttng::MMAv5OpInterface>(&op) && op.hasAttr("tt.autows")) {
+      hasAnnotations = true;
+      break;
+    }
+  }
+  if (stageAssigned) {
+    useSplitMMA = false;
+    hasAnnotations = false;
+  }
+
   // Based on the latencies, schedule the key ops to the stages.
-  CoarseSchedule schedule = getInitialSchedule(
-      forOp, opLatency, defaultNumStages, useMetaWS, useSplitMMA);
+  CoarseSchedule schedule =
+      getInitialSchedule(forOp, opLatency, defaultNumStages, useMetaWS,
+                         useSplitMMA, hasAnnotations);
   if (schedule.empty())
     return;
 
-  // For split MMA, save the MMA anchor assignments before dependency phases
-  // can modify them.
+  // For split MMA or annotation-based scheduling, save the MMA anchor
+  // assignments before dependency phases can modify them.
+  bool needRestore = useSplitMMA || hasAnnotations;
   SmallVector<std::tuple<Operation *, int, CoarseSchedule::Cluster>>
       savedMMASchedule;
-  if (useSplitMMA) {
+  if (needRestore) {
     for (auto &op : forOp.getBody()->without_terminator()) {
       if (isa<ttng::MMAv5OpInterface>(&op) && schedule.count(&op)) {
         auto [stage, cluster] = schedule[&op];
@@ -999,11 +1093,12 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
     DBGS() << "Final coarse schedule:\n" << forOp << "\n";
   });
 
-  // For split MMA, restore the desired stage assignments. The dependency
-  // phases (especially scheduleRemainingToLastStage) assign all unscheduled
-  // ops to the last stage, but we want ALL non-MMA computation ops at
-  // stage 0. Only the deferred MMAs (dQ, dK) should be at stage 1.
-  if (useSplitMMA) {
+  // For split MMA or annotation-based scheduling, restore the desired stage
+  // assignments. The dependency phases (especially
+  // scheduleRemainingToLastStage) assign all unscheduled ops to the last stage,
+  // but we want ALL non-MMA computation ops at stage 0. Only the deferred MMAs
+  // should be at stage 1.
+  if (needRestore) {
     // First, force all non-MMA ops to stage 0 while preserving their cluster.
     for (auto &op : forOp.getBody()->without_terminator()) {
       if (!isa<ttng::MMAv5OpInterface>(&op) && schedule.count(&op)) {

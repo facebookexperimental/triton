@@ -1730,11 +1730,12 @@ class TritonSemantic(Generic[TensorTy]):
         allow_tf32,
         max_num_imprecise_acc: int,
         out_dtype: tl.dtype,
+        attrs: Optional[dict] = None,
     ) -> tl.tensor:
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
          ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
 
-        return tl.tensor(
+        result = tl.tensor(
             self.builder.create_dot(
                 lhs.handle,
                 rhs.handle,
@@ -1744,6 +1745,12 @@ class TritonSemantic(Generic[TensorTy]):
             ),
             ret_ty,
         )
+        if attrs is not None:
+            import json
+            if not isinstance(attrs, dict):
+                raise TypeError(f"attrs must be a dict, got {type(attrs).__name__}")
+            result.handle.set_attr("tt.autows", self.builder.get_string_attr(json.dumps(attrs)))
+        return result
 
     def _str_to_fp_type(self, float_format: str):
         ty_enum = getattr(ir.ScaleDotElemTypeTY, float_format.upper(), None)
