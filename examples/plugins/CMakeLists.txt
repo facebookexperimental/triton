@@ -17,6 +17,9 @@ set(TritonPluginsTestLib_SOURCES
 # Dialect Plugins
 add_subdirectory(DialectPlugins)
 
+# TLX Plugin (local_alloc custom op)
+add_subdirectory(TLXPlugin)
+
 foreach( plugin ${TRITON_PLUGIN_PASSES} )
     add_library(${plugin} SHARED ${${plugin}_SOURCES})
     add_dependencies(${plugin}
