@@ -270,8 +270,7 @@ struct ArriveBarrierOpConversion
         ptxAsm << "@$0 ";
       }
       ptxAsm << "mbarrier.arrive.shared::"
-             << (isRemoteBarrier ? "cluster" : "cta")
-             << ".b64 _, ["
+             << (isRemoteBarrier ? "cluster" : "cta") << ".b64 _, ["
              << (hasPred ? "$1" : "$0") << "]";
       if (op.getCount() > 1) {
         ptxAsm << ", " << op.getCount();
