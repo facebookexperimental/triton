@@ -4102,6 +4102,96 @@ def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
     torch.testing.assert_close(output, ref_out)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_cluster_launch_control_multi_cta_delayed_exit(device):
+    """
+    Test that CLC multi-CTA correctly skips barrier_arrive when tile_id is -1.
+
+    CTA 1 is held with a busy-wait before its last clc_consumer call,
+    ensuring CTA 0 finishes first. Without the predicated barrier_arrive skip,
+    CTA 0 would arrive at bar_empty with tile_id == -1, potentially corrupting
+    the mbarrier state while CTA 1 is still active.
+    """
+    CLUSTER_SIZE = 2
+
+    @triton.jit
+    def mul2_clc_delayed(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        iteration_count_ptr,
+        BLOCK_SIZE: tl.constexpr,
+        CLUSTER_SIZE: tl.constexpr,
+    ):
+        tile_id = tl.program_id(axis=0)
+        cta_rank = tlx.cluster_cta_rank()
+
+        clc_phase_producer = 1
+        clc_phase_consumer = 0
+        clc_context = tlx.clc_create_context(CLUSTER_SIZE)
+
+        iteration = 0
+
+        while tile_id != -1:
+            tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=True)
+            clc_phase_producer ^= 1
+
+            block_start = tile_id * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            output = x + y
+            tl.store(z_ptr + offsets, output, mask=mask)
+
+            iteration += 1
+
+            # On the last real iteration, hold CTA 1 before it calls clc_consumer.
+            # This ensures CTA 0 finishes and exits first, exercising the
+            # predicated barrier_arrive skip (tile_id == -1 should NOT arrive).
+            if cta_rank == 1:
+                start = tlx.clock64()
+                while tlx.clock64() - start < 10000000:
+                    pass
+
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
+            clc_phase_consumer ^= 1
+
+        # Record how many iterations each CTA ran (for debugging)
+        tl.atomic_add(iteration_count_ptr + cta_rank, iteration)
+
+    torch.manual_seed(0)
+    BLOCK_SIZE = 1024
+    # 4 tiles total = 2 try_cancel rounds for a 2-CTA cluster
+    size = BLOCK_SIZE * CLUSTER_SIZE * 2
+    x = torch.ones(size, device=device)
+    y = torch.ones(size, device=device)
+    output = torch.zeros_like(x)
+    ref_out = x + y
+    iteration_counts = torch.zeros(CLUSTER_SIZE, dtype=torch.int32, device=device)
+
+    n_elements = output.numel()
+    num_tiles = triton.cdiv(n_elements, BLOCK_SIZE)
+    num_tiles = (num_tiles + CLUSTER_SIZE - 1) // CLUSTER_SIZE * CLUSTER_SIZE
+    grid = (num_tiles, )
+
+    mul2_clc_delayed[grid](
+        x,
+        y,
+        output,
+        n_elements,
+        iteration_counts,
+        BLOCK_SIZE=BLOCK_SIZE,
+        CLUSTER_SIZE=CLUSTER_SIZE,
+        launch_cluster=True,
+        ctas_per_cga=(CLUSTER_SIZE, 1, 1),
+    )
+
+    torch.testing.assert_close(output, ref_out)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_async_tasks_region_error(device):
 

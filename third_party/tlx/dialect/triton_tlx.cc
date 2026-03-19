@@ -317,9 +317,16 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def(
           "create_barrier_arrive",
-          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount) -> void {
-            self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
-          })
+          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount,
+             std::optional<Value> pred) -> void {
+            if (pred.has_value())
+              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount,
+                                                 pred.value());
+            else
+              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
+          },
+          py::arg("mbarrerLoc"), py::arg("arriveCount"),
+          py::arg("pred") = py::none())
       .def("create_warp_barrier_arrive",
            [](TritonOpBuilder &self, Value mbarrierLoc,
               int arriveCount) -> void {

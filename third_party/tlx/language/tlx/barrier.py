@@ -134,10 +134,11 @@ def barrier_wait(
 
 @tl.builtin
 def barrier_arrive(
-        bar: tlx.buffered_tensor,
-        arrive_count: tl.constexpr = tl.constexpr(1),
-        remote_cta_rank: tl.tensor = None,
-        _semantic=None,
+    bar: tlx.buffered_tensor,
+    arrive_count: tl.constexpr = tl.constexpr(1),
+    remote_cta_rank: tl.tensor = None,
+    pred: tl.tensor = None,
+    _semantic=None,
 ) -> None:
     """
     Perform the arrive operation on an mbarrier.
@@ -147,6 +148,7 @@ def barrier_arrive(
         arrive_count: The number of arrivals to signal.
         remote_cta_rank: If provided, the barrier will be mapped to the remote CTA's shared memory
                          before signaling. This allows signaling a barrier in another CTA.
+        pred: Optional predicate. If provided, the arrive is only performed when pred is true.
     """
     assert bar.type.storage == tlx.storage_kind.smem, (
         "barrier_arrive does not allow users to pass a remote_view of mbarrier. Remote view is done inside barrier_arrive"
@@ -159,10 +161,12 @@ def barrier_arrive(
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
 
+    pred_handle = pred.handle if pred is not None else None
+
     if is_warp_bar:
         _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value)
     else:
-        _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)
+        _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
 
 
 @tl.builtin
