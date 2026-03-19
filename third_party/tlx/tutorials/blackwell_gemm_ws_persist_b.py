@@ -267,6 +267,7 @@ def matmul_kernel_tma_ws_blackwell(
     EPILOGUE_SUBTILE: tl.constexpr,
     NEXT_POW2_K: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
+    NUM_SMS: tl.constexpr = 1,
 ):
     NUM_K_TILES: tl.constexpr = NEXT_POW2_K // BLOCK_SIZE_K
 
@@ -316,25 +317,27 @@ def matmul_kernel_tma_ws_blackwell(
                                                                           BLOCK_SIZE_K)
 
             tmem_accum_cnt = 0
-            pid_m = start_pid
-            pid_n = 0
+            pid_n = start_pid // num_pid_m
+            pid_m = start_pid % num_pid_m
 
-            cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-            _process_tile_epilogue_inner(
-                pid_m=pid_m,
-                pid_n=pid_n,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
-                EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-                c_desc=c_desc,
-                c_smem_buffers=c_smem_buffers,
-                tmem_buffers=tmem_buffers,
-                tmem_full_bars=tmem_full_bars,
-                tmem_empty_bars=tmem_empty_bars,
-                cur_tmem_buf=cur_tmem_buf,
-                tmem_read_phase=tmem_read_phase,
-            )
-            tmem_accum_cnt += 1
+            while pid_m < num_pid_m:
+                cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                _process_tile_epilogue_inner(
+                    pid_m=pid_m,
+                    pid_n=pid_n,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+                    c_desc=c_desc,
+                    c_smem_buffers=c_smem_buffers,
+                    tmem_buffers=tmem_buffers,
+                    tmem_full_bars=tmem_full_bars,
+                    tmem_empty_bars=tmem_empty_bars,
+                    cur_tmem_buf=cur_tmem_buf,
+                    tmem_read_phase=tmem_read_phase,
+                )
+                tmem_accum_cnt += 1
+                pid_m += NUM_SMS
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             start_pid, num_pid_m, num_pid_n, k_tiles = _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -342,35 +345,36 @@ def matmul_kernel_tma_ws_blackwell(
 
             tmem_accum_cnt = 0
             smem_accum_cnt = 0
-            pid_m = start_pid
-            pid_n = 0
+            pid_m = start_pid % num_pid_m
 
-            cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-            smem_accum_cnt = _process_tile_mma_inner(
-                NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                buffers_A=buffers_A,
-                buffers_B=buffers_B,
-                tmem_buffers=tmem_buffers,
-                A_smem_full_bars=A_smem_full_bars,
-                A_smem_empty_bars=A_smem_empty_bars,
-                tmem_full_bars=tmem_full_bars,
-                cur_tmem_buf=cur_tmem_buf,
-                tmem_empty_bars=tmem_empty_bars,
-                tmem_write_phase=tmem_write_phase,
-                smem_accum_cnt=smem_accum_cnt,
-                NUM_K_TILES=NUM_K_TILES,
-            )
-            tmem_accum_cnt += 1
+            while pid_m < num_pid_m:
+                cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                smem_accum_cnt = _process_tile_mma_inner(
+                    NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                    buffers_A=buffers_A,
+                    buffers_B=buffers_B,
+                    tmem_buffers=tmem_buffers,
+                    A_smem_full_bars=A_smem_full_bars,
+                    A_smem_empty_bars=A_smem_empty_bars,
+                    tmem_full_bars=tmem_full_bars,
+                    cur_tmem_buf=cur_tmem_buf,
+                    tmem_empty_bars=tmem_empty_bars,
+                    tmem_write_phase=tmem_write_phase,
+                    smem_accum_cnt=smem_accum_cnt,
+                    NUM_K_TILES=NUM_K_TILES,
+                )
+                tmem_accum_cnt += 1
+                pid_m += NUM_SMS
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             start_pid, num_pid_m, num_pid_n, k_tiles = _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N,
                                                                           BLOCK_SIZE_K)
 
             smem_accum_cnt = 0
-            pid_m = start_pid
-            pid_n = 0
+            pid_n = start_pid // num_pid_m
+            pid_m = start_pid % num_pid_m
 
-            # Single tile: load both A and B
+            # First M-tile: load both A and B
             smem_accum_cnt = _process_tile_producer_inner(
                 pid_m=pid_m,
                 pid_n=pid_n,
@@ -388,6 +392,28 @@ def matmul_kernel_tma_ws_blackwell(
                 NUM_K_TILES=NUM_K_TILES,
                 LOAD_B=True,
             )
+            pid_m += NUM_SMS
+
+            # Remaining M-tiles: only load A (B persists in SMEM)
+            while pid_m < num_pid_m:
+                smem_accum_cnt = _process_tile_producer_inner(
+                    pid_m=pid_m,
+                    pid_n=pid_n,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                    a_desc=a_desc,
+                    b_desc=b_desc,
+                    buffers_A=buffers_A,
+                    buffers_B=buffers_B,
+                    A_smem_full_bars=A_smem_full_bars,
+                    A_smem_empty_bars=A_smem_empty_bars,
+                    smem_accum_cnt=smem_accum_cnt,
+                    NUM_K_TILES=NUM_K_TILES,
+                    LOAD_B=False,
+                )
+                pid_m += NUM_SMS
 
 
 def matmul(a, b):
@@ -426,5 +452,6 @@ def matmul(a, b):
         M,
         N,
         K,
+        NUM_SMS=NUM_SMS,
     )
     return c
