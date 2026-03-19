@@ -649,6 +649,7 @@ def _attn_bwd_dkdv_inner(
     dtype: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     LN2: tl.constexpr,
+    RESCHED: tl.constexpr,
 ):
     q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
     qT = tl.trans(q)
@@ -662,13 +663,22 @@ def _attn_bwd_dkdv_inner(
     do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
     ppT = pT
     ppT = ppT.to(dtype)
-    dv += tl.dot(ppT, do)
-    Di = tl.load(D + offs_m)
-    dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+    if RESCHED:
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        Di = tl.load(D + offs_m)
+        dv += tl.dot(ppT, do)
+    else:
+        dv += tl.dot(ppT, do)
+        Di = tl.load(D + offs_m)
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
-    dk += tl.dot(dsT, tl.trans(qT))
-    dq = tl.dot(tl.trans(dsT), k)
+    if RESCHED:
+        dq = tl.dot(tl.trans(dsT), k)
+        dk += tl.dot(dsT, tl.trans(qT))
+    else:
+        dk += tl.dot(dsT, tl.trans(qT))
+        dq = tl.dot(tl.trans(dsT), k)
     dqs = _split_n(dq, EPILOGUE_SUBTILE)
     slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
@@ -718,7 +728,7 @@ def _attn_bwd_dkdv(
     step_m = BLOCK_M1
     if warp_specialize:
         for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2,
-                                smem_alloc_algo=1, smem_budget=200000):
+                                smem_alloc_algo=1, smem_budget=200000, split_mma=True):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -740,6 +750,7 @@ def _attn_bwd_dkdv(
                 dtype,
                 EPILOGUE_SUBTILE,
                 LN2,
+                True,
             )
     else:
         for blk_idx in tl.range(0, num_steps):
@@ -764,6 +775,7 @@ def _attn_bwd_dkdv(
                 dtype,
                 EPILOGUE_SUBTILE,
                 LN2,
+                True,
             )
 
     return dk, dv
@@ -811,6 +823,7 @@ configs_bwd_persist = [
         },
         num_warps=4,
         num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
     )
 ]
 
@@ -938,50 +951,6 @@ def _attn_bwd(
     bhid = tl.program_id(2)
     pid = tl.program_id(0)
 
-    y_dim = BATCH * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(
-        desc_q,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM],
-    )
-    desc_do = _maybe_make_tensor_desc(
-        desc_do,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM],
-    )
-    desc_dq = _maybe_make_tensor_desc(
-        desc_dq,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE],
-    )
-    desc_v = _maybe_make_tensor_desc(
-        desc_v,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM],
-    )
-    desc_k = _maybe_make_tensor_desc(
-        desc_k,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM],
-    )
-    desc_dv = _maybe_make_tensor_desc(
-        desc_dv,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
-    )
-    desc_dk = _maybe_make_tensor_desc(
-        desc_dk,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
-    )
-
     _attn_bwd_core(
         desc_q,
         desc_k,
@@ -1054,43 +1023,43 @@ def _attn_bwd_persist(
     tile_idx = prog_id
 
     y_dim = BATCH * H * N_CTX
-    desc_q = tl.make_tensor_descriptor(
+    desc_q = _maybe_make_tensor_desc(
         desc_q,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M1, HEAD_DIM],
     )
-    desc_do = tl.make_tensor_descriptor(
+    desc_do = _maybe_make_tensor_desc(
         desc_do,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M1, HEAD_DIM],
     )
-    desc_dq = tl.make_tensor_descriptor(
+    desc_dq = _maybe_make_tensor_desc(
         desc_dq,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
-    desc_v = tl.make_tensor_descriptor(
+    desc_v = _maybe_make_tensor_desc(
         desc_v,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N1, HEAD_DIM],
     )
-    desc_k = tl.make_tensor_descriptor(
+    desc_k = _maybe_make_tensor_desc(
         desc_k,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N1, HEAD_DIM],
     )
-    desc_dv = tl.make_tensor_descriptor(
+    desc_dv = _maybe_make_tensor_desc(
         desc_dv,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
     )
-    desc_dk = tl.make_tensor_descriptor(
+    desc_dk = _maybe_make_tensor_desc(
         desc_dk,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
@@ -1098,7 +1067,7 @@ def _attn_bwd_persist(
     )
 
     for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1,
-                      smem_budget=200000):
+                      smem_budget=200000, split_mma=True):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
@@ -1279,57 +1248,48 @@ class _attention_opt(torch.autograd.Function):
         # the kernel body exceeds the 512-unit TMEM hardware limit (needs 704)
         # and the pipeliner cannot predicate tt.descriptor_reduce (atomic_add
         # via TMA). Use non-persistent backward until compiler support improves.
-        if supports_host_descriptor():
-            desc_k = TensorDescriptor(
-                arg_k,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-            desc_v = TensorDescriptor(
-                v,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-            desc_q = TensorDescriptor(
-                q,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-            desc_do = TensorDescriptor(
-                do,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-            desc_dq = TensorDescriptor(
-                dq,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-            desc_dk = TensorDescriptor(
-                dk,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-            desc_dv = TensorDescriptor(
-                dv,
-                shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-                strides=[HEAD_DIM, 1],
-                block_shape=dummy_block,
-            )
-        else:
-            desc_q = q
-            desc_v = v
-            desc_k = k
-            desc_do = do
-            desc_dq = dq
-            desc_dk = dk
-            desc_dv = dv
+        desc_k = TensorDescriptor(
+            arg_k,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_v = TensorDescriptor(
+            v,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_q = TensorDescriptor(
+            q,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_do = TensorDescriptor(
+            do,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_dq = TensorDescriptor(
+            dq,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_dk = TensorDescriptor(
+            dk,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_dv = TensorDescriptor(
+            dv,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
 
         def grid(meta):
             return (
@@ -1351,17 +1311,15 @@ class _attention_opt(torch.autograd.Function):
                     1,
                 )
 
-            # Persistent BWD constructs device-side descriptors internally,
-            # so pass raw pointers instead of host TensorDescriptors.
             _attn_bwd_persist[grid_persist_bwd](
-                q,
-                arg_k,
-                v,
+                desc_q,
+                desc_k,
+                desc_v,
                 ctx.sm_scale,
-                do,
-                dq,
-                dk,
-                dv,  #
+                desc_do,
+                desc_dq,
+                desc_dk,
+                desc_dv,  #
                 M,
                 delta,  #
                 q.stride(0),
@@ -1375,6 +1333,7 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=ctx.HEAD_DIM,  #
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
             )
         else:
             _attn_bwd[grid](
@@ -1399,6 +1358,7 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=ctx.HEAD_DIM,  #
                 dtype=torch_dtype_to_triton(q.dtype),
                 warp_specialize=warp_specialize,
+                maxRegAutoWS=192,
             )
 
         return dq, dk, dv, None, None, None, None, None, None

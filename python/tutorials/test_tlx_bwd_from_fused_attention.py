@@ -9,6 +9,10 @@ Three backward implementations are compared:
 
 Both Triton backward kernels share the same forward pass so that the
 comparison isolates backward-pass differences only.
+
+The script runs:
+  - Accuracy comparison: verifies dQ, dK, dV against PyTorch reference
+  - Performance benchmark: measures TFLOPS for Triton autoWS vs TLX bwd
 """
 
 import sys
@@ -202,6 +206,21 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
     if persistent:
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
+        desc_q = TensorDescriptor(q, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                  block_shape=dummy_block)
+        desc_k = TensorDescriptor(arg_k, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                  block_shape=dummy_block)
+        desc_v = TensorDescriptor(v, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                  block_shape=dummy_block)
+        desc_do = TensorDescriptor(do, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_dq = TensorDescriptor(dq, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_dk = TensorDescriptor(dk, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_dv = TensorDescriptor(dv, shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+
         def grid_persist_bwd(meta):
             return (
                 min(NUM_SMS,
@@ -211,14 +230,14 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
             )
 
         _attn_bwd_persist_orig[grid_persist_bwd](
-            q,
-            arg_k,
-            v,
+            desc_q,
+            desc_k,
+            desc_v,
             sm_scale,
-            do,
-            dq,
-            dk,
-            dv,
+            desc_do,
+            desc_dq,
+            desc_dk,
+            desc_dv,
             M,
             delta,
             q.stride(0),
@@ -232,6 +251,7 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
             HEAD_DIM=HEAD_DIM,
             dtype=torch_dtype_to_triton(q.dtype),
             warp_specialize=warp_specialize,
+            maxRegAutoWS=192,
         )
     else:
         if supports_host_descriptor():
@@ -282,6 +302,7 @@ def run_original_bwd(q, k, v, o, M, do, sm_scale, causal, persistent):
             HEAD_DIM=HEAD_DIM,
             dtype=torch_dtype_to_triton(q.dtype),
             warp_specialize=warp_specialize,
+            maxRegAutoWS=192,
         )
 
     return dq, dk, dv
@@ -339,7 +360,7 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     stage = 3 if causal else 1
-    BWD_BLOCK_M1 = 64
+    BWD_BLOCK_M1 = 64  # 128 or 64
     EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
     GROUP_SIZE_M = 1
 
@@ -421,6 +442,49 @@ def print_table(rows, col_widths):
         for val, w in zip(row, col_widths):
             line += str(val).ljust(w)
         print(line)
+
+
+# ============================================================================
+# Performance benchmark
+# ============================================================================
+# warmup=2000, rep=2000
+def benchmark_bwd(Z, H, N_CTX, HEAD_DIM, causal, baseVariant, dtype=torch.float16, warmup=1000, rep=1000):
+    """Benchmark original bwd vs TLX bwd and return (orig_ms, tlx_ms, orig_tflops, tlx_tflops)."""
+    torch.manual_seed(20)
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    sm_scale = 0.5
+
+    persistent = baseVariant in ("persistent", "ws_persistent")
+    tri_out, M = shared_forward(q, k, v, sm_scale, causal, baseVariant)
+    dout = torch.randn_like(q)
+
+    # Warm up both paths once to trigger compilation
+    run_original_bwd(q, k, v, tri_out, M, dout, sm_scale, causal, persistent)
+    run_tlx_bwd(q, k, v, tri_out, M, dout, sm_scale, causal)
+
+    # Benchmark original bwd
+    orig_ms = triton.testing.do_bench(
+        lambda: run_original_bwd(q, k, v, tri_out, M, dout, sm_scale, causal, persistent),
+        warmup=warmup,
+        rep=rep,
+    )
+
+    # Benchmark TLX bwd
+    tlx_ms = triton.testing.do_bench(
+        lambda: run_tlx_bwd(q, k, v, tri_out, M, dout, sm_scale, causal),
+        warmup=warmup,
+        rep=rep,
+    )
+
+    # Compute TFLOPS: bwd = 2.5 * 2 * (2 * B * H * N * N * D)
+    flops_per_matmul = 2.0 * Z * H * N_CTX * N_CTX * HEAD_DIM
+    total_flops = 2 * flops_per_matmul * 2.5  # 2.0(bwd) + 0.5(recompute)
+    orig_tflops = total_flops * 1e-12 / (orig_ms * 1e-3)
+    tlx_tflops = total_flops * 1e-12 / (tlx_ms * 1e-3)
+
+    return orig_ms, tlx_ms, orig_tflops, tlx_tflops
 
 
 # ============================================================================
@@ -553,4 +617,49 @@ if __name__ == "__main__":
         print("*** ALL CONFIGURATIONS PASSED ***")
     else:
         print("*** SOME CONFIGURATIONS FAILED ***")
+    print(f"{'=' * 78}")
+
+    # ---- Performance benchmark -----------------------------------------------
+    print(f"\n{'=' * 78}")
+    print("Performance Benchmark: FA BWD — Triton autoWS vs TLX")
+    print(f"{'=' * 78}\n")
+
+    bench_configs = [
+        # (Z,  H,  N_CTX, HEAD_DIM, causal, baseVariant)
+        (8, 16, 1024, 128, False, "ws_persistent"),
+        (8, 16, 2048, 128, False, "ws_persistent"),
+        (8, 16, 4096, 128, False, "ws_persistent"),
+        (4, 32, 4096, 128, False, "ws_persistent"),
+    ]
+
+    cw = [8, 6, 8, 10, 16, 14, 14, 14, 10]
+    header = ["Z", "H", "N_CTX", "HEAD_DIM", "baseVariant", "Triton (ms)", "TLX (ms)", "Triton TFLOPS", "Speedup"]
+    sep = ["-" * (w - 1) for w in cw]
+    print_table([header, sep], cw)
+
+    for Z, H, N_CTX, HEAD_DIM, causal, baseVariant in bench_configs:
+        orig_ms, tlx_ms, orig_tflops, tlx_tflops = benchmark_bwd(
+            Z,
+            H,
+            N_CTX,
+            HEAD_DIM,
+            causal,
+            baseVariant,
+        )
+        speedup = tlx_ms / orig_ms if orig_ms > 0 else float("inf")
+        row = [
+            str(Z),
+            str(H),
+            str(N_CTX),
+            str(HEAD_DIM),
+            baseVariant,
+            f"{orig_ms:.3f}",
+            f"{tlx_ms:.3f}",
+            f"{orig_tflops:.1f}",
+            f"{speedup:.2f}x",
+        ]
+        print_table([row], cw)
+
+    print(f"\n{'=' * 78}")
+    print("Benchmark complete.")
     print(f"{'=' * 78}")
