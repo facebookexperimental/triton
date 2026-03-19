@@ -1472,6 +1472,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       std::string tmaInst =
           "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
           "d.shared::cluster.global.mbarrier::complete_tx::bytes";
+      if (op.getTwoCta())
+        tmaInst += ".cta_group::2";
       auto multicastMask = op.getMulticastTargets();
       if (multicastMask != nullptr)
         tmaInst += ".multicast::cluster";
