@@ -36,7 +36,7 @@ tt.func @simple_loop_i32(%lb : i32, %ub : i32, %step : i32) -> f32 {
 // -----
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
-// CHECK-LABEL: @simple_loop_i32_dup
+// CHECK-LABEL: @simple_loop_i32
 // CHECK: (%[[LB:.*]]: i32, %[[UB:.*]]: i32, %[[STEP:.*]]: i32) -> f32
 // CHECK-DAG: %[[CST:.*]] = arith.constant 0.000000e+00 : f32
 // CHECK-DAG: %[[ONE:.*]] = arith.constant 1 : i32
@@ -56,7 +56,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 // CHECK: else
 // CHECK:   scf.yield %[[FOR]] : f32
 // CHECK: tt.return %[[IF]] : f32
-tt.func @simple_loop_i32_dup(%lb : i32, %ub : i32, %step : i32) -> f32 {
+tt.func @simple_loop_i32(%lb : i32, %ub : i32, %step : i32) -> f32 {
   %init = arith.constant 0.00e+00 : f32
   %loop = scf.for %iv = %lb to %ub step %step iter_args(%acc = %init) -> (f32) : i32 {
     %a = "def"(%iv) : (i32) -> f32
