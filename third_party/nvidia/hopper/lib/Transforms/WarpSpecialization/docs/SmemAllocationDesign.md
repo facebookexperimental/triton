@@ -573,18 +573,18 @@ This interface is unchanged.
 
 ---
 
-## Summary of Changes
+## Design Summary
 
-| Component | Current | Proposed |
-|-----------|---------|----------|
-| Abstraction | Raw `BufferT` + `DenseMap` | `WSBuffer` struct per `local_alloc` |
-| Initial state | Single pass, group by type | Phase 1: unique IDs, all `copy = 1` |
-| Cross-stage | Not considered | Phase 2: force `copy ≥ 2` |
-| Multi-buffering | Unconditional for TMA+innermost | Phase 4: iterative, budget-aware |
-| Reuse | Not done | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2 |
-| Max copies | `numBuffers` param (all-or-nothing) | `num_buffers` param (incremental cap) |
-| Budget | Not checked | Enforced at every iteration |
-| Iteration order | Non-deterministic | Sorted by operation ID |
+| Component | Description |
+|-----------|----------|
+| Abstraction | `WSBuffer` struct per `local_alloc` |
+| Initial state | Phase 1: unique IDs, all `copy = 1` |
+| Cross-stage | Phase 2: force `copy ≥ 2` |
+| Multi-buffering | Phase 4: iterative, budget-aware |
+| Reuse | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2 |
+| Max copies | `num_buffers` param (incremental cap) |
+| Budget | Enforced at every iteration |
+| Iteration order | Sorted by operation ID |
 
 ---
 
@@ -607,12 +607,10 @@ doMemoryPlanner(funcOp, numBuffers)
   └── Step 4: MemoryPlannerTmem::allocateBuffers(lastBufferId)
 ```
 
-## Files to Modify
+## Implementation
 
-| File | Change |
-|------|--------|
-| `WSMemoryPlanner.cpp` — `MemoryPlanner` class | Add `WSBuffer` struct, rewrite `run()` with 5-phase algorithm |
-| `WSMemoryPlanner.cpp` — `doMemoryPlanner` | Pass cross-stage info from Step 1.5 into the planner |
-| `Passes.td` | Add `--smem-budget` and `--smem-circular-reuse` options |
-| `ws_memory_planner_bwd.mlir` | Update CHECK lines for new assignments |
-| `ws_memory_planner_fwd.mlir` | Update CHECK lines similarly |
+**File**: `WSMemoryPlanner.cpp` — `MemoryPlanner` class
+
+The algorithm is implemented in `MemoryPlanner::run()`, with the `WSBuffer`
+struct, cross-stage detection, and budget-aware iteration all within
+`WSMemoryPlanner.cpp`.
