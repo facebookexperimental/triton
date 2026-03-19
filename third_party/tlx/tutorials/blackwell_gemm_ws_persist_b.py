@@ -27,6 +27,7 @@ def get_cuda_autotune_config():
                 "BLOCK_SIZE_M": BM,
                 "BLOCK_SIZE_N": BN,
                 "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": g,
                 "NUM_SMEM_BUFFERS": s,
                 "NUM_TMEM_BUFFERS": t,
                 "EPILOGUE_SUBTILE": subtile,
@@ -39,6 +40,7 @@ def get_cuda_autotune_config():
         for BM in [128]
         for BN in [64, 128, 256]
         for BK in [64, 128]
+        for g in [1, 4, 8]
         for s in [2, 3, 4, 5, 6, 7]
         for t in [1, 2, 3, 4]
         for subtile in [1, 2, 4, 8]
@@ -65,6 +67,16 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     bufIdx = accum_cnt % NUM_BUFFERS_KV
     phase = (accum_cnt // NUM_BUFFERS_KV) & 1
     return bufIdx, phase
+
+
+@triton.jit
+def _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M):
+    """Swizzle pid_m within groups of GROUP_SIZE_M for better L2 locality."""
+    group_id = pid_m // GROUP_SIZE_M
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid_m % group_size_m)
+    return pid_m
 
 
 @triton.jit
@@ -262,6 +274,7 @@ def matmul_kernel_tma_ws_blackwell(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
     NUM_SMEM_BUFFERS: tl.constexpr,
     NUM_TMEM_BUFFERS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
@@ -321,9 +334,10 @@ def matmul_kernel_tma_ws_blackwell(
             pid_m = start_pid % num_pid_m
 
             while pid_m < num_pid_m:
+                swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
                 cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                 _process_tile_epilogue_inner(
-                    pid_m=pid_m,
+                    pid_m=swizzled_pid_m,
                     pid_n=pid_n,
                     BLOCK_SIZE_M=BLOCK_SIZE_M,
                     BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -373,10 +387,11 @@ def matmul_kernel_tma_ws_blackwell(
             smem_accum_cnt = 0
             pid_n = start_pid // num_pid_m
             pid_m = start_pid % num_pid_m
+            swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
 
             # First M-tile: load both A and B
             smem_accum_cnt = _process_tile_producer_inner(
-                pid_m=pid_m,
+                pid_m=swizzled_pid_m,
                 pid_n=pid_n,
                 BLOCK_SIZE_M=BLOCK_SIZE_M,
                 BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -396,8 +411,9 @@ def matmul_kernel_tma_ws_blackwell(
 
             # Remaining M-tiles: only load A (B persists in SMEM)
             while pid_m < num_pid_m:
+                swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
                 smem_accum_cnt = _process_tile_producer_inner(
-                    pid_m=pid_m,
+                    pid_m=swizzled_pid_m,
                     pid_n=pid_n,
                     BLOCK_SIZE_M=BLOCK_SIZE_M,
                     BLOCK_SIZE_N=BLOCK_SIZE_N,
