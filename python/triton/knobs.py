@@ -508,6 +508,7 @@ class nvidia_knobs(base_knobs):
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
     use_meta_partition: env_bool = env_bool("TRITON_USE_META_PARTITION")
+    compute_partition_granularity: env_str = env_str("TRITON_COMPUTE_PARTITION_GRANULARITY", "auto")
     # Force OAI SWP schedule even when using Meta's WS implementation.
     force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
