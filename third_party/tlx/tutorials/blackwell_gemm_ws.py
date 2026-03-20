@@ -383,7 +383,7 @@ def get_cuda_autotune_config():
             pre_hook=matmul_tma_set_block_size_hook,
             ctas_per_cga=(num_ctas, 1, 1) if num_ctas > 1 else None,
         )
-        for BM in [128, 256]
+        for BM in [64, 128, 256]
         for BN in [64, 128, 256]
         for BK in [64, 128]
         for s in [2, 3, 4, 5, 6, 7]
@@ -484,9 +484,19 @@ def preprocess_configs(configs, named_args, **kwargs):
         if INTERLEAVE_EPILOGUE and NUM_MMA_GROUPS != 2:
             continue
 
+        # Blackwell MMA requires BLOCK_M_SPLIT >= 64
+        if BLOCK_M // NUM_MMA_GROUPS < 64:
+            continue
+
         num_tiles_m = math.ceil(M / BLOCK_M)
         num_tiles_n = math.ceil(N / BLOCK_N)
         num_mn_tiles = num_tiles_m * num_tiles_n
+
+        # BM=64 tiles only help when MN is too small with larger tiles.
+        # Skip them for shapes that already have enough spatial tiles
+        # to avoid bloating the autotuner search space.
+        if BLOCK_M == 64 and math.ceil(M / 128) * math.ceil(N / 128) > 16:
+            continue
 
         # --- Split-K gating: only allow SPLIT_K > 1 for small shapes ---
         # Split-K helps when MN tiles are too few to saturate the GPU.
