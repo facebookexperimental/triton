@@ -627,7 +627,67 @@ struct WSBuffer {
   unsigned bufferId;
   unsigned numCopies;
   WSBufferPriority priority;
+  bool isPinned = false; // Set by user annotation; skips heuristic phases.
 };
+
+/// Parsed channel annotation from tt.autows JSON on an MMA op.
+/// Format: "opndA,smem,2,0" → operand=opndA, memType=smem, numCopies=2,
+/// bufferId=0.
+struct ChannelAnnotation {
+  std::string operand; // "opndA", "opndB", "opndD"
+  std::string memType; // "smem", "tmem"
+  unsigned numCopies;
+  unsigned bufferId;
+};
+
+/// Parse tt.autows channel annotations from all MMA ops in parentOp.
+/// Returns a map from (mmaOp, operandIdx) → ChannelAnnotation, where
+/// operandIdx is 0=opndA, 1=opndB, 2=opndD.
+static std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
+parseChannelAnnotations(Operation *parentOp) {
+  std::map<std::pair<Operation *, unsigned>, ChannelAnnotation> result;
+
+  parentOp->walk([&](Operation *op) {
+    if (!isa<ttng::MMAv5OpInterface>(op))
+      return;
+    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+    if (!attr)
+      return;
+    auto parsed = llvm::json::parse(attr.getValue());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return;
+    }
+    auto *obj = parsed->getAsObject();
+    if (!obj)
+      return;
+    auto *channelsArr = obj->getArray("channels");
+    if (!channelsArr)
+      return;
+    for (auto &elem : *channelsArr) {
+      auto str = elem.getAsString();
+      if (!str)
+        continue;
+      SmallVector<StringRef, 4> parts;
+      StringRef(*str).split(parts, ',');
+      if (parts.size() != 4)
+        continue;
+      ChannelAnnotation ann;
+      ann.operand = parts[0].str();
+      ann.memType = parts[1].str();
+      ann.numCopies = std::stoi(parts[2].str());
+      ann.bufferId = std::stoi(parts[3].str());
+      unsigned opIdx = ann.operand == "opndA"   ? 0
+                       : ann.operand == "opndB" ? 1
+                                                : 2; // opndD
+      result[{op, opIdx}] = ann;
+      LDBG("parseChannelAnnotations: MMA op has annotation: "
+           << ann.operand << "," << ann.memType << "," << ann.numCopies << ","
+           << ann.bufferId);
+    }
+  });
+  return result;
+}
 
 /// Check if all users of a channel are in the same innermost loop and the
 /// alloc type has at least 2 non-trivial dimensions.
