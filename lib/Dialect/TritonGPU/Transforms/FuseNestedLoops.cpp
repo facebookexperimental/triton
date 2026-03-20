@@ -999,7 +999,7 @@ static void fuseOneLevel(LoopNestNode *parent, mlir::DominanceInfo &domInfo) {
       }))
     fused->setAttr(kWarpSpecializeAttrName, b.getUnitAttr());
 
-  // Propagate the `tt.disallow_acc_multi_buffer` attribute
+  // Propagate the `tt.disallow_acc_multi_buffer` attribute to the parent loop.
   bool disallowAccMultiBuffer = getDisallowAccMultiBuffer(outer);
   for (InnerLoop &loop : innerLoops) {
     disallowAccMultiBuffer |= getDisallowAccMultiBuffer(loop.op);

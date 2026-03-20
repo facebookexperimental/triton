@@ -1120,7 +1120,6 @@ def _attn_bwd_ws(
     # Note: Setting REUSE_DP_FOR_DQ=False with BLOCK_M1 == 64 and
     # HEAD_DIM == 128 will result in an accuracy issue.
     REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128)
-    # REUSE_DP_FOR_DQ: tl.constexpr = True
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
