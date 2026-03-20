@@ -3987,6 +3987,92 @@ def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
     torch.testing.assert_close(output, ref_out)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_cluster_launch_control_multi_cta_delayed_exit(device):
+    """
+    Test that CLC multi-CTA correctly skips barrier_arrive when tile_id is -1.
+
+    CTA 1 is held with a busy-wait before its last clc_consumer call,
+    ensuring CTA 0 finishes first. Without the predicated barrier_arrive skip,
+    CTA 1 would arrive at CTA 0's bar with tile_id == -1, when CTA 0 already exits,
+    and thus cause errors.
+    """
+    CLUSTER_SIZE = 2
+
+    @triton.jit
+    def clc_delayed(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        CLUSTER_SIZE: tl.constexpr,
+    ):
+        tile_id = tl.program_id(axis=0)
+        cta_rank = tlx.cluster_cta_rank()
+
+        clc_phase_producer = 1
+        clc_phase_consumer = 0
+        clc_context = tlx.clc_create_context(CLUSTER_SIZE)
+
+        while tile_id != -1:
+            tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=True)
+            clc_phase_producer ^= 1
+
+            # just do some regular processing
+            block_start = tile_id * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            output = x + y
+            tl.store(z_ptr + offsets, output, mask=mask)
+
+            # Hold CTA 1 before it calls clc_consumer.
+            # This ensures CTA 0 finishes and exits first, exercising the
+            # predicated barrier_arrive skip (tile_id == -1 should NOT arrive).
+            if cta_rank == 1:
+                # sleep 500ms
+                for i in range(500):
+                    # nanosleep instruction can sleep max 1ms: https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-nanosleep
+                    tl.inline_asm_elementwise(
+                        "nanosleep.u32 1000000;  mov.u32 $0, 0;",
+                        "=r",
+                        [],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
+            clc_phase_consumer ^= 1
+
+    torch.manual_seed(0)
+    BLOCK_SIZE = 1024
+    # just launch 1 cluster, grid size is 2
+    n_elements = BLOCK_SIZE * CLUSTER_SIZE
+    x = torch.ones(n_elements, device=device)
+    y = torch.ones(n_elements, device=device)
+    output = torch.zeros_like(x)
+    ref_out = x + y
+
+    num_tiles = triton.cdiv(n_elements, BLOCK_SIZE)
+    grid = (num_tiles, )
+
+    clc_delayed[grid](
+        x,
+        y,
+        output,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        CLUSTER_SIZE=CLUSTER_SIZE,
+        ctas_per_cga=(CLUSTER_SIZE, 1, 1),
+    )
+
+    torch.testing.assert_close(output, ref_out)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_async_tasks_region_error(device):
 

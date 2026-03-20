@@ -169,11 +169,16 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, _seman
     stolen_tile_id = _clc_query(response, _semantic=_semantic)
 
     # Signal completion: all CTAs signal CTA 0's bar_empty
+    # NOTE: if stolen_tile_id is -1, it means no more tile is available. We shouldn't expect
+    # the producer to run any more, and leader CTA could already exit now, so we skip the bar_empty arrival here
+    zero = _semantic.builder.get_int32(0)
+    pred_has_tile_handle = _semantic.builder.create_icmpSGE(stolen_tile_id.handle, zero)
+    pred_has_tile = tl.tensor(pred_has_tile_handle, tl.int1)
     if multi_ctas:
         # Arrive at CTA 0's bar_empty via remote_cta_rank=0
         # (barrier_arrive handles remote_view internally)
-        barrier_arrive(bar_empty, tl.constexpr(1), 0, _semantic=_semantic)
+        barrier_arrive(bar_empty, tl.constexpr(1), 0, pred=pred_has_tile, _semantic=_semantic)
     else:
-        barrier_arrive(bar_empty, _semantic=_semantic)
+        barrier_arrive(bar_empty, pred=pred_has_tile, _semantic=_semantic)
 
     return stolen_tile_id
