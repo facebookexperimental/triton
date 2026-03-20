@@ -351,11 +351,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
     if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    # Early TMA store lowering not yet supported for non-persistent kernels
-    # (store is outside WS loop; partition scheduling can't handle TMAStoreTokenWaitOp)
-    if use_early_tma_store_lowering:
-        pytest.skip("Early TMA store lowering not supported for non-persistent kernels")
-
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")

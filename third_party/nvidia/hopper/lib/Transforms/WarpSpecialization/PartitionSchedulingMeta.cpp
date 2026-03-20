@@ -935,18 +935,23 @@ static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
     OpOperand *use = uses.pop_back_val();
     Operation *user = use->getOwner();
 
-    // Skip if already visited or scheduled.
-    if (!visited.insert(user).second || hasPartition(user))
+    // Skip if already visited.
+    if (!visited.insert(user).second)
       continue;
 
     // Only schedule operations that are outside the loop.
     if (loop->isAncestor(user))
       continue;
 
-    // Schedule this post-loop operation to the epilogue partition.
-    tryScheduleOp(epiloguePartition, user);
+    // Schedule this post-loop operation to the epilogue partition
+    // (skip if already scheduled, e.g. categorized as an epilogue store).
+    if (!hasPartition(user))
+      tryScheduleOp(epiloguePartition, user);
 
-    // Add all users of this operation to process transitively.
+    // Add all users of this operation to process transitively, even if the
+    // op was already scheduled. This ensures ops reachable only through
+    // already-scheduled ops (e.g. TMAStoreTokenWaitOp reachable through
+    // AsyncTMACopyLocalToGlobalOp) still get visited and scheduled.
     for (OpResult result : user->getResults())
       for (OpOperand &nextUse : result.getUses())
         uses.push_back(&nextUse);
@@ -1451,6 +1456,9 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // already assigned to a partition.
     auto useCallback = [&](OpResult result, OpOperand &use, unsigned distance) {
       Operation *user = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      // Skip users outside the loop — they are handled by schedulePostLoopOps.
+      if (!user)
+        return;
       if (!hasPartition(user)) {
         // Add the current partition as a def to the cluster.
         opClusters.getOrCreate(user)->defPartitions.insert(&partition);
