@@ -491,9 +491,9 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   // but to compute the shapePerCTA on the rhs, we need to divide by 2.
   // Something similar happens when we multiply by 2 the mmaSizeM when creating
   // It's a massive code smell tho
-  DotOpMmaSmemLoader bLoader = DotOpMmaSmemLoader::build(
-      loc, rewriter, bTensorTy, baseB,
-      {mmaSizeK, mmaSizeN / (twoCTAs ? 2 : 1)}, 5, isFp4b);
+  DotOpMmaSmemLoader bLoader =
+      DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
+                                {mmaSizeK, mmaSizeN / (twoCTAs ? 2 : 1)}, 5, isFp4b);
 
   DotConversion::InstDesc desc{mmaSizeM, mmaSizeN, {numRepM, numRepN, numRepK},
                                transA,   transB,   interleaved,
