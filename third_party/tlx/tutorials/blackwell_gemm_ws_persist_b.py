@@ -267,7 +267,7 @@ TORCH_DTYPE_TO_TRITON = {
     key=["M", "N", "K"],
 )
 @triton.jit
-def matmul_kernel_tma_ws_blackwell(
+def matmul_kernel_tma_persist_b_blackwell(
     a_desc,
     b_desc,
     c_desc,
@@ -478,7 +478,7 @@ def matmul(a, b):
         num_pid_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
         return (num_pid_m * num_pid_n, )
 
-    matmul_kernel_tma_ws_blackwell[grid](
+    matmul_kernel_tma_persist_b_blackwell[grid](
         a_desc,
         b_desc,
         c_desc,
