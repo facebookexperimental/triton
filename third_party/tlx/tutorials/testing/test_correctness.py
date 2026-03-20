@@ -304,7 +304,7 @@ def test_blackwell_gemm_2cta(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("M", [4096, 8192])
+@pytest.mark.parametrize("M", [4096, 8192, 32768])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws_persist_b(M, dtype):
     N, K = 384, 384

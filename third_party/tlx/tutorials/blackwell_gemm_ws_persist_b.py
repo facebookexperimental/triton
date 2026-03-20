@@ -81,12 +81,11 @@ def _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M):
 
 
 @triton.jit
-def _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K):
+def _compute_grid_info(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    return start_pid, num_pid_m, num_pid_n, k_tiles
+    return start_pid, num_pid_m, num_pid_n
 
 
 @triton.jit
@@ -330,13 +329,13 @@ def matmul_kernel_tma_ws_blackwell(
 
     with tlx.async_tasks():
         with tlx.async_task("default"):  # epilogue consumer
-            start_pid, num_pid_m, num_pid_n, k_tiles = _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                                                                          BLOCK_SIZE_K)
+            start_pid, num_pid_m, num_pid_n = _compute_grid_info(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
             tmem_accum_cnt = 0
             smem_epilogue_cnt = 0
             pid_n = start_pid % num_pid_n
             num_tiles_per_sm = num_pid_m
+            pid_m = start_pid
             tile_cnt = 0
 
             while tile_cnt < num_tiles_per_sm:
@@ -360,18 +359,19 @@ def matmul_kernel_tma_ws_blackwell(
                     TOTAL_SMEM_SLICES=TOTAL_SMEM_SLICES,
                 )
                 tmem_accum_cnt += 1
+                pid_m += NUM_SMS
                 tile_cnt += 1
 
             # Wait for the final TMA store.
             tlx.async_descriptor_store_wait(0)
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
-            start_pid, num_pid_m, num_pid_n, k_tiles = _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                                                                          BLOCK_SIZE_K)
+            start_pid, num_pid_m, num_pid_n = _compute_grid_info(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
             tmem_accum_cnt = 0
             smem_accum_cnt = 0
             num_tiles_per_sm = num_pid_m
+            pid_m = start_pid
             tile_cnt = 0
 
             while tile_cnt < num_tiles_per_sm:
@@ -391,19 +391,18 @@ def matmul_kernel_tma_ws_blackwell(
                     NUM_K_TILES=NUM_K_TILES,
                 )
                 tmem_accum_cnt += 1
+                pid_m += NUM_SMS
                 tile_cnt += 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
-            start_pid, num_pid_m, num_pid_n, k_tiles = _compute_grid_info(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                                                                          BLOCK_SIZE_K)
+            start_pid, num_pid_m, num_pid_n = _compute_grid_info(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
             smem_accum_cnt = 0
             pid_n = start_pid % num_pid_n
             num_tiles_per_sm = num_pid_m
-            tile_cnt = 0
+            pid_m = start_pid
 
             # First M-tile: load both A and B
-            pid_m = tile_cnt
             swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
             smem_accum_cnt = _process_tile_producer_inner(
                 pid_m=swizzled_pid_m,
@@ -422,11 +421,11 @@ def matmul_kernel_tma_ws_blackwell(
                 NUM_K_TILES=NUM_K_TILES,
                 LOAD_B=True,
             )
-            tile_cnt += 1
+            pid_m += NUM_SMS
+            tile_cnt = 1
 
             # Remaining M-tiles: only load A (B persists in SMEM)
             while tile_cnt < num_tiles_per_sm:
-                pid_m = tile_cnt
                 swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
                 smem_accum_cnt = _process_tile_producer_inner(
                     pid_m=swizzled_pid_m,
@@ -445,6 +444,7 @@ def matmul_kernel_tma_ws_blackwell(
                     NUM_K_TILES=NUM_K_TILES,
                     LOAD_B=False,
                 )
+                pid_m += NUM_SMS
                 tile_cnt += 1
 
 
