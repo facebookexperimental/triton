@@ -368,6 +368,20 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        # 2-CTA support: propagate two_ctas attr to TCGen5MMAOp, transform B loads,
+        # and insert cross-CTA sync.
+        # These passes detect cluster-dim-x >= 2 and:
+        # 1. Set two_ctas=true on TCGen5MMAOp (based on cluster config)
+        # 2. Transform B loads to load BLOCK_N/2 per CTA
+        # 3. Insert arrive_remote/wait_local sync pattern
+        # NOTE: These passes are skipped when WS is enabled because the WS passes
+        # restructure the IR in ways that are incompatible with the sync pattern.
+        # For WS+2CTA, use TLX which has native support.
+        if capability // 10 >= 10 and opt.cluster_dims is not None:
+            if opt.cluster_dims[0] >= 2 or opt.cluster_dims[1] >= 2 or opt.cluster_dims[2] >= 2:
+                nvidia.passes.hopper.add_2cta_propagate_attr(pm)
+                nvidia.passes.hopper.add_2cta_transform_loads(pm)
+                nvidia.passes.hopper.add_2cta_insert_sync(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
         use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule

@@ -202,4 +202,78 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// 2-CTA Support Passes
+//===----------------------------------------------------------------------===//
+
+def NVGPU2CTAPropagateAttr : Pass<"nvgpu-2cta-propagate-attr", "mlir::ModuleOp"> {
+  let summary = "Propagate two_ctas attribute to TCGen5MMAOp";
+
+  let description = [{
+    This pass propagates the two_ctas attribute from the module configuration
+    to TCGen5MMAOp operations. When the frontend uses `tl.dot(two_ctas=True)`,
+    the cluster-dim-x is set to 2, but AccelerateMatmul does not set two_ctas
+    on the resulting TCGen5MMAOp.
+    
+    This pass detects when cluster-dim-x == 2 and sets two_ctas=true on all
+    TCGen5MMAOp operations that meet the size requirements (M >= 64, N >= 32).
+    
+    This approach is similar to how TLX handles 2-CTA mode - TLX directly creates
+    TCGen5MMAOp with two_ctas=true. For standard Triton, we set it here based on
+    the cluster configuration.
+    
+    This pass should run after `accelerate_matmul` and before
+    `NVGPU2CTATransformLoads`.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp"> {
+  let summary = "Transform loads for 2-CTA mode";
+
+  let description = [{
+    This pass transforms B matrix loads for 2-CTA (pair CTA) mode. When a
+    `TCGen5MMAOp` has the `two_ctas` attribute set, this pass:
+    
+    1. Inserts `ClusterCTAIdOp` to get the CTA rank within the cluster
+    2. Computes the CTA's portion of the B matrix (CTA 0 loads first half,
+       CTA 1 loads second half)
+    3. Modifies B matrix TMA loads to load only `BLOCK_N/2` columns with
+       appropriate offset based on CTA rank
+    
+    This pass should run after `accelerate_matmul` which converts `tt.dot` to
+    `TCGen5MMAOp`, and before warp specialization passes.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
+def NVGPU2CTAInsertSync : Pass<"nvgpu-2cta-insert-sync", "mlir::ModuleOp"> {
+  let summary = "Insert cross-CTA synchronization for 2-CTA mode";
+
+  let description = [{
+    This pass inserts the cross-CTA synchronization pattern required for 2-CTA
+    MMA operations. The synchronization follows the "arrive remote, wait local"
+    pattern:
+    
+    1. Each CTA arrives on the leader CTA's barrier (using `MapToRemoteBufferOp`
+       and `ArriveBarrierOp`)
+    2. The leader CTA (rank 0 in each pair) waits for both CTAs to arrive
+    3. After the barrier, both CTAs execute the 2-CTA MMA instruction
+    
+    This pass should run after `NVGPU2CTATransformLoads` and before the
+    pipeline pass.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvgpu::NVGPUDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES
