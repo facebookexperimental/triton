@@ -4,6 +4,14 @@ import torch
 
 import triton
 
+from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
+    matmul as _tlx_matmul_ws, )
+from triton.language.extra.tlx.tutorials.blackwell_gemm_clc import (
+    matmul as _tlx_matmul_clc, )
+from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
+    matmul as _tlx_matmul_pipelined, )
+from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
+    matmul as _tlx_matmul_2cta, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws_persist_b import (
     matmul as _tlx_matmul_persist_b, )
 
@@ -13,10 +21,10 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 # Registry of available matmul implementations
 MATMUL_METHODS = {
-    # "ws": _tlx_matmul_ws,
-    # "clc": _tlx_matmul_clc,
-    # "pipelined": _tlx_matmul_pipelined,
-    # "2cta": _tlx_matmul_2cta,
+    "ws": _tlx_matmul_ws,
+    "clc": _tlx_matmul_clc,
+    "pipelined": _tlx_matmul_pipelined,
+    "2cta": _tlx_matmul_2cta,
     "persist_b": _tlx_matmul_persist_b,
 }
 
