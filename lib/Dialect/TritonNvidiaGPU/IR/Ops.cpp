@@ -935,6 +935,303 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, subsliceType, alloc, offset);
 }
 
+// -- SubtiledRegionOp --
+LogicalResult SubtiledRegionOp::verify() {
+  // 0. Setup and tile regions must have exactly one basic block.
+  if (!getSetupRegion().hasOneBlock())
+    return emitOpError("setup region must have exactly one block");
+  if (!getTileRegion().hasOneBlock())
+    return emitOpError("tile region must have exactly one block");
+
+  // 1. Setup region terminates with SubtiledRegionYieldOp
+  auto &setupBlock = getSetupRegion().front();
+  if (!isa<SubtiledRegionYieldOp>(setupBlock.getTerminator()))
+    return emitOpError("setup region must terminate with "
+                       "'ttng.subtiled_region_yield'");
+
+  // 2. Tile region terminates with SubtiledRegionYieldOp
+  auto &tileBlock = getTileRegion().front();
+  if (!isa<SubtiledRegionYieldOp>(tileBlock.getTerminator()))
+    return emitOpError("tile region must terminate with "
+                       "'ttng.subtiled_region_yield'");
+
+  auto setupYieldOp = cast<SubtiledRegionYieldOp>(setupBlock.getTerminator());
+  unsigned numSetupOutputs = setupYieldOp.getResults().size();
+  unsigned numTileArgs = tileBlock.getNumArguments();
+
+  // 3. Infer number of tiles from setup outputs and tile block args.
+  //    Tile block args must be > 0, and setup outputs must be divisible.
+  if (numTileArgs == 0)
+    return emitOpError("tile region must have at least one block argument");
+  if (numSetupOutputs == 0)
+    return emitOpError("setup region must yield at least one value");
+  if (numSetupOutputs % numTileArgs != 0)
+    return emitOpError("setup region yields ")
+           << numSetupOutputs
+           << " values, which is not divisible by the number of tile block "
+              "arguments ("
+           << numTileArgs << ")";
+  unsigned numTiles = numSetupOutputs / numTileArgs;
+
+  // 4. Type check: setup outputs must match tile block arg types (repeating)
+  for (unsigned i = 0; i < numSetupOutputs; ++i) {
+    unsigned argPos = i % numTileArgs;
+    Type setupType = setupYieldOp.getResults()[i].getType();
+    Type tileArgType = tileBlock.getArgument(argPos).getType();
+    if (setupType != tileArgType)
+      return emitOpError("type mismatch: setup output ")
+             << i << " has type " << setupType << " but tile block arg "
+             << argPos << " has type " << tileArgType;
+  }
+
+  // 5-7. Validate barrier annotations
+  unsigned numBarriers = getBarriers().size();
+  unsigned numPhases = getBarrierPhases().size();
+  unsigned numTileOps = llvm::range_size(tileBlock.without_terminator());
+  for (auto [i, attr] : llvm::enumerate(getBarrierAnnotations())) {
+    auto annotation = dyn_cast<BarrierAnnotationAttr>(attr);
+    if (!annotation)
+      return emitOpError("barrierAnnotations[")
+             << i << "] must be a BarrierAnnotationAttr";
+
+    // 5. barrierIdx in range
+    if (annotation.getBarrierIdx() >= numBarriers)
+      return emitOpError("barrierAnnotations[")
+             << i << "] has barrierIdx=" << annotation.getBarrierIdx()
+             << " but there are only " << numBarriers << " barriers";
+
+    // 6. For wait_barrier, check phase exists
+    if (annotation.getBarrierOpKind().getValue() == "wait_barrier") {
+      if (annotation.getBarrierIdx() >= numPhases)
+        return emitOpError("barrierAnnotations[")
+               << i << "] is a wait_barrier with barrierIdx="
+               << annotation.getBarrierIdx() << " but there are only "
+               << numPhases << " phases";
+    }
+
+    // 7. targetOpIdx in range
+    if (annotation.getTargetOpIdx() >= numTileOps)
+      return emitOpError("barrierAnnotations[")
+             << i << "] has targetOpIdx=" << annotation.getTargetOpIdx()
+             << " but tile block has only " << numTileOps << " ops";
+
+    // Validate barrierOpKind is one of the known values
+    StringRef kind = annotation.getBarrierOpKind().getValue();
+    if (kind != "wait_barrier" && kind != "arrive_barrier")
+      return emitOpError("barrierAnnotations[")
+             << i << "] has unknown barrierOpKind '" << kind << "'";
+  }
+
+  // 8. Validate teardown region and tile yield interaction
+  auto tileYieldOp = cast<SubtiledRegionYieldOp>(tileBlock.getTerminator());
+  unsigned numTileYieldOperands = tileYieldOp.getResults().size();
+  bool hasTeardown = !getTeardownRegion().empty();
+
+  if (numTileYieldOperands > 0) {
+    // Tile yields values => teardown region must be present
+    if (!hasTeardown)
+      return emitOpError(
+          "tile region yields values but no teardown region is present");
+
+    if (!getTeardownRegion().hasOneBlock())
+      return emitOpError("teardown region must have exactly one block");
+
+    auto &teardownBlock = getTeardownRegion().front();
+    if (!isa<SubtiledRegionYieldOp>(teardownBlock.getTerminator()))
+      return emitOpError("teardown region must terminate with "
+                         "'ttng.subtiled_region_yield'");
+
+    // Teardown block arg count must equal K * N (numTiles *
+    // numTileYieldOperands)
+    unsigned totalTileYields = numTiles * numTileYieldOperands;
+    unsigned numTeardownArgs = teardownBlock.getNumArguments();
+    if (numTeardownArgs != totalTileYields)
+      return emitOpError("teardown region has ")
+             << numTeardownArgs << " block arguments but expected "
+             << totalTileYields << " (numTiles=" << numTiles
+             << " * numTileYields=" << numTileYieldOperands << ")";
+
+    // Type check: teardown block args must match tile yield types in order
+    for (unsigned i = 0; i < numTeardownArgs; ++i) {
+      unsigned yieldPos = i % numTileYieldOperands;
+      Type tileYieldType = tileYieldOp.getResults()[yieldPos].getType();
+      Type teardownArgType = teardownBlock.getArgument(i).getType();
+      if (tileYieldType != teardownArgType)
+        return emitOpError("teardown block arg ")
+               << i << " has type " << teardownArgType
+               << " but tile yield operand " << yieldPos << " has type "
+               << tileYieldType;
+    }
+
+    // Teardown yield count == op result count
+    auto teardownYieldOp =
+        cast<SubtiledRegionYieldOp>(teardownBlock.getTerminator());
+    unsigned numTeardownYields = teardownYieldOp.getResults().size();
+    unsigned numResults = getNumResults();
+    if (numTeardownYields != numResults)
+      return emitOpError("teardown region yields ")
+             << numTeardownYields << " values but op has " << numResults
+             << " results";
+
+    // Teardown yield types == op result types
+    for (auto [i, pair] : llvm::enumerate(llvm::zip(
+             teardownYieldOp.getResults().getTypes(), getResultTypes()))) {
+      if (std::get<0>(pair) != std::get<1>(pair))
+        return emitOpError("teardown yield type ")
+               << std::get<0>(pair) << " at position " << i
+               << " doesn't match op result type " << std::get<1>(pair);
+    }
+  } else {
+    // Tile yields nothing => no teardown, no results
+    if (hasTeardown)
+      return emitOpError(
+          "teardown region is present but tile region yields no values");
+    if (getNumResults() > 0)
+      return emitOpError("op has results but tile region yields no values");
+  }
+
+  return success();
+}
+
+void SubtiledRegionOp::print(OpAsmPrinter &p) {
+  // Print barriers
+  if (!getBarriers().empty()) {
+    p << " barriers(";
+    llvm::interleaveComma(getBarriers(), p,
+                          [&](Value v) { p.printOperand(v); });
+    p << " : ";
+    llvm::interleaveComma(getBarriers().getTypes(), p,
+                          [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+
+  // Print phases
+  if (!getBarrierPhases().empty()) {
+    p << " phases(";
+    llvm::interleaveComma(getBarrierPhases(), p,
+                          [&](Value v) { p.printOperand(v); });
+    p << " : ";
+    llvm::interleaveComma(getBarrierPhases().getTypes(), p,
+                          [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+
+  // Print barrierAnnotations
+  p << " barrier_annotations = ";
+  p.printAttribute(getBarrierAnnotations());
+
+  // Print attr-dict (excluding our custom attrs and operand segment sizes)
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          {"barrierAnnotations", getOperandSegmentSizeAttr()});
+
+  // Print setup region
+  p << " setup ";
+  p.printRegion(getSetupRegion(), /*printEntryBlockArgs=*/false);
+
+  // Print tile region with block args
+  p << " tile";
+  p.printRegion(getTileRegion(), /*printEntryBlockArgs=*/true);
+
+  // Print teardown region (if non-empty)
+  if (!getTeardownRegion().empty()) {
+    p << " teardown";
+    p.printRegion(getTeardownRegion(), /*printEntryBlockArgs=*/true);
+  }
+
+  // Print result types
+  if (getNumResults() > 0) {
+    p << " -> (";
+    llvm::interleaveComma(getResultTypes(), p, [&](Type t) { p.printType(t); });
+    p << ")";
+  }
+}
+
+ParseResult SubtiledRegionOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  SmallVector<OpAsmParser::UnresolvedOperand> barrierOperands;
+  SmallVector<Type> barrierTypes;
+  SmallVector<OpAsmParser::UnresolvedOperand> phaseOperands;
+  SmallVector<Type> phaseTypes;
+
+  // Parse optional barriers(...)
+  if (succeeded(parser.parseOptionalKeyword("barriers"))) {
+    if (parser.parseLParen() || parser.parseOperandList(barrierOperands) ||
+        parser.parseColonTypeList(barrierTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  // Parse optional phases(...)
+  if (succeeded(parser.parseOptionalKeyword("phases"))) {
+    if (parser.parseLParen() || parser.parseOperandList(phaseOperands) ||
+        parser.parseColonTypeList(phaseTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  // Parse barrier_annotations = <attr>
+  Attribute barrierAnnotationsAttr;
+  if (parser.parseKeyword("barrier_annotations") || parser.parseEqual() ||
+      parser.parseAttribute(barrierAnnotationsAttr))
+    return failure();
+  result.addAttribute("barrierAnnotations", barrierAnnotationsAttr);
+
+  // Parse optional attr-dict
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperands(barrierOperands, barrierTypes,
+                             parser.getCurrentLocation(), result.operands) ||
+      parser.resolveOperands(phaseOperands, phaseTypes,
+                             parser.getCurrentLocation(), result.operands))
+    return failure();
+
+  // Set operand segment sizes
+  result.addAttribute(SubtiledRegionOp::getOperandSegmentSizeAttr(),
+                      parser.getBuilder().getDenseI32ArrayAttr(
+                          {static_cast<int32_t>(barrierOperands.size()),
+                           static_cast<int32_t>(phaseOperands.size())}));
+
+  // Parse setup region
+  if (parser.parseKeyword("setup"))
+    return failure();
+  Region *setupRegion = result.addRegion();
+  if (parser.parseRegion(*setupRegion))
+    return failure();
+
+  // Parse tile region with block arguments
+  if (parser.parseKeyword("tile"))
+    return failure();
+  SmallVector<OpAsmParser::Argument> tileArgs;
+  if (parser.parseArgumentList(tileArgs, OpAsmParser::Delimiter::Paren,
+                               /*allowType=*/true))
+    return failure();
+  Region *tileRegion = result.addRegion();
+  if (parser.parseRegion(*tileRegion, tileArgs))
+    return failure();
+
+  // Parse optional teardown region
+  Region *teardownRegion = result.addRegion();
+  if (succeeded(parser.parseOptionalKeyword("teardown"))) {
+    SmallVector<OpAsmParser::Argument> teardownArgs;
+    if (parser.parseArgumentList(teardownArgs, OpAsmParser::Delimiter::Paren,
+                                 /*allowType=*/true))
+      return failure();
+    if (parser.parseRegion(*teardownRegion, teardownArgs))
+      return failure();
+  }
+
+  // Parse optional result types: -> (type, ...)
+  if (succeeded(parser.parseOptionalArrow())) {
+    SmallVector<Type> resultTypes;
+    if (parser.parseLParen() || parser.parseTypeList(resultTypes) ||
+        parser.parseRParen())
+      return failure();
+    result.addTypes(resultTypes);
+  }
+
+  return success();
+}
+
 // -- TensormapCreateOp --
 LogicalResult TensormapCreateOp::verify() {
   auto rank = getBoxDim().size();
