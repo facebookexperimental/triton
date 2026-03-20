@@ -338,8 +338,9 @@ static bool getBackwardSliceToPartition(Value v,
       unsigned remappedDim =
           remappedSqueezedDim(inputShape, outputShape, currentDim, true);
       if (!getBackwardSliceToPartition(loadOp.getDesc(), partitionScheme,
-                                       remappedDim))
+                                       remappedDim)) {
         return false;
+      }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
@@ -349,8 +350,10 @@ static bool getBackwardSliceToPartition(Value v,
                    nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
                    ReshapeOp>(op)) {
       for (Value operand : op->getOperands())
-        if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
+        if (!getBackwardSliceToPartition(operand, partitionScheme,
+                                         currentDim)) {
           return false;
+        }
     } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
       if (!getBackwardSliceToPartition(currentDim == 0 ? Value(dotOp.getA())
                                                        : dotOp.getB(),
@@ -363,11 +366,13 @@ static bool getBackwardSliceToPartition(Value v,
     } else if (auto dotOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(op)) {
       if (!getBackwardSliceToPartition(currentDim == 0 ? dotOp.getA()
                                                        : dotOp.getB(),
-                                       partitionScheme, currentDim))
+                                       partitionScheme, currentDim)) {
         return false;
+      }
       if (!getBackwardSliceToPartition(dotOp.getD(), partitionScheme,
-                                       currentDim))
+                                       currentDim)) {
         return false;
+      }
       partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
     } else if (isa<ttng::ReinterpretTensorDescOp, MakeTensorDescOp>(op)) {
       return true;
@@ -387,12 +392,14 @@ static bool getBackwardSliceToPartition(Value v,
       partitionScheme.opPartitionDims[ifOp.elseYield()] = currentDim;
       auto thenYieldArg = ifOp.thenYield().getOperand(resultIndex);
       auto elseYieldArg = ifOp.elseYield().getOperand(resultIndex);
-      if (getBackwardSliceToPartition(thenYieldArg, partitionScheme,
-                                      currentDim))
+      if (!getBackwardSliceToPartition(thenYieldArg, partitionScheme,
+                                       currentDim)) {
         return false;
+      }
       if (!getBackwardSliceToPartition(elseYieldArg, partitionScheme,
-                                       currentDim))
+                                       currentDim)) {
         return false;
+      }
     } else {
       llvm_unreachable("Unexpected op");
     }
@@ -403,20 +410,23 @@ static bool getBackwardSliceToPartition(Value v,
     if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
       // track initial value
       auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
-      if (!getBackwardSliceToPartition(initArg, partitionScheme, currentDim))
+      if (!getBackwardSliceToPartition(initArg, partitionScheme, currentDim)) {
         return false;
+      }
       // track yield value
       auto yieldArg = forOp.getYieldedValues()[bbArg.getArgNumber() - 1];
-      if (!getBackwardSliceToPartition(yieldArg, partitionScheme, currentDim))
+      if (!getBackwardSliceToPartition(yieldArg, partitionScheme, currentDim)) {
         return false;
+      }
     } else if (isa<triton::FuncOp>(bbAargOwner)) {
       if (isa<TensorDescType>(bbArg.getType())) {
         unsigned argIndex = bbArg.getArgNumber();
         auto it = partitionScheme.funcArgPartitionDims.find(argIndex);
         if (it != partitionScheme.funcArgPartitionDims.end()) {
           // Same arg reached again; must agree on dimension.
-          if (it->second != currentDim)
+          if (it->second != currentDim) {
             return false;
+          }
         } else {
           partitionScheme.funcArgPartitionDims[argIndex] = currentDim;
         }
@@ -565,8 +575,9 @@ static bool getForwardSliceToPartition(Value v,
 static bool getSliceToPartition(Value root,
                                 DataPartitionScheme &partitionScheme,
                                 unsigned currentDim) {
-  if (!getBackwardSliceToPartition(root, partitionScheme, currentDim))
+  if (!getBackwardSliceToPartition(root, partitionScheme, currentDim)) {
     return false;
+  }
   DataPartitionScheme forwardPartitionScheme = partitionScheme;
   DenseSet<Value> seen;
   bool forwardSuccess = getForwardSliceToPartition(root, forwardPartitionScheme,
@@ -1359,12 +1370,22 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       }
     }
   } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+    // For ForOp yields, only append sliced yield operands for positions where
+    // the parent ForOp actually added a new init arg. The ForOp slicing records
+    // new args via mappings on ForOp results. If a yield value was mapped
+    // (sliced inside the loop) but the corresponding ForOp init arg was NOT
+    // mapped (not sliced outside the loop), appending would create a
+    // type/ordering mismatch between init args and yield operands.
+    auto parentForOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
     int num = yieldOp.getNumOperands();
     for (int i = 0; i < num; i++) {
       auto operand = yieldOp.getOperand(i);
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
-      if (auto newV = mappings.lookupOrNull(operand))
-        yieldOp->insertOperands(op->getNumOperands(), newV);
+      if (auto newV = mappings.lookupOrNull(operand)) {
+        // Only append if the parent ForOp also has a corresponding new result.
+        if (!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i)))
+          yieldOp->insertOperands(op->getNumOperands(), newV);
+      }
     }
     newOp = op;
   } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
@@ -1435,6 +1456,14 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
       if (!isMemoryEffectFree(op))
         opsCanBeTriviallyDead.insert(op);
 
+      // Don't delete ForOps or IfOps directly. After slicing, the only
+      // ForOps/IfOps remaining in the partition scheme are the final sliced
+      // versions (originals were erased via "to_be_removed"). These contain
+      // the partitioned ops and must be preserved. Let the canonicalization
+      // patterns handle dead argument elimination instead.
+      if (isa<scf::ForOp, scf::IfOp>(op))
+        return;
+
       bool notUsed = true;
       for (auto result : op->getResults()) {
         if (!result.getUsers().empty()) {
@@ -1482,6 +1511,58 @@ static bool doDeepCleanup(triton::FuncOp &funcOp,
     }
   } while (!opsToDelete.empty());
   return true;
+}
+
+/// Check if a value is effectively a splat constant by tracing through
+/// element-preserving ops (convert_layout, truncf, extf, split). Returns the
+/// splat element Attribute in the target value's element type, or nullopt.
+static std::optional<Attribute> getEffectiveSplatAttr(Value v) {
+  // Direct constant.
+  if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+    auto valAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
+    if (valAttr && valAttr.isSplat())
+      return valAttr.getSplatValue<Attribute>();
+    return std::nullopt;
+  }
+  // convert_layout preserves values and element type.
+  if (auto convertOp = v.getDefiningOp<ConvertLayoutOp>())
+    return getEffectiveSplatAttr(convertOp.getSrc());
+  // truncf preserves splatness; convert the element value.
+  if (auto truncOp = v.getDefiningOp<arith::TruncFOp>()) {
+    auto srcAttr = getEffectiveSplatAttr(truncOp.getIn());
+    if (!srcAttr)
+      return std::nullopt;
+    auto srcFloat = dyn_cast<FloatAttr>(*srcAttr);
+    if (!srcFloat)
+      return std::nullopt;
+    auto dstElemType = cast<FloatType>(
+        cast<RankedTensorType>(truncOp.getType()).getElementType());
+    bool losesInfo;
+    APFloat trunced = srcFloat.getValue();
+    trunced.convert(dstElemType.getFloatSemantics(),
+                    APFloat::rmNearestTiesToEven, &losesInfo);
+    return FloatAttr::get(dstElemType, trunced);
+  }
+  // extf preserves splatness; convert the element value.
+  if (auto extOp = v.getDefiningOp<arith::ExtFOp>()) {
+    auto srcAttr = getEffectiveSplatAttr(extOp.getIn());
+    if (!srcAttr)
+      return std::nullopt;
+    auto srcFloat = dyn_cast<FloatAttr>(*srcAttr);
+    if (!srcFloat)
+      return std::nullopt;
+    auto dstElemType = cast<FloatType>(
+        cast<RankedTensorType>(extOp.getType()).getElementType());
+    bool losesInfo;
+    APFloat extended = srcFloat.getValue();
+    extended.convert(dstElemType.getFloatSemantics(),
+                     APFloat::rmNearestTiesToEven, &losesInfo);
+    return FloatAttr::get(dstElemType, extended);
+  }
+  // split preserves values and element type.
+  if (auto splitOp = v.getDefiningOp<SplitOp>())
+    return getEffectiveSplatAttr(splitOp.getSrc());
+  return std::nullopt;
 }
 
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
@@ -1570,6 +1651,80 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   });
 
   fixTaskId(funcOp);
+
+  // Handle unpartitioned descriptor_store ops that reference func args we're
+  // about to modify. This can happen when there are multiple store paths and
+  // only one of them includes the dot. For example, with FLATTEN=True the
+  // persistent GEMM kernel creates an if condition when k_tiles==0 that
+  // is just a store.
+  for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
+    auto &entryBlock = funcOp.getBlocks().front();
+    auto bbArg = entryBlock.getArgument(argIndex);
+    auto descType = cast<TensorDescType>(bbArg.getType());
+    auto blockType = descType.getBlockType();
+    int64_t slicedSize =
+        blockType.getShape()[dim] / partitionScheme.numPartitions;
+
+    SmallVector<DescriptorStoreOp> unpartitionedStores;
+    for (Operation *user : bbArg.getUsers()) {
+      if (auto descStoreOp = dyn_cast<DescriptorStoreOp>(user)) {
+        if (!partitionScheme.isPartitioned(descStoreOp)) {
+          // Skip stores whose source is already the sliced size — these
+          // were created by the partition pass itself.
+          auto srcType = cast<RankedTensorType>(descStoreOp.getSrc().getType());
+          if (srcType.getShape()[dim] == slicedSize)
+            continue;
+          unpartitionedStores.push_back(descStoreOp);
+        }
+      }
+    }
+
+    for (auto descStoreOp : unpartitionedStores) {
+      OpBuilder builder(descStoreOp);
+      Value src = descStoreOp.getSrc();
+      auto srcType = cast<RankedTensorType>(src.getType());
+      SmallVector<int64_t> srcShape(srcType.getShape());
+
+      // Compute the sliced source type.
+      SmallVector<int64_t> slicedShape(srcShape);
+      slicedShape[dim] = slicedSize;
+      auto slicedSrcType = RankedTensorType::get(
+          slicedShape, srcType.getElementType(), srcType.getEncoding());
+
+      // Create sliced source value. For splat constants (including values
+      // derived from splat constants through element-preserving ops like
+      // convert_layout, truncf, and split), create a new constant with the
+      // sliced shape. For other sources, bail out.
+      Value slicedSrc;
+      if (auto splatAttr = getEffectiveSplatAttr(src)) {
+        auto slicedValType = RankedTensorType::get(
+            slicedShape, srcType.getElementType(), srcType.getEncoding());
+        auto slicedValAttr = DenseElementsAttr::get(slicedValType, *splatAttr);
+        slicedSrc = builder.create<arith::ConstantOp>(descStoreOp.getLoc(),
+                                                      slicedValAttr);
+      }
+
+      if (!slicedSrc) {
+        LDBG("Cannot slice non-splat source of unpartitioned descriptor_store");
+        return false;
+      }
+
+      // Create numPartitions replacement stores with adjusted coordinates.
+      for (int i = 0; i < partitionScheme.numPartitions; i++) {
+        SmallVector<Value> indices(descStoreOp.getIndices());
+        if (i > 0) {
+          Value offset = builder.create<arith::ConstantIntOp>(
+              descStoreOp.getLoc(), i * slicedSize, 32);
+          indices[dim] = builder.create<arith::AddIOp>(descStoreOp.getLoc(),
+                                                       indices[dim], offset);
+        }
+        builder.create<DescriptorStoreOp>(
+            descStoreOp.getLoc(), descStoreOp.getDesc(), slicedSrc, indices);
+      }
+
+      descStoreOp.erase();
+    }
+  }
 
   // Update function argument types for host-side TMA descriptors.
   if (!partitionScheme.funcArgPartitionDims.empty()) {
