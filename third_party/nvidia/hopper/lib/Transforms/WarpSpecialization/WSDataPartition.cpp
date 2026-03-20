@@ -306,9 +306,6 @@ static bool getBackwardSliceToPartition(Value v,
             LDBG("dim " << currentDim);
             op->dump();
           });
-          llvm::errs() << "[DEBUG-DP] backward: incompatible remat, dim="
-                       << currentDim << "\n";
-          op->dump();
           return false;
         }
       }
@@ -342,7 +339,6 @@ static bool getBackwardSliceToPartition(Value v,
           remappedSqueezedDim(inputShape, outputShape, currentDim, true);
       if (!getBackwardSliceToPartition(loadOp.getDesc(), partitionScheme,
                                        remappedDim)) {
-        llvm::errs() << "[DEBUG-DP] backward: DescriptorLoadOp failed\n";
         return false;
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
@@ -356,10 +352,6 @@ static bool getBackwardSliceToPartition(Value v,
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme,
                                          currentDim)) {
-          llvm::errs()
-              << "[DEBUG-DP] backward: elementwise/misc op failed, dim="
-              << currentDim << "\n";
-          op->dump();
           return false;
         }
     } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
@@ -375,15 +367,10 @@ static bool getBackwardSliceToPartition(Value v,
       if (!getBackwardSliceToPartition(currentDim == 0 ? dotOp.getA()
                                                        : dotOp.getB(),
                                        partitionScheme, currentDim)) {
-        llvm::errs() << "[DEBUG-DP] backward: TCGen5MMA operand failed, dim="
-                     << currentDim << "\n";
         return false;
       }
       if (!getBackwardSliceToPartition(dotOp.getD(), partitionScheme,
                                        currentDim)) {
-        llvm::errs()
-            << "[DEBUG-DP] backward: TCGen5MMA accumulator(D) failed, dim="
-            << currentDim << "\n";
         return false;
       }
       partitionScheme.dotPartitionOperand[dotOp] = currentDim == 0 ? 0 : 1;
@@ -407,21 +394,13 @@ static bool getBackwardSliceToPartition(Value v,
       auto elseYieldArg = ifOp.elseYield().getOperand(resultIndex);
       if (!getBackwardSliceToPartition(thenYieldArg, partitionScheme,
                                        currentDim)) {
-        llvm::errs() << "[DEBUG-DP] backward: scf.if then-branch failed, dim="
-                     << currentDim << "\n";
-        ifOp->dump();
         return false;
       }
       if (!getBackwardSliceToPartition(elseYieldArg, partitionScheme,
                                        currentDim)) {
-        llvm::errs() << "[DEBUG-DP] backward: scf.if else-branch failed, dim="
-                     << currentDim << "\n";
-        ifOp->dump();
         return false;
       }
     } else {
-      llvm::errs() << "[DEBUG-DP] backward: UNEXPECTED OP:\n";
-      op->dump();
       llvm_unreachable("Unexpected op");
     }
   } else {
@@ -432,15 +411,11 @@ static bool getBackwardSliceToPartition(Value v,
       // track initial value
       auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
       if (!getBackwardSliceToPartition(initArg, partitionScheme, currentDim)) {
-        llvm::errs() << "[DEBUG-DP] backward: forOp init arg failed, argNum="
-                     << bbArg.getArgNumber() << " dim=" << currentDim << "\n";
         return false;
       }
       // track yield value
       auto yieldArg = forOp.getYieldedValues()[bbArg.getArgNumber() - 1];
       if (!getBackwardSliceToPartition(yieldArg, partitionScheme, currentDim)) {
-        llvm::errs() << "[DEBUG-DP] backward: forOp yield arg failed, argNum="
-                     << bbArg.getArgNumber() << " dim=" << currentDim << "\n";
         return false;
       }
     } else if (isa<triton::FuncOp>(bbAargOwner)) {
@@ -450,10 +425,6 @@ static bool getBackwardSliceToPartition(Value v,
         if (it != partitionScheme.funcArgPartitionDims.end()) {
           // Same arg reached again; must agree on dimension.
           if (it->second != currentDim) {
-            llvm::errs()
-                << "[DEBUG-DP] backward: funcArg dim mismatch, argIndex="
-                << argIndex << " existing=" << it->second
-                << " current=" << currentDim << "\n";
             return false;
           }
         } else {
@@ -605,9 +576,6 @@ static bool getSliceToPartition(Value root,
                                 DataPartitionScheme &partitionScheme,
                                 unsigned currentDim) {
   if (!getBackwardSliceToPartition(root, partitionScheme, currentDim)) {
-    llvm::errs() << "[DEBUG-DP] getSliceToPartition: backward slice failed for "
-                    "root, dim="
-                 << currentDim << "\n";
     return false;
   }
   DataPartitionScheme forwardPartitionScheme = partitionScheme;
@@ -731,8 +699,6 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
     auto shapePerCTA = getShapePerCTA(dotType);
     if (shapePerCTA.size() != 2) {
       LDBG("partition not possible: shapePerCTA " << shapePerCTA.size());
-      llvm::errs() << "[DEBUG-DP] shapePerCTA size != 2: " << shapePerCTA.size()
-                   << "\n";
       return false;
     }
     int sliceSizeM = shapePerCTA[0] / partitionScheme.numPartitions;
@@ -779,8 +745,6 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
 
     if (!success) {
       LDBG("partition not possible\n");
-      llvm::errs() << "[DEBUG-DP] partition not possible for dot op\n";
-      op->dump();
       return false;
     }
   }
