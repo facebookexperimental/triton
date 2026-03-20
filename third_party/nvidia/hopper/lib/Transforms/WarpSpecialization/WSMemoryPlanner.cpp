@@ -2885,10 +2885,15 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
          << " smemBudget=" << effectiveSmemBudget
          << " smemCircularReuse=" << effectiveSmemCircularReuse);
     assert(effectiveSmemBudget != 0 && "smem budget is not set");
+    // Parse channel annotations from MMA ops for SMEM pre-assignment.
+    auto mmaAnnotations = parseChannelAnnotations(funcOp);
+    DenseMap<Operation *, ChannelAnnotation> smemAllocAnnotations;
+    if (!mmaAnnotations.empty())
+      smemAllocAnnotations = buildAllocToAnnotationMap(channels, mmaAnnotations);
+
     bufferId =
         allocateSmemBuffers(funcOp, channels, numBuffers, effectiveSmemBudget,
-                            effectiveSmemCircularReuse,
-                            DenseMap<Operation *, ChannelAnnotation>());
+                            effectiveSmemCircularReuse, smemAllocAnnotations);
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");
