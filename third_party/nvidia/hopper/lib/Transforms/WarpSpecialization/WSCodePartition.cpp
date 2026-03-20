@@ -1985,12 +1985,39 @@ DenseMap<Channel *, Value> createBufferPost(
       users.push_back(user);
     DenseMap<Operation *, Value> userToBufIdx;
     int reuseGrp = channelInReuseGroup(channel, config);
+
+    bool isOperandDTmem = false;
+    if (channel->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(channel);
+      isOperandDTmem = tmemCh->isOperandD;
+    }
+
     for (auto *user : users) {
       Value bufferIdx;
       Value _phase = Value();
       OpBuilderWithAsyncTaskIds builder(user);
       builder.clearLoopScheduleInfo();
-      if (auto forOp = user->getParentOfType<scf::ForOp>()) {
+      if (isOperandDTmem) {
+        // For operandD TMEM users inside a loop with a loop-carried
+        // accumulator token (inner k-loop), the buffer index should not
+        // rotate within that loop. Pass the inner ForOp itself as the 'op'
+        // to getBufferIdxAndPhase so that getAccumCount looks up to the
+        // outer loop for the accumCnt. The builder stays at the user's
+        // position with its task IDs, so arith ops are per-task.
+        auto innerFor = user->getParentOfType<scf::ForOp>();
+        if (innerFor && hasLoopCarriedAccToken(oldAllocOp, innerFor)) {
+          getBufferIdxAndPhase(builder, innerFor.getOperation(), numBuffers,
+                               regionsWithChannels, bufferIdx, _phase, config,
+                               reuseGrp, channel);
+        } else if (innerFor) {
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
+        } else {
+          std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
+              builder, user, channel, oldAllocOp, numBuffers,
+              regionsWithChannels, config, reuseGrp);
+        }
+      } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
@@ -2921,8 +2948,10 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), *commChannel.producerBarrier);
+          auto indexedBarrier = getBarrierForPipelineStage(
+              builder, *commChannel.producerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               indexedBarrier);
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -2995,8 +3024,10 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               consumerBarrier);
+          auto indexedConsumerBarrier =
+              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), indexedConsumerBarrier);
           builder.clearLoopScheduleInfo();
         }
 
@@ -3735,6 +3766,24 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   }
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
+      // If all channels reference the same alloc op, they are lifecycle
+      // phases of one buffer, not distinct buffers reusing memory.
+      Operation *firstAlloc;
+      if (kv.second[0]->channelKind == DataChannelKind::TMEMPost)
+        firstAlloc =
+            static_cast<ttng::TmemDataChannelPost *>(kv.second[0])->allocOp;
+      else
+        firstAlloc = static_cast<ChannelPost *>(kv.second[0])->allocOp;
+      bool allSameAlloc = llvm::all_of(kv.second, [&](Channel *ch) {
+        Operation *alloc =
+            (ch->channelKind == DataChannelKind::TMEMPost)
+                ? static_cast<ttng::TmemDataChannelPost *>(ch)->allocOp
+                : static_cast<ChannelPost *>(ch)->allocOp;
+        return alloc == firstAlloc;
+      });
+      if (allSameAlloc)
+        continue;
+
       ReuseGroup group;
       // make sure the channel without buffer.offset is the first one (i.e the
       // representative channel)

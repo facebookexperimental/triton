@@ -35,6 +35,28 @@ bool enclosing(scf::ForOp forOp, Operation *op) {
   return forOp->isProperAncestor(op);
 }
 
+bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp) {
+  for (auto *user : tmemAlloc->getResult(0).getUsers()) {
+    auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user);
+    if (!mmaOp || !forOp->isProperAncestor(user))
+      continue;
+    Value accDep = mmaOp.getAccDep();
+    if (!accDep)
+      continue;
+    auto blockArg = dyn_cast<BlockArgument>(accDep);
+    if (!blockArg || blockArg.getOwner() != forOp.getBody())
+      continue;
+    // Get the iter_arg index (subtract the induction variable).
+    unsigned argIdx = blockArg.getArgNumber() - forOp.getNumInductionVars();
+    // Check if the yield operand at that position is this MMA's result token.
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    Value token = mmaOp.getToken();
+    if (token && yieldOp.getOperand(argIdx) == token)
+      return true;
+  }
+  return false;
+}
+
 // After createBufferPost, MemDescIndexOp will be used.
 Operation *skipIdxOp(Operation *op) {
   if (auto idx = dyn_cast<triton::gpu::MemDescIndexOp>(op)) {
