@@ -335,8 +335,8 @@ def matmul_kernel_tma_ws_blackwell(
 
             tmem_accum_cnt = 0
             smem_epilogue_cnt = 0
-            pid_n = start_pid % num_pid_m
-            pid_m = start_pid % num_pid_m
+            pid_n = start_pid % num_pid_n
+            pid_m = start_pid // num_pid_n
 
             while pid_m < num_pid_m:
                 swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
@@ -369,7 +369,7 @@ def matmul_kernel_tma_ws_blackwell(
 
             tmem_accum_cnt = 0
             smem_accum_cnt = 0
-            pid_m = start_pid % num_pid_m
+            pid_m = start_pid // num_pid_n
 
             while pid_m < num_pid_m:
                 cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
@@ -395,8 +395,8 @@ def matmul_kernel_tma_ws_blackwell(
                                                                           BLOCK_SIZE_K)
 
             smem_accum_cnt = 0
-            pid_n = start_pid // num_pid_m
-            pid_m = start_pid % num_pid_m
+            pid_n = start_pid % num_pid_n
+            pid_m = start_pid // num_pid_n
             swizzled_pid_m = _swizzle_pid_m(pid_m, num_pid_m, GROUP_SIZE_M)
 
             # First M-tile: load both A and B
