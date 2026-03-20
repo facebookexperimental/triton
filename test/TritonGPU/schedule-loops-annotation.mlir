@@ -2,10 +2,64 @@
 
 // Test that user-provided tt.autows annotations on MMA ops are respected by
 // the scheduleKeyOpsAnnotation path. Each tc_gen5_mma carries a JSON string
-// attribute like tt.autows = "{\"stage\": \"0\", \"cluster\": \"0\"}" that
+// attribute like tt.autows = "{\"stage\": \"0\", \"order\": \"0\"}" that
 // specifies the desired stage and cluster for scheduling.
 
 // CHECK-LABEL: @_attn_bwd_annotated
+// CHECK: scf.for
+
+// --- Cluster 0: loads and address computation (stage 0) ---
+// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32
+// CHECK: tt.load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+
+// --- qkT MMA: stage 0, cluster 0 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32
+
+// --- Cluster 2: qkT result consumption + softmax (stage 0) ---
+// CHECK: ttg.convert_layout {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: arith.subf {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: math.exp2 {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+
+// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: arith.truncf {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+
+// --- dv MMA: stage 0, cluster 2 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32
+
+// CHECK: tt.load {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32
+
+// --- dpT MMA: stage 0, cluster 2 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32
+
+// --- Cluster 1: dpT result consumption + dk/dq operand prep (stage 0) ---
+// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: arith.subf {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: arith.mulf {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: arith.truncf {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+
+// --- dk MMA: stage 1, cluster 1 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32
+
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
+
+// --- dq MMA: stage 1, cluster 1 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32
+
+// --- dq epilogue: tmem_load + reduce (stage 0, cluster 1) ---
+// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: arith.mulf {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.convert_layout {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: tt.descriptor_reduce {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+
+// CHECK: } {tt.scheduled_max_stage = 1 : i32, tt.warp_specialize}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -58,13 +112,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %result_7, %token_8 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %26 = ttng.tmem_store %cst_0, %result_5[%token_6], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %27 = ttng.tmem_store %cst_0, %result_1[%token_2], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // The loop has tt.split_mma to trigger the split-MMA scheduling path,
-    // which will try scheduleKeyOpsAnnotation first.
     %28:7 = scf.for %arg43 = %c0_i32 to %22 step %c1_i32 iter_args(%arg44 = %c0_i32, %arg45 = %false, %arg46 = %token, %arg47 = %27, %arg48 = %token_4, %arg49 = %26, %arg50 = %token_8) -> (i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token)  : i32 {
       %35 = arith.extsi %arg44 : i32 to i64
       %36 = arith.addi %10, %35 : i64
       %37 = arith.trunci %36 : i64 to i32
-      // q descriptor_load with latency (triggers hasLatenciesAssigned)
       %38 = tt.descriptor_load %arg0[%37, %c0_i32] {tt.latency = 1 : i32} : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
       %39 = ttg.local_alloc %38 : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
       %40 = ttg.memdesc_trans %39 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem> -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
@@ -72,29 +123,25 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %42 = arith.addi %41, %23 : tensor<128xi32, #blocked2>
       %43 = tt.addptr %24, %42 : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2>
       %44 = tt.load %43 {tt.latency = 1 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>
-      // qkT MMA: annotated stage 0, cluster 0
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32
-      %45 = ttng.tc_gen5_mma %19, %40, %result[%arg46], %false, %true {tt.autows = "{\"stage\": \"0\", \"cluster\": \"0\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // qkT MMA
+      %45 = ttng.tc_gen5_mma %19, %40, %result[%arg46], %false, %true {tt.autows = "{\"stage\": \"0\", \"order\": \"0\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %46 = ttg.convert_layout %44 : tensor<128xf32, #blocked2> -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
       %47 = tt.expand_dims %46 {axis = 0 : i32} : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xf32, #blocked>
       %48 = tt.broadcast %47 : tensor<1x128xf32, #blocked> -> tensor<128x128xf32, #blocked>
       %result_13, %token_14 = ttng.tmem_load %result[%45] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       %49 = arith.subf %result_13, %48 : tensor<128x128xf32, #blocked>
       %50 = math.exp2 %49 : tensor<128x128xf32, #blocked>
-      // do descriptor_load with latency
       %51 = tt.descriptor_load %arg16[%37, %c0_i32] {tt.latency = 1 : i32} : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
       %52 = ttg.local_alloc %51 : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
       %53 = arith.truncf %50 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
       %result_15 = ttng.tmem_alloc %53 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>
-      // dv MMA: annotated stage 0, cluster 2
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32
-      %54 = ttng.tc_gen5_mma %result_15, %52, %result_1[%arg47], %arg45, %true {tt.autows = "{\"stage\": \"0\", \"cluster\": \"2\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // dv MMA
+      %54 = ttng.tc_gen5_mma %result_15, %52, %result_1[%arg47], %arg45, %true {tt.autows = "{\"stage\": \"0\", \"order\": \"2\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %55 = tt.addptr %25, %42 : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2>
       %56 = tt.load %55 {tt.latency = 1 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>
       %57 = ttg.memdesc_trans %52 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem> -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
-      // dpT MMA: annotated stage 0, cluster 2
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32
-      %58 = ttng.tc_gen5_mma %21, %57, %result_3[%arg48], %false, %true {tt.autows = "{\"stage\": \"0\", \"cluster\": \"2\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // dpT MMA
+      %58 = ttng.tc_gen5_mma %21, %57, %result_3[%arg48], %false, %true {tt.autows = "{\"stage\": \"0\", \"order\": \"2\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %59 = ttg.convert_layout %56 : tensor<128xf32, #blocked2> -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
       %60 = tt.expand_dims %59 {axis = 0 : i32} : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xf32, #blocked>
       %61 = tt.broadcast %60 : tensor<1x128xf32, #blocked> -> tensor<128x128xf32, #blocked>
@@ -103,14 +150,12 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %63 = arith.mulf %50, %62 : tensor<128x128xf32, #blocked>
       %64 = arith.truncf %63 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
       %result_18 = ttng.tmem_alloc %64 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>
-      // dk MMA: annotated stage 1, cluster 1
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32
-      %65 = ttng.tc_gen5_mma %result_18, %39, %result_5[%arg49], %arg45, %true {tt.autows = "{\"stage\": \"1\", \"cluster\": \"1\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // dk MMA
+      %65 = ttng.tc_gen5_mma %result_18, %39, %result_5[%arg49], %arg45, %true {tt.autows = "{\"stage\": \"1\", \"order\": \"1\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %66 = ttg.local_alloc %64 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
       %67 = ttg.memdesc_trans %66 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared2, #smem> -> !ttg.memdesc<128x128xbf16, #shared, #smem>
-      // dq MMA: annotated stage 1, cluster 1
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32
-      %68 = ttng.tc_gen5_mma %67, %19, %result_7[%arg50], %false, %true {tt.autows = "{\"stage\": \"1\", \"cluster\": \"1\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // dq MMA
+      %68 = ttng.tc_gen5_mma %67, %19, %result_7[%arg50], %false, %true {tt.autows = "{\"stage\": \"1\", \"order\": \"1\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %result_19, %token_20 = ttng.tmem_load %result_7[%68] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       %69 = arith.mulf %result_19, %cst : tensor<128x128xf32, #blocked>
       %70 = ttg.convert_layout %69 : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked1>
