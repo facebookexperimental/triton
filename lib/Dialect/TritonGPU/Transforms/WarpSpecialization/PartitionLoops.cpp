@@ -324,7 +324,18 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         continue;
       }
 
-      for (size_t idx : partitionIndices) {
+      // For yields inside if-ops, restrict to the if-op's partition set.
+      // The yield op itself typically has no partition annotation, so
+      // partitionIndices defaults to all partitions. But we must only create
+      // yields for partitions that actually contain the parent if-op,
+      // otherwise the yield is placed in the wrong block.
+      auto yieldPartitionIndices = partitionIndices;
+      if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+        yieldPartitionIndices =
+            getPartitionIds(ifOp.getOperation(), partitions.getNumPartitions());
+      }
+
+      for (size_t idx : yieldPartitionIndices) {
         auto &builder = builders[idx];
         SmallVector<size_t> newOperandIndices;
         if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
