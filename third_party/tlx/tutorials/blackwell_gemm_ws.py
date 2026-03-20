@@ -1296,17 +1296,15 @@ def matmul_kernel_tma_ws_blackwell(
                 tile_id += NUM_SMS
 
 
-def matmul(a, b, config=None, use_heuristic=False):
+def matmul(a, b, config=None):
     """Matrix multiplication using TLX GEMM kernel.
 
     Args:
         a: Input matrix A of shape (M, K)
         b: Input matrix B of shape (K, N)
-        config: Optional dict with kernel config. If None and use_heuristic=True,
-                uses shape-dependent heuristic selection. If heuristic fails,
-                falls back to full autotuning.
-        use_heuristic: When config is None, try heuristic config selection first.
-                      Default True for faster kernel launch.
+        config: Optional dict with kernel config. If None and
+                TLX_GEMM_USE_HEURISTIC=1, uses shape-dependent heuristic
+                selection. If heuristic fails, falls back to full autotuning.
 
     Returns:
         Output matrix C of shape (M, N)
@@ -1327,7 +1325,8 @@ def matmul(a, b, config=None, use_heuristic=False):
 
     NUM_SMS = _get_num_sms()
 
-    # Use heuristic config if no config provided and heuristic is enabled
+    # Use heuristic config if no config provided and env var is set
+    use_heuristic = os.environ.get("TLX_GEMM_USE_HEURISTIC", "0") == "1"
     if config is None and use_heuristic:
         config = get_heuristic_config(M, N, K, NUM_SMS)
         if config is not None and os.environ.get("TRITON_PRINT_AUTOTUNING") == "1":
