@@ -29,7 +29,7 @@ Handled in `WSMemoryPlanner.cpp` Phase 4 (`allocateSmemBuffers`). Requires:
 When these conditions hold, buffer B is given buffer A's `bufferId` and both
 receive the same `numCopies`. The number of copies is then maximized by the
 SMEM memory planner's incremental allocation algorithm described in
-[SMEM Allocation Design](smem_allocation_design.md).
+[SMEM Allocation Design](SmemAllocationDesign.md).
 
 ### TMEM Packing
 

@@ -50,17 +50,7 @@ python your_test.py
 # /tmp/ws_graphs/combined_graph_2.dot
 ```
 
-For the FA backward pass example:
 ```bash
-mkdir -p /tmp/ws_graphs
-cd ~/OpenSource/tritonbench
-TRITON_DUMP_WS_GRAPHS=/tmp/ws_graphs \
-TRITON_USE_META_WS=1 \
-CUDA_VISIBLE_DEVICES=0 \
-python run.py --op blackwell_attentions --seq-len 8192 --batch 4 \
-  --n-heads 32 --d-head 128 --only triton_tutorial_flash_persistent_blackwell \
-  --bwd --force 2>&1 | tail -20
-
 # Clean and render to PNG (strip header/footer markers)
 sed -n '/^digraph/,/^}$/p' /tmp/ws_graphs/smem_liveness_0.dot | dot -Tpng -o /tmp/ws_graphs/smem_liveness.png
 sed -n '/^digraph/,/^}$/p' /tmp/ws_graphs/tmem_liveness_2.dot | dot -Tpng -o /tmp/ws_graphs/tmem_liveness.png
@@ -75,7 +65,6 @@ convert /tmp/ws_graphs/smem_liveness.png /tmp/ws_graphs/tmem_liveness.png \
 
 #### Step 1: Build with Debug Support
 ```bash
-cd ~/MetaMain/triton
 pip install -e . --no-build-isolation
 ```
 
@@ -84,18 +73,6 @@ pip install -e . --no-build-isolation
 TRITON_LLVM_DEBUG_ONLY="nvgpu-ws-memory-planner" \
 MLIR_ENABLE_DUMP=1 \
 python your_test.py 2>&1 | tee output.txt
-```
-
-For the FA backward pass example:
-```bash
-cd ~/OpenSource/tritonbench
-TRITON_LLVM_DEBUG_ONLY="nvgpu-ws-memory-planner" \
-MLIR_ENABLE_DUMP=1 \
-TRITON_USE_META_WS=1 \
-CUDA_VISIBLE_DEVICES=0 \
-python run.py --op blackwell_attentions --seq-len 8192 --batch 4 \
-  --n-heads 32 --d-head 128 --only triton_tutorial_flash_persistent_blackwell \
-  --bwd 2>&1 | tee output.txt
 ```
 
 ### Step 3: Extract DOT Files
