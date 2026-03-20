@@ -51,9 +51,9 @@ LogicalResult insertRequireLayout(ModuleOp m) {
           localLoadOp.dump();
         });
         // Get the shared encoding for this local load op based on the dot op
-        auto encoding = mlir::getSharedEncIfAllUsersAreDotEnc(
-                            localLoadOp->getResult(0))
-                            .value_or(nullptr);
+        auto encoding =
+            mlir::getSharedEncIfAllUsersAreDotEnc(localLoadOp->getResult(0))
+                .value_or(nullptr);
         if (encoding) {
           LLVM_DEBUG({
             llvm::dbgs() << "SwizzledSharedEncodingAttr\n";
