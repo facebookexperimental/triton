@@ -202,4 +202,29 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
   ];
 }
 
+
+def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
+  let summary = "Insert cross-CTA synchronization for 2-CTA MMA operations";
+
+  let description = [{
+    This pass inserts cross-CTA synchronization barriers for TCGen5MMAOp
+    operations that use 2-CTA mode (tcgen05.mma.cta_group::2).
+
+    It implements the "arrive remote, wait local" pattern:
+    - Both CTAs arrive on the leader CTA's barrier
+    - Only the leader CTA (even-ranked) waits
+    - Then both CTAs issue the 2-CTA MMA instruction
+
+    This pattern is compatible with warp specialization because the sync
+    ops are inserted after the pipeline pass, and the MMA hardware handles
+    the actual cross-CTA execution synchronization.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect"
+  ];
+}
+
 #endif // NV_TRANSFORMS_PASSES

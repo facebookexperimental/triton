@@ -267,10 +267,12 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
     }
     c = rewriter.create<triton::gpu::ConvertLayoutOp>(c.getLoc(), retType, c);
 
-    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
-                      op, retType, a, b, c, adaptor.getInputPrecision(),
-                      adaptor.getMaxNumImpreciseAcc()),
-                  adaptor.getAttributes());
+    auto newDot = rewriter.replaceOpWithNewOp<triton::DotOp>(
+        op, retType, a, b, c, adaptor.getInputPrecision(),
+        adaptor.getMaxNumImpreciseAcc());
+    if (op.getTwoCtas())
+      newDot.setTwoCtas(true);
+    addNamedAttrs(newDot, adaptor.getAttributes());
     return success();
   }
 };
