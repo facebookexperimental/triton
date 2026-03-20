@@ -906,9 +906,8 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
   }
 
   // Based on the latencies, schedule the key ops to the stages.
-  CoarseSchedule schedule =
-      getInitialSchedule(forOp, opLatency, defaultNumStages, useMetaWS,
-                         hasAnnotations);
+  CoarseSchedule schedule = getInitialSchedule(
+      forOp, opLatency, defaultNumStages, useMetaWS, hasAnnotations);
   if (schedule.empty())
     return;
 
