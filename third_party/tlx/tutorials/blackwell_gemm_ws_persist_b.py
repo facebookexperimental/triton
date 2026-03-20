@@ -39,14 +39,14 @@ def get_cuda_autotune_config():
             pre_hook=matmul_tma_set_block_size_hook,
         )
         for BM in [128]
-        for BN in [64, 128, 256]
-        for BK in [64, 128]
-        for g in [1, 4, 8]
-        for s in [3, 4, 5, 6, 7, 8]
-        for t in [1, 2, 3, 4]
-        for subtile in [1, 2, 4, 8]
-        for esb in [1, 2, 3, 4]
-        for uwb in [False, True]
+        for BN in [128]
+        for BK in [128]
+        for g in [1]
+        for s in [3]
+        for t in [2]
+        for subtile in [2]
+        for esb in [1]
+        for uwb in [False]
     ]
 
 
@@ -61,7 +61,6 @@ def matmul_tma_set_block_size_hook(nargs):
         BLOCK_M,
         BLOCK_N // EPILOGUE_SUBTILE,
     ]
-    nargs["NEXT_POW2_K"] = triton.next_power_of_2(nargs["K"])
 
 
 @triton.jit
@@ -275,7 +274,7 @@ def matmul_kernel_tma_ws_blackwell(
     c_desc,
     M,
     N,
-    K,
+    K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -284,11 +283,10 @@ def matmul_kernel_tma_ws_blackwell(
     NUM_TMEM_BUFFERS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr,
-    NEXT_POW2_K: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
     NUM_SMS: tl.constexpr = 1,
 ):
-    NUM_K_TILES: tl.constexpr = NEXT_POW2_K // BLOCK_SIZE_K
+    NUM_K_TILES: tl.constexpr = triton.cdiv(K, BLOCK_SIZE_K)
 
     # allocate NUM_SMEM_BUFFERS buffers
     buffers_A = tlx.local_alloc(
@@ -337,7 +335,7 @@ def matmul_kernel_tma_ws_blackwell(
 
             tmem_accum_cnt = 0
             smem_epilogue_cnt = 0
-            pid_n = start_pid // num_pid_m
+            pid_n = start_pid % num_pid_m
             pid_m = start_pid % num_pid_m
 
             while pid_m < num_pid_m:
@@ -471,7 +469,8 @@ def matmul(a, b):
 
     def grid(META):
         num_pid_m = triton.cdiv(M, META["BLOCK_SIZE_M"])
-        return (min(num_pid_m, NUM_SMS), )
+        num_pid_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
+        return (num_pid_m * num_pid_n, )
 
     matmul_kernel_tma_ws_blackwell[grid](
         a_desc,
