@@ -1154,7 +1154,9 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
 static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
                                     SmallVector<Channel *> &channels,
                                     unsigned numBuffers, unsigned smemBudget,
-                                    bool smemCircularReuse) {
+                                    bool smemCircularReuse,
+                                    const DenseMap<Operation *, ChannelAnnotation>
+                                        &allocToAnnotation) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
   unsigned nextBufferId = 0;
@@ -1173,20 +1175,38 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     buf.numCopies = 1;
     buf.priority = WSBufferPriority::P2_Other;
 
+    // Check for annotation-based pre-assignment.
+    auto it = allocToAnnotation.find(alloc.getOperation());
+    if (it != allocToAnnotation.end() && it->second.memType == "smem") {
+      buf.bufferId = it->second.bufferId;
+      buf.numCopies = it->second.numCopies;
+      buf.isPinned = true;
+      LDBG("Phase 1: WSBuffer pinned by annotation: bufferId="
+           << buf.bufferId << " numCopies=" << buf.numCopies);
+    }
+
     wsBuffers.push_back(buf);
 
     LDBG("Phase 1: WSBuffer["
          << buf.bufferId << "] " << buf.sizeBytes << " bytes"
          << " innermost=" << buf.isInnermost << " TMA=" << buf.isTMA
-         << " crossStage=" << buf.isCrossStage);
+         << " crossStage=" << buf.isCrossStage
+         << " pinned=" << buf.isPinned);
   });
 
   if (wsBuffers.empty())
     return nextBufferId;
 
+  // Ensure heuristic-assigned IDs don't collide with annotated IDs.
+  for (auto &buf : wsBuffers)
+    if (buf.isPinned)
+      nextBufferId = std::max(nextBufferId, buf.bufferId + 1);
+
   // ── Phase 2: Enforce cross-stage minimum ────────────────────────────
   // Budget-aware: only set copy=2 if the total SMEM stays within budget.
   for (auto &buf : wsBuffers) {
+    if (buf.isPinned)
+      continue;
     if (buf.isCrossStage && numBuffers >= 2) {
       unsigned saved = buf.numCopies;
       buf.numCopies = 2;
@@ -1207,6 +1227,8 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
 
   // ── Phase 3: Classify and prioritize ────────────────────────────────
   for (auto &buf : wsBuffers) {
+    if (buf.isPinned)
+      continue;
     if (buf.isInnermost && buf.isTMA) {
       buf.priority = WSBufferPriority::P0_InnermostTMA;
     } else if (buf.isInnermost) {
@@ -1231,6 +1253,8 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+      if (wsBuffers[i].isPinned)
+        continue;
       if (wsBuffers[i].priority == priority)
         candidateIndices.push_back(i);
     }
@@ -2843,7 +2867,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     assert(effectiveSmemBudget != 0 && "smem budget is not set");
     bufferId =
         allocateSmemBuffers(funcOp, channels, numBuffers, effectiveSmemBudget,
-                            effectiveSmemCircularReuse);
+                            effectiveSmemCircularReuse,
+                            DenseMap<Operation *, ChannelAnnotation>());
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");
