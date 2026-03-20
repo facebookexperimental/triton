@@ -478,7 +478,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   } else {
     auto isFp4a = op.numBitsPerElementA == 4;
     aLoader = std::make_unique<DotOpMmaSmemLoader>(DotOpMmaSmemLoader::build(
-        loc, rewriter, aTensorTy, baseA, aOperandShape, 5, isFp4a));
+        loc, rewriter, aTensorTy, baseA, aOperandShape, 0, 5, isFp4a));
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
@@ -493,7 +493,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   // It's a massive code smell tho
   DotOpMmaSmemLoader bLoader = DotOpMmaSmemLoader::build(
       loc, rewriter, bTensorTy, baseB,
-      {mmaSizeK, mmaSizeN / (twoCTAs ? 2 : 1)}, 5, isFp4b);
+      {mmaSizeK, mmaSizeN / (twoCTAs ? 2 : 1)}, 1, 5, isFp4b);
 
   DotConversion::InstDesc desc{mmaSizeM, mmaSizeN, {numRepM, numRepN, numRepK},
                                transA,   transB,   interleaved,
