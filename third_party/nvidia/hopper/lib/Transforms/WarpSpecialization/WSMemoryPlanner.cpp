@@ -689,6 +689,110 @@ parseChannelAnnotations(Operation *parentOp) {
   return result;
 }
 
+/// Determine which MMA operand index (0=A, 1=B) an SMEM allocation feeds.
+/// Traces from the local_alloc through its users (memdesc_trans, etc.) to find
+/// the MMA consumer and which operand it connects to.
+static int getSmemOperandIndex(Operation *allocOp) {
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  for (auto result : allocOp->getResults())
+    worklist.push_back(result);
+
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    for (auto *user : v.getUsers()) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        // Check which operand of the MMA this value feeds.
+        if (mmaOp.getA() == v || mmaOp.getA().getDefiningOp() == allocOp)
+          return 0; // operand A
+        if (mmaOp.getB() == v || mmaOp.getB().getDefiningOp() == allocOp)
+          return 1; // operand B
+        // Check all operands positionally.
+        for (unsigned i = 0; i < user->getNumOperands(); ++i) {
+          if (user->getOperand(i) == v) {
+            // MMA operands: 0=A, 1=B, 2=D, 3=token, 4=useD, 5=pred
+            if (i == 0)
+              return 0;
+            if (i == 1)
+              return 1;
+          }
+        }
+      }
+      // Follow through memdesc_trans, local_load, etc.
+      for (auto result : user->getResults())
+        worklist.push_back(result);
+    }
+  }
+  return -1; // unknown
+}
+
+/// Build a mapping from alloc ops → ChannelAnnotation using the channel list
+/// and the parsed MMA annotations.
+static DenseMap<Operation *, ChannelAnnotation>
+buildAllocToAnnotationMap(
+    SmallVector<Channel *> &channels,
+    const std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
+        &annotations) {
+  DenseMap<Operation *, ChannelAnnotation> result;
+
+  if (annotations.empty())
+    return result;
+
+  for (auto *ch : channels) {
+    Operation *allocOp = ch->getAllocOp();
+    if (!allocOp)
+      continue;
+
+    // Determine the consumer MMA op.
+    Operation *dstOp = ch->getDstOp();
+    if (!dstOp)
+      continue;
+
+    // Find the MMA op: for SMEM channels, getDstOp() may return a non-MMA
+    // consumer. Walk forward to find the actual MMA.
+    Operation *mmaOp = nullptr;
+    if (isa<ttng::MMAv5OpInterface>(dstOp)) {
+      mmaOp = dstOp;
+    } else {
+      // For SMEM, the consumer might be memdesc_trans or local_load feeding MMA.
+      SmallVector<Operation *> dsts;
+      ch->getDstOps(dsts);
+      for (auto *dst : dsts) {
+        if (isa<ttng::MMAv5OpInterface>(dst)) {
+          mmaOp = dst;
+          break;
+        }
+      }
+    }
+    if (!mmaOp)
+      continue;
+
+    // Determine operand index.
+    unsigned opIdx;
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      opIdx = tmemCh->isOperandD ? 2 : 0; // 0=A for non-D TMEM (default)
+    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+      int idx = getSmemOperandIndex(allocOp);
+      opIdx = idx >= 0 ? static_cast<unsigned>(idx) : 0;
+    } else {
+      continue;
+    }
+
+    // Look up annotation for (mmaOp, opIdx).
+    auto it = annotations.find({mmaOp, opIdx});
+    if (it != annotations.end()) {
+      result[allocOp] = it->second;
+      LDBG("buildAllocToAnnotationMap: allocOp mapped to annotation: "
+           << it->second.operand << "," << it->second.memType << ","
+           << it->second.numCopies << "," << it->second.bufferId);
+    }
+  }
+  return result;
+}
+
 /// Check if all users of a channel are in the same innermost loop and the
 /// alloc type has at least 2 non-trivial dimensions.
 static bool isInnermostSmemChannel(Operation *alloc,
