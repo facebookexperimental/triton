@@ -670,18 +670,6 @@ scheduleKeyOpsUpstream(scf::ForOp forOp,
   return schedule;
 }
 
-// Schedule key ops for split-MMA backward attention pattern.
-// The backward attention loop has 5 MMA ops with a specific dependency pattern:
-//   qkT -> softmax -> dV (via pT)
-//   qkT -> softmax -> dpT -> dsT -> dK, dQ (dsT depends on BOTH qkT and dpT)
-//
-// "Deferred MMAs" are those whose operand A transitively depends on tmem_load
-// results from TWO different MMAs (dQ and dK, via the dsT chain).
-// "Current-iter MMAs" are the rest (qkT, dpT, dV).
-//
-// Desired schedule (3 clusters, 2 stages):
-//   cluster 0: qkT at stage 0 (first current MMA with latency)
-//   cluster 1: dQ, dK at stage 1 (deferred MMAs)
 // Schedule key ops based on user-provided tt.autows annotations on MMA ops.
 // The tt.autows attribute is a JSON string like {"stage": "0", "cluster": "2"}
 // that specifies the desired stage and cluster for each MMA.
@@ -708,7 +696,7 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
         if (!obj)
           continue;
         auto stageStr = obj->getString("stage");
-        auto clusterStr = obj->getString("cluster");
+        auto clusterStr = obj->getString("order");
         if (!stageStr || !clusterStr)
           continue;
         int stage = std::stoi(stageStr->str());
