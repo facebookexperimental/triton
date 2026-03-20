@@ -753,148 +753,10 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
   return schedule;
 }
 
-// Schedule key ops using split-MMA heuristics for backward attention.
-//
-// Execution order in steady state:
-//   qkT(iter i) -> dQ(iter i-1) -> dK(iter i-1) -> dpT(iter i) -> dV(iter i)
-// This hides qkT's self-latency behind dQ/dK execution from the previous
-// iteration.
-CoarseSchedule
-scheduleKeyOpsSplitMMA(scf::ForOp forOp,
-                       const DenseMap<Operation *, int> &opLatency,
-                       int defaultNumStages) {
-  // Collect all latency ops.
-  SmallVector<Operation *> latOps;
-  for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
-      latOps.push_back(&op);
-  }
-  if (latOps.empty())
-    return CoarseSchedule(0);
-
-  // Collect MMA ops and classify them as "deferred" or "current-iter".
-  // A "deferred MMA" has its operand A depending (transitively) on tmem_load
-  // results from TWO different MMAs. These are dQ and dK.
-  SmallVector<ttng::MMAv5OpInterface> currentMMAs;
-  SmallVector<ttng::MMAv5OpInterface> deferredMMAs;
-
-  // First, collect all MMA ops and their tmem_load results.
-  SmallVector<ttng::MMAv5OpInterface> allMMAs;
-  DenseSet<Value> mmaTmemLoadResults;
-  for (auto &op : forOp.getBody()->without_terminator()) {
-    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
-      allMMAs.push_back(mmaOp);
-      // Find tmem_load users of this MMA's result token.
-      for (auto user : op.getUsers()) {
-        if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(user)) {
-          for (auto result : tmemLoad->getResults())
-            mmaTmemLoadResults.insert(result);
-        }
-      }
-    }
-  }
-
-  // For each MMA, check if its operand A depends on tmem_load results
-  // from two different MMAs.
-  for (auto mmaOp : allMMAs) {
-    // Get operand A (first operand).
-    Value opA = mmaOp->getOperand(0);
-
-    // Walk backward from opA to find all tmem_load results it depends on.
-    DenseSet<Operation *> sourceMMAOps;
-    SmallVector<Value> worklist;
-    DenseSet<Value> visited;
-    worklist.push_back(opA);
-    while (!worklist.empty()) {
-      Value v = worklist.pop_back_val();
-      if (!visited.insert(v).second)
-        continue;
-      Operation *defOp = v.getDefiningOp();
-      if (!defOp)
-        continue;
-      if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(defOp)) {
-        // Find which MMA produced this tmem_load's input.
-        for (auto operand : tmemLoad->getOperands()) {
-          if (auto tmemLoadDefOp = operand.getDefiningOp()) {
-            if (isa<ttng::MMAv5OpInterface>(tmemLoadDefOp))
-              sourceMMAOps.insert(tmemLoadDefOp);
-          }
-        }
-      } else {
-        for (auto operand : defOp->getOperands())
-          worklist.push_back(operand);
-      }
-    }
-
-    if (sourceMMAOps.size() >= 2)
-      deferredMMAs.push_back(mmaOp);
-    else
-      currentMMAs.push_back(mmaOp);
-  }
-
-  // Sort deferred MMAs: hasLoadsAfterMMA=true first (dQ before dK).
-  // dQ has in-block tmem_load users (tmem_load -> descriptor_reduce),
-  // dK does not (accumulator only consumed via yield).
-  llvm::stable_sort(deferredMMAs,
-                    [&](ttng::MMAv5OpInterface a, ttng::MMAv5OpInterface b) {
-                      bool aHasLoads = ttng::hasLoadsAfterMMA(a, forOp);
-                      bool bHasLoads = ttng::hasLoadsAfterMMA(b, forOp);
-                      return aHasLoads > bHasLoads;
-                    });
-
-  // Sort current-iter MMAs: tt.latency=1 first (qkT, dpT), then
-  // tt.latency=0 (dV). Within same latency, preserve program order.
-  llvm::stable_sort(
-      currentMMAs, [](ttng::MMAv5OpInterface a, ttng::MMAv5OpInterface b) {
-        int la = a->hasAttr("tt.latency")
-                     ? cast<IntegerAttr>(a->getAttr("tt.latency")).getInt()
-                     : 0;
-        int lb = b->hasAttr("tt.latency")
-                     ? cast<IntegerAttr>(b->getAttr("tt.latency")).getInt()
-                     : 0;
-        return la > lb;
-      });
-
-  // Build schedule: 2 stages (stage 0 = iter i, stage 1 = iter i-1).
-  // Stage 0 ops are "one iteration ahead"; stage 1 ops are "current".
-  // In the steady-state loop body, stage 0(iter i) runs alongside stage 1(iter
-  // i-1). Desired cluster order:
-  //   cluster 0: first current MMA (qkT) at stage 0
-  //   cluster 1: all deferred MMAs (dQ, dK) at stage 1
-  //   cluster 2: remaining current MMAs (dpT, dV) at stage 0
-  CoarseSchedule schedule(/*numStages=*/2);
-  auto cluster0 = schedule.clusters.newAtBack();
-  auto cluster1 = schedule.clusters.newAtBack();
-  auto cluster2 = schedule.clusters.newAtBack();
-
-  // First current MMA (qkT): stage 0, cluster 0.
-  if (!currentMMAs.empty()) {
-    schedule.insert(currentMMAs[0], 0, cluster0);
-  }
-  // All deferred MMAs (dQ, dK): stage 1, cluster 1.
-  for (auto mma : deferredMMAs) {
-    schedule.insert(mma, 1, cluster1);
-  }
-  // Remaining current MMAs (dpT, dV): stage 0, cluster 2.
-  for (size_t i = 1; i < currentMMAs.size(); ++i) {
-    schedule.insert(currentMMAs[i], 0, cluster2);
-  }
-
-  // Schedule latency ops (loads, etc.) to stage 0 based on their cluster
-  // affinity. Loads feeding qkT go to cluster 0, others to cluster 2.
-  for (auto *op : latOps) {
-    if (schedule.count(op))
-      continue;
-    schedule.insert(op, 0, cluster0);
-  }
-
-  return schedule;
-}
-
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency,
                               int defaultNumStages, bool useMetaWS,
-                              bool useSplitMMA, bool useAnnotation) {
+                              bool useAnnotation) {
   // Try annotation-based scheduling first (user-provided tt.autows attrs).
   // This takes priority over all other scheduling strategies.
   if (useAnnotation) {
@@ -903,9 +765,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     if (!annotatedSchedule.empty())
       return annotatedSchedule;
   }
-  if (useSplitMMA) {
-    return scheduleKeyOpsSplitMMA(forOp, opLatency, defaultNumStages);
-  } else if (useMetaWS) {
+  if (useMetaWS) {
     return scheduleKeyOpsMetaWS(forOp, opLatency, defaultNumStages);
   } else {
     return scheduleKeyOpsUpstream(forOp, opLatency);
@@ -917,7 +777,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency,
                                   int defaultNumStages, bool useMetaWS,
-                                  bool useSplitMMA, bool useAnnotation) {
+                                  bool useAnnotation) {
   if (!isSafeToPipeline(forOp))
     return CoarseSchedule(0);
 
@@ -925,7 +785,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
   // schedule.
   if (hasLatenciesAssigned(forOp, opLatency))
     return scheduleKeyOps(forOp, opLatency, defaultNumStages, useMetaWS,
-                          useSplitMMA, useAnnotation);
+                          useAnnotation);
 
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
@@ -1020,10 +880,11 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
 }
 
 void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
-                  int defaultNumStages, bool useMetaWS, bool useSplitMMA) {
+                  int defaultNumStages, bool useMetaWS) {
   // If the loop already has loop.stage assignments (from a prior pass such as
-  // partition scheduling), disable split-MMA scheduling so that the existing
-  // schedule is deserialized and respected rather than rebuilt from scratch.
+  // partition scheduling), disable annotation-based scheduling so that the
+  // existing schedule is deserialized and respected rather than rebuilt from
+  // scratch.
   bool stageAssigned = false;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (op.hasAttr(kLoopStageAttrName)) {
@@ -1041,23 +902,21 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
     }
   }
   if (stageAssigned) {
-    useSplitMMA = false;
     hasAnnotations = false;
   }
 
   // Based on the latencies, schedule the key ops to the stages.
   CoarseSchedule schedule =
       getInitialSchedule(forOp, opLatency, defaultNumStages, useMetaWS,
-                         useSplitMMA, hasAnnotations);
+                         hasAnnotations);
   if (schedule.empty())
     return;
 
-  // For split MMA or annotation-based scheduling, save the MMA anchor
+  // For annotation-based scheduling, save the MMA anchor
   // assignments before dependency phases can modify them.
-  bool needRestore = useSplitMMA || hasAnnotations;
   SmallVector<std::tuple<Operation *, int, CoarseSchedule::Cluster>>
       savedMMASchedule;
-  if (needRestore) {
+  if (hasAnnotations) {
     for (auto &op : forOp.getBody()->without_terminator()) {
       if (isa<ttng::MMAv5OpInterface>(&op) && schedule.count(&op)) {
         auto [stage, cluster] = schedule[&op];
@@ -1093,12 +952,12 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
     DBGS() << "Final coarse schedule:\n" << forOp << "\n";
   });
 
-  // For split MMA or annotation-based scheduling, restore the desired stage
+  // For annotation-based scheduling, restore the desired stage
   // assignments. The dependency phases (especially
   // scheduleRemainingToLastStage) assign all unscheduled ops to the last stage,
   // but we want ALL non-MMA computation ops at stage 0. Only the deferred MMAs
   // should be at stage 1.
-  if (needRestore) {
+  if (hasAnnotations) {
     // First, force all non-MMA ops to stage 0 while preserving their cluster.
     for (auto &op : forOp.getBody()->without_terminator()) {
       if (!isa<ttng::MMAv5OpInterface>(&op) && schedule.count(&op)) {
@@ -1190,17 +1049,7 @@ void scheduleLoops(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
   if (loops.empty())
     return;
   for (auto forOp : loops) {
-    // Check the loop itself and any ancestor ForOp for the tt.split_mma
-    // attribute. The Python frontend sets tt.split_mma on the tl.range() loop,
-    // but after FuseNestedLoops, the attribute ends up on the outer
-    // (persistent) loop while the inner loop (where the MMAs live) is the one
-    // being scheduled.
-    bool splitMMA = forOp->hasAttr(kSplitMMAAttrName);
-    if (!splitMMA) {
-      if (auto parentFor = forOp->getParentOfType<scf::ForOp>())
-        splitMMA = parentFor->hasAttr(kSplitMMAAttrName);
-    }
-    scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS, splitMMA);
+    scheduleLoop(forOp, opLatency, defaultNumStages, useMetaWS);
   }
 }
 //===----------------------------------------------------------------------===//

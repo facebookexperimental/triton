@@ -731,7 +731,7 @@ def _attn_bwd_dkdv(
     step_m = BLOCK_M1
     if warp_specialize:
         for blk_idx in tl.range(0, num_steps, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2,
-                                smem_alloc_algo=1, smem_budget=200000, split_mma=False):
+                                smem_alloc_algo=1, smem_budget=200000):
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
@@ -1067,7 +1067,7 @@ def _attn_bwd_persist(
     )
 
     for _ in tl.range(0, tiles_per_sm, warp_specialize=True, merge_epilogue=True, tmem_alloc_algo=2, smem_alloc_algo=1,
-                      smem_budget=200000, split_mma=False):
+                      smem_budget=200000):
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
