@@ -1891,6 +1891,26 @@ public:
       }
     });
 
+    // ── Post-process: apply TMEM annotation overrides ──────────────────
+    // If any MMA ops have tt.autows channel annotations for TMEM operands,
+    // override the heuristic-assigned buffer.id and buffer.copy.
+    auto annotations = parseChannelAnnotations(parentOp);
+    if (!annotations.empty()) {
+      auto allocToAnn = buildAllocToAnnotationMap(*channels, annotations);
+      auto i32Type = IntegerType::get(parentOp->getContext(), 32);
+      for (auto alloc : allocs) {
+        auto it = allocToAnn.find(alloc.getOperation());
+        if (it == allocToAnn.end() || it->second.memType != "tmem")
+          continue;
+        auto &ann = it->second;
+        alloc->setAttr("buffer.id", IntegerAttr::get(i32Type, ann.bufferId));
+        alloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, ann.numCopies));
+        LDBG("TMEM annotation override: alloc buffer.id=" << ann.bufferId
+             << " buffer.copy=" << ann.numCopies
+             << " operand=" << ann.operand);
+      }
+    }
+
     return success();
   }
 
