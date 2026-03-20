@@ -15,6 +15,7 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSTaskIdPropagate.cpp
   WarpSpecialization/WSTaskPartition.cpp
   WarpSpecialization/PartitionSchedulingMeta.cpp
+  Insert2CTASync.cpp
 
   DEPENDS
   NVHopperTransformsIncGen

@@ -406,6 +406,12 @@ class CUDABackend(BaseBackend):
                                                          dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            # Insert cross-CTA sync for 2-CTA MMA ops (arrive remote, wait local).
+            # Only for autocompiler kernels (cluster_dims set, ctas_per_cga NOT set).
+            # TLX kernels use ctas_per_cga and manage their own cross-CTA sync.
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                    and opt.ctas_per_cga is None):
+                nvidia.passes.hopper.add_insert_2cta_sync(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)

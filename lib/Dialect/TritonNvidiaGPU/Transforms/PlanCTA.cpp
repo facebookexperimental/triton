@@ -295,7 +295,16 @@ bool CTAPlanner::processDot(triton::FuncOp &funcOp) {
     unsigned K = aTy.getShape()[1];
 
     unsigned splitM, splitN;
-    std::tie(splitM, splitN) = getCTATiling(M, N, K, ttg::getNumCTAs(dLayout));
+    if (dot.getTwoCtas()) {
+      // 2-CTA MMA requires M-split (T259718487): each CTA has half the rows of
+      // the output. The hardware reads B from both CTAs' SMEM, so B gets
+      // N-split via splitBOperand() in AccelerateMatmul.
+      splitM = 2;
+      splitN = 1;
+    } else {
+      std::tie(splitM, splitN) =
+          getCTATiling(M, N, K, ttg::getNumCTAs(dLayout));
+    }
     // FIXME: Should consider IR with more than one DotOps
     setTiling({splitM, splitN, 1});
 
