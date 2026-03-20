@@ -155,32 +155,22 @@ static bool isInnermostLoop(scf::ForOp forOp) {
 /// buffer ID sharing when they have disjoint liveness.
 static Operation *findOriginalLoadOp(Value value) {
   Operation *op = value.getDefiningOp();
-  while (op) {
-    // TMEM load is the data source we trace back to.
-    if (isa<ttng::TMEMLoadOp>(op))
-      return op;
-
+  // Currently we only support TMEMLoadOp.
+  while (op && !isa<ttng::TMEMLoadOp>(op)) {
     // TODO: Generalize to support addmm.
     // The SubtileOperator should hopefully simplify this work.
     // Transparent ops: trace through to their single tensor input.
-    Value nextValue;
-    if (isa<tt::SplitOp>(op)) {
-      nextValue = op->getOperand(0);
-    } else if (isa<tt::ReshapeOp, tt::TransOp, ttg::ConvertLayoutOp>(op)) {
-      nextValue = op->getOperand(0);
-    } else if (isa<arith::TruncFOp, arith::ExtFOp, arith::SIToFPOp,
-                   arith::FPToSIOp, arith::UIToFPOp, arith::FPToUIOp,
-                   arith::TruncIOp, arith::ExtSIOp, arith::ExtUIOp,
-                   arith::BitcastOp>(op)) {
-      nextValue = op->getOperand(0);
+    if (isa<tt::SplitOp, tt::ReshapeOp, tt::TransOp, ttg::ConvertLayoutOp,
+            arith::TruncFOp, arith::ExtFOp, arith::SIToFPOp, arith::FPToSIOp,
+            arith::UIToFPOp, arith::FPToUIOp, arith::TruncIOp, arith::ExtSIOp,
+            arith::ExtUIOp, arith::BitcastOp>(op)) {
+      op = op->getOperand(0).getDefiningOp();
     } else {
-      // Unknown op — treat as a data source.
-      return op;
+      // Unknown op — Don't support
+      op = nullptr;
     }
-
-    op = nextValue.getDefiningOp();
   }
-  return nullptr; // Reached a block argument.
+  return op;
 }
 
 /// Given a channel, find the original load operation that produced the data
@@ -649,6 +639,9 @@ public:
     // tmem_load result into multiple sub-tiles stored to separate SMEM
     // buffers. Since they are used sequentially, their liveness is disjoint
     // and they can share the same buffer.id to save SMEM.
+    //
+    // Note: This doesn't yet provide the ability to increase the buffer count
+    // in the epilogue.
     fuseEpilogueBuffers();
 
     lastBufferId = bufferId;
