@@ -153,10 +153,13 @@ def barrier_arrive(
     )
     assert arrive_count.value == 1 or not is_hip(), "AMD backend currently only supports arrive_count == 1"
 
+    # Capture is_warp_barrier before remote_view, which doesn't preserve it.
+    is_warp_bar = getattr(bar, 'is_warp_barrier', False)
+
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
 
-    if getattr(bar, 'is_warp_barrier', False):
+    if is_warp_bar:
         _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value)
     else:
         _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value)
