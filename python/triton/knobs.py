@@ -10,7 +10,20 @@ import pathlib
 
 from dataclasses import dataclass
 from contextlib import contextmanager
-from typing import cast, Any, Callable, Generator, Generic, Optional, Protocol, Type, TypeVar, TypedDict, TYPE_CHECKING, Union
+from typing import (
+    cast,
+    Any,
+    Callable,
+    Generator,
+    Generic,
+    Optional,
+    Protocol,
+    Type,
+    TypeVar,
+    TypedDict,
+    TYPE_CHECKING,
+    Union,
+)
 
 from triton._C.libtriton import getenv, getenv_bool  # type: ignore
 
@@ -258,12 +271,19 @@ class CompileTimes:
 
 class CompilationListener(Protocol):
 
-    def __call__(self, *, src: Union[ASTSource, IRSource], metadata: dict[str, Any], metadata_group: dict[str, str],
-                 times: CompileTimes, cache_hit: bool) -> None:
+    def __call__(
+        self,
+        *,
+        src: Union[ASTSource, IRSource],
+        metadata: dict[str, Any],
+        metadata_group: dict[str, str],
+        times: CompileTimes,
+        cache_hit: bool,
+    ) -> None:
         ...
 
 
-knobs_type = TypeVar("knobs_type", bound='base_knobs')
+knobs_type = TypeVar("knobs_type", bound="base_knobs")
 
 
 class base_knobs:
@@ -310,13 +330,22 @@ class base_knobs:
 
 class BuildImpl(Protocol):
 
-    def __call__(self, name: str, src: str, srcdir: str, library_dirs: list[str], include_dirs: list[str],
-                 libraries: list[str], /) -> str:
+    def __call__(
+        self,
+        name: str,
+        src: str,
+        srcdir: str,
+        library_dirs: list[str],
+        include_dirs: list[str],
+        libraries: list[str],
+        /,
+    ) -> str:
         ...
 
 
 class build_knobs(base_knobs):
     """Configuration controlling how the native compiler is invoked"""
+
     cc: env_opt_str = env_opt_str("CC")
 
     cudacrt_path: env_opt_str = env_opt_str("TRITON_CUDACRT_PATH")
@@ -378,8 +407,7 @@ class autotuning_knobs(base_knobs):
 
 
 class LaunchHook(Protocol):
-    """Hook invoked before and after kernel launching
-    """
+    """Hook invoked before and after kernel launching"""
 
     def __call__(self, metadata: LazyDict) -> None:
         ...
@@ -405,8 +433,7 @@ F = TypeVar("F", bound=Callable)
 
 
 class HookChain(Generic[F]):
-    """A chain of hooks of the same type F to be called in order.
-    """
+    """A chain of hooks of the same type F to be called in order."""
 
     def __init__(self, reversed: bool = False):
         self.calls: list[F] = []
@@ -451,8 +478,16 @@ class JITHookCompileInfo(TypedDict):
 
 class JITHook(Protocol):
 
-    def __call__(self, *, key: str, repr: str, fn: JitFunctionInfo, compile: JITHookCompileInfo, is_manual_warmup: bool,
-                 already_compiled: bool) -> Optional[bool]:
+    def __call__(
+        self,
+        *,
+        key: str,
+        repr: str,
+        fn: JitFunctionInfo,
+        compile: JITHookCompileInfo,
+        is_manual_warmup: bool,
+        already_compiled: bool,
+    ) -> Optional[bool]:
         ...
 
 
@@ -510,6 +545,7 @@ class nvidia_knobs(base_knobs):
     force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     use_early_tma_store_lowering: env_bool = env_bool("TRITON_USE_EARLY_TMA_STORE_LOWERING")
+    dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
 
 
 class amd_knobs(base_knobs):
