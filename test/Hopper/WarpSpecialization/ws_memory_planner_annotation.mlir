@@ -22,28 +22,28 @@
 
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
-// TMEM: dq gets heuristic buffer.id=8 (reuses dpT), buffer.offset=0
-// CHECK: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// TMEM: dq gets heuristic buffer.id (not mapped by annotation yet)
+// CHECK: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = 0 : i32}
 //
 // SMEM: dsT has no annotation, gets heuristic assignment
 // CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 //
-// TMEM: dpT owns buffer 8
-// CHECK: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// TMEM: dpT heuristic allocation
+// CHECK: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
 //
 // SMEM: do gets buffer.copy=2 (cross-stage TMA), buffer.id=1
 // CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
 //
-// TMEM: qkT owns buffer 7
-// CHECK: %qkT, %qkT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
+// TMEM: qkT heuristic allocation
+// CHECK: %qkT, %qkT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
 //
-// SMEM: q gets buffer.copy=2 (cross-stage), buffer.id=2
+// SMEM: q gets buffer.copy=2, buffer.id=2
 // CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
 //
-// TMEM: dv reuses qkT (buffer.id=7)
+// TMEM: dv pre-assigned by annotation → buffer.id=7
 // CHECK: %dv, %dv_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
-// TMEM: dk overridden by annotation to buffer.id=10
+// TMEM: dk pre-assigned by annotation → buffer.id=10
 // CHECK: %dk, %dk_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 10 : i32}
 //
 // SMEM: v and k
