@@ -184,6 +184,17 @@ for each channel group:
    attaching a completion barrier and creating a `WaitBarrierOp`.
 5. **Consumer release placement**: `consumerReleaseHeuristic` uses
    post-dominance analysis to find optimal placement.
+6. **`replaceDataPartitionedCommits`**: In data-partitioned loops
+   (`tt.data_partition_factor > 1`), the D-channel creation emits standalone
+   `tcgen05_commit` ops after the inner for loop — one per data-partitioned
+   MMA. Because `tcgen05_commit` is a global fence that commits ALL pending
+   async operations, the first commit must wait for every MMA to finish,
+   serializing them. This function replaces all but the last commit with a
+   per-MMA `wait_barrier` on the MMA's existing inline A/B barrier (from the
+   final loop iteration) followed by an `arrive_barrier` on the D barrier.
+   The last commit is kept because `tcgen05_commit` is cumulative — it covers
+   all async ops since the previous commit, so the final one ensures all
+   remaining MMA operations complete.
 
 ### Channel Loop Detection
 

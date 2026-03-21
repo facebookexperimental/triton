@@ -139,10 +139,48 @@ materialized barriers, which is another form of barrier reduction.
 See [Token & Barrier Lowering](TokenBarrierLowering.md) for the full
 lowering algorithm.
 
+## Data-Partitioned Commit Replacement
+
+**File**: `WSCodePartition.cpp` (`replaceDataPartitionedCommits`)
+
+In data-partitioned loops (`tt.data_partition_factor > 1`), the D-channel
+creation emits multiple standalone `tcgen05_commit` ops after the inner for
+loop — one per data-partitioned MMA. Because `tcgen05_commit` is a global
+fence that commits ALL pending async tcgen05 operations, using it for
+per-MMA D-channel signaling is unnecessarily coarse: the first commit must
+wait for every outstanding MMA, serializing completion.
+
+`replaceDataPartitionedCommits` replaces each commit with a targeted
+barrier-based synchronization:
+
+1. **Group detection**: Walk the function for groups of consecutive
+   `TCGen5CommitOp`s (skipping interleaved `MemDescIndexOp`s that compute
+   barrier indices). Groups with 2+ commits indicate data-partitioned
+   D-channels.
+
+2. **MMA matching**: For each commit in the group, find the corresponding
+   `TCGen5MMAOp` inside the preceding for loop by matching `async_task_id`.
+
+3. **Replacement**: For each commit except the last:
+   - Compute the final-iteration buffer index and phase for the MMA's
+     inline A/B barrier (via `getOutOfScopeBufferIdxAndPhase`).
+   - Emit `WaitBarrierOp` on the A/B barrier — waits for that specific MMA
+     to finish its final iteration.
+   - Emit `ArriveBarrierOp` on the D barrier — signals the D-channel
+     consumer that the MMA result is available.
+   - Erase the original `TCGen5CommitOp`.
+
+The last commit in the group is kept because `tcgen05_commit` is
+cumulative — it covers all async ops since the previous commit, so the
+final one ensures all remaining MMA operations complete. This enables
+per-MMA completion tracking for earlier commits while preserving
+correctness for the last one.
+
 ## Summary: Forms of Barrier Fusion
 
 | Fusion Type | What Gets Fused | Result | Where |
 |------------|----------------|--------|-------|
 | **TMA fusion** | Multiple TMA loads to same consumer | Single mbarrier, single `BarrierExpectOp` with summed bytes | `WSLowerMem.cpp::optimizeTMALoads` |
 | **tcgen05_commit** | Multiple commits to same barrier | Single `TCGen5CommitOp` (last one kept) | `CodePartitionUtility.cpp::fuseTcgen05CommitBarriers` |
+| **DP commit replacement** | Consecutive commits from data-partitioned D-channels | Per-MMA `WaitBarrierOp` + `ArriveBarrierOp` | `WSCodePartition.cpp::replaceDataPartitionedCommits` |
 | **Token sharing** | Channels grouped by consumer | Shared `CreateTokenOp` → shared barrier pair | `WSCodePartition.cpp::doCodePartitionPost` |
