@@ -2193,6 +2193,10 @@ replaceDataPartitionedCommits(triton::FuncOp funcOp,
           seen.insert(op);
           group.push_back(op);
         }
+      } else if (isa<ttg::MemDescIndexOp>(*it)) {
+        // Skip memdesc_index ops that compute barrier indices between
+        // commits — they are part of the same commit group.
+        continue;
       } else {
         break;
       }
@@ -2216,9 +2220,15 @@ replaceDataPartitionedCommits(triton::FuncOp funcOp,
     if (!forOp)
       continue;
 
-    // For each commit, find the MMA with matching task IDs inside the loop.
+    // For each commit except the last, find the MMA with matching task IDs
+    // inside the loop and replace the commit with a per-MMA wait+arrive.
+    // The last commit is kept because tcgen05_commit is cumulative — it
+    // covers all async ops issued since the previous commit. By keeping the
+    // final commit, we ensure all remaining async MMA operations are properly
+    // committed without needing an explicit wait+arrive for the last one.
     bool allReplaced = true;
-    for (auto commitOp : group) {
+    for (size_t i = 0; i + 1 < group.size(); i++) {
+      auto commitOp = group[i];
       auto taskIds = getAsyncTaskIds(commitOp);
       auto mmaOp = findMMAInLoop(forOp, taskIds);
       if (!mmaOp) {
