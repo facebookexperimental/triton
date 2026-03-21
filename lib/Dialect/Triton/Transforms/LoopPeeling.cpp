@@ -64,5 +64,47 @@ void peelLoopEpilogue(
   }
 }
 
+void peelLoopPrologue(scf::ForOp forOp) {
+  IRRewriter rewriter(forOp);
+  Location loc = forOp.getLoc();
+
+  Value lowerBound = forOp.getLowerBound();
+  Value step = forOp.getStep();
+
+  // Clone the loop body before the loop as the prologue.
+  // Map induction var -> lowerBound, region iter args -> init args.
+  rewriter.setInsertionPoint(forOp);
+  IRMapping map;
+  map.map(forOp.getInductionVar(), lowerBound);
+  for (auto [regionArg, initArg] :
+       llvm::zip(forOp.getRegionIterArgs(), forOp.getInitArgs())) {
+    map.map(regionArg, initArg);
+  }
+
+  // Clone all ops except the yield, and capture yielded values as
+  // the new init args for the remaining loop.
+  SmallVector<Value> prologueYieldedValues;
+  for (auto &op : forOp.getBody()->getOperations()) {
+    if (auto yieldOp = dyn_cast<scf::YieldOp>(&op)) {
+      for (Value v : yieldOp.getOperands()) {
+        prologueYieldedValues.push_back(map.lookupOrDefault(v));
+      }
+    } else {
+      rewriter.clone(op, map);
+    }
+  }
+
+  // Adjust the loop in place: lb -> lb + step, init args -> prologue outputs.
+  // Note: This assumes the loop always executes at least once. If the loop
+  // could have zero iterations, the prologue would execute unconditionally
+  // which would be incorrect.
+  Value newLowerBound = rewriter.create<arith::AddIOp>(loc, lowerBound, step);
+  forOp.getLowerBoundMutable().assign(newLowerBound);
+  for (auto [initArg, prologueVal] :
+       llvm::zip(forOp.getInitArgsMutable(), prologueYieldedValues)) {
+    initArg.set(prologueVal);
+  }
+}
+
 } // namespace triton
 } // namespace mlir
