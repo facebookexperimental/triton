@@ -1858,6 +1858,110 @@ public:
     });
     DenseSet<Operation *> handledAllocs;
     unsigned ctrlIdx = 0;
+
+    // ── Pre-assignment: parse annotations and partition annotated TMEM allocs.
+    auto annotations = parseChannelAnnotations(parentOp);
+    DenseMap<Operation *, ChannelAnnotation> tmemAllocAnnotations;
+    if (!annotations.empty())
+      tmemAllocAnnotations = buildAllocToAnnotationMap(*channels, annotations);
+    // Filter to only tmem annotations.
+    DenseMap<Operation *, ChannelAnnotation> tmemAnnotations;
+    for (auto &[op, ann] : tmemAllocAnnotations) {
+      if (ann.memType == "tmem")
+        tmemAnnotations[op] = ann;
+    }
+
+    // Pre-assign annotated TMEM allocs before heuristic.
+    if (!tmemAnnotations.empty()) {
+      auto i32Type = IntegerType::get(parentOp->getContext(), 32);
+
+      // Group annotated allocs by bufferId.
+      std::map<unsigned, SmallVector<ttng::TMEMAllocOp>> annotatedGroups;
+      for (auto alloc : allocs) {
+        auto it = tmemAnnotations.find(alloc.getOperation());
+        if (it != tmemAnnotations.end())
+          annotatedGroups[it->second.bufferId].push_back(alloc);
+      }
+
+      // For each group: first alloc is owner, rest are reusers.
+      // Validate reuse legality and compute buffer.offset.
+      size_t preAssignRowOffset = 0;
+      for (auto &[bid, group] : annotatedGroups) {
+        // Owner: first alloc in the group.
+        auto ownerAlloc = group[0];
+        auto *ownerBuf = getBuffer(ownerAlloc.getOperation());
+        ownerBuf->rowOffset = preAssignRowOffset;
+        ownerBuf->colOffset = 0;
+        ownerBuf->isOwnerOfSpace = true;
+        ownerBuf->reuseOwner = ownerBuf;
+        ownerAlloc->setAttr("buffer.id", IntegerAttr::get(i32Type, bid));
+        ownerAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
+        preAssignRowOffset += ownerBuf->rowSize;
+        handledAllocs.insert(ownerAlloc.getOperation());
+        LDBG("TMEM pre-assign: owner alloc buffer.id=" << bid
+             << " rows=" << ownerBuf->rowSize << "x" << ownerBuf->colSize);
+
+        // Reusers: subsequent allocs in the group.
+        size_t nextColOffset = 0;
+        for (size_t i = 1; i < group.size(); ++i) {
+          auto reuserAlloc = group[i];
+          auto *reuserBuf = getBuffer(reuserAlloc.getOperation());
+
+          // Validate: reuser columns must fit in owner.
+          if (reuserBuf->colSize > ownerBuf->colSize) {
+            LDBG("WARNING: annotated TMEM reuse buffer.id=" << bid
+                 << " reuser colSize=" << reuserBuf->colSize
+                 << " > owner colSize=" << ownerBuf->colSize
+                 << " — skipping reuse, treating as separate owner");
+            reuserBuf->rowOffset = preAssignRowOffset;
+            reuserBuf->colOffset = 0;
+            reuserBuf->isOwnerOfSpace = true;
+            reuserBuf->reuseOwner = reuserBuf;
+            reuserAlloc->setAttr("buffer.id", IntegerAttr::get(i32Type, bid));
+            reuserAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
+            preAssignRowOffset += reuserBuf->rowSize;
+            handledAllocs.insert(reuserAlloc.getOperation());
+            continue;
+          }
+
+          // Validate: liveness non-overlap.
+          if (bufferRange[ownerBuf].intersects(bufferRange[reuserBuf])) {
+            LDBG("WARNING: annotated TMEM reuse buffer.id=" << bid
+                 << " has overlapping liveness between owner and reuser"
+                 << " — skipping reuse, treating as separate owner");
+            reuserBuf->rowOffset = preAssignRowOffset;
+            reuserBuf->colOffset = 0;
+            reuserBuf->isOwnerOfSpace = true;
+            reuserBuf->reuseOwner = reuserBuf;
+            reuserAlloc->setAttr("buffer.id", IntegerAttr::get(i32Type, bid));
+            reuserAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
+            preAssignRowOffset += reuserBuf->rowSize;
+            handledAllocs.insert(reuserAlloc.getOperation());
+            continue;
+          }
+
+          // Assign reuser at nextColOffset within owner's column space.
+          reuserBuf->rowOffset = ownerBuf->rowOffset;
+          reuserBuf->colOffset = nextColOffset;
+          reuserBuf->isOwnerOfSpace = false;
+          reuserBuf->reuseOwner = ownerBuf;
+          reuserAlloc->setAttr("buffer.id", IntegerAttr::get(i32Type, bid));
+          reuserAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
+          reuserAlloc->setAttr(
+              "buffer.offset", IntegerAttr::get(i32Type, nextColOffset));
+          handledAllocs.insert(reuserAlloc.getOperation());
+          LDBG("TMEM pre-assign: reuser buffer.id=" << bid
+               << " colOffset=" << nextColOffset
+               << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
+          nextColOffset += reuserBuf->colSize;
+        }
+      }
+
+      // Ensure heuristic buffer IDs don't collide with annotated IDs.
+      for (auto &[bid, _] : annotatedGroups)
+        bufferId = std::max(bufferId, bid + 1);
+    }
+
     for (auto *ctrlOp : innermostLoops) {
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocsForThisLoop;
       unsigned allocIdx = 0;
@@ -1990,26 +2094,6 @@ public:
         info.alloc->dump();
       }
     });
-
-    // ── Post-process: apply TMEM annotation overrides ──────────────────
-    // If any MMA ops have tt.autows channel annotations for TMEM operands,
-    // override the heuristic-assigned buffer.id and buffer.copy.
-    auto annotations = parseChannelAnnotations(parentOp);
-    if (!annotations.empty()) {
-      auto allocToAnn = buildAllocToAnnotationMap(*channels, annotations);
-      auto i32Type = IntegerType::get(parentOp->getContext(), 32);
-      for (auto alloc : allocs) {
-        auto it = allocToAnn.find(alloc.getOperation());
-        if (it == allocToAnn.end() || it->second.memType != "tmem")
-          continue;
-        auto &ann = it->second;
-        alloc->setAttr("buffer.id", IntegerAttr::get(i32Type, ann.bufferId));
-        alloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, ann.numCopies));
-        LDBG("TMEM annotation override: alloc buffer.id=" << ann.bufferId
-             << " buffer.copy=" << ann.numCopies
-             << " operand=" << ann.operand);
-      }
-    }
 
     return success();
   }
