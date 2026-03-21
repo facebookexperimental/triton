@@ -684,14 +684,14 @@ parseChannelAnnotations(Operation *parentOp) {
       // Validate operand name.
       if (ann.operand != "opndA" && ann.operand != "opndB" &&
           ann.operand != "opndD") {
-        LDBG("WARNING: invalid operand name '" << ann.operand
-             << "' in channel annotation, skipping");
+        LDBG("WARNING: invalid operand name '"
+             << ann.operand << "' in channel annotation, skipping");
         continue;
       }
       // Validate memType.
       if (ann.memType != "smem" && ann.memType != "tmem") {
-        LDBG("WARNING: invalid memType '" << ann.memType
-             << "' in channel annotation, skipping");
+        LDBG("WARNING: invalid memType '"
+             << ann.memType << "' in channel annotation, skipping");
         continue;
       }
 
@@ -704,21 +704,20 @@ parseChannelAnnotations(Operation *parentOp) {
       auto dupIt = result.find(key);
       if (dupIt != result.end()) {
         auto &prev = dupIt->second;
-        LDBG("WARNING: duplicate annotation for " << ann.operand
-             << " on same MMA op — overwriting "
-             << prev.memType << "," << prev.numCopies << "," << prev.bufferId
-             << " with " << ann.memType << "," << ann.numCopies << ","
-             << ann.bufferId);
+        LDBG("WARNING: duplicate annotation for "
+             << ann.operand << " on same MMA op — overwriting " << prev.memType
+             << "," << prev.numCopies << "," << prev.bufferId << " with "
+             << ann.memType << "," << ann.numCopies << "," << ann.bufferId);
       }
 
       // Check for same bufferId with conflicting numCopies across all MMA ops.
       auto bufIt = bufferIdToInfo.find(ann.bufferId);
       if (bufIt != bufferIdToInfo.end()) {
         if (bufIt->second.first != ann.numCopies) {
-          LDBG("WARNING: bufferId=" << ann.bufferId
-               << " has conflicting numCopies: "
-               << bufIt->second.first << " vs " << ann.numCopies
-               << " — using max("
+          LDBG("WARNING: bufferId="
+               << ann.bufferId
+               << " has conflicting numCopies: " << bufIt->second.first
+               << " vs " << ann.numCopies << " — using max("
                << bufIt->second.first << ", " << ann.numCopies << ")");
           unsigned maxCopies = std::max(bufIt->second.first, ann.numCopies);
           ann.numCopies = maxCopies;
@@ -731,7 +730,7 @@ parseChannelAnnotations(Operation *parentOp) {
       // Check for operand D annotated as SMEM (always TMEM).
       if (ann.operand == "opndD" && ann.memType != "tmem") {
         LDBG("WARNING: opndD must be tmem, got '" << ann.memType
-             << "' — correcting to tmem");
+                                                  << "' — correcting to tmem");
         ann.memType = "tmem";
       }
 
@@ -742,112 +741,6 @@ parseChannelAnnotations(Operation *parentOp) {
     }
   });
   return result;
-}
-
-/// Determine which MMA operand index (0=A, 1=B) an SMEM allocation feeds.
-/// Traces from the local_alloc through its users (memdesc_trans, etc.) to find
-/// the MMA consumer and which operand it connects to.
-static int getSmemOperandIndex(Operation *allocOp) {
-  SmallVector<Value> worklist;
-  DenseSet<Value> visited;
-  for (auto result : allocOp->getResults())
-    worklist.push_back(result);
-
-  while (!worklist.empty()) {
-    Value v = worklist.pop_back_val();
-    if (!visited.insert(v).second)
-      continue;
-    for (auto *user : v.getUsers()) {
-      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        if (mmaOp.getA() == v)
-          return 0;
-        if (mmaOp.getB() == v)
-          return 1;
-        for (unsigned i = 0; i < user->getNumOperands(); ++i) {
-          if (user->getOperand(i) == v) {
-            if (i == 0)
-              return 0;
-            if (i == 1)
-              return 1;
-          }
-        }
-      }
-      for (auto result : user->getResults())
-        worklist.push_back(result);
-    }
-  }
-  return -1;
-}
-
-/// Find the MMA op that consumes a TMEM alloc and determine its operand index.
-/// For operand D: the MMA uses the alloc's result as its D operand.
-/// For operand A/B: the alloc feeds through tmem_store into MMA operand A or B.
-/// Returns {mmaOp, opIdx} or {nullptr, 0} if not found.
-static std::pair<Operation *, unsigned>
-findMmaForTmemAlloc(Operation *allocOp,
-                    ttng::TmemDataChannelPost *tmemCh) {
-  // Walk from the allocOp's result through users to find the MMA.
-  SmallVector<Value> worklist;
-  DenseSet<Value> visited;
-  for (auto result : allocOp->getResults()) {
-    // Skip token results.
-    if (isa<ttg::AsyncTokenType>(result.getType()))
-      continue;
-    worklist.push_back(result);
-  }
-
-  while (!worklist.empty()) {
-    Value v = worklist.pop_back_val();
-    if (!visited.insert(v).second)
-      continue;
-    for (auto *user : v.getUsers()) {
-      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        // Check which operand this alloc feeds.
-        if (mmaOp.getD() == v)
-          return {user, 2}; // operand D
-        if (mmaOp.getA() == v)
-          return {user, 0}; // operand A
-        if (mmaOp.getB() == v)
-          return {user, 1}; // operand B
-      }
-      // Follow through MemDescIndex, tmem_load, tmem_store, etc.
-      for (auto result : user->getResults()) {
-        if (!isa<ttg::AsyncTokenType>(result.getType()))
-          worklist.push_back(result);
-      }
-    }
-  }
-  return {nullptr, 0};
-}
-
-/// Find all MMA ops that consume an SMEM alloc, with their operand indices.
-/// Returns a list of {mmaOp, opIdx} pairs since an SMEM alloc can feed
-/// multiple MMAs (e.g., k feeds both qkT and dq).
-static SmallVector<std::pair<Operation *, unsigned>>
-findMmasForSmemAlloc(Operation *allocOp) {
-  SmallVector<std::pair<Operation *, unsigned>> results;
-  SmallVector<Value> worklist;
-  DenseSet<Value> visited;
-  for (auto result : allocOp->getResults())
-    worklist.push_back(result);
-
-  while (!worklist.empty()) {
-    Value v = worklist.pop_back_val();
-    if (!visited.insert(v).second)
-      continue;
-    for (auto *user : v.getUsers()) {
-      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        if (mmaOp.getA() == v)
-          results.push_back({user, 0});
-        else if (mmaOp.getB() == v)
-          results.push_back({user, 1});
-        continue; // Don't follow through MMA results
-      }
-      for (auto result : user->getResults())
-        worklist.push_back(result);
-    }
-  }
-  return results;
 }
 
 /// Trace an MMA operand value back to its defining alloc op (local_alloc or
@@ -880,10 +773,10 @@ static Operation *traceBackToAlloc(Value v) {
 /// getB(), getD()) to identify which alloc feeds which operand.
 ///
 /// Detects and warns about conflicting annotations:
-///   - Duplicate allocOp mapping (same alloc gets annotations from multiple MMAs)
+///   - Duplicate allocOp mapping (same alloc gets annotations from multiple
+///   MMAs)
 ///   - memType mismatch (SMEM alloc annotated as tmem, or vice versa)
-static DenseMap<Operation *, ChannelAnnotation>
-buildAllocToAnnotationMap(
+static DenseMap<Operation *, ChannelAnnotation> buildAllocToAnnotationMap(
     SmallVector<Channel *> &channels,
     const std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
         &annotations) {
@@ -912,8 +805,8 @@ buildAllocToAnnotationMap(
     // Trace back to the defining alloc op.
     Operation *allocOp = traceBackToAlloc(operandVal);
     if (!allocOp) {
-      LDBG("buildAllocToAnnotationMap: could not trace " << ann.operand
-           << " back to alloc op, skipping");
+      LDBG("buildAllocToAnnotationMap: could not trace "
+           << ann.operand << " back to alloc op, skipping");
       continue;
     }
 
@@ -921,14 +814,14 @@ buildAllocToAnnotationMap(
     bool isSmemAlloc = isa<ttg::LocalAllocOp>(allocOp);
     bool isTmemAlloc = isa<ttng::TMEMAllocOp>(allocOp);
     if (isSmemAlloc && ann.memType != "smem") {
-      LDBG("WARNING: SMEM alloc annotated with memType='" << ann.memType
-           << "' — expected 'smem', skipping annotation for "
+      LDBG("WARNING: SMEM alloc annotated with memType='"
+           << ann.memType << "' — expected 'smem', skipping annotation for "
            << ann.operand);
       continue;
     }
     if (isTmemAlloc && ann.memType != "tmem") {
-      LDBG("WARNING: TMEM alloc annotated with memType='" << ann.memType
-           << "' — expected 'tmem', skipping annotation for "
+      LDBG("WARNING: TMEM alloc annotated with memType='"
+           << ann.memType << "' — expected 'tmem', skipping annotation for "
            << ann.operand);
       continue;
     }
@@ -939,18 +832,18 @@ buildAllocToAnnotationMap(
       auto &prev = dupIt->second;
       if (prev.bufferId != ann.bufferId || prev.numCopies != ann.numCopies) {
         LDBG("WARNING: allocOp has conflicting annotations: "
-             << prev.operand << "," << prev.memType << ","
-             << prev.numCopies << "," << prev.bufferId
-             << " vs " << ann.operand << "," << ann.memType << ","
-             << ann.numCopies << "," << ann.bufferId
+             << prev.operand << "," << prev.memType << "," << prev.numCopies
+             << "," << prev.bufferId << " vs " << ann.operand << ","
+             << ann.memType << "," << ann.numCopies << "," << ann.bufferId
              << " — using earlier annotation");
       }
       continue;
     }
 
     result[allocOp] = ann;
-    LDBG("buildAllocToAnnotationMap: " << ann.operand << ","
-         << ann.memType << "," << ann.numCopies << "," << ann.bufferId);
+    LDBG("buildAllocToAnnotationMap: " << ann.operand << "," << ann.memType
+                                       << "," << ann.numCopies << ","
+                                       << ann.bufferId);
   }
   return result;
 }
@@ -1111,12 +1004,10 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
 /// Phase 5: Emit buffer.id and buffer.copy attributes.
 ///
 /// Returns the next available buffer ID after the SMEM allocations.
-static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
-                                    SmallVector<Channel *> &channels,
-                                    unsigned numBuffers, unsigned smemBudget,
-                                    bool smemCircularReuse,
-                                    const DenseMap<Operation *, ChannelAnnotation>
-                                        &allocToAnnotation) {
+static unsigned allocateSmemBuffers(
+    triton::FuncOp funcOp, SmallVector<Channel *> &channels,
+    unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
   unsigned nextBufferId = 0;
@@ -1150,8 +1041,7 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
     LDBG("Phase 1: WSBuffer["
          << buf.bufferId << "] " << buf.sizeBytes << " bytes"
          << " innermost=" << buf.isInnermost << " TMA=" << buf.isTMA
-         << " crossStage=" << buf.isCrossStage
-         << " pinned=" << buf.isPinned);
+         << " crossStage=" << buf.isCrossStage << " pinned=" << buf.isPinned);
   });
 
   if (wsBuffers.empty())
@@ -1167,9 +1057,9 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
   for (auto &buf : wsBuffers) {
     if (buf.isPinned) {
       if (buf.isCrossStage && buf.numCopies < 2) {
-        LDBG("WARNING: pinned WSBuffer[" << buf.bufferId
-             << "] is cross-stage but has numCopies=" << buf.numCopies
-             << " — this may cause correctness issues"
+        LDBG("WARNING: pinned WSBuffer["
+             << buf.bufferId << "] is cross-stage but has numCopies="
+             << buf.numCopies << " — this may cause correctness issues"
              << " (producer may overwrite before consumer reads)");
       }
       continue;
@@ -1753,8 +1643,9 @@ public:
         ownerAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
         preAssignRowOffset += ownerBuf->rowSize;
         handledAllocs.insert(ownerAlloc.getOperation());
-        LDBG("TMEM pre-assign: owner alloc buffer.id=" << bid
-             << " rows=" << ownerBuf->rowSize << "x" << ownerBuf->colSize);
+        LDBG("TMEM pre-assign: owner alloc buffer.id="
+             << bid << " rows=" << ownerBuf->rowSize << "x"
+             << ownerBuf->colSize);
 
         // Reusers: subsequent allocs in the group.
         size_t nextColOffset = 0;
@@ -1764,8 +1655,8 @@ public:
 
           // Validate: reuser columns must fit in owner.
           if (reuserBuf->colSize > ownerBuf->colSize) {
-            LDBG("WARNING: annotated TMEM reuse buffer.id=" << bid
-                 << " reuser colSize=" << reuserBuf->colSize
+            LDBG("WARNING: annotated TMEM reuse buffer.id="
+                 << bid << " reuser colSize=" << reuserBuf->colSize
                  << " > owner colSize=" << ownerBuf->colSize
                  << " — skipping reuse, treating as separate owner");
             reuserBuf->rowOffset = preAssignRowOffset;
@@ -1781,8 +1672,8 @@ public:
 
           // Validate: liveness non-overlap.
           if (bufferRange[ownerBuf].intersects(bufferRange[reuserBuf])) {
-            LDBG("WARNING: annotated TMEM reuse buffer.id=" << bid
-                 << " has overlapping liveness between owner and reuser"
+            LDBG("WARNING: annotated TMEM reuse buffer.id="
+                 << bid << " has overlapping liveness between owner and reuser"
                  << " — skipping reuse, treating as separate owner");
             reuserBuf->rowOffset = preAssignRowOffset;
             reuserBuf->colOffset = 0;
@@ -1802,11 +1693,11 @@ public:
           reuserBuf->reuseOwner = ownerBuf;
           reuserAlloc->setAttr("buffer.id", IntegerAttr::get(i32Type, bid));
           reuserAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
-          reuserAlloc->setAttr(
-              "buffer.offset", IntegerAttr::get(i32Type, nextColOffset));
+          reuserAlloc->setAttr("buffer.offset",
+                               IntegerAttr::get(i32Type, nextColOffset));
           handledAllocs.insert(reuserAlloc.getOperation());
-          LDBG("TMEM pre-assign: reuser buffer.id=" << bid
-               << " colOffset=" << nextColOffset
+          LDBG("TMEM pre-assign: reuser buffer.id="
+               << bid << " colOffset=" << nextColOffset
                << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
           nextColOffset += reuserBuf->colSize;
         }
@@ -2863,7 +2754,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     auto mmaAnnotations = parseChannelAnnotations(funcOp);
     DenseMap<Operation *, ChannelAnnotation> smemAllocAnnotations;
     if (!mmaAnnotations.empty())
-      smemAllocAnnotations = buildAllocToAnnotationMap(channels, mmaAnnotations);
+      smemAllocAnnotations =
+          buildAllocToAnnotationMap(channels, mmaAnnotations);
 
     bufferId =
         allocateSmemBuffers(funcOp, channels, numBuffers, effectiveSmemBudget,
