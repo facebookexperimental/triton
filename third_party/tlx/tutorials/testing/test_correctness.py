@@ -38,6 +38,7 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
 
 from triton._internal_testing import is_blackwell, is_hopper
+from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -271,6 +272,16 @@ def test_blackwell_gemm_ws(dtype):
     Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
 
 
+@pytest.mark.parametrize(
+    "shape",
+    _BLACKWELL_GEMM_WS_MORE_SHAPES,
+    ids=[f"{m}x{n}x{k}" for m, n, k in _BLACKWELL_GEMM_WS_MORE_SHAPES],
+)
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_more_shapes(shape):
+    Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], shapes=[shape], dtype=torch.bfloat16)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_clc(dtype):
@@ -279,7 +290,7 @@ def test_blackwell_gemm_clc(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_gemm_ws_warp_barrier(dtype):
+def test_blackwell_gemm_warp_barrier(dtype):
     Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws_warp_barrier"], dtype=dtype)
 
 
