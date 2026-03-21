@@ -978,8 +978,10 @@ buildAllocToAnnotationMap(
     Operation *mmaOp = nullptr;
     if (isa<ttng::MMAv5OpInterface>(dstOp)) {
       mmaOp = dstOp;
-    } else {
-      // For SMEM, the consumer might be memdesc_trans or local_load feeding MMA.
+    } else if (ch->channelKind != DataChannelKind::TMEMPost ||
+               !static_cast<ttng::TmemDataChannelPost *>(ch)->isOperandD) {
+      // For SMEM and non-operand-D TMEM channels, try getDstOps() to find MMA.
+      // Note: getDstOps() asserts !isOperandD for TmemDataChannelPost.
       SmallVector<Operation *> dsts;
       ch->getDstOps(dsts);
       for (auto *dst : dsts) {
