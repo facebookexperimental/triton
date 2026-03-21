@@ -163,6 +163,51 @@ Channel edges show:
 - Green arrows: SMEM data transfers
 - Red arrows: TMEM data transfers (including OperandD accumulators)
 
+## Epilogue Buffer Fusion
+
+### What It Does
+
+When a single `tmem_load` result is split into multiple sub-tiles that are stored to separate SMEM buffers (the epilogue pattern), these buffers are used sequentially with disjoint liveness. The epilogue buffer fusion optimization detects this pattern and assigns the same `buffer.id` to all such buffers so they share physical SMEM, reducing overall shared memory consumption.
+
+### How It Works
+
+The algorithm follows the same logical steps in both code paths:
+
+1. **Group buffers by original load op.** For each candidate buffer, trace back through its channel's `LocalStoreOp` source using `findOriginalLoadOp`, which walks backward through transparent ops (`SplitOp`, `ReshapeOp`, `TransOp`, `ConvertLayoutOp`, truncation/extension casts, `BitcastOp`) to find the root `TMEMLoadOp`. Buffers that originate from the same `TMEMLoadOp` are grouped together.
+
+2. **Skip small groups.** Groups with fewer than 2 buffers have nothing to fuse.
+
+3. **Check compatibility.** All allocs in the group must have the same element type and SMEM size (checked by `allAllocsCompatible`).
+
+4. **Verify disjoint liveness** (legacy path only). Buffers are sorted by liveness start, then all pairs are checked for overlap. If any intervals overlap, the group is skipped.
+
+5. **Assign shared buffer ID.** All buffers in the group receive the same `buffer.id` (or `bufferId`), so they share the same physical SMEM allocation.
+
+### Two Code Paths
+
+| Aspect | Legacy (`fuseEpilogueBuffers`) | New (`fuseEpilogueWSBuffers`) |
+|--------|-------------------------------|-------------------------------|
+| Phase | Phase 2 of `MemoryPlanner::run()` | Phase 3.5 of `allocateSmemBuffers()` |
+| Scope | `MemoryPlanner` member function | Free function in anonymous namespace |
+| Buffer filter | Non-innermost-loop buffers | `P2_Other` priority WSBuffers |
+| Liveness check | Pairwise disjoint verification (with sort) | None (sequential use assumed by priority classification) |
+
+### Debugging
+
+Enable debug logging with:
+
+```bash
+TRITON_LLVM_DEBUG_ONLY="nvgpu-ws-memory-planner" python your_test.py 2>&1
+```
+
+Look for these messages:
+- `"Phase 2 (epilogue fusion): merged N buffers into buffer.id=X"` — legacy path
+- `"Phase 3.5 (epilogue fusion): merged N P2_Other buffers into bufferId=X"` — new path
+
+### Limitations
+
+The optimization does not yet support increasing the buffer count in the epilogue (i.e., it only fuses existing buffers but cannot create additional copies for deeper pipelining of epilogue stores).
+
 ## Source Files
 
 - **Declaration**: `CodePartitionUtility.h`
