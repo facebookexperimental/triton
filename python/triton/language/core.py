@@ -3263,6 +3263,13 @@ class range(base_value):
         The compiler will attempt to partition memory, MMA, and vector
         operations in the loop into separate async partitions. This will
         increase the total number of warps required by the kernel.
+    :param multi_cta: Enable multi-CTA reduction on the loop. The compiler
+        will partition loop iterations across CTAs in a cluster and
+        automatically generate cross-CTA reduction (via Distributed Shared
+        Memory) for any ``tl.sum`` / ``tl.reduce`` that consumes the loop's
+        accumulator. Requires ``ctas_per_cga`` to be set in the kernel
+        launch config (e.g., via ``triton.Config``). Only supported on
+        SM90+ (Hopper/Blackwell) GPUs.
     :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
         code outside the loop. This is often useful to avoid creating long liveranges
         within a loop.
@@ -3273,9 +3280,9 @@ class range(base_value):
     """
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
-                 disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
-                 data_partition_factor=None, merge_epilogue=False, tmem_alloc_algo=None, smem_alloc_algo=None,
-                 smem_budget=None, smem_circular_reuse=None):
+                 disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, multi_cta=False,
+                 disable_licm=False, data_partition_factor=None, merge_epilogue=False, tmem_alloc_algo=None,
+                 smem_alloc_algo=None, smem_budget=None, smem_circular_reuse=None):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -3297,6 +3304,7 @@ class range(base_value):
         self.smem_circular_reuse = smem_circular_reuse
         self.flatten = flatten
         self.warp_specialize = warp_specialize
+        self.multi_cta = multi_cta
         self.disable_licm = disable_licm
 
     def __iter__(self):
