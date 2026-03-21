@@ -808,9 +808,12 @@ struct ChannelAnnotation {
 /// Parse tt.autows channel annotations from all MMA ops in parentOp.
 /// Returns a map from (mmaOp, operandIdx) → ChannelAnnotation, where
 /// operandIdx is 0=opndA, 1=opndB, 2=opndD.
+/// Detects and warns about conflicting annotations.
 static std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
 parseChannelAnnotations(Operation *parentOp) {
   std::map<std::pair<Operation *, unsigned>, ChannelAnnotation> result;
+  // Track bufferId → (numCopies, sourceOp) for cross-MMA consistency checks.
+  std::map<unsigned, std::pair<unsigned, Operation *>> bufferIdToInfo;
 
   parentOp->walk([&](Operation *op) {
     if (!isa<ttng::MMAv5OpInterface>(op))
@@ -842,10 +845,62 @@ parseChannelAnnotations(Operation *parentOp) {
       ann.memType = parts[1].str();
       ann.numCopies = std::stoi(parts[2].str());
       ann.bufferId = std::stoi(parts[3].str());
+
+      // Validate operand name.
+      if (ann.operand != "opndA" && ann.operand != "opndB" &&
+          ann.operand != "opndD") {
+        LDBG("WARNING: invalid operand name '" << ann.operand
+             << "' in channel annotation, skipping");
+        continue;
+      }
+      // Validate memType.
+      if (ann.memType != "smem" && ann.memType != "tmem") {
+        LDBG("WARNING: invalid memType '" << ann.memType
+             << "' in channel annotation, skipping");
+        continue;
+      }
+
       unsigned opIdx = ann.operand == "opndA"   ? 0
                        : ann.operand == "opndB" ? 1
                                                 : 2; // opndD
-      result[{op, opIdx}] = ann;
+
+      // Check for duplicate operand annotation on the same MMA.
+      auto key = std::make_pair(op, opIdx);
+      auto dupIt = result.find(key);
+      if (dupIt != result.end()) {
+        auto &prev = dupIt->second;
+        LDBG("WARNING: duplicate annotation for " << ann.operand
+             << " on same MMA op — overwriting "
+             << prev.memType << "," << prev.numCopies << "," << prev.bufferId
+             << " with " << ann.memType << "," << ann.numCopies << ","
+             << ann.bufferId);
+      }
+
+      // Check for same bufferId with conflicting numCopies across all MMA ops.
+      auto bufIt = bufferIdToInfo.find(ann.bufferId);
+      if (bufIt != bufferIdToInfo.end()) {
+        if (bufIt->second.first != ann.numCopies) {
+          LDBG("WARNING: bufferId=" << ann.bufferId
+               << " has conflicting numCopies: "
+               << bufIt->second.first << " vs " << ann.numCopies
+               << " — using max("
+               << bufIt->second.first << ", " << ann.numCopies << ")");
+          unsigned maxCopies = std::max(bufIt->second.first, ann.numCopies);
+          ann.numCopies = maxCopies;
+          bufIt->second.first = maxCopies;
+        }
+      } else {
+        bufferIdToInfo[ann.bufferId] = {ann.numCopies, op};
+      }
+
+      // Check for operand D annotated as SMEM (always TMEM).
+      if (ann.operand == "opndD" && ann.memType != "tmem") {
+        LDBG("WARNING: opndD must be tmem, got '" << ann.memType
+             << "' — correcting to tmem");
+        ann.memType = "tmem";
+      }
+
+      result[key] = ann;
       LDBG("parseChannelAnnotations: MMA op has annotation: "
            << ann.operand << "," << ann.memType << "," << ann.numCopies << ","
            << ann.bufferId);
@@ -895,6 +950,9 @@ static int getSmemOperandIndex(Operation *allocOp) {
 
 /// Build a mapping from alloc ops → ChannelAnnotation using the channel list
 /// and the parsed MMA annotations.
+/// Detects and warns about conflicting annotations:
+///   - Duplicate allocOp mapping (multiple channels map to the same alloc)
+///   - memType mismatch (SMEM alloc annotated as tmem, or vice versa)
 static DenseMap<Operation *, ChannelAnnotation>
 buildAllocToAnnotationMap(
     SmallVector<Channel *> &channels,
@@ -948,12 +1006,45 @@ buildAllocToAnnotationMap(
 
     // Look up annotation for (mmaOp, opIdx).
     auto it = annotations.find({mmaOp, opIdx});
-    if (it != annotations.end()) {
-      result[allocOp] = it->second;
-      LDBG("buildAllocToAnnotationMap: allocOp mapped to annotation: "
-           << it->second.operand << "," << it->second.memType << ","
-           << it->second.numCopies << "," << it->second.bufferId);
+    if (it == annotations.end())
+      continue;
+
+    const auto &ann = it->second;
+
+    // Validate memType matches the actual alloc type.
+    bool isSmemAlloc = (ch->channelKind == DataChannelKind::SMEMPost);
+    bool isTmemAlloc = (ch->channelKind == DataChannelKind::TMEMPost);
+    if (isSmemAlloc && ann.memType != "smem") {
+      LDBG("WARNING: SMEM alloc annotated with memType='" << ann.memType
+           << "' — expected 'smem', skipping annotation for "
+           << ann.operand);
+      continue;
     }
+    if (isTmemAlloc && ann.memType != "tmem") {
+      LDBG("WARNING: TMEM alloc annotated with memType='" << ann.memType
+           << "' — expected 'tmem', skipping annotation for "
+           << ann.operand);
+      continue;
+    }
+
+    // Check for duplicate allocOp mapping.
+    auto dupIt = result.find(allocOp);
+    if (dupIt != result.end()) {
+      auto &prev = dupIt->second;
+      if (prev.bufferId != ann.bufferId || prev.numCopies != ann.numCopies) {
+        LDBG("WARNING: allocOp has conflicting annotations: "
+             << prev.operand << "," << prev.memType << ","
+             << prev.numCopies << "," << prev.bufferId
+             << " vs " << ann.operand << "," << ann.memType << ","
+             << ann.numCopies << "," << ann.bufferId
+             << " — using later annotation");
+      }
+    }
+
+    result[allocOp] = ann;
+    LDBG("buildAllocToAnnotationMap: allocOp mapped to annotation: "
+         << ann.operand << "," << ann.memType << ","
+         << ann.numCopies << "," << ann.bufferId);
   }
   return result;
 }
@@ -1205,8 +1296,15 @@ static unsigned allocateSmemBuffers(triton::FuncOp funcOp,
   // ── Phase 2: Enforce cross-stage minimum ────────────────────────────
   // Budget-aware: only set copy=2 if the total SMEM stays within budget.
   for (auto &buf : wsBuffers) {
-    if (buf.isPinned)
+    if (buf.isPinned) {
+      if (buf.isCrossStage && buf.numCopies < 2) {
+        LDBG("WARNING: pinned WSBuffer[" << buf.bufferId
+             << "] is cross-stage but has numCopies=" << buf.numCopies
+             << " — this may cause correctness issues"
+             << " (producer may overwrite before consumer reads)");
+      }
       continue;
+    }
     if (buf.isCrossStage && numBuffers >= 2) {
       unsigned saved = buf.numCopies;
       buf.numCopies = 2;
