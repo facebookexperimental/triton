@@ -678,7 +678,7 @@ def _attn_bwd_dkdv_inner(
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
     if RESCHED:
-        dq = tl.dot(tl.trans(dsT), k, attrs={"stage": "1", "order": "1", "channels": ["opndA,tmem,1,8", "opndD,tmem,1,5"]})
+        dq = tl.dot(tl.trans(dsT), k, attrs={"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]})
         dk += tl.dot(dsT, tl.trans(qT), attrs={"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]})
     else:
         dk += tl.dot(dsT, tl.trans(qT))

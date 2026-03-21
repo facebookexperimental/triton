@@ -6,49 +6,64 @@
 // array specifying per-operand buffer assignments. The memory planner reads
 // these annotations and pre-assigns buffer.id and buffer.copy accordingly.
 //
-// SMEM annotations (from tt.autows channels):
-//   qkT opndA → k:  smem,1,0  → buffer.id=0, buffer.copy=1 (pinned)
-//   qkT opndB → qT: smem,2,1  → buffer.id=1, buffer.copy=2 (pinned)
-//   dpT opndA → v:  smem,1,3  → buffer.id=3, buffer.copy=1 (pinned)
-//   dpT opndB → do: smem,1,4  → buffer.id=4, buffer.copy=1 (pinned)
-//   dsT: no annotation → heuristic assignment
+// Annotations per MMA:
+//   qkT: opndA,smem,1,0 / opndB,smem,2,1 / opndD,tmem,1,2
+//   dpT: opndA,smem,1,3 / opndB,smem,1,4 / opndD,tmem,1,5
+//   dv:  opndA,tmem,1,2 / opndD,tmem,1,7
+//   dq:  opndA,smem,1,8 / opndD,tmem,1,5
+//   dk:  opndD,tmem,1,10
 //
-// TMEM annotation overrides (applied after heuristic):
-//   qkT opndD: tmem,1,2
-//   dpT opndD: tmem,1,5
+// SMEM buffers:
+//   k  (qkT opndA): smem,1,0 → buffer.id=0, copy=1 (pinned)
+//   q  (qkT opndB): smem,2,1 → buffer.id=1, copy=2 (pinned)
+//   v  (dpT opndA): smem,1,3 → buffer.id=3, copy=1 (pinned)
+//   do (dpT opndB): smem,1,4 → buffer.id=4, copy=1 (pinned)
+//   dsT (dq opndA): smem,1,8 → buffer.id=8, copy=1 (pinned)
+//   dsT: also used by dk (no annotation) → heuristic would assign, but
+//        pinned by dq's annotation
+//
+// TMEM buffers (pre-assigned):
+//   qkT opndD: tmem,1,2 (owner)
+//   ppT (dv opndA): tmem,1,2 (reuses qkT, offset=0)
+//   dpT opndD: tmem,1,5 (owner)
+//   dq  opndD: tmem,1,5 (reuses dpT, offset=0)
 //   dv  opndD: tmem,1,7
-//   dq  opndD: tmem,1,5 (reuse with dpT)
 //   dk  opndD: tmem,1,10
 
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 //
-// TMEM: dq gets heuristic buffer.id (not mapped by annotation yet)
-// CHECK: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = 0 : i32}
+// TMEM: dq pre-assigned by annotation (opndD) → buffer.id=5, reuses dpT
+// CHECK: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32}
 //
-// SMEM: dsT has no annotation, gets heuristic assignment
-// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// SMEM: dsT pinned by annotation (dq opndA) → buffer.id=8, buffer.copy=1
+// CHECK: %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32}
 //
-// TMEM: dpT heuristic allocation
-// CHECK: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
+// TMEM: dpT pre-assigned by annotation (opndD) → buffer.id=5 (owner)
+// CHECK: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
-// SMEM: do gets buffer.copy=2 (cross-stage TMA), buffer.id=1
-// CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+// TMEM: ppT pre-assigned by annotation (dv opndA) → buffer.id=2, reuses qkT
+// CHECK: %ppT = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 0 : i32}
 //
-// TMEM: qkT heuristic allocation
-// CHECK: %qkT, %qkT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
+// SMEM: do pinned by annotation (dpT opndB) → buffer.id=4, buffer.copy=1
+// CHECK: %do = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 //
-// SMEM: q gets buffer.copy=2, buffer.id=2
-// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
+// TMEM: qkT pre-assigned by annotation (opndD) → buffer.id=2 (owner)
+// CHECK: %qkT, %qkT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
 //
-// TMEM: dv pre-assigned by annotation → buffer.id=7
+// SMEM: q pinned by annotation (qkT opndB) → buffer.id=1, buffer.copy=2
+// CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+//
+// TMEM: dv pre-assigned by annotation (opndD) → buffer.id=7
 // CHECK: %dv, %dv_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
-// TMEM: dk pre-assigned by annotation → buffer.id=10
+// TMEM: dk pre-assigned by annotation (opndD) → buffer.id=10
 // CHECK: %dk, %dk_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 10 : i32}
 //
-// SMEM: v and k
+// SMEM: v pinned by annotation (dpT opndA) → buffer.id=3, buffer.copy=1
 // CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
-// CHECK: %k = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+//
+// SMEM: k pinned by annotation (qkT opndA) → buffer.id=0, buffer.copy=1
+// CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -190,7 +205,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %dsT_122 = arith.truncf %dsT_121 {async_task_id = array<i32: 3>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked> loc(#loc194)
         ttg.local_store %dsT_122, %dsT {async_task_id = array<i32: 3>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable> loc(#loc194)
         %dq_123 = ttg.memdesc_trans %dsT {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared3, #smem, mutable> loc(#loc219)
-        %dq_124 = ttng.tc_gen5_mma %dq_123, %k, %dq[%dq_90], %false, %true {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.autows = "{\22stage\22: \221\22, \22order\22: \221\22, \22channels\22: [\22opndA,tmem,1,8\22, \22opndD,tmem,1,5\22]}"} : !ttg.memdesc<128x128xf16, #shared3, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc193)
+        %dq_124 = ttng.tc_gen5_mma %dq_123, %k, %dq[%dq_90], %false, %true {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.autows = "{\22stage\22: \221\22, \22order\22: \221\22, \22channels\22: [\22opndA,smem,1,8\22, \22opndD,tmem,1,5\22]}"} : !ttg.memdesc<128x128xf16, #shared3, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc193)
         %dk_125 = ttng.tc_gen5_mma %dsT, %q, %dk[%dk_91], %arg48, %true {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.autows = "{\22stage\22: \221\22, \22order\22: \221\22, \22channels\22: [\22opndD,tmem,1,10\22]}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc201)
         %dq_126, %dq_127 = ttng.tmem_load %dq[%dq_124] {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked> loc(#loc193)
         %dqs = tt.reshape %dq_126 {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> -> tensor<128x2x64xf32, #blocked4> loc(#loc235)

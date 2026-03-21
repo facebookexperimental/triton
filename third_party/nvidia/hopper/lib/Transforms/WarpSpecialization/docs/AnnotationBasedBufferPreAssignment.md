@@ -9,30 +9,16 @@ Users can annotate `tl.dot` operations with per-operand channel specifications v
 | Component | Status | Description |
 |-----------|--------|-------------|
 | SMEM algo 1 (WSBuffer-based) | ✅ **Pre-assignment** | Annotated buffers pinned in Phase 1; skip Phases 2–4 |
-| SMEM algo 0 (original MemoryPlanner) | ❌ **Not implemented** | No annotation support |
-| TMEM algo 1 (greedy) | ⚠️ **Post-processing override** | Heuristic runs first; buffer.id/buffer.copy overridden after |
-| TMEM algo 2 (backtracking) | ⚠️ **Post-processing override** | Same as TMEM algo 1 |
+| SMEM algo 0 (original MemoryPlanner) | ❌ **Not implemented** | No annotation support; require `tt.smem_alloc_algo = 1` for annotated kernels |
+| TMEM algo 1 (greedy) | ✅ **Pre-assignment** | Annotated allocs pre-assigned before heuristic; reuse validated |
+| TMEM algo 2 (backtracking) | ✅ **Pre-assignment** | Same as TMEM algo 1 |
+| Operand tracing | ✅ **Complete** | `findMmaForTmemAlloc()` traces through all intermediate ops |
+| Conflict detection | ✅ **Complete** | Duplicate annotations, bufferId conflicts, memType mismatches, cross-stage warnings |
 
-### Known Gaps
+### Remaining Gap
 
-1. **SMEM algo 0**: The original `MemoryPlanner` class doesn't receive annotations at all.
-   All annotated kernels should use `tt.smem_alloc_algo = 1`.
-
-2. **TMEM post-processing vs. pre-assignment**: The current TMEM implementation is a
-   post-processing override — the heuristic allocator runs first (computing its own
-   reuse groups and offsets), then we override `buffer.id`/`buffer.copy` for annotated
-   allocs. This can lead to inconsistencies:
-   - `buffer.offset` was computed for the heuristic's reuse groups, not the annotated ones
-   - If two annotated allocs share a `bufferId` (reuse group), the heuristic doesn't
-     know about this and may compute conflicting offsets
-   - The proper fix is to **pre-assign** annotated TMEM allocs before the heuristic runs,
-     partitioning them out of `allocsForThisLoop` (see Step 4 design below)
-
-3. **Alloc-to-annotation mapping**: `buildAllocToAnnotationMap` traces from channels to
-   MMA consumers to look up annotations. This tracing is incomplete for some cases
-   (e.g., SMEM allocs feeding MMA through multiple levels of indirection). The
-   `getSmemOperandIndex` helper only finds MMA operand A vs B when there's a direct or
-   single-hop path.
+**SMEM algo 0**: The original `MemoryPlanner` class (used when `tt.smem_alloc_algo = 0` or not set)
+does not receive annotations. All annotated kernels should use `tt.smem_alloc_algo = 1`.
 
 ### User-Facing API
 
@@ -407,38 +393,6 @@ TMEM: pre-assign buffer.id/buffer.copy/buffer.offset → validate reuse → excl
 ## Testing
 
 1. **Regression**: Run existing WS memory planner lit tests to verify no change for un-annotated kernels
-2. **New lit test**: MLIR test with `tt.autows` channel annotations on `tc_gen5_mma` ops, verify `buffer.id`/`buffer.copy`/`buffer.offset` match annotations
+2. **New lit test**: `ws_memory_planner_annotation.mlir` — MLIR test with `tt.autows` channel annotations on `tc_gen5_mma` ops, verify `buffer.id`/`buffer.copy`/`buffer.offset` match annotations
 3. **Integration**: Run bwd attention tutorial with channel annotations, dump MLIR, verify buffer attributes
 4. **Edge cases**: Partially annotated kernels, invalid reuse annotations (overlapping liveness), memType mismatches
-
----
-
-## Future Work: Proper TMEM Pre-Assignment
-
-The current TMEM implementation (Step 4) is a **post-processing override** — the heuristic
-runs first, then we override `buffer.id`/`buffer.copy`. This has limitations:
-
-1. `buffer.offset` remains from the heuristic's reuse computation, which may be wrong
-   for the annotated reuse groups
-2. Annotated reuse groups (same `bufferId`) are not validated for liveness non-overlap
-3. The heuristic may allocate new row space for allocs that should reuse annotated space
-
-### Proper Pre-Assignment Design (from Step 4 in this document)
-
-The correct approach is to:
-
-1. **Partition** `allocsForThisLoop` into annotated and un-annotated before calling
-   `allocateTMemAllocs`/`allocateTMemAllocs2`
-2. **Pre-assign** annotated allocs: group by `bufferId`, validate reuse (liveness
-   non-overlap, column size compatibility), compute `buffer.offset`
-3. **Update `BufferT` fields** for pre-assigned allocs (`rowOffset`, `colOffset`,
-   `isOwnerOfSpace`, `reuseOwner`) so the heuristic sees them as already placed
-4. **Exclude** annotated allocs from `allocsForThisLoop` passed to the heuristic
-5. **Coordinate** `bufferId` so heuristic IDs don't collide with annotated IDs
-
-### Also Needed: SMEM Algo 0 Support
-
-The original `MemoryPlanner` class (algo 0) does not receive annotations. To support it:
-- Pass `allocToAnnotation` map to `MemoryPlanner::run()`
-- In the original allocation loop, check for annotations and pin buffer.id/buffer.copy
-- Or: require `tt.smem_alloc_algo = 1` for annotated kernels (simpler)

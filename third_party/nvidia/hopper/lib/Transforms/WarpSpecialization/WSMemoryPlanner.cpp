@@ -759,15 +759,12 @@ static int getSmemOperandIndex(Operation *allocOp) {
       continue;
     for (auto *user : v.getUsers()) {
       if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        // Check which operand of the MMA this value feeds.
-        if (mmaOp.getA() == v || mmaOp.getA().getDefiningOp() == allocOp)
-          return 0; // operand A
-        if (mmaOp.getB() == v || mmaOp.getB().getDefiningOp() == allocOp)
-          return 1; // operand B
-        // Check all operands positionally.
+        if (mmaOp.getA() == v)
+          return 0;
+        if (mmaOp.getB() == v)
+          return 1;
         for (unsigned i = 0; i < user->getNumOperands(); ++i) {
           if (user->getOperand(i) == v) {
-            // MMA operands: 0=A, 1=B, 2=D, 3=token, 4=useD, 5=pred
             if (i == 0)
               return 0;
             if (i == 1)
@@ -775,18 +772,115 @@ static int getSmemOperandIndex(Operation *allocOp) {
           }
         }
       }
-      // Follow through memdesc_trans, local_load, etc.
       for (auto result : user->getResults())
         worklist.push_back(result);
     }
   }
-  return -1; // unknown
+  return -1;
 }
 
-/// Build a mapping from alloc ops → ChannelAnnotation using the channel list
-/// and the parsed MMA annotations.
+/// Find the MMA op that consumes a TMEM alloc and determine its operand index.
+/// For operand D: the MMA uses the alloc's result as its D operand.
+/// For operand A/B: the alloc feeds through tmem_store into MMA operand A or B.
+/// Returns {mmaOp, opIdx} or {nullptr, 0} if not found.
+static std::pair<Operation *, unsigned>
+findMmaForTmemAlloc(Operation *allocOp,
+                    ttng::TmemDataChannelPost *tmemCh) {
+  // Walk from the allocOp's result through users to find the MMA.
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  for (auto result : allocOp->getResults()) {
+    // Skip token results.
+    if (isa<ttg::AsyncTokenType>(result.getType()))
+      continue;
+    worklist.push_back(result);
+  }
+
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    for (auto *user : v.getUsers()) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        // Check which operand this alloc feeds.
+        if (mmaOp.getD() == v)
+          return {user, 2}; // operand D
+        if (mmaOp.getA() == v)
+          return {user, 0}; // operand A
+        if (mmaOp.getB() == v)
+          return {user, 1}; // operand B
+      }
+      // Follow through MemDescIndex, tmem_load, tmem_store, etc.
+      for (auto result : user->getResults()) {
+        if (!isa<ttg::AsyncTokenType>(result.getType()))
+          worklist.push_back(result);
+      }
+    }
+  }
+  return {nullptr, 0};
+}
+
+/// Find all MMA ops that consume an SMEM alloc, with their operand indices.
+/// Returns a list of {mmaOp, opIdx} pairs since an SMEM alloc can feed
+/// multiple MMAs (e.g., k feeds both qkT and dq).
+static SmallVector<std::pair<Operation *, unsigned>>
+findMmasForSmemAlloc(Operation *allocOp) {
+  SmallVector<std::pair<Operation *, unsigned>> results;
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  for (auto result : allocOp->getResults())
+    worklist.push_back(result);
+
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    for (auto *user : v.getUsers()) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        if (mmaOp.getA() == v)
+          results.push_back({user, 0});
+        else if (mmaOp.getB() == v)
+          results.push_back({user, 1});
+        continue; // Don't follow through MMA results
+      }
+      for (auto result : user->getResults())
+        worklist.push_back(result);
+    }
+  }
+  return results;
+}
+
+/// Trace an MMA operand value back to its defining alloc op (local_alloc or
+/// tmem_alloc), following through memdesc_trans, MemDescIndex, etc.
+static Operation *traceBackToAlloc(Value v) {
+  DenseSet<Value> visited;
+  SmallVector<Value> worklist = {v};
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    if (!visited.insert(cur).second)
+      continue;
+    Operation *defOp = cur.getDefiningOp();
+    if (!defOp)
+      continue;
+    if (isa<ttg::LocalAllocOp>(defOp) || isa<ttng::TMEMAllocOp>(defOp))
+      return defOp;
+    // Follow through memdesc_trans, MemDescIndex, memdesc_reinterpret, etc.
+    for (auto operand : defOp->getOperands())
+      worklist.push_back(operand);
+  }
+  return nullptr;
+}
+
+/// Build a mapping from alloc ops → ChannelAnnotation using a top-down
+/// approach: iterate over annotated MMA ops, trace each operand back to its
+/// defining alloc op, and associate the annotation.
+///
+/// This is more robust than the old bottom-up approach (alloc → trace users →
+/// find MMA) because it directly uses the MMA's operand accessors (getA(),
+/// getB(), getD()) to identify which alloc feeds which operand.
+///
 /// Detects and warns about conflicting annotations:
-///   - Duplicate allocOp mapping (multiple channels map to the same alloc)
+///   - Duplicate allocOp mapping (same alloc gets annotations from multiple MMAs)
 ///   - memType mismatch (SMEM alloc annotated as tmem, or vice versa)
 static DenseMap<Operation *, ChannelAnnotation>
 buildAllocToAnnotationMap(
@@ -798,59 +892,34 @@ buildAllocToAnnotationMap(
   if (annotations.empty())
     return result;
 
-  for (auto *ch : channels) {
-    Operation *allocOp = ch->getAllocOp();
-    if (!allocOp)
+  for (auto &[key, ann] : annotations) {
+    auto [mmaOp, opIdx] = key;
+    auto tcMma = dyn_cast<ttng::TCGen5MMAOp>(mmaOp);
+    if (!tcMma)
       continue;
 
-    // Determine the consumer MMA op.
-    Operation *dstOp = ch->getDstOp();
-    if (!dstOp)
+    // Get the MMA operand value for this annotation.
+    Value operandVal;
+    if (opIdx == 0)
+      operandVal = tcMma.getA();
+    else if (opIdx == 1)
+      operandVal = tcMma.getB();
+    else if (opIdx == 2)
+      operandVal = tcMma.getD();
+    else
       continue;
 
-    // Find the MMA op: for SMEM channels, getDstOp() may return a non-MMA
-    // consumer. Walk forward to find the actual MMA.
-    Operation *mmaOp = nullptr;
-    if (isa<ttng::MMAv5OpInterface>(dstOp)) {
-      mmaOp = dstOp;
-    } else if (ch->channelKind != DataChannelKind::TMEMPost ||
-               !static_cast<ttng::TmemDataChannelPost *>(ch)->isOperandD) {
-      // For SMEM and non-operand-D TMEM channels, try getDstOps() to find MMA.
-      // Note: getDstOps() asserts !isOperandD for TmemDataChannelPost.
-      SmallVector<Operation *> dsts;
-      ch->getDstOps(dsts);
-      for (auto *dst : dsts) {
-        if (isa<ttng::MMAv5OpInterface>(dst)) {
-          mmaOp = dst;
-          break;
-        }
-      }
-    }
-    if (!mmaOp)
-      continue;
-
-    // Determine operand index.
-    unsigned opIdx;
-    if (ch->channelKind == DataChannelKind::TMEMPost) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
-      opIdx = tmemCh->isOperandD ? 2 : 0; // 0=A for non-D TMEM (default)
-    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
-      int idx = getSmemOperandIndex(allocOp);
-      opIdx = idx >= 0 ? static_cast<unsigned>(idx) : 0;
-    } else {
+    // Trace back to the defining alloc op.
+    Operation *allocOp = traceBackToAlloc(operandVal);
+    if (!allocOp) {
+      LDBG("buildAllocToAnnotationMap: could not trace " << ann.operand
+           << " back to alloc op, skipping");
       continue;
     }
-
-    // Look up annotation for (mmaOp, opIdx).
-    auto it = annotations.find({mmaOp, opIdx});
-    if (it == annotations.end())
-      continue;
-
-    const auto &ann = it->second;
 
     // Validate memType matches the actual alloc type.
-    bool isSmemAlloc = (ch->channelKind == DataChannelKind::SMEMPost);
-    bool isTmemAlloc = (ch->channelKind == DataChannelKind::TMEMPost);
+    bool isSmemAlloc = isa<ttg::LocalAllocOp>(allocOp);
+    bool isTmemAlloc = isa<ttng::TMEMAllocOp>(allocOp);
     if (isSmemAlloc && ann.memType != "smem") {
       LDBG("WARNING: SMEM alloc annotated with memType='" << ann.memType
            << "' — expected 'smem', skipping annotation for "
@@ -874,14 +943,14 @@ buildAllocToAnnotationMap(
              << prev.numCopies << "," << prev.bufferId
              << " vs " << ann.operand << "," << ann.memType << ","
              << ann.numCopies << "," << ann.bufferId
-             << " — using later annotation");
+             << " — using earlier annotation");
       }
+      continue;
     }
 
     result[allocOp] = ann;
-    LDBG("buildAllocToAnnotationMap: allocOp mapped to annotation: "
-         << ann.operand << "," << ann.memType << ","
-         << ann.numCopies << "," << ann.bufferId);
+    LDBG("buildAllocToAnnotationMap: " << ann.operand << ","
+         << ann.memType << "," << ann.numCopies << "," << ann.bufferId);
   }
   return result;
 }
