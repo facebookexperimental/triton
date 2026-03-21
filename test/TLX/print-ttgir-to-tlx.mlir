@@ -7,16 +7,17 @@
 // - Simplified operation names
 // - local_alloc differentiation between barriers and buffers
 
-// Check function signature
-// CHECK: func _attn_fwd_persist(
+// Check function signature (now emits Python-style def with @triton.jit)
+// CHECK: @triton.jit
+// CHECK: def _attn_fwd_persist(
 
 // Verify barrier allocations are detected and converted
 // CHECK-DAG: tlx.alloc_barriers(1)
 // CHECK-DAG: tlx.alloc_barriers(3)
 
 // Verify regular buffer allocations are converted with shape, dtype, count
-// CHECK-DAG: tlx.local_alloc((128, 128), bf16, 1)
-// CHECK-DAG: tlx.local_alloc((128, 128), bf16, 3)
+// CHECK-DAG: tlx.local_alloc((128, 128), tl.bfloat16, 1)
+// CHECK-DAG: tlx.local_alloc((128, 128), tl.bfloat16, 3)
 
 // Verify barrier operations are replaced
 // CHECK-DAG: tlx.barrier_wait(
@@ -24,23 +25,23 @@
 // CHECK-DAG: tlx.barrier_expect_bytes(
 
 // Verify MMA operations are replaced
-// CHECK-DAG: tlx.tc_gen5_mma(
+// CHECK-DAG: tlx.async_dot(
 
 // Verify TMA operations are replaced
 // CHECK-DAG: tlx.async_descriptor_load(
 // CHECK-DAG: tlx.async_descriptor_store(
 
 // Verify memory operations are replaced
-// CHECK-DAG: tlx.tmem_alloc(
-// CHECK-DAG: tlx.tmem_load(
-// CHECK-DAG: tlx.tmem_store(
+// CHECK-DAG: tlx.local_alloc(
+// CHECK-DAG: tlx.local_load(
+// CHECK-DAG: tlx.local_store(
 // CHECK-DAG: tlx.local_trans(
 // CHECK-DAG: tlx.subslice(
 
 // Verify warp specialization uses Python-like async_tasks syntax
 // CHECK-DAG: with tlx.async_tasks():
 // CHECK-DAG: with tlx.async_task("default"):
-// CHECK-DAG: with tlx.async_task():
+// CHECK-DAG: with tlx.async_task(num_warps=
 
 // Verify control flow is simplified - for loops use Python range syntax
 // CHECK-DAG: for arg{{[0-9]+}} in range(
