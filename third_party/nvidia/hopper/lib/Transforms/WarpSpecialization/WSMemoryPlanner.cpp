@@ -759,15 +759,12 @@ static int getSmemOperandIndex(Operation *allocOp) {
       continue;
     for (auto *user : v.getUsers()) {
       if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        // Check which operand of the MMA this value feeds.
-        if (mmaOp.getA() == v || mmaOp.getA().getDefiningOp() == allocOp)
-          return 0; // operand A
-        if (mmaOp.getB() == v || mmaOp.getB().getDefiningOp() == allocOp)
-          return 1; // operand B
-        // Check all operands positionally.
+        if (mmaOp.getA() == v)
+          return 0;
+        if (mmaOp.getB() == v)
+          return 1;
         for (unsigned i = 0; i < user->getNumOperands(); ++i) {
           if (user->getOperand(i) == v) {
-            // MMA operands: 0=A, 1=B, 2=D, 3=token, 4=useD, 5=pred
             if (i == 0)
               return 0;
             if (i == 1)
@@ -775,12 +772,52 @@ static int getSmemOperandIndex(Operation *allocOp) {
           }
         }
       }
-      // Follow through memdesc_trans, local_load, etc.
       for (auto result : user->getResults())
         worklist.push_back(result);
     }
   }
-  return -1; // unknown
+  return -1;
+}
+
+/// Find the MMA op that consumes a TMEM alloc and determine its operand index.
+/// For operand D: the MMA uses the alloc's result as its D operand.
+/// For operand A/B: the alloc feeds through tmem_store into MMA operand A or B.
+/// Returns {mmaOp, opIdx} or {nullptr, 0} if not found.
+static std::pair<Operation *, unsigned>
+findMmaForTmemAlloc(Operation *allocOp,
+                    ttng::TmemDataChannelPost *tmemCh) {
+  // Walk from the allocOp's result through users to find the MMA.
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  for (auto result : allocOp->getResults()) {
+    // Skip token results.
+    if (isa<ttg::AsyncTokenType>(result.getType()))
+      continue;
+    worklist.push_back(result);
+  }
+
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    for (auto *user : v.getUsers()) {
+      if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        // Check which operand this alloc feeds.
+        if (mmaOp.getD() == v)
+          return {user, 2}; // operand D
+        if (mmaOp.getA() == v)
+          return {user, 0}; // operand A
+        if (mmaOp.getB() == v)
+          return {user, 1}; // operand B
+      }
+      // Follow through MemDescIndex, tmem_load, tmem_store, etc.
+      for (auto result : user->getResults()) {
+        if (!isa<ttg::AsyncTokenType>(result.getType()))
+          worklist.push_back(result);
+      }
+    }
+  }
+  return {nullptr, 0};
 }
 
 /// Build a mapping from alloc ops → ChannelAnnotation using the channel list
@@ -803,43 +840,40 @@ buildAllocToAnnotationMap(
     if (!allocOp)
       continue;
 
-    // Determine the consumer MMA op.
-    Operation *dstOp = ch->getDstOp();
-    if (!dstOp)
-      continue;
-
-    // Find the MMA op: for SMEM channels, getDstOp() may return a non-MMA
-    // consumer. Walk forward to find the actual MMA.
     Operation *mmaOp = nullptr;
-    if (isa<ttng::MMAv5OpInterface>(dstOp)) {
-      mmaOp = dstOp;
-    } else if (ch->channelKind != DataChannelKind::TMEMPost ||
-               !static_cast<ttng::TmemDataChannelPost *>(ch)->isOperandD) {
-      // For SMEM and non-operand-D TMEM channels, try getDstOps() to find MMA.
-      // Note: getDstOps() asserts !isOperandD for TmemDataChannelPost.
-      SmallVector<Operation *> dsts;
-      ch->getDstOps(dsts);
-      for (auto *dst : dsts) {
-        if (isa<ttng::MMAv5OpInterface>(dst)) {
-          mmaOp = dst;
-          break;
+    unsigned opIdx = 0;
+
+    if (ch->channelKind == DataChannelKind::TMEMPost) {
+      // For TMEM channels, walk from the allocOp through users to find MMA.
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      auto [foundMma, foundIdx] = findMmaForTmemAlloc(allocOp, tmemCh);
+      mmaOp = foundMma;
+      opIdx = foundIdx;
+    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+      // For SMEM channels, try getDstOp first, then walk from allocOp.
+      Operation *dstOp = ch->getDstOp();
+      if (dstOp && isa<ttng::MMAv5OpInterface>(dstOp)) {
+        mmaOp = dstOp;
+      } else {
+        SmallVector<Operation *> dsts;
+        ch->getDstOps(dsts);
+        for (auto *dst : dsts) {
+          if (isa<ttng::MMAv5OpInterface>(dst)) {
+            mmaOp = dst;
+            break;
+          }
         }
       }
-    }
-    if (!mmaOp)
-      continue;
-
-    // Determine operand index.
-    unsigned opIdx;
-    if (ch->channelKind == DataChannelKind::TMEMPost) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
-      opIdx = tmemCh->isOperandD ? 2 : 0; // 0=A for non-D TMEM (default)
-    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
-      int idx = getSmemOperandIndex(allocOp);
-      opIdx = idx >= 0 ? static_cast<unsigned>(idx) : 0;
+      if (mmaOp) {
+        int idx = getSmemOperandIndex(allocOp);
+        opIdx = idx >= 0 ? static_cast<unsigned>(idx) : 0;
+      }
     } else {
       continue;
     }
+
+    if (!mmaOp)
+      continue;
 
     // Look up annotation for (mmaOp, opIdx).
     auto it = annotations.find({mmaOp, opIdx});
