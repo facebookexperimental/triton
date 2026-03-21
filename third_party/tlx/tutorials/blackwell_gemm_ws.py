@@ -1419,5 +1419,22 @@ def matmul(a, b, config=None, use_heuristic=False):
             K,
             NUM_SMS=NUM_SMS,
         )
-        # post_hook handles reduction for split-K > 1
+        # Run split-K reduction after the autotuner picks and launches the kernel.
+        # The autotuner's post_hook only runs during benchmarking, not production calls.
+        best = matmul_kernel_tma_ws_blackwell.best_config
+        split_k = best.kwargs.get("SPLIT_K", 1)
+        if split_k > 1:
+            workspace = workspace_desc.base
+            reduce_grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
+            _reduce_k_kernel[reduce_grid](
+                workspace,
+                c,
+                M,
+                N,
+                SPLIT_K=split_k,
+                BLOCK_SIZE_M=128,
+                BLOCK_SIZE_N=128,
+                OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[a.dtype],
+                num_warps=8,
+            )
     return c
