@@ -54,17 +54,17 @@ def setenv(key: str, value: Optional[str]) -> None:
 
 def toenv(val: Any) -> Union[None, tuple[Optional[str]]]:
     if val is None:
-        return (None,)
+        return (None, )
 
     t = type(val)
     if t is bool:
-        return ("1" if val else "0",)
+        return ("1" if val else "0", )
 
     if t is str:
-        return (val,)
+        return (val, )
 
     if t is int:
-        return (str(val),)
+        return (str(val), )
 
     return None
 
@@ -78,6 +78,7 @@ _NOTHING = object()
 
 
 class env_base(Generic[SetType, GetType]):
+
     def __init__(self, key: str) -> None:
         self.key = key
 
@@ -111,6 +112,7 @@ class env_base(Generic[SetType, GetType]):
 
 
 class env_str(env_base[str, str]):
+
     def __init__(self, key: str, default: str):
         super().__init__(key)
         self.default = default
@@ -120,6 +122,7 @@ class env_str(env_base[str, str]):
 
 
 class env_str_callable_default(env_base[str, str]):
+
     def __init__(self, key: str, default_factory: Callable[[], str]):
         super().__init__(key)
         self.default_factory = default_factory
@@ -132,6 +135,7 @@ class env_str_callable_default(env_base[str, str]):
 
 
 class env_bool(env_base[bool, bool]):
+
     def __init__(self, key: str, default: bool = False) -> None:
         super().__init__(key)
         self.default = default
@@ -141,6 +145,7 @@ class env_bool(env_base[bool, bool]):
 
 
 class env_int(env_base[int, int]):
+
     def __init__(self, key: str, default: int = 0) -> None:
         super().__init__(key)
         self.default = default
@@ -159,6 +164,7 @@ ClassType = TypeVar("ClassType")
 
 
 class env_class(Generic[ClassType], env_base[Optional[Type[ClassType]], Optional[Type[ClassType]]]):
+
     def __init__(self, key: str, type: str) -> None:
         super().__init__(key)
         # We can't pass the type directly to avoid import cycles
@@ -198,6 +204,7 @@ class NvidiaTool:
 
 
 class env_nvidia_tool(env_base[str, NvidiaTool]):
+
     def __init__(self, binary: str) -> None:
         binary += sysconfig.get_config_var("EXE")
         self.binary = binary
@@ -224,11 +231,13 @@ class env_nvidia_tool(env_base[str, NvidiaTool]):
 
 # Separate classes so that types are correct
 class env_opt_str(env_base[Optional[str], Optional[str]]):
+
     def get(self) -> Optional[str]:
         return getenv(self.key)
 
 
 class env_opt_bool(env_base):
+
     def get(self) -> Optional[str]:
         return getenv_bool(self.key, None)
 
@@ -261,6 +270,7 @@ class CompileTimes:
 
 
 class CompilationListener(Protocol):
+
     def __call__(
         self,
         *,
@@ -269,13 +279,15 @@ class CompilationListener(Protocol):
         metadata_group: dict[str, str],
         times: CompileTimes,
         cache_hit: bool,
-    ) -> None: ...
+    ) -> None:
+        ...
 
 
 knobs_type = TypeVar("knobs_type", bound="base_knobs")
 
 
 class base_knobs:
+
     @property
     def knob_descriptors(self) -> dict[str, env_base]:
         return {
@@ -317,6 +329,7 @@ class base_knobs:
 
 
 class BuildImpl(Protocol):
+
     def __call__(
         self,
         name: str,
@@ -326,7 +339,8 @@ class BuildImpl(Protocol):
         include_dirs: list[str],
         libraries: list[str],
         /,
-    ) -> str: ...
+    ) -> str:
+        ...
 
 
 class build_knobs(base_knobs):
@@ -395,7 +409,8 @@ class autotuning_knobs(base_knobs):
 class LaunchHook(Protocol):
     """Hook invoked before and after kernel launching"""
 
-    def __call__(self, metadata: LazyDict) -> None: ...
+    def __call__(self, metadata: LazyDict) -> None:
+        ...
 
 
 class InitHandleHook(Protocol):
@@ -410,7 +425,8 @@ class InitHandleHook(Protocol):
         name: str,
         metadata_group: dict[str, str],
         hash: str,
-    ) -> None: ...
+    ) -> None:
+        ...
 
 
 F = TypeVar("F", bound=Callable)
@@ -461,6 +477,7 @@ class JITHookCompileInfo(TypedDict):
 
 
 class JITHook(Protocol):
+
     def __call__(
         self,
         *,
@@ -470,11 +487,14 @@ class JITHook(Protocol):
         compile: JITHookCompileInfo,
         is_manual_warmup: bool,
         already_compiled: bool,
-    ) -> Optional[bool]: ...
+    ) -> Optional[bool]:
+        ...
 
 
 class PipelineStagesHook(Protocol):
-    def __call__(self, stages, options, language, capability): ...
+
+    def __call__(self, stages, options, language, capability):
+        ...
 
 
 class runtime_knobs(base_knobs):
@@ -549,8 +569,8 @@ class amd_knobs(base_knobs):
 
 class proton_knobs(base_knobs):
     cupti_lib_dir: env_str = env_str(
-        "TRITON_CUPTI_LIB_PATH", str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti")
-    )
+        "TRITON_CUPTI_LIB_PATH",
+        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"))
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
 
 
