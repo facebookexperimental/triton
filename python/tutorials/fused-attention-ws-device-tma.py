@@ -656,7 +656,8 @@ def _attn_bwd_dkdv_inner(
     offs_m = curr_m + tl.arange(0, BLOCK_M1)
     m = tl.load(M + offs_m)
     if RESCHED:
-        qkT = tl.dot(k, qT, attrs={"stage": "0", "order": "0"})
+        # opndA is k, in smem, has 2 copies, buffer.id is 0
+        qkT = tl.dot(k, qT, attrs={"stage": "0", "order": "0", "channels": ["opndA,smem,2,0", "opndB,smem,2,1", "opndD,tmem,1,2"]})
     else:
         qkT = tl.dot(k, qT)
     pT = tl.math.exp2(qkT - m[None, :])
@@ -667,9 +668,9 @@ def _attn_bwd_dkdv_inner(
     ppT = pT
     ppT = ppT.to(dtype)
     if RESCHED:
-        dpT = tl.dot(v, tl.trans(do), attrs={"stage": "0", "order": "2"}).to(tl.float32)
+        dpT = tl.dot(v, tl.trans(do), attrs={"stage": "0", "order": "2", "channels": ["opndA,smem,2,3", "opndB,smem,2,4", "opndD,tmem,1,5"]}).to(tl.float32)
         Di = tl.load(D + offs_m)
-        dv += tl.dot(ppT, do, attrs={"stage": "0", "order": "2"})
+        dv += tl.dot(ppT, do, attrs={"stage": "0", "order": "2", "channels": ["opndA,tmem,1,6", "opndB,smem,2,4", "opndD,tmem,1,7"]})
     else:
         dv += tl.dot(ppT, do)
         Di = tl.load(D + offs_m)
@@ -677,8 +678,8 @@ def _attn_bwd_dkdv_inner(
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
     if RESCHED:
-        dq = tl.dot(tl.trans(dsT), k, attrs={"stage": "1", "order": "1"})
-        dk += tl.dot(dsT, tl.trans(qT), attrs={"stage": "1", "order": "1"})
+        dq = tl.dot(tl.trans(dsT), k, attrs={"stage": "1", "order": "1", "channels": ["opndA,tmem,1,8", "opndB,smem,2,0", "opndD,tmem,1,9"]})
+        dk += tl.dot(dsT, tl.trans(qT), attrs={"stage": "1", "order": "1", "channels": ["opndA,tmem,1,6", "opndB,smem,2,1", "opndD,tmem,1,10"]})
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
