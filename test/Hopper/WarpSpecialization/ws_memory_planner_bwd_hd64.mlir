@@ -1,12 +1,12 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
-// Test case: FA BWD with HEAD_DIM=64 — dq reuses dpT at col offset 0.
+// Test case: FA BWD with HEAD_DIM=64 — dq reuses qkT at col offset 64.
 //
 // When HEAD_DIM=64, dk/dv/dq are 128x64 while qkT/dpT remain 128x128.
-// The memory planner assigns dq to dpT (buffer 8) at col offset 0.
+// The memory planner assigns dq to qkT (buffer 7) at col offset 64.
 //
 // CHECK-LABEL: tt.func public @_attn_bwd
-// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 64 : i32}
 // CHECK: %dpT, %dpT_1 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
 // CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 // CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
