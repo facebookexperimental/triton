@@ -1030,17 +1030,17 @@ def reduce_post_hook(nargs, exception=None):
         N = nargs["N"]
         workspace = nargs["workspace_desc"].base
         c = nargs["c_desc"].base
-        reduce_grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
+        reduce_grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
         _reduce_k_kernel[reduce_grid](
             workspace,
             c,
             M,
             N,
             SPLIT_K=split_k,
-            BLOCK_SIZE_M=128,
-            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=32,
             OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[workspace.dtype],
-            num_warps=8,
+            num_warps=4,
         )
 
 
@@ -1382,17 +1382,17 @@ def matmul(a, b, config=None, use_heuristic=False):
         )
         # Run separate reduction kernel for split-K
         if split_k > 1:
-            reduce_grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
+            reduce_grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
             _reduce_k_kernel[reduce_grid](
                 workspace_desc.base,
                 c,
                 M,
                 N,
                 SPLIT_K=split_k,
-                BLOCK_SIZE_M=128,
-                BLOCK_SIZE_N=128,
+                BLOCK_SIZE_M=32,
+                BLOCK_SIZE_N=32,
                 OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[a.dtype],
-                num_warps=8,
+                num_warps=4,
             )
     else:
         # Pass c as dummy workspace_desc. Pre_hook dynamically allocates
@@ -1425,16 +1425,16 @@ def matmul(a, b, config=None, use_heuristic=False):
         split_k = best.kwargs.get("SPLIT_K", 1)
         if split_k > 1:
             workspace = workspace_desc.base
-            reduce_grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
+            reduce_grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
             _reduce_k_kernel[reduce_grid](
                 workspace,
                 c,
                 M,
                 N,
                 SPLIT_K=split_k,
-                BLOCK_SIZE_M=128,
-                BLOCK_SIZE_N=128,
+                BLOCK_SIZE_M=32,
+                BLOCK_SIZE_N=32,
                 OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[a.dtype],
-                num_warps=8,
+                num_warps=4,
             )
     return c
