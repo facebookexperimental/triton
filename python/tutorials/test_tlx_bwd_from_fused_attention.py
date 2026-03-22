@@ -627,9 +627,9 @@ if __name__ == "__main__":
     bench_configs = [
         # (Z,  H,  N_CTX, HEAD_DIM, causal, baseVariant)
         (8, 16, 1024, 128, False, "ws_persistent"),
-        (8, 16, 2048, 128, False, "ws_persistent"),
-        (8, 16, 4096, 128, False, "ws_persistent"),
-        (4, 32, 4096, 128, False, "ws_persistent"),
+        #(8, 16, 2048, 128, False, "ws_persistent"),
+        #(8, 16, 4096, 128, False, "ws_persistent"),
+        #(4, 32, 4096, 128, False, "ws_persistent"),
     ]
 
     cw = [8, 6, 8, 10, 16, 14, 14, 14, 10]
