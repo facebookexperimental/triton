@@ -2831,6 +2831,7 @@ void insertAsyncComm(
     // be moved for correct synchronization across reused buffers.
     // Use reuseBarrier=false to find reuse groups even with single-copy
     // buffers.
+    Channel *earlyChannelForReuseSync = nullptr;
     int reuseGrp2 = channelInReuseGroup(masterChannel, config,
                                         /*reuseBarrier=*/false);
     if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
@@ -2862,6 +2863,11 @@ void insertAsyncComm(
               producerAcquireForChannelLoop->dump();
             });
           }
+          // Track the early channel so we can insert an intra-iteration
+          // reuse sync: the late channel's producer must wait for the early
+          // channel's consumer to finish reading from the shared buffer
+          // before overwriting it.
+          earlyChannelForReuseSync = earlyChannel;
         }
       }
     }
@@ -3163,6 +3169,42 @@ void insertAsyncComm(
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
         });
+      }
+
+      // Intra-iteration reuse sync: when two channels share a single-buffered
+      // SMEM slot (reuse group with copy=1), the late channel's producer must
+      // wait for the early channel's consumer to finish reading from the buffer
+      // before overwriting it. Without this, the late store races with the
+      // early channel's async TMA read.
+      //
+      // ProducerAcquireOp lowering XORs the phase before waiting on
+      // bufferEmpty. We want WaitBarrier(bufferEmpty, phase) (block while
+      // bufferEmpty.phase == phase, unblock when CR flips it to phase^1).
+      // Since lowering does phase^1, we pass phase^1 here so the double-XOR
+      // yields the correct wait phase.
+      if (earlyChannelForReuseSync) {
+        auto earlyTokenIt = tokenMap.find(earlyChannelForReuseSync);
+        if (earlyTokenIt != tokenMap.end()) {
+          for (const auto &earlyToken : earlyTokenIt->second.tokens) {
+            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setInsertionPoint(headProducer);
+            builder.setLoopScheduleInfoFromOp(headProducer);
+            Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                headProducer->getLoc(), 1, 1);
+            Value phaseFlipped = builder.createWithAsyncTaskIds<arith::XOrIOp>(
+                headProducer->getLoc(), phase, one);
+            auto acquireOp =
+                builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                    headProducer->getLoc(), earlyToken.second, bufferIdx,
+                    phaseFlipped);
+            LLVM_DEBUG({
+              LDBG("Insert intra-iteration reuse ProducerAcquireOp for late "
+                   "channel "
+                   << masterChannel->uniqID << " waiting on early channel "
+                   << earlyChannelForReuseSync->uniqID);
+            });
+          }
+        }
       }
 
       if (!commChannel.producerBarrier) {
