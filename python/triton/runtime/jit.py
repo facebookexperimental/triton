@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import itertools
+import os
 import threading
 import re
 import textwrap
@@ -699,6 +700,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
                                                                     options)
 
+            # Capture kernel argument metadata for TLX benchmark generation
+            if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
+                try:
+                    from triton.tools.tlx_benchmark_gen import capture_kernel_args
+                    capture_kernel_args(bound_args, signature, constexprs, self.params)
+                except Exception:
+                    pass
+
             kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
@@ -719,6 +728,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
             grid_0 = grid[0]
             grid_1 = grid[1] if grid_size > 1 else 1
             grid_2 = grid[2] if grid_size > 2 else 1
+
+            # Capture actual grid values for TLX benchmark generation
+            if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
+                try:
+                    from triton.tools.tlx_benchmark_gen import capture_grid
+                    capture_grid((grid_0, grid_1, grid_2))
+                except Exception:
+                    pass
+
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
             # launch kernel
