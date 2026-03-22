@@ -496,10 +496,12 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN and SMEM_ALLOC_ALGO == 0:
         pytest.skip("Out of resources: tensor memory exceeded")
 
-    if DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 0 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 64 and not FLATTEN:
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 0 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256
+            and BLOCK_SIZE_K == 64 and not FLATTEN):
         pytest.skip("Out of resources: shared memory exceeded")
 
-    if DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN and EPILOGUE_SUBTILE == 4:
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
+            and EPILOGUE_SUBTILE == 4):
         pytest.skip("TODO: FIXME: PassManager crash with DP=2, SMEM_ALLOC_ALGO=1, FLATTEN, EPILOGUE_SUBTILE=4")
 
     if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
@@ -508,8 +510,8 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         pytest.skip(
             "TODO: FIXME: correctness failures with DP=2, SMEM_ALLOC_ALGO=1, FLATTEN, early_tma, stages=2, N=128")
 
-    if DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN and EPILOGUE_SUBTILE in (
-            1, 2):
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
+            and EPILOGUE_SUBTILE in (1, 2)):
         pytest.skip("Out of resources: tensor memory exceeded")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
@@ -642,10 +644,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
 
     if DATA_PARTITION_FACTOR == 2:
         pytest.skip("TODO: FIX CORRECTNESS ISSUES")
-
-    # TODO: FIX HANG
-    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 128 and SMEM_ALLOC_ALGO == 0:
-        pytest.skip("TODO: FIX HANG ISSUE")
 
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
