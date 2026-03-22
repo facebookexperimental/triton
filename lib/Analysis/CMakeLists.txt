@@ -3,6 +3,7 @@ add_triton_library(TritonAnalysis
   Allocation.cpp
   Membar.cpp
   Alias.cpp
+  ProgramIdToAddressAnalysis.cpp
   Utility.cpp
 
   DEPENDS

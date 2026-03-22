@@ -97,6 +97,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUPartitionScheduling);
   ADD_PASS_WRAPPER_0("add_optimize_partition_warps",
                      createTritonGPUOptimizePartitionWarps);
+  ADD_PASS_WRAPPER_0("add_annotate_pid_address_patterns",
+                     createTritonGPUAnnotatePidAddressPatterns);
 }
 
 void init_triton_passes_convert(py::module &&m) {
