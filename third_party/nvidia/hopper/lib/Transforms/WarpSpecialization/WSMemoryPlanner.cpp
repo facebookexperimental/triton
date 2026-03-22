@@ -641,33 +641,11 @@ public:
     }
 
     // Enforce minimum buffer.copy >= number of entries sharing each
-    // buffer.id.  When data partitioning creates multiple operands that
-    // share a single reuse group (same buffer.id), the code partition pass
-    // computes indices as (accumCnt + theIdx) % numBuffers.  If numBuffers
-    // is smaller than the reuse group size, two entries collide on the same
-    // buffer slot, causing a deadlock.
-    {
-      DenseMap<int, unsigned> idCounts;
-      for (auto bufferIter : bufferRange) {
-        Operation *owner = bufferIter.first->owner;
-        if (auto id = owner->getAttrOfType<IntegerAttr>("buffer.id"))
-          idCounts[id.getInt()]++;
-      }
-      for (auto bufferIter : bufferRange) {
-        Operation *owner = bufferIter.first->owner;
-        auto id = owner->getAttrOfType<IntegerAttr>("buffer.id");
-        auto copy = owner->getAttrOfType<IntegerAttr>("buffer.copy");
-        if (id && copy) {
-          unsigned minCopy = idCounts[id.getInt()];
-          if (static_cast<unsigned>(copy.getInt()) < minCopy) {
-            owner->setAttr(
-                "buffer.copy",
-                IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
-                                 minCopy));
-          }
-        }
-      }
-    }
+    // buffer.id. When buffers are shared (e.g. Data Partition) they
+    // must be completely disjoin based on the barrier handling. Rather
+    // than enforce/optimize that, we ensure we can store 1 of each
+    // buffer.
+    enforceMinBufferCopy();
 
     // Phase 2: Merge non-innermost-loop buffers with disjoint liveness
     // and shared data generation step (same original load op).
@@ -687,6 +665,29 @@ public:
   /// Group non-innermost-loop buffers by their original load op and assign
   /// the same buffer.id to buffers within each group that have compatible
   /// types/sizes and pairwise disjoint liveness intervals.
+  void enforceMinBufferCopy() {
+    DenseMap<int, unsigned> idCounts;
+    for (auto bufferIter : bufferRange) {
+      Operation *owner = bufferIter.first->owner;
+      if (auto id = owner->getAttrOfType<IntegerAttr>("buffer.id"))
+        idCounts[id.getInt()]++;
+    }
+    for (auto bufferIter : bufferRange) {
+      Operation *owner = bufferIter.first->owner;
+      auto id = owner->getAttrOfType<IntegerAttr>("buffer.id");
+      auto copy = owner->getAttrOfType<IntegerAttr>("buffer.copy");
+      if (id && copy) {
+        unsigned minCopy = idCounts[id.getInt()];
+        if (static_cast<unsigned>(copy.getInt()) < minCopy) {
+          owner->setAttr(
+              "buffer.copy",
+              IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
+                               minCopy));
+        }
+      }
+    }
+  }
+
   void fuseEpilogueBuffers() {
     DenseMap<Operation *, SmallVector<BufferT *>> loadGroups;
     for (auto &bufferIter : bufferRange) {
