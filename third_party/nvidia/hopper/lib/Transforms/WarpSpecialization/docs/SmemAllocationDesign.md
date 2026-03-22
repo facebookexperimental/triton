@@ -614,3 +614,55 @@ doMemoryPlanner(funcOp, numBuffers)
 The algorithm is implemented in `MemoryPlanner::run()`, with the `WSBuffer`
 struct, cross-stage detection, and budget-aware iteration all within
 `WSMemoryPlanner.cpp`.
+
+---
+
+## Algorithm 0 (Legacy) — Reuse Group Minimum Copy Constraint
+
+Algorithm 0 (`SMEM_ALLOC_ALGO=0`) is the original SMEM allocation path. It
+assigns the same `buffer.id` to all innermost-loop 2D+ SMEM allocations with
+the same element type, and sets `buffer.copy = numBuffers` (= `num_stages`)
+unconditionally.
+
+### The Problem
+
+When data partitioning creates multiple operands that share a single
+`buffer.id`, the number of entries in the reuse group can exceed `numBuffers`.
+The code partition pass computes buffer indices for each entry at position
+`theIdx` as:
+
+```
+bufferIdx = (accumCnt + theIdx) % numBuffers
+```
+
+If `numBuffers < reuse_group_size`, two entries collide on the same buffer
+slot, causing a deadlock. For example, with `DATA_PARTITION_FACTOR=2` and
+`num_stages=2`, a GEMM kernel has 3 SMEM operands per k-tile (a_0, a_1, b)
+sharing `buffer.id=2`. With only 2 buffer slots, entries at `theIdx=0` and
+`theIdx=2` both map to slot 0 on the first iteration, creating a circular
+wait:
+
+```
+Load partition:
+  1. a_0: wait_barrier(slot 0) → succeeds (phase 0, slot free)
+  2. a_1: wait_barrier(slot 1) → succeeds
+  3. b:   wait_barrier(slot 0) → BLOCKS (slot 0 in use by a_0, awaiting MMA)
+
+MMA partition:
+  Needs a_0, a_1, AND b to proceed → BLOCKS (b never loaded)
+
+→ Deadlock: load waits for MMA to free slot 0, MMA waits for b to be loaded.
+```
+
+### The Fix
+
+After the initial `buffer.id` / `buffer.copy` assignment loop, algorithm 0
+enforces:
+
+```
+buffer.copy >= number of entries sharing each buffer.id
+```
+
+This is done by counting entries per `buffer.id` and bumping any `buffer.copy`
+that is too small. For the example above, `buffer.copy` is raised from 2 to 3,
+giving each entry its own slot and eliminating the collision.

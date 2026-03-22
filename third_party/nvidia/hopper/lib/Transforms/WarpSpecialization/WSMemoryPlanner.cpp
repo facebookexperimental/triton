@@ -640,6 +640,35 @@ public:
       }
     }
 
+    // Enforce minimum buffer.copy >= number of entries sharing each
+    // buffer.id.  When data partitioning creates multiple operands that
+    // share a single reuse group (same buffer.id), the code partition pass
+    // computes indices as (accumCnt + theIdx) % numBuffers.  If numBuffers
+    // is smaller than the reuse group size, two entries collide on the same
+    // buffer slot, causing a deadlock.
+    {
+      DenseMap<int, unsigned> idCounts;
+      for (auto bufferIter : bufferRange) {
+        Operation *owner = bufferIter.first->owner;
+        if (auto id = owner->getAttrOfType<IntegerAttr>("buffer.id"))
+          idCounts[id.getInt()]++;
+      }
+      for (auto bufferIter : bufferRange) {
+        Operation *owner = bufferIter.first->owner;
+        auto id = owner->getAttrOfType<IntegerAttr>("buffer.id");
+        auto copy = owner->getAttrOfType<IntegerAttr>("buffer.copy");
+        if (id && copy) {
+          unsigned minCopy = idCounts[id.getInt()];
+          if (static_cast<unsigned>(copy.getInt()) < minCopy) {
+            owner->setAttr(
+                "buffer.copy",
+                IntegerAttr::get(IntegerType::get(owner->getContext(), 32),
+                                 minCopy));
+          }
+        }
+      }
+    }
+
     // Phase 2: Merge non-innermost-loop buffers with disjoint liveness
     // and shared data generation step (same original load op).
     // This handles epilogue buffers that come from splitting a single
