@@ -2,183 +2,67 @@
 
 Barriers, fences, waits, and other synchronization primitives.
 
-## mbarriers (Shared Memory Barriers)
+## Op Taxonomy
 
-mbarriers are allocated in SMEM (8 bytes each). They support both arrival
-counting and byte-count tracking (for TMA/tcgen05 operations).
+### mbarriers (SMEM-allocated, 8 bytes each)
 
-### `ttng.init_barrier`
-Initialize an mbarrier with an arrival `count`. Must be called before any
-arrive/wait. Lowers to `mbarrier.init.shared::cta.b64`.
+| Op | Purpose | PTX |
+|---|---|---|
+| `ttng.init_barrier` | Initialize with arrival count | `mbarrier.init` |
+| `ttng.inval_barrier` | Invalidate for storage reuse | `mbarrier.inval` |
+| `ttng.barrier_expect` | Declare expected byte count (for TMA/tcgen05) | `mbarrier.arrive.expect_tx` |
+| `ttng.arrive_barrier` | Arrive, decrement pending count | `mbarrier.arrive` |
+| `ttng.wait_barrier` | Wait for phase completion | `mbarrier.try_wait.parity` |
+| `ttng.async_copy_mbarrier_arrive` | Arrive when prior cp.async ops complete | bridges cp.async → mbarrier |
 
-```mlir
-ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-```
+### Named Barriers (hardware indices 0-15, no SMEM needed)
 
-### `ttng.inval_barrier`
-Invalidate an mbarrier so its memory can be reused. Required by PTX spec
-before any reuse of mbarrier storage.
+| Op | Purpose |
+|---|---|
+| `ttng.arrive_barrier_named` | Arrive on hardware barrier index |
+| `ttng.wait_barrier_named` | Wait for N threads to arrive |
 
-```mlir
-ttng.inval_barrier %bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-```
+Used for lightweight warp-level sync (e.g., ping-pong scheduling in warp
+specialization). Only 16 available per SM.
 
-### `ttng.barrier_expect`
-Signal an mbarrier that `size` bytes are expected to arrive (from TMA or
-tcgen05 operations). The associated wait will block until all expected
-bytes arrive.
+### TCGen5 Commit (Blackwell)
 
-```mlir
-ttng.barrier_expect %bar, 32768, %pred : !ttg.memdesc<...>
-```
+`ttng.tc_gen5_commit`: Commits all prior async tcgen05 ops (MMA + tmem_copy)
+to an mbarrier. Sequential ordering: commit A before commit B guarantees
+arrive A before arrive B, even if B's group is empty. Optional 2-CTA mode.
 
-### `ttng.arrive_barrier`
-Arrive on an mbarrier, decrementing the pending arrival count by `count`.
-Optional predicate. Optional `perThread` flag (default: per-warp).
+### Async Copy Groups (cp.async, SM80+)
 
-```mlir
-ttng.arrive_barrier %bar, 1 : !ttg.memdesc<...>
-ttng.arrive_barrier %bar, 1, %pred : !ttg.memdesc<...>
-```
+| Op | Purpose |
+|---|---|
+| `ttg.async_commit_group` | Commit pending cp.async ops, return token |
+| `ttg.async_wait` | Wait until N or fewer groups outstanding |
 
-### `ttng.wait_barrier`
-Wait until mbarrier completes its current phase. Blocks using
-`mbarrier.try_wait.parity`. Takes a `phase` value to distinguish
-ping/pong phases. Optional predicate and memory deps.
+### TMA Store Waits
 
-```mlir
-ttng.wait_barrier %bar, %phase : !ttg.memdesc<...>
-ttng.wait_barrier %bar, %phase, %pred deps %buf : !ttg.memdesc<...>, ...
-```
+| Op | Purpose |
+|---|---|
+| `ttng.async_tma_store_wait` | Wait for TMA stores to finish reading SMEM (`pendings` count) |
+| `ttng.async_tma_store_token_wait` | Token-based wait for specific TMA store; can arrive on barriers |
 
-### `ttng.async_copy_mbarrier_arrive`
-Arrive on an mbarrier once all previously issued `cp.async` copies complete.
-Bridges the cp.async completion mechanism with mbarrier tracking.
+### Fences
 
-```mlir
-ttng.async_copy_mbarrier_arrive %bar : !ttg.memdesc<...>
-```
+| Op | Purpose | Min CC |
+|---|---|---|
+| `ttng.fence_async_shared` | Proxy fence between generic-proxy writes and async-proxy reads | SM90 |
+| `ttng.fence` | GPU or system-scope memory fence | SM70 |
 
-## Named Barriers (Hardware Indices)
+### Cluster Sync
 
-Named barriers use hardware barrier indices (0-15). No SMEM allocation
-needed. Used for warp-level synchronization (e.g., ping-pong scheduling).
+| Op | Purpose |
+|---|---|
+| `ttng.cluster_arrive` | Signal CTA reached sync point (optional `relaxed`) |
+| `ttng.cluster_wait` | Block until all CTAs in cluster have arrived |
 
-### `ttng.arrive_barrier_named`
-Arrive on a named barrier. `bar` is the barrier index (i32), `numThreads`
-is the expected arrival count.
+### Warp-Level
 
-```mlir
-ttng.arrive_barrier_named %bar_idx, %num_threads : i32, i32
-```
-
-### `ttng.wait_barrier_named`
-Wait on a named barrier until `numThreads` threads have arrived.
-
-```mlir
-ttng.wait_barrier_named %bar_idx, %num_threads : i32, i32
-```
-
-## TCGen5 Commit (Blackwell)
-
-### `ttng.tc_gen5_commit`
-Commits all prior async tcgen05 operations (MMA + tmem_copy) to an mbarrier.
-When the operations complete, the barrier arrival count is decremented by 1.
-
-Commit groups are sequential: if commit A is issued before commit B, the
-arrive on A is guaranteed to happen before the arrive on B, even if B's
-group is empty.
-
-Optional 2-CTA mode (`two_ctas`).
-
-```mlir
-ttng.tc_gen5_commit %bar : !ttg.memdesc<...>
-ttng.tc_gen5_commit %bar, %pred : !ttg.memdesc<...>
-```
-
-## Async Copy Groups (cp.async)
-
-### `ttg.async_commit_group`
-Commit a group of pending cp.async operations. Returns a token.
-
-```mlir
-%token = ttg.async_commit_group
-```
-
-### `ttg.async_wait`
-Wait until there are `num` or fewer outstanding async copy groups.
-
-```mlir
-%token = ttg.async_wait {num = 0}
-```
-
-## TMA Store Waits
-
-### `ttng.async_tma_store_wait`
-Wait until TMA stores have finished reading from SMEM. `pendings` specifies
-how many outstanding stores are allowed. Must complete before SMEM can be
-overwritten.
-
-```mlir
-ttng.async_tma_store_wait {pendings = 0}
-```
-
-### `ttng.async_tma_store_token_wait`
-Token-based wait for a specific TMA store to finish reading SMEM. After
-completion, optionally arrives on barriers (used by warp specialization for
-consumer release). Can also carry deferred NVWS tokens.
-
-```mlir
-ttng.async_tma_store_token_wait %token barriers(%bar : %pred) : ...
-```
-
-## Fences
-
-### `ttng.fence_async_shared`
-Proxy fence for async shared memory operations
-(`fence.proxy.async.shared`). Required between generic-proxy writes
-(e.g., `local_store`) and async-proxy reads (e.g., TMA, wgmma) to the
-same SMEM buffer. `bCluster` controls scope. SM90+.
-
-```mlir
-ttng.fence_async_shared {bCluster = false}
-```
-
-### `ttng.fence`
-GPU or system-scope memory fence. The `scope` attribute specifies the
-fence scope (e.g., "gpu", "sys"). SM70+.
-
-```mlir
-ttng.fence {scope = "gpu"}
-```
-
-## Cluster Synchronization
-
-### `ttng.cluster_arrive`
-Cluster-level arrive. Signals that this CTA has reached a synchronization
-point. `relaxed` attribute controls ordering guarantees.
-
-```mlir
-ttng.cluster_arrive {relaxed = false}
-```
-
-### `ttng.cluster_wait`
-Cluster-level wait. Blocks until all CTAs in the cluster have arrived.
-
-```mlir
-ttng.cluster_wait
-```
-
-## Warp-Level Sync
-
-### `ttng.vote_ballot_sync`
-Warp-level vote ballot. Collects a predicate from each thread in the warp
-and returns a 32-bit mask. When `pred` is a tensor, each thread contributes
-the OR of its owned elements. Pure operation. SM70+.
-
-```mlir
-%mask = ttng.vote_ballot_sync %membermask, %pred : i1 -> i32
-```
+`ttng.vote_ballot_sync`: Warp ballot — collect predicate from each thread,
+return 32-bit mask. Pure op.
 
 ## Synchronization Patterns
 
@@ -207,3 +91,11 @@ wait_barrier %bar, %phase
 async_wait %group {num = 0}
 // SMEM data now available
 ```
+
+### Proxy Fence Requirement
+```
+local_store %tensor, %buf          // generic proxy write to SMEM
+fence_async_shared                 // required fence
+warp_group_dot %a, %buf, ...      // async proxy read from SMEM
+```
+Without the fence, the async engine (TMA/wgmma/tcgen05) may read stale data.

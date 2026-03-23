@@ -4,103 +4,35 @@ Warp specialization structure, pipeline control, and cluster launch control.
 
 ## Warp Specialization
 
-### `ttg.warp_specialize`
-Top-level op for executing different code on different warp groups
-simultaneously. Contains a "default" region (implicit capture, runs on the
-original warp group) and N "partition" regions (isolated from above, each
-with its own warp count).
+**`ttg.warp_specialize`**: Top-level op for running different code on different
+warp groups simultaneously. Contains a "default" region (implicit capture) and
+N "partition" regions (isolated from above, explicit captures as block args).
+All regions start simultaneously and join at the end.
 
-All regions start simultaneously and are joined at the end of the op.
-Partition regions receive explicit captures as block arguments.
+Key attributes: `partitionNumWarps`, `warpGroupStartIds`,
+`requestedRegisters` / `actualRegisters`.
 
-```mlir
-%out = ttg.warp_specialize(%a, %b)
-default {
-    %result = some_op(%a)   // implicit capture
-    ttg.warp_yield %result : f32
-}
-partition0(%arg0: ..., %arg1: ...) num_warps(4) {
-    async_work(%arg0, %arg1)
-    ttg.warp_return
-} : (...) -> f32
-```
-
-Attributes:
-- `partitionNumWarps`: number of warps per partition
-- `warpGroupStartIds`: starting warp IDs (optional)
-- `requestedRegisters` / `actualRegisters`: register budget hints
-
-### `ttg.warp_specialize.partitions`
-Container op that holds the partition regions of a `warp_specialize` op.
-Required because MLIR needs entire operations to be `IsolatedFromAbove`.
-This op is the `IsolatedFromAbove` boundary; it's a terminator of the
-parent `warp_specialize`.
-
-### `ttg.warp_yield`
-Terminator for the default region of `warp_specialize`. Operands become
-the SSA results of the `warp_specialize` op.
-
-```mlir
-ttg.warp_yield %a, %b : i32, tensor<32xbf16, #blocked>
-```
-
-### `ttg.warp_return`
-Terminator for partition regions. Has no operands — partitions cannot
-return values (they communicate via shared memory / barriers).
-
-```mlir
-ttg.warp_return
-```
+Related ops:
+- `ttg.warp_specialize.partitions`: Container for partition regions
+  (the `IsolatedFromAbove` boundary)
+- `ttg.warp_yield`: Terminates the default region; operands become the
+  `warp_specialize` results
+- `ttg.warp_return`: Terminates partition regions; no operands (partitions
+  communicate via SMEM/barriers)
 
 ## Pipeline Control
 
-### `ttg.predicate_stage`
-Generates a predicate for a pipeline stage. Given the loop induction
-variable, upper bound, step, max number of stages, and current stage,
-returns whether this stage should execute on this iteration.
+- `ttg.predicate_stage`: Generates a predicate for a software pipeline stage
+  given `(iv, ub, step, maxStage, stage)`.
+- `ttg.mask` / `ttg.mask.return`: Guarded execution region — operations inside
+  only execute when the predicate is true.
 
-Used by software pipelining to guard operations in different pipeline stages.
+## Cluster Launch Control (Blackwell only)
 
-```mlir
-%pred = ttg.predicate_stage %iv, %ub, %step maxStage 3 stage 1 : i32 -> i1
-```
+CLC enables dynamic persistent kernels with work stealing on SM100+.
 
-### `ttg.mask`
-Mask region for pipelining. Contains operations that should only execute
-when the predicate is true. The region returns values via `mask.return`.
-
-```mlir
-%result = ttg.mask %pred {
-    %val = some_op(...)
-    ttg.mask.return %val : f32
-} : f32
-```
-
-### `ttg.mask.return`
-Terminator for `mask` regions. Returns values to the parent `mask` op.
-
-```mlir
-ttg.mask.return %result : f32
-```
-
-## Cluster Launch Control (CLC, Blackwell only)
-
-CLC enables dynamic persistent kernels with work stealing on Blackwell.
-A CTA can try to cancel a pending cluster launch and steal its work.
-
-### `ttng.async_clc_try_cancel`
-Requests atomic cancellation of a cluster not yet launched. Writes an
-opaque 16-byte CLC response to SMEM. Completion tracked via mbarrier.
-Uses PTX `clusterlaunchcontrol.try_cancel.async.shared::cta`.
-
-```mlir
-ttng.async_clc_try_cancel %mbar_alloc, %clc_res_alloc : ...
-```
-
-### `ttng.clc_query_cancel`
-Extracts the CTA ID from a CLC cancel response in SMEM. Returns -1 if
-the cancellation was not successful (cluster already launched).
-
-```mlir
-%cta_id = ttng.clc_query_cancel %clc_res_alloc : ... -> i32
-```
+- `ttng.async_clc_try_cancel`: Request atomic cancellation of a not-yet-launched
+  cluster. Writes opaque 16-byte response to SMEM. Tracked by mbarrier.
+  PTX: `clusterlaunchcontrol.try_cancel.async.shared::cta`.
+- `ttng.clc_query_cancel`: Extract CTA ID from cancel response. Returns -1 if
+  cancellation failed (cluster already launched).
