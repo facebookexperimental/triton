@@ -3757,6 +3757,95 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
   }
 }
 
+// Remove redundant TMEM zeroing stores.
+// When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
+// useAccumulator=false (on the first iteration), any preceding
+// tmem_store of zeros is redundant — the MMA's useC=false already
+// zeros the accumulator. Removing the store early (before buffer
+// allocation) prevents the autoWS compiler from creating a
+// cross-partition channel for it, which would otherwise cause a race
+// condition between the reduction partition (zeroing) and the
+// computation partition (reading) in persistent kernels.
+void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
+  auto isConstZeroTensor = [](Value v) -> bool {
+    auto constOp = v.getDefiningOp<arith::ConstantOp>();
+    if (!constOp)
+      return false;
+    auto denseAttr = dyn_cast<DenseFPElementsAttr>(constOp.getValue());
+    if (!denseAttr)
+      return false;
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero();
+  };
+
+  auto mmaUsesAccFalseOnFirstIter = [](ttng::TCGen5MMAOp mmaOp) -> bool {
+    Value useAccFlag = mmaOp.useAccumulator();
+    if (!useAccFlag)
+      return false;
+    // If useAccFlag is a block argument of a ForOp, trace it to the
+    // init value to check the first iteration.
+    if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
+      if (auto forOp = dyn_cast<scf::ForOp>(
+              blockArg.getOwner()->getParentOp())) {
+        if (blockArg.getOwner() == forOp.getBody()) {
+          unsigned argNum = blockArg.getArgNumber();
+          if (argNum > 0)
+            useAccFlag = forOp.getInitArgs()[argNum - 1];
+        }
+      }
+    }
+    if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
+      if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue()))
+        return !boolAttr.getValue();
+      if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+        return intAttr.getInt() == 0;
+    }
+    return false;
+  };
+
+  SmallVector<ttng::TMEMStoreOp> toErase;
+  funcOp.walk([&](ttng::TMEMAllocOp tmemAllocOp) {
+    bool hasZeroStore = false;
+    ttng::TMEMStoreOp zeroStoreOp;
+    bool hasMmaWithUseCFalse = false;
+    for (auto user : tmemAllocOp.getResult().getUsers()) {
+      if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+        if (isConstZeroTensor(storeOp.getSrc())) {
+          hasZeroStore = true;
+          zeroStoreOp = storeOp;
+        }
+      } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+        if (mmaOp.getD() == tmemAllocOp.getResult() &&
+            mmaUsesAccFalseOnFirstIter(mmaOp)) {
+          hasMmaWithUseCFalse = true;
+        }
+      }
+    }
+    if (hasZeroStore && hasMmaWithUseCFalse) {
+      LLVM_DEBUG({
+        LDBG("Removing redundant TMEM zero-store for operand D: "
+             << "MMA useC=false already handles zeroing");
+      });
+      toErase.push_back(zeroStoreOp);
+    }
+  });
+  for (auto op : toErase) {
+    // TMEMStoreOp may produce a token result that has downstream uses.
+    // Replace the output token with the input token before erasing.
+    if (op.getNumResults() > 0 && !op.getResult(0).use_empty()) {
+      Value inputToken = op.getToken();
+      Value outputToken = op.getResult(0);
+      if (inputToken != outputToken) {
+        outputToken.replaceAllUsesWith(inputToken);
+      } else {
+        // Input and output token are the same SSA value — cannot replace.
+        // Skip this op to avoid crashes.
+        continue;
+      }
+    }
+    op.erase();
+  }
+}
+
 void doBufferAllocation(triton::FuncOp &funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
