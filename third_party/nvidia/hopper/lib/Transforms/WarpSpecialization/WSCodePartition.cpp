@@ -3807,42 +3807,78 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
     bool hasZeroStore = false;
     ttng::TMEMStoreOp zeroStoreOp;
     bool hasMmaWithUseCFalse = false;
-    for (auto user : tmemAllocOp.getResult().getUsers()) {
-      if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
-        if (isConstZeroTensor(storeOp.getSrc())) {
-          hasZeroStore = true;
-          zeroStoreOp = storeOp;
+    scf::ForOp mmaParentLoop = nullptr;
+    // Collect all transitive users of the alloc result, following through
+    // MemDescIndexOp and other view ops to find the actual TMEMStoreOp
+    // and TCGen5MMAOp users.
+    SmallVector<Value> worklist = {tmemAllocOp.getResult()};
+    DenseSet<Value> visited;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+      for (auto *user : v.getUsers()) {
+        if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+          if (isConstZeroTensor(storeOp.getSrc())) {
+            hasZeroStore = true;
+            zeroStoreOp = storeOp;
+          }
+        } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+          if (mmaOp.getD() == v && mmaUsesAccFalseOnFirstIter(mmaOp)) {
+            hasMmaWithUseCFalse = true;
+            mmaParentLoop = mmaOp->getParentOfType<scf::ForOp>();
+          }
         }
-      } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
-        if (mmaOp.getD() == tmemAllocOp.getResult() &&
-            mmaUsesAccFalseOnFirstIter(mmaOp)) {
-          hasMmaWithUseCFalse = true;
+        // Follow through view ops (MemDescIndexOp, etc.) to find
+        // indirect users of the TMEM alloc.
+        for (auto result : user->getResults()) {
+          if (isa<triton::gpu::MemDescType>(result.getType()))
+            worklist.push_back(result);
         }
       }
     }
-    if (hasZeroStore && hasMmaWithUseCFalse) {
-      LLVM_DEBUG({
-        LDBG("Removing redundant TMEM zero-store for operand D: "
-             << "MMA useC=false already handles zeroing");
-      });
-      toErase.push_back(zeroStoreOp);
+    if (hasZeroStore && hasMmaWithUseCFalse && zeroStoreOp && mmaParentLoop) {
+      // Only remove the zero-store if both it and the MMA are inside a
+      // common persistent outer loop. If the zero-store is outside all
+      // loops (e.g., matmul initialization before the loop), it's
+      // legitimate and must be kept.
+      // In persistent BWD FA, the outer persistent loop contains both
+      // the zero-store and the inner loop (which contains the MMA).
+      auto zeroStoreParentLoop =
+          zeroStoreOp->getParentOfType<scf::ForOp>();
+      if (zeroStoreParentLoop &&
+          (zeroStoreParentLoop == mmaParentLoop ||
+           zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
+        LLVM_DEBUG({
+          LDBG("Removing redundant TMEM zero-store for operand D: "
+               << "MMA useC=false already handles zeroing");
+        });
+        toErase.push_back(zeroStoreOp);
+      }
     }
   });
   for (auto op : toErase) {
     // TMEMStoreOp may produce a token result that has downstream uses.
     // Replace the output token with the input token before erasing.
-    if (op.getNumResults() > 0 && !op.getResult(0).use_empty()) {
-      Value inputToken = op.getToken();
-      Value outputToken = op.getResult(0);
-      if (inputToken != outputToken) {
-        outputToken.replaceAllUsesWith(inputToken);
-      } else {
-        // Input and output token are the same SSA value — cannot replace.
-        // Skip this op to avoid crashes.
-        continue;
+    for (unsigned i = 0; i < op.getNumResults(); ++i) {
+      if (!op.getResult(i).use_empty()) {
+        // Find the corresponding input token operand to forward.
+        // TMEMStoreOp signature: (src, dst[token], pred) -> token
+        // The token input is the second operand (getToken()).
+        if (i == 0 && op.getNumOperands() >= 2) {
+          Value inputToken = op.getOperand(1);
+          if (inputToken.getType() == op.getResult(i).getType() &&
+              inputToken != op.getResult(i)) {
+            op.getResult(i).replaceAllUsesWith(inputToken);
+            continue;
+          }
+        }
+        // Cannot safely replace — skip erasing this op.
+        goto next_op;
       }
     }
     op.erase();
+    next_op:;
   }
 }
 
