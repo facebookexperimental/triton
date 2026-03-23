@@ -1562,6 +1562,12 @@ static std::optional<Attribute> getEffectiveSplatAttr(Value v) {
   // split preserves values and element type.
   if (auto splitOp = v.getDefiningOp<SplitOp>())
     return getEffectiveSplatAttr(splitOp.getSrc());
+  // reshape preserves splatness and element type.
+  if (auto reshapeOp = v.getDefiningOp<ReshapeOp>())
+    return getEffectiveSplatAttr(reshapeOp.getSrc());
+  // trans/permute preserves splatness and element type.
+  if (auto transOp = v.getDefiningOp<TransOp>())
+    return getEffectiveSplatAttr(transOp.getSrc());
   return std::nullopt;
 }
 
