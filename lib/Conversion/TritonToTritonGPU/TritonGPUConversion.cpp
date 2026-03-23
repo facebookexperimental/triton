@@ -120,7 +120,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   addDynamicallyLegalOp<
       triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
       triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,
-      triton::gpu::AsyncRemoteShmemStoreOp,
+      triton::gpu::AsyncRemoteShmemStoreOp, triton::nvidia_gpu::PrefetchOp,
       triton::nvidia_gpu::WarpGroupDotWaitOp,
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp>(

@@ -474,6 +474,33 @@ def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemW
   }];
 }
 
+def TTNG_PrefetchOp : TTNG_Op<"prefetch", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "prefetch data from global memory into cache using pointer";
+
+  let description = [{
+    This operation issues a non-blocking prefetch hint for pointer-based
+    scattered/gather loads.  Unlike `async_tma_prefetch` which works on tensor
+    descriptors, this supports raw pointer tensors.  It emits a per-element
+    `prefetch.global.{L1|L2}` PTX instruction.
+
+    The `cache` attribute controls the cache level:
+    - CA (cache-all) → `prefetch.global.L1` (prefetch into L1 and L2)
+    - CG (cache-global) → `prefetch.global.L2` (prefetch into L2 only)
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$ptr,
+    Optional<TT_BoolLike>:$mask,
+    DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::CG">:$cache
+  );
+
+  let assemblyFormat = [{
+    $ptr (`,` $mask^)?
+    oilist(`cacheModifier` `=` $cache)
+    attr-dict `:` type($ptr) (`,` type($mask)^)?
+  }];
+}
+
 def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
   let summary = "copy data based on descriptor from local memory to global memory asynchronously";
 
