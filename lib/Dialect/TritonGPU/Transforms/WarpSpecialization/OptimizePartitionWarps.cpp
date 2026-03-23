@@ -293,6 +293,52 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
 
   // Read the attribute from the module
   ModuleOp mod = axisInfo.getModuleOp();
+
+  // Apply per-partition-type warp count overrides from module attributes.
+  // These override the heuristic (and BWD hardcode above) when set.
+  //
+  // partitionTypes comes from the scheduler and includes all partitions
+  // (including "default"/"reduction" at index 0). partitionNumWarps only
+  // covers the worker regions. We build a deduplicated type-to-worker-index
+  // mapping by skipping index 0 and assigning unique types to consecutive
+  // worker indices.
+  const std::pair<StringRef, StringRef> warpOverrideAttrs[] = {
+      {"gemm", AttrWarpsGemmName},
+      {"load", AttrWarpsLoadName},
+      {"computation", AttrWarpsComputationName},
+      {"epilogue", AttrWarpsEpilogueName},
+  };
+
+  // Build mapping from partition type to worker region index.
+  // E.g. types =
+  // ["default","gemm","load","epilogue","computation","computation"] →
+  // workerTypeMap: gemm→0, load→1, epilogue→1, computation→2 (epilogue and load
+  // share a worker if there are only 3 workers)
+  SmallVector<std::pair<StringRef, unsigned>> workerTypeMap;
+  if (!partitionTypes.empty() && !partitionNumWarps.empty()) {
+    unsigned workerIdx = 0;
+    for (unsigned i = 1; i < partitionTypes.size(); ++i) {
+      if (workerIdx < partitionNumWarps.size()) {
+        workerTypeMap.push_back({partitionTypes[i], workerIdx});
+        // Advance worker index only for new unique types
+        bool isLastOfType = (i + 1 >= partitionTypes.size() ||
+                             partitionTypes[i + 1] != partitionTypes[i]);
+        if (isLastOfType && workerIdx + 1 < partitionNumWarps.size())
+          workerIdx++;
+      }
+    }
+  }
+
+  for (const auto &[typeName, attrName] : warpOverrideAttrs) {
+    if (auto attr = mod->getAttrOfType<IntegerAttr>(attrName)) {
+      int overrideWarps = attr.getInt();
+      for (auto [type, workerIdx] : workerTypeMap) {
+        if (type == typeName) {
+          partitionNumWarps[workerIdx] = overrideWarps;
+        }
+      }
+    }
+  }
   int minRegAutoWS = 24; // default value
   if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName)) {
     minRegAutoWS = attr.getInt();

@@ -144,6 +144,10 @@ class CUDAOptions:
     minRegAutoWS: int = 24
     maxRegAutoWS: int = 152
     pingpongAutoWS: bool = False
+    warps_gemm: Optional[int] = None
+    warps_load: Optional[int] = None
+    warps_computation: Optional[int] = None
+    warps_epilogue: Optional[int] = None
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -333,6 +337,17 @@ class CUDABackend(BaseBackend):
         # Add maxRegAutoWS attribute
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
+
+        # Add per-partition warp count overrides
+        for attr_name, opt_name in [
+            ("ttg.warps_gemm", "warps_gemm"),
+            ("ttg.warps_load", "warps_load"),
+            ("ttg.warps_computation", "warps_computation"),
+            ("ttg.warps_epilogue", "warps_epilogue"),
+        ]:
+            val = getattr(opt, opt_name, None)
+            if val is not None:
+                mod.set_attr(attr_name, ir.builder(mod.context).get_int32_attr(val))
 
         cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:

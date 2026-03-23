@@ -590,6 +590,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             repr_parts.append(f"maxRegAutoWS={maxRegAutoWS}")
         if pingpongAutoWS is not None:
             repr_parts.append(f"pingpongAutoWS={pingpongAutoWS}")
+        for warp_attr in ('warps_gemm', 'warps_load', 'warps_computation', 'warps_epilogue'):
+            val = getattr(options, warp_attr, None)
+            if val is not None:
+                repr_parts.append(f"{warp_attr}={val}")
         repr_parts.extend([
             f"enable_fp_fusion={options.enable_fp_fusion}",
             f"launch_cooperative_grid={options.launch_cooperative_grid}",
@@ -609,6 +613,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
             'minRegAutoWS': getattr(options, 'minRegAutoWS', None),
             'maxRegAutoWS': getattr(options, 'maxRegAutoWS', None),
             'pingpongAutoWS': getattr(options, 'pingpongAutoWS', None),
+            'warps_gemm': getattr(options, 'warps_gemm', None),
+            'warps_load': getattr(options, 'warps_load', None),
+            'warps_computation': getattr(options, 'warps_computation', None),
+            'warps_epilogue': getattr(options, 'warps_epilogue', None),
             'enable_fp_fusion': options.enable_fp_fusion,
             'launch_cooperative_grid': options.launch_cooperative_grid,
             'extern_libs': options.extern_libs,
