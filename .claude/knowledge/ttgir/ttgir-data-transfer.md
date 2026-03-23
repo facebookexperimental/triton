@@ -14,17 +14,20 @@ All ops that move data between memory levels.
 | SMEM → Global | `ttng.async_tma_reduce` | TMA atomic reduction | SM90 |
 | SMEM → Global | `ttng.async_tma_scatter` | TMA scatter (per-row offsets) | SM90 |
 | SMEM → Global | `ttng.async_store` | `cp.async.bulk` (non-TMA) | SM90 |
-| Reg → SMEM | `ttg.local_alloc` (with src) | Copy on alloc | all |
-| Reg → SMEM | `ttg.local_store` | Store to existing buffer | all |
-| SMEM → Reg | `ttg.local_load` | Load from SMEM | all |
-| SMEM dealloc | `ttg.local_dealloc` | Optional; compiler infers if omitted | all |
+| Reg → SMEM | `ttg.local_alloc` (with src) | Copy on alloc | — |
+| Reg → SMEM | `ttg.local_store` | Store to existing buffer | — |
+| SMEM → Reg | `ttg.local_load` | Load from SMEM | — |
+| SMEM dealloc | `ttg.local_dealloc` | Optional; compiler infers if omitted | — |
 | Reg → Remote SMEM | `ttg.remote_shmem_store` | Cluster store (sync) | SM90 |
 | Reg → Remote SMEM | `ttg.async_remote_shmem_store` | Cluster store (async, mbarrier) | SM90 |
 | SMEM → TMEM | `ttng.tmem_copy` | `tcgen05.cp` | SM100 |
 | Reg → TMEM | `ttng.tmem_alloc` (with src) | Copy on alloc | SM100 |
 | Reg → TMEM | `ttng.tmem_store` | Store to existing TMEM | SM100 |
 | TMEM → Reg | `ttng.tmem_load` | Load from TMEM | SM100 |
-| Global alloc | `ttg.global_scratch_alloc` | Returns `!tt.ptr<i8>` | all |
+| Global alloc | `ttg.global_scratch_alloc` | Returns `!tt.ptr<i8>` | — |
+
+CC 8.0 = Ampere (`cp.async` / LDGSTS). CC 9.0 = Hopper (TMA, STAS, clusters).
+CC 10.0 = Blackwell (tcgen05 / TMEM). "—" = no hardware-specific requirement.
 
 ## Completion Tracking
 

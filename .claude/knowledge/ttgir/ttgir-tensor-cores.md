@@ -31,7 +31,7 @@ Used for MX-format GEMM with FP4/FP6/FP8 narrow types.
 
 ## Architectural Comparison
 
-| Aspect | Hopper (`warp_group_dot`) | Blackwell (`tc_gen5_mma`) |
+| Aspect | Hopper (`warp_group_dot`, CC 9.0) | Blackwell (`tc_gen5_mma`, CC 10.0) |
 |---|---|---|
 | A operand | SMEM or Registers | SMEM |
 | B operand | SMEM | SMEM |

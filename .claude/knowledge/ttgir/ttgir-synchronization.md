@@ -4,7 +4,10 @@ Barriers, fences, waits, and other synchronization primitives.
 
 ## Op Taxonomy
 
-### mbarriers (SMEM-allocated, 8 bytes each)
+### mbarriers (SMEM-allocated, 8 bytes each, CC 8.0+ hardware-accelerated)
+
+Available from CC 7.0; hardware-accelerated in shared memory from CC 8.0 (Ampere).
+Cluster-scope barriers (arrive from remote CTA) require CC 9.0 (Hopper).
 
 | Op | Purpose | PTX |
 |---|---|---|
@@ -23,9 +26,10 @@ Barriers, fences, waits, and other synchronization primitives.
 | `ttng.wait_barrier_named` | Wait for N threads to arrive |
 
 Used for lightweight warp-level sync (e.g., ping-pong scheduling in warp
-specialization). Only 16 available per SM.
+specialization). Only 16 available per CTA (indices 0-15). Thread count
+operand must be a multiple of warp size (32).
 
-### TCGen5 Commit (Blackwell)
+### TCGen5 Commit (CC 10.0+, Blackwell)
 
 `ttng.tc_gen5_commit`: Commits all prior async tcgen05 ops (MMA + tmem_copy)
 to an mbarrier. Sequential ordering: commit A before commit B guarantees
@@ -38,7 +42,7 @@ arrive A before arrive B, even if B's group is empty. Optional 2-CTA mode.
 | `ttg.async_commit_group` | Commit pending cp.async ops, return token |
 | `ttg.async_wait` | Wait until N or fewer groups outstanding |
 
-### TMA Store Waits
+### TMA Store Waits (CC 9.0+)
 
 | Op | Purpose |
 |---|---|
@@ -52,7 +56,7 @@ arrive A before arrive B, even if B's group is empty. Optional 2-CTA mode.
 | `ttng.fence_async_shared` | Proxy fence between generic-proxy writes and async-proxy reads | SM90 |
 | `ttng.fence` | GPU or system-scope memory fence | SM70 |
 
-### Cluster Sync
+### Cluster Sync (CC 9.0+)
 
 | Op | Purpose |
 |---|---|

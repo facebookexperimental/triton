@@ -27,9 +27,10 @@ Related ops:
 - `ttg.mask` / `ttg.mask.return`: Guarded execution region — operations inside
   only execute when the predicate is true.
 
-## Cluster Launch Control (Blackwell only)
+## Cluster Launch Control (CC 10.0+, Blackwell)
 
-CLC enables dynamic persistent kernels with work stealing on SM100+.
+CLC enables dynamic persistent kernels with work stealing. Introduced in
+CC 10.0 (Blackwell) per CUDA Programming Guide Section 3.5.1.4.
 
 - `ttng.async_clc_try_cancel`: Request atomic cancellation of a not-yet-launched
   cluster. Writes opaque 16-byte response to SMEM. Tracked by mbarrier.
