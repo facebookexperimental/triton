@@ -20,7 +20,7 @@ namespace tlx = ::mlir::triton::tlx;
 
 namespace mlir {
 std::optional<ttg::SwizzledSharedEncodingAttr>
-getSharedEncIfAllUsersAreDotEnc(Value loadedValue);
+getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
 
 namespace triton {
 namespace tlx {
@@ -51,8 +51,9 @@ LogicalResult insertRequireLayout(ModuleOp m) {
           localLoadOp.dump();
         });
         // Get the shared encoding for this local load op based on the dot op
+        bool incompatible = false;
         auto encoding =
-            mlir::getSharedEncIfAllUsersAreDotEnc(localLoadOp->getResult(0))
+            mlir::getSharedEncIfAllUsersAreDotEnc(localLoadOp->getResult(0), incompatible)
                 .value_or(nullptr);
         if (encoding) {
           LLVM_DEBUG({
