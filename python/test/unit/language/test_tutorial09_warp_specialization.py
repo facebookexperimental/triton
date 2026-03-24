@@ -630,9 +630,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if DATA_PARTITION_FACTOR == 2:
-        pytest.skip("TODO: FIX CORRECTNESS ISSUES")
-
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
