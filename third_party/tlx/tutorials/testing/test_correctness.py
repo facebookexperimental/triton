@@ -13,7 +13,12 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     matmul as _blackwell_gemm_2cta, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
-    attention as _blackwell_fa_ws_pipelined_persistent, )
+    attention as _blackwell_fa_ws_pipelined_persistent,
+    _attn_bwd_preprocess as _blackwell_fa_bwd_preprocess,
+    _attn_bwd_ws as _blackwell_fa_bwd_ws,
+    _attn_fwd_ws as _blackwell_fa_fwd_ws,
+    _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
+)
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
     attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
     generate_attention_inputs as _generate_mxfp8_attention_inputs,
@@ -366,6 +371,126 @@ def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE):
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, 64, 1, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_bwd(causal):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    fwd_config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"].copy()
+    fwd_config["RESCALE_OPT"] = False
+    fwd_config["USE_WHERE"] = False
+    sm_scale = 0.5
+    BWD_BLOCK_M1 = 64
+    GROUP_SIZE_M = 1
+
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+
+        # Reference backward via PyTorch autograd
+        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+        do = torch.randn_like(ref_out)
+        ref_out.backward(do)
+        ref_dq, ref_dk, ref_dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
+        q.grad, k.grad, v.grad = None, None, None
+
+        # Forward with known-good config (no autotuning)
+        stage = 3 if causal else 1
+        o = torch.empty_like(q)
+        M = torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32)
+        y_dim = Z * H * N_CTX
+        dummy_block = [1, 1]
+        desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+
+        nargs = {
+            **fwd_config, "HEAD_DIM": HEAD_DIM, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o
+        }
+        _blackwell_fa_fwd_pre_hook(nargs)
+
+        def alloc_fn(size: int, align: int, _):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        grid = (min(NUM_SMS, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+        _blackwell_fa_fwd_ws.fn[grid](
+            sm_scale,
+            M,
+            Z,
+            H,
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            N_CTX=N_CTX,
+            HEAD_DIM=HEAD_DIM,
+            STAGE=stage,
+            **fwd_config,
+        )
+        torch.testing.assert_close(o, ref_out, atol=1e-2, rtol=0)
+
+        # Backward: preprocess
+        RCP_LN2 = 1.4426950408889634
+        arg_k = k * (sm_scale * RCP_LN2)
+        PRE_BLOCK = 128
+        pre_grid = (N_CTX // PRE_BLOCK, Z * H)
+        delta = torch.empty_like(M)
+        _blackwell_fa_bwd_preprocess[pre_grid](o, do, delta, N_CTX, BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM)
+
+        # Backward: main kernel
+        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+
+        desc_bk = TensorDescriptor(arg_k, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_bv = TensorDescriptor(v, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_bq = TensorDescriptor(q, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_do = TensorDescriptor(do, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dq = TensorDescriptor(dq, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dk = TensorDescriptor(dk, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dv = TensorDescriptor(dv, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+
+        BLK_SLICE_FACTOR = 2
+        EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
+
+        def grid_persistent(meta):
+            return (min(NUM_SMS, triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H), 1, 1)
+
+        _blackwell_fa_bwd_ws[grid_persistent](
+            desc_bq,
+            desc_bk,
+            desc_bv,
+            sm_scale,
+            desc_do,
+            desc_dq,
+            desc_dk,
+            desc_dv,
+            M,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            H,
+            Z,
+            N_CTX,
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            HEAD_DIM=HEAD_DIM,
+            STAGE=stage,
+            BLOCK_M1=BWD_BLOCK_M1,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+        )
+
+        tri_dq = dq.to(q.dtype)
+        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
