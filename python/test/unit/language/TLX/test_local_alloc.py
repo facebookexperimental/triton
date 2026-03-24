@@ -17,6 +17,7 @@ import torch
 
 import triton
 import triton.language as tl
+from triton import knobs
 
 # Add the plugin Python package to the path.
 # Resolve to absolute path so it works regardless of cwd.
@@ -28,6 +29,11 @@ _plugin_python_dir = os.path.normpath(
 if _plugin_python_dir not in sys.path:
     sys.path.insert(0, _plugin_python_dir)
 import tlx_plugin as tlx  # type: ignore[import-not-found]
+from tlx_plugin.custom_stages import inspect_stages_hook
+
+# Activate the plugin's custom ConvertTritonToTritonGPU pass so that
+# ttg.local_store / ttg.local_load ops emitted at TTIR level are legalized.
+knobs.runtime.add_stages_inspection_hook = inspect_stages_hook
 
 
 def is_hopper_or_newer():
@@ -183,8 +189,8 @@ def test_local_alloc_compile_only():
     # Compile to TTGIR (does not require GPU)
     src = triton.compiler.ASTSource(
         fn=kernel,
-        signature="*fp16",
-        constants={"BLOCK": 128},
+        signature={"ptr": "*fp16"},
+        constexprs={"BLOCK": 128},
     )
     try:
         ret = triton.compile(src, target=triton.runtime.driver.active.get_current_target())
