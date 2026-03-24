@@ -23,6 +23,7 @@
 
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Transforms/InliningUtils.h"
 
 // clang-format off
 #include "Dialect/NVGPU/IR/Dialect.h"
@@ -31,6 +32,25 @@
 
 using namespace mlir;
 using namespace mlir::triton::nvgpu;
+
+namespace {
+struct NVGPUInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Operation *call, Operation *callable,
+                       bool wouldBeCloned) const final {
+    return true;
+  }
+  bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
+                       IRMapping &valueMapping) const final {
+    return true;
+  }
+  bool isLegalToInline(Operation *, Region *, bool wouldBeCloned,
+                       IRMapping &) const final {
+    return true;
+  }
+};
+} // namespace
 
 void mlir::triton::nvgpu::NVGPUDialect::initialize() {
   addAttributes<
@@ -42,6 +62,8 @@ void mlir::triton::nvgpu::NVGPUDialect::initialize() {
 #define GET_OP_LIST
 #include "Dialect/NVGPU/IR/Ops.cpp.inc"
       >();
+
+  addInterfaces<NVGPUInlinerInterface>();
 }
 
 #define GET_OP_CLASSES

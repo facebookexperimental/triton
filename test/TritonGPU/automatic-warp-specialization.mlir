@@ -363,9 +363,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %c_ptr = tt.addptr %group_c_ptrs, %g : !tt.ptr<i64>, i32
       %c_ptr_10 = tt.load %c_ptr : !tt.ptr<i64>
       %c_ptr_11 = tt.int_to_ptr %c_ptr_10 : i64 -> !tt.ptr<f16>
-      %a_desc_12 = tt.make_tensor_descriptor %a_ptr_7, [%gm, %gk], [%stride, %c1_i64] : <f16>, <128x64xf16, #shared>
-      %b_desc_13 = tt.make_tensor_descriptor %b_ptr_9, [%gn, %gk], [%stride, %c1_i64] : <f16>, <128x64xf16, #shared>
-      %c_desc_14 = tt.make_tensor_descriptor %c_ptr_11, [%gm, %gn], [%stride, %c1_i64] : <f16>, <128x128xf16, #shared>
+      %a_desc_12 = tt.make_tensor_descriptor %a_ptr_7, [%gm, %gk], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x64xf16, #shared>
+      %b_desc_13 = tt.make_tensor_descriptor %b_ptr_9, [%gn, %gk], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x64xf16, #shared>
+      %c_desc_14 = tt.make_tensor_descriptor %c_ptr_11, [%gm, %gn], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x128xf16, #shared>
       scf.for %tile_idx = %start_pid to %num_tiles step %c4_i32  : i32 {
         %tile_m_idx = arith.divsi %tile_idx, %num_n_tiles_1 : i32
         %tile_n_idx = arith.remsi %tile_idx, %num_n_tiles_1 : i32

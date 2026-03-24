@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -inline | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect -inline | FileCheck %s
 
 #smem = #ttg.shared_memory
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>

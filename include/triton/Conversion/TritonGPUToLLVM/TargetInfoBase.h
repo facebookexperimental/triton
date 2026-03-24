@@ -31,25 +31,27 @@ public:
   virtual void warpSync(Location loc, RewriterBase &rewriter) const = 0;
 
   // Store/load a value from shared memory, either in the same CTA or, if
-  // `ctaId` is non-null, in another CTA in the same group.
+  // `ctaId` is non-nullopt, in another CTA in the same group.
   //
   // A target that does not support cross-CTA transfers will assert if ctaId is
-  // non-null.
+  // non-nullopt.
   //
   // Assumes the address is aligned to the width of `val`.
   virtual void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                            Value ctaId, Value val, Value pred) const = 0;
+                            std::optional<Value> ctaId, Value val, Value pred,
+                            std::optional<Value> barrierPtr = {}) const = 0;
   virtual Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                            Value ctaId, Type elemTy, Value pred,
+                            std::optional<Value> ctaId, Type elemTy, Value pred,
                             Operation *localLoadOp = nullptr) const = 0;
 
   void storeShared(RewriterBase &rewriter, Location loc, Value ptr, Value val,
                    Value pred) const {
-    storeDShared(rewriter, loc, ptr, /*ctaId=*/Value(), val, pred);
+    storeDShared(rewriter, loc, ptr, /*ctaId=*/std::nullopt, val, pred);
   }
   Value loadShared(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
                    Value pred) const {
-    return loadDShared(rewriter, loc, ptr, /*ctaId=*/Value(), elemTy, pred);
+    return loadDShared(rewriter, loc, ptr, /*ctaId=*/std::nullopt, elemTy,
+                       pred);
   }
 
   virtual Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,

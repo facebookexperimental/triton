@@ -25,10 +25,12 @@ public:
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
-  void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    Value ctaId, Value val, Value pred) const override;
+  void
+  storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
+               std::optional<Value> ctaId, Value val, Value pred,
+               std::optional<Value> barrierPtr = std::nullopt) const override;
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    Value ctaId, Type elemTy, Value pred,
+                    std::optional<Value> ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
 
   bool supportLdMatrix() const override {

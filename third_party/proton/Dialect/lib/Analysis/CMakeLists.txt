@@ -8,3 +8,5 @@ add_triton_library(ProtonAnalysis
 	ProtonIR
 	TritonAnalysis
 )
+
+target_compile_options(ProtonAnalysis PRIVATE -Wno-deprecated-declarations)

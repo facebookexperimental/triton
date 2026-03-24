@@ -67,8 +67,9 @@ LogicalResult verifyDotOpInterface(Operation *op) {
   if (!dotOp.verifyOutputDims())
     return dotOp->emitOpError(
         "expected the output shape to be the concatenation of the last "
-        "dimension of the first operand and the last dimension of the "
-        "second ");
+        "dimension of the first operand and (the last dimension of the "
+        "second if 1cta; or 2 times the last dimension of the second operand "
+        "if 2cta TLX)");
   return success();
 }
 

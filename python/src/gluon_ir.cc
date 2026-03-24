@@ -1112,7 +1112,8 @@ void init_gluon_ir(py::module_ &m) {
               std::vector<Value> &shape, std::vector<Value> &strides,
               tt::PaddingOption paddingOption) -> Value {
              return self.create<tt::MakeTensorDescOp>(resultTy, base, shape,
-                                                      strides, paddingOption);
+                                                      strides, Value(),
+                                                      paddingOption);
            })
       .def(
           "create_async_tdm_copy_global_to_local",

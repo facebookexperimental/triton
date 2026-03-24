@@ -183,10 +183,15 @@ void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              Value ctaId, Value val, Value pred) const {
-  if (ctaId) {
+                              std::optional<Value> ctaId, Value val, Value pred,
+                              std::optional<Value> barrierPtr) const {
+  if (ctaId.has_value()) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
+  }
+  if (barrierPtr.has_value()) {
+    llvm::report_fatal_error("AMDGPU does not support barrier-based "
+                             "synchronization for remote stores");
   }
   mlir::LLVM::AMD::llStore(rewriter, loc, ptr, val, pred);
 }
@@ -200,9 +205,9 @@ TargetInfo::queryLDSTransLoadParams(int bitWidth) const {
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              Value ctaId, Type elemTy, Value pred,
-                              Operation *localLoadOp) const {
-  if (ctaId) {
+                              std::optional<Value> ctaId, Type elemTy,
+                              Value pred, Operation *localLoadOp) const {
+  if (ctaId.has_value()) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
   }

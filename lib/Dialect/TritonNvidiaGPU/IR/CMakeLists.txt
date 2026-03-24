@@ -9,6 +9,9 @@ add_triton_library(TritonNvidiaGPUIR
   TritonNvidiaGPUAttrDefsIncGen
   TritonNvidiaGPUOpInterfacesIncGen
   TritonNvidiaGPUTypesIncGen
+  TLXTableGen
+  TLXTypesIncGen
+  TLXAttrDefsIncGen
 
   LINK_LIBS PUBLIC
   TritonIR
