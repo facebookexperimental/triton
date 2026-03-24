@@ -671,7 +671,7 @@ scheduleKeyOpsUpstream(scf::ForOp forOp,
 }
 
 // Schedule key ops based on user-provided tt.autows annotations on MMA ops.
-// The tt.autows attribute is a JSON string like {"stage": "0", "cluster": "2"}
+// The tt.autows attribute is a JSON string like {"stage": "0", "order": "2"}
 // that specifies the desired stage and cluster for each MMA.
 // Returns an empty schedule if no MMA has tt.autows annotations.
 CoarseSchedule

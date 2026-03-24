@@ -3,6 +3,7 @@ import warnings
 
 from typing import List, Optional, Sequence, Tuple, TypeVar, Generic, Type, Any
 import numbers
+import json
 
 from triton.runtime import driver
 
@@ -1746,7 +1747,6 @@ class TritonSemantic(Generic[TensorTy]):
             ret_ty,
         )
         if attrs is not None:
-            import json
             if not isinstance(attrs, dict):
                 raise TypeError(f"attrs must be a dict, got {type(attrs).__name__}")
             result.handle.set_attr("tt.autows", self.builder.get_string_attr(json.dumps(attrs)))
