@@ -496,12 +496,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         pytest.skip("Out of resources: tensor memory exceeded")
 
     if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
-            and EPILOGUE_SUBTILE in (1, 2) and use_early_tma_store_lowering and num_stages == 2
-            and BLOCK_SIZE_N == 128):
-        pytest.skip(
-            "TODO: FIXME: correctness failures with DP=2, SMEM_ALLOC_ALGO=1, FLATTEN, early_tma, stages=2, N=128")
-
-    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
             and EPILOGUE_SUBTILE in (1, 2)):
         pytest.skip("Out of resources: tensor memory exceeded")
 
