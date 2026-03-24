@@ -3088,15 +3088,13 @@ def test_prefetch(level, use_mask, device):
     ):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
         if USE_MASK:
-            mask = offsets < n_elements
             tlx.prefetch(input_ptr + offsets, level=LEVEL, mask=mask)
-            x = tl.load(input_ptr + offsets, mask=mask)
-            tl.store(output_ptr + offsets, x, mask=mask)
         else:
             tlx.prefetch(input_ptr + offsets, level=LEVEL)
-            x = tl.load(input_ptr + offsets)
-            tl.store(output_ptr + offsets, x)
+        x = tl.load(input_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
 
     BLOCK_SIZE = 1024
     n_elements = BLOCK_SIZE
