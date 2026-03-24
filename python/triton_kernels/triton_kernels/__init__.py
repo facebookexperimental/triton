@@ -5,10 +5,7 @@ from . import matmul_ogs_details
 from . import numerics
 from . import numerics_details
 from . import proton_opts
-from . import reduction_details
 from . import roofline
-from . import routing
-from . import routing_details
 from . import specialize
 from . import swiglu
 from . import swiglu_details
@@ -27,10 +24,7 @@ __all__ = [
     "numerics",
     "numerics_details",
     "proton_opts",
-    "reduction_details",
     "roofline",
-    "routing",
-    "routing_details",
     "specialize",
     "swiglu",
     "swiglu_details",

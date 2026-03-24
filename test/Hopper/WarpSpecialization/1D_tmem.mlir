@@ -98,7 +98,6 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
         // CHECK-NOT: tmem.start
         %69 = math.exp2 %68 {tmem.start = 0 : i32, loop.cluster = 0 : i32, loop.stage = 2 : i32, async_task_id = array<i32: 1>} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>>
         // CHECK: tt.expand_dims
-        // CHECK: ttg.convert_layout
         // CHECK: ttng.tmem_store
         // CHECK: tt.reduce
         %70 = "tt.reduce"(%67) <{axis = 1 : i32}> ({
@@ -159,7 +158,6 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
         // CHECK-NOT: tmem.start
         %97 = math.exp2 %96 {tmem.start = 1 : i32, loop.cluster = 0 : i32, loop.stage = 2 : i32, async_task_id = array<i32: 2>} : tensor<64xf32, #ttg.slice<{dim = 1, parent = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>}>>
         // CHECK: tt.expand_dims
-        // CHECK: ttg.convert_layout
         // CHECK: ttng.tmem_store
         // CHECK: tt.reduce
         %98 = "tt.reduce"(%95) <{axis = 1 : i32}> ({

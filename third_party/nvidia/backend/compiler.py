@@ -405,6 +405,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled, smem_budget)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
+            passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
@@ -445,8 +446,7 @@ class CUDABackend(BaseBackend):
         metadata["ctas_per_cga"] = opt.ctas_per_cga
         metadata["preferred_ctas_per_cga"] = tuple(
             opt.preferred_ctas_per_cga) if opt.preferred_ctas_per_cga is not None else None
-        tensordesc_meta = mod.get_tensordesc_metadata()
-        metadata["tensordesc_meta"] = tensordesc_meta
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
     def gluon_to_ttgir(self, src, metadata, options, capability):
@@ -463,6 +463,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         pm.run(mod, 'gluon_to_ttgir')
+        metadata["cluster_dims"] = (options.num_ctas, 1, 1)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
