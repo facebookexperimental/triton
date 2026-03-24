@@ -587,8 +587,13 @@ void collectRegionsWithChannelsPost(
                              .getResult()
                              .getUsers()) {
           auto *pOp = user->getParentOp();
-          if (auto forOp = dyn_cast<scf::ForOp>(pOp))
+          if (auto forOp = dyn_cast<scf::ForOp>(pOp)) {
+            // Skip loops where the accumulator token is loop-carried —
+            // the buffer doesn't rotate within such loops.
+            if (hasLoopCarriedAccToken(tmemChannel->allocOp, forOp))
+              continue;
             regionsWithChannels.insert(pOp);
+          }
           if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
             regionsWithChannels.insert(pOp);
         }

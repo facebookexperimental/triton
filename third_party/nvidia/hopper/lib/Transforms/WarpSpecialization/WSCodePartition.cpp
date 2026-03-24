@@ -1985,12 +1985,39 @@ DenseMap<Channel *, Value> createBufferPost(
       users.push_back(user);
     DenseMap<Operation *, Value> userToBufIdx;
     int reuseGrp = channelInReuseGroup(channel, config);
+
+    bool isOperandDTmem = false;
+    if (channel->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(channel);
+      isOperandDTmem = tmemCh->isOperandD;
+    }
+
     for (auto *user : users) {
       Value bufferIdx;
       Value _phase = Value();
       OpBuilderWithAsyncTaskIds builder(user);
       builder.clearLoopScheduleInfo();
-      if (auto forOp = user->getParentOfType<scf::ForOp>()) {
+      if (isOperandDTmem) {
+        // For operandD TMEM users inside a loop with a loop-carried
+        // accumulator token (inner k-loop), the buffer index should not
+        // rotate within that loop. Pass the inner ForOp itself as the 'op'
+        // to getBufferIdxAndPhase so that getAccumCount looks up to the
+        // outer loop for the accumCnt. The builder stays at the user's
+        // position with its task IDs, so arith ops are per-task.
+        auto innerFor = user->getParentOfType<scf::ForOp>();
+        if (innerFor && hasLoopCarriedAccToken(oldAllocOp, innerFor)) {
+          getBufferIdxAndPhase(builder, innerFor.getOperation(), numBuffers,
+                               regionsWithChannels, bufferIdx, _phase, config,
+                               reuseGrp, channel);
+        } else if (innerFor) {
+          getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                               bufferIdx, _phase, config, reuseGrp, channel);
+        } else {
+          std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
+              builder, user, channel, oldAllocOp, numBuffers,
+              regionsWithChannels, config, reuseGrp);
+        }
+      } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
         // Goes through channels here. Make sure the channel is not partilly
         // mutated.
         getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
@@ -2971,6 +2998,7 @@ void insertAsyncComm(
     // be moved for correct synchronization across reused buffers.
     // Use reuseBarrier=false to find reuse groups even with single-copy
     // buffers.
+    Channel *earlyChannelForReuseSync = nullptr;
     int reuseGrp2 = channelInReuseGroup(masterChannel, config,
                                         /*reuseBarrier=*/false);
     if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
@@ -3002,6 +3030,11 @@ void insertAsyncComm(
               producerAcquireForChannelLoop->dump();
             });
           }
+          // Track the early channel so we can insert an intra-iteration
+          // reuse sync: the late channel's producer must wait for the early
+          // channel's consumer to finish reading from the shared buffer
+          // before overwriting it.
+          earlyChannelForReuseSync = earlyChannel;
         }
       }
     }
@@ -3088,8 +3121,10 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), *commChannel.producerBarrier);
+          auto indexedBarrier = getBarrierForPipelineStage(
+              builder, *commChannel.producerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               indexedBarrier);
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3162,8 +3197,10 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               consumerBarrier);
+          auto indexedConsumerBarrier =
+              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), indexedConsumerBarrier);
           builder.clearLoopScheduleInfo();
         }
 
@@ -3299,6 +3336,42 @@ void insertAsyncComm(
           LDBG("Insert ProducerAcquireOp " << masterChannel->uniqID << " ");
           producerAcquirePoint->dump();
         });
+      }
+
+      // Intra-iteration reuse sync: when two channels share a single-buffered
+      // SMEM slot (reuse group with copy=1), the late channel's producer must
+      // wait for the early channel's consumer to finish reading from the buffer
+      // before overwriting it. Without this, the late store races with the
+      // early channel's async TMA read.
+      //
+      // ProducerAcquireOp lowering XORs the phase before waiting on
+      // bufferEmpty. We want WaitBarrier(bufferEmpty, phase) (block while
+      // bufferEmpty.phase == phase, unblock when CR flips it to phase^1).
+      // Since lowering does phase^1, we pass phase^1 here so the double-XOR
+      // yields the correct wait phase.
+      if (earlyChannelForReuseSync) {
+        auto earlyTokenIt = tokenMap.find(earlyChannelForReuseSync);
+        if (earlyTokenIt != tokenMap.end()) {
+          for (const auto &earlyToken : earlyTokenIt->second.tokens) {
+            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setInsertionPoint(headProducer);
+            builder.setLoopScheduleInfoFromOp(headProducer);
+            Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                headProducer->getLoc(), 1, 1);
+            Value phaseFlipped = builder.createWithAsyncTaskIds<arith::XOrIOp>(
+                headProducer->getLoc(), phase, one);
+            auto acquireOp =
+                builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                    headProducer->getLoc(), earlyToken.second, bufferIdx,
+                    phaseFlipped);
+            LLVM_DEBUG({
+              LDBG("Insert intra-iteration reuse ProducerAcquireOp for late "
+                   "channel "
+                   << masterChannel->uniqID << " waiting on early channel "
+                   << earlyChannelForReuseSync->uniqID);
+            });
+          }
+        }
       }
 
       if (!commChannel.producerBarrier) {
@@ -3908,6 +3981,24 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
   }
   for (auto kv : bufferIdToChannels) {
     if (kv.second.size() > 1) {
+      // If all channels reference the same alloc op, they are lifecycle
+      // phases of one buffer, not distinct buffers reusing memory.
+      Operation *firstAlloc;
+      if (kv.second[0]->channelKind == DataChannelKind::TMEMPost)
+        firstAlloc =
+            static_cast<ttng::TmemDataChannelPost *>(kv.second[0])->allocOp;
+      else
+        firstAlloc = static_cast<ChannelPost *>(kv.second[0])->allocOp;
+      bool allSameAlloc = llvm::all_of(kv.second, [&](Channel *ch) {
+        Operation *alloc =
+            (ch->channelKind == DataChannelKind::TMEMPost)
+                ? static_cast<ttng::TmemDataChannelPost *>(ch)->allocOp
+                : static_cast<ChannelPost *>(ch)->allocOp;
+        return alloc == firstAlloc;
+      });
+      if (allSameAlloc)
+        continue;
+
       ReuseGroup group;
       // make sure the channel without buffer.offset is the first one (i.e the
       // representative channel)

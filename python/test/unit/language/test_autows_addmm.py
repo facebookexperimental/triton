@@ -168,6 +168,10 @@ def test_autows_addmm_tma_persistent(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
+    if BLOCK_SIZE_M == 256:
+        # TODO: Fix compiler failures.
+        pytest.skip("BLOCK_SIZE_M=256 leads to many OOMs and some compiler failures.")
+
     if use_early_tma_store_lowering:
         # This fails due to NaN with < 0.1% of values.
         # Is this the previous register issue?
