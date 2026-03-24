@@ -115,7 +115,6 @@ def test_record(method, tmp_path: pathlib.Path):
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -214,7 +213,6 @@ def test_tree(tmp_path: pathlib.Path, hook):
             output = x + y
             tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -283,7 +281,6 @@ def test_trace(tmp_path: pathlib.Path):
             output = x - y
             tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -330,7 +327,6 @@ def test_multi_session(tmp_path: pathlib.Path):
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -399,7 +395,6 @@ def test_autotune(tmp_path: pathlib.Path):
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 2048
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -509,7 +504,6 @@ def test_warp_spec(tmp_path: pathlib.Path):
     mode = proton.mode.Default(metric_type="cycle", optimizations="clock32")
     temp_file = tmp_path / "test_warpspec.hatchet"
     proton.start(str(temp_file.with_suffix("")), backend="instrumentation", mode=mode)
-    torch.manual_seed(0)
     M, N, K = 512, 512, 512
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
