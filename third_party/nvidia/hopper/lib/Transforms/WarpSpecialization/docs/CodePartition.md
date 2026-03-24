@@ -169,7 +169,8 @@ Creates synchronization tokens for each channel group:
 ### `insertAsyncComm`
 
 The largest function (~950 lines) — inserts the full synchronization protocol
-for each channel group:
+for each channel group. See [Barrier Insertion](BarrierInsertion.md) for the
+detailed decision tree, code paths, and a worked FA BWD example.
 
 1. **Compute head/tail**: Find the first and last producer/consumer ops.
 2. **Scope lifting**: When producer and consumer are at different nesting

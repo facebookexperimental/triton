@@ -131,6 +131,213 @@ point at the representative's alloc:
 Buffers in a reuse group are tagged with an `allocation.shareGroup` attribute
 for consumption by downstream passes.
 
+## 2-Buffer Reuse Group Synchronization
+
+When two channels share the same physical buffer (a **reuse group** with
+2 buffers and `buffer.copy=1`), we must ensure that one channel's consumer
+has fully released the buffer before the other channel's producer acquires it.
+The code shares tokens between reuse group channels but must also reason
+about the ordering of `producer_acquire` across the two channels.
+
+### Background: Current `producer_acquire` Insertion
+
+`producer_acquire` is inserted at one of these points in `insertAsyncComm`:
+
+| Mechanism | Condition | Insertion Point |
+|-----------|-----------|-----------------|
+| `ProducerAcquireOp` (token-based) | `consumerBarriers` empty | Before `headProducer` (or `producerAcquireForChannelLoop`) |
+| `WaitBarrierOp` (gen5 inline) | `consumerBarriers` populated | Before the producer, via `desyncTCGen5MMAOp(..., asProducerAcquire=true)` |
+
+The variable `producerAcquireForChannelLoop` already handles the case of
+**forward/backward channel loops** (same alloc, same block, cycle through
+gen5 operand D). The 2-buffer reuse group design extends that concept.
+
+### Requirements
+
+For a reuse group with 2 buffers A and B (`buffer.copy=1`):
+
+1. **Verification**: Each buffer must have exactly one channel, and there must
+   be a dependency chain from one buffer's consumer to the other's producer.
+2. **Ordering**: Determine which buffer is "early" (A) and which is "late" (B).
+   If `A.producer → A.consumer → B.producer`, then A is early.
+3. **Case analysis**: Check whether there is an ordering from B's consumer back
+   to A's producer:
+   - **Implicit ordering** (e.g. `qk/pp`): B's consumer and A's producer are
+     both in the same partition (e.g. gemm). The partition-internal ordering
+     already guarantees B's consumer_release happens after A's producer_acquire.
+     No additional synchronization needed.
+   - **Explicit wait needed** (e.g. `dp/dq`): B's consumer and A's producer
+     are in different partitions (or same partition but wrong order). We must
+     move B's `producer_acquire` to be before A's producer, so A's producer
+     waits for B's consumer_release before writing.
+
+### Helper Functions
+
+#### `verifyReuseGroup2`
+
+```cpp
+// Verify a 2-buffer reuse group:
+// - Exactly 2 channels.
+// - Each channel has 1 copy (getNumBuffers() == 1).
+// - A dependency chain exists between one channel's consumer and the other's producer.
+// Returns true if valid.
+bool verifyReuseGroup2(ReuseGroup *group);
+```
+
+Implementation:
+```
+verifyReuseGroup2(group):
+  assert group.channels.size() == 2
+  A = group.channels[0], B = group.channels[1]
+  assert A.getNumBuffers() == 1 && B.getNumBuffers() == 1
+
+  // Check dependency chain: A.consumer → B.producer or B.consumer → A.producer
+  hasAtoB = isDependencyChain(A.dstOp, B.srcOp)
+  hasBtoA = isDependencyChain(B.dstOp, A.srcOp)
+  assert (hasAtoB || hasBtoA) // At least one direction
+  return true
+```
+
+#### `orderReuseGroup2`
+
+```cpp
+// For a verified 2-buffer reuse group, determine which channel is early (A)
+// and which is late (B).
+// Returns {earlyChannel, lateChannel}.
+std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
+```
+
+Implementation:
+```
+orderReuseGroup2(group):
+  A = group.channels[0], B = group.channels[1]
+  if isDependencyChain(A.dstOp, B.srcOp):
+    return {A, B}
+  return {B, A}
+```
+
+#### `needExplicitReuseWait`
+
+```cpp
+// Given ordered channels {A (early), B (late)}, determine whether we need to
+// explicitly wait for B's consumer_release before A's producer_acquire.
+// Returns false when B's consumer and A's producer are in the same partition
+// and program order guarantees correctness.
+bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
+```
+
+Implementation:
+```
+needExplicitReuseWait(earlyChannel, lateChannel):
+  bConsumerOp = getUniqueActualConsumer(lateChannel.dstOp, consumerTaskId)
+  aProducerOp = earlyChannel.srcOp
+
+  bConsumerTasks = getAsyncTaskIds(bConsumerOp)
+  aProducerTasks = getAsyncTaskIds(aProducerOp)
+
+  if bConsumerTasks and aProducerTasks share a common taskId:
+    if appearsBefore(aProducerOp, bConsumerOp):
+      return false  // No explicit wait needed (qk/pp case)
+
+  return true  // Need explicit wait (dp/dq case)
+```
+
+### Integration into `insertAsyncComm`
+
+In the main channel processing loop, after computing
+`producerAcquireForChannelLoop`, the reuse group logic is added:
+
+```cpp
+Operation *producerAcquireForChannelLoop = nullptr;
+if (headProducer->getBlock() == headConsumer->getBlock()) {
+  auto *bwdCh = isForwardOfChannelLoop(masterChannel);
+  if (bwdCh)
+    producerAcquireForChannelLoop = bwdCh->getDstOp();
+}
+
+// --- 2-buffer reuse group handling ---
+Operation *producerAcquireForReuse = nullptr;
+int reuseGrp = channelInReuseGroup(masterChannel, config);
+if (reuseGrp >= 0) {
+  auto *group = config->getGroup(reuseGrp);
+  if (group->channels.size() == 2) {
+    verifyReuseGroup2(group);
+    auto [earlyChannel, lateChannel] = orderReuseGroup2(group);
+
+    if (masterChannel == earlyChannel) {
+      // Early buffer (A): check if we need explicit wait for late buffer's
+      // consumer_release. No change needed here — the key change is for
+      // the LATE buffer (below).
+      if (needExplicitReuseWait(earlyChannel, lateChannel)) {
+        // implicit: early buffer uses default producer_acquire placement
+      }
+    } else {
+      // Late buffer (B): if explicit wait is needed, move this buffer's
+      // producer_acquire to before the early buffer's producer.
+      assert(masterChannel == lateChannel);
+      if (needExplicitReuseWait(earlyChannel, lateChannel)) {
+        producerAcquireForReuse = earlyChannel->getSrcOp();
+      }
+    }
+  }
+}
+
+// Combine with existing producerAcquireForChannelLoop
+if (producerAcquireForReuse && !producerAcquireForChannelLoop) {
+  producerAcquireForChannelLoop = producerAcquireForReuse;
+}
+```
+
+This reuses the existing `producerAcquireForChannelLoop` mechanism which
+flows through to both `ProducerAcquireOp` insertion and gen5 inline barrier
+`desyncTCGen5MMAOp` insertion.
+
+### Processing Order
+
+The early channel should be processed before the late channel so that when
+the late channel is processed, it can reference the early channel's producer
+as an insertion point. In `orderedChannelsGroupedByConsumers` construction,
+ensure that within a reuse group, the early channel appears first:
+
+```cpp
+for (unsigned idx = 0; idx < config.getGroupSize(); idx++) {
+  auto *group = config.getGroup(idx);
+  if (group->channels.size() == 2) {
+    auto [early, late] = orderReuseGroup2(group);
+    // Ensure early appears before late in orderedChannelsGroupedByConsumers
+  }
+}
+```
+
+### Examples
+
+#### `dp/dq` (explicit wait needed)
+
+```
+dp: producer = tc_gen5_mma (task 1, gemm)    → consumer = tmem_load (task 3, computation)
+dq: producer = tc_gen5_mma (task 1, gemm)    → consumer = tmem_load (task 0, computation)
+```
+
+- Ordering: `dp` is early (dp.producer → dp.consumer → dq.producer).
+- `dq.consumer` (task 0) and `dp.producer` (task 1) are in **different
+  partitions** → `needExplicitReuseWait` returns `true`.
+- Action: Move `dq`'s `producer_acquire` to before `dp`'s producer. This
+  ensures `dp`'s producer waits (via the shared token) until `dq`'s consumer
+  releases the buffer.
+
+#### `qk/pp` (implicit ordering)
+
+```
+qk: producer = TMA load (task 2, load)       → consumer = tc_gen5_mma (task 1, gemm)
+pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1, gemm)
+```
+
+- Ordering: `pp` is early (pp.producer → pp.consumer → qk.producer).
+- `pp.consumer` (task 1, gemm) and `qk.producer` (task 1, gemm) are in the
+  **same partition** and `qk.producer` appears before `pp.consumer` →
+  `needExplicitReuseWait` returns `false`.
+- Action: No change. Partition-internal ordering guarantees correctness.
+
 ## Key Attributes
 
 | Attribute | Description | Set by | Read by |
@@ -156,3 +363,6 @@ for consumption by downstream passes.
 | SMEM `buffer.id` assignment | `WSMemoryPlanner.cpp` | Assign `buffer.id` to SMEM allocs |
 | SMEM circular reuse (Phase 4) | `WSMemoryPlanner.cpp` | Form SMEM reuse pairs, maximize copies |
 | TMEM `applyAllocationState` | `WSMemoryPlanner.cpp` | Assign `buffer.id` + `buffer.offset` to TMEM allocs |
+| `verifyReuseGroup2` | `CodePartitionUtility.cpp` | Verify 2-buffer reuse group constraints |
+| `orderReuseGroup2` | `CodePartitionUtility.cpp` | Determine early/late channel ordering |
+| `needExplicitReuseWait` | `CodePartitionUtility.cpp` | Check if explicit cross-channel wait is needed |
