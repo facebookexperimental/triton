@@ -18,6 +18,28 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+// Check whether two channels belong to the same consumer group.
+// Mirrors the merge conditions in insertAsyncComm (WSCodePartition.cpp):
+//   same getDstOp(), same consumer task IDs, same full consumer set.
+static bool sameConsumerGroup(Channel *a, Channel *b) {
+  if (a->getDstOp() != b->getDstOp())
+    return false;
+  if (a->relation.second != b->relation.second)
+    return false;
+  if (a->channelKind == DataChannelKind::TMEMPost)
+    return true;
+  SmallVector<Operation *> aDsts, bDsts;
+  a->getDstOps(aDsts);
+  b->getDstOps(bDsts);
+  if (aDsts.empty() && bDsts.empty())
+    return true;
+  if (aDsts.size() != bDsts.size())
+    return false;
+  llvm::sort(aDsts, [](Operation *x, Operation *y) { return x < y; });
+  llvm::sort(bDsts, [](Operation *x, Operation *y) { return x < y; });
+  return aDsts == bDsts;
+}
+
 // Helper function to check if a channel is needed between producer and
 // consumers. Returns false if the producer task ID matches all consumer task
 // IDs (no cross-warp synchronization needed).
@@ -758,11 +780,43 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   getReuseChannels(config->getGroup(reuseGroupIdx), parentForOp.getOperation(),
                    chList);
   assert(chList.size() >= 1);
-  int vecIdx = 0, theIdx = -1;
+
+  // When multiple channels in the reuse group share the same getDstOp() but
+  // belong to different consumer groups (different consumer task IDs or
+  // different full consumer sets), getReuseChannels pushes one chList entry
+  // per channel. We must find the correct entry by counting how many
+  // *distinct consumer groups* with the same getDstOp() appear before ch's
+  // consumer group in the reuse group's channel list.
+  auto *group = config->getGroup(reuseGroupIdx);
+  int targetOccurrence = 0;
+  SmallVector<Channel *> seenGroups;
+  for (auto *grpCh : group->channels) {
+    if (grpCh->getDstOp() != ch->getDstOp())
+      continue;
+    if (sameConsumerGroup(grpCh, ch))
+      break;
+    // Only count distinct consumer groups (skip duplicates within a group).
+    bool alreadySeen = false;
+    for (auto *seen : seenGroups) {
+      if (sameConsumerGroup(seen, grpCh)) {
+        alreadySeen = true;
+        break;
+      }
+    }
+    if (!alreadySeen) {
+      seenGroups.push_back(grpCh);
+      targetOccurrence++;
+    }
+  }
+
+  int vecIdx = 0, theIdx = -1, matchNum = 0;
   for (auto *tCh : chList) {
     if (tCh == ch->getDstOp()) {
-      theIdx = vecIdx;
-      break;
+      if (matchNum == targetOccurrence) {
+        theIdx = vecIdx;
+        break;
+      }
+      matchNum++;
     }
     ++vecIdx;
   }
