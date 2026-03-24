@@ -108,4 +108,12 @@ def TTG_TensorMemoryScalesEncodingAttr
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+def TTG_SharedClusterMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "SharedClusterMemorySpace"> {
+  let mnemonic = "shared_cluster_memory";
+  let description = [{
+    Attribute to indicate that the memory descriptor points to shared memory. The shared memory could reside in
+    any CTA within a CTA cluster.
+  }];
+}
+
 #endif

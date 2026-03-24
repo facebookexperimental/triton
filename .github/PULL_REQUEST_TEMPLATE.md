@@ -1,14 +1,21 @@
-<!---
-The core Triton is a small number of people, and we receive many PRs (thank
-you!).  To help us review your code more quickly, **if you are a new
-contributor (less than 3 PRs merged) we ask that you complete the following
-tasks and include the filled-out checklist in your PR description.**
+# FB-only:
 
-Complete the following tasks before sending your PR, and replace `[ ]` with
-`[x]` to indicate you have done them.
--->
+This PR will be imported to fbcode diff. Ensure all internal tests passed.
 
-# New contributor declaration
+For TLX, run `third_party/tlx/run_all.sh` to cover TLX unit tests and TLX kernel correctness verification:
+
+```
+Need to build triton in this script? {y|n}n
+Run all LITs? {y|n}n
+Run core Triton python unit tests? {y|n}n
+Run all TLX unit tests? {y|n}y
+Running TLX Unit Tests
+...
+Run TLX tutorial kernels (correctness|performance|no)? {c|p|n}c
+...
+```
+
+# New contributor declaration (copied from Core Triton):
 - [ ] I am not making a trivial change, such as fixing a typo in a comment.
 
 - [ ] I have written a PR description following these

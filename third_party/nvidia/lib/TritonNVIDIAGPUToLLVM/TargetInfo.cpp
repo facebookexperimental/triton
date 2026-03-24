@@ -205,7 +205,7 @@ static std::string getConstraintForBitwidth(unsigned bitwidth) {
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               std::optional<Value> ctaId, Value val,
-                              Value pred) const {
+                              Value pred, std::optional<Value> barrierPtr) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());

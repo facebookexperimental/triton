@@ -100,6 +100,8 @@ public:
   std::string dump(triton::FuncOp func) const;
   void dumpToFile(triton::FuncOp func, const std::string &filename) const;
 
+  virtual ~GraphDumper() = default; // Facebook
+
 protected:
   std::string getShapeStr(const Type &type) const;
 
@@ -134,6 +136,10 @@ bool isExpensiveLoadOrStore(Operation *op);
 
 // Return true if the op can use the target encoding for its result.
 bool canUseResultEncoding(Operation *op, Attribute targetEncoding);
+
+bool isExpensiveLocalLoad(Operation *op);
+
+bool canFoldIntoConversion(Operation *op, Attribute targetEncoding);
 
 // Replace ForOp with a new ForOp with extra operands. The YieldOp is not
 // updated and needs to be updated separately for the loop to be correct.

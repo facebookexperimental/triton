@@ -1584,8 +1584,6 @@ SmallVector<uint16_t> getCTABroadcastMasks(bool twoCTAs, ValueRange descs) {
 
 TMAMulticastMaskEncoding getTMAMulticastMaskEncoding(int numCTAs,
                                                      uint16_t broadcastBits) {
-  // Compute the map that goes from cta_id to lead_cta_id (fixedBits)
-  // and the pattern that goes from cta_id to the multicast group (pattern).
   int blockBits = llvm::Log2_32(numCTAs);
   uint32_t fixedBits = (~broadcastBits) & (numCTAs - 1);
   uint32_t pattern = 1;
@@ -1595,6 +1593,10 @@ TMAMulticastMaskEncoding getTMAMulticastMaskEncoding(int numCTAs,
   }
   return {fixedBits, pattern};
 }
+
+// TLX stub
+LogicalResult MapToRemoteBufferOp::verify() { return success(); }
+LogicalResult VoteBallotSyncOp::verify() { return success(); }
 
 } // namespace nvidia_gpu
 } // namespace triton

@@ -12,3 +12,5 @@ add_triton_library(ProtonGPUIR
   TritonGPUIR
   ProtonIR
 )
+
+target_compile_options(ProtonGPUIR PRIVATE -Wno-deprecated-declarations)

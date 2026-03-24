@@ -177,6 +177,6 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // CHECK:           %[[VAL_2:.*]] = arith.constant 1 : i64
 // CHECK:           %[[VAL_3:.*]] = arith.constant 1 : i32
 // CHECK:           %[[VAL_4:.*]] = tt.addptr %[[VAL_0]], %[[VAL_3]] : !tt.ptr<f32>, i32
-// CHECK:           %[[VAL_5:.*]] = tt.make_tensor_descriptor %[[VAL_4]], {{\[}}%[[VAL_1]]], {{\[}}%[[VAL_2]]] : <f32>, <16xf32>
+// CHECK:           %[[VAL_5:.*]] = tt.make_tensor_descriptor %[[VAL_4]], {{\[}}%[[VAL_1]]], {{\[}}%[[VAL_2]]] : !tt.ptr<f32>, !tt.tensordesc<16xf32>
 // CHECK:           tt.return %[[VAL_5]] : !tt.tensordesc<16xf32>
 // CHECK:         }

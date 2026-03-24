@@ -12,3 +12,5 @@ add_triton_library(ProtonNVIDIAGPUToLLVM
     ProtonGPUToLLVM
     TritonNVIDIAGPUToLLVM
 )
+
+target_compile_options(ProtonNVIDIAGPUToLLVM PRIVATE -Wno-deprecated-declarations)

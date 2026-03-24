@@ -10,6 +10,9 @@
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
 #include "proton/Dialect/include/Dialect/ProtonGPU/IR/Dialect.h"
 #include "proton/Dialect/include/Dialect/ProtonGPU/Transforms/Passes.h"
+#include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
+#include "third_party/nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -30,6 +33,7 @@
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "nvidia/include/NVGPUToLLVM/Passes.h"
 #include "nvidia/include/TritonNVIDIAGPUToLLVM/Passes.h"
+#include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Target/LLVMIR/Passes.h"
@@ -151,6 +155,9 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::proton::gpu::registerScheduleBufferStorePass();
   mlir::triton::proton::gpu::registerAddSchedBarriersPass();
 
+  // TLX passes
+  mlir::triton::tlx::registerPasses();
+
   // Register plugin passes and dialects.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
     plugin.registerPasses();
@@ -168,5 +175,5 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::amdgpu::TritonAMDGPUDialect,
       mlir::triton::proton::ProtonDialect,
       mlir::triton::proton::gpu::ProtonGPUDialect, mlir::ROCDL::ROCDLDialect,
-      mlir::triton::gluon::GluonDialect>();
+      mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
 }

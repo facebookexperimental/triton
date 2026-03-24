@@ -33,7 +33,7 @@ module {
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 module {
   // expected-error @+1 {{tensor descriptors must not wrap tensor types; use !tt.tensordesc<shape x element-type[, layout]> instead}}
-  tt.func public @nested_tensordesc(%arg0: !tt.tensordesc<tensor<8x16xf32, #shared>>) {
+  tt.func public @nested_tensordesc(%arg0: !tt.tensordesc<8x16xtensor<4x4xf32>, #shared>) {
     tt.return
   }
 }

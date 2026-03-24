@@ -41,6 +41,13 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/SourceMgr.h"
 
+// TLX addition: getBuilderClass for TLX dialect Python bindings
+static pybind11::class_<TritonOpBuilder> *builderClassPtr = nullptr;
+namespace ir {
+pybind11::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
+} // namespace ir
+
+
 namespace {
 
 namespace py = pybind11;
@@ -837,10 +844,12 @@ void init_triton_ir(py::module &&m) {
 
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  py::class_<TritonOpBuilder> TritonOpBuilderBinding =
-      py::class_<TritonOpBuilder>(m, "builder", py::module_local(),
-                                  py::dynamic_attr());
-  TritonOpBuilderBinding.def(py::init<MLIRContext *>())
+  static py::class_<TritonOpBuilder> builder_cls(m, "builder",
+                                                   py::module_local(),
+                                                   py::dynamic_attr());
+  builderClassPtr = &builder_cls;
+  builder_cls
+      .def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
       // getters
       .def("create_module",
@@ -1867,7 +1876,7 @@ void init_triton_ir(py::module &&m) {
   // Add custom operations.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
     for (const auto &op : plugin.listOps()) {
-      TritonOpBuilderBinding.def(
+      builder_cls.def(
           op.name, [op](TritonOpBuilder &self, std::vector<Value> args) {
             args.insert(args.begin(), Value());
             op.addOp(self, args);
