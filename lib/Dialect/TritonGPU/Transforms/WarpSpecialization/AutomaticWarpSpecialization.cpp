@@ -4,6 +4,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
@@ -12,6 +13,8 @@
 using namespace mlir;
 using namespace triton;
 using namespace triton::gpu;
+namespace ttng = triton::nvidia_gpu;
+namespace tlx = mlir::triton::tlx;
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
@@ -28,6 +31,12 @@ struct AutomaticWarpSpecialization
           AutomaticWarpSpecialization> {
   using TritonGPUAutomaticWarpSpecializationBase::
       TritonGPUAutomaticWarpSpecializationBase;
+
+  bool shouldBail(ModuleOp &mod) const {
+    auto hasManualWarpSpec =
+        mod->getAttrOfType<BoolAttr>(tlx::AttrHasWarpSpecOpsName);
+    return hasManualWarpSpec != nullptr && hasManualWarpSpec.getValue() == true;
+  }
 
   void runOnOperation() override;
 };
@@ -60,6 +69,9 @@ void multiBufferTMADescriptors(ModuleOp mod, int numStages) {
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
+  ModuleOp m = getOperation();
+  if (shouldBail(m))
+    return;
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
   pm.addPass(createNVWSHoistTmemStore());

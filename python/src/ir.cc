@@ -41,6 +41,13 @@
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/SourceMgr.h"
 
+// TLX addition: getBuilderClass for TLX dialect Python bindings
+static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
+namespace ir {
+py::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
+} // namespace ir
+
+
 namespace {
 
 namespace py = pybind11;
@@ -823,8 +830,11 @@ void init_triton_ir(py::module &&m) {
 
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  py::class_<TritonOpBuilder>(m, "builder", py::module_local(),
-                              py::dynamic_attr())
+  static py::class_<TritonOpBuilder> builder_cls(m, "builder",
+                                                   py::module_local(),
+                                                   py::dynamic_attr());
+  builderClassPtr = &builder_cls;
+  builder_cls
       .def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
       // getters

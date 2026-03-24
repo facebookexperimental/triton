@@ -378,6 +378,17 @@ def test_tma_store(FAILURE, device, run_wrapper, monkeypatch):
             assert result.exc is None
             assert result.driver_stderr_output == ""
         return
+@gluon.jit
+def tcgen5_mma_kernel(input_desc, XBLOCK: ttgl.constexpr, FAILURE: ttgl.constexpr, MEM_ACCESS_KIND: ttgl.constexpr):
+    acc_layout: ttgl.constexpr = blackwell.TensorMemoryLayout([XBLOCK, XBLOCK], col_stride=1, cta_split_num=[1, 1])
+    blocked_layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, XBLOCK], threads_per_warp=[32, 1],
+                                                        warps_per_cta=[4, 1], order=[0, 1])
+    smemA = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
+    smemB = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
+    bar = ttgl.allocate_shared_memory(ttgl.int64, [2, 1], mbarrier.MBarrierLayout())
+    acc = blackwell.allocate_tensor_memory(ttgl.float32, [XBLOCK, XBLOCK], acc_layout)
+    mbarrier.init(bar.index(0), count=1)
+    mbarrier.init(bar.index(1), count=1)
 
     monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
     monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
@@ -547,6 +558,33 @@ def test_warpgroup_mma2(FAILURE, device, run_wrapper, monkeypatch):
 
     input = torch.randn((XBLOCK, XBLOCK), device=device, dtype=torch.float16)
     kernel[(1, )](input, FAILURE=FAILURE)
+    warpgroup_mma_kernel[(1, )](input, XBLOCK, FAILURE=FAILURE)
+
+
+@gluon.jit
+def tcgen5_mma_multibar_kernel(input_desc, XBLOCK: ttgl.constexpr, BUF_IDX: ttgl.constexpr, BAR_IDX: ttgl.constexpr):
+    acc_layout: ttgl.constexpr = blackwell.TensorMemoryLayout([XBLOCK, XBLOCK], col_stride=1, cta_split_num=[1, 1])
+    blocked_layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, XBLOCK], threads_per_warp=[32, 1],
+                                                        warps_per_cta=[4, 1], order=[0, 1])
+    smemA = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
+    smemB = ttgl.allocate_shared_memory(ttgl.float16, [XBLOCK, XBLOCK], input_desc.layout)
+    bar = ttgl.allocate_shared_memory(ttgl.int64, [4, 1], mbarrier.MBarrierLayout())
+    acc = blackwell.allocate_tensor_memory(ttgl.float32, [2, XBLOCK, XBLOCK], acc_layout)
+    for i in range(4):
+        mbarrier.init(bar.index(i), count=1)
+
+    blackwell.tcgen05_mma(smemA, smemB.permute([1, 0]), acc.index(0), mbarriers=[bar.index(0),
+                                                                                 bar.index(1)],
+                          mbarrier_preds=[False, True])
+    blackwell.tcgen05_mma(smemA, smemB.permute([1, 0]), acc.index(1), mbarriers=[bar.index(2)])
+    blackwell.tcgen05_commit(bar.index(3))
+
+    mbarrier.wait(bar.index(BAR_IDX), 0)
+
+    acc.index(BUF_IDX).store(ttgl.full([XBLOCK, XBLOCK], 42, ttgl.float32, blocked_layout))
+
+    for i in range(4):
+        mbarrier.invalidate(bar.index(i))
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 10, reason="Requires blackwell or newer")
@@ -602,6 +640,93 @@ def test_tcgen5_mma_multibar(BUF_IDX, BAR_IDX, device, run_wrapper, monkeypatch)
 @gluon.jit
 def inc_mod(x, mod):
     return (x + 1) % mod
+
+
+@gluon.jit
+def multibuffered_loop_tma_kernel(input_desc, XBLOCK: ttgl.constexpr, FAILURE: ttgl.constexpr):
+    num_buffers: ttgl.constexpr = 2 if FAILURE else 3
+    num_mma_stages: ttgl.constexpr = 2
+
+    acc_layout: ttgl.constexpr = blackwell.TensorMemoryLayout([XBLOCK, XBLOCK], col_stride=1, cta_split_num=[1, 1])
+    blocked_layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, XBLOCK], threads_per_warp=[32, 1],
+                                                        warps_per_cta=[4, 1], order=[0, 1])
+    zero = ttgl.zeros([XBLOCK, XBLOCK], ttgl.float32, blocked_layout)
+
+    smemA = ttgl.allocate_shared_memory(ttgl.float16, [num_buffers, XBLOCK, XBLOCK], input_desc.layout)
+    smemB = ttgl.allocate_shared_memory(ttgl.float16, [num_buffers, XBLOCK, XBLOCK], input_desc.layout)
+    barLoadA = ttgl.allocate_shared_memory(ttgl.int64, [num_buffers, 1], mbarrier.MBarrierLayout())
+    barLoadB = ttgl.allocate_shared_memory(ttgl.int64, [num_buffers, 1], mbarrier.MBarrierLayout())
+    barMMA = ttgl.allocate_shared_memory(ttgl.int64, [num_mma_stages, 1], mbarrier.MBarrierLayout())
+    acc = blackwell.allocate_tensor_memory(ttgl.float32, [XBLOCK, XBLOCK], acc_layout, zero)
+    for i in range(num_buffers):
+        mbarrier.init(barLoadA.index(i), count=1)
+        mbarrier.init(barLoadB.index(i), count=1)
+
+    for i in range(num_mma_stages):
+        mbarrier.init(barMMA.index(i), count=1)
+
+    phase = 0
+    mma_phase = 0
+    ins_id = 0
+    ext_id = 0
+    mma_id = 0
+    wait_id = 0
+
+    # ins_id = 0
+    mbarrier.expect(barLoadA.index(ins_id), XBLOCK * XBLOCK * ttgl.float16.primitive_bitwidth // 8)
+    tma.async_copy_global_to_shared(input_desc, [0, 0], barLoadA.index(ins_id), smemA.index(ins_id))
+
+    mbarrier.expect(barLoadB.index(ins_id), XBLOCK * XBLOCK * ttgl.float16.primitive_bitwidth // 8)
+    tma.async_copy_global_to_shared(input_desc, [0, 0], barLoadB.index(ins_id), smemB.index(ins_id))
+    ins_id = inc_mod(ins_id, num_buffers)
+
+    # ins_id = 1
+    mbarrier.expect(barLoadA.index(ins_id), XBLOCK * XBLOCK * ttgl.float16.primitive_bitwidth // 8)
+    tma.async_copy_global_to_shared(input_desc, [0, 0], barLoadA.index(ins_id), smemA.index(ins_id))
+
+    mbarrier.expect(barLoadB.index(ins_id), XBLOCK * XBLOCK * ttgl.float16.primitive_bitwidth // 8)
+    tma.async_copy_global_to_shared(input_desc, [0, 0], barLoadB.index(ins_id), smemB.index(ins_id))
+    ins_id = inc_mod(ins_id, num_buffers)
+
+    mbarrier.wait(barLoadA.index(ext_id), phase)
+    mbarrier.wait(barLoadB.index(ext_id), phase)
+
+    blackwell.tcgen05_mma(smemA.index(ext_id), smemB.index(ext_id), acc, mbarriers=[barMMA.index(mma_id)])
+    ext_id = inc_mod(ext_id, num_buffers)
+    mma_id = inc_mod(mma_id, num_mma_stages)
+
+    # ins_id = 2
+    ub = 10
+    for i in range(ub):
+        if i < ub - 2:
+            mbarrier.expect(barLoadA.index(ins_id), XBLOCK * XBLOCK * ttgl.float16.primitive_bitwidth // 8)
+            tma.async_copy_global_to_shared(input_desc, [0, 0], barLoadA.index(ins_id), smemA.index(ins_id))
+
+            mbarrier.expect(barLoadB.index(ins_id), XBLOCK * XBLOCK * ttgl.float16.primitive_bitwidth // 8)
+            tma.async_copy_global_to_shared(input_desc, [0, 0], barLoadB.index(ins_id), smemB.index(ins_id))
+            ins_id = inc_mod(ins_id, num_buffers)
+
+        if i < ub - 1:
+            mbarrier.wait(barLoadA.index(ext_id), phase)
+            mbarrier.wait(barLoadB.index(ext_id), phase)
+
+            blackwell.tcgen05_mma(smemA.index(ext_id), smemB.index(ext_id), acc, mbarriers=[barMMA.index(mma_id)])
+            mma_id = inc_mod(mma_id, num_mma_stages)
+
+        mbarrier.wait(barMMA.index(wait_id), mma_phase)
+        wait_id = inc_mod(wait_id, num_mma_stages)
+        if wait_id == 0:
+            mma_phase = (mma_phase + 1) % 2
+        ext_id = inc_mod(ext_id, num_buffers)
+        if ext_id == 0:
+            phase = (phase + 1) % 2
+
+    for i in range(num_buffers):
+        mbarrier.invalidate(barLoadA.index(i))
+        mbarrier.invalidate(barLoadB.index(i))
+
+    for i in range(num_mma_stages):
+        mbarrier.invalidate(barMMA.index(i))
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 10, reason="Requires blackwell or newer")

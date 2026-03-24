@@ -6,6 +6,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Support/LogicalResult.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -779,11 +780,15 @@ struct TensorMemoryCopyOpConversion
     Location loc = op->getLoc();
     Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
     bool twoCTAs = getModuleTwoCTAs(op);
+    if (tlx::tlxEnablePairedMMA(op)) {
+      twoCTAs = true;
+    }
     // Similar to twoCTA tcgen05.mma, the 2CTA version of this op should only be
     // emitted from the lead CTA.
     if (twoCTAs) {
       Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
       pred = TritonLLVMOpBuilder(loc, rewriter).and_(pred, cluster0);
+
     }
 
     if (failed(copySharedToTmem(rewriter, loc, typeConverter, op,
@@ -794,6 +799,7 @@ struct TensorMemoryCopyOpConversion
       auto barrier = LLVM::getSharedMemoryObjectFromStruct(
           op.getLoc(), adaptor.getBarrier(), i64_ty, rewriter);
       createCommit(rewriter, loc, barrier.getBase(), pred, twoCTAs);
+
     }
 
     rewriter.eraseOp(op);
@@ -815,7 +821,8 @@ struct MemDescIndexOpConversion
     auto dstTy = op.getResult().getType();
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
 
-    if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+    if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
+             triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(
             srcTy.getEncoding())) {
       return failure();
     }
@@ -867,6 +874,7 @@ struct TMEMSubSliceOpConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto dstTy = cast<MemDescType>(op.getResult().getType());
     uint32_t offset = getTMemSubSliceOffset(dstTy, op.getN());
+
 
     Value tmemBase = adaptor.getSrc();
     Value offsetVal = b.i32_val(offset);

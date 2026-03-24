@@ -1083,4 +1083,35 @@ tt.func @partitioned_shared_padded_alloc() {
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #PARTITIONED_SHARED_PADDED, #ttg.shared_memory, mutable>
   tt.return
 }
+
+// expected-remark @below {{no_remote_shmem_store_kernel}}
+// expected-remark @below {{size = 8}}
+tt.func public @no_remote_shmem_store_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: tensor<1xf32>) {
+  // expected-remark @below {{offset = 0, size = 8}}
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  %1 = nvgpu.cluster_id
+  %c1_i32 = arith.constant 1 : i32
+  %c1_i32_0 = arith.constant 1 : i32
+  %2 = arith.xori %1, %c1_i32_0 : i32
+  %3 = ttg.memdesc_index %0[%2] : !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable> -> !ttg.memdesc<1xf32, #A_SHARED, #smem, mutable>
+  %c1_i32_1 = arith.constant 1 : i32
+  // expected-remark @below {{offset = 0, size = 8}}
+  %4 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  tt.return
+}
+
+// expected-remark @below {{remote_shmem_store_kernel}}
+// expected-remark @below {{size = 24}}
+tt.func public @remote_shmem_store_kernel(%store_val: tensor<1xf32>) {
+  // expected-remark @below {{offset = 0, size = 8}}
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  %c1_i32 = arith.constant 1 : i32
+  %remote_store_view_2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable> -> !ttg.memdesc<1xf32, #A_SHARED, #smem, mutable>
+  %cta_rank = arith.constant 1 : i32
+  ttg.remote_shmem_store %store_val, rank %cta_rank, %remote_store_view_2 : tensor<1xf32> -> !ttg.memdesc<1xf32, #A_SHARED, #smem, mutable>
+  // expected-remark @below {{offset = 16, size = 8}}
+  %4 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  tt.return
+}
+
 }

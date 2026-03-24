@@ -213,6 +213,13 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     copyOp.getPredMutable().assign(mask);
     return op;
   }
+  if (auto prefetchOp = dyn_cast<ttng::AsyncTMAPrefetchOp>(op)) {
+    rewriter.setInsertionPoint(prefetchOp);
+    Value mask = getPredMask(rewriter, prefetchOp.getPred().getType(),
+                             prefetchOp.getPred(), pred);
+    prefetchOp.getPredMutable().assign(mask);
+    return op;
+  }
   if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
     rewriter.setInsertionPoint(gatherOp);
     Value mask = getPredMask(rewriter, gatherOp.getPred().getType(),

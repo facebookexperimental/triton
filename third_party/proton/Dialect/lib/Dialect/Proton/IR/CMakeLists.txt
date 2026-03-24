@@ -6,3 +6,5 @@ add_triton_library(ProtonIR
   ProtonTableGen
   ProtonAttrDefsIncGen
 )
+
+target_compile_options(ProtonIR PRIVATE -Wno-deprecated-declarations)

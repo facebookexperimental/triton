@@ -1126,4 +1126,19 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
   let assemblyFormat = "attr-dict";
 }
 
+
+
+
+
+def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[MemRead<SharedMemory>]>]> {
+  let summary = "Read phase";
+
+  let description = [{ Read barrier phase}];
+
+  let arguments = (ins
+                   Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$alloc
+                  );
+  let results = (outs I32:$result);
+  //let assemblyFormat = "operands attr-dict `:` type($result)";
+}
 #endif

@@ -1277,6 +1277,11 @@ LogicalResult CLCLoadResultOp::verify() {
   return verifyCLCResultMemdesc(getLoc(), getSrc().getType());
 }
 
+
+// TLX stub
+LogicalResult MapToRemoteBufferOp::verify() { return success(); }
+LogicalResult VoteBallotSyncOp::verify() { return success(); }
+
 } // namespace nvidia_gpu
 } // namespace triton
 } // namespace mlir

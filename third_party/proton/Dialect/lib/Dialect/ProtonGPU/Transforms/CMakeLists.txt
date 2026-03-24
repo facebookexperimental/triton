@@ -6,3 +6,5 @@ add_triton_library(ProtonGPUTransforms
   LINK_LIBS PUBLIC
   ProtonGPUIR
 )
+
+target_compile_options(ProtonGPUTransforms PRIVATE -Wno-deprecated-declarations)

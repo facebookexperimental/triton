@@ -184,4 +184,21 @@ def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-
   }];
 }
 
+def TritonNvidiaGPUPruneUnusedBarriersPass
+    : Pass<"triton-nvidia-gpu-prune-unused-barriers", "mlir::ModuleOp"> {
+  let summary = "Prune barriers with no wait uses after warp specialization";
+
+  let description = [{
+    After warp specialization materializes barriers for producer-consumer
+    communication channels, some barriers may have no corresponding wait ops.
+    This pass finds and removes such unused barriers and their associated
+    init/arrive/expect/commit ops.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 #endif

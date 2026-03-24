@@ -5,6 +5,7 @@ import time
 import inspect
 import hashlib
 import json
+import importlib.util
 from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
@@ -225,10 +226,27 @@ class Autotuner(KernelInterface):
                 pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
+                    if importlib.util.find_spec("torch.monitor") is not None:
+                        from torch.monitor import _WaitCounter
+                        waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
+                        waitcounter.__enter__()
+
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
                     self.bench_time = bench_end - bench_start
+                    # facebook begin T203283446
+                    if importlib.util.find_spec("torch.monitor") is not None:
+                        waitcounter.__exit__()
+                    if knobs.autotuning.print:
+                        print(
+                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
+                            flush=True)
+                        sorted_configs = builtins.sorted(timings, key=timings.get)
+                        for config in sorted_configs:
+                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
+                                  flush=True)
+                    # facebook end T203283446
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                     self.pre_hook(full_nargs, reset_only=True)
@@ -318,9 +336,35 @@ class Config:
     :ivar pre_hook: a function that will be called before the kernel is called. Parameters of this
                     function are args.
     :ivar ir_override: filename of a user-defined IR (*.{ttgir|llir|ptx|amdgcn}).
+    :ivar ctas_per_cga: number of CTAs per Cooperative Grid Array (cluster) for CUDA Thread Block Clusters. SM90+ only.
+        Unlike cluster_dims which spawns new CTAs, ctas_per_cga regroups existing grid CTAs into clusters.
+        This matches CUDA's cuLaunchKernelEx CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION semantics.
+    :type ctas_per_cga: tuple[int, int, int]
+    :ivar preferred_ctas_per_cga: preferred number of CTAs per cluster. Unlike ctas_per_cga which is
+        required, this is a hint: the driver may use a smaller cluster if resources are constrained.
+        Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
+    :type preferred_ctas_per_cga: tuple[int, int, int]
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None):
+    def __init__(
+        self,
+        kwargs,
+        num_warps=4,
+        num_stages=3,
+        num_ctas=1,
+        maxnreg=None,
+        pre_hook=None,
+        ir_override=None,
+        minRegAutoWS=None,
+        maxRegAutoWS=None,
+        pingpongAutoWS=None,
+        num_buffers_warp_spec=0,
+        num_consumer_groups=0,
+        reg_dec_producer=0,
+        reg_inc_consumer=0,
+        ctas_per_cga=None,
+        preferred_ctas_per_cga=None,
+    ):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
@@ -328,6 +372,11 @@ class Config:
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
         self.ir_override = ir_override
+        self.minRegAutoWS = minRegAutoWS
+        self.maxRegAutoWS = maxRegAutoWS
+        self.pingpongAutoWS = pingpongAutoWS
+        self.ctas_per_cga = ctas_per_cga
+        self.preferred_ctas_per_cga = preferred_ctas_per_cga
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -337,10 +386,16 @@ class Config:
         self.maxnreg = state.get("maxnreg", None)
         self.pre_hook = state.get("pre_hook", None)
         self.ir_override = state.get("ir_override", None)
+        self.minRegAutoWS = state.get("minRegAutoWS", None)
+        self.maxRegAutoWS = state.get("maxRegAutoWS", None)
+        self.pingpongAutoWS = state.get("pingpongAutoWS", None)
+        self.ctas_per_cga = state.get("ctas_per_cga", None)
+        self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
 
     def all_kwargs(self):
         return {
-            **self.kwargs, **{
+            **self.kwargs,
+            **{
                 k: v
                 for (k, v) in (
                     ("num_warps", self.num_warps),
@@ -348,8 +403,13 @@ class Config:
                     ("num_stages", self.num_stages),
                     ("maxnreg", self.maxnreg),
                     ("ir_override", self.ir_override),
+                    ("minRegAutoWS", self.minRegAutoWS),
+                    ("maxRegAutoWS", self.maxRegAutoWS),
+                    ("pingpongAutoWS", self.pingpongAutoWS),
+                    ("ctas_per_cga", self.ctas_per_cga),
+                    ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                 ) if v is not None
-            }
+            },
         }
 
     def __str__(self):
@@ -360,6 +420,11 @@ class Config:
         res.append(f"num_ctas: {self.num_ctas}")
         res.append(f"num_stages: {self.num_stages}")
         res.append(f"maxnreg: {self.maxnreg}")
+        res.append(f"minRegAutoWS: {self.minRegAutoWS}")
+        res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
+        res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
+        res.append(f"ctas_per_cga: {self.ctas_per_cga}")
+        res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         return ", ".join(res)
 
     def __hash__(self):

@@ -9,7 +9,9 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONTOTRITONGPU
@@ -538,6 +540,13 @@ public:
   }
 };
 
+void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
+                        RewritePatternSet &patterns) {
+  MLIRContext *context = patterns.getContext();
+  patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
+  patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter, context);
+}
+
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns, unsigned numCTAs) {
   MLIRContext *context = patterns.getContext();
@@ -588,6 +597,10 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::DotScaledOp>,
       GenericOpPattern<triton::CallOp>,
       GenericOpPattern<ReturnOp>,
+      GenericOpPattern<triton::gpu::AsyncCopyGlobalToLocalOp>,
+      GenericOpPattern<triton::gpu::LocalStoreOp>,
+      GenericOpPattern<triton::gpu::LocalLoadOp>,
+      GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       TritonFuncOpPattern
       // clang-format on
       >(typeConverter, context);
@@ -805,6 +818,7 @@ public:
     populateArithPatternsAndLegality(typeConverter, patterns, target);
     populateMathPatternsAndLegality(typeConverter, patterns, target);
     populateTritonPatterns(typeConverter, patterns, numCTAs);
+    populateTLXPatterns(typeConverter, patterns);
     // TODO: can we use
     //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
     populateSCFPatterns(typeConverter, patterns);
