@@ -398,7 +398,11 @@ class CUDABackend(BaseBackend):
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
                 if knobs.nvidia.use_meta_partition:
-                    nvidia.passes.hopper.add_partition_scheduling_meta(pm)
+                    nvidia.passes.hopper.add_partition_scheduling_meta(
+                        pm,
+                        False,
+                        knobs.nvidia.compute_partition_granularity,
+                    )
                 else:
                     passes.ttgpuir.add_partition_scheduling(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)

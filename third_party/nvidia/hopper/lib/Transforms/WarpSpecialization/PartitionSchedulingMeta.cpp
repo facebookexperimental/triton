@@ -412,6 +412,11 @@ public:
   /// Get the detected data partition factor.
   unsigned getDataPartitionFactor() const { return dataPartitionFactor; }
 
+  /// Get per-MMA union-find group IDs (only populated when 2+ MMAs exist).
+  const DenseMap<Operation *, unsigned> &getMMAGroupIds() const {
+    return mmaGroupId;
+  }
+
   /// Get all MMAs.
   ArrayRef<ttng::MMAv5OpInterface> getMMAs() const { return mmas; }
 
@@ -555,6 +560,10 @@ private:
     dataPartitionFactor =
         groupsWithExclusiveOps.size() > 1 ? groupsWithExclusiveOps.size() : 1;
 
+    // Store per-MMA group IDs for cluster-aware partitioning.
+    for (unsigned i = 0; i < n; ++i)
+      mmaGroupId[loopMmas[i].getOperation()] = find(i);
+
     LLVM_DEBUG(llvm::dbgs() << "[data-partition] " << n << " MMAs → "
                             << groupsWithExclusiveOps.size()
                             << " independent groups (dpFactor="
@@ -689,6 +698,7 @@ private:
   DenseMap<Operation *, CategorizedOp> opCategories;
   DenseMap<Operation *, SetVector<Operation *>> mmaToSlice;
   DenseSet<Operation *> sharedOps;
+  DenseMap<Operation *, unsigned> mmaGroupId;
   unsigned dataPartitionFactor = 1;
 };
 
@@ -960,7 +970,8 @@ struct ScheduleResult {
 // users and/or dependencies. This sets up the initial partitioning of the ops.
 static std::optional<ScheduleResult>
 getInitialSchedule(scf::ForOp mainLoop,
-                   bool mergeEpilogueIntoComputation = false) {
+                   bool mergeEpilogueIntoComputation = false,
+                   llvm::StringRef computePartitionGranularity = "auto") {
   // Check for an existing schedule.
   if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
       succeeded(scheduleOr))
@@ -1314,37 +1325,58 @@ getInitialSchedule(scf::ForOp mainLoop,
   // MMA users create computation partitions. This runs AFTER correction/load
   // user propagation so that shared ops are already claimed, leaving only
   // per-MMA-exclusive ops for the computation partitions.
-  //
-  // When dpFactor > 1 (fwd): each independent MMA group gets its own
-  //   dynamic partition via scheduleUsers(nullptr).
-  // When dpFactor == 1 (bwd): all MMA users share a single computation
-  //   partition to avoid creating too many partitions.
+
+  // Compute partition strategy is determined by computePartitionGranularity:
+  //   "auto"     → use dataPartitionFactor heuristic (dpFactor>1 = separate,
+  //                dpFactor <=1 merged)
+  //   "cluster"  → always one partition per union-find cluster
+  //   "separate" → always one partition per MMA
+  //   "merged"   → always one shared computation partition
+
+  // Resolve compute partition strategy
+  enum class ComputePolicy { Cluster, Separate, Merged };
+  ComputePolicy policy;
+  if (computePartitionGranularity == "cluster")
+    policy = ComputePolicy::Cluster;
+  else if (computePartitionGranularity == "separate" ||
+           (computePartitionGranularity == "auto" && dataPartitionFactor > 1))
+    policy = ComputePolicy::Separate;
+  else // "merged", or "auto" with dpFactor<=1
+    policy = ComputePolicy::Merged;
 
   DenseMap<Operation *, Partition *> mmaToPartition;
   SmallVector<Operation *> inFirstLoop;
 
-  // For dpFactor==1, pre-create a single shared computation partition.
-  // For dpFactor>1, let scheduleUsers(nullptr) create per-group partitions.
   Partition *sharedComputePartition = nullptr;
-  if (dataPartitionFactor <= 1) {
-    // All MMA users go to one computation partition (bwd pattern).
-    sharedComputePartition = nullptr; // lazy-created on first use
-  }
+  DenseMap<unsigned, Partition *> clusterPartitions;
 
   for (auto mmaOp : llvm::reverse(mmas)) {
     if (mmaOp->getParentOfType<scf::ForOp>() == loops[0]) {
       Partition *targetPart = nullptr;
-      if (dataPartitionFactor > 1) {
-        // fwd: each MMA group gets its own dynamic partition
+      switch (policy) {
+      case ComputePolicy::Separate:
         targetPart = nullptr;
-      } else {
-        // bwd: all MMA users share one partition
+        break;
+      case ComputePolicy::Merged:
         targetPart = sharedComputePartition;
+        break;
+      case ComputePolicy::Cluster: {
+        unsigned group =
+            categorizer.getMMAGroupIds().lookup(mmaOp.getOperation());
+        targetPart = clusterPartitions.lookup(group);
+        break;
+      }
       }
       auto part = scheduleUsers(mmaOp->getParentOfType<scf::ForOp>(), schedule,
                                 targetPart, mmaOp);
-      if (dataPartitionFactor <= 1 && !sharedComputePartition)
+      if (policy == ComputePolicy::Merged && !sharedComputePartition)
         sharedComputePartition = part;
+      if (policy == ComputePolicy::Cluster && part) {
+        unsigned group =
+            categorizer.getMMAGroupIds().lookup(mmaOp.getOperation());
+        if (!clusterPartitions.count(group))
+          clusterPartitions[group] = part;
+      }
       mmaToPartition[mmaOp.getOperation()] = part;
       inFirstLoop.push_back(mmaOp.getOperation());
     }
@@ -1363,12 +1395,17 @@ getInitialSchedule(scf::ForOp mainLoop,
 
   // When epilogue is merged into computation, post-loop ops should be
   // assigned to the computation partition (not the default partition).
-  // For bwd (dpFactor<=1), sharedComputePartition is the single computation
-  // partition. For fwd (dpFactor>1), fall back to defaultPartition since
-  // there are multiple per-group computation partitions.
+  // For merged compute, sharedComputePartition is the single computation
+  // partition. For cluster with a single cluster, use that cluster's partition.
+  // For separate compute, fall back to defaultPartition since there are
+  // multiple per-MMA computation partitions.
   Partition *postLoopPartition = epiloguePartition;
-  if (!postLoopPartition)
-    postLoopPartition = sharedComputePartition;
+  if (!postLoopPartition) {
+    if (policy == ComputePolicy::Merged)
+      postLoopPartition = sharedComputePartition;
+    else if (policy == ComputePolicy::Cluster && clusterPartitions.size() == 1)
+      postLoopPartition = clusterPartitions.begin()->second;
+  }
   if (!postLoopPartition)
     postLoopPartition = defaultPartition;
   return ScheduleResult{std::move(schedule), postLoopPartition};
@@ -1663,6 +1700,15 @@ struct PartitionSchedulingMeta
 } // namespace
 
 void PartitionSchedulingMeta::runOnOperation() {
+  if (computePartitionGranularity != "auto" &&
+      computePartitionGranularity != "merged" &&
+      computePartitionGranularity != "separate" &&
+      computePartitionGranularity != "cluster")
+    llvm::report_fatal_error(
+        llvm::Twine("Invalid compute-partition-granularity '") +
+        computePartitionGranularity +
+        "'. Expected: auto, merged, separate, or cluster");
+
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
     if (loop->hasAttr(kWarpSpecializeAttrName))
@@ -1675,8 +1721,13 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (auto attr = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue"))
       mergeEpilogue = attr.getValue();
 
+    llvm::StringRef computeGranularity = computePartitionGranularity;
+    if (auto attr =
+            loop->getAttrOfType<StringAttr>("tt.compute_partition_granularity"))
+      computeGranularity = attr.getValue();
+
     if (std::optional<ScheduleResult> result =
-            getInitialSchedule(loop, mergeEpilogue)) {
+            getInitialSchedule(loop, mergeEpilogue, computeGranularity)) {
       PartitionSet &schedule = result->schedule;
       propagatePartitions(loop, schedule);
 
