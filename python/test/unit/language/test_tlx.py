@@ -7010,3 +7010,46 @@ def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
     result = output.cpu().tolist()
     assert result[0] == 5, f"Expected output[0]=5, got {result[0]}"
     assert result[1] == 99, f"Expected output[1]=99, got {result[1]}"
+
+
+@triton.jit
+def _store_ws_kernel(
+    output_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Warp-specialized store kernel for PlanCTA regression test.
+
+    Tests tl.store in a warp-specialized context where the store partition
+    has fewer warps (1) than the default partition, with num_ctas=2 to
+    ensure PlanCTA actually runs (it skips when num_ctas=1).
+
+    This exercises PlanCTA's per-op numWarps lookup: the store's layout
+    must be planned with 1 warp (the partition's warp count), not the
+    function-level total. Without the fix (lookupNumWarps(store) instead
+    of lookupNumWarps(funcOp)), PlanCTA would assign warpsPerCTA=[4]
+    inside the 1-warp partition, producing an invalid layout.
+    """
+    pid = tl.program_id(axis=0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            _ = tl.arange(0, BLOCK_SIZE)
+
+        with tlx.async_task(num_warps=1):
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            data = offsets.to(tl.float32)
+            tl.store(output_ptr + offsets, data)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_store_ws(device):
+    BLOCK_SIZE = 256
+    n_elements = 1024
+    n_blocks = n_elements // BLOCK_SIZE
+
+    output = torch.empty(n_elements, device=device, dtype=torch.float32)
+    # num_ctas=2 ensures PlanCTA runs (it skips when num_ctas=1).
+    _store_ws_kernel[(n_blocks, )](output, BLOCK_SIZE=BLOCK_SIZE, num_ctas=2)
+
+    expected = torch.arange(n_elements, device=device, dtype=torch.float32)
+    torch.testing.assert_close(output, expected)
