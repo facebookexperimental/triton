@@ -166,4 +166,20 @@ tt.func @tma_scatter(%arg0: !tt.tensordesc<1x128xbf16, #shared1>, %arg1: tensor<
   tt.return
 }
 
+
+
+// Non-multicast TMA copy test (multicast requires multi-CTA layout attributes)
+// CHECK-LABEL: @tma_non_multicast
+tt.func @tma_non_multicast(%desc: !tt.tensordesc<64x64xf16, #shared1>,
+                        %buffer: !ttg.memdesc<64x64xf16, #shared1, #smem, mutable>,
+                        %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+                        %off_m: i32,
+                        %off_n: i32) {
+  %true = arith.constant true
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [$1], [$2, {$3, $4}], [$5];"
+  ttng.async_tma_copy_global_to_local %desc[%off_m, %off_n] %buffer, %bar, %true : !tt.tensordesc<64x64xf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared1, #smem, mutable>
+
+  tt.return
+}
+
 }

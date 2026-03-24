@@ -74,7 +74,7 @@ def DotOpInterface : OpInterface<"DotOpInterface"> {
         auto bShape = bTy.getShape();
         auto cShape = cTy.getShape();
         return cShape[cShape.size() - 2] == aShape[aShape.size() - 2] &&
-               cShape[cShape.size() - 1] == bShape[aShape.size() - 1];
+               cShape[cShape.size() - 1] == bShape[bShape.size() - 1];
       }]>
   ];
 

@@ -47,6 +47,7 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 /// Create a predicate with just single active thread.
 Value createElectPredicate(Location loc, OpBuilder &rewriter);
 Value createElectPredicateWarp0(Location loc, OpBuilder &rewriter);
+Value createLeaderCTAPredicate(Location loc, RewriterBase &rewriter);
 
 // Create bar.warp.sync
 void createSyncWarp(Location loc, OpBuilder &builder);

@@ -23,6 +23,9 @@ option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
 option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 option(TRITON_OFFLINE_BUILD "Build without downloading dependencies" OFF)
 option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" OFF)
+option(TRITON_BUILD_TLX "Build Triton TLX" ON)
+option(LLVM_BUILD_SHARED_LIBS
+  "Build all libraries as shared libraries instead of static" OFF)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 set(TRITON_VERSION "" CACHE STRING "Triton version string (passed from setup.py)")
 
@@ -344,6 +347,12 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endforeach()
   endif()
 
+  if (TRITON_BUILD_TLX)
+    add_subdirectory(third_party/tlx)
+  endif()
+  list(APPEND TRITON_PLUGIN_NAMES "tlx")
+  add_subdirectory(third_party/tlx/dialect)
+
   get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
   get_property(triton_plugins GLOBAL PROPERTY TRITON_PLUGINS)
   set(TRITON_LIBRARIES
@@ -482,7 +491,8 @@ if(NOT TRITON_BUILD_PYTHON_MODULE)
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
-  add_subdirectory(third_party/proton/Dialect)
+  add_subdirectory(third_party/proton/dialect)
+  add_subdirectory(third_party/tlx/dialect)
 endif()
 
 find_package(Threads REQUIRED)

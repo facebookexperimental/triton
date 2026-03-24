@@ -61,7 +61,7 @@ createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -115,7 +115,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -166,7 +166,7 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
   Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
+      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
   ttg::MemDescType subviewTy =
       ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
                             sliceType.getEncoding(), sharedMemorySpace,
@@ -210,8 +210,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
-        loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
-        pipelineBuffer, pred);
+        loc, /*multicastTargets*/ Value(), tmaLoad.getDesc(),
+        tmaLoad.getIndices(), prodBarrier, pipelineBuffer, pred);
   }
 
   // Create a wait_barrier before the first consumer.

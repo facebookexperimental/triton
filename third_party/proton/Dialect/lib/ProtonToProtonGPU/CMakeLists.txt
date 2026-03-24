@@ -9,3 +9,5 @@ add_triton_library(ProtonToProtonGPU
   ProtonIR
   ProtonGPUIR
 )
+
+target_compile_options(ProtonToProtonGPU PRIVATE -Wno-deprecated-declarations)

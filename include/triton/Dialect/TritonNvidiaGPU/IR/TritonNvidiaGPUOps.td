@@ -1076,4 +1076,197 @@ def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   }];
 }
 
+def TTNG_AsyncStoreOp : TTNG_Op<"async_store"> {
+  let summary = "Async store from shared to global memory";
+  let description = [{
+    Copies `size` bytes from shared memory to global memory using
+    cp.async.bulk.global.shared::cta.bulk_group. Completion tracked
+    via cp.async.bulk.commit_group / cp.async.bulk.wait_group.
+    The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Arg<TT_Ptr, "", [MemWrite<GlobalMemory>]>:$dst,
+    I32:$size
+  );
+
+  let assemblyFormat = [{
+    $src `,` $dst `,` $size
+    attr-dict `:` qualified(type($src)) `,` qualified(type($dst))
+  }];
+}
+
+def TTNG_FenceOp : TTNG_Op<"fence"> {
+  let arguments = (ins StrAttr:$scope);
+
+  let summary = "GPU or system scope memory fence";
+
+  let assemblyFormat = "attr-dict";
+
+  let extraClassDeclaration = [{
+    static bool isSupported(int computeCapability) {
+      return computeCapability >= 70;
+    }
+  }];
+}
+
+def TTNG_MapToRemoteBufferOp : TTNG_Op<"map_to_remote_buffer", [Pure, MemDescViewTrait]> {
+  let summary = "Map shared memory buffer to the corresponding buffer in the target CTA";
+  let description = [{
+    Given a shared memory buffer mem desc `src`, return a mem desc referring to the corresponding buffer in the specified
+    target CTA.
+
+    `$ctaRank` refers to the unique CTA id in a cluster acorss all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    will be 0~7.
+  }];
+
+  let arguments = (ins TTG_MemDescType:$src, I32:$ctaRank);
+
+  let results = (outs TTG_MemDescType:$result);
+
+  let assemblyFormat = [{$src`,` $ctaRank attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
+
+  let hasVerifier = 1;
+}
+
+def TTNG_ClusterSize1DOp : TTNG_Op<"cluster_size_1d", [Pure]> {
+  let summary = "Returns the number of CTAs in a cluster across all dimensions";
+  let description = [{
+    Returns the total number of CTAs in the current cluster, equal to the
+    product of the cluster dimensions across all axes. Maps to the PTX
+    special register `%cluster_nctarank`.
+  }];
+  let results = (outs I32:$result);
+  let assemblyFormat = "attr-dict";
+}
+
+def TTNG_AsyncCLCTryCancelOp : TTNG_Op<"async_clc_try_cancel", []> {
+  let summary = "Requests cancellation of cluster which is not launched yet";
+
+  let description = [{
+    Requests atomically cancelling the launch of a cluster that has not started running yet.
+
+    This lowers using PTX instruction
+    clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
+
+    It asynchronously writes an opaque response (16-byte CLC response) to shared memory. The completion of the asynchronous operation is tracked using the mbarrier object in `alloc`.
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarAlloc,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc
+  );
+
+  let assemblyFormat = "$mbarAlloc`,` $clcResAlloc attr-dict `:` type(operands)";
+}
+
+def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
+  let summary = "Extract CTA ID from CLC response";
+
+  let description = [{
+    Extract CTA ID from CLC response if try_cancel was successful.
+    Otherwise, returns -1.
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-query-cancel
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc
+  );
+
+  let results = (outs I32:$ctaId);
+
+  let assemblyFormat = "$clcResAlloc attr-dict `:` functional-type(operands, $ctaId)";
+}
+
+def TTNG_VoteBallotSyncOp : TTNG_Op<"vote_ballot_sync", [Pure]> {
+  let summary = "Warp-level vote ballot synchronization";
+
+  let description = [{
+    Performs a warp-level vote ballot operation that collects a predicate from
+    each thread in the warp and returns a 32-bit mask where each bit represents
+    the predicate value from the corresponding lane.
+
+    The `mask` operand specifies which threads participate in the vote. Threads
+    with their corresponding bit set in the mask must execute the instruction
+    with the same mask value.
+
+    The `pred` operand can be either:
+    - A scalar i1: Each thread contributes this predicate, returns scalar i32
+    - A tensor of i1: Each thread contributes its element(s), returns tensor of i32
+      with the same shape. All threads in a warp receive the same ballot value.
+
+    When pred is a tensor, each thread contributes the OR of all its owned
+    elements to the ballot. The result tensor has the same shape, with each
+    element containing the warp's ballot result.
+
+    This lowers to PTX instruction:
+    vote.sync.ballot.b32 dest, predicate, membermask;
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
+  }];
+
+  let arguments = (ins
+    I32:$mask,
+    AnyTypeOf<[I1, TT_BoolTensor]>:$pred
+  );
+
+  let results = (outs AnyTypeOf<[I32, TT_IntTensor]>:$result);
+
+  let assemblyFormat = "$mask `,` $pred attr-dict `:` type($pred) `->` type($result)";
+
+  let hasVerifier = 1;
+}
+
+def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "prefetch data based on descriptor from global memory to L2 cache asynchronously";
+
+  let description = [{
+    This operation prefetches data from global memory into L2 cache
+    asynchronously using TMA.  Unlike `async_tma_copy_global_to_local`, this does
+    not copy data to shared memory and does not use an mbarrier.  It issues a
+    `cp.async.bulk.prefetch.tensor` instruction which is a performance hint to
+    fill the L2 cache before a subsequent TMA load.
+  }];
+
+  let arguments = (ins
+    Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
+    Variadic<I32>:$coord,
+    I1:$pred,
+    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
+  );
+
+  let assemblyFormat = [{
+    $desc `[` $coord `]` `,` $pred
+    oilist(`evictionPolicy` `=` $evict)
+    attr-dict `:` qualified(type($desc))
+  }];
+}
+
+def TTNG_NamedBarrierArriveOp : TTNG_Op<"arrive_barrier_named", []> {
+  let summary = "named barrier arrive";
+
+  let arguments = (ins I32:$bar, I32: $numThreads);
+
+  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
+}
+
+def TTNG_NamedBarrierWaitOp : TTNG_Op<"wait_barrier_named", []> {
+  let summary = "named barrier wait";
+
+  let arguments = (ins I32:$bar, I32: $numThreads);
+
+  let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
+}
+
+
+
+
+
+
+
+
+
 #endif

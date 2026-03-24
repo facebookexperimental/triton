@@ -1650,4 +1650,10 @@ std::optional<bool> getBoolFromConstant(Value cst) {
   return std::nullopt;
 }
 
+
 } // namespace mlir::triton
+
+namespace mlir {
+// TLX stub
+bool isExpensiveLocalLoad(Operation *op) { return false; }
+} // namespace mlir

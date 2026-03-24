@@ -9,12 +9,12 @@ import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
 import builtins
-from .. import knobs
 from ..runtime.jit import JITCallable
 import inspect
 
 from .._C.libtriton import ir
 from .._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth, _tuple_create
+from .. import knobs
 
 T = TypeVar('T')
 
@@ -2335,7 +2335,7 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
         if acc is not None:
             acc = _semantic.reshape(acc, [batch_size] + c_shape[-2:], can_reorder=False)
 
-    res = _semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype)
+    res = _semantic.dot(input, other, acc, input_precision, None, max_num_imprecise_acc, out_dtype)
 
     if rank >= 4:
         res = _semantic.reshape(res, c_shape, can_reorder=False)

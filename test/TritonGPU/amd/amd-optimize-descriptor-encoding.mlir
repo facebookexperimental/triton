@@ -8,14 +8,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-DAG: #[[$PADDED:.*]] = #ttg.padded_shared<[32:+16] {order = [1, 0], shape = [1, 32]}>
 // CHECK-LABEL: @descriptor_gather
 tt.func public @descriptor_gather(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: tensor<32xi32, #blocked> ) -> tensor<32x32xi8, #blocked1> {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <1x32xi8, #[[$PADDED]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<i8>, !tt.tensordesc<1x32xi8, #[[$PADDED]]>
   // CHECK: tt.descriptor_gather {{.*}} : (!tt.tensordesc<1x32xi8, #[[$PADDED]]>
   %c1_i64 = arith.constant 1 : i64
   %cst = arith.constant dense<32> : tensor<8x1xi32>
   %c64_i32 = arith.constant 64 : i32
   %c8_i32 = arith.constant 8 : i32
   %0 = arith.extsi %arg2 : i32 to i64
-  %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : <i8>, <1x32xi8>
+  %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<1x32xi8>
   %2 = tt.descriptor_gather %1[%arg3, %c8_i32] : (!tt.tensordesc<1x32xi8>, tensor<32xi32, #blocked>, i32) -> tensor<32x32xi8, #blocked1>
   tt.return %2 : tensor<32x32xi8, #blocked1>
 }
@@ -29,14 +29,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-DAG: #[[$PADDED:.*]] = #ttg.padded_shared<[32:+16] {order = [1, 0], shape = [1, 32]}>
 // CHECK-LABEL: @descriptor_scatter
 tt.func public @descriptor_scatter(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}, %arg3: tensor<32xi32, #blocked>, %arg4: tensor<32x32xi8, #blocked1>) {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <1x32xi8, #[[$PADDED]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<i8>, !tt.tensordesc<1x32xi8, #[[$PADDED]]>
   // CHECK: tt.descriptor_scatter {{.*}} : !tt.tensordesc<1x32xi8, #[[$PADDED]]>, {{.*}}
   %c1_i64 = arith.constant 1 : i64
   %cst = arith.constant dense<32> : tensor<8x1xi32>
   %c64_i32 = arith.constant 64 : i32
   %c8_i32 = arith.constant 8 : i32
   %0 = arith.extsi %arg2 : i32 to i64
-  %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : <i8>, <1x32xi8>
+  %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<1x32xi8>
   tt.descriptor_scatter %1[%arg3, %c8_i32], %arg4 : !tt.tensordesc<1x32xi8>, tensor<32xi32, #blocked>, i32, tensor<32x32xi8, #blocked1>
   tt.return
 }
@@ -53,12 +53,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-DAG: #[[$PADDED_ALLOC:.*]] = #ttg.padded_shared<[32:+2] {order = [1, 0], shape = [256, 32]}>
 // CHECK-LABEL: @descriptor_load
 tt.func public @descriptor_load(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32, %arg3: i64, %arg4: i64) {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f32>, <1x256x32xf32, #[[$PADDED]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f32>, !tt.tensordesc<1x256x32xf32, #[[$PADDED]]>
   // CHECK: %[[LOAD:.*]] = tt.descriptor_load {{.*}} : !tt.tensordesc<1x256x32xf32, #[[$PADDED]]> -> tensor<256x32xf32, #[[$BLOCKED]]>
   // CHECK: ttg.local_alloc %[[LOAD]] : (tensor<256x32xf32, #[[$BLOCKED]]>) -> !ttg.memdesc<256x32xf32, #[[$PADDED_ALLOC]], #smem>
   %c1_i32 = arith.constant 1 : i32
   %c1_i64 = arith.constant 1 : i64
-  %0 = tt.make_tensor_descriptor %arg0, [%c1_i32, %arg1, %arg2], [%arg3, %arg4, %c1_i64] : <f32>, <1x256x32xf32>
+  %0 = tt.make_tensor_descriptor %arg0, [%c1_i32, %arg1, %arg2], [%arg3, %arg4, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<1x256x32xf32>
   %1 = tt.descriptor_load %0[%c1_i32, %c1_i32, %c1_i32] : !tt.tensordesc<1x256x32xf32> -> tensor<256x32xf32, #blocked>
   %2 = ttg.local_alloc %1 : (tensor<256x32xf32, #blocked>) -> !ttg.memdesc<256x32xf32, #shared, #smem>
   tt.return
@@ -103,8 +103,8 @@ tt.func public @descriptor_load_while(%arg0: !tt.ptr<i8> {tt.divisibility = 16 :
     %c1_i64 = arith.constant 1 : i64
 
     %0 = arith.extsi %arg2 : i32 to i64
-    // CHECK: tt.make_tensor_descriptor {{.*}} : <i8>, <1x32xi8, #[[$PADDED_DESC]]>
-    %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : <i8>, <1x32xi8>
+    // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<i8>, !tt.tensordesc<1x32xi8, #[[$PADDED_DESC]]>
+    %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<1x32xi8>
 
     %2 = scf.while (%arg4 = %1) : (!tt.tensordesc<1x32xi8>) -> (!tt.tensordesc<1x32xi8>) {
         scf.condition(%cond) %arg4 : !tt.tensordesc<1x32xi8>
@@ -137,13 +137,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-DAG: #[[$PADDED_B:.*]] = #ttg.padded_shared<[128:+16] {
 // CHECK-LABEL: @descriptor_load_dot_operand
 tt.func public @descriptor_load_dot_operand(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: i32, %arg3: i32, %arg4: i64, %arg5: i64) {
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f16>, <512x32xf16, #[[$PADDED_A]]>
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f16>, <32x64xf16, #[[$PADDED_B]]
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<512x32xf16, #[[$PADDED_A]]>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<32x64xf16, #[[$PADDED_B]]>
   %c0_i32 = arith.constant 0 : i32
   %c1_i64 = arith.constant 1 : i64
   %cst = arith.constant dense<0.000000e+00> : tensor<512x64xf32, #mma>
-  %0 = tt.make_tensor_descriptor %arg0, [%arg2, %arg3], [%arg4, %c1_i64] : <f16>, <512x32xf16>
-  %1 = tt.make_tensor_descriptor %arg1, [%arg3, %arg2], [%arg5, %c1_i64] : <f16>, <32x64xf16>
+  %0 = tt.make_tensor_descriptor %arg0, [%arg2, %arg3], [%arg4, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<512x32xf16>
+  %1 = tt.make_tensor_descriptor %arg1, [%arg3, %arg2], [%arg5, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<32x64xf16>
   %2 = tt.descriptor_load %0[%c0_i32, %c0_i32] : !tt.tensordesc<512x32xf16> -> tensor<512x32xf16, #blocked>
   %3 = tt.descriptor_load %1[%c0_i32, %c0_i32] : !tt.tensordesc<32x64xf16> -> tensor<32x64xf16, #blocked1>
   %4 = ttg.convert_layout %2 : tensor<512x32xf16, #blocked> -> tensor<512x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
@@ -172,8 +172,8 @@ tt.func public @descriptor_fallback(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32,
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %rng = arith.constant 5 : index
-  // CHECK: tt.make_tensor_descriptor {{.*}} : <f32>, <1x64x32xf32, #[[$PADDED_FALLBACK]]>
-  %0 = tt.make_tensor_descriptor %arg0, [%c1_i32, %arg1, %arg2], [%c1_i64, %arg3, %arg4] : <f32>, <1x64x32xf32>
+  // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f32>, !tt.tensordesc<1x64x32xf32, #[[$PADDED_FALLBACK]]>
+  %0 = tt.make_tensor_descriptor %arg0, [%c1_i32, %arg1, %arg2], [%c1_i64, %arg3, %arg4] : !tt.ptr<f32>, !tt.tensordesc<1x64x32xf32>
   // CHECK: scf.for {{.*}} -> (!tt.tensordesc<1x64x32xf32, #[[$PADDED_FALLBACK]]>)
   %1 = scf.for %iv = %c0 to %rng step %c1 iter_args(%iter_desc = %0) -> (!tt.tensordesc<1x64x32xf32>) {
     // CHECK: scf.if {{.*}} -> (!tt.tensordesc<1x64x32xf32, #[[$PADDED_FALLBACK]]>)

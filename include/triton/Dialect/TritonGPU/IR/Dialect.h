@@ -51,6 +51,11 @@ constexpr static char AttrNumWarpsName[] = "ttg.num-warps";
 constexpr static char AttrNumCTAsName[] = "ttg.num-ctas";
 constexpr static char AttrTargetName[] = "ttg.target";
 constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
+constexpr static char AttrMinRegAutoWSName[] = "ttg.min_reg_auto_ws";
+constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
+constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";
+constexpr static char AttrClusterDimY[] = "ttg.cluster-dim-y";
+constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
@@ -59,6 +64,9 @@ int lookupNumWarps(Region *region);
 // executed. Returns nullopt if a warp size cannot be find. This is used for
 // verifiers.
 std::optional<int> maybeLookupNumWarps(Operation *op);
+
+// Try to find the contextual number of warps of this block.
+std::optional<int> maybeLookupNumWarps(Block *block);
 
 // FIXME: Make this API and that of maybeLookupNumWarps consistent!
 // Utility to find the number of threads per warp

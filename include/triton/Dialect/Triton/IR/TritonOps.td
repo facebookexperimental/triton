@@ -94,12 +94,25 @@ def TT_FpToFpOp : TT_Op<"fp_to_fp", [Elementwise,
 
     let arguments = (
       ins TT_FloatLike:$src,
+      Optional<TT_I32Like>:$rbits,
       OptionalAttr<TT_RoundingModeAttr>:$rounding
     );
 
     let results = (outs TT_FloatLike:$result);
 
-    let assemblyFormat = "$src attr-dict  (`,` `rounding` `=` $rounding^)? `:` type($src) `->` type($result)";
+    let builders = [
+      OpBuilder<(ins "Type":$resultType,
+                    "Value":$src,
+                    CArg<"Attribute", "Attribute()">:$rounding)>,
+
+      OpBuilder<(ins "Type":$resultType,
+                    "Value":$src,
+                    "Value":$rbits,
+                    CArg<"Attribute", "Attribute()">:$rounding)>,
+    ];
+
+
+    let hasCustomAssemblyFormat = 1;
 
     let hasVerifier = 1;
 
@@ -982,8 +995,8 @@ def TT_AssertOp : TT_Op<"assert", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
 // Make Tensor Descriptor Op
 //
 def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
-    Pure,
-    SameVariadicOperandSize,
+    AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
 ]> {
   let summary = "Make a tensor descriptor type with meta information of the parent tensor and block size";
 
@@ -996,15 +1009,18 @@ def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
     TT_Ptr:$base,
     Variadic<I32>:$shape,
     Variadic<I64>:$strides,
+      Optional<TT_Ptr>:$descPtr,
     DefaultValuedAttr<TT_PaddingOptionAttr, "::mlir::triton::PaddingOption::PAD_ZERO">:$padding
   );
 
   let results = (outs TT_TensorDescType:$result);
 
-  let assemblyFormat = "$base `,` `[` $shape `]` `,` `[` $strides `]` attr-dict `:` type($base) `,` type($result)";
+  let hasCustomAssemblyFormat = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$base, "ValueRange":$shape, "ValueRange":$strides, "ArrayRef<int32_t>":$blockShape, "bool":$isSignedInteger,
+    "triton::PaddingOption":$padding)>,
+    OpBuilder<(ins "Value":$base, "ValueRange":$shape, "ValueRange":$strides, "Value":$descPtr, "ArrayRef<int32_t>":$blockShape, "bool":$isSignedInteger,
     "triton::PaddingOption":$padding)>
   ];
 

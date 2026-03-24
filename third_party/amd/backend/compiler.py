@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, amd
+from triton._C.libtriton import ir, passes, llvm, amd, tlx
 from triton import knobs
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
@@ -60,6 +60,7 @@ class HIPOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", 'bf16x3', 'bf16x6')
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
+    launch_cluster: bool = False  # No-op placeholder
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False
@@ -220,6 +221,8 @@ class HIPBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        tlx.tlx_passes.add_triton_tlx_fixup(pm, f"hip:{options.arch}", options.num_warps, 64, options.num_ctas,
+                                            list((1, 1, 1)))
         passes.common.add_inliner(pm)
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -247,7 +250,16 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
+        
+        # Maintain the order of the following three passes
+        # for graphs with tlx.local_load -> tt.dot,
+        # dot op specifics from add_accelerate_matmul are required
+        # to create the require_layout before tlx.local_local. 
+        # This layout will then be propagated to the tlx.local_alloc
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
+        tlx.tlx_passes.add_tlx_insert_require_layout(pm)
+        tlx.tlx_passes.add_tlx_propagate_layout(pm)
+
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
         amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)

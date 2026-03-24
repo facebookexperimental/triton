@@ -144,6 +144,21 @@ public:
     return tmem(blockM, blockN, CGAEncodingAttr::get1CTALayout(&ctx, 2));
   }
 
+  TensorMemoryEncodingAttr tmem(unsigned blockM, unsigned blockN,
+                                unsigned colStride, unsigned ctaSplitM,
+                                unsigned ctaSplitN) {
+    auto cgaLayout = CGAEncodingAttr::fromSplitParams(
+        &ctx, {ctaSplitM, ctaSplitN}, {ctaSplitM, ctaSplitN}, {1, 0});
+    return TensorMemoryEncodingAttr::get(&ctx, blockM, blockN, colStride,
+                                         cgaLayout, false);
+  }
+
+  TensorMemoryEncodingAttr tmem(unsigned blockM, unsigned blockN,
+                                unsigned ctaSplitM, unsigned ctaSplitN) {
+    // TODO Test colStride > 1
+    return tmem(blockM, blockN, 1, ctaSplitM, ctaSplitN);
+  }
+
   StringAttr S(StringRef str) { return StringAttr::get(&ctx, str); }
 
 protected:

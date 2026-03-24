@@ -1,16 +1,19 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace tlx = mlir::triton::tlx;
 
 namespace mlir {
 namespace triton {
@@ -526,6 +529,13 @@ struct HoistTMEMAlloc
     : public impl::TritonGPUHoistTMEMAllocBase<HoistTMEMAlloc> {
   using impl::TritonGPUHoistTMEMAllocBase<
       HoistTMEMAlloc>::TritonGPUHoistTMEMAllocBase;
+
+  // check whether we should bail early due to using TLX
+  bool shouldBail(ModuleOp &mod) const {
+    auto hasTLX =
+        mod->getAttrOfType<BoolAttr>(tlx::AttrHasExplicitLocalMemAccessName);
+    return hasTLX != nullptr && hasTLX.getValue() == true;
+  }
 
   void runOnOperation() override {
     ModuleOp m = getOperation();

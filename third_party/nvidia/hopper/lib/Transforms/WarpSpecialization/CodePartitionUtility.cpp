@@ -156,14 +156,11 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx) {
-  auto context = barrierAlloc.getContext();
-  Attribute sharedMemorySpace =
-      triton::gpu::SharedMemorySpaceAttr::get(context);
-  ttg::MemDescType barrierTy = ttg::MemDescType::get(
-      {1}, builder.getI64Type(),
-      cast<ttg::MemDescType>(barrierAlloc.getType()).getEncoding(),
-      sharedMemorySpace,
-      /*mutableMemory=*/true);
+  ttg::MemDescType allocType = cast<ttg::MemDescType>(barrierAlloc.getType());
+  ttg::MemDescType barrierTy =
+      ttg::MemDescType::get({1}, builder.getI64Type(), allocType.getEncoding(),
+                            allocType.getMemorySpace(),
+                            /*mutableMemory=*/true);
 
   // Create barrierForTMA from barrierAlloc.
   return builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(

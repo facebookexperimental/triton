@@ -13,3 +13,5 @@ add_triton_library(ProtonAMDGPUToLLVM
     ProtonGPUToLLVM
     TritonAMDGPUToLLVM
 )
+
+target_compile_options(ProtonAMDGPUToLLVM PRIVATE -Wno-deprecated-declarations)

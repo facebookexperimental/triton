@@ -361,6 +361,7 @@ class compilation_knobs(base_knobs):
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")
     # TODO: Use enum to constrain / 'typecheck' the values
     use_ir_loc: env_opt_str = env_opt_str("USE_IR_LOC")
+    use_ptx_loc: env_bool = env_bool("USE_PTX_LOC")
     enable_asan: env_bool = env_bool("TRITON_ENABLE_ASAN")
     disable_line_info: env_bool = env_bool("TRITON_DISABLE_LINE_INFO")
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
@@ -502,6 +503,8 @@ class nvidia_knobs(base_knobs):
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
+    use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
 
 
 class amd_knobs(base_knobs):

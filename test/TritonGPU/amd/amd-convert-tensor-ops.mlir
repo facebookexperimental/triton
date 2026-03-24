@@ -30,9 +30,9 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %1 = tt.get_program_id y : i32
     %2 = arith.muli %0, %c128_i32 : i32
     %3 = arith.muli %1, %c128_i32 : i32
-    %4 = tt.make_tensor_descriptor %a_ptr, [%c1024_i32, %c256_i32], [%c256_i64, %c1_i64] : <f16>, <128x16xf16, #shared>
-    %5 = tt.make_tensor_descriptor %b_ptr, [%c256_i32, %c512_i32], [%c512_i64, %c1_i64] : <f16>, <16x128xf16, #shared1>
-    %6 = tt.make_tensor_descriptor %c_ptr, [%c1024_i32, %c512_i32], [%c512_i64, %c1_i64] : <f16>, <128x128xf16, #shared2>
+    %4 = tt.make_tensor_descriptor %a_ptr, [%c1024_i32, %c256_i32], [%c256_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x16xf16, #shared>
+    %5 = tt.make_tensor_descriptor %b_ptr, [%c256_i32, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<16x128xf16, #shared1>
+    %6 = tt.make_tensor_descriptor %c_ptr, [%c1024_i32, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x128xf16, #shared2>
     %7 = tt.descriptor_load %4[%2, %c0_i32] : !tt.tensordesc<128x16xf16, #shared> -> tensor<128x16xf16, #blocked>
     %8 = tt.descriptor_load %5[%c0_i32, %3] : !tt.tensordesc<16x128xf16, #shared1> -> tensor<16x128xf16, #blocked1>
     %9 = ttg.convert_layout %7 : tensor<128x16xf16, #blocked> -> tensor<128x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>

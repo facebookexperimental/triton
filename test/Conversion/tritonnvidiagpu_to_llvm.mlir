@@ -106,6 +106,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     ttng.arrive_barrier %alloc, 2, %pred : !ttg.memdesc<1xi64, #shared0, #smem>
     tt.return
   }
+
+  // CHECK-LABEL: arrive_barrier_per_thread
+  tt.func @arrive_barrier_per_thread(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>) {
+    // CHECK-NOT: nvvm.read.ptx.sreg.tid.x
+    // CHECK-NOT: llvm.icmp "eq"
+    // CHECK: "mbarrier.arrive.shared::cta.b64 _, [$0], 2;", "r" %arg0
+    ttng.arrive_barrier %alloc, 2 {perThread} : !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+
+  // CHECK-LABEL: arrive_barrier_named
+  tt.func @arrive_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
+    %c9_i32 = arith.constant 9 : i32
+    %c256_i32 = arith.constant 256 : i32
+    // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
+    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
+    // CHECK-NEXT: "llvm.nvvm.barrier.cta.arrive.aligned.count"([[BAR_ID]], [[NUM_THRADS]])
+    ttng.arrive_barrier_named %c9_i32, %c256_i32 : i32, i32
+    tt.return
+  }
+
+  // CHECK-LABEL: arrive_barrier_remote
+  tt.func @arrive_barrier_remote(%alloc: !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>, %pred: i1) {
+    // CHECK: "@$0 mbarrier.arrive.shared::cluster.b64 _, [$1], 2;", "b,r" %{{.*}}
+    ttng.arrive_barrier %alloc, 2, %pred : !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>
+    tt.return
+  }
+
+  // CHECK-LABEL: wait_barrier_named
+  tt.func @wait_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
+    %c9_i32 = arith.constant 9 : i32
+    %c256_i32 = arith.constant 256 : i32
+    // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
+    // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
+    // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.aligned.count"([[BAR_ID]], [[NUM_THRADS]])
+    ttng.wait_barrier_named %c9_i32, %c256_i32 : i32, i32
+    tt.return
+  }
+
 }
 
 // -----
@@ -127,6 +166,43 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   }
 }
 
+// -----
+
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: clc_query_cancel
+  // CHECK: clusterlaunchcontrol.query_cancel.is_canceled.pred.b128
+  // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128
+  tt.func @clc_query_cancel(%clc_response: !ttg.memdesc<1xui128, #shared0, #smem, mutable>) {
+    %x = ttng.clc_query_cancel %clc_response : (!ttg.memdesc<1xui128, #shared0, #smem, mutable>) -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: vote_ballot_sync
+  // CHECK: nvvm.vote.sync  ballot
+  tt.func @vote_ballot_sync(%mask: i32, %pred: i1) {
+    %result = ttng.vote_ballot_sync %mask, %pred : i1 -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: tma_prefetch
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.async.bulk.prefetch.tensor.2d.L2.global [$1, {$2, $3}];", "b,l,r,r"
+  // CHECK: return
+  tt.func @tma_prefetch(%tma: !tt.tensordesc<128x128xf32>, %x: i32, %y: i32, %pred: i1) {
+    ttng.async_tma_prefetch %tma[%x, %y], %pred : !tt.tensordesc<128x128xf32>
+    tt.return
+  }
+}
 
 // -----
 
@@ -335,6 +411,86 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: nvvm.cp.async.bulk.commit.group
   tt.func @tma_copy_local_to_global_broadcast(%tma: !tt.tensordesc<128x128xf32, #shared1_broadcast>, %alloc: !ttg.memdesc<128x128xf32, #shared1_broadcast, #smem>, %x: i32) {
     ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc : !tt.tensordesc<128x128xf32, #shared1_broadcast>, !ttg.memdesc<128x128xf32, #shared1_broadcast, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:90"} {
+  // CHECK-LABEL: tma_copy_local_to_global_l2_evict_first
+  // CHECK: createpolicy.fractional.L2::evict_first.b64
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @tma_copy_local_to_global_l2_evict_first(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:90"} {
+  // CHECK-LABEL: tma_copy_local_to_global_l2_evict_last
+  // CHECK: createpolicy.fractional.L2::evict_last.b64
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @tma_copy_local_to_global_l2_evict_last(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: async_tma_reduce
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group [$1, {$2, $3}], [$4];", "b,l,r,r,r" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>) -> !llvm.void
+  // CHECK-NOT: cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @async_tma_reduce(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:90"} {
+  // CHECK-LABEL: async_tma_reduce_l2_evict_first
+  // CHECK: createpolicy.fractional.L2::evict_first.b64
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @async_tma_reduce_l2_evict_first(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_first : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:90"} {
+  // CHECK-LABEL: async_tma_reduce_l2_evict_last
+  // CHECK: createpolicy.fractional.L2::evict_last.b64
+  // CHECK: elect.sync
+  // CHECK: "@$0 cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group.L2::cache_hint [$1, {$2, $3}], [$4], $5;", "b,l,r,r,r,l" {{.*}} : (i1, !llvm.ptr, i32, i32, !llvm.ptr<3>, i64) -> !llvm.void
+  // CHECK: nvvm.cp.async.bulk.commit.group
+  tt.func @async_tma_reduce_l2_evict_last(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
+    ttng.async_tma_reduce add, %tma[%x, %x] %alloc evictionPolicy = evict_last : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
@@ -580,5 +736,19 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     // CHECK-NEXT: ttg.warp_return
     ttng.cluster_barrier {relaxed = true}
     llvm.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: map_smem_to_remote
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @map_smem_to_remote(%arg: !ttg.memdesc<1xi64, #shared, #smem, mutable>) {
+    %c1_i32 = arith.constant 1 : i32
+    // CHECK: nvvm.mapa %{{.*}} : !llvm.ptr<3> -> !llvm.ptr<7>
+    %0 = ttng.map_to_remote_buffer %arg, %c1_i32: !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
   }
 }

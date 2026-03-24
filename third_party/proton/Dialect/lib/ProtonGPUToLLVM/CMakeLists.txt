@@ -14,3 +14,5 @@ add_triton_library(ProtonGPUToLLVM
 
 add_subdirectory(ProtonNvidiaGPUToLLVM)
 add_subdirectory(ProtonAMDGPUToLLVM)
+
+target_compile_options(ProtonGPUToLLVM PRIVATE -Wno-deprecated-declarations)

@@ -980,6 +980,25 @@ LogicalResult ReshapeOp::verify() {
 
 //-- FpToFpOp --
 
+// Builder for FpToFpOp without rbits (regular conversion)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Attribute rounding) {
+  state.addOperands(src);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
+// Builder for FpToFpOp with rbits (stochastic rounding)
+void FpToFpOp::build(OpBuilder &builder, OperationState &state, Type resultType,
+                     Value src, Value rbits, Attribute rounding) {
+  state.addOperands(src);
+  state.addOperands(rbits);
+  state.addTypes(resultType);
+  if (rounding)
+    state.addAttribute("rounding", rounding);
+}
+
 // Fold FpToFpOp when the input operand is a constant zero.
 OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
   auto srcVal = getSrc();
@@ -1008,6 +1027,105 @@ OpFoldResult FpToFpOp::fold(FoldAdaptor adaptor) {
   }
 
   return {};
+}
+
+//-- FpToFpOp --
+ParseResult FpToFpOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Parse: $src (`, rbits = ` $rbits `:` type($rbits))? (`, rounding = `
+  // $rounding)? attr-dict `:` type($src) `->` type($result)
+
+  OpAsmParser::UnresolvedOperand src;
+  Type srcType, resultType;
+
+  // Parse src operand
+  if (parser.parseOperand(src))
+    return failure();
+
+  // Try to parse optional clauses after comma
+  OpAsmParser::UnresolvedOperand rbits;
+  Type rbitsType;
+  bool hasRbits = false;
+  bool hasRounding = false;
+
+  while (succeeded(parser.parseOptionalComma())) {
+    // Check which clause we have
+    if (!hasRbits && succeeded(parser.parseOptionalKeyword("rbits"))) {
+      if (parser.parseEqual() || parser.parseOperand(rbits) ||
+          parser.parseColon() || parser.parseType(rbitsType))
+        return failure();
+      hasRbits = true;
+    } else if (!hasRounding &&
+               succeeded(parser.parseOptionalKeyword("rounding"))) {
+      // Parse rounding mode enum value
+      StringRef roundingStr;
+      if (parser.parseEqual() || parser.parseKeyword(&roundingStr))
+        return failure();
+
+      // Convert string to RoundingMode enum
+      auto roundingMode = triton::symbolizeRoundingMode(roundingStr);
+      if (!roundingMode) {
+        return parser.emitError(parser.getCurrentLocation(),
+                                "invalid rounding mode: ")
+               << roundingStr;
+      }
+
+      // Create RoundingModeAttr
+      auto roundingAttr =
+          triton::RoundingModeAttr::get(parser.getContext(), *roundingMode);
+      result.attributes.append("rounding", roundingAttr);
+      hasRounding = true;
+    } else {
+      return failure();
+    }
+  }
+
+  // Parse attr-dict (for any additional attributes)
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse `:` type($src) `->` type($result)
+  if (parser.parseColon() || parser.parseType(srcType) || parser.parseArrow() ||
+      parser.parseType(resultType))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperand(src, srcType, result.operands))
+    return failure();
+
+  if (hasRbits) {
+    if (parser.resolveOperand(rbits, rbitsType, result.operands))
+      return failure();
+  }
+
+  // Add result type
+  result.addTypes(resultType);
+
+  return success();
+}
+
+void FpToFpOp::print(OpAsmPrinter &p) {
+  // Print: $src (`, rbits = ` $rbits `:` type($rbits))? (`, rounding = `
+  // $rounding)? `:` type($src) `->` type($result)
+
+  p << " " << getSrc();
+
+  // Print rbits if present
+  if (getRbits()) {
+    p << ", rbits = " << getRbits() << " : " << getRbits().getType();
+  }
+
+  // Print rounding if present
+  if (getRounding()) {
+    p << ", rounding = " << getRounding();
+  }
+
+  // Don't print attributes that were explicitly handled
+  SmallVector<StringRef> elidedAttrs;
+  if (getRounding())
+    elidedAttrs.push_back("rounding");
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+
+  p << " : " << getSrc().getType() << " -> " << getType();
 }
 
 LogicalResult FpToFpOp::verify() {
@@ -1121,7 +1239,152 @@ void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
   SmallVector<int64_t> blockShape64(blockShape);
   auto descTy = TensorDescType::get(blockShape64, elemTy, isSignedInteger);
   auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
-  return build(builder, state, descTy, base, shape, strides, paddingAttr);
+  return build(builder, state, descTy, base, shape, strides,
+               /*descPtr=*/Value(), paddingAttr);
+}
+
+void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
+                             Value base, ValueRange shape, ValueRange strides,
+                             Value descPtr, ArrayRef<int32_t> blockShape,
+                             bool isSignedInteger,
+                             triton::PaddingOption padding) {
+  auto ptrTy = dyn_cast<triton::PointerType>(base.getType());
+  if (!ptrTy) {
+    llvm::report_fatal_error("Expected pointer type");
+  }
+  auto elemTy = ptrTy.getPointeeType();
+  SmallVector<int64_t> blockShape64(blockShape);
+  auto descTy =
+      TensorDescType::get(blockShape64, elemTy, isSignedInteger);
+  auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
+  return build(builder, state, descTy, base, shape, strides, descPtr,
+               paddingAttr);
+}
+
+ParseResult MakeTensorDescOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  // Parse: $base `,` `[` $shape `]` `,` `[` $strides `]`
+  //        (`,` `descPtr` `=` $descPtr `:` type($descPtr))?
+  //        attr-dict `:` type($base) `,` type($result)
+
+  OpAsmParser::UnresolvedOperand base;
+  SmallVector<OpAsmParser::UnresolvedOperand> shape;
+  SmallVector<OpAsmParser::UnresolvedOperand> strides;
+  Type baseType, resultType;
+
+  // Parse base operand
+  if (parser.parseOperand(base) || parser.parseComma())
+    return failure();
+
+  // Parse shape: `[` $shape `]`
+  if (parser.parseLSquare() ||
+      parser.parseOperandList(shape, OpAsmParser::Delimiter::None) ||
+      parser.parseRSquare() || parser.parseComma())
+    return failure();
+
+  // Parse strides: `[` $strides `]`
+  if (parser.parseLSquare() ||
+      parser.parseOperandList(strides, OpAsmParser::Delimiter::None) ||
+      parser.parseRSquare())
+    return failure();
+
+  // Optional descPtr
+  OpAsmParser::UnresolvedOperand descPtr;
+  Type descPtrType;
+  bool hasDescPtr = false;
+
+  if (succeeded(parser.parseOptionalComma())) {
+    if (succeeded(parser.parseOptionalKeyword("descPtr"))) {
+      if (parser.parseEqual() || parser.parseOperand(descPtr) ||
+          parser.parseColon() || parser.parseType(descPtrType))
+        return failure();
+      hasDescPtr = true;
+    } else {
+      // If we see a comma but not "descPtr", it's an error
+      return parser.emitError(parser.getCurrentLocation(),
+                              "expected 'descPtr' keyword");
+    }
+  }
+
+  // Attr-dict
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse `:` type($base) `,` type($result)
+  if (parser.parseColon() || parser.parseType(baseType) ||
+      parser.parseComma() || parser.parseType(resultType))
+    return failure();
+
+  // Resolve operands
+  if (parser.resolveOperand(base, baseType, result.operands))
+    return failure();
+
+  // Shape operands are I32
+  auto i32Type = parser.getBuilder().getI32Type();
+  if (parser.resolveOperands(shape, i32Type, result.operands))
+    return failure();
+
+  // Strides operands are I64
+  auto i64Type = parser.getBuilder().getI64Type();
+  if (parser.resolveOperands(strides, i64Type, result.operands))
+    return failure();
+
+  // Resolve optional descPtr
+  if (hasDescPtr) {
+    if (parser.resolveOperand(descPtr, descPtrType, result.operands))
+      return failure();
+  }
+
+  // Tell MLIR how many operands belong to each segment:
+  // [ base, shape..., strides..., descPtr? ]
+  SmallVector<int32_t, 4> segmentSizes;
+  segmentSizes.push_back(1);                  // base
+  segmentSizes.push_back(shape.size());       // shape (Variadic<I32>)
+  segmentSizes.push_back(strides.size());     // strides (Variadic<I64>)
+  segmentSizes.push_back(hasDescPtr ? 1 : 0); // descPtr (Optional<TT_Ptr>)
+
+  auto &builder = parser.getBuilder();
+  result.addAttribute("operand_segment_sizes",
+                      builder.getDenseI32ArrayAttr(segmentSizes));
+
+  // Result type
+  result.addTypes(resultType);
+
+  return success();
+}
+
+void MakeTensorDescOp::print(OpAsmPrinter &p) {
+  // Print: $base `,` `[` $shape `]` `,` `[` $strides `]`
+  //        (`,` `descPtr` `=` $descPtr `:` type($descPtr))?
+  //        attr-dict `:` type($base) `,` type($result)
+
+  p << " " << getBase() << ", [" << getShape() << "], [" << getStrides() << "]";
+
+  // Print descPtr if present
+  if (getDescPtr()) {
+    p << ", descPtr = " << getDescPtr() << " : " << getDescPtr().getType();
+  }
+
+  // Print attributes (excluding any that were explicitly handled)
+  SmallVector<StringRef> elidedAttrs;
+  elidedAttrs.push_back("operandSegmentSizes");
+  // Elide padding if it's the default value
+  if (getPadding() == triton::PaddingOption::PAD_ZERO) {
+    elidedAttrs.push_back("padding");
+  }
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+
+  p << " : " << getBase().getType() << ", " << getType();
+}
+
+void MakeTensorDescOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // If descPtr operand is present, this operation writes to global memory
+  if (getDescPtr()) {
+    effects.emplace_back(MemoryEffects::Write::get(), GlobalMemory::get());
+  }
+  // Otherwise, the operation is pure (no effects)
 }
 
 //-- IntToPtrOp --
