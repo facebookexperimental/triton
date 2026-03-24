@@ -88,8 +88,8 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto oldLayout = expandDims.getType().getEncoding();
   auto newLayout = oldLayout;
   if (!layoutTmemCompatible) {
-    newLayout = ttng::getTmemCompatibleLayout(
-        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
+    auto ctaLayout = ttg::getCTALayout(expandType.getEncoding());
+    newLayout = ttng::getDefaultLayoutForTmemLdSt(tmemDesc, numWarps, ctaLayout);
   }
   mlir::Operation *src = expandDims;
   if (newLayout != oldLayout) {
@@ -113,9 +113,10 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto oldInputType = dyn_cast<RankedTensorType>(producer.getType());
   auto targetEncoding = oldInputType.getEncoding();
   auto oldExpandType = getExpandedInput().getType();
-  Attribute newDistributedEncoding = ttng::getTmemCompatibleLayout(
-      oldExpandType.getShape()[0], oldExpandType.getShape()[1], oldExpandType,
-      numWarps);
+  auto allocDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  auto ctaLayout = ttg::getCTALayout(oldExpandType.getEncoding());
+  auto newDistributedEncoding =
+      ttng::getDefaultLayoutForTmemLdSt(allocDesc, numWarps, ctaLayout);
   auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
   // Generate the load
   auto originTaskIds = builder.getAsyncTaskIds();

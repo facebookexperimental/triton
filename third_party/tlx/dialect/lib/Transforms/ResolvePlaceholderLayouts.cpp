@@ -44,9 +44,8 @@ static Attribute getDummyLayoutFromType(Type type) {
 
 /// Compute the resolved layout for a dummy register layout.
 /// If tmemCompatible is true, creates a TMEM-compatible register layout using
-/// getTmemCompatibleLayout (matches
-/// make_default_tmem_compatible_tensor_layout_encoding). Otherwise, creates a
-/// default BlockedEncodingAttr.
+/// getDefaultLayoutForTmemLdSt. Otherwise, creates a default
+/// BlockedEncodingAttr.
 ///
 static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
                                        Operation *contextOp,
@@ -62,24 +61,24 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
 
   if (dummyLayout.getTmemCompatible()) {
     // Create a TMEM-compatible register layout
-    // Matches make_default_tmem_compatible_tensor_layout_encoding
-    //
-    // Use the allocation shape (not the subsliced shape) for the
-    // TMEM-compatible layout calculation. The allocation shape determines the
-    // TMEM block dimensions.
     assert(rank == 2 &&
            "Only supporting 2D tensors for TMEM compatible layout.");
     assert((numWarps == 4 || numWarps == 8) &&
            "Currently only support numWarps 4 or 8 for TMEM load and store.");
 
-    ttg::BlockedEncodingAttr defaultBlockedEncoding =
-        ttg::getDefaultBlockedEncoding(moduleOp.getContext(), shape, numWarps,
-                                       threadsPerWarp, numCTAs);
-    auto oldType =
-        RankedTensorType::get(shape, elementType, defaultBlockedEncoding);
+    auto *ctx = moduleOp.getContext();
+    unsigned bitwidth = elementType.getIntOrFloatBitWidth();
+    unsigned colStride = 32 / bitwidth;
+    auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
+        ctx, shape[0], shape[1], colStride, /*CTASplitM=*/1,
+        /*CTASplitN=*/1);
+    auto memSpace = ttng::TensorMemorySpaceAttr::get(ctx);
+    auto memDescType = ttg::MemDescType::get(
+        shape, elementType, tmemEncoding, memSpace, /*mutableMemory=*/true);
+    auto ctaLayout = ttg::CTALayoutAttr::get(ctx, {1, 1}, {1, 1}, {1, 0});
 
     auto result =
-        ttng::getTmemCompatibleLayout(shape[0], shape[1], oldType, numWarps);
+        ttng::getDefaultLayoutForTmemLdSt(memDescType, numWarps, ctaLayout);
     return result;
   }
 
