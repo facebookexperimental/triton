@@ -42,7 +42,12 @@ from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
 from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
     attention as _hopper_fa_ws, )
 
-from triton._internal_testing import is_blackwell, is_hopper
+from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
+    multi_cta_layernorm as _multi_cta_layernorm,
+    multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
+)
+
+from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -623,3 +628,41 @@ def test_hopper_fa_ws_pipelined_pingpong_persistent():
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _hopper_fa_ws_pipelined_pingpong_persistent(q, k, v, sm_scale, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+# =============================================================================
+# Multi-CTA Layer Normalization Tests
+# =============================================================================
+
+
+class LayerNorm:
+    """Common utilities for multi-CTA layer normalization tests."""
+
+    # (M, N) shapes
+    SHAPES = [(4, 16384), (1152, 16384), (4, 32768)]
+
+    @staticmethod
+    def run_test(layernorm_fn, shapes=None, dtype=torch.float16, num_ctas=2, **kwargs):
+        if shapes is None:
+            shapes = LayerNorm.SHAPES
+        eps = 1e-5
+        for M, N in shapes:
+            torch.manual_seed(0)
+            x = torch.randn(M, N, device=DEVICE, dtype=dtype)
+            weight = torch.randn(N, device=DEVICE, dtype=dtype)
+            bias = torch.randn(N, device=DEVICE, dtype=dtype)
+            ref_out = torch.nn.functional.layer_norm(x, (N, ), weight, bias, eps)
+            tri_out, _, _ = layernorm_fn(x, weight, bias, eps, NUM_CTAS=num_ctas, **kwargs)
+            torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_ctas", [1, 2, 4], ids=["1cta", "2cta", "4cta"])
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
+def test_multi_cta_layer_norm(num_ctas):
+    LayerNorm.run_test(_multi_cta_layernorm, num_ctas=num_ctas)
+
+
+@pytest.mark.parametrize("num_ctas", [2, 4], ids=["2cta", "4cta"])
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or Blackwell GPU")
+def test_multi_cta_layer_norm_2d(num_ctas):
+    LayerNorm.run_test(_multi_cta_layernorm_2d, num_ctas=num_ctas, BLOCK_SIZE_M=4)
