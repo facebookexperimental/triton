@@ -28,9 +28,16 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_K = nargs["BK"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
-    nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
-    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N // NUM_CTAS]
+    # For column-major inputs, TMA descriptor block shape matches the transposed view
+    if nargs.get("A_ROW_MAJOR", True):
+        nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
+    else:
+        nargs["a_desc"].block_shape = [BLOCK_K, BLOCK_M_SPLIT]
+    if nargs.get("B_ROW_MAJOR", True):
+        nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N // NUM_CTAS]
+    else:
+        nargs["b_desc"].block_shape = [BLOCK_N // NUM_CTAS, BLOCK_K]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
     if EPILOGUE_SUBTILE:
         nargs["c_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N // 2]
@@ -110,6 +117,8 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                          NUM_CTAS: tl.constexpr,  #
                          NUM_SMS: tl.constexpr,  #
                          USE_WARP_BARRIER: tl.constexpr = False,  #
+                         A_ROW_MAJOR: tl.constexpr = True,  #
+                         B_ROW_MAJOR: tl.constexpr = True,  #
                          ):
     # Descriptor
     BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
@@ -117,8 +126,14 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
     # Need NUM_STAGES sets of SMEM buffers for A and B
     # where each set contains two for A and one for B.
     # Split A into two in M-dimension to have two consumer tasks for wgmma
-    a = tlx.local_alloc((BLOCK_M_SPLIT, BK), tlx.dtype_of(a_desc), NUM_STAGES * NUM_MMA_GROUPS)
-    b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
+    if not A_ROW_MAJOR:
+        a = tlx.local_alloc((BK, BLOCK_M_SPLIT), tlx.dtype_of(a_desc), NUM_STAGES * NUM_MMA_GROUPS)
+    else:
+        a = tlx.local_alloc((BLOCK_M_SPLIT, BK), tlx.dtype_of(a_desc), NUM_STAGES * NUM_MMA_GROUPS)
+    if not B_ROW_MAJOR:
+        b = tlx.local_alloc((BN, BK), tlx.dtype_of(b_desc), NUM_STAGES)
+    else:
+        b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
 
     # Need NUM_STAGES sets of mbarriers for A and B
     # where each set contains two for A and one for B.
@@ -170,7 +185,10 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                     tlx.barrier_wait(bar=empty_a_1st, phase=p ^ 1)  # EmptyBar A1 wait
                     tlx.barrier_expect_bytes(full_a_1st, BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
                     data_a_1st = tlx.local_view(a, buf)  # smem data
-                    tlx.async_descriptor_load(a_desc, data_a_1st, [offset_am, offset_k], full_a_1st)
+                    if not A_ROW_MAJOR:
+                        tlx.async_descriptor_load(a_desc, data_a_1st, [offset_k, offset_am], full_a_1st)
+                    else:
+                        tlx.async_descriptor_load(a_desc, data_a_1st, [offset_am, offset_k], full_a_1st)
 
                     # Async load to b[buf]
                     empty_b = tlx.local_view(bars_empty_b, buf)
@@ -188,19 +206,35 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                         tlx.barrier_wait(cta_bar, p)
 
                         # Each CTA loads half of B and multicasts to both CTAs
-                        if cta_id == 0:
-                            buf_b_slice = tlx.local_slice(data_b, [0, 0], [BK, BN // 2])
+                        if not B_ROW_MAJOR:
+                            if cta_id == 0:
+                                buf_b_slice = tlx.local_slice(data_b, [0, 0], [BN // 2, BK])
+                            else:
+                                buf_b_slice = tlx.local_slice(data_b, [BN // 2, 0], [BN // 2, BK])
+                            tlx.async_descriptor_load(
+                                b_desc,
+                                buf_b_slice,
+                                [offset_bn + cta_id * BN // 2, offset_k],
+                                full_b,
+                                multicast_targets=[cta_id, cta_id ^ 1],
+                            )
                         else:
-                            buf_b_slice = tlx.local_slice(data_b, [0, BN // 2], [BK, BN // 2])
-                        tlx.async_descriptor_load(
-                            b_desc,
-                            buf_b_slice,
-                            [offset_k, offset_bn + cta_id * BN // 2],
-                            full_b,
-                            multicast_targets=[cta_id, cta_id ^ 1],
-                        )
+                            if cta_id == 0:
+                                buf_b_slice = tlx.local_slice(data_b, [0, 0], [BK, BN // 2])
+                            else:
+                                buf_b_slice = tlx.local_slice(data_b, [0, BN // 2], [BK, BN // 2])
+                            tlx.async_descriptor_load(
+                                b_desc,
+                                buf_b_slice,
+                                [offset_k, offset_bn + cta_id * BN // 2],
+                                full_b,
+                                multicast_targets=[cta_id, cta_id ^ 1],
+                            )
                     else:
-                        tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full_b)
+                        if not B_ROW_MAJOR:
+                            tlx.async_descriptor_load(b_desc, data_b, [offset_bn, offset_k], full_b)
+                        else:
+                            tlx.async_descriptor_load(b_desc, data_b, [offset_k, offset_bn], full_b)
 
                     # Async load to a[buf+NUM_STAGES]
                     empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
@@ -209,7 +243,10 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                     tlx.barrier_expect_bytes(bar=full_a_2nd,
                                              size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_desc)))
                     data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)  # smem data
-                    tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
+                    if not A_ROW_MAJOR:
+                        tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_k, offset_am + BLOCK_M_SPLIT], full_a_2nd)
+                    else:
+                        tlx.async_descriptor_load(a_desc, data_a_2nd, [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
 
                     smem_accum_cnt += 1
 
@@ -251,9 +288,12 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                     # async_dot
                     data_a = tlx.local_view(a, buf + NUM_STAGES * tlx.async_task_replica_id())  # noqa
                     data_b = tlx.local_view(b, buf)
+                    # Transpose SMEM buffers if inputs were column-major
+                    a_operand = tlx.local_trans(data_a) if not A_ROW_MAJOR else data_a
+                    b_operand = tlx.local_trans(data_b) if not B_ROW_MAJOR else data_b
                     acc = tlx.async_dot(
-                        data_a,
-                        data_b,
+                        a_operand,
+                        b_operand,
                         acc,
                     )
                     # async_wait
@@ -287,47 +327,52 @@ def matmul(a, b, config=None):
     """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
+    M, K = a.shape
+    K, N = b.shape
 
     triton.set_allocator(alloc_fn)
 
-    (M, N, K) = (a.shape[0], b.shape[1], a.shape[1])
+    # Allocates output.
     c = torch.empty(
         (M, N),
         dtype=torch.float16,
         device=DEVICE,
     )
 
+    # Detect column-major inputs.
+    # A column-major (M, K) tensor has strides (1, M); its .T is row-major (K, M).
+    a_row_major = a.is_contiguous()
+    b_row_major = b.is_contiguous()
+
     # Get number of SMs
     NUM_SMS = torch.cuda.get_device_properties(DEVICE).multi_processor_count
 
     dummy_block = [1, 1]
-    desc_in_1 = TensorDescriptor(
-        a,
-        shape=[M, K],
-        strides=[K, 1],
-        block_shape=dummy_block,
-    )
-
-    desc_in_2 = TensorDescriptor(
-        b,
-        shape=[K, N],
-        strides=[N, 1],
-        block_shape=dummy_block,
-    )
-    desc_out = TensorDescriptor(
-        c,
-        shape=[M, N],
-        strides=[N, 1],
-        block_shape=dummy_block,
-    )
+    if not a_row_major:
+        a_t = a.T  # (K, M) with strides (M, 1) — row-major
+        desc_in_1 = TensorDescriptor(a_t, a_t.shape, a_t.stride(), dummy_block)
+    else:
+        desc_in_1 = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
+    if not b_row_major:
+        b_t = b.T  # (N, K) with strides (K, 1) — row-major
+        desc_in_2 = TensorDescriptor(b_t, b_t.shape, b_t.stride(), dummy_block)
+    else:
+        desc_in_2 = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
+    desc_out = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     if config is not None:
         # Set descriptor block shapes according to config
         NUM_MMA_GROUPS = config["NUM_MMA_GROUPS"]
         BLOCK_M_SPLIT = config["BM"] // NUM_MMA_GROUPS
-        desc_in_1.block_shape = [BLOCK_M_SPLIT, config["BK"]]
-        desc_in_2.block_shape = [config["BK"], config["BN"] // config.get("NUM_CTAS", 1)]
+        NUM_CTAS = config.get("NUM_CTAS", 1)
+        if a_row_major:
+            desc_in_1.block_shape = [BLOCK_M_SPLIT, config["BK"]]
+        else:
+            desc_in_1.block_shape = [config["BK"], BLOCK_M_SPLIT]
+        if b_row_major:
+            desc_in_2.block_shape = [config["BK"], config["BN"] // NUM_CTAS]
+        else:
+            desc_in_2.block_shape = [config["BN"] // NUM_CTAS, config["BK"]]
         if config.get("EPILOGUE_SUBTILE", False):
             desc_out.block_shape = [BLOCK_M_SPLIT, config["BN"] // 2]
         else:
@@ -345,6 +390,8 @@ def matmul(a, b, config=None):
             M,
             N,
             K,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
             NUM_SMS=NUM_SMS,
             **config,
         )
@@ -358,6 +405,8 @@ def matmul(a, b, config=None):
             M,
             N,
             K,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
             NUM_SMS=NUM_SMS,
         )
     return c

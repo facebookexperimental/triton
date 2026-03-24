@@ -403,9 +403,18 @@ def matmul_tma_set_block_size_hook(nargs):
     BLOCK_N = nargs["BLOCK_SIZE_N"]
     BLOCK_K = nargs["BLOCK_SIZE_K"]
     NUM_MMA_GROUPS = nargs.get("NUM_MMA_GROUPS", 1)
-    nargs["a_desc"].block_shape = [BLOCK_M // NUM_MMA_GROUPS, BLOCK_K]
+    BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
-    nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N // NUM_CTAS]
+    BLOCK_N_PER_CTA = BLOCK_N // NUM_CTAS
+    # For column-major inputs, TMA descriptor block shape matches the transposed view
+    if nargs.get("A_ROW_MAJOR", True):
+        nargs["a_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
+    else:
+        nargs["a_desc"].block_shape = [BLOCK_K, BLOCK_M_SPLIT]
+    if nargs.get("B_ROW_MAJOR", True):
+        nargs["b_desc"].block_shape = [BLOCK_K, BLOCK_N_PER_CTA]
+    else:
+        nargs["b_desc"].block_shape = [BLOCK_N_PER_CTA, BLOCK_K]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
     nargs["c_desc"].block_shape = [
         BLOCK_M // NUM_MMA_GROUPS,
@@ -837,6 +846,8 @@ def _process_tile_mma_inner(
     NUM_CTAS,
     cta_bars,
     pred_cta0,
+    A_ROW_MAJOR: tl.constexpr = True,
+    B_ROW_MAJOR: tl.constexpr = True,
 ):
     """Process MMA for a single tile over [k_tile_start, k_tile_end). Returns updated smem_accum_cnt."""
     local_k_tiles = k_tile_end - k_tile_start
@@ -865,10 +876,14 @@ def _process_tile_mma_inner(
             tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
             tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+        # Transpose SMEM buffers if inputs were column-major
+        a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+        b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
+
         # Perform MMA: use_acc=False for first K iteration (clears accumulator)
         tlx.async_dot(
-            buffers_A[a_buf],
-            buffers_B[buf],
+            a_operand,
+            b_operand,
             tmem_buffers[acc_buf],
             use_acc=False,
             mBarriers=[A_smem_empty_bars[a_buf]],
@@ -899,10 +914,14 @@ def _process_tile_mma_inner(
                 tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
                 tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+            # Transpose SMEM buffers if inputs were column-major
+            a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+            b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
+
             # Perform MMA: use_acc=True for remaining K iterations
             tlx.async_dot(
-                buffers_A[a_buf],
-                buffers_B[buf],
+                a_operand,
+                b_operand,
                 tmem_buffers[acc_buf],
                 use_acc=True,
                 mBarriers=[A_smem_empty_bars[a_buf]],
@@ -948,6 +967,8 @@ def _process_tile_producer_inner(
     smem_accum_cnt,
     NUM_CTAS,
     cluster_cta_rank,
+    A_ROW_MAJOR: tl.constexpr = True,
+    B_ROW_MAJOR: tl.constexpr = True,
 ):
     """Process TMA loads for a single tile with all subtiles over [k_tile_start, k_tile_end)."""
     mn_tile_id = tile_id % num_mn_tiles
@@ -970,15 +991,23 @@ def _process_tile_producer_inner(
         tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
         offs_am = pid_m * BLOCK_SIZE_M
         tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
-        tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
-                                  eviction_policy="evict_last")
+        if not A_ROW_MAJOR:
+            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_k, offs_am], A_smem_full_bars[a_buf],
+                                      eviction_policy="evict_last")
+        else:
+            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                      eviction_policy="evict_last")
 
         # Load B once per K iteration (shared across all subtiles)
         last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
         tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
         tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-        tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                  eviction_policy="evict_last")
+        if not B_ROW_MAJOR:
+            tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
+                                      eviction_policy="evict_last")
+        else:
+            tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                      eviction_policy="evict_last")
 
         # Load all remaining A subtiles for this K iteration
         for group_id in tl.static_range(1, NUM_MMA_GROUPS):
@@ -989,8 +1018,12 @@ def _process_tile_producer_inner(
             offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
 
             tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
-            tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
-                                      eviction_policy="evict_last")
+            if not A_ROW_MAJOR:
+                tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_k, offs_am2], A_smem_full_bars[a_buf],
+                                          eviction_policy="evict_last")
+            else:
+                tlx.async_descriptor_load(a_desc, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                          eviction_policy="evict_last")
 
         smem_accum_cnt += 1
 
@@ -1081,17 +1114,29 @@ def matmul_kernel_tma_ws_blackwell(
     SPLIT_K: tl.constexpr,
     INTERLEAVE_EPILOGUE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    A_ROW_MAJOR: tl.constexpr = True,
+    B_ROW_MAJOR: tl.constexpr = True,
     USE_WARP_BARRIER: tl.constexpr = False,
 ):
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
-    buffers_A = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_SIZE_K),
-        tlx.dtype_of(a_desc),
-        NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
-    )
+    if not A_ROW_MAJOR:
+        buffers_A = tlx.local_alloc(
+            (BLOCK_SIZE_K, BLOCK_M_SPLIT),
+            tlx.dtype_of(a_desc),
+            NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+        )
+    else:
+        buffers_A = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_SIZE_K),
+            tlx.dtype_of(a_desc),
+            NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+        )
     # In 2-CTA mode, each CTA only needs to load BLOCK_N // NUM_CTAS of B.
-    buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // NUM_CTAS), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+    if not B_ROW_MAJOR:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_N // NUM_CTAS, BLOCK_SIZE_K), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+    else:
+        buffers_B = tlx.local_alloc((BLOCK_SIZE_K, BLOCK_SIZE_N // NUM_CTAS), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
     # Each buffer holds one subtile: BLOCK_M_SPLIT x BLOCK_SIZE_N
     # Total buffers: NUM_TMEM_BUFFERS * NUM_MMA_GROUPS
@@ -1244,6 +1289,8 @@ def matmul_kernel_tma_ws_blackwell(
                     NUM_CTAS=NUM_CTAS,
                     cta_bars=cta_bars,
                     pred_cta0=pred_cta0,
+                    A_ROW_MAJOR=A_ROW_MAJOR,
+                    B_ROW_MAJOR=B_ROW_MAJOR,
                 )
                 tmem_accum_cnt += 1
                 tile_id += NUM_SMS
@@ -1302,6 +1349,8 @@ def matmul_kernel_tma_ws_blackwell(
                     smem_accum_cnt=smem_accum_cnt,
                     NUM_CTAS=NUM_CTAS,
                     cluster_cta_rank=cluster_cta_rank,
+                    A_ROW_MAJOR=A_ROW_MAJOR,
+                    B_ROW_MAJOR=B_ROW_MAJOR,
                 )
                 tile_id += NUM_SMS
 
@@ -1321,16 +1370,28 @@ def matmul(a, b, config=None):
     """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
+    # Detect column-major inputs.
+    # A column-major (M, K) tensor has strides (1, M); its .T is row-major (K, M).
+    a_row_major = a.is_contiguous()
+    b_row_major = b.is_contiguous()
+
     # A dummy block value that will be overwritten when we have the real block size
     dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
-    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
+    if not a_row_major:
+        a_t = a.T  # (K, M) with strides (M, 1) — row-major
+        a_desc = TensorDescriptor(a_t, a_t.shape, a_t.stride(), dummy_block)
+    else:
+        a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
+    if not b_row_major:
+        b_t = b.T  # (N, K) with strides (K, 1) — row-major
+        b_desc = TensorDescriptor(b_t, b_t.shape, b_t.stride(), dummy_block)
+    else:
+        b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     NUM_SMS = _get_num_sms()
@@ -1365,6 +1426,8 @@ def matmul(a, b, config=None):
             "M": M,
             "N": N,
             "K": K,
+            "A_ROW_MAJOR": a_row_major,
+            "B_ROW_MAJOR": b_row_major,
             **config,
         }
         if pre_hook:
@@ -1385,6 +1448,8 @@ def matmul(a, b, config=None):
             M,
             N,
             K,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
             NUM_SMS=NUM_SMS,
             ctas_per_cga=ctas_per_cga,
             **config,
@@ -1426,6 +1491,8 @@ def matmul(a, b, config=None):
             M,
             N,
             K,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
             NUM_SMS=NUM_SMS,
         )
         # Run split-K reduction after the autotuner picks and launches the kernel.
