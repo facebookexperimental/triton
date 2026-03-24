@@ -551,6 +551,11 @@ def _attn_fwd_ws(
                     # Signal qk_empties after both l and m loads complete,
                     # since both tiles share the same synchronization group.
                     tlx.barrier_arrive(qk_empties[cid])
+                    if RESCALE_OPT:
+                        # RESCALE_OPT stores unscaled row-max in m_tiles.
+                        # The bwd kernel expects scaled values (m * qk_scale),
+                        # so we scale here before storing M.
+                        m = m * sm_scale * 1.44269504
                     m += tl.math.log2(l)
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -994,6 +999,11 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
     EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
+
+    # Reset dq accumulator to zeros before each autotuner warmup run.
+    # Without this, dq accumulates across autotuner benchmark runs when
+    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
+    nargs["desc_dq"].base.zero_()
 
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
