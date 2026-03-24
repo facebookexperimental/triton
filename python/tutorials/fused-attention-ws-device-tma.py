@@ -631,6 +631,7 @@ def _attn_bwd_preprocess(O, DO,  #
 # Frozen (hashable) wrapper for dot attrs configuration, usable in triton.Config.
 # Supports .get(key) like a dict but is hashable for Triton's JIT cache key.
 class FrozenDotAttrs:
+
     def __init__(self, d):
         self._data = d
         self._hash = hash(json.dumps(d, sort_keys=True)) if d else hash(None)
@@ -665,14 +666,13 @@ _DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
 
-
 _BWD_DOT_ATTRS_BM64 = FrozenDotAttrs({
     # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
     # no need to reuse between dq and dpT
-    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]}, # k, q
-    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]}, # v, do
-    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]}, # ppT
-    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]}, # dsT
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},  # k, q
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},  # v, do
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},  # ppT
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]},  # dsT
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
 
@@ -883,9 +883,8 @@ configs_bwd_persist = [
     #),
     triton.Config(
         {
-            "BLOCK_M1": 64,
-            "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 2,
-            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64, #_DEFAULT_BWD_DOT_ATTRS, #_BWD_DOT_ATTRS_BM64,
+            "BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 2, "BWD_DOT_ATTRS":
+            _BWD_DOT_ATTRS_BM64,  #_DEFAULT_BWD_DOT_ATTRS, #_BWD_DOT_ATTRS_BM64,
         },
         num_warps=4,
         num_stages=2,

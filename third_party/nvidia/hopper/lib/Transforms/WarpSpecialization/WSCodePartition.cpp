@@ -3784,8 +3784,8 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
     // If useAccFlag is a block argument of a ForOp, trace it to the
     // init value to check the first iteration.
     if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(
-              blockArg.getOwner()->getParentOp())) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
         if (blockArg.getOwner() == forOp.getBody()) {
           unsigned argNum = blockArg.getArgNumber();
           if (argNum > 0)
@@ -3844,8 +3844,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
       // legitimate and must be kept.
       // In persistent BWD FA, the outer persistent loop contains both
       // the zero-store and the inner loop (which contains the MMA).
-      auto zeroStoreParentLoop =
-          zeroStoreOp->getParentOfType<scf::ForOp>();
+      auto zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::ForOp>();
       if (zeroStoreParentLoop &&
           (zeroStoreParentLoop == mmaParentLoop ||
            zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
@@ -3878,7 +3877,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
       }
     }
     op.erase();
-    next_op:;
+  next_op:;
   }
 }
 
