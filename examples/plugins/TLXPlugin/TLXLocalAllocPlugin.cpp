@@ -6,6 +6,8 @@
 ///   - tlx_local_view:             ttg::MemDescIndexOp (subview into buffer)
 ///   - tlx_local_store:            ttg::LocalStoreOp (register -> SMEM)
 ///   - tlx_local_load:             ttg::LocalLoadOp (SMEM -> register)
+///   - tlx_alloc_barriers:         ttg::LocalAllocOp + ttng::InitBarrierOp
+///                                 (allocate & init mbarriers in SMEM)
 ///
 /// The composite custom op `tlx_local_alloc` constructs the shared memory
 /// encoding attribute (SwizzledSharedEncoding for 1D, NVMMASharedEncoding
@@ -269,6 +271,76 @@ createLocalLoad(const char *handle, TritonOpBuilder &self,
 }
 
 // ===========================================================================
+// tlx_alloc_barriers — Allocate mbarriers in shared memory
+//
+// Allocates a multi-slot barrier buffer in shared memory (i64 elements with
+// SwizzledSharedEncoding), then initializes each slot with InitBarrierOp.
+//
+// Operand convention:
+//   operands[0] = result slot (overwritten with LocalAllocOp result)
+//   operands[1] = numBarriers (i32 constant)
+//   operands[2] = arriveCount (i32 constant)
+// ===========================================================================
+
+static TritonPluginResult
+createAllocBarriers(const char *handle, TritonOpBuilder &self,
+                    std::vector<mlir::Value> &operands) {
+  if (operands.size() < 3)
+    return TP_GENERIC_FAILURE;
+
+  auto numBarriersVal = extractConstantInt(operands[1]);
+  auto arriveCountVal = extractConstantInt(operands[2]);
+  if (!numBarriersVal || !arriveCountVal)
+    return TP_GENERIC_FAILURE;
+
+  int64_t numBarriers = *numBarriersVal;
+  int arriveCount = static_cast<int>(*arriveCountVal);
+
+  auto *context = self.getBuilder().getContext();
+  auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+  auto i64Type = self.getBuilder().getI64Type();
+
+  // InitBarrierOp's verifier (verifyBarrierType) requires a rank-1 <Nxi64>
+  // MemDesc. MemDescIndexOp requires result rank = input rank - 1.
+  // Therefore we use a 2D buffer {numBarriers, 1} so that indexing produces
+  // rank-1 {1} subviews suitable for InitBarrierOp.
+  // Follow the canonical pattern from WSLowerToken.cpp:
+  //   buffer shape = {numBarriers, numCTAs}  (rank 2)
+  //   encoding     = rank-1 SwizzledSharedEncoding
+  //   subview      = {numCTAs}               (rank 1, same encoding)
+  // MemDescType allows encoding rank = shape rank - 1.
+  // MemDescIndexOp requires same encoding on src and result.
+  // verifyBarrierType requires rank-1 <N x i64> with N <= numCTAs.
+  int numCTAs = 1;
+  auto cgaLayout = ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
+  auto encoding = ttg::SwizzledSharedEncodingAttr::get(
+      context, 1, 1, 1, {0}, cgaLayout);
+
+  auto barriersMemDescType = ttg::MemDescType::get(
+      {numBarriers, numCTAs}, i64Type, encoding, memorySpace,
+      /*mutableMemory=*/true);
+
+  auto singleBarrierMemDescType = ttg::MemDescType::get(
+      {numCTAs}, i64Type, encoding, memorySpace, /*mutableMemory=*/true);
+
+  // Allocate buffer in shared memory
+  mlir::Value bufferViews =
+      self.create<ttg::LocalAllocOp>(barriersMemDescType);
+
+  // Init barrier in each slot
+  for (int64_t i = 0; i < numBarriers; i++) {
+    mlir::Value idx = mlir::arith::ConstantIntOp::create(
+        self.getBuilder(), bufferViews.getLoc(), i, 32);
+    mlir::Value buf = self.create<ttg::MemDescIndexOp>(
+        singleBarrierMemDescType, bufferViews, idx);
+    self.create<ttng::InitBarrierOp>(buf, arriveCount);
+  }
+
+  operands[0] = bufferViews;
+  return TP_SUCCESS;
+}
+
+// ===========================================================================
 // Plugin registration
 // ===========================================================================
 
@@ -280,6 +352,7 @@ static const char *LOCAL_ALLOC_TMEM = "tlx_local_alloc_tmem";
 static const char *LOCAL_VIEW = "tlx_local_view";
 static const char *LOCAL_STORE = "tlx_local_store";
 static const char *LOCAL_LOAD = "tlx_local_load";
+static const char *ALLOC_BARRIERS = "tlx_alloc_barriers";
 
 static std::unordered_map<std::string, CustomOpFn> customOpMap = {
     {LOCAL_ALLOC_SMEM, createLocalAllocSmem},
@@ -287,10 +360,12 @@ static std::unordered_map<std::string, CustomOpFn> customOpMap = {
     {LOCAL_VIEW, createLocalView},
     {LOCAL_STORE, createLocalStore},
     {LOCAL_LOAD, createLocalLoad},
+    {ALLOC_BARRIERS, createAllocBarriers},
 };
 
 static std::vector<const char *> customOpNames = {
-    LOCAL_ALLOC_SMEM, LOCAL_ALLOC_TMEM, LOCAL_VIEW, LOCAL_STORE, LOCAL_LOAD,
+    LOCAL_ALLOC_SMEM, LOCAL_ALLOC_TMEM, LOCAL_VIEW,
+    LOCAL_STORE,      LOCAL_LOAD,       ALLOC_BARRIERS,
 };
 
 TRITON_PLUGIN_API

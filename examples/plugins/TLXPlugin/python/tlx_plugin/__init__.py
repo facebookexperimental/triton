@@ -15,6 +15,7 @@ from .types import (
     buffered_tensor,
     buffered_tensor_type,
     layout_encoding,
+    mbarrier,
     nv_mma_shared_layout_encoding,
     shared_layout_encoding,
     storage_kind,
@@ -26,6 +27,10 @@ from .mem_ops import (
     local_store,
     local_view,
 )
+from .barrier import (
+    alloc_barriers,
+    alloc_warp_barrier,
+)
 from .utility import dtype_of
 # from . import custom_stages
 
@@ -36,6 +41,7 @@ __all__ = [
     "buffered_tensor",
     "buffered_tensor_type",
     "layout_encoding",
+    "mbarrier",
     "nv_mma_shared_layout_encoding",
     "shared_layout_encoding",
     "storage_kind",
@@ -44,5 +50,7 @@ __all__ = [
     "local_load",
     "local_store",
     "local_view",
+    "alloc_barriers",
+    "alloc_warp_barrier",
     "dtype_of",
 ]

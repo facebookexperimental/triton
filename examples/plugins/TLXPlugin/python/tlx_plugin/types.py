@@ -207,3 +207,24 @@ class buffered_tensor_type(tl.block_type):
         self.storage = storage
         self.layout = layout
         self.num = num
+
+
+class mbarrier(buffered_tensor):
+    """An mbarrier allocated in shared memory."""
+
+    def __init__(
+        self,
+        handle,
+        num_barriers: int,
+        layout: Optional[shared_layout_encoding] = None,
+        is_warp_barrier: bool = False,
+    ):
+        super().__init__(
+            handle,
+            element_ty=tl.int64,
+            shape=[num_barriers],
+            num=num_barriers,
+            storage=storage_kind.smem,
+            layout=layout,
+        )
+        self.is_warp_barrier = is_warp_barrier
