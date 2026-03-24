@@ -1992,7 +1992,7 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 
 @builtin
 def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,
-        _semantic=None):
+        two_ctas=False, _semantic=None):
     """
     Returns the matrix product of two blocks.
 
@@ -2014,8 +2014,25 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     :param allow_tf32: *Deprecated.* If true, input_precision is set to "tf32".
       Only one of :code:`input_precision` and :code:`allow_tf32` can be
       specified (i.e. at least one must be :code:`None`).
+    :param two_ctas: (Blackwell/SM100+ only) If True, enables 2-CTA mode where
+      two CTAs cooperatively execute the MMA instruction. Each CTA loads half
+      of the B matrix (BLOCK_N/2 columns) and the results are combined.
+
+      **Requirements for 2-CTA mode:**
+      - Cluster must be configured with 2 CTAs in the M dimension using
+        TLX's ``ctas_per_cga=(2, 1, 1)`` or equivalent cluster configuration
+        that results in ``CTASplitNum = [2, 1]``
+      - BLOCK_M >= 64, BLOCK_N >= 32
+      - B operand must come from a load operation
+      - The compiler will automatically transform B loads to split across CTAs
+        and insert cross-CTA synchronization
+
+      For full 2-CTA support with explicit control over synchronization, see
+      ``tlx.async_dot(two_ctas=True)`` which handles B matrix splitting and
+      cross-CTA sync in the frontend.
+    :type two_ctas: bool
     """
-    return _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
+    return _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, two_ctas)
 
 
 @builtin

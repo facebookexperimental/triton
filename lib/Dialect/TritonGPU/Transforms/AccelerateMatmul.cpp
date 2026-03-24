@@ -446,21 +446,28 @@ public:
 static bool canUseTwoCTAs(triton::DotOp dotOp) {
   RankedTensorType retType = dotOp.getType();
   auto retShapePerCTA = getShapePerCTA(retType);
+
+  // 2-CTA mode requires cluster configuration with 2 CTAs in M dimension
   // TODO: we could support 2 CTAs matmul with numCTAs > 2.
   SmallVector<unsigned> splitNum = getCTASplitNum(retType.getEncoding());
   if (splitNum.size() != 2 || splitNum[0] != 2 || splitNum[1] != 1)
     return false;
+
   int m = retShapePerCTA[0];
   int n = retShapePerCTA[1];
   // minimum size supported by 2CTAs mmav5.
   if (m < 64 || n < 32)
     return false;
+
   Value b = dotOp.getB();
   // Skip convert layouts.
   while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
     b = cvtOp.getSrc();
-  return llvm::isa_and_nonnull<triton::LoadOp, triton::DescriptorLoadOp,
-                               triton::DescriptorGatherOp>(b.getDefiningOp());
+  if (!llvm::isa_and_nonnull<triton::LoadOp, triton::DescriptorLoadOp,
+                             triton::DescriptorGatherOp>(b.getDefiningOp()))
+    return false;
+
+  return true;
 }
 
 static DistributedEncodingTrait

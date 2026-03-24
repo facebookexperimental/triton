@@ -269,7 +269,7 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
 
     addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
                       op, retType, a, b, c, adaptor.getInputPrecision(),
-                      adaptor.getMaxNumImpreciseAcc()),
+                      adaptor.getMaxNumImpreciseAcc(), adaptor.getTwoCtas()),
                   adaptor.getAttributes());
     return success();
   }
