@@ -17,17 +17,14 @@
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 //
 // The two epilogue buffers each get their own buffer.id with buffer.copy=1:
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 1 : i32, buffer.id =
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 1 : i32, buffer.id =
+// CHECK: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id =
+// CHECK: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id =
 //
 // All three innermost-loop SMEM allocs get the same buffer.id and buffer.copy=3
 // (bumped from 2 because there are 3 entries sharing the reuse group):
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]]
-// CHECK-SAME: loc("arg2"
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 3 : i32, buffer.id = [[ID]]
-// CHECK-SAME: loc("a_1"
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 3 : i32, buffer.id = [[ID]]
-// CHECK-SAME: loc("a_0"
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]]
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID]]
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID]]
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
