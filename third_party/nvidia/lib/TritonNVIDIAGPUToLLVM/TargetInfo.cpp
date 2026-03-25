@@ -319,6 +319,27 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   }
 }
 
+void TargetInfo::copyBulkSharedToRemoteShared(
+    RewriterBase &rewriter, Location loc, Value srcPtr, Value dstPtr,
+    Value barrierPtr, Value ctaId, Value size, Value pred) const {
+  auto *ctx = rewriter.getContext();
+  // Map dst and barrier to the remote CTA's address space via mapa.
+  Value remoteDstPtr = mapa(rewriter, loc, dstPtr, ctaId, pred);
+  Value remoteMbarPtr = mapa(rewriter, loc, barrierPtr, ctaId, pred);
+
+  PTXBuilder ptxBuilder;
+  auto &bulkCopy = *ptxBuilder.create<>(
+      "@$0 cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::"
+      "bytes [$1], [$2], $3, [$4];");
+  bulkCopy({ptxBuilder.newOperand(pred, "b"),
+            ptxBuilder.newOperand(remoteDstPtr, "r"),
+            ptxBuilder.newOperand(srcPtr, "r"),
+            ptxBuilder.newOperand(size, "r"),
+            ptxBuilder.newOperand(remoteMbarPtr, "r")},
+           /*onlyAttachMLIRArgs=*/true);
+  ptxBuilder.launch(rewriter, loc, void_ty(ctx));
+}
+
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               std::optional<Value> ctaId, Type loadTy,
                               Value pred, Operation *localLoadOp) const {

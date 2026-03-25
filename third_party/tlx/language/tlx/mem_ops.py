@@ -400,6 +400,42 @@ def async_remote_shmem_store(
 
 
 @tl.builtin
+def async_remote_shmem_copy(
+    src: tlx.buffered_tensor,
+    dst: tlx.buffered_tensor,
+    remote_cta_rank: int | tl.constexpr,
+    barrier: tlx.mbarrier,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Copy a local shared memory buffer to the remote shared memory of a cluster CTA.
+    Notifies the remote CTA's mbarrier (via mapa) when the copy completes.
+    Uses PTX: cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes
+
+    Args:
+        src: The source buffer in local shared memory
+        dst: The destination buffer in local shared memory (will be internally mapa'd to remote CTA)
+        remote_cta_rank: The rank of the remote CTA within the cluster
+        barrier: mbarrier in local shared memory whose address will be mapa'd to the remote CTA
+    """
+    assert src.type.storage == tlx.storage_kind.smem, (
+        "async_remote_shmem_copy requires local smem src"
+    )
+    assert dst.type.storage == tlx.storage_kind.smem, (
+        "async_remote_shmem_copy requires local smem dst (will be mapa'd to remote CTA)"
+    )
+    assert remote_cta_rank is not None, "remote_cta_rank is required for async_remote_shmem_copy"
+    assert barrier is not None, "barrier is required for async_remote_shmem_copy"
+    remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
+    return tl.tensor(
+        _semantic.builder.create_async_remote_copy(
+            src.handle, dst.handle, remote_cta_rank_handle, barrier.handle
+        ),
+        tl.void,
+    )
+
+
+@tl.builtin
 def _tensor_descriptor_ptr_getitem(self, index, _semantic=None):
     """
     Index into the tensor descriptor pointer array.

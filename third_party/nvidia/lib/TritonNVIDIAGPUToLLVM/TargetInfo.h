@@ -28,6 +28,11 @@ public:
                     std::optional<Value> ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
 
+  void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
+                                    Value srcPtr, Value dstPtr,
+                                    Value barrierPtr, Value ctaId, Value size,
+                                    Value pred) const override;
+
   bool supportLdMatrix() const override { return computeCapability >= 75; }
   bool supportStMatrix() const override { return computeCapability >= 90; }
   bool supportLdStMatrixB8() const override { return computeCapability >= 100; }
