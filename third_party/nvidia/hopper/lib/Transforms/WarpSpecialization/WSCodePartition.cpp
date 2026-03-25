@@ -2914,6 +2914,7 @@ void insertAsyncComm(
         }
       }
     }
+    builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
       // calculation to the lift-up headProducer.
