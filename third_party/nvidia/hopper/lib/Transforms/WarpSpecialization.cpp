@@ -52,6 +52,15 @@ public:
   using impl::NVGPUWarpSpecializationBase<
       NVGPUWarpSpecializationPass>::NVGPUWarpSpecializationBase;
 
+  // Remove the warp_specialize attribute from all loops in the function so
+  // downstream passes (pipelining, latency assignment) don't mistakenly
+  // treat the loop as warp-specialized.
+  void removeWarpSpecializeAttr(triton::FuncOp funcOp) {
+    funcOp->walk([&](scf::ForOp forOp) {
+      forOp->removeAttr(mlir::triton::kWarpSpecializeAttrName);
+    });
+  }
+
   void runOnFuncOp(triton::FuncOp funcOp, int defaultNumStages) {
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
@@ -73,8 +82,12 @@ public:
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
-    if (numWarps != 4)
+    if (numWarps != 4) {
+      LDBG("Warp specialization requires num_warps=4, but got "
+           << numWarps << ". Skipping.");
+      removeWarpSpecializeAttr(funcOp);
       return;
+    }
 
     // FIXME: skip warpspec if there is else block. Need to improve
     // CodePartitioning to correctly handle channels in else block.
@@ -87,8 +100,10 @@ public:
         }
       }
     });
-    if (hasElse)
+    if (hasElse) {
+      removeWarpSpecializeAttr(funcOp);
       return;
+    }
 
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
