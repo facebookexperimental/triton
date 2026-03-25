@@ -1,4 +1,5 @@
 #include "Utility.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -1120,5 +1121,349 @@ public:
     module.walk([&](triton::FuncOp funcOp) { doAddSubtileRegions(funcOp); });
   }
 };
+
+//===----------------------------------------------------------------------===//
+// doFuseSubtileRegions
+//===----------------------------------------------------------------------===//
+
+/// Return the number of tile arguments for a SubtiledRegionOp by inspecting
+/// the tile region's block arguments.
+static unsigned getNumTileArgs(SubtiledRegionOp op) {
+  Block &tileBlock = op.getTileRegion().front();
+  return tileBlock.getNumArguments();
+}
+
+/// Return the number of tiles by dividing setup yields by tile args.
+static unsigned getNumTiles(SubtiledRegionOp op) {
+  auto yieldOp =
+      cast<SubtiledRegionYieldOp>(op.getSetupRegion().front().getTerminator());
+  unsigned numTileArgs = getNumTileArgs(op);
+  assert(numTileArgs > 0 && "tile region must have at least one argument");
+  return yieldOp.getNumOperands() / numTileArgs;
+}
+
+/// Check whether two SubtiledRegionOps are fusible.
+static bool areFusible(SubtiledRegionOp a, SubtiledRegionOp b) {
+  // Must be in the same block.
+  if (a->getBlock() != b->getBlock())
+    return false;
+
+  // Must have the same number of tiles.
+  if (getNumTiles(a) != getNumTiles(b))
+    return false;
+
+  // Both must have empty barriers (we run before doAnnotateSubtileBarriers).
+  if (a.getBarriers().size() != 0 || b.getBarriers().size() != 0)
+    return false;
+
+  // Both must have empty teardown regions.
+  if (!a.getTeardownRegion().empty() || !b.getTeardownRegion().empty())
+    return false;
+
+  // Compatible async_task_id.
+  if (getAsyncTaskIds(a) != getAsyncTaskIds(b))
+    return false;
+
+  // Compatible loop.stage.
+  auto stageA = a->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  auto stageB = b->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  if (stageA != stageB)
+    return false;
+
+  // Compatible loop.cluster.
+  auto clusterA = a->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  auto clusterB = b->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  if (clusterA != clusterB)
+    return false;
+
+  // Must be adjacent: no intervening ops with memory effects.
+  Operation *cursor = a->getNextNode();
+  while (cursor && cursor != b.getOperation()) {
+    if (!isMemoryEffectFree(cursor))
+      return false;
+    cursor = cursor->getNextNode();
+  }
+  // b must actually follow a in the same block.
+  if (cursor != b.getOperation())
+    return false;
+
+  return true;
+}
+
+/// Fuse two adjacent SubtiledRegionOps into one.
+static SubtiledRegionOp fuseSubtiledRegions(SubtiledRegionOp a,
+                                            SubtiledRegionOp b) {
+  unsigned numTiles = getNumTiles(a);
+  unsigned nA = getNumTileArgs(a);
+  unsigned nB = getNumTileArgs(b);
+  unsigned nFused = nA + nB;
+
+  OpBuilder builder(b);
+  Location loc = a.getLoc();
+
+  // Create the fused SubtiledRegionOp.
+  auto fusedOp = builder.create<SubtiledRegionOp>(
+      loc, /*resultTypes=*/TypeRange{},
+      /*barriers=*/ValueRange{}, /*barrierPhases=*/ValueRange{},
+      /*barrierAnnotations=*/builder.getArrayAttr({}));
+
+  // Copy attributes from A.
+  for (auto attr : a->getAttrs()) {
+    if (attr.getName() == "barrierAnnotations" ||
+        attr.getName() == "operandSegmentSizes")
+      continue;
+    fusedOp->setAttr(attr.getName(), attr.getValue());
+  }
+
+  // --- Fused setup region ---
+  Block *setupBlock = builder.createBlock(&fusedOp.getSetupRegion());
+  builder.setInsertionPointToStart(setupBlock);
+
+  // Clone A's setup ops (except terminator).
+  IRMapping mappingA;
+  Block &setupA = a.getSetupRegion().front();
+  for (auto &op : setupA.without_terminator())
+    builder.clone(op, mappingA);
+
+  // Clone B's setup ops (except terminator).
+  IRMapping mappingB;
+  Block &setupB = b.getSetupRegion().front();
+  for (auto &op : setupB.without_terminator())
+    builder.clone(op, mappingB);
+
+  // Build interleaved yield: for each tile t, yield A's args then B's args.
+  auto yieldA = cast<SubtiledRegionYieldOp>(setupA.getTerminator());
+  auto yieldB = cast<SubtiledRegionYieldOp>(setupB.getTerminator());
+
+  SmallVector<Value> fusedYieldValues;
+  for (unsigned t = 0; t < numTiles; ++t) {
+    for (unsigned i = 0; i < nA; ++i)
+      fusedYieldValues.push_back(
+          mappingA.lookupOrDefault(yieldA.getOperand(t * nA + i)));
+    for (unsigned i = 0; i < nB; ++i)
+      fusedYieldValues.push_back(
+          mappingB.lookupOrDefault(yieldB.getOperand(t * nB + i)));
+  }
+
+  auto fusedSetupYield =
+      builder.create<SubtiledRegionYieldOp>(loc, fusedYieldValues);
+  // Copy attributes from A's yield.
+  for (auto attr : yieldA->getAttrs())
+    fusedSetupYield->setAttr(attr.getName(), attr.getValue());
+
+  // --- Fused tile region ---
+  Block *tileBlock = builder.createBlock(&fusedOp.getTileRegion());
+  Block &tileA = a.getTileRegion().front();
+  Block &tileB = b.getTileRegion().front();
+
+  // Add nA + nB block arguments.
+  SmallVector<Type> tileArgTypes;
+  SmallVector<Location> tileArgLocs;
+  for (unsigned i = 0; i < nA; ++i) {
+    tileArgTypes.push_back(tileA.getArgument(i).getType());
+    tileArgLocs.push_back(tileA.getArgument(i).getLoc());
+  }
+  for (unsigned i = 0; i < nB; ++i) {
+    tileArgTypes.push_back(tileB.getArgument(i).getType());
+    tileArgLocs.push_back(tileB.getArgument(i).getLoc());
+  }
+  tileBlock->addArguments(tileArgTypes, tileArgLocs);
+
+  builder.setInsertionPointToStart(tileBlock);
+
+  // Clone A's tile body, mapping A's block args to first nA args.
+  IRMapping tileMapA;
+  for (unsigned i = 0; i < nA; ++i)
+    tileMapA.map(tileA.getArgument(i), tileBlock->getArgument(i));
+  for (auto &op : tileA.without_terminator())
+    builder.clone(op, tileMapA);
+
+  // Clone B's tile body, mapping B's block args to next nB args.
+  IRMapping tileMapB;
+  for (unsigned i = 0; i < nB; ++i)
+    tileMapB.map(tileB.getArgument(i), tileBlock->getArgument(nA + i));
+  for (auto &op : tileB.without_terminator())
+    builder.clone(op, tileMapB);
+
+  // Terminate with empty yield.
+  auto fusedTileYield =
+      builder.create<SubtiledRegionYieldOp>(loc, ValueRange{});
+  // Copy attributes from A's tile yield.
+  auto tileYieldA = cast<SubtiledRegionYieldOp>(tileA.getTerminator());
+  for (auto attr : tileYieldA->getAttrs())
+    fusedTileYield->setAttr(attr.getName(), attr.getValue());
+
+  // Erase originals.
+  a.erase();
+  b.erase();
+
+  return fusedOp;
+}
+
+void doFuseSubtileRegions(triton::FuncOp &funcOp) {
+  SmallVector<SubtiledRegionOp> subtileOps;
+  funcOp.walk([&](SubtiledRegionOp op) { subtileOps.push_back(op); });
+
+  if (subtileOps.size() < 2)
+    return;
+
+  // Iterate through adjacent pairs, fusing when possible.
+  unsigned i = 0;
+  while (i + 1 < subtileOps.size()) {
+    SubtiledRegionOp a = subtileOps[i];
+    SubtiledRegionOp b = subtileOps[i + 1];
+
+    if (areFusible(a, b)) {
+      SubtiledRegionOp fused = fuseSubtiledRegions(a, b);
+      // Replace both with the fused op in the list.
+      subtileOps[i] = fused;
+      subtileOps.erase(subtileOps.begin() + i + 1);
+      // Don't advance i — allow chain-fusion.
+    } else {
+      ++i;
+    }
+  }
+}
+
+#define GEN_PASS_DEF_NVGPUTESTFUSESUBTILEREGIONS
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestFuseSubtileRegionsPass
+    : public impl::NVGPUTestFuseSubtileRegionsBase<
+          NVGPUTestFuseSubtileRegionsPass> {
+public:
+  using NVGPUTestFuseSubtileRegionsBase::NVGPUTestFuseSubtileRegionsBase;
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    module.walk([&](triton::FuncOp funcOp) { doFuseSubtileRegions(funcOp); });
+  }
+};
+
+void doAnnotateSubtileBarriers(triton::FuncOp &funcOp) {
+  SmallVector<SubtiledRegionOp> subtileOps;
+  funcOp.walk([&](SubtiledRegionOp op) { subtileOps.push_back(op); });
+
+  for (auto subtileOp : subtileOps) {
+    Block *parentBlock = subtileOp->getBlock();
+    if (!parentBlock)
+      continue;
+
+    SmallVector<Value> newBarriers;
+    SmallVector<Value> newPhases;
+    SmallVector<Attribute> newAnnotations;
+
+    // Scan backward for adjacent WaitBarrierOps.
+    SmallVector<WaitBarrierOp> waitOps;
+    Operation *prev = subtileOp->getPrevNode();
+    while (prev && isa<WaitBarrierOp>(prev)) {
+      waitOps.push_back(cast<WaitBarrierOp>(prev));
+      prev = prev->getPrevNode();
+    }
+    // Reverse so they appear in original order.
+    std::reverse(waitOps.begin(), waitOps.end());
+
+    // Scan forward for adjacent ArriveBarrierOps.
+    SmallVector<ArriveBarrierOp> arriveOps;
+    Operation *next = subtileOp->getNextNode();
+    while (next && isa<ArriveBarrierOp>(next)) {
+      arriveOps.push_back(cast<ArriveBarrierOp>(next));
+      next = next->getNextNode();
+    }
+
+    if (waitOps.empty() && arriveOps.empty())
+      continue;
+
+    // Determine the target op index for annotations. We use index 0
+    // (first op in tile body) for BEFORE annotations and the last op
+    // index for AFTER annotations.
+    Block &tileBlock = subtileOp.getTileRegion().front();
+    unsigned numTileOps = 0;
+    for (auto &op : tileBlock.without_terminator())
+      ++numTileOps;
+    unsigned lastOpIdx = numTileOps > 0 ? numTileOps - 1 : 0;
+
+    OpBuilder builder(subtileOp->getContext());
+
+    // Absorb wait barriers.
+    for (auto waitOp : waitOps) {
+      unsigned barrierIdx = newBarriers.size();
+      newBarriers.push_back(waitOp.getAlloc());
+      newPhases.push_back(waitOp.getPhase());
+      newAnnotations.push_back(BarrierAnnotationAttr::get(
+          subtileOp->getContext(), barrierIdx, BarrierPlacement::BEFORE,
+          /*targetOpIdx=*/0, builder.getStringAttr("wait_barrier"),
+          /*count=*/1));
+    }
+
+    // Absorb arrive barriers.
+    for (auto arriveOp : arriveOps) {
+      unsigned barrierIdx = newBarriers.size();
+      newBarriers.push_back(arriveOp.getAlloc());
+      // Arrive doesn't use phase; use a placeholder constant.
+      auto phaseConst = builder.create<arith::ConstantOp>(
+          arriveOp.getLoc(), builder.getI32IntegerAttr(0));
+      phaseConst->moveBefore(subtileOp);
+      newPhases.push_back(phaseConst);
+      newAnnotations.push_back(BarrierAnnotationAttr::get(
+          subtileOp->getContext(), barrierIdx, BarrierPlacement::AFTER,
+          /*targetOpIdx=*/lastOpIdx, builder.getStringAttr("arrive_barrier"),
+          /*count=*/arriveOp.getCount()));
+    }
+
+    // Merge with any existing barriers/annotations on the op.
+    SmallVector<Value> allBarriers(subtileOp.getBarriers().begin(),
+                                   subtileOp.getBarriers().end());
+    SmallVector<Value> allPhases(subtileOp.getBarrierPhases().begin(),
+                                 subtileOp.getBarrierPhases().end());
+    SmallVector<Attribute> allAnnotations;
+    for (auto attr : subtileOp.getBarrierAnnotations())
+      allAnnotations.push_back(attr);
+
+    // Adjust barrier indices for new annotations (offset by existing count).
+    unsigned existingCount = allBarriers.size();
+    for (auto &ann : newAnnotations) {
+      auto a = cast<BarrierAnnotationAttr>(ann);
+      ann = BarrierAnnotationAttr::get(subtileOp->getContext(),
+                                       a.getBarrierIdx() + existingCount,
+                                       a.getPlacement(), a.getTargetOpIdx(),
+                                       a.getBarrierOpKind(), a.getCount());
+    }
+
+    allBarriers.append(newBarriers.begin(), newBarriers.end());
+    allPhases.append(newPhases.begin(), newPhases.end());
+    allAnnotations.append(newAnnotations.begin(), newAnnotations.end());
+
+    // Replace the SubtiledRegionOp with a new one that has the barriers.
+    OpBuilder replaceBuilder(subtileOp);
+    auto newOp = replaceBuilder.create<SubtiledRegionOp>(
+        subtileOp.getLoc(), subtileOp.getResultTypes(), allBarriers, allPhases,
+        replaceBuilder.getArrayAttr(allAnnotations));
+
+    // Copy attributes (async_task_id, loop.stage, etc).
+    for (auto attr : subtileOp->getAttrs()) {
+      if (attr.getName() == "barrierAnnotations" ||
+          attr.getName() == "operandSegmentSizes")
+        continue;
+      newOp->setAttr(attr.getName(), attr.getValue());
+    }
+
+    // Move regions from old op to new op.
+    newOp.getSetupRegion().takeBody(subtileOp.getSetupRegion());
+    newOp.getTileRegion().takeBody(subtileOp.getTileRegion());
+    if (!subtileOp.getTeardownRegion().empty())
+      newOp.getTeardownRegion().takeBody(subtileOp.getTeardownRegion());
+
+    // Replace results.
+    subtileOp.replaceAllUsesWith(newOp.getResults());
+    subtileOp.erase();
+
+    // Erase original barrier ops.
+    for (auto waitOp : waitOps)
+      waitOp.erase();
+    for (auto arriveOp : arriveOps)
+      arriveOp.erase();
+  }
+}
 
 } // namespace mlir

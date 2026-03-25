@@ -10,6 +10,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
@@ -43,6 +44,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
 void doAddSubtileRegions(triton::FuncOp &funcOp);
+void doFuseSubtileRegions(triton::FuncOp &funcOp);
+void doAnnotateSubtileBarriers(triton::FuncOp &funcOp);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -212,6 +215,17 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
+    if (useSubtiledRegionOperator &&
+        triton::tools::getBoolEnv("TRITON_FUSE_SUBTILED_REGIONS")) {
+      doFuseSubtileRegions(funcOp);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                        "doFuseSubtileRegions\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
+      }
+    }
+
     if (pingpongAutoWS) {
       doPingPongSync(funcOp, numWarpGroups, capability);
       if (dumpIntermediateSteps) {
@@ -228,6 +242,16 @@ public:
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
+    }
+
+    if (useSubtiledRegionOperator) {
+      doAnnotateSubtileBarriers(funcOp);
+      if (dumpIntermediateSteps) {
+        llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                        "doAnnotateSubtileBarriers\n";
+        moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+        llvm::dbgs() << "\n\n\n";
+      }
     }
 
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);

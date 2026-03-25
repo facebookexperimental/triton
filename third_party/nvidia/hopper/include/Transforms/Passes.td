@@ -247,4 +247,18 @@ def NVGPUTestAddSubtileRegions : Pass<"nvgpu-test-add-subtile-regions", "mlir::M
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+def NVGPUTestFuseSubtileRegions : Pass<"nvgpu-test-fuse-subtile-regions", "mlir::ModuleOp"> {
+  let summary = "Fuse adjacent SubtiledRegionOps for interleaved execution";
+
+  let description = [{
+    This pass fuses adjacent SubtiledRegionOps that have the same number of
+    tiles, compatible attributes, and empty barriers/teardown regions. The
+    fused op interleaves tile arguments from both sources so that lowering
+    produces interleaved per-tile code, improving locality and enabling
+    better barrier placement around the combined operation.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES
