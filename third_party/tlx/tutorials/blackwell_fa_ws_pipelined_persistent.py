@@ -43,7 +43,7 @@ configs = [
     for kv in [3, 6]
     for grp_n in [1, 4]
     for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
-    for uwb in [False, True]
+    for uwb in [False]
 ]
 
 
@@ -1035,7 +1035,7 @@ configs_bwd_tlx = [
         num_warps=4,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for uwb in [False, True]
+    ) for uwb in [False]
 ]
 
 
