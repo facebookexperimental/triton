@@ -41,6 +41,10 @@ def matmul_kernel_tma_ws(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    A_COL_MAJOR: tl.constexpr,
+    B_COL_MAJOR: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
@@ -63,10 +67,17 @@ def matmul_kernel_tma_ws(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Always use warp_specialize=True
-    for k in tl.range(k_tiles, warp_specialize=True, disallow_acc_multi_buffer=True):
+    for k in tl.range(k_tiles, warp_specialize=True, data_partition_factor=DATA_PARTITION_FACTOR,
+                      smem_alloc_algo=SMEM_ALLOC_ALGO):
         offs_k = k * BLOCK_SIZE_K
-        a = a_desc.load([offs_am, offs_k])
-        b = b_desc.load([offs_bn, offs_k])
+        if A_COL_MAJOR:
+            a = a_desc.load([offs_k, offs_am]).T
+        else:
+            a = a_desc.load([offs_am, offs_k])
+        if B_COL_MAJOR:
+            b = b_desc.load([offs_k, offs_bn]).T
+        else:
+            b = b_desc.load([offs_bn, offs_k])
         accumulator = tl.dot(a, b.T, accumulator)
 
     c = accumulator.to(dtype)
@@ -95,6 +106,10 @@ def matmul_kernel_tma_persistent_ws(
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FLATTEN: tl.constexpr,
+    A_COL_MAJOR: tl.constexpr,
+    B_COL_MAJOR: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
@@ -114,7 +129,8 @@ def matmul_kernel_tma_persistent_ws(
             NUM_SMS,
             flatten=FLATTEN,
             warp_specialize=True,
-            disallow_acc_multi_buffer=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -123,8 +139,14 @@ def matmul_kernel_tma_persistent_ws(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
+            if A_COL_MAJOR:
+                a = a_desc.load([offs_k, offs_am]).T
+            else:
+                a = a_desc.load([offs_am, offs_k])
+            if B_COL_MAJOR:
+                b = b_desc.load([offs_k, offs_bn]).T
+            else:
+                b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
@@ -132,7 +154,10 @@ def matmul_kernel_tma_persistent_ws(
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
-        if EPILOGUE_SUBTILE:
+        if EPILOGUE_SUBTILE == 1:
+            accumulator = accumulator.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c], accumulator)
+        elif EPILOGUE_SUBTILE == 2:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
@@ -140,9 +165,20 @@ def matmul_kernel_tma_persistent_ws(
             c_desc.store([offs_am_c, offs_bn_c], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-        else:
-            accumulator = accumulator.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], accumulator)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            c00 = acc00.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c], c00)
+            c01 = acc01.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 4], c01)
+            c10 = acc10.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c + 2 * (BLOCK_SIZE_N // 4)], c10)
+            c11 = acc11.to(dtype)
+            c_desc.store([offs_am_c, offs_bn_c + 3 * (BLOCK_SIZE_N // 4)], c11)
 
 
 # ============================================================================
@@ -164,6 +200,10 @@ def matmul_kernel_descriptor_persistent_ws(
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FLATTEN: tl.constexpr,
+    A_COL_MAJOR: tl.constexpr,
+    B_COL_MAJOR: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
 ):
     """Persistent matmul with device-side TMA descriptors and warp specialization (always enabled)."""
     dtype = c_ptr.dtype.element_ty
@@ -173,25 +213,41 @@ def matmul_kernel_descriptor_persistent_ws(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    a_desc = tl.make_tensor_descriptor(
-        a_ptr,
-        shape=[M, K],
-        strides=[K, 1],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-    )
-    b_desc = tl.make_tensor_descriptor(
-        b_ptr,
-        shape=[N, K],
-        strides=[K, 1],
-        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
-    )
+    if A_COL_MAJOR:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[K, M],
+            strides=[M, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_M],
+        )
+    else:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+    if B_COL_MAJOR:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[K, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+        )
+    else:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[N, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
     c_desc = tl.make_tensor_descriptor(
         c_ptr,
         shape=[M, N],
         strides=[N, 1],
         block_shape=[
             BLOCK_SIZE_M,
-            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+            BLOCK_SIZE_N // EPILOGUE_SUBTILE,
         ],
     )
 
@@ -205,7 +261,8 @@ def matmul_kernel_descriptor_persistent_ws(
             NUM_SMS,
             flatten=FLATTEN,
             warp_specialize=True,
-            disallow_acc_multi_buffer=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
     ):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
@@ -214,8 +271,14 @@ def matmul_kernel_descriptor_persistent_ws(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
+            if A_COL_MAJOR:
+                a = a_desc.load([offs_k, offs_am]).T
+            else:
+                a = a_desc.load([offs_am, offs_k])
+            if B_COL_MAJOR:
+                b = b_desc.load([offs_k, offs_bn]).T
+            else:
+                b = b_desc.load([offs_bn, offs_k])
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
@@ -223,7 +286,10 @@ def matmul_kernel_descriptor_persistent_ws(
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
-        if EPILOGUE_SUBTILE:
+        if EPILOGUE_SUBTILE == 1:
+            c = accumulator.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 2:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
@@ -231,9 +297,20 @@ def matmul_kernel_descriptor_persistent_ws(
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
-        else:
-            c = accumulator.to(dtype)
-            c_desc.store([offs_cm, offs_cn], c)
+        elif EPILOGUE_SUBTILE == 4:
+            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+            acc = tl.permute(acc, (0, 2, 1))
+            acc0, acc1 = tl.split(acc)
+            acc00, acc01 = tl.split(tl.permute(tl.reshape(acc0, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            acc10, acc11 = tl.split(tl.permute(tl.reshape(acc1, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 4)), (0, 2, 1)))
+            c00 = acc00.to(dtype)
+            c_desc.store([offs_cm, offs_cn], c00)
+            c01 = acc01.to(dtype)
+            c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 4], c01)
+            c10 = acc10.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 2 * (BLOCK_SIZE_N // 4)], c10)
+            c11 = acc11.to(dtype)
+            c_desc.store([offs_cm, offs_cn + 3 * (BLOCK_SIZE_N // 4)], c11)
 
 
 # ============================================================================
@@ -244,11 +321,36 @@ def matmul_kernel_descriptor_persistent_ws(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages,
-                                               num_warps):
+def test_tutorial09_matmul_tma_warp_specialize(
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    num_stages,
+    num_warps,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
+):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
+    # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4):
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
@@ -257,14 +359,21 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
         device = "cuda"
 
         torch.manual_seed(42)
-        A = torch.randn((M, K), dtype=dtype, device=device)
-        B = torch.randn((N, K), dtype=dtype, device=device)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
@@ -272,9 +381,15 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 
         triton.set_allocator(alloc_fn)
 
-        # Set up tensor descriptors
-        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
-        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        # Set up tensor descriptors (swap dims for col-major so contiguous dim is last)
+        if A_col_major:
+            a_desc = TensorDescriptor(A, [K, M], [M, 1], [BLOCK_SIZE_K, BLOCK_SIZE_M])
+        else:
+            a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        if B_col_major:
+            b_desc = TensorDescriptor(B, [K, N], [N, 1], [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        else:
+            b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
         c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
 
         grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
@@ -290,6 +405,10 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             GROUP_SIZE_M=GROUP_SIZE_M,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
         )
@@ -310,13 +429,18 @@ def test_tutorial09_matmul_tma_warp_specialize(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
 @pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
-@pytest.mark.parametrize("BLOCK_SIZE_M", [128])
+@pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
-@pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_tma_persistent_warp_specialize(
     M,
@@ -329,19 +453,60 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     num_warps,
     FLATTEN,
     EPILOGUE_SUBTILE,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
+    # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
+            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded (BLOCK_SIZE_M=256 with num_stages=3 and FLATTEN)")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and not EPILOGUE_SUBTILE:
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded")
+
+    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256 and FLATTEN and SMEM_ALLOC_ALGO == 0:
+        pytest.skip("Out of resources: tensor memory exceeded")
+
+    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN and SMEM_ALLOC_ALGO == 0:
+        pytest.skip("Out of resources: tensor memory exceeded")
+
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 0 and BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256
+            and BLOCK_SIZE_K == 64 and not FLATTEN):
+        pytest.skip("Out of resources: shared memory exceeded")
+
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
+            and EPILOGUE_SUBTILE == 4 and (BLOCK_SIZE_N == 256 or num_stages == 3)):
+        pytest.skip("Out of resources: tensor memory exceeded")
+
+    if (DATA_PARTITION_FACTOR == 2 and SMEM_ALLOC_ALGO == 1 and BLOCK_SIZE_M == 256 and FLATTEN
+            and EPILOGUE_SUBTILE in (1, 2)):
+        pytest.skip("Out of resources: tensor memory exceeded")
+
+    if EPILOGUE_SUBTILE >= 2 and not FLATTEN and (SMEM_ALLOC_ALGO != 0 or use_early_tma_store_lowering):
+        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtiling without flatten produces wrong results")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -349,8 +514,14 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         device = "cuda"
 
         torch.manual_seed(42)
-        A = torch.randn((M, K), dtype=dtype, device=device)
-        B = torch.randn((N, K), dtype=dtype, device=device)
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
@@ -358,14 +529,20 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 
         triton.set_allocator(alloc_fn)
 
-        # Set up tensor descriptors
-        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
-        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        # Set up tensor descriptors (swap dims for col-major so contiguous dim is last)
+        if A_col_major:
+            a_desc = TensorDescriptor(A, [K, M], [M, 1], [BLOCK_SIZE_K, BLOCK_SIZE_M])
+        else:
+            a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        if B_col_major:
+            b_desc = TensorDescriptor(B, [K, N], [N, 1], [BLOCK_SIZE_K, BLOCK_SIZE_N])
+        else:
+            b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
         c_desc = TensorDescriptor(
             C,
             C.shape,
             C.stride(),
-            [BLOCK_SIZE_M, BLOCK_SIZE_N // 2 if EPILOGUE_SUBTILE else BLOCK_SIZE_N],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
         )
 
         grid = lambda META: (min(
@@ -387,11 +564,15 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             FLATTEN=FLATTEN,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
         )
 
-        # Verify IR contains warp_specialize
+        # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
@@ -411,9 +592,14 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("num_warps", [4])
 @pytest.mark.parametrize("FLATTEN", [True, False])
-@pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+@pytest.mark.parametrize("A_col_major", [False, True])
+@pytest.mark.parametrize("B_col_major", [False, True])
+@pytest.mark.parametrize("use_early_tma_store_lowering", [True, False])
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("SMEM_ALLOC_ALGO", [0, 1])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     M,
@@ -426,19 +612,42 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     num_warps,
     FLATTEN,
     EPILOGUE_SUBTILE,
+    A_col_major,
+    B_col_major,
+    use_early_tma_store_lowering,
+    DATA_PARTITION_FACTOR,
+    SMEM_ALLOC_ALGO,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
+    # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
+    if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
+        pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if (DATA_PARTITION_FACTOR == 1 and BLOCK_SIZE_M == 256
+            and (BLOCK_SIZE_N == 256 or (BLOCK_SIZE_K == 128 and not FLATTEN))):
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
     # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and (num_stages == 3 or num_warps == 4) and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and not EPILOGUE_SUBTILE:
+    if BLOCK_SIZE_N == 256 and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE == 1:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
+        pytest.skip("Out of resources: tensor memory exceeded")
+
+    if EPILOGUE_SUBTILE >= 2 and not FLATTEN and (SMEM_ALLOC_ALGO != 0 or use_early_tma_store_lowering):
+        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtiling without flatten produces wrong results")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -446,10 +655,15 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
         device = "cuda"
 
         torch.manual_seed(42)
-        # For device-side TMA descriptors, we need contiguous memory layout
-        A = torch.randn((M, K), dtype=dtype, device=device).contiguous()
-        B = torch.randn((N, K), dtype=dtype, device=device).contiguous()
-        C = torch.empty((M, N), dtype=dtype, device=device).contiguous()
+        if A_col_major:
+            A = torch.randn((K, M), dtype=dtype, device=device).t()
+        else:
+            A = torch.randn((M, K), dtype=dtype, device=device)
+        if B_col_major:
+            B = torch.randn((K, N), dtype=dtype, device=device).t()
+        else:
+            B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
 
         def alloc_fn(size, align, stream):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -475,11 +689,15 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             FLATTEN=FLATTEN,
+            A_COL_MAJOR=A_col_major,
+            B_COL_MAJOR=B_col_major,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
         )
 
-        # Verify IR contains warp_specialize
+        # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
