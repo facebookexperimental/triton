@@ -853,13 +853,20 @@ static int getLoopStage(Operation *op) {
   return attr ? attr.getValue().getSExtValue() : -1;
 }
 
-/// Check if a channel's source and destination(s) are in different
-/// loop.stage values.
+/// Check if a channel's actual consumers are in different loop.stage values.
+/// The producer stage is not considered because it may be in a different
+/// partition. We follow through memdesc_trans operations to find the actual
+/// consumers. Only returns true if the buffer is updated inside the innermost
+/// loop (srcOp has loop.stage).
 static bool isSmemCrossStage(Operation *alloc,
                              SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
   if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
     return false;
+
+  // Check that the source (producer) is inside the innermost loop.
+  // If srcOp doesn't have loop.stage, the buffer is written outside the loop
+  // and doesn't need double-buffering.
   Operation *srcOp = ch->getSrcOp();
   if (!srcOp)
     return false;
@@ -873,10 +880,26 @@ static bool isSmemCrossStage(Operation *alloc,
     if (Operation *dst = ch->getDstOp())
       dstOps.push_back(dst);
   }
+
+  // Collect all actual consumers by following through memdesc_trans operations.
+  SmallVector<Operation *> actualConsumers;
   for (Operation *dstOp : dstOps) {
-    int dstStage = getLoopStage(dstOp);
-    if (dstStage >= 0 && dstStage != srcStage)
-      return true;
+    auto consumers = getActualConsumers(dstOp);
+    for (auto *consumer : consumers)
+      actualConsumers.push_back(consumer);
+  }
+
+  // Check if actual consumers are in different stages.
+  int firstConsumerStage = -1;
+  for (Operation *consumer : actualConsumers) {
+    int stage = getLoopStage(consumer);
+    if (stage >= 0) {
+      if (firstConsumerStage < 0) {
+        firstConsumerStage = stage;
+      } else if (stage != firstConsumerStage) {
+        return true;
+      }
+    }
   }
   return false;
 }

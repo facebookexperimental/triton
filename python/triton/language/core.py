@@ -1992,7 +1992,7 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 
 @builtin
 def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,
-        _semantic=None):
+        attrs=None, _semantic=None):
     """
     Returns the matrix product of two blocks.
 
@@ -2014,8 +2014,11 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     :param allow_tf32: *Deprecated.* If true, input_precision is set to "tf32".
       Only one of :code:`input_precision` and :code:`allow_tf32` can be
       specified (i.e. at least one must be :code:`None`).
+    :param attrs: Optional dictionary of string-valued attributes to attach to the dot operation.
+    :type attrs: dict, optional
     """
-    return _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
+    attrs = _unwrap_if_constexpr(attrs)
+    return _semantic.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype, attrs)
 
 
 @builtin
