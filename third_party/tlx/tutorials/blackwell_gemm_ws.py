@@ -517,6 +517,11 @@ def preprocess_configs(configs, named_args, **kwargs):
             k_tiles = math.ceil(K / BLOCK_K)
             if k_tiles < SPLIT_K:
                 continue
+            # Reject SK values where cdiv overallocation leaves the last split empty
+            # (causes deadlock: producer loop is empty but MMA consumer waits on barrier)
+            k_tiles_per_split = math.ceil(k_tiles / SPLIT_K)
+            if k_tiles_per_split * (SPLIT_K - 1) >= k_tiles:
+                continue
             # Each split must have enough K tiles to be worthwhile
             if k_tiles // SPLIT_K < 4:
                 continue
