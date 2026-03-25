@@ -316,7 +316,7 @@ def matmul_kernel_descriptor_persistent_ws(
 # ============================================================================
 # Test 1: matmul_kernel_tma warp specialization (K-loop based)
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -428,7 +428,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
 # Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop based)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
@@ -584,7 +584,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 # Test 3: matmul_kernel_descriptor_persistent warp specialization (device-side TMA)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
-@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (1024, 1024, 512)])
+@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (512, 512, 256), (8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])

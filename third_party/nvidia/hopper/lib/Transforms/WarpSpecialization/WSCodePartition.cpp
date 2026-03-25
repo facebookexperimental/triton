@@ -3151,9 +3151,15 @@ void insertAsyncComm(
           builder.setAsynTaskIdsFromArray(foundGuardCh->relation.first);
           builder.setInsertionPointAfter(guardConsumerReleasePoint);
           builder.setLoopScheduleInfoFromOp(guardConsumerReleasePoint);
-          Value guardBufIdx =
-              builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-                  guardConsumerReleasePoint->getLoc(), 0, 32);
+          // Compute bufferIdx in the consumer's async-task context so that
+          // the defining ops carry the consumer's task IDs and survive
+          // partitioning (the producer's bufferIdx carries producer task IDs
+          // and would be destroyed in the consumer partition).
+          Value guardBufIdx, guardPhase;
+          getBufferIdxAndPhase(builder, guardConsumerReleasePoint,
+                               masterChannel->getNumBuffers(),
+                               regionsWithChannels, guardBufIdx, guardPhase,
+                               config, reuseGrp, masterChannel);
           builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
               guardConsumerReleasePoint->getLoc(), guardToken, guardBufIdx);
 
