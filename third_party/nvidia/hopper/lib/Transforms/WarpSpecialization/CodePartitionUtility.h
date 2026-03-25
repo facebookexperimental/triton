@@ -158,6 +158,11 @@ struct TmemDataChannel : Channel {
 struct TmemDataChannelPost : Channel {
   bool isOperandD;
   bool isOperandDNoAcc;
+  // When true, this channel is a same-iteration resource-hazard guard:
+  // tmem_load (producer) → tmem_store (consumer). It ensures the tmem_load
+  // finishes reading before the next iteration's tmem_store overwrites.
+  // This is the reverse direction of the wrap-around data-flow channel.
+  bool isSameIterGuard = false;
   Operation *allocOp;
 
   // Can be produced by tmem_store or operand D of gen5, consumed by tmem_load
@@ -186,6 +191,13 @@ struct TmemDataChannelPost : Channel {
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 
+/// Returns true if \p tmemAlloc has a MMAv5OpInterface user inside \p forOp
+/// whose acc_dep token is a loop iter_arg of \p forOp and whose output
+/// token is yielded back to the same iter_arg position. This indicates
+/// the accumulator is reused across iterations and the buffer index
+/// should not rotate within this loop.
+bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp);
+
 // Return number of AccumCnts for the given ctrlOp. AccumCnts due to reuses
 // will be at the end, we go through all ReuseGroups and if any channel in
 // the group is nested under ctrlOp, we add one accumCnt for this group.
@@ -202,6 +214,7 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 
 void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
                       SmallVector<Operation *> &chList);
+
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,
@@ -297,6 +310,29 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
 void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
+
+// Verify that a 2-buffer reuse group is well-formed:
+// - Exactly 2 channels, each with a single copy (getNumBuffers() == 1).
+// - A dependency chain exists from one channel's consumer to the other's
+//   producer.
+// Returns true if valid; asserts on violations.
+bool verifyReuseGroup2(ReuseGroup *group);
+
+// For a verified 2-buffer reuse group, determine which channel is early (A)
+// and which is late (B). Channel A is early if there is a data dependency
+// chain from A's consumer to B's producer (A.consumer -> ... -> B.producer).
+// Returns {earlyChannel, lateChannel}.
+std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
+
+// Given ordered channels {early, late} in a 2-buffer reuse group, determine
+// whether we need to explicitly move late's producer_acquire to before early's
+// producer.
+// Returns false when late's consumer and early's producer are in the same
+// partition AND early's producer appears before late's consumer in program
+// order (partition-internal ordering guarantees correctness).
+// Returns true otherwise (explicit synchronization needed).
+bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
+
 } // namespace mlir
 
 #endif // NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
