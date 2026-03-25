@@ -5,34 +5,24 @@
 module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // GFX1250-LABEL: init_barrier
   tt.func @init_barrier(%alloc: !ttg.memdesc<1xi64, #shared, #smem, mutable>) {
-    // GFX1250:   %[[INIT_VAL1:.+]] = llvm.mlir.constant(4294967297 : i64) : i64
-    // GFX1250:   %[[ALLOC_PTR:.+]] = llvm.extractvalue %arg0[0] : !llvm.struct<(ptr<3>, i32)>
-    // GFX1250:   llvm.cond_br %{{.+}}, ^[[BB0:.+]], ^[[BB1:.+]]
-    // GFX1250-NEXT: ^[[BB0]]:
-    // GFX1250-NEXT:   llvm.store %[[INIT_VAL1]], %[[ALLOC_PTR]] : i64, !llvm.ptr<3>
-    // GFX1250-NEXT:   llvm.br ^[[BB1]]
-    // GFX1250-NEXT: ^[[BB1]]:
-    // GFX1250-NEXT:   rocdl.s.wait.dscnt 0
-    // GFX1250-NEXT:   rocdl.s.barrier
-    // GFX1250-NEXT:   llvm.return
+    // GFX1250: builtin.unrealized_conversion_cast
+    // GFX1250: amdg.init_barrier
     amdg.init_barrier %alloc, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
 
   // GFX1250-LABEL: wait_barrier
   tt.func @wait_barrier(%alloc: !ttg.memdesc<1xi64, #shared, #smem, mutable>, %phase: i32) {
-    // GFX1250: rocdl.s.sleep {{.*}}
-    // GFX1250: llvm.load {{.*}} : !llvm.ptr<3> -> i64
-    // GFX1250: llvm.icmp "ne" {{%arg1, %.*|%.*, %arg1}} : i32
+    // GFX1250: builtin.unrealized_conversion_cast
+    // GFX1250: amdg.wait_barrier
     amdg.wait_barrier %alloc, %phase : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
 
   // GFX1250-LABEL: arrive_barrier
   tt.func @arrive_barrier(%alloc: !ttg.memdesc<1xi64, #shared, #smem, mutable>) {
-    // GFX1250: %[[UPDATE_VAL1:.+]] = llvm.mlir.constant(1 : i64) : i64
-    // GFX1250: %[[ALLOC_PTR:.+]] = llvm.extractvalue %arg0[0] : !llvm.struct<(ptr<3>, i32)>
-    // GFX1250: rocdl.ds.atomic.barrier.arrive.rtn.b64 %[[ALLOC_PTR]], %[[UPDATE_VAL1]] : !llvm.ptr<3>, i64 -> i64
+    // GFX1250: builtin.unrealized_conversion_cast
+    // GFX1250: amdg.arrive_barrier
     %prior_phase = amdg.arrive_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> i32
     tt.return
   }
