@@ -20,3 +20,20 @@ tlx.local_store(smem_buf, data)
 tlx.fence("async_shared")
 tlx.async_descriptor_store(desc, smem_buf, offsets)
 ```
+
+## Prefetch
+
+`tlx.prefetch(pointer, level="L2", mask=None)` issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
+
+| Level | PTX | Description |
+|-------|-----|-------------|
+| `"L1"` | `prefetch.global.L1` | Prefetch into L1 and L2 cache |
+| `"L2"` | `prefetch.global.L2` | Prefetch into L2 cache only (default) |
+
+Example:
+```python
+offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+mask = offsets < n_elements
+tlx.prefetch(input_ptr + offsets, level="L2", mask=mask)
+x = tl.load(input_ptr + offsets, mask=mask)
+```

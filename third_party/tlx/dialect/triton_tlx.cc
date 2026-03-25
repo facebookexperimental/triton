@@ -682,6 +682,12 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::AsyncTMAPrefetchOp>(desc, coord, pred,
                                                    evictionPolicy);
            })
+      .def("create_prefetch",
+           [](TritonOpBuilder &self, Value ptr, std::optional<Value> mask,
+              CacheModifier cache) -> void {
+             Value maskVal = mask.has_value() ? mask.value() : Value();
+             self.create<ttng::PrefetchOp>(ptr, maskVal, cache);
+           })
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value source, tt::EvictionPolicy evictionPolicy) -> void {

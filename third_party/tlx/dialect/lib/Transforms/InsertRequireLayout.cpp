@@ -53,8 +53,9 @@ LogicalResult insertRequireLayout(ModuleOp m) {
           localLoadOp.dump();
         });
         // Get the shared encoding for this local load op based on the dot op
-        auto encoding = mlir::amdpipeliner::getSharedEncIfAllUsersAreDotEnc(
-                            localLoadOp->getResult(0))
+        bool incompatible = false;
+        auto encoding = mlir::getSharedEncIfAllUsersAreDotEnc(
+                            localLoadOp->getResult(0), incompatible)
                             .value_or(nullptr);
         if (encoding) {
           LLVM_DEBUG({

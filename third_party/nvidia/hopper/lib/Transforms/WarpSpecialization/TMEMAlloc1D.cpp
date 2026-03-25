@@ -88,8 +88,9 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto oldLayout = expandDims.getType().getEncoding();
   auto newLayout = oldLayout;
   if (!layoutTmemCompatible) {
-    newLayout = ttng::getTmemCompatibleLayout(
-        tmemDesc.getShape()[0], tmemDesc.getShape()[1], expandType, numWarps);
+    auto ctaLayout = ttg::getCTALayout(expandType.getEncoding());
+    newLayout =
+        ttng::getDefaultLayoutForTmemLdSt(tmemDesc, numWarps, ctaLayout);
   }
   mlir::Operation *src = expandDims;
   if (newLayout != oldLayout) {

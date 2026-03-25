@@ -72,11 +72,16 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
     assert((numWarps == 4 || numWarps == 8) &&
            "Currently only support numWarps 4 or 8 for TMEM load and store.");
 
-    ttg::BlockedEncodingAttr defaultBlockedEncoding =
-        ttg::getDefaultBlockedEncoding(moduleOp.getContext(), shape, numWarps,
-                                       threadsPerWarp, numCTAs);
-    auto oldType =
-        RankedTensorType::get(shape, elementType, defaultBlockedEncoding);
+    auto *ctx = moduleOp.getContext();
+    unsigned bitwidth = elementType.getIntOrFloatBitWidth();
+    unsigned colStride = 32 / bitwidth;
+    auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
+        ctx, shape[0], shape[1], colStride, /*CTASplitM=*/1,
+        /*CTASplitN=*/1);
+    auto memSpace = ttng::TensorMemorySpaceAttr::get(ctx);
+    auto memDescType = ttg::MemDescType::get(shape, elementType, tmemEncoding,
+                                             memSpace, /*mutableMemory=*/true);
+    auto ctaLayout = ttg::CTALayoutAttr::get(ctx, {1, 1}, {1, 1}, {1, 0});
 
     auto result =
         ttng::getTmemCompatibleLayout(shape[0], shape[1], oldType, numWarps);
