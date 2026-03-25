@@ -193,13 +193,13 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    doHoistLoopInvariantTMEMStore(funcOp);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doHoistLoopInvariantTMEMStore\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    // doHoistLoopInvariantTMEMStore(funcOp);
+    // if (dumpIntermediateSteps) {
+    //   llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+    //                   "doHoistLoopInvariantTMEMStore\n";
+    //   moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+    //   llvm::dbgs() << "\n\n\n";
+    // }
 
     if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
                                /*writeDecisionFile=*/"",
