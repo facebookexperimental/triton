@@ -1054,13 +1054,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
     // Convert the source operand to a tmem compatible layout via
     // ConvertLayoutOp instead of mutating the type in-place (which would break
-    // ops like arith.constant whose value attribute must match the result type).
+    // ops like arith.constant whose value attribute must match the result
+    // type).
     auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
     assert(newSrc && "TMEMStoreOp src not found in mappings; was it "
                      "backward-sliced in getSliceToPartition?");
     if (newSrc.getType() != newSrcType) {
-      auto cvtOp = builder.create<ConvertLayoutOp>(op->getLoc(), newSrcType,
-                                                   newSrc);
+      auto cvtOp =
+          builder.create<ConvertLayoutOp>(op->getLoc(), newSrcType, newSrc);
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
     }
     newOp = cloneAndSetResultType(op);

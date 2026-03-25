@@ -24,6 +24,7 @@ from .mem_ops import (
     async_descriptor_load,
     async_descriptor_prefetch_tensor,
     async_descriptor_store,
+    prefetch,
     async_descriptor_store_wait,
     async_load,
     async_load_commit_group,
@@ -137,6 +138,7 @@ __all__ = [
     "reinterpret_tensor_descriptor",
     "remote_shmem_store",
     "async_remote_shmem_store",
+    "prefetch",
     # barriers
     "cluster_barrier",
     "alloc_barriers",

@@ -422,6 +422,7 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)

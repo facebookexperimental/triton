@@ -1208,6 +1208,7 @@ class CodeGenerator(ast.NodeVisitor):
         smem_circular_reuse = None
         flatten = False
         warp_specialize = False
+        multi_cta = False
         disable_licm = False
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
@@ -1228,6 +1229,7 @@ class CodeGenerator(ast.NodeVisitor):
             smem_circular_reuse = iterator.smem_circular_reuse
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
+            multi_cta = iterator.multi_cta
             disable_licm = iterator.disable_licm
         elif IteratorClass is range:
             # visit iterator arguments
@@ -1293,6 +1295,8 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
+            if multi_cta:
+                for_op.set_attr("tt.multi_cta", self.builder.get_unit_attr())
             if merge_epilogue:
                 for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
             if tmem_alloc_algo is not None:

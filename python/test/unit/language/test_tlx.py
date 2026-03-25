@@ -3072,6 +3072,39 @@ def test_descriptor_load_prefetch_ws(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("level", ["L1", "L2"])
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_prefetch(level, use_mask, device):
+    """Test pointer-based prefetch hint (tlx.prefetch)."""
+
+    @triton.jit
+    def prefetch_and_load_kernel(
+        input_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        LEVEL: tl.constexpr,
+        USE_MASK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements if USE_MASK else None
+        tlx.prefetch(input_ptr + offsets, level=LEVEL, mask=mask)
+        x = tl.load(input_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    BLOCK_SIZE = 1024
+    n_elements = BLOCK_SIZE
+    x = torch.randn(n_elements, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+    grid = (1, )
+    kernel = prefetch_and_load_kernel[grid](x, y, n_elements, BLOCK_SIZE=BLOCK_SIZE, LEVEL=level, USE_MASK=use_mask)
+    torch.testing.assert_close(x, y)
+    assert "ttng.prefetch" in kernel.asm["ttgir"]
+    assert f"prefetch.global.{level}" in kernel.asm["ptx"]
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("eviction_policy", ["evict_first", "evict_last", ""])
 def test_descriptor_load_l2_cache_hint(eviction_policy, device):
     """Test that TMA loads can use L2 cache hints via eviction_policy parameter."""
@@ -7010,3 +7043,46 @@ def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
     result = output.cpu().tolist()
     assert result[0] == 5, f"Expected output[0]=5, got {result[0]}"
     assert result[1] == 99, f"Expected output[1]=99, got {result[1]}"
+
+
+@triton.jit
+def _store_ws_kernel(
+    output_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Warp-specialized store kernel for PlanCTA regression test.
+
+    Tests tl.store in a warp-specialized context where the store partition
+    has fewer warps (1) than the default partition, with num_ctas=2 to
+    ensure PlanCTA actually runs (it skips when num_ctas=1).
+
+    This exercises PlanCTA's per-op numWarps lookup: the store's layout
+    must be planned with 1 warp (the partition's warp count), not the
+    function-level total. Without the fix (lookupNumWarps(store) instead
+    of lookupNumWarps(funcOp)), PlanCTA would assign warpsPerCTA=[4]
+    inside the 1-warp partition, producing an invalid layout.
+    """
+    pid = tl.program_id(axis=0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            _ = tl.arange(0, BLOCK_SIZE)
+
+        with tlx.async_task(num_warps=1):
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            data = offsets.to(tl.float32)
+            tl.store(output_ptr + offsets, data)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_store_ws(device):
+    BLOCK_SIZE = 256
+    n_elements = 1024
+    n_blocks = n_elements // BLOCK_SIZE
+
+    output = torch.empty(n_elements, device=device, dtype=torch.float32)
+    # num_ctas=2 ensures PlanCTA runs (it skips when num_ctas=1).
+    _store_ws_kernel[(n_blocks, )](output, BLOCK_SIZE=BLOCK_SIZE, num_ctas=2)
+
+    expected = torch.arange(n_elements, device=device, dtype=torch.float32)
+    torch.testing.assert_close(output, expected)
