@@ -404,7 +404,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
     fwd_config["RESCALE_OPT"] = RESCALE_OPT
     fwd_config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
-    BWD_BLOCK_M1 = 64
+    BWD_BLOCK_M1 = 128
     GROUP_SIZE_M = 1
 
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
@@ -482,6 +482,12 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_dk = TensorDescriptor(dk, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
         desc_dv = TensorDescriptor(dv, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
 
+        # 2-CTA descriptors
+        desc_kt = TensorDescriptor(arg_k, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_qt = TensorDescriptor(q, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dot = TensorDescriptor(do, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+
         BLK_SLICE_FACTOR = 2
         EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
 
@@ -506,6 +512,9 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             H,
             Z,
             N_CTX,
+            desc_kt,
+            desc_qt,
+            desc_dot,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
