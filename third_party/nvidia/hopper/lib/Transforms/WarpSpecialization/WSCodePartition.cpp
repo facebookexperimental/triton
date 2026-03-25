@@ -3036,27 +3036,15 @@ void insertAsyncComm(
                                                    << " ");
         });
         // If we have a nested target we cannot use the barrier in the
-        // TCGen5MMAOp directly. When there are multiple MMAs in the loop
-        // (data partitioning), replace the commit with a wait on the MMA's
-        // A/B barrier + arrive on the D barrier for per-MMA completion
-        // tracking. With a single MMA, use a normal tcgen05_commit.
+        // TCGen5MMAOp directly and instead need a tcgen05.commit.
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          // Count MMAs in the nested loop to detect data partitioning.
-          unsigned mmaCount = 0;
-          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
-          if (mmaCount <= 1 ||
-              !replaceCommitWithBarrierSync(
-                  builder, cast<ttng::TCGen5MMAOp>(mmaOp),
-                  *commChannel.producerBarrier, regionsWithChannels, config)) {
-            auto indexedBarrier = getBarrierForPipelineStage(
-                builder, *commChannel.producerBarrier, bufferIdx);
-            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), indexedBarrier);
-          }
+          // We need to place the commit after the for loop.
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), *commChannel.producerBarrier);
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3125,24 +3113,12 @@ void insertAsyncComm(
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // When there are multiple MMAs in the loop (data partitioning),
-          // replace the commit with a wait on the MMA's A/B barrier + arrive
-          // on the D barrier for per-MMA completion tracking. With a single
-          // MMA, use a normal tcgen05_commit.
+          // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          // Count MMAs in the nested loop to detect data partitioning.
-          unsigned mmaCount = 0;
-          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
-          if (mmaCount <= 1 ||
-              !replaceCommitWithBarrierSync(builder, mmaOp, consumerBarrier,
-                                            regionsWithChannels, config)) {
-            auto indexedConsumerBarrier =
-                getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), indexedConsumerBarrier);
-          }
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               consumerBarrier);
           builder.clearLoopScheduleInfo();
         }
 
@@ -3754,6 +3730,130 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 
   for (auto allocOp : toErase) {
     allocOp.erase();
+  }
+}
+
+// Remove redundant TMEM zeroing stores.
+// When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
+// useAccumulator=false (on the first iteration), any preceding
+// tmem_store of zeros is redundant — the MMA's useD=false already
+// zeros the accumulator. Removing the store early (before buffer
+// allocation) prevents the autoWS compiler from creating a
+// cross-partition channel for it.
+void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
+  auto isConstZeroTensor = [](Value v) -> bool {
+    auto constOp = v.getDefiningOp<arith::ConstantOp>();
+    if (!constOp)
+      return false;
+    auto denseAttr = dyn_cast<DenseFPElementsAttr>(constOp.getValue());
+    if (!denseAttr)
+      return false;
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero();
+  };
+
+  auto mmaUsesAccFalseOnFirstIter = [](ttng::TCGen5MMAOp mmaOp) -> bool {
+    Value useAccFlag = mmaOp.useAccumulator();
+    if (!useAccFlag)
+      return false;
+    // If useAccFlag is a block argument of a ForOp, trace it to the
+    // init value to check the first iteration.
+    if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
+        if (blockArg.getOwner() == forOp.getBody()) {
+          unsigned argNum = blockArg.getArgNumber();
+          if (argNum > 0)
+            useAccFlag = forOp.getInitArgs()[argNum - 1];
+        }
+      }
+    }
+    if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
+      if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue()))
+        return !boolAttr.getValue();
+      if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+        return intAttr.getInt() == 0;
+    }
+    return false;
+  };
+
+  SmallVector<ttng::TMEMStoreOp> toErase;
+  funcOp.walk([&](ttng::TMEMAllocOp tmemAllocOp) {
+    bool hasZeroStore = false;
+    ttng::TMEMStoreOp zeroStoreOp;
+    bool hasMmaWithUseDFalse = false;
+    scf::ForOp mmaParentLoop = nullptr;
+    // Collect all transitive users of the alloc result, following through
+    // MemDescIndexOp and other view ops to find the actual TMEMStoreOp
+    // and TCGen5MMAOp users.
+    SmallVector<Value> worklist = {tmemAllocOp.getResult()};
+    DenseSet<Value> visited;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+      for (auto *user : v.getUsers()) {
+        // Need to check store happens before other producers and it doesn't
+        // reach other users directly.
+        if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+          if (isConstZeroTensor(storeOp.getSrc())) {
+            hasZeroStore = true;
+            zeroStoreOp = storeOp;
+          }
+        } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+          if (mmaOp.getD() == v && mmaUsesAccFalseOnFirstIter(mmaOp)) {
+            hasMmaWithUseDFalse = true;
+            mmaParentLoop = mmaOp->getParentOfType<scf::ForOp>();
+          }
+        }
+        // Follow through view ops (MemDescIndexOp, etc.) to find
+        // indirect users of the TMEM alloc.
+        for (auto result : user->getResults()) {
+          if (isa<triton::gpu::MemDescType>(result.getType()))
+            worklist.push_back(result);
+        }
+      }
+    }
+    if (hasZeroStore && hasMmaWithUseDFalse && zeroStoreOp && mmaParentLoop) {
+      // Only remove the zero-store if both it and the MMA are inside a
+      // common persistent outer loop. If the zero-store is outside all
+      // loops (e.g., matmul initialization before the loop), it's
+      // legitimate and must be kept.
+      // In persistent BWD FA, the outer persistent loop contains both
+      // the zero-store and the inner loop (which contains the MMA).
+      auto zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::ForOp>();
+      if (zeroStoreParentLoop &&
+          (zeroStoreParentLoop == mmaParentLoop ||
+           zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
+        LLVM_DEBUG({
+          LDBG("Removing redundant TMEM zero-store for operand D: "
+               << "MMA useD=false already handles zeroing");
+        });
+        toErase.push_back(zeroStoreOp);
+      }
+    }
+  });
+  for (auto op : toErase) {
+    // TMEMStoreOp may produce a token result that has downstream uses.
+    // Replace the output token with the input token before erasing.
+    for (unsigned i = 0; i < op.getNumResults(); ++i) {
+      if (!op.getResult(i).use_empty()) {
+        // Find the corresponding input token operand to forward.
+        // TMEMStoreOp signature: (src, dst[token], pred) -> token
+        // The token input is the second operand (getToken()).
+        if (i == 0 && op.getNumOperands() >= 2) {
+          Value inputToken = op.getOperand(1);
+          if (inputToken.getType() == op.getResult(i).getType() &&
+              inputToken != op.getResult(i)) {
+            op.getResult(i).replaceAllUsesWith(inputToken);
+            continue;
+          }
+        }
+        // Cannot safely replace — skip erasing this op.
+        goto next_op;
+      }
+    }
+    op.erase();
+  next_op:;
   }
 }
 
