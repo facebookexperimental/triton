@@ -5,7 +5,7 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // CHECK-LABEL: tma_store_basic
 //       CHECK: ttg.local_alloc %arg2
-//       CHECK: ttng.fence_async_shared {bCluster = false}
+//   CHECK-NOT: ttng.fence_async_shared
 //       CHECK: %[[TOKEN:.*]] = ttng.async_tma_copy_local_to_global
 //  CHECK-SAME: -> !ttg.async.token
 //       CHECK: ttng.async_tma_store_token_wait %[[TOKEN]] : !ttg.async.token

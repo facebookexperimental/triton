@@ -252,6 +252,7 @@ public:
     // This makes reduction the "default" partition in warp_specialize.
     if (options.hasReduction) {
       reductionPartition = schedule.addPartition(0);
+      reductionPartition->setType("reduction");
       defaultPartition = nullptr; // No separate default for bwd
     } else {
       reductionPartition = nullptr;
@@ -259,13 +260,16 @@ public:
       bool needDefault = options.hasCorrection || options.hasEpilogue;
       if (needDefault) {
         defaultPartition = schedule.addPartition(0);
+        defaultPartition->setType("default");
       } else {
         defaultPartition = nullptr;
       }
     }
 
     gemmPartition = schedule.addPartition(1); // stage 1 for MMA
+    gemmPartition->setType("gemm");
     loadPartition = schedule.addPartition(0);
+    loadPartition->setType("load");
 
     // Correction: merge into default partition.
     if (options.hasCorrection)
@@ -275,10 +279,12 @@ public:
 
     // Epilogue: only if there are epilogue stores and not merged into
     // computation.
-    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation)
+    if (options.hasEpilogue && !options.mergeEpilogueIntoComputation) {
       epiloguePartition = schedule.addPartition(0);
-    else
+      epiloguePartition->setType("epilogue");
+    } else {
       epiloguePartition = nullptr;
+    }
 
     // Note: computation partitions are NOT pre-allocated here.
     // They are created dynamically by scheduleUsers() in Phase 5.
@@ -324,9 +330,13 @@ class GEMMTemplate : public SchedulingTemplate {
 public:
   void createPartitions(PartitionSet &schedule) override {
     defaultPartition = schedule.addPartition(0);
+    defaultPartition->setType("default");
     gemmPartition = schedule.addPartition(1);
+    gemmPartition->setType("gemm");
     loadPartition = schedule.addPartition(0);
+    loadPartition->setType("load");
     epiloguePartition = schedule.addPartition(0);
+    epiloguePartition->setType("epilogue");
   }
 
   Partition *getPartition(AbstractPartition absPart,
@@ -892,8 +902,10 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 
     if (hasPartition(user))
       continue;
-    if (!partition)
+    if (!partition) {
       partition = schedule.addPartition(/* stage is unused */ 0);
+      partition->setType("computation");
+    }
     tryScheduleOp(partition, user);
     for (OpOperand &use : user->getUses())
       uses.push_back(&use);
@@ -923,18 +935,23 @@ static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
     OpOperand *use = uses.pop_back_val();
     Operation *user = use->getOwner();
 
-    // Skip if already visited or scheduled.
-    if (!visited.insert(user).second || hasPartition(user))
+    // Skip if already visited.
+    if (!visited.insert(user).second)
       continue;
 
     // Only schedule operations that are outside the loop.
     if (loop->isAncestor(user))
       continue;
 
-    // Schedule this post-loop operation to the epilogue partition.
-    tryScheduleOp(epiloguePartition, user);
+    // Schedule this post-loop operation to the epilogue partition
+    // (skip if already scheduled, e.g. categorized as an epilogue store).
+    if (!hasPartition(user))
+      tryScheduleOp(epiloguePartition, user);
 
-    // Add all users of this operation to process transitively.
+    // Add all users of this operation to process transitively, even if the
+    // op was already scheduled. This ensures ops reachable only through
+    // already-scheduled ops (e.g. TMAStoreTokenWaitOp reachable through
+    // AsyncTMACopyLocalToGlobalOp) still get visited and scheduled.
     for (OpResult result : user->getResults())
       for (OpOperand &nextUse : result.getUses())
         uses.push_back(&nextUse);
@@ -1273,6 +1290,25 @@ getInitialSchedule(scf::ForOp mainLoop,
         }
       }
     }
+
+    // For BWD (hasReduction): tag pre-loop TMEMStoreOp with the reduction
+    // partition index. These ops initialize accumulators (e.g., zeroing dK/dV)
+    // before the loop. Without explicit assignment, they would get pulled
+    // into the gemm partition via token chains to the in-loop MMA, causing
+    // gemm to require >=4 warps (TMEM ops need 4 warps).
+    // We set the attribute directly rather than using schedule.trySchedule
+    // because pre-loop ops must not be added to the partition's ops list
+    // (optimizeSchedule only handles in-loop ops).
+    if (reductionPartition) {
+      Builder b(mainLoop->getContext());
+      for (Operation &op : *mainLoop->getBlock()) {
+        if (&op == mainLoop)
+          break;
+        if (isa<ttng::TMEMStoreOp>(op))
+          op.setAttr(kPartitionAttrName,
+                     b.getDenseI32ArrayAttr({reductionPartition->getIndex()}));
+      }
+    }
   }
 
   //===--------------------------------------------------------------------===//
@@ -1420,6 +1456,9 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // already assigned to a partition.
     auto useCallback = [&](OpResult result, OpOperand &use, unsigned distance) {
       Operation *user = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      // Skip users outside the loop — they are handled by schedulePostLoopOps.
+      if (!user)
+        return;
       if (!hasPartition(user)) {
         // Add the current partition as a def to the cluster.
         opClusters.getOrCreate(user)->defPartitions.insert(&partition);
@@ -1503,7 +1542,28 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // If there are multiple def or sink partitions, don't know what to do.
     // Assign the whole cluster to its own partition.
     if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
+      // For BWD-like kernels (has reduction partition, no epilogue partition),
+      // avoid creating extra partitions which can split pointer-typed ops
+      // across partitions and crash createLocalAlloc. Reuse the existing
+      // computation partition instead.
+      Partition *existingComputation = nullptr;
+      bool hasReduction = false;
+      bool hasEpilogue = false;
+      for (Partition &p : schedule.getPartitions()) {
+        if (p.getType() == "reduction")
+          hasReduction = true;
+        if (p.getType() == "epilogue")
+          hasEpilogue = true;
+        if (p.getType() == "computation")
+          existingComputation = &p;
+      }
+      if (hasReduction && !hasEpilogue && existingComputation) {
+        for (Operation *op : cluster.ops)
+          setPartition(op, existingComputation);
+        continue;
+      }
       Partition *newPartition = schedule.addPartition(0);
+      newPartition->setType("computation");
       for (Operation *op : cluster.ops)
         setPartition(op, newPartition);
       continue;

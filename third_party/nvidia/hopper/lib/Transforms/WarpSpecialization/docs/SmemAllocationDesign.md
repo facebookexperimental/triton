@@ -573,18 +573,18 @@ This interface is unchanged.
 
 ---
 
-## Summary of Changes
+## Design Summary
 
-| Component | Current | Proposed |
-|-----------|---------|----------|
-| Abstraction | Raw `BufferT` + `DenseMap` | `WSBuffer` struct per `local_alloc` |
-| Initial state | Single pass, group by type | Phase 1: unique IDs, all `copy = 1` |
-| Cross-stage | Not considered | Phase 2: force `copy ≥ 2` |
-| Multi-buffering | Unconditional for TMA+innermost | Phase 4: iterative, budget-aware |
-| Reuse | Not done | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2 |
-| Max copies | `numBuffers` param (all-or-nothing) | `num_buffers` param (incremental cap) |
-| Budget | Not checked | Enforced at every iteration |
-| Iteration order | Non-deterministic | Sorted by operation ID |
+| Component | Description |
+|-----------|----------|
+| Abstraction | `WSBuffer` struct per `local_alloc` |
+| Initial state | Phase 1: unique IDs, all `copy = 1` |
+| Cross-stage | Phase 2: force `copy ≥ 2` |
+| Multi-buffering | Phase 4: iterative, budget-aware |
+| Reuse | Pair of 2 same-priority WSBuffers; grouping-first when copies ≥ 2 |
+| Max copies | `num_buffers` param (incremental cap) |
+| Budget | Enforced at every iteration |
+| Iteration order | Sorted by operation ID |
 
 ---
 
@@ -607,12 +607,62 @@ doMemoryPlanner(funcOp, numBuffers)
   └── Step 4: MemoryPlannerTmem::allocateBuffers(lastBufferId)
 ```
 
-## Files to Modify
+## Implementation
 
-| File | Change |
-|------|--------|
-| `WSMemoryPlanner.cpp` — `MemoryPlanner` class | Add `WSBuffer` struct, rewrite `run()` with 5-phase algorithm |
-| `WSMemoryPlanner.cpp` — `doMemoryPlanner` | Pass cross-stage info from Step 1.5 into the planner |
-| `Passes.td` | Add `--smem-budget` and `--smem-circular-reuse` options |
-| `ws_memory_planner_bwd.mlir` | Update CHECK lines for new assignments |
-| `ws_memory_planner_fwd.mlir` | Update CHECK lines similarly |
+**File**: `WSMemoryPlanner.cpp` — `MemoryPlanner` class
+
+The algorithm is implemented in `MemoryPlanner::run()`, with the `WSBuffer`
+struct, cross-stage detection, and budget-aware iteration all within
+`WSMemoryPlanner.cpp`.
+
+---
+
+## Algorithm 0 (Legacy) — Reuse Group Minimum Copy Constraint
+
+Algorithm 0 (`SMEM_ALLOC_ALGO=0`) is the original SMEM allocation path. It
+assigns the same `buffer.id` to all innermost-loop 2D+ SMEM allocations with
+the same element type, and sets `buffer.copy = numBuffers` (= `num_stages`)
+unconditionally.
+
+### The Problem
+
+When data partitioning creates multiple operands that share a single
+`buffer.id`, the number of entries in the reuse group can exceed `numBuffers`.
+The code partition pass computes buffer indices for each entry at position
+`theIdx` as:
+
+```
+bufferIdx = (accumCnt + theIdx) % numBuffers
+```
+
+If `numBuffers < reuse_group_size`, two entries collide on the same buffer
+slot, causing a deadlock. For example, with `DATA_PARTITION_FACTOR=2` and
+`num_stages=2`, a GEMM kernel has 3 SMEM operands per k-tile (a_0, a_1, b)
+sharing `buffer.id=2`. With only 2 buffer slots, entries at `theIdx=0` and
+`theIdx=2` both map to slot 0 on the first iteration, creating a circular
+wait:
+
+```
+Load partition:
+  1. a_0: wait_barrier(slot 0) → succeeds (phase 0, slot free)
+  2. a_1: wait_barrier(slot 1) → succeeds
+  3. b:   wait_barrier(slot 0) → BLOCKS (slot 0 in use by a_0, awaiting MMA)
+
+MMA partition:
+  Needs a_0, a_1, AND b to proceed → BLOCKS (b never loaded)
+
+→ Deadlock: load waits for MMA to free slot 0, MMA waits for b to be loaded.
+```
+
+### The Fix
+
+After the initial `buffer.id` / `buffer.copy` assignment loop, algorithm 0
+enforces:
+
+```
+buffer.copy >= number of entries sharing each buffer.id
+```
+
+This is done by counting entries per `buffer.id` and bumping any `buffer.copy`
+that is too small. For the example above, `buffer.copy` is raised from 2 to 3,
+giving each entry its own slot and eliminating the collision.
