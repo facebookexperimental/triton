@@ -10,7 +10,7 @@
 // B: 2x64x32xf32 = 8192 bytes per buffer
 // distinct total = 16384 + 8192 = 24576 bytes per buffer
 // For A: 24576 % 16384 = 8192 (NOT divisible)
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   tt.func @bytes_between_not_divisible_error() {
@@ -31,7 +31,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // B: 2x64x64xf32 = 16384 bytes per buffer
 // distinct total = 32768 + 16384 = 49152 bytes per buffer
 // For A: 49152 % 32768 = 16384 (not divisible)
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   tt.func @bytes_between_not_divisible_error_2() {
