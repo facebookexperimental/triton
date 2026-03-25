@@ -546,6 +546,7 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     use_early_tma_store_lowering: env_bool = env_bool("TRITON_USE_EARLY_TMA_STORE_LOWERING")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
+    analyze_ttgir_barrier: env_bool = env_bool("TRITON_DUMP_BARRIER_ANALYSIS")
 
 
 class amd_knobs(base_knobs):

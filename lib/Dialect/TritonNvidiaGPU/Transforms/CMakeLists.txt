@@ -1,4 +1,5 @@
 add_triton_library(TritonNvidiaGPUTransforms
+  BarrierAnalysisPass.cpp
   FenceInsertion.cpp
   InterleaveTMem.cpp
   MMALowering.cpp
@@ -17,6 +18,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   TritonNvidiaGPUTransformsIncGen
 
   LINK_LIBS PUBLIC
+  TritonAnalysis
   TritonIR
   TritonGPUIR
   TritonGPUTransforms
