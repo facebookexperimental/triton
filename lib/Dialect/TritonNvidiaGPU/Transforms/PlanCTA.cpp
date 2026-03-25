@@ -398,10 +398,10 @@ void CTAPlanner::processStoreLikeOps(triton::FuncOp &funcOp) {
       stores.push_back(op);
   });
   assert(stores.size() > 0 && "Cannot find store-like ops");
-  auto numWarps = ttg::lookupNumWarps(funcOp);
 
   ttg::CTALayoutAttr CTALayout;
   for (Operation *store : stores) {
+    auto numWarps = ttg::lookupNumWarps(store);
     auto val = [store]() -> Value {
       if (auto descStore =
               dyn_cast<triton::DescriptorStoreLikeOpInterface>(store))
