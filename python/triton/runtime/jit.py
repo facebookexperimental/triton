@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import itertools
+import os
 import threading
 import re
 import textwrap
@@ -542,12 +543,13 @@ class JitFunctionInfo:
 
 
 def compute_cache_key(kernel_key_cache, specialization, options):
-    key = (tuple(specialization), str(options))
+    env_vars = get_cache_invalidating_env_vars()
+    key = (tuple(specialization), str(options), tuple(sorted(env_vars.items())))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
         return cache_key
 
-    cache_key = str(specialization) + str(options)
+    cache_key = str(specialization) + str(options) + str(sorted(env_vars.items()))
     kernel_key_cache[key] = cache_key
     return cache_key
 
@@ -698,6 +700,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
             options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
                                                                     options)
 
+            # Capture kernel argument metadata for TLX benchmark generation
+            if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
+                try:
+                    from triton.tools.tlx_benchmark_gen import capture_kernel_args
+                    capture_kernel_args(bound_args, signature, constexprs, self.params)
+                except Exception:
+                    pass
+
             kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
@@ -718,6 +728,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
             grid_0 = grid[0]
             grid_1 = grid[1] if grid_size > 1 else 1
             grid_2 = grid[2] if grid_size > 2 else 1
+
+            # Capture actual grid values for TLX benchmark generation
+            if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
+                try:
+                    from triton.tools.tlx_benchmark_gen import capture_grid
+                    capture_grid((grid_0, grid_1, grid_2))
+                except Exception:
+                    pass
+
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
             # launch kernel
