@@ -1,5 +1,4 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
 """Pure-Python ctypes-based launcher for Triton CUDA kernels.
 
 Replaces the C-compiled launcher with a Python implementation that uses ctypes
@@ -157,13 +156,9 @@ def _get_device_pointer(obj, idx):
     # Validate pointer is accessible from device
     _init_pointer_validation()
     dev_ptr = c_uint64()
-    status = _cuPointerGetAttribute(
-        ctypes.byref(dev_ptr), _CU_POINTER_ATTRIBUTE_DEVICE_POINTER, c_uint64(ptr)
-    )
+    status = _cuPointerGetAttribute(ctypes.byref(dev_ptr), _CU_POINTER_ATTRIBUTE_DEVICE_POINTER, c_uint64(ptr))
     if status == 1:  # CUDA_ERROR_INVALID_VALUE
-        raise ValueError(
-            f"Pointer argument (at {idx}) cannot be accessed from Triton (cpu tensor?)"
-        )
+        raise ValueError(f"Pointer argument (at {idx}) cannot be accessed from Triton (cpu tensor?)")
     elif status != 0:
         raise RuntimeError(f"cuPointerGetAttribute failed with error {status}")
     # Use the original data_ptr() value directly. The cuPointerGetAttribute call
@@ -203,14 +198,10 @@ def _get_tma_desc_ptr(obj):
         obj_addr = id(obj)
         map_ptr = obj_addr + 128
         if map_ptr % 128 != 0:
-            raise ValueError(
-                f"CUtensorMap must be aligned to 128B, but got address % 128 = {map_ptr % 128}"
-            )
+            raise ValueError(f"CUtensorMap must be aligned to 128B, but got address % 128 = {map_ptr % 128}")
         return map_ptr
-    raise TypeError(
-        f"Expected TMA descriptor object with tma_desc_cpu_ptr() method, "
-        f"got {type(obj).__name__}"
-    )
+    raise TypeError(f"Expected TMA descriptor object with tma_desc_cpu_ptr() method, "
+                    f"got {type(obj).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +261,6 @@ TYPE_MAP = {
     "f32": (ctypes.c_uint32, False, True),
     "fp64": (ctypes.c_uint64, False, True),
 }
-
 
 # ---------------------------------------------------------------------------
 # Python launcher factory
@@ -338,9 +328,7 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             continue
 
         if isinstance(ty, tuple):
-            raise NotImplementedError(
-                "tuple signature arguments are not yet supported in ctypes launcher"
-            )
+            raise NotImplementedError("tuple signature arguments are not yet supported in ctypes launcher")
 
         if idx in constants or ty == "constexpr":
             arg_handlers.append(None)
@@ -419,16 +407,12 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
         # Process global_scratch
         global_scratch = CUdeviceptr(0)
         if global_scratch_obj is not None:
-            global_scratch = CUdeviceptr(
-                _get_device_pointer(global_scratch_obj, -1)
-            )
+            global_scratch = CUdeviceptr(_get_device_pointer(global_scratch_obj, -1))
 
         # Process profile_scratch
         profile_scratch = CUdeviceptr(0)
         if profile_scratch_obj is not None:
-            profile_scratch = CUdeviceptr(
-                _get_device_pointer(profile_scratch_obj, -1)
-            )
+            profile_scratch = CUdeviceptr(_get_device_pointer(profile_scratch_obj, -1))
 
         # Build kernel params array
         # Order: kernel_args..., global_scratch, profile_scratch
@@ -459,9 +443,7 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             actual_gridZ *= clusterDimZ
 
         if launch_pdl:
-            launch_attrs[num_attrs].id = (
-                CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
-            )
+            launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION)
             launch_attrs[num_attrs].value.value = 1
             num_attrs += 1
 
@@ -477,12 +459,8 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             launch_attrs[num_attrs].value.clusterDim.z = clusterDimZ
             num_attrs += 1
 
-            launch_attrs[num_attrs].id = (
-                CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE
-            )
-            launch_attrs[num_attrs].value.clusterSchedulingPolicyPreference = (
-                CU_CLUSTER_SCHEDULING_POLICY_SPREAD
-            )
+            launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE)
+            launch_attrs[num_attrs].value.clusterSchedulingPolicyPreference = (CU_CLUSTER_SCHEDULING_POLICY_SPREAD)
             num_attrs += 1
 
         config = CUlaunchConfig()
@@ -506,9 +484,7 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             None,
         )
         if err != 0:
-            raise RuntimeError(
-                f"Triton Error [CUDA]: cuLaunchKernelEx failed with error code {err}"
-            )
+            raise RuntimeError(f"Triton Error [CUDA]: cuLaunchKernelEx failed with error code {err}")
 
         # Call exit hook
         if launch_exit_hook is not None:

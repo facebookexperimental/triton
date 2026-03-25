@@ -71,9 +71,7 @@ def test_no_compile_launcher_add(device, fresh_triton_cache):
 
 
 @triton.jit(debug=True)
-def _host_tensordesc_load_kernel(
-    out_ptr, desc, M, N, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr
-):
+def _host_tensordesc_load_kernel(out_ptr, desc, M, N, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr):
     block = desc.load([0, 0])
     idx = tl.arange(0, M_BLOCK)[:, None] * N_BLOCK + tl.arange(0, N_BLOCK)[None, :]
     tl.store(out_ptr + idx, block)
@@ -88,13 +86,11 @@ def test_no_compile_launcher_host_tensordesc(device, fresh_triton_cache):
     inp = torch.randn((M, N), device=device, dtype=torch.float16)
     expected = inp[:M_BLOCK, :N_BLOCK].clone()
 
-    inp_desc = TensorDescriptor(
-        inp, shape=inp.shape, strides=inp.stride(), block_shape=[M_BLOCK, N_BLOCK]
-    )
+    inp_desc = TensorDescriptor(inp, shape=inp.shape, strides=inp.stride(), block_shape=[M_BLOCK, N_BLOCK])
 
     # Run with C launcher
     out_c = torch.empty((M_BLOCK, N_BLOCK), device=device, dtype=torch.float16)
-    _host_tensordesc_load_kernel[(1,)](out_c, inp_desc, M, N, M_BLOCK, N_BLOCK)
+    _host_tensordesc_load_kernel[(1, )](out_c, inp_desc, M, N, M_BLOCK, N_BLOCK)
     torch.testing.assert_close(out_c, expected)
 
     # Clear cache and run with ctypes launcher
@@ -102,12 +98,8 @@ def test_no_compile_launcher_host_tensordesc(device, fresh_triton_cache):
 
     with knobs.nvidia.scope():
         knobs.nvidia.use_no_compile_launcher = True
-        out_ctypes = torch.empty(
-            (M_BLOCK, N_BLOCK), device=device, dtype=torch.float16
-        )
-        _host_tensordesc_load_kernel[(1,)](
-            out_ctypes, inp_desc, M, N, M_BLOCK, N_BLOCK
-        )
+        out_ctypes = torch.empty((M_BLOCK, N_BLOCK), device=device, dtype=torch.float16)
+        _host_tensordesc_load_kernel[(1, )](out_ctypes, inp_desc, M, N, M_BLOCK, N_BLOCK)
 
     torch.testing.assert_close(out_ctypes, expected)
     torch.testing.assert_close(out_ctypes, out_c)
@@ -119,9 +111,7 @@ def test_no_compile_launcher_host_tensordesc(device, fresh_triton_cache):
 
 
 @triton.jit
-def _tma_tensordesc_load_kernel(
-    out_ptr, a_ptr, M, N, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr
-):
+def _tma_tensordesc_load_kernel(out_ptr, a_ptr, M, N, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr):
     desc = tl.make_tensor_descriptor(
         a_ptr,
         shape=[M, N],
@@ -144,7 +134,7 @@ def test_no_compile_launcher_tma_tensordesc(device, fresh_triton_cache, with_all
 
     # Run with C launcher
     out_c = torch.empty((M_BLOCK, N_BLOCK), device=device, dtype=torch.float16)
-    _tma_tensordesc_load_kernel[(1,)](out_c, inp, M, N, M_BLOCK, N_BLOCK)
+    _tma_tensordesc_load_kernel[(1, )](out_c, inp, M, N, M_BLOCK, N_BLOCK)
     torch.testing.assert_close(out_c, expected)
 
     # Clear cache and run with ctypes launcher
@@ -152,10 +142,8 @@ def test_no_compile_launcher_tma_tensordesc(device, fresh_triton_cache, with_all
 
     with knobs.nvidia.scope():
         knobs.nvidia.use_no_compile_launcher = True
-        out_ctypes = torch.empty(
-            (M_BLOCK, N_BLOCK), device=device, dtype=torch.float16
-        )
-        _tma_tensordesc_load_kernel[(1,)](out_ctypes, inp, M, N, M_BLOCK, N_BLOCK)
+        out_ctypes = torch.empty((M_BLOCK, N_BLOCK), device=device, dtype=torch.float16)
+        _tma_tensordesc_load_kernel[(1, )](out_ctypes, inp, M, N, M_BLOCK, N_BLOCK)
 
     torch.testing.assert_close(out_ctypes, expected)
     torch.testing.assert_close(out_ctypes, out_c)
