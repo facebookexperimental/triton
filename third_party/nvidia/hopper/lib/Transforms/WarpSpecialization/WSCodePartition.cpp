@@ -2921,6 +2921,7 @@ void insertAsyncComm(
     // Use reuseBarrier=false to find reuse groups even with single-copy
     // buffers.
     Channel *earlyChannelForReuseSync = nullptr;
+    Channel *wrapAroundChannelForReuseSync = nullptr;
     int reuseGrp2 = channelInReuseGroup(masterChannel, config,
                                         /*reuseBarrier=*/false);
     if (reuseGrp2 >= 0 && !producerAcquireForChannelLoop) {
@@ -2999,6 +3000,20 @@ void insertAsyncComm(
               }
               break;
             }
+          }
+          // Wrap-around dependency: the first channel in program order
+          // must wait for the last channel's consumer from the previous
+          // iteration. Without this, the first channel's producer can
+          // overwrite the shared SMEM buffer while the last channel's
+          // TMA is still reading from the previous iteration.
+          if (ordered[0] == masterChannel) {
+            wrapAroundChannelForReuseSync = ordered.back();
+            LLVM_DEBUG({
+              LDBG("N-reuse group: channel "
+                   << masterChannel->uniqID
+                   << " will wrap-around wait on last channel "
+                   << wrapAroundChannelForReuseSync->uniqID);
+            });
           }
         }
       }
@@ -3339,6 +3354,33 @@ void insertAsyncComm(
                    "channel "
                    << masterChannel->uniqID << " waiting on early channel "
                    << earlyChannelForReuseSync->uniqID);
+            });
+          }
+        }
+      }
+
+      // Wrap-around reuse sync: when N>2 channels share a single-buffered
+      // SMEM slot, the first channel in program order must wait for the
+      // last channel's consumer from the PREVIOUS iteration to finish
+      // reading. This uses `phase` (not phaseFlipped) so that after
+      // lowering's XOR the actual wait is on phase^1, which passes on
+      // the first iteration (no previous consumer) and blocks on
+      // subsequent iterations until the last channel's consumer_release
+      // from the previous iteration completes.
+      if (wrapAroundChannelForReuseSync) {
+        auto wrapTokenIt = tokenMap.find(wrapAroundChannelForReuseSync);
+        if (wrapTokenIt != tokenMap.end()) {
+          for (const auto &wrapToken : wrapTokenIt->second.tokens) {
+            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setInsertionPoint(headProducer);
+            builder.setLoopScheduleInfoFromOp(headProducer);
+            auto acquireOp =
+                builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                    headProducer->getLoc(), wrapToken.second, bufferIdx, phase);
+            LLVM_DEBUG({
+              LDBG("Insert wrap-around reuse ProducerAcquireOp for channel "
+                   << masterChannel->uniqID << " waiting on last channel "
+                   << wrapAroundChannelForReuseSync->uniqID);
             });
           }
         }
