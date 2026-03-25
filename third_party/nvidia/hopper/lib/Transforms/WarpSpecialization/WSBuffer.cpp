@@ -18,6 +18,11 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+
+static mlir::Location accumCntLoc(mlir::Location loc) {
+  return mlir::NameLoc::get(
+      mlir::StringAttr::get(loc.getContext(), "accum_cnt"));
+}
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
@@ -125,7 +130,8 @@ static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
     // Either parent[accumCnt] + 1 or parent[accumCnt].
     Value one =
         ifBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-    endAccum = ifBuilder.createWithAsyncTaskIds<arith::AddIOp>(loc, arg, one);
+    endAccum = ifBuilder.createWithAsyncTaskIds<arith::AddIOp>(accumCntLoc(loc),
+                                                               arg, one);
     endAccumElse = arg;
   } else {
     endAccum =
@@ -206,7 +212,8 @@ static Value generateYieldCntsForForOp(scf::ForOp forOp, unsigned accumArgId) {
   builder.setInsertionPoint(yieldOp);
   auto loc = forOp.getLoc();
   Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-  Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(loc, arg, one);
+  Value endAccum =
+      builder.createWithAsyncTaskIds<arith::AddIOp>(accumCntLoc(loc), arg, one);
   return endAccum;
 }
 
@@ -280,8 +287,8 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     // From the last region op, accumulate till before or after "op".
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         loc, before ? opIdx - lastRegionIdx - 1 : opIdx - lastRegionIdx, 64);
-    Value endAccum =
-        builder.createWithAsyncTaskIds<arith::AddIOp>(loc, res, lit);
+    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+        accumCntLoc(loc), res, lit);
     return endAccum;
   }
   // Here lastRegionIdx < 0: we need to start with the accumCnt value at the
@@ -295,8 +302,8 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     Value arg = forOp.getBody()->getArgument(numArgs - tCnts + argIdx);
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         forOp.getLoc(), before ? opIdx : opIdx + 1, 64);
-    Value endAccum =
-        builder.createWithAsyncTaskIds<arith::AddIOp>(forOp.getLoc(), arg, lit);
+    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+        accumCntLoc(forOp.getLoc()), arg, lit);
     return endAccum;
   }
   if (isa<scf::IfOp>(ctrlOp)) {
@@ -310,7 +317,7 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         ctrlOp->getLoc(), before ? opIdx : opIdx + 1, 64);
     Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
-        ctrlOp->getLoc(), startOfIf, lit);
+        accumCntLoc(ctrlOp->getLoc()), startOfIf, lit);
     return endAccum;
   }
   assert(isa<tt::FuncOp>(ctrlOp));
@@ -501,7 +508,8 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
 
   // Step 1: Append accumCnts as forOp arguments.
   for (unsigned i = 0; i < numAccumCnts; i++)
-    body->insertArgument(body->getNumArguments(), builder.getI64Type(), loc);
+    body->insertArgument(body->getNumArguments(), builder.getI64Type(),
+                         accumCntLoc(loc));
 
   // Step 2: Add accumCnts to yieldOp.
   auto yieldOp = llvm::cast<scf::YieldOp>(body->getTerminator());
@@ -526,6 +534,15 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
       loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
       newLoopArgs);
   newForOp.getRegion().takeBody(forOp.getRegion());
+
+  // Set NameLoc("accum_cnt") on the accumCnt block arguments so they are
+  // distinguishable from user-defined iter_args under
+  // --mlir-use-nameloc-as-prefix.
+  unsigned bodyArgSize = newForOp.getBody()->getNumArguments();
+  for (unsigned i = 0; i < numAccumCnts; i++) {
+    auto arg = newForOp.getBody()->getArgument(bodyArgSize - numAccumCnts + i);
+    arg.setLoc(accumCntLoc(loc));
+  }
 
   // Step 5: Copy over the existing attributes.
   // This is needed to preserve tt.warp_specialize.
@@ -570,8 +587,13 @@ void collectRegionsWithChannelsPost(
                              .getResult()
                              .getUsers()) {
           auto *pOp = user->getParentOp();
-          if (auto forOp = dyn_cast<scf::ForOp>(pOp))
+          if (auto forOp = dyn_cast<scf::ForOp>(pOp)) {
+            // Skip loops where the accumulator token is loop-carried —
+            // the buffer doesn't rotate within such loops.
+            if (hasLoopCarriedAccToken(tmemChannel->allocOp, forOp))
+              continue;
             regionsWithChannels.insert(pOp);
+          }
           if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
             regionsWithChannels.insert(pOp);
         }

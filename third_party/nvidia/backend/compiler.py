@@ -381,7 +381,6 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
-            nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
@@ -443,7 +442,13 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
-        if knobs.nvidia.dump_ttgir_to_tlx:
+        tlx_dump_dir = None
+        tlx_saved_fd = None
+        tlx_capture_file = None
+        if knobs.nvidia.dump_tlx_benchmark:
+            from triton.tools.tlx_benchmark_gen import setup_tlx_dump
+            tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
+        elif knobs.nvidia.dump_ttgir_to_tlx:
             tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
@@ -466,6 +471,11 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
         pm.run(mod, 'make_llir')
+
+        # After pm.run(), restore stdout and generate TLX benchmark artifacts
+        if tlx_dump_dir is not None:
+            from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
+            finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it

@@ -6,6 +6,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -253,6 +254,42 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
       }
     }
   } while (changed);
+
+  // Read partition types if available for type-aware warp assignment.
+  SmallVector<StringRef> partitionTypes;
+  if (auto typesAttr =
+          wsOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+    for (Attribute attr : typesAttr) {
+      if (auto strAttr = dyn_cast<StringAttr>(attr))
+        partitionTypes.push_back(strAttr.getValue());
+      else
+        partitionTypes.push_back("");
+    }
+  }
+
+  // Apply type-aware warp assignment overrides BEFORE relayout.
+  // This ensures layouts are computed with the correct warp counts.
+  //
+  // For bwd FA (has reduction): computation partition gets 8 warps.
+  // With reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
+  // total = 14, within the 16 warp budget.
+  //
+  // Note: the types array comes from the scheduler and may be longer than
+  // partitionNumWarps (the WarpSpecializeOp may have fewer regions). We scan
+  // the full types array to detect the BWD pattern, then apply the override
+  // to the last partition (which is computation in BWD).
+  bool hasReduction = false;
+  bool hasComputation = false;
+  for (StringRef type : partitionTypes) {
+    if (type == "reduction")
+      hasReduction = true;
+    if (type == "computation")
+      hasComputation = true;
+  }
+
+  if (hasReduction && hasComputation && !partitionNumWarps.empty()) {
+    partitionNumWarps.back() = 8;
+  }
 
   // Read the attribute from the module
   ModuleOp mod = axisInfo.getModuleOp();

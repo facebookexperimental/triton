@@ -70,6 +70,36 @@ public:
 
       return WalkResult::advance();
     });
+
+    // AsyncTMACopyLocalToGlobalOp reads shared memory via the async proxy.
+    // If the SMEM was written via the generic proxy (e.g. LocalAllocOp with a
+    // source), we need a fence between the write and the TMA store.
+    mod.walk([&](AsyncTMACopyLocalToGlobalOp tmaStoreOp) {
+      Value src = tmaStoreOp.getSrc();
+      SmallVector<Operation *> copyRegToSharedOps = findCopyRegToSharedOps(src);
+      if (copyRegToSharedOps.empty())
+        return WalkResult::advance();
+
+      OpBuilder builder(tmaStoreOp);
+      auto fence = builder.create<FenceAsyncSharedOp>(tmaStoreOp.getLoc(),
+                                                      /*bCluster=*/false);
+      // Try to hoist the fence out of loops if all dependencies are outside.
+      while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
+        if (llvm::any_of(copyRegToSharedOps,
+                         [&](Operation *op) { return loopOp->isAncestor(op); }))
+          break;
+        loopOp.moveOutOfLoop(fence);
+      }
+
+      // If the previous op is already a fence, this one isn't needed.
+      if (auto lastFence =
+              dyn_cast_or_null<FenceAsyncSharedOp>(fence->getPrevNode())) {
+        if (lastFence.getBCluster() == fence.getBCluster())
+          fence.erase();
+      }
+
+      return WalkResult::advance();
+    });
   }
 
 private:
@@ -90,6 +120,17 @@ private:
     visited.insert(operand);
     if (!isa<triton::gpu::MemDescType>(operand.getType()))
       return;
+
+    // Check if any user of this memdesc is a LocalStoreOp, indicating
+    // a generic-proxy write to this buffer. This handles the case where
+    // the buffer was pre-allocated (e.g. by NVGPUWSTMAStoreLowering) and
+    // written via a separate local_store rather than local_alloc with source.
+    for (auto *user : operand.getUsers()) {
+      if (isa<ttg::LocalStoreOp>(user)) {
+        result.insert(user);
+        return;
+      }
+    }
 
     auto op = operand.getDefiningOp();
     if (op) {

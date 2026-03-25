@@ -18,8 +18,9 @@
 //   * Barrier allocations -> tlx.alloc_barriers(count)
 //   * Buffer allocations -> tlx.local_alloc((shape), dtype, count)
 // - Variable name simplification:
-//   * Removes % prefix from SSA names
-//   * Prefixes numeric-only names with "var_" (e.g., %0 -> var_0)
+//   * Uses NameLoc metadata from the Python frontend to recover original
+//     variable names (e.g., %0 -> "Q" if assigned as `Q = tl.load(...)`)
+//   * Falls back to removing % prefix and prefixing numeric names with "var_"
 // - Argument substitution:
 //   * warp_specialize partition args -> original operands
 //   * scf.for outputs -> corresponding iter_args
@@ -59,6 +60,7 @@
 
 #include "IR/Dialect.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -67,6 +69,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "tlx-print-ttgir-to-tlx"
@@ -105,16 +109,15 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Arrive at named hardware barrier"},
 
     // Memory allocation operations - local_alloc is handled specially
-    {"ttng.tmem_alloc", "tlx.tmem_alloc",
-     "Allocate tensor memory buffer (Blackwell)"},
+    // ttng.tmem_alloc: handled specially in printSimplifiedOp
 
     // Memory load/store operations
     {"ttg.local_load", "tlx.local_load",
      "Load from shared memory to registers"},
-    {"ttng.tmem_load", "tlx.tmem_load",
+    {"ttng.tmem_load", "tlx.local_load",
      "Load from tensor memory to registers (Blackwell)"},
     {"ttg.local_store", "tlx.local_store", "Store registers to shared memory"},
-    {"ttng.tmem_store", "tlx.tmem_store",
+    {"ttng.tmem_store", "tlx.local_store",
      "Store registers to tensor memory (Blackwell)"},
     {"ttng.tmem_copy", "tlx.tmem_copy",
      "Copy from shared memory to tensor memory (Blackwell)"},
@@ -125,7 +128,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttg.memdesc_reinterpret", "tlx.local_reinterpret",
      "Reinterpret buffer dtype/shape"},
     {"ttng.tmem_subslice", "tlx.subslice", "TMEM subslice (Blackwell)"},
-    {"ttg.memdesc_index", "tlx.memdesc_index", "Index into memdesc"},
+    {"ttg.memdesc_index", "tlx.local_view", "Index into memdesc"},
 
     // Async copy operations (cp.async)
     {"ttg.async_load", "tlx.async_load",
@@ -167,11 +170,11 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Warp-group MMA (Hopper wgmma.mma_async)"},
     {"ttng.warp_group_dot_wait", "tlx.warp_group_dot_wait",
      "Wait for async dot completion"},
-    {"ttng.tc_gen5_mma", "tlx.tc_gen5_mma",
+    {"ttng.tc_gen5_mma", "tlx.async_dot",
      "Tensor Core Gen5 MMA (Blackwell tcgen05.mma)"},
-    {"ttng.tc_gen5_mma_scaled", "tlx.tc_gen5_mma_scaled",
+    {"ttng.tc_gen5_mma_scaled", "tlx.async_dot_scaled",
      "Scaled FP8 MMA (Blackwell)"},
-    {"ttng.tc_gen5_commit", "tlx.tc_gen5_commit",
+    {"ttng.tc_gen5_commit", "tlx.tcgen05_commit",
      "Commit tcgen05 operations to barrier (Blackwell)"},
 
     // Fence operations
@@ -222,7 +225,7 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.dot", "tl.dot", "Matrix multiply"},
     {"tt.load", "tl.load", "Load from global memory"},
     {"tt.store", "tl.store", "Store to global memory"},
-    {"tt.addptr", "addptr", "Add to pointer"},
+    // tt.addptr: handled as infix + in buildInfixOpMap
     {"tt.make_range", "tl.arange", "Make range"},
     {"tt.trans", "tl.trans", "Transpose"},
     {"tt.reshape", "tl.reshape", "Reshape tensor"},
@@ -274,6 +277,7 @@ llvm::StringMap<StringRef> buildInfixOpMap() {
   map["arith.shli"] = "<<";
   map["arith.shrsi"] = ">>";
   map["arith.shrui"] = ">>";
+  map["tt.addptr"] = "+";
   return map;
 }
 
@@ -350,6 +354,56 @@ llvm::StringMap<StringRef> buildOpNameMap() {
   return map;
 }
 
+// Format a raw SSA name from printAsOperand into a clean variable name.
+static std::string formatSSAName(StringRef raw) {
+  std::string name = raw.str();
+  size_t colonPos = name.find(':');
+  if (colonPos != std::string::npos)
+    name = name.substr(0, colonPos);
+  while (!name.empty() && name.back() == ' ')
+    name.pop_back();
+  if (!name.empty() && name[0] == '%')
+    name = name.substr(1);
+  if (!name.empty() && std::all_of(name.begin(), name.end(),
+                                   [](char c) { return std::isdigit(c); }))
+    name = "var_" + name;
+  return name;
+}
+
+// Thread-local pointer to the value name cache built once per module.
+static DenseMap<Value, std::string> *valueNameCacheStorage = nullptr;
+static DenseMap<Value, std::string> *getValueNameCachePtr() {
+  return valueNameCacheStorage;
+}
+
+// Build a cache mapping each Value to its formatted SSA name.
+// Uses AsmState to perform SSA numbering once for the entire module.
+static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
+  DenseMap<Value, std::string> cache;
+  AsmState asmState(rootOp, OpPrintingFlags().printNameLocAsPrefix(true));
+  rootOp->walk([&](Operation *op) {
+    for (Value result : op->getResults()) {
+      std::string buf;
+      llvm::raw_string_ostream os(buf);
+      result.printAsOperand(os, asmState);
+      os.flush();
+      cache[result] = formatSSAName(buf);
+    }
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region) {
+        for (BlockArgument arg : block.getArguments()) {
+          std::string buf;
+          llvm::raw_string_ostream os(buf);
+          arg.printAsOperand(os, asmState);
+          os.flush();
+          cache[arg] = formatSSAName(buf);
+        }
+      }
+    }
+  });
+  return cache;
+}
+
 // Get simplified name for a value (just the SSA name)
 // If argSubstitutionMap is provided, substitute block args with their mapped
 // values
@@ -369,47 +423,56 @@ getValueName(Value v,
 
   // Pass through convert_layout and type casts: use the input operand's name
   if (Operation *defOp = v.getDefiningOp()) {
+    // Handle ub.poison (undefined values) — emit proper Python default
+    if (defOp->getName().getStringRef() == "ub.poison") {
+      Type type = v.getType();
+      if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+        // Tensor poison: emit tl.full with appropriate init value
+        // Use float('-inf') for float types (common for max-reduce init)
+        std::string shape;
+        llvm::raw_string_ostream shapeOs(shape);
+        shapeOs << "[";
+        for (int64_t i = 0; i < tensorType.getRank(); ++i) {
+          if (i > 0)
+            shapeOs << ", ";
+          shapeOs << tensorType.getShape()[i];
+        }
+        shapeOs << "]";
+        if (tensorType.getElementType().isF32() ||
+            tensorType.getElementType().isBF16() ||
+            tensorType.getElementType().isF16())
+          return "tl.full(" + shape + ", float('-inf'), tl.float32)";
+        return "tl.zeros(" + shape + ", tl.int32)";
+      }
+      if (type.isF32() || type.isBF16() || type.isF16())
+        return "float('-inf')";
+      if (type.isInteger(32))
+        return "0";
+      return "None";
+    }
+
     static const llvm::StringSet<> transparentOps = {
         "ttg.convert_layout", "arith.extui",   "arith.extsi",
         "arith.extf",         "arith.trunci",  "arith.truncf",
         "arith.sitofp",       "arith.uitofp",  "arith.fptosi",
         "arith.fptoui",       "arith.bitcast", "arith.index_cast",
-        "arith.index_castui",
+        "arith.index_castui", "tt.splat",      "tt.broadcast",
     };
     if (transparentOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
       return getValueName(defOp->getOperand(0), argSubstitutionMap,
                           inlineConstants);
     }
-  }
 
-  // Inline constants: if this value is defined by arith.constant, return the
-  // literal value
-  if (inlineConstants) {
-    if (Operation *defOp = v.getDefiningOp()) {
-      if (defOp->getName().getStringRef() == "arith.constant") {
-        if (auto valueAttr = defOp->getAttr("value")) {
-          std::string result;
-          llvm::raw_string_ostream os(result);
-          if (auto intAttr = dyn_cast<IntegerAttr>(valueAttr)) {
-            if (intAttr.getType().isInteger(1)) {
-              os << (intAttr.getValue().getBoolValue() ? "True" : "False");
-            } else {
-              os << intAttr.getValue();
-            }
-          } else if (auto floatAttr = dyn_cast<FloatAttr>(valueAttr)) {
-            SmallString<16> str;
-            floatAttr.getValue().toString(str);
-            os << str;
-          } else {
-            // Fall through to normal name handling for unsupported constant
-            // types
-            goto normal_name;
-          }
-          os.flush();
-          return result;
-        }
-      }
+    // Inline memdesc_index(buf, idx) as buf[idx]
+    if (defOp->getName().getStringRef() == "ttg.memdesc_index" &&
+        defOp->getNumOperands() == 2) {
+      return getValueName(defOp->getOperand(0), argSubstitutionMap,
+                          inlineConstants) +
+             "[" +
+             getValueName(defOp->getOperand(1), argSubstitutionMap,
+                          inlineConstants) +
+             "]";
     }
   }
 
@@ -444,28 +507,13 @@ getValueName(Value v,
   }
 
 normal_name:
-  std::string name;
-  llvm::raw_string_ostream os(name);
-  v.printAsOperand(os, OpPrintingFlags());
-  os.flush();
-  // Remove type info if present (after ':')
-  size_t colonPos = name.find(':');
-  if (colonPos != std::string::npos) {
-    name = name.substr(0, colonPos);
+  // Look up from pre-built cache to avoid O(N) SSA renumbering per call.
+  if (auto *cache = getValueNameCachePtr()) {
+    auto it = cache->find(v);
+    if (it != cache->end())
+      return it->second;
   }
-  // Trim whitespace
-  while (!name.empty() && name.back() == ' ')
-    name.pop_back();
-  // Remove % prefix
-  if (!name.empty() && name[0] == '%') {
-    name = name.substr(1);
-  }
-  // If name is all digits, prefix with "var_"
-  if (!name.empty() && std::all_of(name.begin(), name.end(),
-                                   [](char c) { return std::isdigit(c); })) {
-    name = "var_" + name;
-  }
-  return name;
+  return "unknown";
 }
 
 // Print a constant value
@@ -482,10 +530,44 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
     floatAttr.getValue().toString(str);
     os << str;
   } else if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
-    // For dense tensors, print a summary
+    // For dense tensors, print as tl.full() for splats
     if (denseAttr.isSplat()) {
-      os << "splat(";
-      printConstantValue(denseAttr.getSplatValue<Attribute>(), os);
+      auto tensorType = denseAttr.getType();
+      os << "tl.full([";
+      for (int64_t i = 0; i < tensorType.getRank(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << tensorType.getShape()[i];
+      }
+      os << "], ";
+      // Print the splat value
+      auto splatAttr = denseAttr.getSplatValue<Attribute>();
+      if (auto floatVal = dyn_cast<FloatAttr>(splatAttr)) {
+        auto apFloat = floatVal.getValue();
+        if (apFloat.isInfinity() && apFloat.isNegative())
+          os << "float('-inf')";
+        else if (apFloat.isInfinity())
+          os << "float('inf')";
+        else {
+          SmallString<16> str;
+          apFloat.toString(str);
+          os << str;
+        }
+      } else {
+        printConstantValue(splatAttr, os);
+      }
+      os << ", ";
+      Type et = tensorType.getElementType();
+      if (et.isF32())
+        os << "tl.float32";
+      else if (et.isBF16())
+        os << "tl.bfloat16";
+      else if (et.isF16())
+        os << "tl.float16";
+      else if (et.isInteger(32))
+        os << "tl.int32";
+      else
+        os << "tl.float32";
       os << ")";
     } else {
       os << "dense<...>";
@@ -501,23 +583,23 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
 // Get element type name as a simple string
 std::string getElementTypeName(Type type) {
   if (type.isF32())
-    return "f32";
+    return "tl.float32";
   if (type.isF16())
-    return "f16";
+    return "tl.float16";
   if (type.isBF16())
-    return "bf16";
+    return "tl.bfloat16";
   if (type.isF64())
-    return "f64";
+    return "tl.float64";
   if (type.isInteger(1))
-    return "i1";
+    return "tl.int1";
   if (type.isInteger(8))
-    return "i8";
+    return "tl.int8";
   if (type.isInteger(16))
-    return "i16";
+    return "tl.int16";
   if (type.isInteger(32))
-    return "i32";
+    return "tl.int32";
   if (type.isInteger(64))
-    return "i64";
+    return "tl.int64";
   // Fallback
   std::string str;
   llvm::raw_string_ostream os(str);
@@ -583,14 +665,21 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
     } else {
       // Regular buffer allocation
       info.isBarrierAlloc = false;
-      // Shape format: first dim is buffer count, rest is actual shape
-      // E.g., <1x128x128xbf16> -> count=1, shape=(128,128)
+      // Shape format: for 3D+ shapes, first dim is buffer count,
+      // rest is actual shape.
+      // E.g., <2x128x128xbf16> -> count=2, shape=(128,128)
       // E.g., <3x128x64xf32> -> count=3, shape=(128,64)
-      if (shape.size() >= 2) {
+      // For 2D shapes, it's a single buffer (count=1).
+      // E.g., <128x128xbf16> -> count=1, shape=(128,128)
+      if (shape.size() >= 3) {
         info.bufferCount = shape[0];
         for (size_t i = 1; i < shape.size(); ++i) {
           info.shape.push_back(shape[i]);
         }
+      } else if (shape.size() == 2) {
+        info.bufferCount = 1;
+        info.shape.push_back(shape[0]);
+        info.shape.push_back(shape[1]);
       } else if (shape.size() == 1) {
         info.bufferCount = 1;
         info.shape.push_back(shape[0]);
@@ -603,6 +692,7 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
 
 // Check if an operation should be skipped because it's folded into
 // a barrier alloc or not meaningful in TLX output
+static bool isModuloIntermediateMul(Operation *mulOp);
 bool shouldSkipOp(Operation *op,
                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
                   llvm::DenseSet<Operation *> &skippedOps) {
@@ -629,41 +719,24 @@ bool shouldSkipOp(Operation *op,
       "arith.sitofp",       "arith.uitofp",
       "arith.fptosi",       "arith.fptoui",
       "arith.bitcast",      "arith.index_cast",
-      "arith.index_castui",
+      "arith.index_castui", "ttng.inval_barrier",
+      "tt.splat",           "tt.broadcast",
+      "ttg.memdesc_index",
   };
   if (opsToSkip.contains(opName)) {
+    // Don't skip arith.constant with DenseElementsAttr (tensor splat constants)
+    // — they need to be printed as explicit tl.full() assignments
+    if (opName == "arith.constant") {
+      if (auto valueAttr = op->getAttr("value")) {
+        if (isa<DenseElementsAttr>(valueAttr))
+          return false; // Don't skip — needs explicit assignment
+      }
+    }
     return true;
   }
 
-  // Skip memdesc_index that are only used by init_barrier for barrier allocs
-  if (opName == "ttg.memdesc_index") {
-    // Check if operand comes from a barrier alloc
-    if (op->getNumOperands() > 0) {
-      Value src = op->getOperand(0);
-      if (Operation *srcOp = src.getDefiningOp()) {
-        if (srcOp->getName().getStringRef() == "ttg.local_alloc") {
-          auto it = allocInfoMap.find(srcOp);
-          if (it != allocInfoMap.end() && it->second.isBarrierAlloc) {
-            // Check if all uses of this memdesc_index are init_barrier
-            bool allUsesAreInitBarrier = true;
-            for (Value result : op->getResults()) {
-              for (Operation *user : result.getUsers()) {
-                if (user->getName().getStringRef() != "ttng.init_barrier") {
-                  allUsesAreInitBarrier = false;
-                  break;
-                }
-              }
-              if (!allUsesAreInitBarrier)
-                break;
-            }
-            if (allUsesAreInitBarrier) {
-              return true;
-            }
-          }
-        }
-      }
-    }
-  }
+  if (isModuloIntermediateMul(op))
+    return true;
 
   return skippedOps.count(op) > 0;
 }
@@ -683,6 +756,64 @@ static Value resolveThroughCasts(Value v) {
       break;
   }
   return v;
+}
+
+// Check if an arith.muli is an intermediate op in a modulo pattern:
+//   a = X // N; b = a * N; c = X - b  (i.e. c = X % N)
+// Returns true if the muli should be skipped.
+static bool isModuloIntermediateMul(Operation *mulOp) {
+  if (mulOp->getName().getStringRef() != "arith.muli" ||
+      mulOp->getNumOperands() != 2 || !mulOp->getResult(0).hasOneUse())
+    return false;
+
+  Value divResult = mulOp->getOperand(0);
+  Value N_mul = mulOp->getOperand(1);
+  auto *divOp = divResult.getDefiningOp();
+  if (!divOp || divOp->getNumOperands() != 2)
+    return false;
+  StringRef divName = divOp->getName().getStringRef();
+  if (divName != "arith.divsi" && divName != "arith.divui")
+    return false;
+
+  Value X_div = divOp->getOperand(0);
+  Value N_div = divOp->getOperand(1);
+  if (N_mul != N_div)
+    return false;
+
+  // Check the single user is arith.subi with X as operand 0
+  Operation *subOp = *mulOp->getResult(0).getUsers().begin();
+  if (subOp->getName().getStringRef() != "arith.subi" ||
+      subOp->getNumOperands() != 2)
+    return false;
+  return subOp->getOperand(0) == X_div &&
+         subOp->getOperand(1) == mulOp->getResult(0);
+}
+
+// Check if an arith.subi matches a modulo pattern:
+//   a = X // N; b = a * N; c = X - b  →  c = X % N
+// If so, returns true and sets X and N.
+static bool isModuloSub(Operation *subOp, Value &X, Value &N) {
+  if (subOp->getName().getStringRef() != "arith.subi" ||
+      subOp->getNumOperands() != 2)
+    return false;
+
+  X = subOp->getOperand(0);
+  Value mulResult = subOp->getOperand(1);
+  auto *mulOp = mulResult.getDefiningOp();
+  if (!mulOp || mulOp->getName().getStringRef() != "arith.muli" ||
+      mulOp->getNumOperands() != 2)
+    return false;
+
+  Value divResult = mulOp->getOperand(0);
+  N = mulOp->getOperand(1);
+  auto *divOp = divResult.getDefiningOp();
+  if (!divOp || divOp->getNumOperands() != 2)
+    return false;
+  StringRef divName = divOp->getName().getStringRef();
+  if (divName != "arith.divsi" && divName != "arith.divui")
+    return false;
+
+  return divOp->getOperand(0) == X && divOp->getOperand(1) == N;
 }
 
 // Forward declarations
@@ -769,8 +900,50 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
 
     for (unsigned j = 0; j < indent; ++j)
       os << "  ";
-    os << getValueName(iterArg, argSubstitutionMap) << " = "
-       << getValueName(initValue, argSubstitutionMap) << "\n";
+    os << getValueName(iterArg, argSubstitutionMap) << " = ";
+
+    // Resolve init value through the FULL substitution chain
+    Value resolved = initValue;
+    if (argSubstitutionMap) {
+      auto mapIt = argSubstitutionMap->find(resolved);
+      if (mapIt != argSubstitutionMap->end())
+        resolved = mapIt->second;
+    }
+    // Check if the resolved value is a warp specialize captured block
+    // argument with tensor/float type — these are undefined in Python scope
+    // and need proper initialization (e.g., from ub.poison in the TTIR).
+    // Detect by checking: no defining op + is BlockArgument + is tensor/f32
+    bool needsInit = false;
+    if (!resolved.getDefiningOp() && isa<BlockArgument>(resolved)) {
+      Type type = resolved.getType();
+      if (isa<RankedTensorType>(type) || type.isF32())
+        needsInit = true;
+    }
+    // Also check if defining op is ub.poison
+    if (auto defOp = resolved.getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "ub.poison")
+        needsInit = true;
+    }
+
+    if (needsInit) {
+      Type type = resolved.getType();
+      if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+        os << "tl.full([";
+        for (int64_t d = 0; d < tensorType.getRank(); ++d) {
+          if (d > 0)
+            os << ", ";
+          os << tensorType.getShape()[d];
+        }
+        os << "], float('-inf'), tl.float32)";
+      } else if (type.isF32()) {
+        os << "float('-inf')";
+      } else {
+        os << "0";
+      }
+    } else {
+      os << getValueName(initValue, argSubstitutionMap);
+    }
+    os << "\n";
   }
 
   // Print the for loop header
@@ -782,9 +955,13 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
      << getValueName(upperBound, argSubstitutionMap) << ", "
      << getValueName(step, argSubstitutionMap) << "):\n";
 
-  // Print the body
+  // Print the body, passing iter_args as yield targets so scf.yield prints
+  // assignments updating the iter_args at the end of each iteration.
+  SmallVector<Value> yieldTargets;
+  for (unsigned i = 0; i < numIterArgs; ++i)
+    yieldTargets.push_back(entryBlock.getArgument(1 + i));
   printRegion(bodyRegion, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
-              argSubstitutionMap);
+              argSubstitutionMap, yieldTargets);
 }
 
 // Print scf.if with yield-to-assignment conversion
@@ -893,10 +1070,20 @@ void printWarpSpecialize(
           if (innerOp.getName().getStringRef() ==
               "ttg.warp_specialize.partitions") {
             // Each region in warp_specialize.partitions is a partition
+            unsigned partitionIdx = 0;
+            ArrayRef<int32_t> partNumWarps;
+            if (auto nwAttr =
+                    op->getAttrOfType<DenseI32ArrayAttr>("partitionNumWarps"))
+              partNumWarps = nwAttr.asArrayRef();
+            std::optional<ArrayRef<int32_t>> partRegs;
+            if (auto regAttr =
+                    op->getAttrOfType<DenseI32ArrayAttr>("requestedRegisters"))
+              partRegs = regAttr.asArrayRef();
             for (Region &partitionRegion : innerOp.getRegions()) {
               // Skip empty partitions (only contain skipped ops)
               if (!regionHasMeaningfulOps(partitionRegion, allocInfoMap,
                                           skippedOps)) {
+                partitionIdx++;
                 continue;
               }
 
@@ -911,14 +1098,22 @@ void printWarpSpecialize(
                 }
               }
 
-              // Print indentation and "with tlx.async_task():"
+              // Print "with tlx.async_task(num_warps=N, registers=R):"
               for (unsigned i = 0; i < indent + 1; ++i)
                 os << "  ";
-              os << "with tlx.async_task():\n";
+              os << "with tlx.async_task(";
+              if (partitionIdx < partNumWarps.size())
+                os << "num_warps=" << partNumWarps[partitionIdx];
+              else
+                os << "num_warps=1";
+              if (partRegs && partitionIdx < partRegs->size())
+                os << ", registers=" << (*partRegs)[partitionIdx];
+              os << "):\n";
 
               // Print partition contents
               printRegion(partitionRegion, os, opNameMap, allocInfoMap,
                           skippedOps, indent + 2, &argSubstitutionMap);
+              partitionIdx++;
             }
           }
         }
@@ -926,6 +1121,50 @@ void printWarpSpecialize(
     }
     regionIdx++;
   }
+}
+
+// Extract source location string (basename:line) from an MLIR Location.
+// Recursively unwraps NameLoc, CallSiteLoc, FusedLoc to find the underlying
+// FileLineColLoc.
+std::string getLocString(Location loc) {
+  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
+    StringRef filename = fileLoc.getFilename().getValue();
+    size_t lastSlash = filename.rfind('/');
+    if (lastSlash != StringRef::npos)
+      filename = filename.substr(lastSlash + 1);
+    return (filename + ":" + Twine(fileLoc.getLine())).str();
+  }
+  if (auto nameLoc = dyn_cast<NameLoc>(loc)) {
+    return getLocString(nameLoc.getChildLoc());
+  }
+  if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc)) {
+    std::string result = getLocString(callSiteLoc.getCallee());
+    if (!result.empty())
+      return result;
+    return getLocString(callSiteLoc.getCaller());
+  }
+  if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+    for (Location subLoc : fusedLoc.getLocations()) {
+      std::string result = getLocString(subLoc);
+      if (!result.empty())
+        return result;
+    }
+  }
+  return "";
+}
+
+// Print "  # filename:line\n" comment suffix for an operation, or just "\n"
+// if location is unknown.
+void printLocComment(Operation *op, llvm::raw_ostream &os) {
+  StringRef opName = op->getName().getStringRef();
+  // memdesc_index is a compiler-generated lowering op whose inherited
+  // MLIR location does not correspond to user-written Python code.
+  if (opName != "ttg.memdesc_index") {
+    std::string loc = getLocString(op->getLoc());
+    if (!loc.empty())
+      os << "  # " << loc;
+  }
+  os << "\n";
 }
 
 // Print operation in simplified TLX format
@@ -950,7 +1189,7 @@ void printSimplifiedOp(
     } else {
       os << "const";
     }
-    os << "\n";
+    printLocComment(op, os);
     return;
   }
 
@@ -967,7 +1206,20 @@ void printSimplifiedOp(
           os << ", ";
         os << shape[i];
       }
-      os << "])\n";
+      os << "])";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // Special handling for modulo pattern: x - (x // N * N) → x % N
+  {
+    Value X, N;
+    if (isModuloSub(op, X, N)) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+         << getValueName(X, argSubstitutionMap) << " % "
+         << getValueName(N, argSubstitutionMap);
+      printLocComment(op, os);
       return;
     }
   }
@@ -981,7 +1233,8 @@ void printSimplifiedOp(
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
          << getValueName(op->getOperand(0), argSubstitutionMap) << " "
          << infixIt->second << " "
-         << getValueName(op->getOperand(1), argSubstitutionMap) << "\n";
+         << getValueName(op->getOperand(1), argSubstitutionMap);
+      printLocComment(op, os);
       return;
     }
   }
@@ -990,7 +1243,8 @@ void printSimplifiedOp(
   if (opName == "arith.negf" && op->getNumOperands() == 1 &&
       op->getNumResults() > 0) {
     os << getValueName(op->getResult(0), argSubstitutionMap) << " = -"
-       << getValueName(op->getOperand(0), argSubstitutionMap) << "\n";
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    printLocComment(op, os);
     return;
   }
 
@@ -1003,9 +1257,30 @@ void printSimplifiedOp(
                                                  : getCmpFOperator(pred);
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
          << getValueName(op->getOperand(0), argSubstitutionMap) << " " << cmpOp
-         << " " << getValueName(op->getOperand(1), argSubstitutionMap) << "\n";
+         << " " << getValueName(op->getOperand(1), argSubstitutionMap);
+      printLocComment(op, os);
       return;
     }
+  }
+
+  // Special handling for tmem_subslice - print with N offset and output size
+  if (opName == "ttng.tmem_subslice" && op->getNumResults() > 0) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    os << "tlx.subslice(";
+    os << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto nAttr = op->getAttrOfType<IntegerAttr>("N")) {
+      os << ", " << nAttr.getInt();
+    }
+    if (auto memDescType =
+            dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
+      ArrayRef<int64_t> shape = memDescType.getShape();
+      if (!shape.empty()) {
+        os << ", " << shape.back();
+      }
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
   }
 
   // Special handling for local_alloc
@@ -1018,7 +1293,8 @@ void printSimplifiedOp(
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")\n";
+        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        printLocComment(op, os);
         return;
       } else {
         // Print as tlx.local_alloc((shape), dtype, count)
@@ -1031,11 +1307,365 @@ void printSimplifiedOp(
             os << ", ";
           os << info.shape[i];
         }
+        if (info.shape.size() == 1)
+          os << ","; // trailing comma for single-element tuple
         os << "), " << getElementTypeName(info.elementType) << ", "
-           << info.bufferCount << ")\n";
+           << info.bufferCount << ")";
+        printLocComment(op, os);
         return;
       }
     }
+  }
+
+  // === Special-case handlers for ops needing custom printing ===
+
+  // tt.get_program_id: emit tl.program_id(axis=N)
+  if (opName == "tt.get_program_id") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.program_id(axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.make_range: emit tl.arange(start, end)
+  if (opName == "tt.make_range") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int64_t start = 0, end = 0;
+    if (auto startAttr = op->getAttrOfType<IntegerAttr>("start"))
+      start = startAttr.getInt();
+    if (auto endAttr = op->getAttrOfType<IntegerAttr>("end"))
+      end = endAttr.getInt();
+    os << "tl.arange(" << start << ", " << end << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.expand_dims: emit tl.expand_dims(src, axis=N)
+  if (opName == "tt.expand_dims") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    int axis = 0;
+    if (auto axisAttr = op->getAttrOfType<IntegerAttr>("axis"))
+      axis = axisAttr.getInt();
+    os << "tl.expand_dims("
+       << getValueName(op->getOperand(0), argSubstitutionMap)
+       << ", axis=" << axis << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttg.local_store: swap arg order (MLIR has src,dst; Python needs dst,src)
+  // Also add .to(dtype) cast when the resolved source value's element type
+  // differs from destination (transparent cast ops may resolve names to
+  // pre-cast values while MLIR types show post-cast types)
+  if (opName == "ttg.local_store") {
+    Value src = op->getOperand(0);
+    Value dst = op->getOperand(1);
+    std::string srcName = getValueName(src, argSubstitutionMap);
+    std::string dstName = getValueName(dst, argSubstitutionMap);
+
+    // Check if destination is a 2D local_alloc (emitted as count=1 in Python)
+    // which needs local_view(buf, 0) to drop the count prefix
+    if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType())) {
+      if (dstMemType.getRank() == 2) {
+        // Check if dst is defined by local_alloc (not memdesc_index)
+        if (Operation *defOp = dst.getDefiningOp()) {
+          if (defOp->getName().getStringRef() == "ttg.local_alloc") {
+            dstName = "tlx.local_view(" + dstName + ", 0)";
+          }
+        }
+      }
+    }
+
+    // Check if transparent ops resolve the source name to a different-dtype
+    // value. Resolve through casts to find the actual Python-level type.
+    Value resolvedSrc = resolveThroughCasts(src);
+    Type dstElemType;
+    Type resolvedSrcElemType;
+    if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
+      dstElemType = dstMemType.getElementType();
+    if (auto resolvedType = dyn_cast<RankedTensorType>(resolvedSrc.getType()))
+      resolvedSrcElemType = resolvedType.getElementType();
+
+    os << "tlx.local_store(" << dstName << ", " << srcName;
+    if (dstElemType && resolvedSrcElemType &&
+        resolvedSrcElemType != dstElemType) {
+      os << ".to(" << getElementTypeName(dstElemType) << ")";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.tmem_store: emit local_store(dst, src), drop pred/dep
+  // Also add .to(dtype) cast when resolved element types differ
+  if (opName == "ttng.tmem_store") {
+    Value dst = op->getOperand(0);
+    Value src = op->getOperand(1);
+    std::string srcName = getValueName(src, argSubstitutionMap);
+
+    Value resolvedSrc = resolveThroughCasts(src);
+    Type dstElemType;
+    Type resolvedSrcElemType;
+    if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
+      dstElemType = dstMemType.getElementType();
+    if (auto resolvedType = dyn_cast<RankedTensorType>(resolvedSrc.getType()))
+      resolvedSrcElemType = resolvedType.getElementType();
+
+    os << "tlx.local_store(" << getValueName(dst, argSubstitutionMap) << ", "
+       << srcName;
+    if (dstElemType && resolvedSrcElemType &&
+        resolvedSrcElemType != dstElemType) {
+      os << ".to(" << getElementTypeName(dstElemType) << ")";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.barrier_expect: emit barrier_expect_bytes(bar, SIZE)
+  if (opName == "ttng.barrier_expect") {
+    os << "tlx.barrier_expect_bytes("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto sizeAttr = op->getAttrOfType<IntegerAttr>("size"))
+      os << ", " << sizeAttr.getInt();
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.wait_barrier: emit barrier_wait(bar, phase) without pred
+  if (opName == "ttng.wait_barrier" && op->getNumOperands() >= 2) {
+    os << "tlx.barrier_wait("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_tma_copy_global_to_local: reorder args for Python API
+  // TTGIR operands: desc, coords..., result_buf, barrier, pred
+  // Python API: async_descriptor_load(desc, result_buf, [coords], barrier)
+  if (opName == "ttng.async_tma_copy_global_to_local") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    Value desc = op->getOperand(0);
+    SmallVector<Value> coords;
+    Value barrier, result;
+    for (unsigned i = 1; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (auto memType = dyn_cast<ttg::MemDescType>(v.getType())) {
+        // Distinguish barrier (1xi64) from result buffer by element type
+        if (memType.getElementType().isInteger(64))
+          barrier = v;
+        else
+          result = v;
+      } else if (!v.getType().isInteger(1)) {
+        coords.push_back(v);
+      }
+    }
+    os << "tlx.async_descriptor_load(" << getValueName(desc, argSubstitutionMap)
+       << ", " << getValueName(result, argSubstitutionMap) << ", [";
+    for (size_t i = 0; i < coords.size(); ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(coords[i], argSubstitutionMap);
+    }
+    os << "], " << getValueName(barrier, argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_tma_copy_local_to_global: reorder args for Python API
+  // Also wrap 2D local_alloc sources with local_view to match shape
+  if (opName == "ttng.async_tma_copy_local_to_global") {
+    Value desc = op->getOperand(0);
+    SmallVector<Value> coords;
+    Value src;
+    for (unsigned i = 1; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (isa<ttg::MemDescType>(v.getType()))
+        src = v;
+      else
+        coords.push_back(v);
+    }
+    // Check if source is a 2D local_alloc (emitted as count=1 in Python,
+    // needs local_view to drop the count prefix for TMA descriptor)
+    std::string srcName = getValueName(src, argSubstitutionMap);
+    if (auto srcMemType = dyn_cast<ttg::MemDescType>(src.getType())) {
+      if (srcMemType.getRank() == 2) {
+        Value resolved = src;
+        if (argSubstitutionMap) {
+          auto it = argSubstitutionMap->find(resolved);
+          if (it != argSubstitutionMap->end())
+            resolved = it->second;
+        }
+        if (Operation *defOp = resolved.getDefiningOp()) {
+          if (defOp->getName().getStringRef() == "ttg.local_alloc") {
+            srcName = "tlx.local_view(" + srcName + ", 0)";
+          }
+        }
+      }
+    }
+    os << "tlx.async_descriptor_store("
+       << getValueName(desc, argSubstitutionMap) << ", " << srcName << ", [";
+    for (size_t i = 0; i < coords.size(); ++i) {
+      if (i > 0)
+        os << ", ";
+      os << getValueName(coords[i], argSubstitutionMap);
+    }
+    os << "])";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tma_store_wait: emit with pendings attribute
+  if (opName == "ttng.tma_store_wait" ||
+      opName == "ttng.async_tma_store_wait") {
+    int pendings = 0;
+    if (auto pendingsAttr = op->getAttrOfType<IntegerAttr>("pendings"))
+      pendings = pendingsAttr.getInt();
+    os << "tlx.async_descriptor_store_wait(" << pendings << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.tc_gen5_mma: emit async_dot with named kwargs
+  if (opName == "ttng.tc_gen5_mma") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    os << "tlx.async_dot("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(2), argSubstitutionMap);
+    if (auto segSizes =
+            op->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes")) {
+      ArrayRef<int32_t> sizes = segSizes.asArrayRef();
+      int idx = 3 + sizes[3]; // skip a,b,d,acc_dep
+      os << ", use_acc="
+         << getValueName(op->getOperand(idx), argSubstitutionMap);
+      idx += 2; // skip useD, pred
+      int numBarriers = sizes[6];
+      if (numBarriers > 0) {
+        os << ", mBarriers=[";
+        for (int i = 0; i < numBarriers; ++i) {
+          if (i > 0)
+            os << ", ";
+          os << getValueName(op->getOperand(idx + i), argSubstitutionMap);
+        }
+        os << "]";
+      }
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.tc_gen5_commit: emit tcgen05_commit(barrier)
+  if (opName == "ttng.tc_gen5_commit") {
+    os << "tlx.tcgen05_commit("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.fence: emit tlx.fence("scope")
+  if (opName == "ttng.fence") {
+    if (auto scopeAttr = op->getAttrOfType<StringAttr>("scope"))
+      os << "tlx.fence(\"" << scopeAttr.getValue() << "\")";
+    else
+      os << "tlx.fence(\"gpu\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.fence_async_shared: emit tlx.fence("async_shared")
+  if (opName == "ttng.fence_async_shared") {
+    os << "tlx.fence(\"async_shared\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttg.memdesc_reinterpret: emit local_alloc with reuse= when dtype or shape
+  // differs
+  if (opName == "ttg.memdesc_reinterpret" && op->getNumResults() > 0) {
+    auto srcType = dyn_cast<ttg::MemDescType>(op->getOperand(0).getType());
+    auto dstType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+    if (srcType && dstType) {
+      bool dtypeDiffers = srcType.getElementType() != dstType.getElementType();
+      bool shapeDiffers = srcType.getShape() != dstType.getShape();
+      if (dtypeDiffers || shapeDiffers) {
+        ArrayRef<int64_t> shape = dstType.getShape();
+        Type elemType = dstType.getElementType();
+        int64_t count = 1;
+        SmallVector<int64_t> actualShape;
+        if (shape.size() >= 2) {
+          count = shape[0];
+          for (size_t i = 1; i < shape.size(); ++i)
+            actualShape.push_back(shape[i]);
+        } else if (shape.size() == 1) {
+          actualShape.push_back(shape[0]);
+        }
+        // Emit local_alloc with reuse= for dtype or shape changes
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+        os << "tlx.local_alloc((";
+        for (size_t i = 0; i < actualShape.size(); ++i) {
+          if (i > 0)
+            os << ", ";
+          os << actualShape[i];
+        }
+        if (actualShape.size() == 1)
+          os << ","; // trailing comma for single-element tuple
+        os << "), " << getElementTypeName(elemType) << ", " << count
+           << ", tlx.storage_kind.tmem, reuse="
+           << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+      } else {
+        // Same dtype and shape: emit as alias
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+           << getValueName(op->getOperand(0), argSubstitutionMap);
+      }
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // ttng.tmem_alloc: emit tlx.local_alloc with tmem storage
+  if (opName == "ttng.tmem_alloc") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    if (auto memDescType =
+            dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
+      ArrayRef<int64_t> shape = memDescType.getShape();
+      Type elemType = memDescType.getElementType();
+      int64_t count = 1;
+      SmallVector<int64_t> actualShape;
+      if (shape.size() >= 2) {
+        count = shape[0];
+        for (size_t i = 1; i < shape.size(); ++i)
+          actualShape.push_back(shape[i]);
+      } else if (shape.size() == 1) {
+        actualShape.push_back(shape[0]);
+      }
+      os << "tlx.local_alloc((";
+      for (size_t i = 0; i < actualShape.size(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << actualShape[i];
+      }
+      if (actualShape.size() == 1)
+        os << ","; // trailing comma for single-element tuple
+      os << "), " << getElementTypeName(elemType) << ", " << count
+         << ", tlx.storage_kind.tmem)";
+    } else {
+      os << "ttng.tmem_alloc()";
+    }
+    printLocComment(op, os);
+    return;
   }
 
   // Get the TLX name or use original
@@ -1072,7 +1702,7 @@ void printSimplifiedOp(
   }
   os << ")";
 
-  os << "\n";
+  printLocComment(op, os);
 }
 
 // Print a block
@@ -1107,19 +1737,54 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     }
 
     if (auto funcOp = dyn_cast<tt::FuncOp>(op)) {
-      os << "func " << funcOp.getName() << "(";
-      // Print function arguments
-      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
-        if (i > 0)
-          os << ", ";
-        os << getValueName(funcOp.getArgument(i), argSubstitutionMap);
+      // Emit Python module preamble
+      os << "import triton\n";
+      os << "import triton.language as tl\n";
+      os << "try:\n";
+      os << "    import triton.language.extra.cuda.tlx as tlx\n";
+      os << "except ModuleNotFoundError:\n";
+      os << "    import triton.language.extra.tlx as tlx\n";
+      os << "\n";
+      os << "@triton.jit\n";
+      os << "def " << funcOp.getName() << "(";
+      // Print function arguments, collapsing expanded TensorDescriptor args
+      // Pattern: desc_q, desc_q_0, desc_q_1, ... -> just desc_q
+      SmallVector<std::string> argNames;
+      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i)
+        argNames.push_back(
+            getValueName(funcOp.getArgument(i), argSubstitutionMap));
+      std::set<std::string> skipArgs;
+      for (unsigned i = 0; i < argNames.size(); ++i) {
+        StringRef name(argNames[i]);
+        if (name.starts_with("desc_") &&
+            name.substr(5).find('_') == StringRef::npos) {
+          for (unsigned j = i + 1; j < argNames.size(); ++j) {
+            StringRef next(argNames[j]);
+            if (next.starts_with(name) && next.size() > name.size() &&
+                next[name.size()] == '_' &&
+                std::all_of(next.begin() + name.size() + 1, next.end(),
+                            [](char c) { return std::isdigit(c); }))
+              skipArgs.insert(argNames[j]);
+            else
+              break;
+          }
+        }
       }
-      os << ") {\n";
+      bool first = true;
+      for (auto &name : argNames) {
+        if (skipArgs.count(name))
+          continue;
+        if (!first)
+          os << ", ";
+        first = false;
+        os << name;
+      }
+      os << "):\n";
       for (Region &region : op.getRegions()) {
         printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 1,
                     argSubstitutionMap);
       }
-      os << "}\n";
+      os << "\n";
       continue;
     }
 
@@ -1162,6 +1827,63 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+
+    // Special handling for tt.reduce — detect combiner and emit tl.max/tl.sum
+    if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
+        op.getNumResults() > 0) {
+      // Detect combiner type by looking at ops in the body region
+      bool isMax = false, isSum = false;
+      for (Region &bodyRegion : op.getRegions()) {
+        for (Block &block : bodyRegion) {
+          for (Operation &bodyOp : block) {
+            StringRef bodyOpName = bodyOp.getName().getStringRef();
+            if (bodyOpName == "arith.maxf" || bodyOpName == "arith.maxnumf" ||
+                bodyOpName == "arith.maxsi" || bodyOpName == "arith.maxui")
+              isMax = true;
+            if (bodyOpName == "arith.addf" || bodyOpName == "arith.addi")
+              isSum = true;
+          }
+        }
+      }
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
+      if (isMax)
+        os << "tl.max(";
+      else if (isSum)
+        os << "tl.sum(";
+      else
+        os << "tl.reduce(";
+      os << getValueName(op.getOperand(0), argSubstitutionMap);
+      // Extract axis from the reduce op — use the result shape vs input shape
+      if (auto inputType =
+              dyn_cast<RankedTensorType>(op.getOperand(0).getType())) {
+        if (auto resultType =
+                dyn_cast<RankedTensorType>(op.getResult(0).getType())) {
+          // Find the axis that was reduced by comparing input and result
+          // shapes dimension by dimension. The reduced axis is the first
+          // dimension in the input that is missing from the result.
+          auto inShape = inputType.getShape();
+          auto outShape = resultType.getShape();
+          int64_t axis = 0;
+          for (int64_t i = 0, j = 0; i < inputType.getRank(); ++i) {
+            if (j < resultType.getRank() && inShape[i] == outShape[j]) {
+              ++j;
+            } else {
+              axis = i;
+              break;
+            }
+          }
+          os << ", " << axis;
+        } else {
+          // Result is scalar — reduce all dims, use axis=0 as default
+          os << ", 0";
+        }
+      }
+      os << ")";
+      printLocComment(&op, os);
       continue;
     }
 
@@ -1250,6 +1972,57 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+    // Special handling for tt.reduce in CF printer
+    if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
+        op.getNumResults() > 0) {
+      bool isMax = false, isSum = false;
+      for (Region &bodyRegion : op.getRegions()) {
+        for (Block &block : bodyRegion) {
+          for (Operation &bodyOp : block) {
+            StringRef n = bodyOp.getName().getStringRef();
+            if (n == "arith.maxf" || n == "arith.maxnumf" ||
+                n == "arith.maxsi" || n == "arith.maxui")
+              isMax = true;
+            if (n == "arith.addf" || n == "arith.addi")
+              isSum = true;
+          }
+        }
+      }
+      for (unsigned i = 0; i < indent; ++i)
+        os << "  ";
+      os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
+      if (isMax)
+        os << "tl.max(";
+      else if (isSum)
+        os << "tl.sum(";
+      else
+        os << "tl.reduce(";
+      os << getValueName(op.getOperand(0), argSubstitutionMap);
+      // Extract axis from the reduce op
+      if (auto inputType =
+              dyn_cast<RankedTensorType>(op.getOperand(0).getType())) {
+        if (auto resultType =
+                dyn_cast<RankedTensorType>(op.getResult(0).getType())) {
+          auto inShape = inputType.getShape();
+          auto outShape = resultType.getShape();
+          int64_t axis = 0;
+          for (int64_t i = 0, j = 0; i < inputType.getRank(); ++i) {
+            if (j < resultType.getRank() && inShape[i] == outShape[j]) {
+              ++j;
+            } else {
+              axis = i;
+              break;
+            }
+          }
+          os << ", " << axis;
+        } else {
+          os << ", 0";
+        }
+      }
+      os << ")";
+      printLocComment(&op, os);
       continue;
     }
     if (op.getNumRegions() > 0) {
@@ -1732,6 +2505,11 @@ public:
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();
 
+    // Build value name cache once using AsmState (avoids O(N^2) SSA
+    // renumbering in getValueName).
+    auto cache = buildValueNameCache(m.getOperation());
+    valueNameCacheStorage = &cache;
+
     // Pre-analyze all local_alloc operations
     DenseMap<Operation *, LocalAllocInfo> allocInfoMap;
     m.walk([&](Operation *op) {
@@ -1743,10 +2521,41 @@ public:
     // Track ops to skip
     llvm::DenseSet<Operation *> skippedOps;
 
-    // Print simplified TLX representation
-    for (Region &region : m->getRegions()) {
-      printRegion(region, llvm::outs(), opNameMap, allocInfoMap, skippedOps, 0);
+    // Check if TRITON_TLX_DUMP_DIR is set for file output
+    const char *dumpDir = std::getenv("TRITON_TLX_DUMP_DIR");
+    if (dumpDir && dumpDir[0] != '\0') {
+      // Extract kernel function name from module
+      std::string kernelName = "kernel";
+      m.walk([&](tt::FuncOp funcOp) { kernelName = funcOp.getName().str(); });
+
+      // Build output path: <dir>/<kernel_name>.tlx
+      llvm::SmallString<256> outPath(dumpDir);
+      llvm::sys::path::append(outPath, kernelName + ".tlx");
+
+      // Write TLX dump to file
+      std::error_code ec;
+      llvm::raw_fd_ostream fileOs(outPath, ec);
+      if (!ec) {
+        for (Region &region : m->getRegions()) {
+          printRegion(region, fileOs, opNameMap, allocInfoMap, skippedOps, 0);
+        }
+      } else {
+        llvm::errs() << "Warning: Could not open TLX dump file " << outPath
+                     << ": " << ec.message() << "\n";
+        for (Region &region : m->getRegions()) {
+          printRegion(region, llvm::outs(), opNameMap, allocInfoMap, skippedOps,
+                      0);
+        }
+      }
+    } else {
+      // Default behavior: print to stdout
+      for (Region &region : m->getRegions()) {
+        printRegion(region, llvm::outs(), opNameMap, allocInfoMap, skippedOps,
+                    0);
+      }
     }
+
+    valueNameCacheStorage = nullptr;
   }
 };
 

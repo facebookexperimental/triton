@@ -189,10 +189,14 @@ void PartitionSet::serialize(scf::ForOp loop) const {
   // In the new PartitionSet system, per-op partition attributes are already set
   // by setPartition(). We only need to serialize the partition stages array.
   SmallVector<Attribute> stages;
+  SmallVector<Attribute> types;
   Builder b(loop.getContext());
-  for (const Partition &partition : getPartitions())
+  for (const Partition &partition : getPartitions()) {
     stages.push_back(b.getI32IntegerAttr(partition.getStage()));
+    types.push_back(b.getStringAttr(partition.getType()));
+  }
   loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
+  loop->setAttr(kPartitionTypesAttrName, b.getArrayAttr(types));
 }
 
 void PartitionSet::dump() const {
