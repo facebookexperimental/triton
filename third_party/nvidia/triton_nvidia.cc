@@ -75,6 +75,10 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUOptimizeTMemLayoutsPass);
   ADD_PASS_WRAPPER_0("add_interleave_tmem",
                      ttng::createTritonNvidiaGPUInterleaveTMemPass);
+  ADD_PASS_WRAPPER_0("add_lower_subtiled_region",
+                     ttng::createTritonNvidiaGPULowerSubtiledRegionPass);
+  ADD_PASS_WRAPPER_0("add_subtiled_region_setup_push",
+                     ttng::createTritonNvidiaGPUSubtiledRegionSetupPushPass);
 }
 
 void init_triton_nvidia_passes_nvws(py::module &&m) {

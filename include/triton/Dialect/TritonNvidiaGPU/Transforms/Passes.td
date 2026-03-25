@@ -183,6 +183,27 @@ def TritonNvidiaGPULowerSubtiledRegionPass
   ];
 }
 
+def TritonNvidiaGPUSubtiledRegionSetupPushPass
+    : Pass<"triton-nvidia-gpu-subtiled-region-setup-push", "mlir::ModuleOp"> {
+  let summary = "Push per-tile loads from setup region into the tile body";
+
+  let description = [{
+    After OptimizeTMemLayouts has split TMEM loads into per-tile
+    tmem_subslice + tmem_load pairs, this pass pushes the tmem_load ops
+    from the setup region into the tile body. This reduces register pressure
+    by loading one tile's data at a time instead of all tiles' data
+    simultaneously.
+
+    The setup region retains the tmem_subslice ops (cheap memdesc views)
+    and yields the subsliced memdescs. The tile body starts with tmem_load
+    using the memdesc block arg.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-tokens", "mlir::ModuleOp"> {
   let summary = "remove TMEM tokens";
 
