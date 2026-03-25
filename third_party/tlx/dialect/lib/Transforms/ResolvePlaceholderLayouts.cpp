@@ -73,8 +73,8 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
         ctx, shape[0], shape[1], colStride, /*CTASplitM=*/1,
         /*CTASplitN=*/1);
     auto memSpace = ttng::TensorMemorySpaceAttr::get(ctx);
-    auto memDescType = ttg::MemDescType::get(
-        shape, elementType, tmemEncoding, memSpace, /*mutableMemory=*/true);
+    auto memDescType = ttg::MemDescType::get(shape, elementType, tmemEncoding,
+                                             memSpace, /*mutableMemory=*/true);
     auto ctaLayout = ttg::CTALayoutAttr::get(ctx, {1, 1}, {1, 1}, {1, 0});
 
     auto result =

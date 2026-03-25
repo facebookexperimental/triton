@@ -589,6 +589,19 @@ public:
   }
 };
 
+struct TTNGPrefetchPattern
+    : public OpConversionPattern<triton::nvidia_gpu::PrefetchOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::PrefetchOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<triton::nvidia_gpu::PrefetchOp>(
+        op, adaptor.getPtr(), adaptor.getMask(), op.getCacheAttr());
+    return success();
+  }
+};
+
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns, unsigned numCTAs) {
   MLIRContext *context = patterns.getContext();
@@ -649,6 +662,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       GenericOpPattern<triton::nvidia_gpu::VoteBallotSyncOp>,
+      TTNGPrefetchPattern,
       TritonFuncOpPattern>(typeConverter, context);
 }
 

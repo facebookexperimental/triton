@@ -1580,6 +1580,57 @@ private:
   int computeCapability;
 };
 
+struct PrefetchOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::PrefetchOp> {
+  PrefetchOpConversion(LLVMTypeConverter &converter, int computeCapability,
+                       PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        computeCapability(computeCapability) {}
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::PrefetchOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto voidTy = void_ty(op->getContext());
+
+    Value llPtr = adaptor.getPtr();
+    Value llMask = adaptor.getMask();
+
+    auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
+    SmallVector<Value> maskElems;
+    if (llMask)
+      maskElems = unpackLLElements(loc, llMask, rewriter);
+
+    auto cache = op.getCache();
+    std::string cacheLevel = (cache == triton::CacheModifier::CA) ? "L1" : "L2";
+
+    for (size_t i = 0; i < ptrElems.size(); ++i) {
+      ::mlir::triton::PTXBuilder ptxBuilder;
+      std::string inst = "@$0 prefetch.global." + cacheLevel + " [$1];";
+
+      Value mask;
+      if (!maskElems.empty()) {
+        mask = maskElems[i];
+      } else {
+        mask = b.int_val(1, 1);
+      }
+
+      auto &prefetch = *ptxBuilder.create<>(inst);
+      prefetch({ptxBuilder.newOperand(mask, "b"),
+                ptxBuilder.newOperand(ptrElems[i], "l")},
+               /*onlyAttachMLIRArgs=*/true);
+      ptxBuilder.launch(rewriter, loc, voidTy);
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  int computeCapability;
+};
+
 LogicalResult
 convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
                       ConversionPatternRewriter &rewriter, Value tmaPtr,
@@ -2139,9 +2190,9 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
       typeConverter, targetInfo, computeCapability, axisInfoAnalysis, benefit);
   patterns.add<AsyncCommitGroupOpConversion, AsyncWaitOpConversion,
                AsyncCopyMbarrierArriveOpConversion>(typeConverter, benefit);
-  patterns
-      .add<AsyncTMACopyGlobalToLocalOpConversion, AsyncTMAPrefetchOpConversion>(
-          typeConverter, computeCapability, benefit);
+  patterns.add<AsyncTMACopyGlobalToLocalOpConversion,
+               AsyncTMAPrefetchOpConversion, PrefetchOpConversion>(
+      typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMACopyLocalToGlobalOpConversion>(
       typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMAReduceOpConversion>(typeConverter, computeCapability,

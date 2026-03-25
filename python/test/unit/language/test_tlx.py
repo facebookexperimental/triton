@@ -3072,6 +3072,39 @@ def test_descriptor_load_prefetch_ws(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("level", ["L1", "L2"])
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_prefetch(level, use_mask, device):
+    """Test pointer-based prefetch hint (tlx.prefetch)."""
+
+    @triton.jit
+    def prefetch_and_load_kernel(
+        input_ptr,
+        output_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        LEVEL: tl.constexpr,
+        USE_MASK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements if USE_MASK else None
+        tlx.prefetch(input_ptr + offsets, level=LEVEL, mask=mask)
+        x = tl.load(input_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    BLOCK_SIZE = 1024
+    n_elements = BLOCK_SIZE
+    x = torch.randn(n_elements, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+    grid = (1, )
+    kernel = prefetch_and_load_kernel[grid](x, y, n_elements, BLOCK_SIZE=BLOCK_SIZE, LEVEL=level, USE_MASK=use_mask)
+    torch.testing.assert_close(x, y)
+    assert "ttng.prefetch" in kernel.asm["ttgir"]
+    assert f"prefetch.global.{level}" in kernel.asm["ptx"]
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("eviction_policy", ["evict_first", "evict_last", ""])
 def test_descriptor_load_l2_cache_hint(eviction_policy, device):
     """Test that TMA loads can use L2 cache hints via eviction_policy parameter."""

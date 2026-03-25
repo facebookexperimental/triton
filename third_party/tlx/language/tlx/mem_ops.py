@@ -850,6 +850,31 @@ def async_descriptor_prefetch_tensor(
 
 
 @tl.builtin
+def prefetch(pointer, level="L2", mask=None, _semantic=None):
+    """
+    Issue a non-blocking prefetch hint for pointer-based scattered/gather loads.
+
+    Unlike `async_descriptor_prefetch_tensor` which works on tensor descriptors,
+    this supports raw pointer tensors. It emits per-element
+    ``prefetch.global.{L1|L2}`` PTX instructions.
+
+    Args:
+        pointer: Tensor of pointers to prefetch.
+        level: Cache level to prefetch into. ``"L1"`` prefetches into L1+L2,
+               ``"L2"`` (default) prefetches into L2 only.
+        mask: Optional boolean tensor. Only elements where mask is True are
+              prefetched.
+    """
+    assert level in ("L1", "L2"), f"level must be 'L1' or 'L2', got '{level}'"
+    if level == "L1":
+        cache = _semantic._str_to_load_cache_modifier(".ca")
+    else:
+        cache = _semantic._str_to_load_cache_modifier(".cg")
+    mask_handle = mask.handle if mask is not None else None
+    _semantic.builder.create_prefetch(pointer.handle, mask_handle, cache)
+
+
+@tl.builtin
 def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
