@@ -78,9 +78,7 @@ static bool isDataBufferAlloc(Operation *op) {
 }
 
 /// Check if a tmem_alloc produces a tensor memory buffer.
-static bool isTmemAlloc(Operation *op) {
-  return isa<ttng::TMEMAllocOp>(op);
-}
+static bool isTmemAlloc(Operation *op) { return isa<ttng::TMEMAllocOp>(op); }
 
 /// Get the allocation.offset attribute from an op, or -1 if not set.
 static int64_t getAllocOffset(Operation *op) {
@@ -125,17 +123,21 @@ static int64_t getMemDescIndex(ttg::MemDescIndexOp indexOp) {
 
 struct WarpSpecInfo {
   ttg::WarpSpecializeOp wsOp;
-  // Map from warp_specialize operand index → BarrierObject* (barrier args)
-  DenseMap<unsigned, BarrierObject *> argIdxToBarrier;
+  // Set of warp_specialize operand indices that are barrier allocs.
+  DenseSet<unsigned> barrierArgIndices;
+  // Map from (argIdx, slotIndex) → BarrierObject* for per-slot barriers.
+  DenseMap<std::pair<unsigned, int64_t>, BarrierObject *> slotToBarrier;
+  // Map from warp_specialize operand index → all per-slot BarrierObjects.
+  DenseMap<unsigned, SmallVector<BarrierObject *>> argIdxToBarrierSlots;
+  // Map from named barrier index → BarrierObject* for named barriers.
+  DenseMap<int64_t, BarrierObject *> namedBarriers;
   // Map from warp_specialize operand index → MemoryObject* (memory args)
   DenseMap<unsigned, MemoryObject *> argIdxToMemory;
 };
 
 static void classifyWarpSpecArgs(ttg::WarpSpecializeOp wsOp,
-                                 BarrierGraph &result,
-                                 WarpSpecInfo &info) {
+                                 BarrierGraph &result, WarpSpecInfo &info) {
   info.wsOp = wsOp;
-  unsigned nextBarrierId = result.barrierObjects.size();
   unsigned nextMemoryId = result.memoryObjects.size();
 
   auto captures = wsOp.getExplicitCaptures();
@@ -154,19 +156,44 @@ static void classifyWarpSpecArgs(ttg::WarpSpecializeOp wsOp,
 
       if (mdType.getElementType().isInteger(64) &&
           isUsedByInitBarrier(capture)) {
-        // This is a barrier alloc.
-        auto obj = std::make_unique<BarrierObject>();
-        obj->id = nextBarrierId++;
-        obj->kind = BarrierObject::MBarrier;
-        obj->allocOp = defOp;
-        obj->name = getAllocName(defOp);
-        obj->offset = getAllocOffset(defOp);
+        // Scan memdesc_index → init_barrier chains to find per-slot indices.
+        info.barrierArgIndices.insert(i);
+        std::string allocName = getAllocName(defOp);
 
-        LDBG("Step1: barrier arg[" << i << "] name=" << obj->name
-                                    << " offset=" << obj->offset);
+        for (Operation *user : capture.getUsers()) {
+          auto indexOp = dyn_cast<ttg::MemDescIndexOp>(user);
+          if (!indexOp)
+            continue;
+          // Check if this memdesc_index feeds an init_barrier.
+          bool feedsInit = false;
+          for (Operation *indexUser : indexOp->getResult(0).getUsers()) {
+            if (isa<ttng::InitBarrierOp>(indexUser)) {
+              feedsInit = true;
+              break;
+            }
+          }
+          if (!feedsInit)
+            continue;
 
-        info.argIdxToBarrier[i] = obj.get();
-        result.barrierObjects.push_back(std::move(obj));
+          int64_t slot = getMemDescIndex(indexOp);
+          auto key = std::make_pair(i, slot);
+          if (info.slotToBarrier.count(key))
+            continue; // Already created for this slot.
+
+          auto obj = std::make_unique<BarrierObject>();
+          obj->id = result.barrierObjects.size();
+          obj->kind = BarrierObject::MBarrier;
+          obj->allocOp = defOp;
+          obj->name = allocName;
+          obj->offset = slot;
+
+          LDBG("Step1: barrier arg[" << i << "] name=" << allocName
+                                     << " slot=" << slot);
+
+          info.slotToBarrier[key] = obj.get();
+          info.argIdxToBarrierSlots[i].push_back(obj.get());
+          result.barrierObjects.push_back(std::move(obj));
+        }
       } else if (!mdType.getElementType().isInteger(64)) {
         // This is a data buffer in SMEM.
         auto obj = std::make_unique<MemoryObject>();
@@ -177,7 +204,7 @@ static void classifyWarpSpecArgs(ttg::WarpSpecializeOp wsOp,
         obj->offset = getAllocOffset(defOp);
 
         LDBG("Step1: memory arg[" << i << "] name=" << obj->name
-                                   << " kind=SMEM offset=" << obj->offset);
+                                  << " kind=SMEM offset=" << obj->offset);
 
         info.argIdxToMemory[i] = obj.get();
         result.memoryObjects.push_back(std::move(obj));
@@ -192,7 +219,7 @@ static void classifyWarpSpecArgs(ttg::WarpSpecializeOp wsOp,
       obj->offset = getAllocOffset(defOp);
 
       LDBG("Step1: memory arg[" << i << "] name=" << obj->name
-                                 << " kind=TMEM offset=" << obj->offset);
+                                << " kind=TMEM offset=" << obj->offset);
 
       info.argIdxToMemory[i] = obj.get();
       result.memoryObjects.push_back(std::move(obj));
@@ -218,17 +245,14 @@ static void classifyWarpSpecArgs(ttg::WarpSpecializeOp wsOp,
 
 /// Check if an operation writes to a memdesc (producer of data).
 static bool isMemoryWrite(Operation *op) {
-  return isa<ttg::LocalStoreOp>(op) ||
-         isa<ttng::TCGen5MMAOp>(op) ||
-         isa<ttng::TMEMStoreOp>(op) ||
-         isa<ttng::TCGen5CommitOp>(op) ||
+  return isa<ttg::LocalStoreOp>(op) || isa<ttng::TCGen5MMAOp>(op) ||
+         isa<ttng::TMEMStoreOp>(op) || isa<ttng::TCGen5CommitOp>(op) ||
          isa<ttng::BarrierExpectOp>(op);
 }
 
 /// Check if an operation reads from a memdesc (consumer of data).
 static bool isMemoryRead(Operation *op) {
-  return isa<ttg::LocalLoadOp>(op) ||
-         isa<ttng::TMEMLoadOp>(op);
+  return isa<ttg::LocalLoadOp>(op) || isa<ttng::TMEMLoadOp>(op);
 }
 
 /// Determine the partition id for a region.  The default region is partition 0,
@@ -245,10 +269,8 @@ static int getPartitionId(ttg::WarpSpecializeOp wsOp, Region *region) {
 }
 
 static void collectUsagesInRegion(Region &region, int partitionId,
-                                  const DenseMap<unsigned, BarrierObject *> &argIdxToBarrier,
-                                  const DenseMap<unsigned, MemoryObject *> &argIdxToMemory,
-                                  bool isDefaultRegion,
-                                  ValueRange wsCaptures) {
+                                  WarpSpecInfo &info, BarrierGraph &result,
+                                  bool isDefaultRegion, ValueRange wsCaptures) {
   // Build a map from block argument (or captured value in default region)
   // to the warp_specialize operand index.
   DenseMap<Value, unsigned> valueToArgIdx;
@@ -277,41 +299,59 @@ static void collectUsagesInRegion(Region &region, int partitionId,
     int64_t slotIndex = getMemDescIndex(indexOp);
 
     // Check if this indexes a barrier arg.
-    auto barIt = argIdxToBarrier.find(argIdx);
-    if (barIt != argIdxToBarrier.end()) {
-      BarrierObject *barrier = barIt->second;
-      // Determine role from downstream usage of the indexed barrier.
+    if (info.barrierArgIndices.contains(argIdx)) {
+      // Collect the roles from downstream usage of the indexed barrier.
+      SmallVector<std::pair<BarrierObjectRole, Operation *>> roles;
       for (Operation *user : indexOp->getResult(0).getUsers()) {
-        BarrierObjectRole role;
         if (isa<ttng::WaitBarrierOp>(user)) {
-          // Tentative: will be refined to ProducerAcquire or ConsumerWait
-          // when we build BarrierPairs.
-          role = BarrierObjectRole::ProducerAcquire;
+          roles.push_back({BarrierObjectRole::ProducerAcquire, user});
         } else if (isa<ttng::ArriveBarrierOp>(user)) {
-          // Tentative: will be refined to ProducerCommit or ConsumerRelease.
-          role = BarrierObjectRole::ProducerCommit;
+          roles.push_back({BarrierObjectRole::ProducerCommit, user});
         } else if (isa<ttng::BarrierExpectOp>(user) ||
-                   isa<ttng::TCGen5CommitOp>(user)) {
-          role = BarrierObjectRole::ProducerCommit;
-        } else if (isa<ttng::InitBarrierOp>(user)) {
-          continue; // Skip init ops.
-        } else {
-          continue; // Unknown barrier user.
+                   isa<ttng::TCGen5CommitOp>(user) ||
+                   isa<ttng::TCGen5MMAOp>(user) ||
+                   isa<ttng::TCGen5MMAScaledOp>(user) ||
+                   isa<ttng::AsyncTMACopyGlobalToLocalOp>(user)) {
+          // tc_gen5_mma and async_tma_copy implicitly arrive on their barrier
+          // operands.  barrier_expect and tc_gen5_commit are explicit arrivals.
+          roles.push_back({BarrierObjectRole::ProducerCommit, user});
         }
-        barrier->usages.push_back({role, partitionId, indexOp});
+        // Skip init_barrier and unknown ops.
+      }
+      if (roles.empty())
+        return;
 
-        LDBG("Step2: barrier usage name=" << barrier->name
-              << " partition=" << partitionId
-              << " role=" << (role == BarrierObjectRole::ProducerAcquire
-                                  ? "wait" : "arrive")
-              << " slot=" << slotIndex);
+      // Determine which BarrierObjects to attach usages to.
+      SmallVector<BarrierObject *> targets;
+      if (slotIndex >= 0) {
+        // Constant index → link to the specific per-slot BarrierObject.
+        auto key = std::make_pair(argIdx, slotIndex);
+        auto slotIt = info.slotToBarrier.find(key);
+        if (slotIt != info.slotToBarrier.end())
+          targets.push_back(slotIt->second);
+      } else {
+        // Dynamic index → link to all per-slot BarrierObjects for this alloc.
+        auto slotsIt = info.argIdxToBarrierSlots.find(argIdx);
+        if (slotsIt != info.argIdxToBarrierSlots.end())
+          targets = slotsIt->second;
+      }
+
+      for (BarrierObject *barrier : targets) {
+        for (auto &[role, user] : roles) {
+          barrier->usages.push_back({role, partitionId, indexOp});
+          LDBG("Step2: barrier usage name="
+               << barrier->name << " partition=" << partitionId << " role="
+               << (role == BarrierObjectRole::ProducerAcquire ? "wait"
+                                                              : "arrive")
+               << " slot=" << barrier->offset);
+        }
       }
       return;
     }
 
     // Check if this indexes a memory arg.
-    auto memIt = argIdxToMemory.find(argIdx);
-    if (memIt != argIdxToMemory.end()) {
+    auto memIt = info.argIdxToMemory.find(argIdx);
+    if (memIt != info.argIdxToMemory.end()) {
       MemoryObject *memObj = memIt->second;
       // Determine role from downstream usage.
       for (Operation *user : indexOp->getResult(0).getUsers()) {
@@ -325,11 +365,10 @@ static void collectUsagesInRegion(Region &region, int partitionId,
         }
         memObj->usages.push_back({role, partitionId, indexOp});
 
-        LDBG("Step2: memory usage name=" << memObj->name
-              << " partition=" << partitionId
-              << " role=" << (role == MemoryObjectRole::Producer
-                                  ? "producer" : "consumer")
-              << " slot=" << slotIndex);
+        LDBG("Step2: memory usage name="
+             << memObj->name << " partition=" << partitionId << " role="
+             << (role == MemoryObjectRole::Producer ? "producer" : "consumer")
+             << " slot=" << slotIndex);
       }
 
       // Also record the index as the offset if not yet set.
@@ -337,21 +376,59 @@ static void collectUsagesInRegion(Region &region, int partitionId,
         memObj->offset = slotIndex;
     }
   });
+
+  // Walk named barrier ops (arrive_barrier_named / wait_barrier_named).
+  auto getOrCreateNamedBarrier = [&](int64_t barIdx) -> BarrierObject * {
+    auto it = info.namedBarriers.find(barIdx);
+    if (it != info.namedBarriers.end())
+      return it->second;
+    auto obj = std::make_unique<BarrierObject>();
+    obj->id = result.barrierObjects.size();
+    obj->kind = BarrierObject::Named;
+    obj->allocOp = nullptr;
+    obj->name = "named_bar_" + std::to_string(barIdx);
+    obj->offset = barIdx;
+    auto *ptr = obj.get();
+    info.namedBarriers[barIdx] = ptr;
+    result.barrierObjects.push_back(std::move(obj));
+    return ptr;
+  };
+
+  region.walk([&](ttng::NamedBarrierArriveOp arriveOp) {
+    auto cst = arriveOp.getBar().getDefiningOp<arith::ConstantIntOp>();
+    if (!cst)
+      return;
+    BarrierObject *barrier = getOrCreateNamedBarrier(cst.value());
+    barrier->usages.push_back(
+        {BarrierObjectRole::ProducerCommit, partitionId, arriveOp});
+    LDBG("Step2: named barrier arrive idx=" << cst.value()
+                                            << " partition=" << partitionId);
+  });
+
+  region.walk([&](ttng::NamedBarrierWaitOp waitOp) {
+    auto cst = waitOp.getBar().getDefiningOp<arith::ConstantIntOp>();
+    if (!cst)
+      return;
+    BarrierObject *barrier = getOrCreateNamedBarrier(cst.value());
+    barrier->usages.push_back(
+        {BarrierObjectRole::ProducerAcquire, partitionId, waitOp});
+    LDBG("Step2: named barrier wait idx=" << cst.value()
+                                          << " partition=" << partitionId);
+  });
 }
 
-static void collectUsages(ttg::WarpSpecializeOp wsOp,
-                           const WarpSpecInfo &info) {
+static void collectUsages(ttg::WarpSpecializeOp wsOp, WarpSpecInfo &info,
+                          BarrierGraph &result) {
   auto captures = wsOp.getExplicitCaptures();
 
   // Default region (partition 0) — uses implicit captures.
-  collectUsagesInRegion(wsOp.getDefaultRegion(), /*partitionId=*/0,
-                        info.argIdxToBarrier, info.argIdxToMemory,
+  collectUsagesInRegion(wsOp.getDefaultRegion(), /*partitionId=*/0, info,
+                        result,
                         /*isDefaultRegion=*/true, captures);
 
   // Partition regions (partition 1, 2, ...).
   for (auto [idx, partRegion] : llvm::enumerate(wsOp.getPartitionRegions())) {
-    collectUsagesInRegion(*partRegion, /*partitionId=*/idx + 1,
-                          info.argIdxToBarrier, info.argIdxToMemory,
+    collectUsagesInRegion(*partRegion, /*partitionId=*/idx + 1, info, result,
                           /*isDefaultRegion=*/false, captures);
   }
 }
@@ -370,7 +447,8 @@ BarrierGraph buildBarrierAnalysis(FuncOp funcOp) {
     classifyWarpSpecArgs(wsOp, result, info);
 
     // Step 2: Traverse partitions to collect barrier and memory usages.
-    collectUsages(wsOp, info);
+    // Barrier objects are created per-slot here (not in Step 1).
+    collectUsages(wsOp, info, result);
   });
 
   return result;
@@ -382,84 +460,93 @@ BarrierGraph buildBarrierAnalysis(FuncOp funcOp) {
 
 static const char *roleToStr(BarrierObjectRole role) {
   switch (role) {
-  case BarrierObjectRole::ProducerAcquire: return "ProdAcq";
-  case BarrierObjectRole::ProducerCommit:  return "ProdCmt";
-  case BarrierObjectRole::ConsumerWait:    return "ConsWait";
-  case BarrierObjectRole::ConsumerRelease: return "ConsRel";
+  case BarrierObjectRole::ProducerAcquire:
+    return "ProdAcq";
+  case BarrierObjectRole::ProducerCommit:
+    return "ProdCmt";
+  case BarrierObjectRole::ConsumerWait:
+    return "ConsWait";
+  case BarrierObjectRole::ConsumerRelease:
+    return "ConsRel";
   }
   return "?";
 }
 
 static const char *memRoleToStr(MemoryObjectRole role) {
   switch (role) {
-  case MemoryObjectRole::Producer: return "Producer";
-  case MemoryObjectRole::Consumer: return "Consumer";
+  case MemoryObjectRole::Producer:
+    return "Producer";
+  case MemoryObjectRole::Consumer:
+    return "Consumer";
   }
   return "?";
 }
 
+/// Get a human-readable name for an op: prefer NameLoc, fall back to SSA name.
+static std::string getOpName(Operation *op) {
+  std::string name = getNameFromLoc(op->getLoc());
+  if (!name.empty())
+    return name;
+  if (op->getNumResults() > 0)
+    return getSSAName(op->getResult(0));
+  return "<anon>";
+}
+
+/// Format a usage list as an inline array: [{name, role, task}, ...].
+static void formatUsages(llvm::raw_ostream &os,
+                         ArrayRef<BarrierObjectUsage> usages) {
+  os << "[";
+  for (unsigned i = 0; i < usages.size(); ++i) {
+    if (i > 0)
+      os << ", ";
+    auto &u = usages[i];
+    std::string name = u.op ? getOpName(u.op) : "?";
+    os << "{" << name << ", " << roleToStr(u.role) << ", " << u.taskId << "}";
+  }
+  os << "]";
+}
+
+static void formatUsages(llvm::raw_ostream &os,
+                         ArrayRef<MemoryObjectUsage> usages) {
+  os << "[";
+  for (unsigned i = 0; i < usages.size(); ++i) {
+    if (i > 0)
+      os << ", ";
+    auto &u = usages[i];
+    std::string name = u.op ? getOpName(u.op) : "?";
+    os << "{" << name << ", " << memRoleToStr(u.role) << ", " << u.taskId
+       << "}";
+  }
+  os << "]";
+}
+
 void dumpBarrierTable(const BarrierGraph &result, llvm::raw_ostream &os) {
-  os << "\n";
-  os << "=== Barrier Analysis ===\n\n";
+  os << "\n=== Barrier Analysis ===\n\n";
 
   // Table 1: Barrier Objects
   os << "--- Barrier Objects ---\n";
-  os << "ID   Name                 Kind   Offset\n";
-  os << "-------------------------------------------\n";
-  for (auto &alloc : result.barrierObjects) {
-    const char *name = alloc->name.empty() ? "<anon>" : alloc->name.c_str();
-    const char *kind =
-        alloc->kind == BarrierObject::MBarrier ? "mbar" : "named";
-    os << llvm::format("%-4u %-20s %-6s %-8ld\n", alloc->id, name, kind,
-                       alloc->offset);
+  os << "ID   Name                 Offset   Kind   Usages\n";
+  os << "---------------------------------------------------------------\n";
+  for (auto &obj : result.barrierObjects) {
+    const char *kindStr =
+        obj->kind == BarrierObject::MBarrier ? "mbar" : "named";
+    os << llvm::format("%-4u %-20s %-8ld %-6s ", obj->id, obj->name.c_str(),
+                       obj->offset, kindStr);
+    formatUsages(os, obj->usages);
+    os << "\n";
   }
 
-  // Table 2: Barrier Pairs (placeholder — will be populated in later steps)
-  os << "\n--- Barrier Pairs ---\n";
-  os << "ID   Full(ID)   Empty(ID)  #Mem\n";
-  os << "-------------------------------------\n";
-  for (auto &pair : result.barrierPairs) {
-    unsigned fullId = pair->fullBarrier ? pair->fullBarrier->id : 0;
-    unsigned emptyId = pair->emptyBarrier ? pair->emptyBarrier->id : 0;
-    os << llvm::format("%-4u %-10u %-10u %-8lu\n", pair->id, fullId, emptyId,
-                       (unsigned long)pair->memoryObjects.size());
-  }
-
-  // Table 3: Memory Objects
+  // Table 2: Memory Objects
   os << "\n--- Memory Objects ---\n";
-  os << "ID   Name             Kind   Offset   BarPair\n";
-  os << "------------------------------------------------\n";
-  for (auto &mem : result.memoryObjects) {
-    const char *name = mem->name.empty() ? "<anon>" : mem->name.c_str();
-    const char *kind =
-        mem->memoryKind == MemoryObject::SMEM ? "SMEM" : "TMEM";
-    unsigned bpId = mem->barrierPair ? mem->barrierPair->id : 0;
-    os << llvm::format("%-4u %-16s %-6s %-8ld %-8u\n", mem->id, name, kind,
-                       mem->offset, bpId);
-  }
-
-  // Table 4: Barrier Usages
-  os << "\n--- Barrier Usages ---\n";
-  os << "Barrier              ID   Role       Task\n";
-  os << "--------------------------------------------\n";
-  for (auto &alloc : result.barrierObjects) {
-    const char *name = alloc->name.empty() ? "<anon>" : alloc->name.c_str();
-    for (auto &u : alloc->usages) {
-      os << llvm::format("%-20s %-4u %-10s %-6d\n", name, alloc->id,
-                         roleToStr(u.role), u.taskId);
-    }
-  }
-
-  // Table 5: Memory Usages
-  os << "\n--- Memory Usages ---\n";
-  os << "Memory               ID   Role       Task\n";
-  os << "--------------------------------------------\n";
-  for (auto &mem : result.memoryObjects) {
-    const char *name = mem->name.empty() ? "<anon>" : mem->name.c_str();
-    for (auto &u : mem->usages) {
-      os << llvm::format("%-20s %-4u %-10s %-6d\n", name, mem->id,
-                         memRoleToStr(u.role), u.taskId);
-    }
+  os << "ID   Name                 Offset   Kind   Usages\n";
+  os << "---------------------------------------------------------------\n";
+  for (auto &obj : result.memoryObjects) {
+    const char *kindStr =
+        obj->memoryKind == MemoryObject::SMEM ? "SMEM" : "TMEM";
+    os << llvm::format("%-4u %-20s %-8ld %-6s ", obj->id, obj->name.c_str(),
+                       obj->offset, kindStr);
+    formatUsages(os, obj->usages);
+    os << "\n";
   }
 
   os << "\n=== End Barrier Analysis ===\n";

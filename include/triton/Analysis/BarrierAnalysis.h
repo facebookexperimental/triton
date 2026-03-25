@@ -61,7 +61,8 @@ struct BarrierPair {
   BarrierObject *fullBarrier = nullptr;  // ProducerCommit / ConsumerWait
   BarrierObject *emptyBarrier = nullptr; // ProducerAcquire / ConsumerRelease
 
-  SmallVector<struct MemoryObject *> memoryObjects; // data buffers guarded by this pair
+  SmallVector<struct MemoryObject *>
+      memoryObjects; // data buffers guarded by this pair
 };
 
 // ===----------------------------------------------------------------------===
@@ -88,9 +89,10 @@ struct MemoryObject {
   enum MemoryKind { SMEM, TMEM };
   MemoryKind memoryKind = SMEM;
 
-  Operation *allocOp = nullptr; // ttg.local_alloc (SMEM) or ttng.tmem_alloc (TMEM)
-  std::string name;             // human-readable name from NameLoc
-  int64_t offset = -1;          // byte offset from allocation.offset attribute
+  Operation *allocOp =
+      nullptr;         // ttg.local_alloc (SMEM) or ttng.tmem_alloc (TMEM)
+  std::string name;    // human-readable name from NameLoc
+  int64_t offset = -1; // byte offset from allocation.offset attribute
 
   SmallVector<MemoryObjectUsage> usages; // all use-sites
 
