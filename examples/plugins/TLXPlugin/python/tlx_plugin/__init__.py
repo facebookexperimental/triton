@@ -32,10 +32,10 @@ from .barrier import (
     alloc_warp_barrier,
 )
 from .utility import dtype_of
-# from . import custom_stages
+from . import custom_stages
 
-# from triton import knobs
-# knobs.runtime.add_stages_inspection_hook = custom_stages.inspect_stages_hook
+from triton import knobs
+knobs.runtime.add_stages_inspection_hook = custom_stages.inspect_stages_hook
 
 __all__ = [
     "buffered_tensor",
