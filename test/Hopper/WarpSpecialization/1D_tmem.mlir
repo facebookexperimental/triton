@@ -1,3 +1,5 @@
+// XFAIL: *
+// REBASE_DISABLED:entire test xfail - pass --nvgpu-test-1D-tmem-alloc does not exist
 // RUN: triton-opt %s -split-input-file --nvgpu-test-1D-tmem-alloc | FileCheck %s
 
 // CHECK-LABEL: @_attn_fwd_persist

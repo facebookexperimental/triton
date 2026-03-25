@@ -2,6 +2,7 @@
 #include "mlir/IR/DialectImplementation.h" // required by `Types.cpp.inc`
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "third_party/tlx/dialect/include/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h" // required by `Types.cpp.inc`
 
@@ -150,9 +151,12 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
                          << ll.getOutDimSize(dims[1]);
     }
   } else if (auto enc = dyn_cast<SharedEncodingTrait>(encoding)) {
-    if (memorySpace != SharedMemorySpaceAttr::get(ctx)) {
+    if (memorySpace != SharedMemorySpaceAttr::get(ctx) &&
+        memorySpace !=
+            nvidia_gpu::SharedClusterMemorySpaceAttr::get(ctx)) {
       return emitError()
-             << "memorySpace must be SharedMemorySpace for shared encoding. "
+             << "memorySpace must be SharedMemorySpace or "
+             << "SharedClusterMemorySpace for shared encoding. "
              << "Got " << memorySpace;
     }
     auto rank = cast<LayoutEncodingTrait>(enc).getRank();
@@ -172,6 +176,11 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     auto bitwidth = elementType.getIntOrFloatBitWidth();
     if (bitwidth != 8) {
       return emitError() << "bitwidth must be 8";
+    }
+  } else if (isa<triton::tlx::DummyTMEMLayoutAttr>(encoding)) {
+    if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
+      return emitError() << "memorySpace must be TensorMemorySpace for "
+                         << "DummyTMEMLayout encoding. Got " << memorySpace;
     }
   } else {
     return emitError() << encoding << " is not a valid encoding";

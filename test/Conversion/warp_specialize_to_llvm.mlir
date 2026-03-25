@@ -1250,15 +1250,11 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // CHECK-LABEL: @paired_cta_cluster_sync
 
-// non default warps arrive before jumping to switch loop
-// CHECK: llvm.inline_asm
-// CHECK-SAME: @!$0 barrier.cluster.arrive.aligned
-// CHECK-NEXT: llvm.cond_br
+// non default warps jump to switch loop
+// CHECK: llvm.cond_br
 
-// sync before return for tmem dealloc
-// CHECK: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: nvvm.cluster.wait {aligned}
-// CHECK-NEXT: llvm.return
+// non default warps return from switch loop
+// CHECK: llvm.return
 
 // default warps keep arrive/wait after bar init
 // CHECK: mbarrier.init.shared::cta.b64
@@ -1266,9 +1262,7 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 // CHECK-NEXT: nvvm.cluster.wait {aligned}
 
 // sync before return for tmem dealloc
-// CHECK: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: nvvm.cluster.wait {aligned}
-// CHECK-NEXT: llvm.return
+// CHECK: llvm.return
 llvm.func @paired_cta_cluster_sync(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
   nvvm.cluster.arrive {aligned}

@@ -21,23 +21,23 @@ tt.func public @reinterpret_propagate_to_make_desc(%arg0: !tt.ptr<i8> {tt.divisi
 
   // Create TMA descriptor and write to desc_ptr
   %0 = arith.extsi %arg2 : i32 to i64
-  // CHECK: tt.make_tensor_descriptor {{.*}} descPtr = {{.*}} : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<tensor<128x64xi8, #[[SHARED]]>>
-  %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64], descPtr = %desc_ptr : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<tensor<128x64xi8>>
+  // CHECK: tt.make_tensor_descriptor {{.*}} descPtr = {{.*}} : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<tensor<128x128xi8, #[[SHARED]]>>
+  %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64], descPtr = %desc_ptr : !tt.ptr<i8> : !tt.ptr<i8>, !tt.tensordesc<tensor<128x128xi8>>
 
   // Fence and reinterpret the pointer as a tensor descriptor
   ttng.tensormap_fenceproxy_acquire %desc_ptr : !tt.ptr<i8>
-  // CHECK: ttng.reinterpret_tensor_descriptor {{.*}} : !tt.ptr<i8> to !tt.tensordesc<tensor<128x64xi8, #[[SHARED]]>>
-  %2 = ttng.reinterpret_tensor_descriptor %desc_ptr : !tt.ptr<i8> to !tt.tensordesc<tensor<128x64xi8>>
+  // CHECK: ttng.reinterpret_tensor_descriptor {{.*}} : !tt.ptr<i8> to !tt.tensordesc<tensor<128x128xi8, #[[SHARED]]>>
+  %2 = ttng.reinterpret_tensor_descriptor %desc_ptr : !tt.ptr<i8> to !tt.tensordesc<tensor<128x128xi8, #shared>>
 
   // Allocate shared memory buffer and barrier
-  %buf = ttg.local_alloc : () -> !ttg.memdesc<128x64xi8, #shared, #smem, mutable>
+  %buf = ttg.local_alloc : () -> !ttg.memdesc<128x128xi8, #shared, #smem, mutable>
   %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
   ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
 
   // Use ReinterpretTensorDescOp result with AsyncTMACopyGlobalToLocalOp
   // This should propagate the #shared encoding back to MakeTensorDescOp
-  // CHECK: ttng.async_tma_copy_global_to_local {{.*}} : !tt.tensordesc<tensor<128x64xi8, #[[SHARED]]>>
-  ttng.async_tma_copy_global_to_local %2[%c0_i32, %c0_i32] %buf, %bar, %true : !tt.tensordesc<tensor<128x64xi8>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x64xi8, #shared, #smem, mutable>
+  // CHECK: ttng.async_tma_copy_global_to_local {{.*}} : !tt.tensordesc<tensor<128x128xi8, #[[SHARED]]>>
+  ttng.async_tma_copy_global_to_local %2[%c0_i32, %c0_i32] %buf, %bar, %true : !tt.tensordesc<tensor<128x128xi8, #shared>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xi8, #shared, #smem, mutable>
 
   tt.return
 }

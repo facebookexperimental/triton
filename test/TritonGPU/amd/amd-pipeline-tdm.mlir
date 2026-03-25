@@ -20,10 +20,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %2 = arith.muli %0, %c512_i32 : i32
     %3 = arith.muli %1, %c64_i32 : i32
     %4 = arith.extsi %K : i32 to i64
-    %5 = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : <f16>, <tensor<512x32xf16>>
+    %5 = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<512x32xf16>>
     %6 = arith.extsi %N : i32 to i64
-    %7 = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : <f16>, <tensor<32x64xf16>>
-    %8 = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : <f16>, <tensor<512x64xf16>>
+    %7 = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<32x64xf16>>
+    %8 = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<512x64xf16>>
     %9 = arith.addi %K, %c31_i32 : i32
     %10 = arith.divsi %9, %c32_i32 : i32
     %accumulator:2 = scf.for %accumulator_0 = %c0_i32 to %10 step %c1_i32 iter_args(%arg7 = %c0_i32, %arg8 = %cst) -> (i32, tensor<512x64xf32, #mma>)  : i32 {
@@ -105,10 +105,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %2 = arith.muli %0, %c256_i32 : i32
     %3 = arith.muli %1, %c64_i32 : i32
     %4 = arith.extsi %K : i32 to i64
-    %5 = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : <f8E5M2>, <tensor<256x64xf8E5M2>>
+    %5 = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : !tt.ptr<f8E5M2>, !tt.tensordesc<tensor<256x64xf8E5M2>>
     %6 = arith.extsi %N : i32 to i64
-    %7 = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : <f8E5M2>, <tensor<64x64xf8E5M2>>
-    %8 = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : <f16>, <tensor<256x64xf16>>
+    %7 = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : !tt.ptr<f8E5M2>, !tt.tensordesc<tensor<64x64xf8E5M2>>
+    %8 = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<256x64xf16>>
     %9 = arith.addi %K, %c63_i32 : i32
     %10 = arith.divsi %9, %c64_i32 : i32
     %accumulator:2 = scf.for %iv = %c0_i32 to %10 step %c1_i32 iter_args(%k_off = %c0_i32, %acc = %cst) -> (i32, tensor<256x64xf32, #mma>)  : i32 {
@@ -171,10 +171,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %2 = arith.muli %0, %c256_i32 : i32
     %3 = arith.muli %1, %c64_i32 : i32
     %4 = arith.extsi %K : i32 to i64
-    %5 = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : <f32>, <tensor<256x16xf32>>
+    %5 = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%4, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<tensor<256x16xf32>>
     %6 = arith.extsi %N : i32 to i64
-    %7 = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : <f32>, <tensor<16x64xf32>>
-    %8 = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : <f32>, <tensor<256x64xf32>>
+    %7 = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%6, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<tensor<16x64xf32>>
+    %8 = tt.make_tensor_descriptor %c_ptr, [%M, %N], [%6, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<tensor<256x64xf32>>
     %9 = arith.addi %K, %c15_i32 : i32
     %10 = arith.divsi %9, %c16_i32 : i32
     %accumulator:2 = scf.for %iv = %c0_i32 to %10 step %c1_i32 iter_args(%k_off = %c0_i32, %acc = %cst) -> (i32, tensor<256x64xf32, #mma>)  : i32 {

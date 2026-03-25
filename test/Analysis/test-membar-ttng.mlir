@@ -167,6 +167,7 @@ tt.func @no_barrier_before_perthread_arrive(%arg: tensor<32x16xf16, #blocked_pt>
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_pt, #ttg.shared_memory, mutable>
   %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_pt, #ttg.shared_memory, mutable>
   //      CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.arrive_barrier
   //  CHECK-NOT: gpu.barrier
   //      CHECK: tt.return
@@ -191,7 +192,7 @@ tt.func @barrier_before_regular_arrive(%arg: tensor<32x16xf16, #blocked_reg>) {
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_reg, #ttg.shared_memory, mutable>
   %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
   //      CHECK: ttg.local_store
-  // CHECK-NEXT: gpu.barrier
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.arrive_barrier
   ttg.local_store %arg, %alloc : tensor<32x16xf16, #blocked_reg> -> !ttg.memdesc<32x16xf16, #A_SHARED_reg, #ttg.shared_memory, mutable>
   ttng.arrive_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared_reg, #ttg.shared_memory, mutable>
