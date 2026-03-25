@@ -31,3 +31,4 @@ pytest python/test/unit/language/test_autows_addmm.py
 echo "Run autoWS tutorial kernels"
 echo "Verifying correctness of FA tutorial kernels"
 TRITON_USE_META_PARTITION=1 TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 pytest python/tutorials/fused-attention-ws-device-tma.py
+TRITON_USE_META_PARTITION=1 TRITON_ALWAYS_COMPILE=1 TRITON_USE_META_WS=1 python python/tutorials/test_tlx_bwd_from_fused_attention.py

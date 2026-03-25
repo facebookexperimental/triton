@@ -2111,6 +2111,89 @@ DenseMap<Channel *, Value> createBufferPost(
   return bufferMap;
 }
 
+// Replace a standalone tcgen05_commit (placed after a loop for a D-channel
+// where MMA is the producer) with a wait on the MMA's existing inline A/B
+// consumer_release barrier followed by an arrive on the D barrier. This avoids
+// the global tcgen05_commit fence, enabling per-MMA completion tracking in
+// data-partitioned loops.
+//
+// In the data-partitioned case, multiple MMAs run inside the loop and each has
+// an inline completion barrier from its A/B consumer_release channel. Instead
+// of creating a tcgen05_commit (a global fence that commits ALL pending MMAs),
+// generate a wait on the specific MMA's A/B barrier (from the final iteration)
+// + arrive on the D barrier for per-MMA completion tracking.
+//
+// The caller must set the builder's insertion point, async task IDs, and loop
+// schedule info before calling this function.
+//
+// Returns true if the replacement was performed, false if the MMA doesn't have
+// an inline A/B barrier (caller should fall back to creating a commit).
+static bool
+replaceCommitWithBarrierSync(OpBuilderWithAsyncTaskIds &builder,
+                             ttng::TCGen5MMAOp mmaOp, Value dBarrierAlloc,
+                             DenseSet<Operation *> &regionsWithChannels,
+                             ReuseConfig *config) {
+  // The MMA must have at least one inline completion barrier (from the A/B
+  // consumer_release channel processed earlier in program order).
+  auto barriers = mmaOp.getBarriers();
+  if (barriers.empty())
+    return false;
+
+  // The MMA's inline barrier is a MemDescIndexOp result (indexing into the
+  // barrier allocation). We need the underlying allocation (which lives at
+  // function scope, outside the loop) to create new index ops after the loop.
+  Value abBarrierView = barriers.front();
+  auto indexOp = abBarrierView.getDefiningOp<ttg::MemDescIndexOp>();
+  if (!indexOp)
+    return false;
+  Value abBarrierAlloc = indexOp.getSrc();
+
+  // Get A/B numBuffers from the alloc type (first dimension).
+  auto abAllocType = cast<ttg::MemDescType>(abBarrierAlloc.getType());
+  unsigned abNumBuffers = abAllocType.getShape()[0];
+
+  // Compute the final-iteration buffer index and phase for the A/B barrier.
+  auto [abBufIdx, finalPhase] = getOutOfScopeBufferIdxAndPhase(
+      builder, mmaOp, abNumBuffers, regionsWithChannels, config, -1);
+
+  auto loc = mmaOp->getLoc();
+
+  // Index into the A/B barrier array for the final iteration.
+  Value abBarrier =
+      getBarrierForPipelineStage(builder, abBarrierAlloc, abBufIdx);
+
+  // Zero-extend phase from i1 to i32 for WaitBarrierOp.
+  Value phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+      loc, builder.getI32Type(), finalPhase);
+
+  // Wait on the MMA's A/B barrier from the final iteration.
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, abBarrier, phase);
+
+  // Compute D barrier buffer index. The D barrier may have a different number
+  // of buffers than the A/B barrier (e.g., D has 1 buffer while A/B has 3)
+  // because the D channel and A/B channel have different pipeline depths
+  // (the default partition can cause the D channel to have fewer buffers).
+  auto dAllocType = cast<ttg::MemDescType>(dBarrierAlloc.getType());
+  unsigned dNumBuffers = dAllocType.getShape()[0];
+
+  Value dBufIdx;
+  if (dNumBuffers == abNumBuffers) {
+    dBufIdx = abBufIdx;
+  } else if (dNumBuffers == 1) {
+    dBufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+  } else {
+    auto [idx, unused] = getOutOfScopeBufferIdxAndPhase(
+        builder, mmaOp, dNumBuffers, regionsWithChannels, config, -1);
+    dBufIdx = idx;
+  }
+
+  // Arrive on the D barrier.
+  Value dBarrier = getBarrierForPipelineStage(builder, dBarrierAlloc, dBufIdx);
+  builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(loc, dBarrier,
+                                                        /*count=*/1);
+  return true;
+}
+
 // Make TCGen5MMAOp fully asynchronous by de-synchronizing it. This leverages
 // its inline barrier to synchronize with both the producer (TMA load) and the
 // consumer (TMEM load). Return the WaitBarrierOp inserted before the consumer
@@ -2152,7 +2235,13 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   // is false this wait_barrier serves as consumer_wait.
   builder.setInsertionPoint(producerOrConsumer);
   builder.setAsyncTaskIdsFromOp(producerOrConsumer);
-  builder.setLoopScheduleInfoFromOp(producerOrConsumer);
+  // Use the actual consumer's stage/cluster, not the memdesc_trans prep op's.
+  // producerOrConsumer may be a memdesc_trans/memdesc_index at stage 0, but
+  // the real consumer (e.g. dQ/dK MMA) may be at stage 1. The wait_barrier
+  // must be in the same SWP stage as the actual consumer to avoid off-by-one
+  // barrier count mismatches that cause deadlock.
+  auto *actualConsumer = getUniqueActualConsumer(producerOrConsumer);
+  builder.setLoopScheduleInfoFromOp(actualConsumer);
   auto producerBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   // curPhase = curPhase xor True for emptyBarrier.
@@ -2950,14 +3039,12 @@ void insertAsyncComm(
         // TCGen5MMAOp directly and instead need a tcgen05.commit.
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          auto indexedBarrier = getBarrierForPipelineStage(
-              builder, *commChannel.producerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               indexedBarrier);
+          // We need to place the commit after the for loop.
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), *commChannel.producerBarrier);
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3030,10 +3117,8 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          auto indexedConsumerBarrier =
-              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), indexedConsumerBarrier);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               consumerBarrier);
           builder.clearLoopScheduleInfo();
         }
 
@@ -3279,9 +3364,38 @@ void insertAsyncComm(
       if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
-        builder.setLoopScheduleInfoFromOp(consumerWaitPoint);
+        // Use the actual consumer's stage/cluster instead of the prep op's.
+        // consumerWaitPoint may be a memdesc_trans at stage 0, but the real
+        // consumer (e.g. dQ/dK MMA) may be at stage 1.
+        auto *actualCons = getUniqueActualConsumer(consumerWaitPoint);
+        builder.setLoopScheduleInfoFromOp(actualCons);
         auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
+        // Propagate the actual consumer's loop schedule to the phase/bufferIdx
+        // value ops. These were computed earlier (by getBufferIdxAndPhase) with
+        // no loop.stage/loop.cluster, but they must match the consumer_wait's
+        // stage so SWP pipelines them together.
+        auto schedInfo = builder.getLoopScheduleInfo();
+        for (Value v : {bufferIdx, phase}) {
+          SmallVector<Value> worklist = {v};
+          DenseSet<Value> visited;
+          while (!worklist.empty()) {
+            Value cur = worklist.pop_back_val();
+            if (!visited.insert(cur).second)
+              continue;
+            auto *defOp = cur.getDefiningOp();
+            if (!defOp || defOp->getBlock() != waitOp->getBlock())
+              continue;
+            if (!defOp->hasAttr(triton::kLoopStageAttrName)) {
+              if (schedInfo.stage)
+                defOp->setAttr(triton::kLoopStageAttrName, schedInfo.stage);
+              if (schedInfo.cluster)
+                defOp->setAttr(triton::kLoopClusterAttrName, schedInfo.cluster);
+              for (Value operand : defOp->getOperands())
+                worklist.push_back(operand);
+            }
+          }
+        }
         LDBG("create ConsumerWait " << masterChannel->uniqID << " ");
       }
 
@@ -3616,6 +3730,130 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 
   for (auto allocOp : toErase) {
     allocOp.erase();
+  }
+}
+
+// Remove redundant TMEM zeroing stores.
+// When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
+// useAccumulator=false (on the first iteration), any preceding
+// tmem_store of zeros is redundant — the MMA's useD=false already
+// zeros the accumulator. Removing the store early (before buffer
+// allocation) prevents the autoWS compiler from creating a
+// cross-partition channel for it.
+void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
+  auto isConstZeroTensor = [](Value v) -> bool {
+    auto constOp = v.getDefiningOp<arith::ConstantOp>();
+    if (!constOp)
+      return false;
+    auto denseAttr = dyn_cast<DenseFPElementsAttr>(constOp.getValue());
+    if (!denseAttr)
+      return false;
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero();
+  };
+
+  auto mmaUsesAccFalseOnFirstIter = [](ttng::TCGen5MMAOp mmaOp) -> bool {
+    Value useAccFlag = mmaOp.useAccumulator();
+    if (!useAccFlag)
+      return false;
+    // If useAccFlag is a block argument of a ForOp, trace it to the
+    // init value to check the first iteration.
+    if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
+        if (blockArg.getOwner() == forOp.getBody()) {
+          unsigned argNum = blockArg.getArgNumber();
+          if (argNum > 0)
+            useAccFlag = forOp.getInitArgs()[argNum - 1];
+        }
+      }
+    }
+    if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
+      if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue()))
+        return !boolAttr.getValue();
+      if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+        return intAttr.getInt() == 0;
+    }
+    return false;
+  };
+
+  SmallVector<ttng::TMEMStoreOp> toErase;
+  funcOp.walk([&](ttng::TMEMAllocOp tmemAllocOp) {
+    bool hasZeroStore = false;
+    ttng::TMEMStoreOp zeroStoreOp;
+    bool hasMmaWithUseDFalse = false;
+    scf::ForOp mmaParentLoop = nullptr;
+    // Collect all transitive users of the alloc result, following through
+    // MemDescIndexOp and other view ops to find the actual TMEMStoreOp
+    // and TCGen5MMAOp users.
+    SmallVector<Value> worklist = {tmemAllocOp.getResult()};
+    DenseSet<Value> visited;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+      for (auto *user : v.getUsers()) {
+        // Need to check store happens before other producers and it doesn't
+        // reach other users directly.
+        if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
+          if (isConstZeroTensor(storeOp.getSrc())) {
+            hasZeroStore = true;
+            zeroStoreOp = storeOp;
+          }
+        } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+          if (mmaOp.getD() == v && mmaUsesAccFalseOnFirstIter(mmaOp)) {
+            hasMmaWithUseDFalse = true;
+            mmaParentLoop = mmaOp->getParentOfType<scf::ForOp>();
+          }
+        }
+        // Follow through view ops (MemDescIndexOp, etc.) to find
+        // indirect users of the TMEM alloc.
+        for (auto result : user->getResults()) {
+          if (isa<triton::gpu::MemDescType>(result.getType()))
+            worklist.push_back(result);
+        }
+      }
+    }
+    if (hasZeroStore && hasMmaWithUseDFalse && zeroStoreOp && mmaParentLoop) {
+      // Only remove the zero-store if both it and the MMA are inside a
+      // common persistent outer loop. If the zero-store is outside all
+      // loops (e.g., matmul initialization before the loop), it's
+      // legitimate and must be kept.
+      // In persistent BWD FA, the outer persistent loop contains both
+      // the zero-store and the inner loop (which contains the MMA).
+      auto zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::ForOp>();
+      if (zeroStoreParentLoop &&
+          (zeroStoreParentLoop == mmaParentLoop ||
+           zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
+        LLVM_DEBUG({
+          LDBG("Removing redundant TMEM zero-store for operand D: "
+               << "MMA useD=false already handles zeroing");
+        });
+        toErase.push_back(zeroStoreOp);
+      }
+    }
+  });
+  for (auto op : toErase) {
+    // TMEMStoreOp may produce a token result that has downstream uses.
+    // Replace the output token with the input token before erasing.
+    for (unsigned i = 0; i < op.getNumResults(); ++i) {
+      if (!op.getResult(i).use_empty()) {
+        // Find the corresponding input token operand to forward.
+        // TMEMStoreOp signature: (src, dst[token], pred) -> token
+        // The token input is the second operand (getToken()).
+        if (i == 0 && op.getNumOperands() >= 2) {
+          Value inputToken = op.getOperand(1);
+          if (inputToken.getType() == op.getResult(i).getType() &&
+              inputToken != op.getResult(i)) {
+            op.getResult(i).replaceAllUsesWith(inputToken);
+            continue;
+          }
+        }
+        // Cannot safely replace — skip erasing this op.
+        goto next_op;
+      }
+    }
+    op.erase();
+  next_op:;
   }
 }
 

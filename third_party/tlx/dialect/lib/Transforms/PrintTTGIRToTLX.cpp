@@ -463,17 +463,6 @@ getValueName(Value v,
       return getValueName(defOp->getOperand(0), argSubstitutionMap,
                           inlineConstants);
     }
-
-    // Inline memdesc_index(buf, idx) as buf[idx]
-    if (defOp->getName().getStringRef() == "ttg.memdesc_index" &&
-        defOp->getNumOperands() == 2) {
-      return getValueName(defOp->getOperand(0), argSubstitutionMap,
-                          inlineConstants) +
-             "[" +
-             getValueName(defOp->getOperand(1), argSubstitutionMap,
-                          inlineConstants) +
-             "]";
-    }
   }
 
   // Inline constants: if this value is defined by arith.constant, return the
@@ -692,7 +681,6 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
 
 // Check if an operation should be skipped because it's folded into
 // a barrier alloc or not meaningful in TLX output
-static bool isModuloIntermediateMul(Operation *mulOp);
 bool shouldSkipOp(Operation *op,
                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
                   llvm::DenseSet<Operation *> &skippedOps) {
@@ -735,8 +723,35 @@ bool shouldSkipOp(Operation *op,
     return true;
   }
 
-  if (isModuloIntermediateMul(op))
-    return true;
+  // Skip memdesc_index that are only used by init_barrier for barrier allocs
+  if (opName == "ttg.memdesc_index") {
+    // Check if operand comes from a barrier alloc
+    if (op->getNumOperands() > 0) {
+      Value src = op->getOperand(0);
+      if (Operation *srcOp = src.getDefiningOp()) {
+        if (srcOp->getName().getStringRef() == "ttg.local_alloc") {
+          auto it = allocInfoMap.find(srcOp);
+          if (it != allocInfoMap.end() && it->second.isBarrierAlloc) {
+            // Check if all uses of this memdesc_index are init_barrier
+            bool allUsesAreInitBarrier = true;
+            for (Value result : op->getResults()) {
+              for (Operation *user : result.getUsers()) {
+                if (user->getName().getStringRef() != "ttng.init_barrier") {
+                  allUsesAreInitBarrier = false;
+                  break;
+                }
+              }
+              if (!allUsesAreInitBarrier)
+                break;
+            }
+            if (allUsesAreInitBarrier) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
 
   return skippedOps.count(op) > 0;
 }
@@ -756,64 +771,6 @@ static Value resolveThroughCasts(Value v) {
       break;
   }
   return v;
-}
-
-// Check if an arith.muli is an intermediate op in a modulo pattern:
-//   a = X // N; b = a * N; c = X - b  (i.e. c = X % N)
-// Returns true if the muli should be skipped.
-static bool isModuloIntermediateMul(Operation *mulOp) {
-  if (mulOp->getName().getStringRef() != "arith.muli" ||
-      mulOp->getNumOperands() != 2 || !mulOp->getResult(0).hasOneUse())
-    return false;
-
-  Value divResult = mulOp->getOperand(0);
-  Value N_mul = mulOp->getOperand(1);
-  auto *divOp = divResult.getDefiningOp();
-  if (!divOp || divOp->getNumOperands() != 2)
-    return false;
-  StringRef divName = divOp->getName().getStringRef();
-  if (divName != "arith.divsi" && divName != "arith.divui")
-    return false;
-
-  Value X_div = divOp->getOperand(0);
-  Value N_div = divOp->getOperand(1);
-  if (N_mul != N_div)
-    return false;
-
-  // Check the single user is arith.subi with X as operand 0
-  Operation *subOp = *mulOp->getResult(0).getUsers().begin();
-  if (subOp->getName().getStringRef() != "arith.subi" ||
-      subOp->getNumOperands() != 2)
-    return false;
-  return subOp->getOperand(0) == X_div &&
-         subOp->getOperand(1) == mulOp->getResult(0);
-}
-
-// Check if an arith.subi matches a modulo pattern:
-//   a = X // N; b = a * N; c = X - b  →  c = X % N
-// If so, returns true and sets X and N.
-static bool isModuloSub(Operation *subOp, Value &X, Value &N) {
-  if (subOp->getName().getStringRef() != "arith.subi" ||
-      subOp->getNumOperands() != 2)
-    return false;
-
-  X = subOp->getOperand(0);
-  Value mulResult = subOp->getOperand(1);
-  auto *mulOp = mulResult.getDefiningOp();
-  if (!mulOp || mulOp->getName().getStringRef() != "arith.muli" ||
-      mulOp->getNumOperands() != 2)
-    return false;
-
-  Value divResult = mulOp->getOperand(0);
-  N = mulOp->getOperand(1);
-  auto *divOp = divResult.getDefiningOp();
-  if (!divOp || divOp->getNumOperands() != 2)
-    return false;
-  StringRef divName = divOp->getName().getStringRef();
-  if (divName != "arith.divsi" && divName != "arith.divui")
-    return false;
-
-  return divOp->getOperand(0) == X && divOp->getOperand(1) == N;
 }
 
 // Forward declarations
@@ -1212,18 +1169,6 @@ void printSimplifiedOp(
     }
   }
 
-  // Special handling for modulo pattern: x - (x // N * N) → x % N
-  {
-    Value X, N;
-    if (isModuloSub(op, X, N)) {
-      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
-         << getValueName(X, argSubstitutionMap) << " % "
-         << getValueName(N, argSubstitutionMap);
-      printLocComment(op, os);
-      return;
-    }
-  }
-
   // Special handling for binary infix operators (a + b, a * b, etc.)
   {
     static llvm::StringMap<StringRef> infixOpMap = buildInfixOpMap();
@@ -1261,26 +1206,6 @@ void printSimplifiedOp(
       printLocComment(op, os);
       return;
     }
-  }
-
-  // Special handling for tmem_subslice - print with N offset and output size
-  if (opName == "ttng.tmem_subslice" && op->getNumResults() > 0) {
-    os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
-    os << "tlx.subslice(";
-    os << getValueName(op->getOperand(0), argSubstitutionMap);
-    if (auto nAttr = op->getAttrOfType<IntegerAttr>("N")) {
-      os << ", " << nAttr.getInt();
-    }
-    if (auto memDescType =
-            dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
-      ArrayRef<int64_t> shape = memDescType.getShape();
-      if (!shape.empty()) {
-        os << ", " << shape.back();
-      }
-    }
-    os << ")";
-    printLocComment(op, os);
-    return;
   }
 
   // Special handling for local_alloc

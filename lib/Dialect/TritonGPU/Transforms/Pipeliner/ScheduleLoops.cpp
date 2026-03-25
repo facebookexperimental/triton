@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/JSON.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -669,9 +670,89 @@ scheduleKeyOpsUpstream(scf::ForOp forOp,
   return schedule;
 }
 
+// Schedule key ops based on user-provided tt.autows annotations on MMA ops.
+// The tt.autows attribute is a JSON string like {"stage": "0", "order": "2"}
+// that specifies the desired stage and cluster for each MMA.
+// Returns an empty schedule if no MMA has tt.autows annotations.
+CoarseSchedule
+scheduleKeyOpsAnnotation(scf::ForOp forOp,
+                         const DenseMap<Operation *, int> &opLatency,
+                         int defaultNumStages) {
+  // Collect all latency ops and MMA ops with annotations.
+  SmallVector<Operation *> latOps;
+  SmallVector<std::tuple<ttng::MMAv5OpInterface, int, int>> annotatedMMAs;
+
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (opLatency.count(&op))
+      latOps.push_back(&op);
+    if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
+      if (auto attr = op.getAttrOfType<StringAttr>("tt.autows")) {
+        auto parsed = llvm::json::parse(attr.getValue());
+        if (!parsed) {
+          llvm::consumeError(parsed.takeError());
+          continue;
+        }
+        auto *obj = parsed->getAsObject();
+        if (!obj)
+          continue;
+        auto stageStr = obj->getString("stage");
+        auto clusterStr = obj->getString("order");
+        if (!stageStr || !clusterStr)
+          continue;
+        int stage = std::stoi(stageStr->str());
+        int cluster = std::stoi(clusterStr->str());
+        annotatedMMAs.push_back({mmaOp, stage, cluster});
+      }
+    }
+  }
+
+  if (annotatedMMAs.empty())
+    return CoarseSchedule(0);
+
+  // Determine the number of stages and clusters from annotations.
+  int numStages = 0;
+  int numClusters = 0;
+  for (auto &[mma, stage, cluster] : annotatedMMAs) {
+    numStages = std::max(numStages, stage + 1);
+    numClusters = std::max(numClusters, cluster + 1);
+  }
+
+  CoarseSchedule schedule(numStages);
+  SmallVector<CoarseSchedule::Cluster> clusters;
+  for (int i = 0; i < numClusters; ++i)
+    clusters.push_back(schedule.clusters.newAtBack());
+
+  // Assign annotated MMAs to their specified stage/cluster.
+  for (auto &[mma, stage, cluster] : annotatedMMAs) {
+    schedule.insert(mma, stage, clusters[cluster]);
+  }
+
+  // Schedule latency ops (loads, etc.) to stage 0, cluster 0.
+  for (auto *op : latOps) {
+    if (schedule.count(op))
+      continue;
+    schedule.insert(op, 0, clusters[0]);
+  }
+
+  LDBG("scheduleKeyOpsAnnotation: scheduled "
+       << annotatedMMAs.size() << " annotated MMAs with " << numStages
+       << " stages and " << numClusters << " clusters");
+
+  return schedule;
+}
+
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency,
-                              int defaultNumStages, bool useMetaWS) {
+                              int defaultNumStages, bool useMetaWS,
+                              bool useAnnotation) {
+  // Try annotation-based scheduling first (user-provided tt.autows attrs).
+  // This takes priority over all other scheduling strategies.
+  if (useAnnotation) {
+    auto annotatedSchedule =
+        scheduleKeyOpsAnnotation(forOp, opLatency, defaultNumStages);
+    if (!annotatedSchedule.empty())
+      return annotatedSchedule;
+  }
   if (useMetaWS) {
     return scheduleKeyOpsMetaWS(forOp, opLatency, defaultNumStages);
   } else {
@@ -683,14 +764,16 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency,
-                                  int defaultNumStages, bool useMetaWS) {
+                                  int defaultNumStages, bool useMetaWS,
+                                  bool useAnnotation) {
   if (!isSafeToPipeline(forOp))
     return CoarseSchedule(0);
 
   // If the loop has assigned latencies, use them to determine the initial
   // schedule.
   if (hasLatenciesAssigned(forOp, opLatency))
-    return scheduleKeyOps(forOp, opLatency, defaultNumStages, useMetaWS);
+    return scheduleKeyOps(forOp, opLatency, defaultNumStages, useMetaWS,
+                          useAnnotation);
 
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
@@ -786,11 +869,49 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
 
 void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
                   int defaultNumStages, bool useMetaWS) {
+  // If the loop already has loop.stage assignments (from a prior pass such as
+  // partition scheduling), disable annotation-based scheduling so that the
+  // existing schedule is deserialized and respected rather than rebuilt from
+  // scratch.
+  bool stageAssigned = false;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (op.hasAttr(kLoopStageAttrName)) {
+      stageAssigned = true;
+      break;
+    }
+  }
+
+  // Check if any MMA op has tt.autows annotations.
+  bool hasAnnotations = false;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (isa<ttng::MMAv5OpInterface>(&op) && op.hasAttr("tt.autows")) {
+      hasAnnotations = true;
+      break;
+    }
+  }
+  if (stageAssigned) {
+    hasAnnotations = false;
+  }
+
   // Based on the latencies, schedule the key ops to the stages.
-  CoarseSchedule schedule =
-      getInitialSchedule(forOp, opLatency, defaultNumStages, useMetaWS);
+  CoarseSchedule schedule = getInitialSchedule(
+      forOp, opLatency, defaultNumStages, useMetaWS, hasAnnotations);
   if (schedule.empty())
     return;
+
+  // For annotation-based scheduling, save the MMA anchor
+  // assignments before dependency phases can modify them.
+  SmallVector<std::tuple<Operation *, int, CoarseSchedule::Cluster>>
+      savedMMASchedule;
+  if (hasAnnotations) {
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      if (isa<ttng::MMAv5OpInterface>(&op) && schedule.count(&op)) {
+        auto [stage, cluster] = schedule[&op];
+        savedMMASchedule.push_back({&op, stage, cluster});
+      }
+    }
+  }
+
   LLVM_DEBUG({
     schedule.serialize(forOp);
     DBGS() << "Initial coarse schedule:\n" << forOp << "\n";
