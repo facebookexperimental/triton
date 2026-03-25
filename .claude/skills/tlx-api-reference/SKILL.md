@@ -39,7 +39,7 @@ with tlx.async_tasks():
 | `tlx.alloc_barriers(num_barriers, arrive_count=1)` | Allocate SMEM barriers and initialize with arrive count | Both |
 | `tlx.barrier_expect_bytes(bar, bytes, pred=None)` | Set expected transaction byte count on barrier | Both |
 | `tlx.barrier_wait(bar, phase, pred=None)` | Wait until barrier phase flips (LOCAL mbarrier only) | Both |
-| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` | Signal arrival at barrier | Both |
+| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. | Both |
 | `tlx.cluster_barrier()` | Full cluster-wide synchronization barrier | Both |
 
 **arrive_count rules:**
@@ -105,6 +105,16 @@ Used for PingPong scheduling to prevent tensor core contention between consumer 
 | `tlx.tcgen05_commit(mBarrier, two_ctas=False)` | Make mbarrier track completion of prior tcgen05 ops. Use a SEPARATE mbarrier from async_dot | Blackwell |
 
 **Minimum tile sizes for async_dot:** M ≥ 64, K ≥ 16, N ≥ 32
+
+**Pair-CTA MMA (two_ctas=True):** M must be 128 per CTA.
+
+## Multi-CTA (Cluster) Kernels
+
+`ctas_per_cga=(N,1,1)` in triton.Config sets the cluster size. The grid
+specifies **total CTAs**; hardware divides by ctas_per_cga to get the number
+of clusters. E.g., grid=(2,1,1) with ctas_per_cga=(2,1,1) = 1 cluster of
+2 CTAs.
+
 
 **input_precision options:** `tf32`, `tf32x3`, `ieee`
 
