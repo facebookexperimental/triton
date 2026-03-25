@@ -1624,7 +1624,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
   }
 }
 
-/// Walk over \p loop and clone Broadcast/ExpandDims/ConvertLayout ops into each
+/// Walk over \p loop and clone Broadcast/ExpandDims ops into each
 /// partition that they have users in. This reduces the amount of data that
 /// needs to be transferred through memory.
 void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
@@ -1639,7 +1639,7 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // Walk everything in reverse so that operations are visited before their
   // operands.
   loop.walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (!isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
+    if (!isa<BroadcastOp, ExpandDimsOp>(op))
       return;
 
     Partition *partition = getPartition(op);
@@ -1717,13 +1717,13 @@ void PartitionSchedulingMeta::runOnOperation() {
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
-      // Clean Broadcast/ExpandDims/ConvertLayout that were left with no users
+      // Clean Broadcast/ExpandDims that were left with no users
       // after optimizeSchedule. We wait until after the schedule is serialized
       // to avoid invalidating pointers stored in the schedule.
       loop.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
         // By default, the walk is in postorder so it is safe to delete ops
         // while we walk.
-        if (isa<BroadcastOp, ExpandDimsOp, ConvertLayoutOp>(op))
+        if (isa<BroadcastOp, ExpandDimsOp>(op))
           if (op->use_empty())
             op->erase();
       });

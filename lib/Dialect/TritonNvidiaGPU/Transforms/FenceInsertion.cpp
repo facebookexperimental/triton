@@ -85,8 +85,21 @@ public:
                                                       /*bCluster=*/false);
       // Try to hoist the fence out of loops if all dependencies are outside.
       while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
-        if (llvm::any_of(copyRegToSharedOps,
-                         [&](Operation *op) { return loopOp->isAncestor(op); }))
+        if (llvm::any_of(copyRegToSharedOps, [&](Operation *op) {
+              if (loopOp->isAncestor(op))
+                return true;
+              // Don't hoist if the write is in a sibling partition of the
+              // same warp_specialize. Sibling partitions execute in parallel,
+              // so the write happens each loop iteration and the fence must
+              // too.
+              auto wsPartitions =
+                  op->getParentOfType<ttg::WarpSpecializePartitionsOp>();
+              if (wsPartitions &&
+                  loopOp->getParentOfType<ttg::WarpSpecializePartitionsOp>() ==
+                      wsPartitions)
+                return true;
+              return false;
+            }))
           break;
         loopOp.moveOutOfLoop(fence);
       }
@@ -140,7 +153,7 @@ private:
           result.insert(op);
         }
         // Check if there are local_store ops that write to that buffer.
-        for (auto user : localAlloc.getResult().getUsers()) {
+        for (auto *user : localAlloc.getResult().getUsers()) {
           while (user->hasOneUse() &&
                  user->hasTrait<OpTrait::MemDescViewTrait>()) {
             user = *user->getUsers().begin();
@@ -148,6 +161,46 @@ private:
           if (isa<ttg::LocalStoreOp>(user)) {
             result.insert(user);
             return;
+          }
+        }
+        // When the alloc is captured by a warp_specialize op, check all
+        // partition regions for local_store ops to the corresponding block
+        // arg. This handles the case where early TMA store lowering creates
+        // a local_alloc + async_tma_copy in the epilogue partition, and
+        // code partitioning splits the alloc: the local_store ends up in
+        // the computation partition while the TMA copy stays in the
+        // epilogue partition.
+        for (auto *user : localAlloc.getResult().getUsers()) {
+          auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(user);
+          if (!wsOp)
+            continue;
+          auto captures = wsOp.getExplicitCaptures();
+          for (unsigned i = 0; i < captures.size(); i++) {
+            if (captures[i] != localAlloc.getResult())
+              continue;
+            for (Region *region : wsOp.getPartitionRegions()) {
+              Value blockArg = region->getArgument(i);
+              // Walk through users of the block arg, following memdesc
+              // view ops, looking for local_store.
+              SmallVector<Value> worklist = {blockArg};
+              DenseSet<Value> seen;
+              while (!worklist.empty()) {
+                Value v = worklist.pop_back_val();
+                if (!seen.insert(v).second)
+                  continue;
+                for (auto *vUser : v.getUsers()) {
+                  if (isa<ttg::LocalStoreOp>(vUser)) {
+                    result.insert(vUser);
+                    return;
+                  }
+                  if (vUser->hasTrait<OpTrait::MemDescViewTrait>()) {
+                    for (auto res : vUser->getResults())
+                      worklist.push_back(res);
+                  }
+                }
+              }
+            }
+            break;
           }
         }
       }

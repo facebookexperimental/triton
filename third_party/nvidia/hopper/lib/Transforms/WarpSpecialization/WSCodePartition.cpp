@@ -2958,9 +2958,51 @@ void insertAsyncComm(
           // before overwriting it.
           earlyChannelForReuseSync = earlyChannel;
         }
+      } else if (group->channels.size() > 2) {
+        // N-buffer reuse group handling (N > 2): generalize the 2-buffer
+        // case to create a dependency chain. Each channel i > 0 must wait
+        // for channel i-1's consumer to finish reading from the shared
+        // buffer before overwriting it.
+        //
+        // This handles cases like epilogue subtiling where N subtiles share
+        // a single SMEM buffer and are stored/loaded sequentially.
+        bool allSingleCopy = llvm::all_of(group->channels, [](Channel *ch) {
+          return ch->getNumBuffers() == 1;
+        });
+        if (allSingleCopy) {
+          // Order channels by producer program order.
+          SmallVector<Channel *> ordered(group->channels.begin(),
+                                         group->channels.end());
+          llvm::sort(ordered, [&](Channel *a, Channel *b) {
+            return appearsBefore(a->getSrcOp(), b->getSrcOp());
+          });
+          // Find masterChannel's position in the ordered list.
+          for (size_t i = 1; i < ordered.size(); i++) {
+            if (ordered[i] == masterChannel) {
+              auto *earlyChannel = ordered[i - 1];
+              if (needExplicitReuseWait(earlyChannel, masterChannel)) {
+                auto *earlyProducer = earlyChannel->getSrcOp();
+                if (earlyProducer->getBlock() == headProducer->getBlock() &&
+                    appearsBefore(earlyProducer, headProducer)) {
+                  auto *lateConsumer = masterChannel->getDstOp();
+                  if (lateConsumer->getBlock() == earlyProducer->getBlock()) {
+                    producerAcquireForChannelLoop = earlyProducer;
+                  }
+                }
+                earlyChannelForReuseSync = earlyChannel;
+                LLVM_DEBUG({
+                  LDBG("N-reuse group: channel "
+                       << masterChannel->uniqID
+                       << " will wait on early channel "
+                       << earlyChannel->uniqID);
+                });
+              }
+              break;
+            }
+          }
+        }
       }
     }
-
     builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
@@ -3194,9 +3236,15 @@ void insertAsyncComm(
           builder.setAsynTaskIdsFromArray(foundGuardCh->relation.first);
           builder.setInsertionPointAfter(guardConsumerReleasePoint);
           builder.setLoopScheduleInfoFromOp(guardConsumerReleasePoint);
-          Value guardBufIdx =
-              builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-                  guardConsumerReleasePoint->getLoc(), 0, 32);
+          // Compute bufferIdx in the consumer's async-task context so that
+          // the defining ops carry the consumer's task IDs and survive
+          // partitioning (the producer's bufferIdx carries producer task IDs
+          // and would be destroyed in the consumer partition).
+          Value guardBufIdx, guardPhase;
+          getBufferIdxAndPhase(builder, guardConsumerReleasePoint,
+                               masterChannel->getNumBuffers(),
+                               regionsWithChannels, guardBufIdx, guardPhase,
+                               config, reuseGrp, masterChannel);
           builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
               guardConsumerReleasePoint->getLoc(), guardToken, guardBufIdx);
 
