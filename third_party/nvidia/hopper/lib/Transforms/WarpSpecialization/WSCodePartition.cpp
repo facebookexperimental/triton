@@ -3036,27 +3036,15 @@ void insertAsyncComm(
                                                    << " ");
         });
         // If we have a nested target we cannot use the barrier in the
-        // TCGen5MMAOp directly. When there are multiple MMAs in the loop
-        // (data partitioning), replace the commit with a wait on the MMA's
-        // A/B barrier + arrive on the D barrier for per-MMA completion
-        // tracking. With a single MMA, use a normal tcgen05_commit.
+        // TCGen5MMAOp directly and instead need a tcgen05.commit.
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          // Count MMAs in the nested loop to detect data partitioning.
-          unsigned mmaCount = 0;
-          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
-          if (mmaCount <= 1 ||
-              !replaceCommitWithBarrierSync(
-                  builder, cast<ttng::TCGen5MMAOp>(mmaOp),
-                  *commChannel.producerBarrier, regionsWithChannels, config)) {
-            auto indexedBarrier = getBarrierForPipelineStage(
-                builder, *commChannel.producerBarrier, bufferIdx);
-            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), indexedBarrier);
-          }
+          // We need to place the commit after the for loop.
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), *commChannel.producerBarrier);
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3125,24 +3113,12 @@ void insertAsyncComm(
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // When there are multiple MMAs in the loop (data partitioning),
-          // replace the commit with a wait on the MMA's A/B barrier + arrive
-          // on the D barrier for per-MMA completion tracking. With a single
-          // MMA, use a normal tcgen05_commit.
+          // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          // Count MMAs in the nested loop to detect data partitioning.
-          unsigned mmaCount = 0;
-          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
-          if (mmaCount <= 1 ||
-              !replaceCommitWithBarrierSync(builder, mmaOp, consumerBarrier,
-                                            regionsWithChannels, config)) {
-            auto indexedConsumerBarrier =
-                getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-                mmaOp->getLoc(), indexedConsumerBarrier);
-          }
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               consumerBarrier);
           builder.clearLoopScheduleInfo();
         }
 
