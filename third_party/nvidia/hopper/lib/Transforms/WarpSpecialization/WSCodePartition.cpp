@@ -3085,8 +3085,10 @@ void insertAsyncComm(
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
           // We need to place the commit after the for loop.
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), *commChannel.producerBarrier);
+          auto indexedBarrier = getBarrierForPipelineStage(
+              builder, *commChannel.producerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
+                                                               indexedBarrier);
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3159,8 +3161,10 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               consumerBarrier);
+          auto indexedConsumerBarrier =
+              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+              mmaOp->getLoc(), indexedConsumerBarrier);
           builder.clearLoopScheduleInfo();
         }
 
