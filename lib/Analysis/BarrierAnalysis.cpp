@@ -275,11 +275,31 @@ static void collectUsagesInRegion(Region &region, int partitionId,
   // to the warp_specialize operand index.
   DenseMap<Value, unsigned> valueToArgIdx;
 
+  // Map from pre-indexed barrier memdesc_index results to (argIdx, slotIndex).
+  // Only needed for the default region where pre-computed indices are used
+  // directly by barrier ops (e.g., TLX TTGIR).
+  DenseMap<Value, std::pair<unsigned, int64_t>> preIndexedBarriers;
+
   if (isDefaultRegion) {
     // Default region implicitly captures — the values used inside are the
     // same SSA values as the warp_specialize operands.
-    for (unsigned i = 0; i < wsCaptures.size(); ++i)
+    for (unsigned i = 0; i < wsCaptures.size(); ++i) {
       valueToArgIdx[wsCaptures[i]] = i;
+
+      // For barrier allocs, also map their pre-indexed memdesc_index results
+      // (defined before warp_specialize) so we can detect direct uses.
+      if (info.barrierArgIndices.contains(i)) {
+        for (Operation *user : wsCaptures[i].getUsers()) {
+          if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(user)) {
+            // Only map indices defined outside the warp_specialize regions.
+            if (!region.isAncestor(indexOp->getParentRegion())) {
+              int64_t slot = getMemDescIndex(indexOp);
+              preIndexedBarriers[indexOp->getResult(0)] = {i, slot};
+            }
+          }
+        }
+      }
+    }
   } else {
     // Partition regions have block arguments mapping 1:1 to captures.
     Block &block = region.front();
@@ -376,6 +396,58 @@ static void collectUsagesInRegion(Region &region, int partitionId,
         memObj->offset = slotIndex;
     }
   });
+
+  // Walk barrier ops that use pre-indexed values (default region only, e.g.,
+  // TLX TTGIR where memdesc_index results from before warp_specialize are
+  // used directly by wait_barrier/arrive_barrier in the default region).
+  if (!preIndexedBarriers.empty()) {
+    auto recordPreIndexedUsage = [&](Operation *op, Value barrierVal,
+                                     BarrierObjectRole role) {
+      auto it = preIndexedBarriers.find(barrierVal);
+      if (it == preIndexedBarriers.end())
+        return;
+      auto [argIdx, slot] = it->second;
+      // Use the memdesc_index op (which has a result with an SSA name)
+      // instead of the barrier consumer op (which may have no results).
+      Operation *nameOp = barrierVal.getDefiningOp();
+      if (!nameOp)
+        nameOp = op;
+      SmallVector<BarrierObject *> targets;
+      if (slot >= 0) {
+        auto key = std::make_pair(argIdx, slot);
+        auto slotIt = info.slotToBarrier.find(key);
+        if (slotIt != info.slotToBarrier.end())
+          targets.push_back(slotIt->second);
+      } else {
+        auto slotsIt = info.argIdxToBarrierSlots.find(argIdx);
+        if (slotsIt != info.argIdxToBarrierSlots.end())
+          targets = slotsIt->second;
+      }
+      for (BarrierObject *barrier : targets) {
+        barrier->usages.push_back({role, partitionId, nameOp});
+        LDBG("Step2: pre-indexed barrier usage name="
+             << barrier->name << " partition=" << partitionId << " slot="
+             << barrier->offset);
+      }
+    };
+
+    region.walk([&](ttng::WaitBarrierOp op) {
+      recordPreIndexedUsage(op, op.getAlloc(),
+                            BarrierObjectRole::ProducerAcquire);
+    });
+    region.walk([&](ttng::ArriveBarrierOp op) {
+      recordPreIndexedUsage(op, op.getAlloc(),
+                            BarrierObjectRole::ProducerCommit);
+    });
+    region.walk([&](ttng::BarrierExpectOp op) {
+      recordPreIndexedUsage(op, op.getAlloc(),
+                            BarrierObjectRole::ProducerCommit);
+    });
+    region.walk([&](ttng::TCGen5CommitOp op) {
+      recordPreIndexedUsage(op, op.getBarrier(),
+                            BarrierObjectRole::ProducerCommit);
+    });
+  }
 
   // Walk named barrier ops (arrive_barrier_named / wait_barrier_named).
   auto getOrCreateNamedBarrier = [&](int64_t barIdx) -> BarrierObject * {
