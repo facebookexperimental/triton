@@ -2118,20 +2118,23 @@ DenseMap<Channel *, Value> createBufferPost(
 // data-partitioned loops.
 //
 // In the data-partitioned case, multiple MMAs run inside the loop and each has
-// an inline completion barrier from its A/B consumer_release channel. After the
-// loop, standalone tcgen05_commit ops signal the D barriers. Since
-// tcgen05_commit is a global fence that commits ALL pending MMAs, the first
-// commit must wait for every MMA to finish. By replacing each commit with a
-// wait on the specific MMA's A/B barrier (from the final iteration) + arrive on
-// the D barrier, we enable per-MMA completion tracking.
+// an inline completion barrier from its A/B consumer_release channel. Instead
+// of creating a tcgen05_commit (a global fence that commits ALL pending MMAs),
+// generate a wait on the specific MMA's A/B barrier (from the final iteration)
+// + arrive on the D barrier for per-MMA completion tracking.
 //
-// Returns true if the replacement was performed.
-static bool tryReplaceCommitWithBarrierSync(
-    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5CommitOp commitOp,
-    ttng::TCGen5MMAOp mmaOp, unsigned numBuffers,
-    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
+// The caller must set the builder's insertion point, async task IDs, and loop
+// schedule info before calling this function.
+//
+// Returns true if the replacement was performed, false if the MMA doesn't have
+// an inline A/B barrier (caller should fall back to creating a commit).
+static bool
+replaceCommitWithBarrierSync(OpBuilderWithAsyncTaskIds &builder,
+                             ttng::TCGen5MMAOp mmaOp, Value dBarrierAlloc,
+                             DenseSet<Operation *> &regionsWithChannels,
+                             ReuseConfig *config) {
   // The MMA must have at least one inline completion barrier (from the A/B
-  // consumer_release channel). If not, fall back to the normal tcgen05_commit.
+  // consumer_release channel processed earlier in program order).
   auto barriers = mmaOp.getBarriers();
   if (barriers.empty())
     return false;
@@ -2145,25 +2148,19 @@ static bool tryReplaceCommitWithBarrierSync(
     return false;
   Value abBarrierAlloc = indexOp.getSrc();
 
-  // Ensure the barrier allocation dominates the commit op (i.e., it's defined
-  // outside the loop containing the MMA). If not, bail out.
-  mlir::DominanceInfo dom(commitOp->getParentOfType<triton::FuncOp>());
-  if (auto *defOp = abBarrierAlloc.getDefiningOp()) {
-    if (!dom.properlyDominates(defOp, commitOp))
-      return false;
-  }
+  // Get A/B numBuffers from the alloc type (first dimension).
+  auto abAllocType = cast<ttg::MemDescType>(abBarrierAlloc.getType());
+  unsigned abNumBuffers = abAllocType.getShape()[0];
 
   // Compute the final-iteration buffer index and phase for the A/B barrier.
-  builder.setInsertionPoint(commitOp);
-  builder.setAsyncTaskIdsFromOp(commitOp);
-  auto [finalBufIdx, finalPhase] = getOutOfScopeBufferIdxAndPhase(
-      builder, mmaOp, numBuffers, regionsWithChannels, config, -1);
+  auto [abBufIdx, finalPhase] = getOutOfScopeBufferIdxAndPhase(
+      builder, mmaOp, abNumBuffers, regionsWithChannels, config, -1);
 
-  auto loc = commitOp->getLoc();
+  auto loc = mmaOp->getLoc();
 
-  // Index into the barrier array for the final iteration.
+  // Index into the A/B barrier array for the final iteration.
   Value abBarrier =
-      getBarrierForPipelineStage(builder, abBarrierAlloc, finalBufIdx);
+      getBarrierForPipelineStage(builder, abBarrierAlloc, abBufIdx);
 
   // Zero-extend phase from i1 to i32 for WaitBarrierOp.
   Value phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
@@ -2172,110 +2169,29 @@ static bool tryReplaceCommitWithBarrierSync(
   // Wait on the MMA's A/B barrier from the final iteration.
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, abBarrier, phase);
 
-  // Arrive on the D barrier (the one the commit was going to signal).
-  // Index into the D barrier allocation for the final iteration.
-  Value dBarrierAlloc = commitOp.getBarrier();
-  Value dBarrier =
-      getBarrierForPipelineStage(builder, dBarrierAlloc, finalBufIdx);
+  // Compute D barrier buffer index. The D barrier may have a different number
+  // of buffers than the A/B barrier (e.g., D has 1 buffer while A/B has 3)
+  // because the D channel and A/B channel have different pipeline depths
+  // (the default partition can cause the D channel to have fewer buffers).
+  auto dAllocType = cast<ttg::MemDescType>(dBarrierAlloc.getType());
+  unsigned dNumBuffers = dAllocType.getShape()[0];
+
+  Value dBufIdx;
+  if (dNumBuffers == abNumBuffers) {
+    dBufIdx = abBufIdx;
+  } else if (dNumBuffers == 1) {
+    dBufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+  } else {
+    auto [idx, unused] = getOutOfScopeBufferIdxAndPhase(
+        builder, mmaOp, dNumBuffers, regionsWithChannels, config, -1);
+    dBufIdx = idx;
+  }
+
+  // Arrive on the D barrier.
+  Value dBarrier = getBarrierForPipelineStage(builder, dBarrierAlloc, dBufIdx);
   builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(loc, dBarrier,
                                                         /*count=*/1);
-
-  // Erase the original tcgen05_commit.
-  commitOp->erase();
   return true;
-}
-
-// Find TCGen5MMAOp ops inside a for loop that match the given async_task_ids.
-static ttng::TCGen5MMAOp findMMAInLoop(scf::ForOp forOp,
-                                       ArrayRef<AsyncTaskId> targetTaskIds) {
-  ttng::TCGen5MMAOp result = nullptr;
-  forOp.getBody()->walk([&](ttng::TCGen5MMAOp mmaOp) {
-    auto taskIds = getAsyncTaskIds(mmaOp);
-    if (taskIds.size() == targetTaskIds.size() &&
-        std::equal(taskIds.begin(), taskIds.end(), targetTaskIds.begin())) {
-      result = mmaOp;
-    }
-  });
-  return result;
-}
-
-// Walk the function to find groups of consecutive tcgen05_commit ops that
-// result from data partitioning (2+ commits after the same for loop), and
-// replace each with a per-MMA wait+arrive pattern.
-static void
-replaceDataPartitionedCommits(triton::FuncOp funcOp,
-                              DenseSet<Operation *> &regionsWithChannels,
-                              ReuseConfig *config) {
-  // Collect groups of consecutive commit ops.
-  DenseSet<ttng::TCGen5CommitOp> seen;
-  SmallVector<SmallVector<ttng::TCGen5CommitOp>> commitGroups;
-  funcOp.walk<mlir::WalkOrder::PreOrder>([&](ttng::TCGen5CommitOp commitOp) {
-    if (seen.count(commitOp))
-      return;
-    SmallVector<ttng::TCGen5CommitOp> group;
-    auto *block = commitOp->getBlock();
-    for (auto it = mlir::Block::iterator(commitOp); it != block->end(); ++it) {
-      if (auto op = dyn_cast<ttng::TCGen5CommitOp>(*it)) {
-        if (!seen.count(op)) {
-          seen.insert(op);
-          group.push_back(op);
-        }
-      } else if (isa<ttg::MemDescIndexOp>(*it)) {
-        // Skip memdesc_index ops that compute barrier indices between
-        // commits — they are part of the same commit group.
-        continue;
-      } else {
-        break;
-      }
-    }
-    if (group.size() > 1)
-      commitGroups.push_back(std::move(group));
-  });
-
-  for (auto &group : commitGroups) {
-    // Find the for loop that precedes the commit group.
-    auto *firstCommit = group.front().getOperation();
-    auto *prevOp = firstCommit->getPrevNode();
-    scf::ForOp forOp = nullptr;
-    while (prevOp) {
-      if (auto fOp = dyn_cast<scf::ForOp>(prevOp)) {
-        forOp = fOp;
-        break;
-      }
-      prevOp = prevOp->getPrevNode();
-    }
-    if (!forOp)
-      continue;
-
-    // For each commit except the last, find the MMA with matching task IDs
-    // inside the loop and replace the commit with a per-MMA wait+arrive.
-    // The last commit is kept because tcgen05_commit is cumulative — it
-    // covers all async ops issued since the previous commit. By keeping the
-    // final commit, we ensure all remaining async MMA operations are properly
-    // committed without needing an explicit wait+arrive for the last one.
-    bool allReplaced = true;
-    for (size_t i = 0; i + 1 < group.size(); i++) {
-      auto commitOp = group[i];
-      auto taskIds = getAsyncTaskIds(commitOp);
-      auto mmaOp = findMMAInLoop(forOp, taskIds);
-      if (!mmaOp) {
-        allReplaced = false;
-        continue;
-      }
-      OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
-      // Use the loop's number of buffers (inferred from the barrier
-      // allocation). The barrier is a multi-buffer allocation; its first dim is
-      // numBuffers.
-      auto barrierType =
-          cast<ttg::MemDescType>(commitOp.getBarrier().getType());
-      unsigned numBuffers = barrierType.getShape()[0];
-      if (!tryReplaceCommitWithBarrierSync(builder, commitOp, mmaOp, numBuffers,
-                                           regionsWithChannels, config)) {
-        allReplaced = false;
-      }
-    }
-    (void)allReplaced;
-  }
 }
 
 // Make TCGen5MMAOp fully asynchronous by de-synchronizing it. This leverages
@@ -3114,17 +3030,27 @@ void insertAsyncComm(
                                                    << " ");
         });
         // If we have a nested target we cannot use the barrier in the
-        // TCGen5MMAOp directly and instead need a tcgen05.commit.
+        // TCGen5MMAOp directly. When there are multiple MMAs in the loop
+        // (data partitioning), replace the commit with a wait on the MMA's
+        // A/B barrier + arrive on the D barrier for per-MMA completion
+        // tracking. With a single MMA, use a normal tcgen05_commit.
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          auto indexedBarrier = getBarrierForPipelineStage(
-              builder, *commChannel.producerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               indexedBarrier);
+          // Count MMAs in the nested loop to detect data partitioning.
+          unsigned mmaCount = 0;
+          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
+          if (mmaCount <= 1 ||
+              !replaceCommitWithBarrierSync(
+                  builder, cast<ttng::TCGen5MMAOp>(mmaOp),
+                  *commChannel.producerBarrier, regionsWithChannels, config)) {
+            auto indexedBarrier = getBarrierForPipelineStage(
+                builder, *commChannel.producerBarrier, bufferIdx);
+            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+                mmaOp->getLoc(), indexedBarrier);
+          }
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3193,14 +3119,24 @@ void insertAsyncComm(
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // We need to place the commit after the for loop.
+          // When there are multiple MMAs in the loop (data partitioning),
+          // replace the commit with a wait on the MMA's A/B barrier + arrive
+          // on the D barrier for per-MMA completion tracking. With a single
+          // MMA, use a normal tcgen05_commit.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          auto indexedConsumerBarrier =
-              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), indexedConsumerBarrier);
+          // Count MMAs in the nested loop to detect data partitioning.
+          unsigned mmaCount = 0;
+          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
+          if (mmaCount <= 1 ||
+              !replaceCommitWithBarrierSync(builder, mmaOp, consumerBarrier,
+                                            regionsWithChannels, config)) {
+            auto indexedConsumerBarrier =
+                getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+                mmaOp->getLoc(), indexedConsumerBarrier);
+          }
           builder.clearLoopScheduleInfo();
         }
 
@@ -3488,12 +3424,6 @@ void insertAsyncComm(
                        headConsumer, consumerWaitPoint, isPost);
     }
   }
-
-  // Try to replace consecutive standalone tcgen05_commit ops (from data-
-  // partitioned D-channels) with per-MMA barrier-based synchronization.
-  // Walk the function to find groups of adjacent commits after for loops,
-  // then find their corresponding MMA ops inside the loop.
-  replaceDataPartitionedCommits(funcOp, regionsWithChannels, config);
 
   // Clean up tokens that are not used anymore.
   // Remove an LocalAllocOp op if it is only used by

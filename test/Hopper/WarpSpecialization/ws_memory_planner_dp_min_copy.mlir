@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-print-local-scope | FileCheck %s
 
 // Test: When data partitioning splits the M dimension (factor=2), the inner
 // k-loop has 3 SMEM operands per iteration: a_0 (half 0 of A), a_1 (half 1
@@ -17,16 +17,16 @@
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 //
 // The two epilogue buffers each get their own buffer.id with buffer.copy=1:
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 1 : i32, buffer.id =
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 1 : i32, buffer.id =
+// CHECK: ttg.local_alloc{{.*}}buffer.copy = 1 : i32, buffer.id =
+// CHECK: ttg.local_alloc{{.*}}buffer.copy = 1 : i32, buffer.id =
 //
 // All three innermost-loop SMEM allocs get the same buffer.id and buffer.copy=3
 // (bumped from 2 because there are 3 entries sharing the reuse group):
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]]
+// CHECK: ttg.local_alloc{{.*}}buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]]
 // CHECK-SAME: loc("arg2"
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 3 : i32, buffer.id = [[ID]]
+// CHECK: ttg.local_alloc{{.*}}buffer.copy = 3 : i32, buffer.id = [[ID]]
 // CHECK-SAME: loc("a_1"
-// CHECK: ttg.local_alloc {{.*}} {buffer.copy = 3 : i32, buffer.id = [[ID]]
+// CHECK: ttg.local_alloc{{.*}}buffer.copy = 3 : i32, buffer.id = [[ID]]
 // CHECK-SAME: loc("a_0"
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

@@ -1,22 +1,18 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
 
-// Test: replaceDataPartitionedCommits replaces all but the last standalone
-// tcgen05_commit op (placed after the inner for loop for D-channels where MMA
-// is the producer) with a wait on the MMA's existing inline A/B barrier
-// followed by an arrive on the D barrier. The last commit is kept because
-// tcgen05_commit is cumulative — it covers all async ops since the previous
-// commit, so the final one ensures all remaining MMA operations complete.
+// Test: data-partitioned D-channel commits are replaced at generation time
+// with wait+arrive pairs instead of tcgen05_commit ops. Each MMA gets a
+// wait on its existing inline A/B barrier followed by an arrive on the D
+// barrier, enabling per-MMA completion tracking.
 //
 // The input has a persistent GEMM with tt.data_partition_factor = 2, producing
 // two tc_gen5_mma ops (both with async_task_id {1}) in the inner k-loop.
-// After the inner loop, 3 consecutive tc_gen5_commit ops signal D barriers.
-// The pass replaces the first 2 commits with wait+arrive pairs and keeps the
-// last commit:
-//   1. memdesc_index into the A/B barrier alloc (3x1xi64) for the final iteration
-//   2. extui of the final-iteration phase (i1 -> i32)
-//   3. wait_barrier on the A/B barrier
-//   4. memdesc_index into the D barrier alloc (1x1xi64) for the final iteration
-//   5. arrive_barrier on the D barrier
+// The pass generates wait+arrive groups with no remaining tcgen05_commit.
+//
+// The test verifies barrier identity:
+//   - MMA #1's completion barrier alloc ([[COMP_BAR]]) is captured and verified
+//     to be the same alloc used by MMA #2 and all post-loop wait_barriers
+//   - Each post-loop arrive uses a DISTINCT D barrier alloc
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 // CHECK: ttg.warp_specialize
@@ -24,27 +20,34 @@
 // GEMM partition (partition0, task 1):
 // CHECK: partition0
 // CHECK: scf.for
-// Inner k-loop:
+// Inner k-loop with two MMAs (data_partition_factor = 2):
 // CHECK: scf.for
+// CHECK: ttng.tc_gen5_mma
+// CHECK: ttng.tc_gen5_mma
 // The k-loop ends:
 // CHECK: scf.yield
 //
-// -- Replacement group 1: wait on A/B barrier, arrive on D barrier --
-// CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<3x1xi64
+// After the k-loop, wait+arrive groups replace tcgen05_commit ops.
+// All groups wait on the SAME barrier alloc (the MMA's completion barrier,
+// captured as [[COMP_BAR]] from group 1 and verified in subsequent groups).
+// Each group arrives on a DISTINCT D barrier alloc (1x1xi64).
+//
+// -- Group 1: capture [[COMP_BAR]] and [[D_BAR_A]] --
+// CHECK: ttg.memdesc_index [[COMP_BAR:%[a-z0-9_]+]]{{.*}} : !ttg.memdesc<3x1xi64
 // CHECK: arith.extui {{.*}} : i1 to i32
 // CHECK: ttng.wait_barrier
-// CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<1x1xi64
+// CHECK: ttg.memdesc_index [[D_BAR_A:%[a-z0-9_]+]]{{.*}} : !ttg.memdesc<1x1xi64
 // CHECK: ttng.arrive_barrier
 //
-// -- Replacement group 2 --
-// CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<3x1xi64
+// -- Group 2: same [[COMP_BAR]], distinct D barrier [[D_BAR_B]] --
+// CHECK: ttg.memdesc_index [[COMP_BAR]]{{.*}} : !ttg.memdesc<3x1xi64
 // CHECK: arith.extui {{.*}} : i1 to i32
 // CHECK: ttng.wait_barrier
-// CHECK: ttg.memdesc_index {{.*}} : !ttg.memdesc<1x1xi64
+// CHECK: ttg.memdesc_index [[D_BAR_B:%[a-z0-9_]+]]{{.*}} : !ttg.memdesc<1x1xi64
 // CHECK: ttng.arrive_barrier
 //
-// -- Last commit is kept (cumulative, covers remaining async ops) --
-// CHECK: ttng.tc_gen5_commit {{.*}} : !ttg.memdesc<1x1xi64
+// -- No remaining tc_gen5_commit — all replaced --
+// CHECK-NOT: ttng.tc_gen5_commit
 //
 // Outer loop yield:
 // CHECK: scf.yield
