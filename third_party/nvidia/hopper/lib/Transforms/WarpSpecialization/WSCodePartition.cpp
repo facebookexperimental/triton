@@ -3736,12 +3736,10 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 // Remove redundant TMEM zeroing stores.
 // When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
 // useAccumulator=false (on the first iteration), any preceding
-// tmem_store of zeros is redundant — the MMA's useC=false already
+// tmem_store of zeros is redundant — the MMA's useD=false already
 // zeros the accumulator. Removing the store early (before buffer
 // allocation) prevents the autoWS compiler from creating a
-// cross-partition channel for it, which would otherwise cause a race
-// condition between the reduction partition (zeroing) and the
-// computation partition (reading) in persistent kernels.
+// cross-partition channel for it.
 void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
   auto isConstZeroTensor = [](Value v) -> bool {
     auto constOp = v.getDefiningOp<arith::ConstantOp>();
@@ -3782,7 +3780,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
   funcOp.walk([&](ttng::TMEMAllocOp tmemAllocOp) {
     bool hasZeroStore = false;
     ttng::TMEMStoreOp zeroStoreOp;
-    bool hasMmaWithUseCFalse = false;
+    bool hasMmaWithUseDFalse = false;
     scf::ForOp mmaParentLoop = nullptr;
     // Collect all transitive users of the alloc result, following through
     // MemDescIndexOp and other view ops to find the actual TMEMStoreOp
@@ -3794,6 +3792,8 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
       if (!visited.insert(v).second)
         continue;
       for (auto *user : v.getUsers()) {
+        // Need to check store happens before other producers and it doesn't
+        // reach other users directly.
         if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
           if (isConstZeroTensor(storeOp.getSrc())) {
             hasZeroStore = true;
@@ -3801,7 +3801,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
           }
         } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(user)) {
           if (mmaOp.getD() == v && mmaUsesAccFalseOnFirstIter(mmaOp)) {
-            hasMmaWithUseCFalse = true;
+            hasMmaWithUseDFalse = true;
             mmaParentLoop = mmaOp->getParentOfType<scf::ForOp>();
           }
         }
@@ -3813,7 +3813,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
         }
       }
     }
-    if (hasZeroStore && hasMmaWithUseCFalse && zeroStoreOp && mmaParentLoop) {
+    if (hasZeroStore && hasMmaWithUseDFalse && zeroStoreOp && mmaParentLoop) {
       // Only remove the zero-store if both it and the MMA are inside a
       // common persistent outer loop. If the zero-store is outside all
       // loops (e.g., matmul initialization before the loop), it's
@@ -3826,7 +3826,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
            zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
         LLVM_DEBUG({
           LDBG("Removing redundant TMEM zero-store for operand D: "
-               << "MMA useC=false already handles zeroing");
+               << "MMA useD=false already handles zeroing");
         });
         toErase.push_back(zeroStoreOp);
       }

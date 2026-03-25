@@ -5,7 +5,7 @@
 // This IR is captured from b64/buffer_creation.prior — the actual BWD
 // persistent FA kernel just before NVGPUWarpSpecialization.
 // The removeRedundantTmemZeroStores pass should remove the tmem_store
-// of dense<0.0> for dk/dv since the MMA's useC=false handles zeroing.
+// of dense<0.0> for dk/dv since the MMA's useD=false handles zeroing.
 //
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 // The tmem_store of zeros for dk/dv should be removed:

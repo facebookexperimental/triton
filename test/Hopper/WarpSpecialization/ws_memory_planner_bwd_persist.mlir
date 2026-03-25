@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | triton-opt --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" 2>&1 | FileCheck %s --check-prefix=CODE-PART
 
 // Test case: Persistent FA BWD with budget-aware SMEM allocation (algo=1)
 // and TMEM backtracking allocation (algo=2) propagated from WS ForOp.
@@ -44,6 +45,38 @@
 // SMEM: v and k are not innermost, copy=1
 // CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
 // CHECK: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+
+// Regression test: Code partition must emit tc_gen5_commit ops with raw
+// barrier allocs (1x1xi64), NOT indexed barriers via memdesc_index or
+// wait_barrier+arrive_barrier replacement. Using indexed barriers for the
+// BWD persistent FA kernel caused GPU deadlocks at runtime.
+//
+// CODE-PART-LABEL: @_attn_bwd_persist
+// CODE-PART: ttg.warp_specialize
+//
+// GEMM partition (partition0, task 1): inner k-loop has 5 tc_gen5_mma ops.
+// CODE-PART: partition0
+// CODE-PART: scf.for
+// CODE-PART: scf.for
+// CODE-PART: ttng.tc_gen5_mma
+// CODE-PART: ttng.tc_gen5_mma
+// CODE-PART: ttng.tc_gen5_mma
+// CODE-PART: ttng.tc_gen5_mma
+// CODE-PART: ttng.tc_gen5_mma
+// CODE-PART: scf.yield
+//
+// After the inner k-loop: tc_gen5_commit ops use raw 1x1xi64 barrier allocs.
+// Previously these were replaced with wait_barrier+arrive_barrier (deadlock).
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+//
+// No arrive_barrier ops replacing commits (regression indicator):
+// CODE-PART-NOT: ttng.arrive_barrier
+//
+// Outer loop yield:
+// CODE-PART: scf.yield
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

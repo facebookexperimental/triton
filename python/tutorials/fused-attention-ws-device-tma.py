@@ -676,6 +676,14 @@ _BWD_DOT_ATTRS_BM64 = FrozenDotAttrs({
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
 
+_BWD_DOT_ATTRS_SCHED = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0"},
+    "dpT": {"stage": "0", "order": "2"},
+    "dv": {"stage": "0", "order": "2"},
+    "dq": {"stage": "1", "order": "1"},
+    "dk": {"stage": "1", "order": "1"},
+})
+
 
 @triton.jit
 def _attn_bwd_dkdv_inner(
@@ -845,6 +853,12 @@ def _bwd_host_descriptor_pre_hook(nargs):
     EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
+
+    # Reset dq accumulator to zeros before each autotuner warmup run.
+    # Without this, dq accumulates across autotuner benchmark runs when
+    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
+    nargs["desc_dq"].base.zero_()
+
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE]
@@ -871,20 +885,36 @@ configs_bwd = [
 ]
 
 configs_bwd_persist = [
-    #triton.Config(
-    #    {
-    #        "BLOCK_M1": 128,
-    #        "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4,
-    #        "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
-    #    },
-    #    num_warps=4,
-    #    num_stages=2,
-    #    pre_hook=_bwd_host_descriptor_pre_hook,
-    #),
     triton.Config(
         {
-            "BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 2, "BWD_DOT_ATTRS":
-            _BWD_DOT_ATTRS_BM64,  #_DEFAULT_BWD_DOT_ATTRS, #_BWD_DOT_ATTRS_BM64,
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "BWD_DOT_ATTRS":
+            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
         },
         num_warps=4,
         num_stages=2,

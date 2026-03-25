@@ -174,7 +174,7 @@ public:
     // Remove redundant TMEM zeroing stores before buffer allocation.
     // When a TMEMAllocOp is used as operand D of a TCGen5MMAOp with
     // useAccumulator=false (on the first iteration), any preceding
-    // tmem_store of zeros is redundant — the MMA's useC=false already
+    // tmem_store of zeros is redundant — the MMA's useD=false already
     // zeros the accumulator. Removing the store prevents the autoWS
     // compiler from creating a cross-partition channel for it, which
     // would otherwise cause a race condition between the reduction

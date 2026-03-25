@@ -1,18 +1,13 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
 
-// Test: data-partitioned D-channel commits are replaced at generation time
-// with wait+arrive pairs instead of tcgen05_commit ops. Each MMA gets a
-// wait on its existing inline A/B barrier followed by an arrive on the D
-// barrier, enabling per-MMA completion tracking.
+// Test: data-partitioned D-channel commits use raw barrier allocs (1x1xi64)
+// rather than indexed barriers or wait+arrive replacement. Using indexed
+// barriers in tc_gen5_commit caused GPU deadlocks at runtime.
 //
 // The input has a persistent GEMM with tt.data_partition_factor = 2, producing
 // two tc_gen5_mma ops (both with async_task_id {1}) in the inner k-loop.
-// The pass generates wait+arrive groups with no remaining tcgen05_commit.
-//
-// The test verifies barrier identity:
-//   - MMA #1's completion barrier alloc ([[COMP_BAR]]) is captured and verified
-//     to be the same alloc used by MMA #2 and all post-loop wait_barriers
-//   - Each post-loop arrive uses a DISTINCT D barrier alloc
+// After the k-loop, the pass emits tc_gen5_commit ops with raw 1x1xi64 barrier
+// allocs (no memdesc_index indexing, no wait_barrier+arrive_barrier replacement).
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 // CHECK: ttg.warp_specialize
@@ -27,27 +22,15 @@
 // The k-loop ends:
 // CHECK: scf.yield
 //
-// After the k-loop, wait+arrive groups replace tcgen05_commit ops.
-// All groups wait on the SAME barrier alloc (the MMA's completion barrier,
-// captured as [[COMP_BAR]] from group 1 and verified in subsequent groups).
-// Each group arrives on a DISTINCT D barrier alloc (1x1xi64).
+// After the inner k-loop, tc_gen5_commit ops are emitted with raw barrier
+// allocs (1x1xi64). No wait_barrier+arrive_barrier replacement.
 //
-// -- Group 1: capture [[COMP_BAR]] and [[D_BAR_A]] --
-// CHECK: ttg.memdesc_index [[COMP_BAR:%[a-z0-9_]+]]{{.*}} : !ttg.memdesc<3x1xi64
-// CHECK: arith.extui {{.*}} : i1 to i32
-// CHECK: ttng.wait_barrier
-// CHECK: ttg.memdesc_index [[D_BAR_A:%[a-z0-9_]+]]{{.*}} : !ttg.memdesc<1x1xi64
-// CHECK: ttng.arrive_barrier
+// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
 //
-// -- Group 2: same [[COMP_BAR]], distinct D barrier [[D_BAR_B]] --
-// CHECK: ttg.memdesc_index [[COMP_BAR]]{{.*}} : !ttg.memdesc<3x1xi64
-// CHECK: arith.extui {{.*}} : i1 to i32
-// CHECK: ttng.wait_barrier
-// CHECK: ttg.memdesc_index [[D_BAR_B:%[a-z0-9_]+]]{{.*}} : !ttg.memdesc<1x1xi64
-// CHECK: ttng.arrive_barrier
-//
-// -- No remaining tc_gen5_commit — all replaced --
-// CHECK-NOT: ttng.tc_gen5_commit
+// No wait+arrive replacement pattern:
+// CHECK-NOT: ttng.arrive_barrier
 //
 // Outer loop yield:
 // CHECK: scf.yield
