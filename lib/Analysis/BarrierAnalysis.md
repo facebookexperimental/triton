@@ -35,10 +35,15 @@ Traverse all arguments in ttg.warp_specialize, construct two separate lists of o
 ### Step 2
 Traverse each partition in `ttg.warp_specialize`. The default partition use arguments from `ttg.warp_specialize`. Other partitions use arguments from their own parititon block. Traverse all `ttg.memdesc_index` operation that index into the arguments we collected in step 1 to get each barrierObject and MemoryObject. There should be at least two partitions that involve `ttg.memdesc_index` for the same barrier or memory alloc we collected in step 1 -- one is the producer partition, the other is the consumer partition. For memory object, fill out `memoryKind` from the value encoding; fill out `allocOp` as the operand in ``ttg.memdesc_index``, which is also the op we collected in step 1; fill out `name` as the name of the allocOp; fill out `offset` as the `ttg.memdesc_index` index; fill out `usages` like this -- the partition that writes to the memory chunk is the producer, and the parition that reads from the memory chunk is the consumer; `MemoryObjectUsage.op` should be the `ttg.memdesc_index` op; task id is the partition id involving this operation. Leave `barrierPair` as uninitialized for this step. For BarrierObject, fill out `kind` from operation name (named barrier uses `ttg.*_named`) and value type; fill out `allocOp` as the operand in `ttg.memdesc_index` (also the op we collected in step 1) if it is shared_memory barrier, and `ttg.*_named` if named barrier; fill out `name` as the name of the allocOp; fill out `offset` as the `ttg.memdesc_index` index if shared_memory barrier; fill out `usages` like this -- the partition that uses this barrier as `bar.wait` is either ProducerAcquire or ConsumerWait, and we put ProducerAcquire temporarily for this step. the partition that uses this barrier as `bar.arrive` is either ProducerCommit or ConsumerRelease, and we put ProducerCommit temporarily for this step. The `BarrierObjectUsage.op` is the `ttg.memdesc_index` op. The `BarrierObjectUsage.taskId` is the the partition id involving this operation.
 
+
+## Dump table
+Only dump two tables:
+- Barrier Object table. This table includes these colums: id, `BarrierObject.id`; name, `BarrierObject.name`; offset, `BarrierObject.offset`; type, `BarrierObject.kind`; usages, an array of {BarrierObjectUsage.op.SSA_name, BarrierObjectUsage.role, BarrierObjectUsage.taskId}
+- Memory object table. This table includes these colums: id, `MemoryObject.id`; name, `MemoryObject.name`; offset, `MemoryObject.offset`; type, `MemoryObject.memoryKind`; usages, an array of {MemoryObjectUsage.op.SSA_name, MemoryObjectUsage.role, MemoryObjectUsage.taskId}
 ## Existing wheels
 NVWSOps.td
 ```
-┌───────────────────────┬─────────────────────────────────────────────┬──────────────────────────────────────────────┐
+  ┌───────────────────────┬─────────────────────────────────────────────┬──────────────────────────────────────────────┐
   │          Op           │                    Role                     │                  Lowered To                  │
   ├───────────────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────────┤
   │ nvws.create_token     │ Allocates a pair of barrier arrays (full +  │ ttg.local_alloc × 2 + ttng.init_barrier × 2N │

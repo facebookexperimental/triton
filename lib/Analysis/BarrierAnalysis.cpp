@@ -243,16 +243,70 @@ static void classifyWarpSpecArgs(ttg::WarpSpecializeOp wsOp,
 //   writes (local_store, tc_gen5_mma, tmem_store, etc.) → Producer,
 //   reads (local_load, tmem_load, etc.) → Consumer.
 
-/// Check if an operation writes to a memdesc (producer of data).
-static bool isMemoryWrite(Operation *op) {
-  return isa<ttg::LocalStoreOp>(op) || isa<ttng::TCGen5MMAOp>(op) ||
-         isa<ttng::TMEMStoreOp>(op) || isa<ttng::TCGen5CommitOp>(op) ||
-         isa<ttng::BarrierExpectOp>(op);
+/// Check if an op is a view-like op that passes through a memdesc without
+/// memory side effects (transposing, subviewing, etc.).
+static bool isMemDescViewOp(Operation *op) {
+  return isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+             ttg::MemDescReinterpretOp, ttng::TMEMSubSliceOp>(op);
 }
 
-/// Check if an operation reads from a memdesc (consumer of data).
-static bool isMemoryRead(Operation *op) {
-  return isa<ttg::LocalLoadOp>(op) || isa<ttng::TMEMLoadOp>(op);
+/// Determine the memory role (Producer or Consumer) of a memdesc value used
+/// by a specific operation.  Returns std::nullopt if the op is not a known
+/// memory accessor or the value is not a data operand (e.g., it's a barrier).
+static std::optional<MemoryObjectRole> getMemoryRoleForUser(Operation *user,
+                                                            Value usedVal) {
+  // tc_gen5_mma: $a and $b are reads, $d is a write.
+  if (auto mma = dyn_cast<ttng::TCGen5MMAOp>(user)) {
+    if (usedVal == mma.getA() || usedVal == mma.getB())
+      return MemoryObjectRole::Consumer;
+    if (usedVal == mma.getD())
+      return MemoryObjectRole::Producer;
+    return std::nullopt;
+  }
+  if (auto mma = dyn_cast<ttng::TCGen5MMAScaledOp>(user)) {
+    if (usedVal == mma.getA() || usedVal == mma.getB() ||
+        usedVal == mma.getAScale() || usedVal == mma.getBScale())
+      return MemoryObjectRole::Consumer;
+    if (usedVal == mma.getD())
+      return MemoryObjectRole::Producer;
+    return std::nullopt;
+  }
+  // async_tma_copy writes to its result buffer.
+  if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(user)) {
+    if (usedVal == tma.getResult())
+      return MemoryObjectRole::Producer;
+    return std::nullopt; // barrier operand, not data
+  }
+  // async_tma_copy_local_to_global reads from its $src (SMEM) buffer.
+  if (auto tma = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+    if (usedVal == tma.getSrc())
+      return MemoryObjectRole::Consumer;
+    return std::nullopt;
+  }
+  // Simple read/write ops.
+  if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp>(user))
+    return MemoryObjectRole::Producer;
+  if (isa<ttg::LocalLoadOp, ttng::TMEMLoadOp>(user))
+    return MemoryObjectRole::Consumer;
+  return std::nullopt;
+}
+
+/// Follow a memdesc value through view-like ops to find terminal ops with
+/// memory side effects, and record their roles as usages on `memObj`.
+static void collectMemoryUsages(Value val, int partitionId,
+                                MemoryObject *memObj, Operation *indexOp) {
+  for (Operation *user : val.getUsers()) {
+    auto role = getMemoryRoleForUser(user, val);
+    if (role) {
+      memObj->usages.push_back({*role, partitionId, indexOp});
+      LDBG("Step2: memory usage name="
+           << memObj->name << " partition=" << partitionId << " role="
+           << (*role == MemoryObjectRole::Producer ? "producer" : "consumer"));
+    } else if (isMemDescViewOp(user) && user->getNumResults() > 0) {
+      // Follow through view-like ops to the terminal user.
+      collectMemoryUsages(user->getResult(0), partitionId, memObj, indexOp);
+    }
+  }
 }
 
 /// Determine the partition id for a region.  The default region is partition 0,
@@ -373,23 +427,9 @@ static void collectUsagesInRegion(Region &region, int partitionId,
     auto memIt = info.argIdxToMemory.find(argIdx);
     if (memIt != info.argIdxToMemory.end()) {
       MemoryObject *memObj = memIt->second;
-      // Determine role from downstream usage.
-      for (Operation *user : indexOp->getResult(0).getUsers()) {
-        MemoryObjectRole role;
-        if (isMemoryWrite(user)) {
-          role = MemoryObjectRole::Producer;
-        } else if (isMemoryRead(user)) {
-          role = MemoryObjectRole::Consumer;
-        } else {
-          continue;
-        }
-        memObj->usages.push_back({role, partitionId, indexOp});
-
-        LDBG("Step2: memory usage name="
-             << memObj->name << " partition=" << partitionId << " role="
-             << (role == MemoryObjectRole::Producer ? "producer" : "consumer")
-             << " slot=" << slotIndex);
-      }
+      // Follow the use chain through view-like ops to find terminal ops
+      // with memory side effects, and record their roles.
+      collectMemoryUsages(indexOp->getResult(0), partitionId, memObj, indexOp);
 
       // Also record the index as the offset if not yet set.
       if (memObj->offset == -1 && slotIndex >= 0)
