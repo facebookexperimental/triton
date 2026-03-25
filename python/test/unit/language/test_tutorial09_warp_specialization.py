@@ -499,8 +499,22 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             and EPILOGUE_SUBTILE in (1, 2)):
         pytest.skip("Out of resources: tensor memory exceeded")
 
-    if EPILOGUE_SUBTILE >= 2 and not FLATTEN and (SMEM_ALLOC_ALGO != 0 or use_early_tma_store_lowering):
-        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtiling without flatten produces wrong results")
+    # Correctness: epilogue subtile=2 with early TMA store lowering and no flatten
+    # fails due to intra-iteration barrier serialization bug
+    if EPILOGUE_SUBTILE == 2 and use_early_tma_store_lowering and not FLATTEN:
+        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtile=2 with early TMA store lowering")
+
+    # Correctness: epilogue subtile=4 with early TMA store lowering, no flatten,
+    # asymmetric block sizes, and multi-tile (multiple outer loop iterations)
+    if (EPILOGUE_SUBTILE == 4 and use_early_tma_store_lowering and not FLATTEN and BLOCK_SIZE_M != BLOCK_SIZE_N
+            and (M > BLOCK_SIZE_M or N > BLOCK_SIZE_N)):
+        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtile=4 with asymmetric blocks and multi-tile")
+
+    # Correctness: epilogue subtile=4 with early TMA store lowering, no flatten,
+    # data partition factor 2, and multi-tile
+    if (EPILOGUE_SUBTILE == 4 and use_early_tma_store_lowering and not FLATTEN and DATA_PARTITION_FACTOR == 2
+            and M > BLOCK_SIZE_M):
+        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtile=4 with data partition and multi-tile")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
@@ -640,8 +654,11 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     if BLOCK_SIZE_N == 256 and num_stages == 3 and FLATTEN:
         pytest.skip("Out of resources: tensor memory exceeded")
 
-    if EPILOGUE_SUBTILE >= 2 and not FLATTEN and (SMEM_ALLOC_ALGO != 0 or use_early_tma_store_lowering):
-        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtiling without flatten produces wrong results")
+    # Correctness: epilogue subtile>=2 with early TMA store lowering, no flatten,
+    # asymmetric block sizes, and multi-tile
+    if (EPILOGUE_SUBTILE >= 2 and use_early_tma_store_lowering and not FLATTEN and BLOCK_SIZE_N != BLOCK_SIZE_M
+            and (M > BLOCK_SIZE_M or N > BLOCK_SIZE_N)):
+        pytest.skip("TODO: FIX CORRECTNESS: epilogue subtile with asymmetric blocks and multi-tile")
 
     # Use scope() to set use_meta_ws and automatically restore on exit
     with triton.knobs.nvidia.scope():
