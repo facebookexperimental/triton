@@ -22,7 +22,7 @@
 //   B: offset=0,   bytesBetweenBuffers=384 → scale=48, offSlots=0  → [48*3+0+1, 2] = [145, 2]
 //   C: offset=128, bytesBetweenBuffers=384 → scale=192, offSlots=64 → [192*0+64+1, 1] = [65, 1]
 //   D: offset=256, bytesBetweenBuffers=384 → scale=48, offSlots=32 → [48*3+32+1, 2] = [177, 2]
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [0, 1]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @smem_distinct_shared_distinct_alignment

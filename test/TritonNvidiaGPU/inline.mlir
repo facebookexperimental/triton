@@ -22,13 +22,13 @@ tt.func private @function_with_ttng_ops() {
 // CHECK-LABEL: @inline_nvgpu_ops
 tt.func public @inline_nvgpu_ops() -> i32 {
   // CHECK-NOT: tt.call
-  // CHECK: nvgpu.cluster_id
+  // CHECK: nvg.cluster_id
   %0 = tt.call @function_with_nvgpu_ops() : () -> i32
   tt.return %0 : i32
 }
 
 tt.func private @function_with_nvgpu_ops() -> i32 {
-  %0 = nvgpu.cluster_id
+  %0 = nvg.cluster_id
   tt.return %0 : i32
 }
 
