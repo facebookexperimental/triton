@@ -49,7 +49,7 @@ def create_benchmark(versions, mode="fwd"):
             line_names=line_names,
             ylabel="TFLOPS",
             plot_name=f"flash-attention-{mode}-performance-fp16",
-            args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": True},
+            args={"BATCH": 4, "H": 8, "HEAD_DIM": 128, "causal": True},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
@@ -59,25 +59,41 @@ def create_benchmark(versions, mode="fwd"):
         quantiles = [0.5, 0.2, 0.8]
 
         if mode == "bwd":
-            # Pre-run forward to get output for backward
+            # Run full fwd+bwd each iteration to avoid state issues with retain_graph
             if provider == ref_lib.lower():
-                o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+
+                def fn():
+                    q.grad, k.grad, v.grad = None, None, None
+                    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+                    o.backward(do)
             elif provider in ATTENTION_METHODS:
                 attention = ATTENTION_METHODS[provider]
                 if provider == "ws_pipelined_persistent":
-                    o = attention(q, k, v, sm_scale, causal, 64, 1)
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale, causal, 128, 1)
+                        o.backward(do)
                 elif provider == "ws":
-                    o = attention(q, k, v, sm_scale)
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale)
+                        o.backward(do)
                 else:
-                    o = attention(q, k, v, sm_scale, causal)
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+
+                    def fn():
+                        q.grad, k.grad, v.grad = None, None, None
+                        o = attention(q, k, v, sm_scale, causal)
+                        o.backward(do)
+
+            do = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16)
         elif provider == ref_lib.lower():
             fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
         elif provider in ATTENTION_METHODS:
             attention = ATTENTION_METHODS[provider]
             if provider == "ws_pipelined_persistent":
-                fn = lambda: attention(q, k, v, sm_scale, causal, 64, 1)
+                fn = lambda: attention(q, k, v, sm_scale, causal, 128, 1)
             elif provider == "ws":
                 fn = lambda: attention(q, k, v, sm_scale)
             else:
@@ -91,8 +107,8 @@ def create_benchmark(versions, mode="fwd"):
         )
 
         flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-        # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (dQK, dPV, dV, dK, dQ) = 2.5x fwd
-        total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
+        # fwd: 2 matmuls (QK, PV). bwd mode measures fwd+bwd: 2 + 5 = 7 matmuls
+        total_flops = 2 * flops_per_matmul if mode == "fwd" else 7 * flops_per_matmul
         perf = lambda ms: total_flops * 1e-12 / (ms * 1e-3)
         return perf(ms), perf(max_ms), perf(min_ms)
 

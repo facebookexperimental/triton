@@ -515,6 +515,12 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
         desc_delta = TensorDescriptor(delta, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
 
+        # 2-CTA descriptors
+        desc_kt = TensorDescriptor(arg_k, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                   block_shape=dummy_block)
+        desc_qt = TensorDescriptor(q, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dot = TensorDescriptor(do, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+
         BLK_SLICE_FACTOR = 2
 
         def grid_persistent(meta):
@@ -538,15 +544,34 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             H,
             Z,
             N_CTX,
+            desc_kt,
+            desc_qt,
+            desc_dot,
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
         )
 
+        # Debug: print error stats before asserting
         tri_dq = dq.to(q.dtype)
-        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)
-        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
+        for name, tri, ref in [("dk", dk, ref_dk), ("dv", dv, ref_dv), ("dq", tri_dq, ref_dq)]:
+            diff = (tri - ref).abs()
+            mismatch = (diff > 1e-2).sum().item()
+            total = diff.numel()
+            print(f"{name}: max_err={diff.max().item():.6f}, "
+                  f"mean_err={diff.mean().item():.6f}, "
+                  f"mismatch={mismatch}/{total} ({100*mismatch/total:.1f}%), "
+                  f"tri_norm={tri.norm().item():.4f}, ref_norm={ref.norm().item():.4f}")
+            # Print per-head-dim-half error (first vs second 64 dims)
+            if HEAD_DIM == 128:
+                diff_lo = (tri[..., :64] - ref[..., :64]).abs()
+                diff_hi = (tri[..., 64:] - ref[..., 64:]).abs()
+                print(f"  {name}[:64] max_err={diff_lo.max().item():.6f}, mean={diff_lo.mean().item():.6f}")
+                print(f"  {name}[64:] max_err={diff_hi.max().item():.6f}, mean={diff_hi.mean().item():.6f}")
+
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
+        torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
