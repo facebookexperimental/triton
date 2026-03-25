@@ -2111,6 +2111,89 @@ DenseMap<Channel *, Value> createBufferPost(
   return bufferMap;
 }
 
+// Replace a standalone tcgen05_commit (placed after a loop for a D-channel
+// where MMA is the producer) with a wait on the MMA's existing inline A/B
+// consumer_release barrier followed by an arrive on the D barrier. This avoids
+// the global tcgen05_commit fence, enabling per-MMA completion tracking in
+// data-partitioned loops.
+//
+// In the data-partitioned case, multiple MMAs run inside the loop and each has
+// an inline completion barrier from its A/B consumer_release channel. Instead
+// of creating a tcgen05_commit (a global fence that commits ALL pending MMAs),
+// generate a wait on the specific MMA's A/B barrier (from the final iteration)
+// + arrive on the D barrier for per-MMA completion tracking.
+//
+// The caller must set the builder's insertion point, async task IDs, and loop
+// schedule info before calling this function.
+//
+// Returns true if the replacement was performed, false if the MMA doesn't have
+// an inline A/B barrier (caller should fall back to creating a commit).
+static bool
+replaceCommitWithBarrierSync(OpBuilderWithAsyncTaskIds &builder,
+                             ttng::TCGen5MMAOp mmaOp, Value dBarrierAlloc,
+                             DenseSet<Operation *> &regionsWithChannels,
+                             ReuseConfig *config) {
+  // The MMA must have at least one inline completion barrier (from the A/B
+  // consumer_release channel processed earlier in program order).
+  auto barriers = mmaOp.getBarriers();
+  if (barriers.empty())
+    return false;
+
+  // The MMA's inline barrier is a MemDescIndexOp result (indexing into the
+  // barrier allocation). We need the underlying allocation (which lives at
+  // function scope, outside the loop) to create new index ops after the loop.
+  Value abBarrierView = barriers.front();
+  auto indexOp = abBarrierView.getDefiningOp<ttg::MemDescIndexOp>();
+  if (!indexOp)
+    return false;
+  Value abBarrierAlloc = indexOp.getSrc();
+
+  // Get A/B numBuffers from the alloc type (first dimension).
+  auto abAllocType = cast<ttg::MemDescType>(abBarrierAlloc.getType());
+  unsigned abNumBuffers = abAllocType.getShape()[0];
+
+  // Compute the final-iteration buffer index and phase for the A/B barrier.
+  auto [abBufIdx, finalPhase] = getOutOfScopeBufferIdxAndPhase(
+      builder, mmaOp, abNumBuffers, regionsWithChannels, config, -1);
+
+  auto loc = mmaOp->getLoc();
+
+  // Index into the A/B barrier array for the final iteration.
+  Value abBarrier =
+      getBarrierForPipelineStage(builder, abBarrierAlloc, abBufIdx);
+
+  // Zero-extend phase from i1 to i32 for WaitBarrierOp.
+  Value phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+      loc, builder.getI32Type(), finalPhase);
+
+  // Wait on the MMA's A/B barrier from the final iteration.
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, abBarrier, phase);
+
+  // Compute D barrier buffer index. The D barrier may have a different number
+  // of buffers than the A/B barrier (e.g., D has 1 buffer while A/B has 3)
+  // because the D channel and A/B channel have different pipeline depths
+  // (the default partition can cause the D channel to have fewer buffers).
+  auto dAllocType = cast<ttg::MemDescType>(dBarrierAlloc.getType());
+  unsigned dNumBuffers = dAllocType.getShape()[0];
+
+  Value dBufIdx;
+  if (dNumBuffers == abNumBuffers) {
+    dBufIdx = abBufIdx;
+  } else if (dNumBuffers == 1) {
+    dBufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+  } else {
+    auto [idx, unused] = getOutOfScopeBufferIdxAndPhase(
+        builder, mmaOp, dNumBuffers, regionsWithChannels, config, -1);
+    dBufIdx = idx;
+  }
+
+  // Arrive on the D barrier.
+  Value dBarrier = getBarrierForPipelineStage(builder, dBarrierAlloc, dBufIdx);
+  builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(loc, dBarrier,
+                                                        /*count=*/1);
+  return true;
+}
+
 // Make TCGen5MMAOp fully asynchronous by de-synchronizing it. This leverages
 // its inline barrier to synchronize with both the producer (TMA load) and the
 // consumer (TMEM load). Return the WaitBarrierOp inserted before the consumer
@@ -2947,17 +3030,27 @@ void insertAsyncComm(
                                                    << " ");
         });
         // If we have a nested target we cannot use the barrier in the
-        // TCGen5MMAOp directly and instead need a tcgen05.commit.
+        // TCGen5MMAOp directly. When there are multiple MMAs in the loop
+        // (data partitioning), replace the commit with a wait on the MMA's
+        // A/B barrier + arrive on the D barrier for per-MMA completion
+        // tracking. With a single MMA, use a normal tcgen05_commit.
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          auto indexedBarrier = getBarrierForPipelineStage(
-              builder, *commChannel.producerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               indexedBarrier);
+          // Count MMAs in the nested loop to detect data partitioning.
+          unsigned mmaCount = 0;
+          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
+          if (mmaCount <= 1 ||
+              !replaceCommitWithBarrierSync(
+                  builder, cast<ttng::TCGen5MMAOp>(mmaOp),
+                  *commChannel.producerBarrier, regionsWithChannels, config)) {
+            auto indexedBarrier = getBarrierForPipelineStage(
+                builder, *commChannel.producerBarrier, bufferIdx);
+            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+                mmaOp->getLoc(), indexedBarrier);
+          }
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3026,14 +3119,24 @@ void insertAsyncComm(
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         if (!addCompletionBarrier) {
-          // We need to place the commit after the for loop.
+          // When there are multiple MMAs in the loop (data partitioning),
+          // replace the commit with a wait on the MMA's A/B barrier + arrive
+          // on the D barrier for per-MMA completion tracking. With a single
+          // MMA, use a normal tcgen05_commit.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          auto indexedConsumerBarrier =
-              getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
-              mmaOp->getLoc(), indexedConsumerBarrier);
+          // Count MMAs in the nested loop to detect data partitioning.
+          unsigned mmaCount = 0;
+          nestedInsertionTarget->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
+          if (mmaCount <= 1 ||
+              !replaceCommitWithBarrierSync(builder, mmaOp, consumerBarrier,
+                                            regionsWithChannels, config)) {
+            auto indexedConsumerBarrier =
+                getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
+            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+                mmaOp->getLoc(), indexedConsumerBarrier);
+          }
           builder.clearLoopScheduleInfo();
         }
 

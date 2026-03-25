@@ -139,10 +139,62 @@ materialized barriers, which is another form of barrier reduction.
 See [Token & Barrier Lowering](TokenBarrierLowering.md) for the full
 lowering algorithm.
 
+## Data-Partitioned Commit Replacement
+
+**File**: `WSCodePartition.cpp` (`replaceCommitWithBarrierSync`)
+
+In data-partitioned loops (`tt.data_partition_factor > 1`) with multiple MMAs,
+the D-channel creation sites generate `wait_barrier` + `arrive_barrier` pairs
+directly instead of `tcgen05_commit` ops. Because `tcgen05_commit` is a global
+fence that commits ALL pending async tcgen05 operations, using it for per-MMA
+D-channel signaling is unnecessarily coarse: the first commit must wait for
+every outstanding MMA, serializing completion.
+
+The replacement is performed inline at the two commit creation sites in
+`insertAsyncComm` (the `producerBarrier` and `consumerBarrier` paths), rather
+than as a separate post-pass. This has two advantages: (1) the MMA's inline
+A/B barrier is already available at channel creation time (A/B channels are
+processed before D-channels in program order), and (2) there is a direct 1:1
+mapping between each D-channel and its MMA, avoiding the need for heuristic
+commit-to-MMA matching.
+
+### How It Works
+
+At each D-channel commit creation site, when `mmaCount > 1` in the nested loop:
+
+1. **A/B barrier lookup**: Retrieve the MMA's inline completion barrier (set
+   by the A/B consumer_release channel processed earlier). Trace through the
+   `MemDescIndexOp` to get the underlying barrier allocation.
+
+2. **Final-iteration index**: Compute the buffer index and phase for the A/B
+   barrier's final loop iteration via `getOutOfScopeBufferIdxAndPhase`.
+
+3. **Wait on A/B barrier**: Emit `WaitBarrierOp` on the A/B barrier — waits
+   for that specific MMA to finish its final iteration.
+
+4. **D barrier index**: Compute the buffer index for the D barrier (which may
+   have a different number of buffers than the A/B barrier — e.g., 1 buffer
+   vs 3).
+
+5. **Arrive on D barrier**: Emit `ArriveBarrierOp` on the D barrier — signals
+   the D-channel consumer that the MMA result is available.
+
+**Invariant**: each call to `replaceCommitWithBarrierSync` must represent the
+work of exactly one MMA — the commit being replaced must correspond to a single
+MMA's D-channel, not aggregate work from multiple MMAs. This is structurally
+guaranteed because the call sites iterate per-channel (each D-channel maps to
+one MMA), and the `mmaCount > 1` guard ensures the replacement is only
+attempted when data partitioning has produced multiple distinct per-MMA
+channels.
+
+When there is only a single MMA in the loop, or when the MMA lacks an inline
+A/B barrier, the standard `tcgen05_commit` is emitted as a fallback.
+
 ## Summary: Forms of Barrier Fusion
 
 | Fusion Type | What Gets Fused | Result | Where |
 |------------|----------------|--------|-------|
 | **TMA fusion** | Multiple TMA loads to same consumer | Single mbarrier, single `BarrierExpectOp` with summed bytes | `WSLowerMem.cpp::optimizeTMALoads` |
 | **tcgen05_commit** | Multiple commits to same barrier | Single `TCGen5CommitOp` (last one kept) | `CodePartitionUtility.cpp::fuseTcgen05CommitBarriers` |
+| **DP commit replacement** | Per-MMA D-channel commits (when multiple MMAs) | Per-MMA `WaitBarrierOp` + `ArriveBarrierOp` | `WSCodePartition.cpp::replaceCommitWithBarrierSync` |
 | **Token sharing** | Channels grouped by consumer | Shared `CreateTokenOp` → shared barrier pair | `WSCodePartition.cpp::doCodePartitionPost` |

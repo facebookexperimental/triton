@@ -184,6 +184,26 @@ for each channel group:
    attaching a completion barrier and creating a `WaitBarrierOp`.
 5. **Consumer release placement**: `consumerReleaseHeuristic` uses
    post-dominance analysis to find optimal placement.
+6. **Data-partitioned commit replacement**: In data-partitioned loops
+   (`tt.data_partition_factor > 1`) with multiple MMAs, the D-channel
+   creation sites generate `wait_barrier` + `arrive_barrier` pairs directly
+   instead of `tcgen05_commit` ops. Each MMA gets a per-MMA wait on the
+   MMA's existing inline A/B barrier (from the final loop iteration)
+   followed by an arrive on the D barrier, enabling per-MMA completion
+   tracking. This avoids the problem with `tcgen05_commit`, which is a
+   global fence that commits ALL pending async operations — the first
+   commit would wait for every MMA to finish, serializing them. When there
+   is only a single MMA in the loop, the standard `tcgen05_commit` is used
+   since there is no serialization concern. The replacement is handled by
+   `replaceCommitWithBarrierSync`, called at the two commit creation sites
+   in `insertAsyncComm` (the `producerBarrier` and `consumerBarrier` paths).
+   **Invariant**: each call to `replaceCommitWithBarrierSync` must represent
+   the work of exactly one MMA — the commit being replaced must correspond
+   to a single MMA's D-channel, not aggregate work from multiple MMAs. This
+   is structurally guaranteed because the call sites iterate per-channel
+   (each D-channel maps to one MMA), and the `mmaCount > 1` guard at each
+   call site ensures the replacement is only attempted when data partitioning
+   has produced multiple distinct per-MMA channels.
 
 ### Channel Loop Detection
 

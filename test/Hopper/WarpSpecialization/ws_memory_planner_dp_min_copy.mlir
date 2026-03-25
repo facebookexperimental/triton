@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-print-local-scope | FileCheck %s
 
 // Test: When data partitioning splits the M dimension (factor=2), the inner
 // k-loop has 3 SMEM operands per iteration: a_0 (half 0 of A), a_1 (half 1
