@@ -1571,6 +1571,82 @@ static std::optional<Attribute> getEffectiveSplatAttr(Value v) {
   return std::nullopt;
 }
 
+/// Reorder load ops within each basic block so that loads are sorted by the
+/// position of their earliest use in the same block. This ensures that after
+/// data partitioning, loads are placed closer to their first consumer.
+///
+/// For GEMM, where A is partitioned into A0, A1 and B is shared, this produces
+/// the order: A0, A1, B (matching the use pattern Mma(A0, B), Mma(A1, B)).
+///
+/// TODO: We may be able to reorder other operations, but this is only
+/// implemented for loads for now.
+static void reorderLoadsToFirstUse(triton::FuncOp &funcOp) {
+  funcOp.walk([](Block *block) {
+    // Collect load ops in block order.
+    SmallVector<Operation *> loads;
+    for (auto &op : block->getOperations()) {
+      if (isa<DescriptorLoadOp, LoadOp>(&op))
+        loads.push_back(&op);
+    }
+
+    if (loads.size() <= 1)
+      return;
+
+    // Build position map for all ops in the block.
+    DenseMap<Operation *, unsigned> opPositions;
+    unsigned pos = 0;
+    for (auto &op : block->getOperations())
+      opPositions[&op] = pos++;
+
+    // For each load, find the position of its earliest use in the same block.
+    auto getFirstUsePosition = [&](Operation *loadOp) -> unsigned {
+      unsigned earliest = UINT_MAX;
+      for (auto result : loadOp->getResults()) {
+        for (auto *user : result.getUsers()) {
+          if (user->getBlock() == block) {
+            earliest = std::min(earliest, opPositions[user]);
+          }
+        }
+      }
+      return earliest;
+    };
+
+    // Compute first-use positions and stable sort.
+    SmallVector<std::pair<Operation *, unsigned>> loadWithUse;
+    for (auto *load : loads)
+      loadWithUse.push_back({load, getFirstUsePosition(load)});
+
+    llvm::stable_sort(loadWithUse, [](const auto &a, const auto &b) {
+      return a.second < b.second;
+    });
+
+    // Reorder loads in sorted order. Each load is placed after the previous
+    // sorted load, but never before any of its own operands (to preserve SSA
+    // dominance).
+    for (size_t i = 1; i < loadWithUse.size(); i++) {
+      auto *prevLoad = loadWithUse[i - 1].first;
+      auto *curLoad = loadWithUse[i].first;
+
+      // Target position: right after the previous load in sorted order.
+      Operation *target = prevLoad->getNextNode();
+
+      // Check that all operands of curLoad dominate the target position.
+      bool canMove = true;
+      for (Value operand : curLoad->getOperands()) {
+        if (auto *defOp = operand.getDefiningOp()) {
+          if (defOp->getBlock() == block && !defOp->isBeforeInBlock(target)) {
+            canMove = false;
+            break;
+          }
+        }
+      }
+
+      if (canMove && curLoad != target)
+        curLoad->moveBefore(target);
+    }
+  });
+}
+
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   DataPartitionScheme partitionScheme;
   partitionScheme.numPartitions = numConsumerGroups;
@@ -1750,6 +1826,10 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     funcOp.setFunctionType(FunctionType::get(
         funcOp.getContext(), argTys, funcOp.getFunctionType().getResults()));
   }
+
+  // Reorder loads so they are closer to their first use. After data
+  // partitioning, duplicated loads may end up far from their consumers.
+  reorderLoadsToFirstUse(funcOp);
 
   return true;
 }

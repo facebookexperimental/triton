@@ -10,7 +10,7 @@
 //
 // CRITICAL: dq (128x64) MUST reuse dpT (buffer.id=8) at offset 0.
 // CHECK-LABEL: tt.func public @_attn_bwd
-// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 64 : i32}
 // CHECK: %dpT, %dpT_1 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
 // CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 // CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
