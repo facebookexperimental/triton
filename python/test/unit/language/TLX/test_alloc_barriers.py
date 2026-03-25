@@ -69,6 +69,9 @@ def test_alloc_barriers_compile_only():
     assert "init_barrier" in ir_str, (
         f"Expected 'init_barrier' in TTGIR.\nIR:\n{ir_str}"
     )
+    assert "memdesc_index" in ir_str, (
+        f"Expected 'memdesc_index' in TTGIR.\nIR:\n{ir_str}"
+    )
 
 
 def test_alloc_warp_barrier_compile_only():
