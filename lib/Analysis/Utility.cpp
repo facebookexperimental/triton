@@ -104,6 +104,12 @@ unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
 }
 
 bool ReduceOpHelper::isWarpSynchronous() {
+  // If only 1 element along the reduce axis, inter-warp communication is
+  // unnecessary — only 1 thread has real data regardless of warpsPerCTA.
+  // This handles tensors from multi-CTA DSM exchange (e.g., tensor<1xf32>
+  // with warpsPerCTA=[4]) where warps 1-3 have no data.
+  if (srcShape[axis] == 1)
+    return true;
   return getWarpsPerCTA(srcEncoding, srcShape)[axis] == 1;
 }
 
