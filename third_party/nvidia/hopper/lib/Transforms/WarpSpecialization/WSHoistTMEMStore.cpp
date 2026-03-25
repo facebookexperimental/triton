@@ -1,6 +1,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -34,9 +35,12 @@ public:
         !outerFor.isDefinedOutsideOfLoop(store.getDst()))
       return failure();
 
-    // 6. Store's input token must be a block argument of the outer loop body.
+    // 6. Store's input token must either be a block argument of the outer loop
+    //    body (loop-carried) or be defined outside the loop (loop-invariant).
     auto depArg = dyn_cast<BlockArgument>(store.getDep());
-    if (!depArg || depArg.getOwner() != outerFor.getBody())
+    bool depIsLoopCarried = depArg && depArg.getOwner() == outerFor.getBody();
+    bool depIsLoopInvariant = outerFor.isDefinedOutsideOfLoop(store.getDep());
+    if (!depIsLoopCarried && !depIsLoopInvariant)
       return failure();
 
     // 7. Find all users of the TMEM buffer inside the outer loop and classify
@@ -86,17 +90,18 @@ public:
       return failure();
 
     // 8. The MMA must have useAccum=False on the first iteration of the inner
-    //    loop (inlined accUseFlagSetToFalse logic).
+    //    loop.
     Value accUseFlag = mmaOp.useAccumulator();
     bool firstIterFalse = false;
     if (matchPattern(accUseFlag, m_Zero())) {
       firstIterFalse = true;
-    } else {
-      auto yieldOp = cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
-      while (auto blockArg = dyn_cast<BlockArgument>(accUseFlag))
-        accUseFlag = yieldOp.getOperand(blockArg.getArgNumber() - 1);
-      firstIterFalse = accUseFlag.getDefiningOp() &&
-                       innerFor->isAncestor(accUseFlag.getDefiningOp());
+    } else if (auto blockArg = dyn_cast<BlockArgument>(accUseFlag)) {
+      // If useAccum is a block arg of the inner loop, check that its init
+      // value is false.
+      if (blockArg.getOwner() == innerFor.getBody()) {
+        Value initVal = innerFor.getInitArgs()[blockArg.getArgNumber() - 1];
+        firstIterFalse = matchPattern(initVal, m_Zero());
+      }
     }
     if (!firstIterFalse)
       return failure();
@@ -110,19 +115,38 @@ public:
       return failure();
 
     // === Transformation: hoist the store before the outer loop ===
-    int tokArgNo = depArg.getArgNumber() - 1; // arg 0 is induction var
     auto tokType = rewriter.getType<ttg::AsyncTokenType>();
 
-    rewriter.setInsertionPoint(outerFor);
-    auto hoistedStore = rewriter.create<ttng::TMEMStoreOp>(
-        store.getLoc(), tokType, store.getDst(),
-        outerFor.getInitArgs()[tokArgNo], store.getSrc(), store.getPred());
+    auto copyAttrs = [&](ttng::TMEMStoreOp hoistedStore) {
+      for (auto attr : store->getAttrs())
+        if (!hoistedStore->hasAttr(attr.getName()))
+          hoistedStore->setAttr(attr.getName(), attr.getValue());
+    };
 
-    // Wire hoisted store's output as the outer loop's token init arg.
-    outerFor.getInitArgsMutable()[tokArgNo].assign(hoistedStore.getToken());
+    if (depIsLoopCarried) {
+      int tokArgNo = depArg.getArgNumber() - 1; // arg 0 is induction var
 
-    // Inside loop body: replace store's token with the region iter arg.
-    store.getToken().replaceAllUsesWith(outerFor.getRegionIterArg(tokArgNo));
+      rewriter.setInsertionPoint(outerFor);
+      auto hoistedStore = rewriter.create<ttng::TMEMStoreOp>(
+          store.getLoc(), tokType, store.getDst(),
+          outerFor.getInitArgs()[tokArgNo], store.getSrc(), store.getPred());
+      copyAttrs(hoistedStore);
+
+      // Wire hoisted store's output as the outer loop's token init arg.
+      outerFor.getInitArgsMutable()[tokArgNo].assign(hoistedStore.getToken());
+
+      // Inside loop body: replace store's token with the region iter arg.
+      store.getToken().replaceAllUsesWith(outerFor.getRegionIterArg(tokArgNo));
+    } else {
+      // Dep is defined outside the loop — just move the store before the loop.
+      rewriter.setInsertionPoint(outerFor);
+      auto hoistedStore = rewriter.create<ttng::TMEMStoreOp>(
+          store.getLoc(), tokType, store.getDst(), store.getDep(),
+          store.getSrc(), store.getPred());
+      copyAttrs(hoistedStore);
+
+      store.getToken().replaceAllUsesWith(hoistedStore.getToken());
+    }
 
     // Erase the original store.
     rewriter.eraseOp(store);
@@ -142,5 +166,21 @@ void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp) {
     llvm_unreachable("Failed to hoist loop-invariant TMEM store");
   }
 }
+
+#define GEN_PASS_DEF_NVGPUTESTWSHOISTTMEMSTORE
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestWSHoistTMEMStorePass
+    : public impl::NVGPUTestWSHoistTMEMStoreBase<
+          NVGPUTestWSHoistTMEMStorePass> {
+public:
+  using impl::NVGPUTestWSHoistTMEMStoreBase<
+      NVGPUTestWSHoistTMEMStorePass>::NVGPUTestWSHoistTMEMStoreBase;
+
+  void runOnOperation() override {
+    getOperation()->walk(
+        [&](triton::FuncOp funcOp) { doHoistLoopInvariantTMEMStore(funcOp); });
+  }
+};
 
 } // namespace mlir
