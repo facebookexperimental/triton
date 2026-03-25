@@ -1208,31 +1208,39 @@ def matmul_kernel_tma_ws_blackwell(
             tile_id = start_pid
 
             while tile_id < num_tiles:
-                cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                _process_tile_epilogue_inner(
-                    tile_id=tile_id,
-                    num_pid_in_group=num_pid_in_group,
-                    num_pid_m=num_pid_m,
-                    num_mn_tiles=num_mn_tiles,
-                    GROUP_SIZE_M=GROUP_SIZE_M,
-                    M=M,
-                    BLOCK_SIZE_M=BLOCK_SIZE_M,
-                    BLOCK_SIZE_N=BLOCK_SIZE_N,
-                    EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-                    NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                    NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-                    SPLIT_K=SPLIT_K,
-                    INTERLEAVE_EPILOGUE=INTERLEAVE_EPILOGUE,
-                    c_desc=c_desc,
-                    workspace_desc=workspace_desc,
-                    c_smem_buffers=c_smem_buffers,
-                    tmem_buffers=tmem_buffers,
-                    tmem_full_bars=tmem_full_bars,
-                    tmem_empty_bars=tmem_empty_bars,
-                    cur_tmem_buf=cur_tmem_buf,
-                    tmem_read_phase=tmem_read_phase,
-                )
-                tmem_accum_cnt += 1
+                # Skip tiles whose split has zero K-tiles (last split
+                # can be empty when cdiv(k_tiles_total, SPLIT_K) * (SPLIT_K-1)
+                # >= k_tiles_total).
+                split_id = tile_id // num_mn_tiles
+                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                k_tile_start = split_id * k_tiles_per_split
+                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                if k_tile_end > k_tile_start:
+                    cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    _process_tile_epilogue_inner(
+                        tile_id=tile_id,
+                        num_pid_in_group=num_pid_in_group,
+                        num_pid_m=num_pid_m,
+                        num_mn_tiles=num_mn_tiles,
+                        GROUP_SIZE_M=GROUP_SIZE_M,
+                        M=M,
+                        BLOCK_SIZE_M=BLOCK_SIZE_M,
+                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
+                        SPLIT_K=SPLIT_K,
+                        INTERLEAVE_EPILOGUE=INTERLEAVE_EPILOGUE,
+                        c_desc=c_desc,
+                        workspace_desc=workspace_desc,
+                        c_smem_buffers=c_smem_buffers,
+                        tmem_buffers=tmem_buffers,
+                        tmem_full_bars=tmem_full_bars,
+                        tmem_empty_bars=tmem_empty_bars,
+                        cur_tmem_buf=cur_tmem_buf,
+                        tmem_read_phase=tmem_read_phase,
+                    )
+                    tmem_accum_cnt += 1
                 tile_id += NUM_SMS
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
@@ -1267,32 +1275,34 @@ def matmul_kernel_tma_ws_blackwell(
                 k_tile_start = split_id * k_tiles_per_split
                 k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
 
-                cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                smem_accum_cnt = _process_tile_mma_inner(
-                    k_tiles=k_tiles_total,
-                    k_tile_start=k_tile_start,
-                    k_tile_end=k_tile_end,
-                    NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                    NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                    NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-                    buffers_A=buffers_A,
-                    buffers_B=buffers_B,
-                    tmem_buffers=tmem_buffers,
-                    A_smem_full_bars=A_smem_full_bars,
-                    B_smem_full_bars=B_smem_full_bars,
-                    A_smem_empty_bars=A_smem_empty_bars,
-                    tmem_full_bars=tmem_full_bars,
-                    cur_tmem_buf=cur_tmem_buf,
-                    tmem_empty_bars=tmem_empty_bars,
-                    tmem_write_phase=tmem_write_phase,
-                    smem_accum_cnt=smem_accum_cnt,
-                    NUM_CTAS=NUM_CTAS,
-                    cta_bars=cta_bars,
-                    pred_cta0=pred_cta0,
-                    A_ROW_MAJOR=A_ROW_MAJOR,
-                    B_ROW_MAJOR=B_ROW_MAJOR,
-                )
-                tmem_accum_cnt += 1
+                # Skip tiles whose split has zero K-tiles
+                if k_tile_end > k_tile_start:
+                    cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    smem_accum_cnt = _process_tile_mma_inner(
+                        k_tiles=k_tiles_total,
+                        k_tile_start=k_tile_start,
+                        k_tile_end=k_tile_end,
+                        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
+                        buffers_A=buffers_A,
+                        buffers_B=buffers_B,
+                        tmem_buffers=tmem_buffers,
+                        A_smem_full_bars=A_smem_full_bars,
+                        B_smem_full_bars=B_smem_full_bars,
+                        A_smem_empty_bars=A_smem_empty_bars,
+                        tmem_full_bars=tmem_full_bars,
+                        cur_tmem_buf=cur_tmem_buf,
+                        tmem_empty_bars=tmem_empty_bars,
+                        tmem_write_phase=tmem_write_phase,
+                        smem_accum_cnt=smem_accum_cnt,
+                        NUM_CTAS=NUM_CTAS,
+                        cta_bars=cta_bars,
+                        pred_cta0=pred_cta0,
+                        A_ROW_MAJOR=A_ROW_MAJOR,
+                        B_ROW_MAJOR=B_ROW_MAJOR,
+                    )
+                    tmem_accum_cnt += 1
                 tile_id += NUM_SMS
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
@@ -1326,32 +1336,34 @@ def matmul_kernel_tma_ws_blackwell(
                 k_tile_start = split_id * k_tiles_per_split
                 k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
 
-                smem_accum_cnt = _process_tile_producer_inner(
-                    tile_id=tile_id,
-                    num_pid_in_group=num_pid_in_group,
-                    num_pid_m=num_pid_m,
-                    num_mn_tiles=num_mn_tiles,
-                    GROUP_SIZE_M=GROUP_SIZE_M,
-                    BLOCK_SIZE_M=BLOCK_SIZE_M,
-                    BLOCK_SIZE_N=BLOCK_SIZE_N,
-                    BLOCK_SIZE_K=BLOCK_SIZE_K,
-                    NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                    k_tile_start=k_tile_start,
-                    k_tile_end=k_tile_end,
-                    NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                    a_desc=a_desc,
-                    b_desc=b_desc,
-                    buffers_A=buffers_A,
-                    buffers_B=buffers_B,
-                    A_smem_full_bars=A_smem_full_bars,
-                    B_smem_full_bars=B_smem_full_bars,
-                    A_smem_empty_bars=A_smem_empty_bars,
-                    smem_accum_cnt=smem_accum_cnt,
-                    NUM_CTAS=NUM_CTAS,
-                    cluster_cta_rank=cluster_cta_rank,
-                    A_ROW_MAJOR=A_ROW_MAJOR,
-                    B_ROW_MAJOR=B_ROW_MAJOR,
-                )
+                # Skip tiles whose split has zero K-tiles
+                if k_tile_end > k_tile_start:
+                    smem_accum_cnt = _process_tile_producer_inner(
+                        tile_id=tile_id,
+                        num_pid_in_group=num_pid_in_group,
+                        num_pid_m=num_pid_m,
+                        num_mn_tiles=num_mn_tiles,
+                        GROUP_SIZE_M=GROUP_SIZE_M,
+                        BLOCK_SIZE_M=BLOCK_SIZE_M,
+                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        BLOCK_SIZE_K=BLOCK_SIZE_K,
+                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                        k_tile_start=k_tile_start,
+                        k_tile_end=k_tile_end,
+                        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                        a_desc=a_desc,
+                        b_desc=b_desc,
+                        buffers_A=buffers_A,
+                        buffers_B=buffers_B,
+                        A_smem_full_bars=A_smem_full_bars,
+                        B_smem_full_bars=B_smem_full_bars,
+                        A_smem_empty_bars=A_smem_empty_bars,
+                        smem_accum_cnt=smem_accum_cnt,
+                        NUM_CTAS=NUM_CTAS,
+                        cluster_cta_rank=cluster_cta_rank,
+                        A_ROW_MAJOR=A_ROW_MAJOR,
+                        B_ROW_MAJOR=B_ROW_MAJOR,
+                    )
                 tile_id += NUM_SMS
 
 
