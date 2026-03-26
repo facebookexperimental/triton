@@ -1633,6 +1633,7 @@ def test_async_remote_shmem_copy(device):
             offs = tl.arange(0, N)
             vals = tl.load(input_ptr + offs)
             tlx.local_store(smem_buf[0], vals)
+            tlx.fence("async_shared")
             # Copy local buffer to CTA 1
             tlx.async_remote_shmem_copy(
                 src=smem_buf[0],
@@ -1658,6 +1659,7 @@ def test_async_remote_shmem_copy(device):
     ttgir = kernel.asm["ttgir"]
     ptx = kernel.asm["ptx"]
     assert ttgir.count("ttg.async_remote_shmem_copy") == 1
+    assert ptx.count("fence.proxy.async.shared::cta") == 1
     assert ptx.count("mapa.shared::cluster") == 2
     assert ptx.count("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes") == 1
 
