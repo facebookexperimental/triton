@@ -1463,6 +1463,68 @@ static unsigned allocateSmemBuffers(
 
   LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
+  // ── Phase 4.5: Iterative copy increase for fused P2_Other groups ────
+  // Epilogue buffers merged in Phase 3.5 share a single bufferId but are
+  // left at numCopies=1 by Phase 4. Increase copies uniformly for each
+  // fused group while staying within the SMEM budget.
+  {
+    // Collect fused P2_Other groups by bufferId.
+    DenseMap<unsigned, SmallVector<unsigned>> epilogueGroups;
+    for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+      auto &buf = wsBuffers[i];
+      if (buf.isPinned || buf.priority != WSBufferPriority::P2_Other)
+        continue;
+      epilogueGroups[buf.bufferId].push_back(i);
+    }
+
+    for (auto &[bufferId, indices] : epilogueGroups) {
+      if (indices.size() < 2)
+        continue;
+
+      // Determine current copies (should be uniform within a fused group).
+      unsigned currentCopies = wsBuffers[indices[0]].numCopies;
+
+      // Respect cross-stage minimum from Phase 2.
+      unsigned minCopies = currentCopies;
+      for (unsigned idx : indices) {
+        if (wsBuffers[idx].isCrossStage)
+          minCopies = std::max(minCopies, 2u);
+      }
+      if (minCopies > currentCopies)
+        currentCopies = minCopies;
+
+      // Iteratively increase numCopies up to numBuffers.
+      unsigned tryCopies = currentCopies + 1;
+      while (tryCopies <= numBuffers) {
+        // Tentatively set all buffers in the group.
+        SmallVector<unsigned> saved;
+        for (unsigned idx : indices)
+          saved.push_back(wsBuffers[idx].numCopies);
+
+        for (unsigned idx : indices)
+          wsBuffers[idx].numCopies = tryCopies;
+
+        unsigned totalSmem = computeTotalSmem(wsBuffers);
+        if (totalSmem <= smemBudget) {
+          LDBG("Phase 4.5: epilogue group bufferId="
+               << bufferId << " copies=" << tryCopies
+               << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
+          tryCopies++;
+        } else {
+          // Revert and stop.
+          for (unsigned k = 0; k < indices.size(); ++k)
+            wsBuffers[indices[k]].numCopies = saved[k];
+          LDBG("Phase 4.5: epilogue group bufferId="
+               << bufferId << " copies=" << tryCopies << " totalSmem="
+               << totalSmem << " > " << smemBudget << " — budget exhausted");
+          break;
+        }
+      }
+    }
+  }
+
+  LDBG("Phase 4.5 complete: totalSmem=" << computeTotalSmem(wsBuffers));
+
   // ── Phase 5: Emit buffer.id and buffer.copy attributes ──────────────
   auto i32Type = IntegerType::get(funcOp.getContext(), 32);
   for (auto &buf : wsBuffers) {
