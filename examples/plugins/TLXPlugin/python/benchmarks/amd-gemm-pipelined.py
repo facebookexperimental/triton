@@ -1,20 +1,16 @@
+import os
+import sys
+
+# Ensure the plugin package is importable before anything else.
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
+from tlx_plugin.utility import ensure_plugin_on_path
+ensure_plugin_on_path()
+import tlx_plugin as tlx  # type: ignore[import-not-found]
+
 import torch
 
 import triton
 import triton.language as tl
-
-
-import os
-import sys
-
-# Add the plugin Python package to the path.
-# Resolve to absolute path so it works regardless of cwd.
-_plugin_python_dir = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-            )
-if _plugin_python_dir not in sys.path:
-        sys.path.insert(0, _plugin_python_dir)
-        import tlx_plugin as tlx  # type: ignore[import-not-found]
 
 from triton._internal_testing import is_cuda, is_hip_cdna2
 
