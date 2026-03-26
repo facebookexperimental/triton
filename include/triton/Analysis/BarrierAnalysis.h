@@ -103,6 +103,12 @@ public:
   /// Print a human-readable summary of the extracted traces.
   void printSummary(llvm::raw_ostream &os) const;
 
+  /// Generate a standalone Python Z3 script encoding the barrier deadlock
+  /// constraints. The script imports z3, creates variables, adds all
+  /// constraint components (Phi_ord, Phi_async, Phi_stall, Phi_B, Phi_R,
+  /// deadlock query), runs the solver, and prints SAT/UNSAT with diagnostics.
+  void dumpPythonZ3Script(llvm::raw_ostream &os) const;
+
   /// Get the task traces.
   const std::vector<TaskTrace> &getTaskTraces() const { return taskTraces; }
 
@@ -111,9 +117,18 @@ public:
     return barrierAllocs;
   }
 
+  /// Get initial arrive counts per slot key ("allocName_slotIndex").
+  const std::map<std::string, int64_t> &getInitialArrives() const {
+    return initialArrives;
+  }
+
 private:
   /// Extract barrier allocations (local_alloc ops with i64 element type).
   void collectBarrierAllocs();
+
+  /// Collect pre-task barrier operations (arrives/expects before
+  /// warp_specialize) as initial arrive counts per slot.
+  void collectInitialArrives();
 
   /// Build concrete operation traces by walking warp_specialize regions.
   void buildTaskTraces();
@@ -143,6 +158,10 @@ private:
 
   /// Map capture index to the original value's alloc name.
   std::map<unsigned, std::string> captureIndexToAllocName;
+
+  /// Initial arrive counts per slot key ("allocName_slotIndex") from
+  /// barrier operations that occur before the warp_specialize region.
+  std::map<std::string, int64_t> initialArrives;
 };
 
 } // namespace mlir::triton

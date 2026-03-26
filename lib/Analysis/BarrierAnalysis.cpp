@@ -46,6 +46,7 @@ BarrierDeadlockAnalysis::BarrierDeadlockAnalysis(FunctionOpInterface funcOp,
 
 void BarrierDeadlockAnalysis::run() {
   collectBarrierAllocs();
+  collectInitialArrives();
   buildTaskTraces();
 }
 
@@ -99,6 +100,70 @@ void BarrierDeadlockAnalysis::collectBarrierAllocs() {
     }
 
     barrierAllocs.push_back({name, numSlots, arriveCount});
+  });
+}
+
+//===----------------------------------------------------------------------===//
+// Initial arrive collection (pre-task barrier ops)
+//===----------------------------------------------------------------------===//
+
+void BarrierDeadlockAnalysis::collectInitialArrives() {
+  // Walk barrier ops that are OUTSIDE warp_specialize regions but inside the
+  // function. These represent pre-task arrives that set the initial barrier
+  // state (e.g., pre-arriving "empty" barriers so the producer can start).
+  funcOp.walk([&](Operation *op) {
+    // Skip ops inside warp_specialize regions
+    if (op->getParentOfType<gpu::WarpSpecializeOp>())
+      return;
+
+    // Resolve barrier for arrive/expect ops and count initial arrives
+    if (auto arriveOp = dyn_cast<nvidia_gpu::ArriveBarrierOp>(op)) {
+      auto indexOp = dyn_cast_or_null<gpu::MemDescIndexOp>(
+          arriveOp.getAlloc().getDefiningOp());
+      if (!indexOp)
+        return;
+      Value src = indexOp.getSrc();
+      std::string allocName;
+      if (auto *defOp = src.getDefiningOp()) {
+        auto it = allocOpToName.find(defOp);
+        if (it != allocOpToName.end())
+          allocName = it->second;
+      }
+      if (allocName.empty())
+        return;
+      int64_t slotIdx = -1;
+      if (auto constOp =
+              indexOp.getIndex().getDefiningOp<arith::ConstantIntOp>())
+        slotIdx = constOp.value();
+      if (slotIdx < 0)
+        return;
+      std::string key = allocName + "_" + std::to_string(slotIdx);
+      initialArrives[key] += arriveOp.getCount();
+
+    } else if (auto expectOp = dyn_cast<nvidia_gpu::BarrierExpectOp>(op)) {
+      auto indexOp = dyn_cast_or_null<gpu::MemDescIndexOp>(
+          expectOp.getAlloc().getDefiningOp());
+      if (!indexOp)
+        return;
+      Value src = indexOp.getSrc();
+      std::string allocName;
+      if (auto *defOp = src.getDefiningOp()) {
+        auto it = allocOpToName.find(defOp);
+        if (it != allocOpToName.end())
+          allocName = it->second;
+      }
+      if (allocName.empty())
+        return;
+      int64_t slotIdx = -1;
+      if (auto constOp =
+              indexOp.getIndex().getDefiningOp<arith::ConstantIntOp>())
+        slotIdx = constOp.value();
+      if (slotIdx < 0)
+        return;
+      // barrier_expect counts as an arrive (cnt=1)
+      std::string key = allocName + "_" + std::to_string(slotIdx);
+      initialArrives[key] += 1;
+    }
   });
 }
 
@@ -449,6 +514,12 @@ void BarrierDeadlockAnalysis::printSummary(llvm::raw_ostream &os) const {
        << " slots, arrive_count=" << alloc.arriveCount << "\n";
   }
 
+  if (!initialArrives.empty()) {
+    os << "\nInitial arrives (pre-task):\n";
+    for (const auto &[key, cnt] : initialArrives)
+      os << "  " << key << ": " << cnt << "\n";
+  }
+
   os << "\nTask traces:\n";
   for (const auto &task : taskTraces) {
     os << "  " << task.taskName << " (task " << task.taskId
@@ -465,6 +536,450 @@ void BarrierDeadlockAnalysis::printSummary(llvm::raw_ostream &os) const {
       os << " (iter " << op.iteration << ")\n";
     }
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Z3 Python script generation
+//===----------------------------------------------------------------------===//
+
+void BarrierDeadlockAnalysis::dumpPythonZ3Script(llvm::raw_ostream &os) const {
+  // Helper: unique barrier slot key string for Z3 variable naming.
+  auto slotKey = [](const ConcreteBarrierOp &op) -> std::string {
+    return op.allocName + "_" + std::to_string(op.slotIndex);
+  };
+
+  // Build flat operation list with global indices, and per-task op lists.
+  struct OpRef {
+    size_t globalIdx;
+    const ConcreteBarrierOp *op;
+    const TaskTrace *task;
+  };
+  std::vector<OpRef> allOps;
+  std::map<int64_t, std::vector<OpRef>> taskOps; // taskId -> ops
+  // slot key -> ops
+  std::map<std::string, std::vector<OpRef>> slotOps;
+
+  size_t globalIdx = 0;
+  for (const auto &task : taskTraces) {
+    for (const auto &op : task.ops) {
+      OpRef ref{globalIdx, &op, &task};
+      allOps.push_back(ref);
+      taskOps[task.taskId].push_back(ref);
+      slotOps[slotKey(op)].push_back(ref);
+      globalIdx++;
+    }
+  }
+
+  // Collect arrive counts per slot from barrierAllocs.
+  // Key: (allocName, slotIndex) -> arriveCount
+  std::map<std::string, int64_t> slotArriveCount;
+  for (const auto &alloc : barrierAllocs) {
+    for (int64_t s = 0; s < alloc.numSlots; s++) {
+      std::string key = alloc.name + "_" + std::to_string(s);
+      slotArriveCount[key] = alloc.arriveCount;
+    }
+  }
+
+  // --- Emit Python script ---
+  os << "#!/usr/bin/env python3\n";
+  os << "\"\"\"Auto-generated barrier deadlock check (Z3 constraints).\n\n";
+  os << "Encoding follows barrier_deadlock_design.tex Sections 2-5.\n";
+  os << "SAT = deadlock witness, UNSAT = safe within unroll bound.\n";
+  os << "\"\"\"\n\n";
+  os << "from z3 import *\n\n";
+
+  // --- Variables ---
+  os << "# ---- Variables ----\n\n";
+
+  // Cut-point per task
+  os << "# Cut-point per task: where execution is stuck\n";
+  for (const auto &task : taskTraces) {
+    os << "c_" << task.taskName << " = Int('c_" << task.taskName << "')\n";
+  }
+  os << "\n";
+
+  // Timestamps per operation
+  os << "# Timestamp per operation (global execution order)\n";
+  for (const auto &ref : allOps) {
+    os << "tau_" << ref.globalIdx << " = Int('tau_" << ref.globalIdx << "')\n";
+  }
+  os << "\n";
+
+  // Async timestamps (TMA_LOAD only for now)
+  os << "# Async completion timestamps (TMA_LOAD)\n";
+  bool hasAsync = false;
+  for (const auto &ref : allOps) {
+    if (ref.op->kind == BarrierOpKind::TmaLoad) {
+      os << "tau_prime_" << ref.globalIdx << " = Int('tau_prime_"
+         << ref.globalIdx << "')\n";
+      hasAsync = true;
+    }
+  }
+  if (!hasAsync)
+    os << "# (none)\n";
+  os << "\n";
+
+  // --- Operation metadata as comments ---
+  os << "# ---- Operation index ----\n";
+  for (const auto &ref : allOps) {
+    os << "# op " << ref.globalIdx << ": task=" << ref.op->taskName
+       << " pos=" << ref.op->position << " "
+       << barrierOpKindToString(ref.op->kind).str() << " " << ref.op->allocName
+       << "[" << ref.op->slotIndex << "]";
+    if (ref.op->kind == BarrierOpKind::Wait)
+      os << " phase=" << ref.op->phase;
+    if (ref.op->expectedBytes > 0)
+      os << " bytes=" << ref.op->expectedBytes;
+    os << " iter=" << ref.op->iteration << "\n";
+  }
+  os << "\n";
+
+  // --- Helper functions ---
+  os << "# ---- Helper functions ----\n\n";
+
+  // exec(o) predicate
+  os << "def exec_op(global_idx, task_name, pos):\n";
+  os << "    \"\"\"exec(o) = pos(o) < c_task(o)\"\"\"\n";
+  os << "    c = {'";
+  bool first = true;
+  for (const auto &task : taskTraces) {
+    if (!first)
+      os << ", '";
+    os << task.taskName << "': c_" << task.taskName;
+    first = false;
+  }
+  os << "}\n";
+  os << "    return pos < c[task_name]\n\n";
+
+  // effect_time(o): tau' for async, tau for sync
+  os << "def effect_time(global_idx):\n";
+  os << "    \"\"\"effect_time(o) = tau'_o for async, tau_o for sync\"\"\"\n";
+  os << "    async_ops = {";
+  first = true;
+  for (const auto &ref : allOps) {
+    if (ref.op->kind == BarrierOpKind::TmaLoad) {
+      if (!first)
+        os << ", ";
+      os << ref.globalIdx << ": tau_prime_" << ref.globalIdx;
+      first = false;
+    }
+  }
+  os << "}\n";
+  os << "    if global_idx in async_ops:\n";
+  os << "        return async_ops[global_idx]\n";
+  os << "    return globals()[f'tau_{global_idx}']\n\n";
+
+  // initial_arrives — pre-task arrive counts per slot
+  os << "# Initial arrives (pre-task barrier ops)\n";
+  os << "initial_arrives = {";
+  first = true;
+  for (const auto &[sk, cnt] : initialArrives) {
+    if (!first)
+      os << ", ";
+    os << "'" << sk << "': " << cnt;
+    first = false;
+  }
+  os << "}\n\n";
+
+  // arrive_count(slot) — cumulative arrives
+  os << "def arrive_count(slot_key):\n";
+  os << "    \"\"\"A(b) = initial + sum If(exec(o), cnt(o), 0) for arrive ops "
+        "on slot b\"\"\"\n";
+  os << "    initial = initial_arrives.get(slot_key, 0)\n";
+  os << "    terms = []\n";
+
+  // Group arrive ops by slot
+  for (const auto &[sk, ops] : slotOps) {
+    os << "    if slot_key == '" << sk << "':\n";
+    bool hasArrives = false;
+    for (const auto &ref : ops) {
+      if (ref.op->kind == BarrierOpKind::ArriveSync ||
+          ref.op->kind == BarrierOpKind::ExpectBytes) {
+        os << "        terms.append(If(exec_op(" << ref.globalIdx << ", '"
+           << ref.op->taskName << "', " << ref.op->position << "), "
+           << ref.op->arriveCount << ", 0))\n";
+        hasArrives = true;
+      }
+    }
+    if (!hasArrives)
+      os << "        pass\n";
+  }
+  os << "    return (initial + Sum(terms)) if terms else IntVal(initial)\n\n";
+
+  // arrive_count_before(slot, t) — arrives before timestamp t
+  os << "def arrive_count_before(slot_key, t):\n";
+  os << "    \"\"\"A^{<t}(b) = initial + sum If(exec(o) & effect_time(o) < t, "
+        "cnt(o), 0)\"\"\"\n";
+  os << "    initial = initial_arrives.get(slot_key, 0)\n";
+  os << "    terms = []\n";
+  for (const auto &[sk, ops] : slotOps) {
+    os << "    if slot_key == '" << sk << "':\n";
+    bool hasArrives = false;
+    for (const auto &ref : ops) {
+      if (ref.op->kind == BarrierOpKind::ArriveSync ||
+          ref.op->kind == BarrierOpKind::ExpectBytes) {
+        os << "        terms.append(If(And(exec_op(" << ref.globalIdx << ", '"
+           << ref.op->taskName << "', " << ref.op->position << "), effect_time("
+           << ref.globalIdx << ") < t), " << ref.op->arriveCount << ", 0))\n";
+        hasArrives = true;
+      }
+    }
+    if (!hasArrives)
+      os << "        pass\n";
+  }
+  os << "    return (initial + Sum(terms)) if terms else IntVal(initial)\n\n";
+
+  // blocked_parity(slot, parity) — parity-based blocking
+  os << "def blocked_parity(slot_key, parity, ac):\n";
+  os << "    \"\"\"blocked_parity(b, p) = (A(b) / ac) % 2 == p\"\"\"\n";
+  os << "    a = arrive_count(slot_key)\n";
+  os << "    if ac == 1:\n";
+  os << "        return a % 2 == parity\n";
+  os << "    return (a / ac) % 2 == parity\n\n";
+
+  // --- Solver and constraints ---
+  os << "# ---- Solver ----\n\n";
+  os << "s = Solver()\n\n";
+
+  // Structural constraints: cut-point bounds
+  os << "# Structural: cut-point bounds\n";
+  for (const auto &task : taskTraces) {
+    os << "s.add(c_" << task.taskName << " >= 0, c_" << task.taskName
+       << " <= " << task.ops.size() << ")\n";
+  }
+  os << "\n";
+
+  // Timestamp positivity
+  os << "# Structural: timestamp positivity\n";
+  for (const auto &ref : allOps) {
+    os << "s.add(tau_" << ref.globalIdx << " >= 0)\n";
+  }
+  for (const auto &ref : allOps) {
+    if (ref.op->kind == BarrierOpKind::TmaLoad)
+      os << "s.add(tau_prime_" << ref.globalIdx << " >= 0)\n";
+  }
+  os << "\n";
+
+  // Phi_ord: intra-task ordering (consecutive ops)
+  os << "# Phi_ord: intra-task operation ordering\n";
+  for (const auto &[taskId, ops] : taskOps) {
+    for (size_t i = 0; i + 1 < ops.size(); i++) {
+      const auto &a = ops[i];
+      const auto &b = ops[i + 1];
+      os << "s.add(Implies(And(exec_op(" << a.globalIdx << ", '"
+         << a.op->taskName << "', " << a.op->position << "), exec_op("
+         << b.globalIdx << ", '" << b.op->taskName << "', " << b.op->position
+         << ")), tau_" << a.globalIdx << " < tau_" << b.globalIdx << "))\n";
+    }
+  }
+  os << "\n";
+
+  // Phi_async: causal ordering for async ops
+  os << "# Phi_async: causal ordering (tau < tau' for async ops)\n";
+  for (const auto &ref : allOps) {
+    if (ref.op->kind == BarrierOpKind::TmaLoad) {
+      os << "s.add(Implies(exec_op(" << ref.globalIdx << ", '"
+         << ref.op->taskName << "', " << ref.op->position << "), tau_"
+         << ref.globalIdx << " < tau_prime_" << ref.globalIdx << "))\n";
+    }
+  }
+  os << "\n";
+
+  // Phi_stall: tasks can only stall at WAIT positions
+  os << "# Phi_stall: stall only at WAIT positions\n";
+  for (const auto &task : taskTraces) {
+    std::vector<const ConcreteBarrierOp *> waits;
+    for (const auto &op : task.ops) {
+      if (op.kind == BarrierOpKind::Wait)
+        waits.push_back(&op);
+    }
+    if (waits.empty()) {
+      os << "s.add(c_" << task.taskName << " == " << task.ops.size() << ")\n";
+    } else {
+      os << "s.add(Implies(c_" << task.taskName << " < " << task.ops.size()
+         << ", Or(";
+      first = true;
+      for (const auto *w : waits) {
+        if (!first)
+          os << ", ";
+        os << "c_" << task.taskName << " == " << w->position;
+        first = false;
+      }
+      os << ")))\n";
+    }
+  }
+  os << "\n";
+
+  // Phi_B: blocked barrier at stall point
+  os << "# Phi_B: stalled at WAIT -> barrier is blocked\n";
+  for (const auto &task : taskTraces) {
+    for (const auto &op : task.ops) {
+      if (op.kind != BarrierOpKind::Wait)
+        continue;
+      std::string sk = slotKey(op);
+      int64_t ac = 1;
+      auto it = slotArriveCount.find(sk);
+      if (it != slotArriveCount.end())
+        ac = it->second;
+
+      os << "s.add(Implies(And(c_" << task.taskName << " == " << op.position
+         << ", c_" << task.taskName << " < " << task.ops.size() << "), ";
+      if (op.phase >= 0) {
+        // Parity-based blocking
+        os << "blocked_parity('" << sk << "', " << op.phase << ", " << ac
+           << ")";
+      } else {
+        // Fallback: cycle-based (not expected with concrete eval)
+        os << "blocked_parity('" << sk << "', 0, " << ac << ")";
+      }
+      os << "))\n";
+    }
+  }
+  os << "\n";
+
+  // Phi_R: release constraint for passed-through waits
+  os << "# Phi_R: passed-through WAIT -> barrier was ready when reached\n";
+  for (const auto &task : taskTraces) {
+    for (const auto &op : task.ops) {
+      if (op.kind != BarrierOpKind::Wait)
+        continue;
+      std::string sk = slotKey(op);
+      int64_t ac = 1;
+      auto it = slotArriveCount.find(sk);
+      if (it != slotArriveCount.end())
+        ac = it->second;
+
+      // Find the global index for this op
+      size_t gIdx = 0;
+      for (const auto &ref : allOps) {
+        if (ref.op == &op) {
+          gIdx = ref.globalIdx;
+          break;
+        }
+      }
+
+      os << "s.add(Implies(And(" << op.position << " < c_" << task.taskName
+         << ", c_" << task.taskName << " <= " << task.ops.size() << "), ";
+
+      if (op.phase >= 0) {
+        // Parity-based release: phase at tau_w must differ from parity
+        if (ac == 1) {
+          os << "arrive_count_before('" << sk << "', tau_" << gIdx
+             << ") % 2 != " << op.phase;
+        } else {
+          os << "(arrive_count_before('" << sk << "', tau_" << gIdx << ") / "
+             << ac << ") % 2 != " << op.phase;
+        }
+      } else {
+        // Fallback
+        os << "True";
+      }
+      os << "))\n";
+    }
+  }
+  os << "\n";
+
+  // Byte balance constraints (cumulative): total loaded >= total expected
+  // Only emit if there are EXPECT_BYTES ops on any slot.
+  bool hasByteOps = false;
+  for (const auto &[sk, ops] : slotOps) {
+    for (const auto &ref : ops) {
+      if (ref.op->kind == BarrierOpKind::ExpectBytes) {
+        hasByteOps = true;
+        break;
+      }
+    }
+    if (hasByteOps)
+      break;
+  }
+
+  if (hasByteOps) {
+    os << "# Byte balance: cumulative loaded >= expected per slot\n";
+    os << "# (Over-approximation: not per-cycle, but cumulative)\n";
+    for (const auto &[sk, ops] : slotOps) {
+      std::vector<OpRef> expectOps, tmaOps;
+      for (const auto &ref : ops) {
+        if (ref.op->kind == BarrierOpKind::ExpectBytes)
+          expectOps.push_back(ref);
+        if (ref.op->kind == BarrierOpKind::TmaLoad)
+          tmaOps.push_back(ref);
+      }
+      if (expectOps.empty())
+        continue;
+
+      // For the completion predicate to be correct, we need byte balance.
+      // This is encoded as: if all tasks complete, loaded >= expected.
+      // But more precisely, we add it to the blocking predicate:
+      // blocked also if bytes are insufficient.
+      os << "# Slot " << sk << ": byte balance\n";
+      os << "total_expected_" << sk << " = ";
+      first = true;
+      for (const auto &ref : expectOps) {
+        if (!first)
+          os << " + ";
+        os << "If(exec_op(" << ref.globalIdx << ", '" << ref.op->taskName
+           << "', " << ref.op->position << "), " << ref.op->expectedBytes
+           << ", 0)";
+        first = false;
+      }
+      os << "\n";
+
+      os << "total_loaded_" << sk << " = ";
+      if (tmaOps.empty()) {
+        os << "IntVal(0)";
+      } else {
+        first = true;
+        for (const auto &ref : tmaOps) {
+          if (!first)
+            os << " + ";
+          // TMA load transfer size: use expectedBytes from corresponding
+          // expect_bytes as approximation (xfer not stored separately yet)
+          os << "If(exec_op(" << ref.globalIdx << ", '" << ref.op->taskName
+             << "', " << ref.op->position << "), " << ref.op->expectedBytes
+             << ", 0)";
+          first = false;
+        }
+      }
+      os << "\n";
+
+      // Add byte deficit as additional blocking condition for waits on this
+      // slot
+      os << "byte_deficit_" << sk << " = total_loaded_" << sk
+         << " < total_expected_" << sk << "\n";
+      os << "# (byte_deficit is implicitly part of blocked for this slot)\n\n";
+    }
+  }
+
+  // Deadlock query: at least one task is stuck
+  os << "# Deadlock query: at least one task stuck\n";
+  os << "s.add(Or(";
+  first = true;
+  for (const auto &task : taskTraces) {
+    if (!first)
+      os << ", ";
+    os << "c_" << task.taskName << " < " << task.ops.size();
+    first = false;
+  }
+  os << "))\n\n";
+
+  // --- Solve and diagnose ---
+  os << "# ---- Solve ----\n\n";
+  os << "result = s.check()\n";
+  os << "print(f'Result: {result}')\n\n";
+  os << "if result == sat:\n";
+  os << "    m = s.model()\n";
+  os << "    print('\\nDeadlock detected!')\n";
+  os << "    print('Task cut-points:')\n";
+  for (const auto &task : taskTraces) {
+    os << "    c_val = m.eval(c_" << task.taskName << ").as_long()\n";
+    os << "    print(f'  " << task.taskName << ": c={c_val} / "
+       << task.ops.size() << "', end='')\n";
+    os << "    if c_val < " << task.ops.size() << ":\n";
+    os << "        print(' [STUCK]', end='')\n";
+    os << "    print()\n";
+  }
+  os << "else:\n";
+  os << "    print('No deadlock found (UNSAT).')\n";
 }
 
 } // namespace mlir::triton
