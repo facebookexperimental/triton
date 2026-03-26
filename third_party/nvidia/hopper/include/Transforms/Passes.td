@@ -206,6 +206,23 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+def NVGPUTMAStoreTokenWaitReorder : Pass<"nvgpu-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
+  let summary = "Reorder buffer_ordered TMAStoreTokenWaitOps based on SMEM buffer reuse";
+
+  let description = [{
+    When a `ttng.async_tma_store_token_wait` op carries the `buffer_ordered`
+    attribute, this pass sinks it to just before the next use of the same SMEM
+    buffer (the memdesc read by the corresponding `async_tma_copy_local_to_global`).
+    If no subsequent use exists in the block, the wait is moved to just before
+    the block terminator.
+
+    The `buffer_ordered` attribute is applied by upstream channel analysis when
+    it can prove that buffer reuse is the only ordering constraint on the wait.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
   let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
 

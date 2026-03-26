@@ -88,6 +88,86 @@ struct NVGPUWSTMAStoreLoweringPass
 };
 
 // ---------------------------------------------------------------------------
+// Reorder buffer_ordered TMAStoreTokenWaitOps based on SMEM buffer reuse
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITREORDER
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+// For a TMAStoreTokenWaitOp, return the SMEM memdesc that the corresponding
+// TMA store reads from (i.e., the src operand of AsyncTMACopyLocalToGlobalOp).
+static Value getTMAStoreBuffer(ttng::TMAStoreTokenWaitOp waitOp) {
+  Value token = waitOp.getToken();
+  if (auto copyOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
+    return copyOp.getSrc();
+  }
+  return nullptr;
+}
+
+// Find the K-th write to `buffer` after `start` in the same block. With K
+// buffer copies the same index repeats every K writes, so we skip K-1 writes
+// and return the K-th. Returns nullptr if fewer than K writes exist.
+static Operation *findKthBufferWrite(Operation *start, Value buffer, int k) {
+  int count = 0;
+  for (auto it = std::next(start->getIterator()),
+            end = start->getBlock()->end();
+       it != end; ++it) {
+    // Only count ops that WRITE to the buffer (e.g., local_store).
+    // Reads (e.g., async_tma_copy_local_to_global) don't conflict.
+    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(&*it)) {
+      if (storeOp.getDst() == buffer) {
+        if (++count == k)
+          return &*it;
+      }
+    }
+  }
+  return nullptr;
+}
+
+struct NVGPUTMAStoreTokenWaitReorderPass
+    : public impl::NVGPUTMAStoreTokenWaitReorderBase<
+          NVGPUTMAStoreTokenWaitReorderPass> {
+  void runOnOperation() override {
+    getOperation()->walk([&](Block *block) {
+      // Collect buffer_ordered waits in block order.
+      SmallVector<ttng::TMAStoreTokenWaitOp> waits;
+      for (auto &op : *block) {
+        auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+        if (!waitOp || !waitOp->hasAttr("buffer_ordered"))
+          continue;
+        waits.push_back(waitOp);
+      }
+      if (waits.empty())
+        return;
+
+      for (auto waitOp : waits) {
+        Value buffer = getTMAStoreBuffer(waitOp);
+        if (!buffer)
+          continue;
+
+        // buffer_ordered = K means there are K buffer copies. The same index
+        // repeats every K uses, so we move the wait to just before the K-th
+        // subsequent use of the buffer (after K-1 intervening uses).
+        auto attr = waitOp->getAttrOfType<IntegerAttr>("buffer_ordered");
+        if (!attr)
+          continue;
+        int k = attr.getInt();
+
+        Operation *kthWrite = findKthBufferWrite(waitOp, buffer, k);
+        if (kthWrite) {
+          waitOp->moveBefore(kthWrite);
+        } else {
+          // Fewer than K subsequent uses — sink to just before the terminator.
+          waitOp->moveBefore(block->getTerminator());
+        }
+
+        // Remove the attribute after processing.
+        waitOp->removeAttr("buffer_ordered");
+      }
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp
 // ---------------------------------------------------------------------------
 #define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITLOWERING
