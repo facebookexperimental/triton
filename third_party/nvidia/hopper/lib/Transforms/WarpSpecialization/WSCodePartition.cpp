@@ -2977,6 +2977,23 @@ void insertAsyncComm(
           llvm::sort(ordered, [&](Channel *a, Channel *b) {
             return appearsBefore(a->getSrcOp(), b->getSrcOp());
           });
+          // Verify that consumer order matches producer order. If they
+          // disagree, the dependency chain will create a deadlock (e.g.,
+          // producer stores c01 before c00 but consumer reads c00 first).
+          for (size_t i = 1; i < ordered.size(); i++) {
+            auto *prevConsumer = ordered[i - 1]->getDstOp();
+            auto *curConsumer = ordered[i]->getDstOp();
+            if (prevConsumer->getBlock() == curConsumer->getBlock() &&
+                !appearsBefore(prevConsumer, curConsumer)) {
+              llvm::report_fatal_error(
+                  "N-buffer reuse group: producer and consumer orderings are "
+                  "inconsistent. Producer order has channel " +
+                  Twine(ordered[i - 1]->uniqID) + " before channel " +
+                  Twine(ordered[i]->uniqID) +
+                  ", but consumer order is reversed. This would cause a "
+                  "deadlock in the intra-iteration reuse dependency chain.");
+            }
+          }
           // Find masterChannel's position in the ordered list.
           for (size_t i = 1; i < ordered.size(); i++) {
             if (ordered[i] == masterChannel) {

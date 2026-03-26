@@ -168,16 +168,14 @@ def test_autows_addmm_tma_persistent(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    if BLOCK_SIZE_M == 256:
-        # TODO: Fix compiler failures.
-        pytest.skip("BLOCK_SIZE_M=256 leads to many OOMs and some compiler failures.")
+    # DATA_PARTITION_FACTOR == 2 crashes with PassManager::run failed
+    if DATA_PARTITION_FACTOR == 2:
+        pytest.skip("DATA_PARTITION_FACTOR == 2 causes PassManager::run failure")
 
-    if use_early_tma_store_lowering:
-        # This fails due to NaN with < 0.1% of values.
-        # Is this the previous register issue?
-        pytest.skip("TODO: Fix early TMA store lowering for addmm")
+    # Skip configurations that exceed hardware resource limits (shared memory or tensor memory)
+    if BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
+        pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
-    # Skip configurations that exceed hardware resource limits
     if BLOCK_SIZE_N == 256 and not FLATTEN:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
 
@@ -186,6 +184,15 @@ def test_autows_addmm_tma_persistent(
 
     if not FLATTEN and BLOCK_SIZE_K == 128 and B_col_major and not A_col_major:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
+
+    if BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0 and (BLOCK_SIZE_K == 128 or num_stages == 3):
+        pytest.skip("Out of resources: shared memory exceeded")
+
+    if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
+        pytest.skip("Out of resources: shared memory exceeded")
+
+    if BLOCK_SIZE_M == 256 and not FLATTEN and EPILOGUE_SUBTILE == 4 and use_early_tma_store_lowering:
+        pytest.skip("Wrong results (NaN) with early TMA store lowering")
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
