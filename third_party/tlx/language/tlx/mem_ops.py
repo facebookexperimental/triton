@@ -418,19 +418,14 @@ def async_remote_shmem_copy(
         remote_cta_rank: The rank of the remote CTA within the cluster
         barrier: mbarrier in local shared memory whose address will be mapa'd to the remote CTA
     """
-    assert src.type.storage == tlx.storage_kind.smem, (
-        "async_remote_shmem_copy requires local smem src"
-    )
+    assert src.type.storage == tlx.storage_kind.smem, ("async_remote_shmem_copy requires local smem src")
     assert dst.type.storage == tlx.storage_kind.smem, (
-        "async_remote_shmem_copy requires local smem dst (will be mapa'd to remote CTA)"
-    )
+        "async_remote_shmem_copy requires local smem dst (will be mapa'd to remote CTA)")
     assert remote_cta_rank is not None, "remote_cta_rank is required for async_remote_shmem_copy"
     assert barrier is not None, "barrier is required for async_remote_shmem_copy"
     remote_cta_rank_handle = _get_remote_cta_rank_handle(remote_cta_rank, _semantic)
     return tl.tensor(
-        _semantic.builder.create_async_remote_copy(
-            src.handle, dst.handle, remote_cta_rank_handle, barrier.handle
-        ),
+        _semantic.builder.create_async_remote_copy(src.handle, dst.handle, remote_cta_rank_handle, barrier.handle),
         tl.void,
     )
 

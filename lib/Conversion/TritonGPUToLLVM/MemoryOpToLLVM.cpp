@@ -378,9 +378,8 @@ public:
     Value sizeBytes =
         b.i32_val(numElems * llvmElemTy.getIntOrFloatBitWidth() / 8);
 
-    targetInfo.copyBulkSharedToRemoteShared(rewriter, loc, srcPtr, dstPtr,
-                                            barrierPtr, op.getCtaRank(),
-                                            sizeBytes);
+    targetInfo.copyBulkSharedToRemoteShared(
+        rewriter, loc, srcPtr, dstPtr, barrierPtr, op.getCtaRank(), sizeBytes);
     rewriter.eraseOp(op);
     return success();
   }

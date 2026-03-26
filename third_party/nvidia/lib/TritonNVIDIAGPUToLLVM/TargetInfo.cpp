@@ -319,9 +319,10 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   }
 }
 
-void TargetInfo::copyBulkSharedToRemoteShared(
-    RewriterBase &rewriter, Location loc, Value srcPtr, Value dstPtr,
-    Value barrierPtr, Value ctaId, Value size) const {
+void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,
+                                              Location loc, Value srcPtr,
+                                              Value dstPtr, Value barrierPtr,
+                                              Value ctaId, Value size) const {
   auto *ctx = rewriter.getContext();
   // Elect one thread per warp to issue the bulk copy. This works correctly
   // under warp specialization where the issuing warp may not be warp 0.

@@ -110,10 +110,10 @@ public:
 
   // Bulk-copy a local SMEM buffer to remote SMEM in a cluster CTA and signal
   // the remote CTA's mbarrier on completion.
-  virtual void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
-                                             Value srcPtr, Value dstPtr,
-                                             Value barrierPtr, Value ctaId,
-                                             Value size) const {
+  virtual void copyBulkSharedToRemoteShared(RewriterBase &rewriter,
+                                            Location loc, Value srcPtr,
+                                            Value dstPtr, Value barrierPtr,
+                                            Value ctaId, Value size) const {
     llvm_unreachable(
         "copyBulkSharedToRemoteShared not supported on this target");
   }

@@ -1611,7 +1611,7 @@ def test_async_remote_shmem_copy(device):
         N: tl.constexpr,
     ):
         # Each CTA allocates: a 1-slot shared memory buffer and 1 mbarrier.
-        smem_buf = tlx.local_alloc((N,), tl.float32, 1)
+        smem_buf = tlx.local_alloc((N, ), tl.float32, 1)
         barriers = tlx.alloc_barriers(num_barriers=1)
 
         cta_rank = tlx.cluster_cta_rank()
@@ -1653,9 +1653,7 @@ def test_async_remote_shmem_copy(device):
     input_tensor = torch.rand(N, dtype=torch.float32, device=device)
     output = torch.zeros(N, dtype=torch.float32, device=device)
 
-    kernel = remote_copy_kernel[(2,)](
-        input_tensor, output, N=N, num_warps=1, ctas_per_cga=(2, 1, 1)
-    )
+    kernel = remote_copy_kernel[(2, )](input_tensor, output, N=N, num_warps=1, ctas_per_cga=(2, 1, 1))
 
     ttgir = kernel.asm["ttgir"]
     ptx = kernel.asm["ptx"]
