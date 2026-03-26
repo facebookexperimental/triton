@@ -10,6 +10,7 @@
 
 #include "PatternTritonGPUOpToLLVM.h"
 #include "Utility.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -68,16 +69,7 @@ Value emitRedundantThreadPredicate(
   // In TLX clustered kernels, always use zero for blockId instead of cluster
   // CTA ID This ensures operations execute based on the CTA-local thread ID,
   // not cluster position
-  bool isClusteredKernel = false;
-  if (op) {
-    auto moduleOp = op->getParentOfType<ModuleOp>();
-    if (moduleOp) {
-      const SmallVector<int> clusterDims =
-          triton::gpu::TritonGPUDialect::getClusterDims(moduleOp);
-      isClusteredKernel =
-          llvm::any_of(clusterDims, [](int dim) { return dim > 1; });
-    }
-  }
+  bool isClusteredKernel = op && tlx::tlxIsClustered(op);
 
   Value blockId = (freeVarMasks.lookup(kBlock) == 0 || isClusteredKernel)
                       ? zero

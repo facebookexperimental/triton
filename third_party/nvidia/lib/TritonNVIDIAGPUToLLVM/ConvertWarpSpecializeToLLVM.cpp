@@ -376,7 +376,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));
-  if (tlx::tlxEnablePairedMMA(func)) {
+  if (tlx::tlxIsClustered(func)) {
     // Non default warps should just do a cluster arrive unconditionally
     PTXBuilder ptxBuilder;
     auto clusterArriveOp =
