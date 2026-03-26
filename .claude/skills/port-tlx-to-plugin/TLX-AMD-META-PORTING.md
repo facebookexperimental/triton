@@ -190,6 +190,107 @@ some can be avoided, others need workarounds:
 
 ---
 
+## TLX Pass Pipeline — In-tree vs Plugin
+
+### In-tree TLX pass pipeline (triton-tlx-amd-meta)
+
+#### AMD backend (`third_party/amd/backend/compiler.py`)
+
+**make_ttir stage:**
+1. `add_triton_tlx_fixup(pm, target, numWarps, 64, numCTAs, clusterDims)` — BEFORE `add_inliner`
+   - Sets module attrs: numWarps, threadsPerWarp, numCTAs, target
+   - Sets `tlx.has_tlx_ops`, `tlx.has_explicit_local_mem_access`, `tlx.has_warp_spec_ops`
+   - Validates WarpSpecializeOp (no RankedTensorType captures)
+   - Skips InvalBarrierOp insertion on AMD
+
+**make_ttgir stage:**
+1. `tlx_convert_triton_to_tritongpu` — custom ConvertTritonToTritonGPU with TLX op legalization
+2. Standard AMD passes: `add_coalesce`, `add_f32_dot_tc`, `add_remove_layout_conversions`, etc.
+3. `add_accelerate_matmul(pm, arch, ...)` — converts DotOps to AMD MFMA ops
+4. `add_tlx_insert_require_layout(pm)` — RIGHT AFTER accelerate_matmul
+   - Walks `tt::DotOp`s, finds `LocalLoadOp`s in backward slice
+   - Gets swizzled shared encoding via `getSharedEncIfAllUsersAreDotEnc()`
+   - Creates `tlx::RequireLayoutOp` with target encoding before LocalLoadOp
+5. `add_tlx_propagate_layout(pm)` — RIGHT AFTER insert_require_layout
+   - Runs `LayoutBackwardPropagation` + `LayoutForwardPropagation` (dataflow)
+   - Propagates encoding backward through MemDesc chain
+   - Rewrites `RequireLayoutOp` → `ConvertLayoutOp` (for RankedTensorType)
+   - `RequireLayoutOp` on MemDesc folds away (types now match)
+6. Standard AMD passes continue: `add_remove_layout_conversions`, etc.
+
+#### NVIDIA backend (`third_party/nvidia/backend/compiler.py`)
+
+**make_ttir stage:**
+1. `add_triton_tlx_fixup(pm, target, numWarps, 32, numCTAs, clusterDims)` — BEFORE inliner
+2. Standard TTIR passes
+3. `add_tlx_storage_alias_lowering(pm)` — AFTER inliner
+   - 3-step lowering: compute sizes → process buffer overlaps → materialize allocations
+4. `add_tlx_resolve_placeholder_layouts(pm)` — AFTER storage alias lowering
+   - Resolves `DummyRegisterLayoutAttr` → `BlockedEncodingAttr`
+
+**make_ttgir stage:**
+1. Standard NVIDIA ConvertTritonToTritonGPU
+2. Standard passes: coalesce, f32_dot_tc, etc.
+3. `add_tlx_propagate_layout(pm)` — AFTER coalesce, BEFORE f32_dot_tc
+   - Same as AMD: dataflow-based layout propagation
+
+#### In-tree pybind registration (`triton_tlx.cc:835-875`)
+```python
+# Passes registered as:
+tlx.tlx_passes.add_tlx_propagate_layout(pm)
+tlx.tlx_passes.add_tlx_insert_require_layout(pm)
+tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
+tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
+tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
+tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
+tlx.tlx_passes.add_triton_tlx_fixup(pm, target, numWarps, threadsPerWarp, numCTAs, clusterDims)
+```
+
+### Plugin pass pipeline (TLXPlugin — PORTED)
+
+Three passes registered as pass plugins in `TLXConversionPatterns.cpp`:
+
+1. **`tlx_convert_triton_to_tritongpu`** (existing) — Plugin ConvertTritonToTritonGPU with legalization for `ttg::LocalStoreOp`, `ttg::LocalLoadOp`, `ttg::AsyncCopyGlobalToLocalOp`.
+
+2. **`tlx_fixup`** (new) — Simplified fixup that sets module metadata attrs and detects explicit local mem access ops. Skips InvalBarrier insertion on AMD.
+
+3. **`tlx_insert_and_propagate_layout`** (new) — Combined InsertRequireLayout + PropagateLayout WITHOUT requiring the TLX MLIR dialect. Instead of creating `tlx::RequireLayoutOp` (which would require the TLX dialect), this pass directly:
+   - Walks `DotOp`s to find `LocalLoadOp`s via backward slice analysis
+   - Determines the correct swizzled shared encoding via `getSharedEncIfAllUsersAreDotEnc()`
+   - Propagates the encoding backward through the MemDesc def chain by directly setting types
+   - Avoids the full dataflow analysis framework (LayoutBackwardPropagation/LayoutForwardPropagation) — uses a simpler recursive walk instead
+
+#### AMD plugin pipeline (`custom_stages.py`):
+```python
+# Phase 1: Plugin ConvertTritonToTritonGPU (TTIR → TTGIR)
+passes.plugin.tlx_convert_triton_to_tritongpu(pm, pass_args)
+# Phase 2: Standard AMD backend TTGIR pipeline
+mod = self.make_ttgir(mod, metadata, options)
+# Phase 3: TLX layout passes (after standard pipeline)
+passes.plugin.tlx_insert_and_propagate_layout(pm, [])
+```
+
+#### NVIDIA plugin pipeline (`custom_stages.py`):
+```python
+# Phase 1: TLX fixup (before TTIR)
+passes.plugin.tlx_fixup(pm, pass_args)
+# Phase 2: Standard NVIDIA TTIR pipeline
+mod = self.make_ttir(mod, metadata, opt, cap)
+# Phase 3: Plugin conversion
+passes.plugin.tlx_convert_triton_to_tritongpu(pm, pass_args)
+```
+
+#### Key design difference from in-tree:
+The plugin avoids the TLX MLIR dialect dependency entirely. In-tree TLX creates `RequireLayoutOp` as an intermediate op and uses dataflow analysis to propagate layouts. The plugin's combined pass directly modifies MemDescType encodings in a single backward walk, which is simpler but handles common cases. Advanced cases (e.g., storage alias, reuse groups) still need the full dialect (Phase 6).
+
+#### Passes NOT yet ported (need TLX dialect or NVIDIA-only):
+- `add_tlx_storage_alias_lowering` — NVIDIA only, requires `StorageAliasLocalAllocOp`, `ReuseGroupOp` (Phase 6)
+- `add_tlx_resolve_placeholder_layouts` — NVIDIA only, requires `DummyRegisterLayoutAttr` (Phase 6)
+- `add_tlx_rewrite_local_alias` — Requires `LocalAliasOp` (Phase 6)
+- `add_tlx_print_ttgir_to_tlx` — Debug pass
+
+---
+
 ## Key Architecture Decisions
 
 ### 1. Custom Op vs Dialect Plugin boundary
@@ -207,8 +308,8 @@ For make_*/get_* helpers (layout attrs, types), these are builder methods that d
 
 ### 3. Pipeline hook architecture
 The `custom_stages.py` hook is the right pattern:
-- **AMD**: Replace `stages["ttgir"]` — run plugin conversion first, then `self.make_ttgir()`
-- **NVIDIA**: Replace `stages["ttir"]` — run `self.make_ttir()` then plugin conversion
+- **AMD**: Replace `stages["ttgir"]` — run plugin conversion first, then `self.make_ttgir()`, then layout passes
+- **NVIDIA**: Replace `stages["ttir"]` — run fixup, then `self.make_ttir()`, then plugin conversion
 - **Dialect Plugin passes**: Add to the hook after conversion, before LLVM lowering
 
 ### 4. Python DSL approach
