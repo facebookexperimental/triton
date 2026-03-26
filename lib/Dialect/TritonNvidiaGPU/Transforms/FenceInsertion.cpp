@@ -106,6 +106,27 @@ public:
   }
 
 private:
+  // Walk users of `root` transitively through memdesc view ops, collecting
+  // any LocalStoreOp found into `result`.
+  void findLocalStoresThroughViews(Value root,
+                                   llvm::SetVector<Operation *> &result) {
+    SmallVector<Value> worklist = {root};
+    DenseSet<Value> seen;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!seen.insert(v).second)
+        continue;
+      for (auto *user : v.getUsers()) {
+        if (isa<ttg::LocalStoreOp>(user)) {
+          result.insert(user);
+        } else if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
+          for (auto res : user->getResults())
+            worklist.push_back(res);
+        }
+      }
+    }
+  }
+
   // Return true if the fence should NOT be hoisted past `loopOp` because
   // `writeOp` (a generic-proxy SMEM write) executes concurrently with the
   // loop in a different region of the same warp_specialize.
@@ -169,17 +190,12 @@ private:
         if (localAlloc.getSrc()) {
           result.insert(op);
         }
-        // Check if there are local_store ops that write to that buffer.
-        for (auto *user : localAlloc.getResult().getUsers()) {
-          while (user->hasOneUse() &&
-                 user->hasTrait<OpTrait::MemDescViewTrait>()) {
-            user = *user->getUsers().begin();
-          }
-          if (isa<ttg::LocalStoreOp>(user)) {
-            result.insert(user);
-            return;
-          }
-        }
+        // Check if there are local_store ops that write to that buffer,
+        // following through memdesc view ops (which may have multiple users
+        // e.g. when EPILOGUE_SUBTILE > 1 writes multiple sub-tiles).
+        findLocalStoresThroughViews(localAlloc.getResult(), result);
+        if (!result.empty())
+          return;
         // When the alloc is captured by a warp_specialize op, check all
         // partition regions for local_store ops to the corresponding block
         // arg. This handles the case where early TMA store lowering creates
@@ -197,25 +213,9 @@ private:
               continue;
             for (Region *region : wsOp.getPartitionRegions()) {
               Value blockArg = region->getArgument(i);
-              // Walk through users of the block arg, following memdesc
-              // view ops, looking for local_store.
-              SmallVector<Value> worklist = {blockArg};
-              DenseSet<Value> seen;
-              while (!worklist.empty()) {
-                Value v = worklist.pop_back_val();
-                if (!seen.insert(v).second)
-                  continue;
-                for (auto *vUser : v.getUsers()) {
-                  if (isa<ttg::LocalStoreOp>(vUser)) {
-                    result.insert(vUser);
-                    return;
-                  }
-                  if (vUser->hasTrait<OpTrait::MemDescViewTrait>()) {
-                    for (auto res : vUser->getResults())
-                      worklist.push_back(res);
-                  }
-                }
-              }
+              findLocalStoresThroughViews(blockArg, result);
+              if (!result.empty())
+                return;
             }
             break;
           }
