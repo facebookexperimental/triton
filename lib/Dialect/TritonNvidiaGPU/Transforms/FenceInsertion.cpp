@@ -148,7 +148,8 @@ private:
     // are inside the same WarpSpecializeOp.
     if (bool(writeWsPartitions) != bool(loopWsPartitions)) {
       auto writeWs = writeOp->getParentOfType<ttg::WarpSpecializeOp>();
-      if (writeWs && writeWs == loopOp->getParentOfType<ttg::WarpSpecializeOp>())
+      if (writeWs &&
+          writeWs == loopOp->getParentOfType<ttg::WarpSpecializeOp>())
         return true;
     }
     return false;
