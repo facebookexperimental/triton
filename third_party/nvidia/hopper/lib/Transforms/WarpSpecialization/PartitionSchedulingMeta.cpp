@@ -723,9 +723,11 @@ selectTemplate(const OpCategorizer &categorizer,
                           << ", epilogueStores=" << epilogueStores.size()
                           << ", mmas=" << mmas.size() << "\n");
 
-  // Use UnifiedFA for any pattern with multiple MMAs (FA fwd, FA bwd, etc.)
-  // or with correction ops. Fall back to GEMM only for simple single-MMA cases.
-  if (hasCorrection || mmas.size() > 1 || dpFactor > 1) {
+  // Use UnifiedFA for patterns with more MMAs than data partitions (FA fwd,
+  // FA bwd, etc.) or with correction ops. When #MMAs == dpFactor, each MMA
+  // maps 1:1 to a data partition — use the simpler GEMM template.
+  if (hasCorrection ||
+      ((mmas.size() > 1 || dpFactor > 1) && mmas.size() != dpFactor)) {
     bool hasReduction =
         !categorizer.getOpsInCategory(OpCategory::TMAReduction).empty();
 
@@ -1377,7 +1379,7 @@ getInitialSchedule(scf::ForOp mainLoop,
   if (!postLoopPartition)
     postLoopPartition = defaultPartition;
   return ScheduleResult{std::move(schedule), postLoopPartition,
-                        tmpl->getName() != "GEMM" || dataPartitionFactor > 1};
+                        tmpl->getName() != "GEMM"};
 }
 
 namespace {
