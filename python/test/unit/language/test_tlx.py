@@ -1622,10 +1622,6 @@ def test_async_remote_shmem_copy(device):
         if cta_rank == 1:
             tlx.barrier_expect_bytes(barriers[0], N * tlx.size_of(tl.float32))
 
-        # Synchronize: CTA 0 must not issue the copy until CTA 1 has set up
-        # the barrier.
-        tlx.cluster_barrier()
-
         # CTA 0 (sender): load from global memory into registers, store to
         # local SMEM, then bulk-copy that SMEM to CTA 1's SMEM and signal
         # CTA 1's mbarrier.
