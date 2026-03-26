@@ -19,6 +19,8 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
 )
+from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
+    attention as _blackwell_fa_clc, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent_mxfp8 import (
     attention as _blackwell_fa_ws_pipelined_persistent_mxfp8,
     generate_attention_inputs as _generate_mxfp8_attention_inputs,
@@ -196,6 +198,16 @@ class FlashAttention:
             "NUM_MMA_GROUPS": 2,
         },
         "blackwell_fa_ws_pipelined_persistent": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+        },
+        "blackwell_fa_clc": {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
@@ -391,6 +403,22 @@ def test_blackwell_fa_ws_pipelined_persistent_warp_barrier(causal, RESCALE_OPT, 
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, 64, 1, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("N_CTX", [1024, 2048, 4096, 8192])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
+    config = FlashAttention.CONFIGS["blackwell_fa_clc"].copy()
+    config["RESCALE_OPT"] = RESCALE_OPT
+    config["USE_WHERE"] = USE_WHERE
+    sm_scale = 0.5
+    Z, H, HEAD_DIM = 4, 8, 128
+    q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+    ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+    tri_out = _blackwell_fa_clc(q, k, v, sm_scale, causal, config=config)
+    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("causal", [True, False])

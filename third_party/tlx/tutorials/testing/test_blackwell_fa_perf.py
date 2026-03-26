@@ -12,6 +12,8 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_persistent import (
     attention as _attention_ws_persistent, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws import (
     attention as _attention_ws, )
+from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
+    attention as _attention_clc, )
 
 from triton._internal_testing import is_blackwell
 
@@ -22,6 +24,7 @@ ATTENTION_METHODS = {
     "ws_pipelined": _attention_ws_pipelined,
     "ws_persistent": _attention_ws_persistent,
     "ws": _attention_ws,
+    "clc": _attention_clc,
 }
 
 ref_lib = "SDPA"
