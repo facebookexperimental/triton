@@ -80,8 +80,9 @@ public:
       if (!loops.empty())
         enabled = true;
     }
-    if (!enabled)
+    if (!enabled) {
       return;
+    }
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     if (numWarps != 4) {

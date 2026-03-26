@@ -2961,15 +2961,16 @@ void insertAsyncComm(
         }
       } else if (group->channels.size() > 2) {
         // N-buffer reuse group handling (N > 2): generalize the 2-buffer
-        // case to create a dependency chain. Channel i must wait for
-        // channel i-numCopies (the one that previously occupied the same
-        // buffer slot) before overwriting the shared SMEM buffer.
+        // case to create a dependency chain. Each channel i > 0 must wait
+        // for channel i-1's consumer to finish reading from the shared
+        // buffer before overwriting it.
         //
-        // When numCopies >= numChannels, each channel has its own slot
-        // and no reuse synchronization is needed.
-        unsigned numChannels = group->channels.size();
-        unsigned numCopies = group->channels[0]->getNumBuffers();
-        if (numChannels > numCopies) {
+        // This handles cases like epilogue subtiling where N subtiles share
+        // a single SMEM buffer and are stored/loaded sequentially.
+        bool allSingleCopy = llvm::all_of(group->channels, [](Channel *ch) {
+          return ch->getNumBuffers() == 1;
+        });
+        if (allSingleCopy) {
           // Order channels by producer program order.
           SmallVector<Channel *> ordered(group->channels.begin(),
                                          group->channels.end());
@@ -2977,43 +2978,42 @@ void insertAsyncComm(
             return appearsBefore(a->getSrcOp(), b->getSrcOp());
           });
           // Find masterChannel's position in the ordered list.
-          for (size_t i = 0; i < ordered.size(); i++) {
+          for (size_t i = 1; i < ordered.size(); i++) {
             if (ordered[i] == masterChannel) {
-              if (i >= numCopies) {
-                // Intra-iteration: wait on channel sharing same slot.
-                auto *earlyChannel = ordered[i - numCopies];
-                if (needExplicitReuseWait(earlyChannel, masterChannel)) {
-                  auto *earlyProducer = earlyChannel->getSrcOp();
-                  if (earlyProducer->getBlock() == headProducer->getBlock() &&
-                      appearsBefore(earlyProducer, headProducer)) {
-                    auto *lateConsumer = masterChannel->getDstOp();
-                    if (lateConsumer->getBlock() == earlyProducer->getBlock()) {
-                      producerAcquireForChannelLoop = earlyProducer;
-                    }
+              auto *earlyChannel = ordered[i - 1];
+              if (needExplicitReuseWait(earlyChannel, masterChannel)) {
+                auto *earlyProducer = earlyChannel->getSrcOp();
+                if (earlyProducer->getBlock() == headProducer->getBlock() &&
+                    appearsBefore(earlyProducer, headProducer)) {
+                  auto *lateConsumer = masterChannel->getDstOp();
+                  if (lateConsumer->getBlock() == earlyProducer->getBlock()) {
+                    producerAcquireForChannelLoop = earlyProducer;
                   }
-                  earlyChannelForReuseSync = earlyChannel;
-                  LLVM_DEBUG({
-                    LDBG("N-reuse group: channel "
-                         << masterChannel->uniqID
-                         << " will wait on early channel "
-                         << earlyChannel->uniqID);
-                  });
                 }
-              } else {
-                // Wrap-around: first numCopies channels wait on last
-                // numCopies channels (those that used the same slots in
-                // the previous iteration).
-                wrapAroundChannelForReuseSync =
-                    ordered[numChannels - numCopies + i];
+                earlyChannelForReuseSync = earlyChannel;
                 LLVM_DEBUG({
                   LDBG("N-reuse group: channel "
                        << masterChannel->uniqID
-                       << " will wrap-around wait on channel "
-                       << wrapAroundChannelForReuseSync->uniqID);
+                       << " will wait on early channel "
+                       << earlyChannel->uniqID);
                 });
               }
               break;
             }
+          }
+          // Wrap-around dependency: the first channel in program order
+          // must wait for the last channel's consumer from the previous
+          // iteration. Without this, the first channel's producer can
+          // overwrite the shared SMEM buffer while the last channel's
+          // TMA is still reading from the previous iteration.
+          if (ordered[0] == masterChannel) {
+            wrapAroundChannelForReuseSync = ordered.back();
+            LLVM_DEBUG({
+              LDBG("N-reuse group: channel "
+                   << masterChannel->uniqID
+                   << " will wrap-around wait on last channel "
+                   << wrapAroundChannelForReuseSync->uniqID);
+            });
           }
         }
       }

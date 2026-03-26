@@ -700,3 +700,89 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
         # Verify correctness
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test 4: Multi-copy epilogue buffers with epilogue subtiling
+# Focused test for the Phase 4.5 memory planner feature: with algo 1 and
+# numBuffers capped at 2, 4 epilogue channels share 2 buffer copies.
+# FLATTEN=True is not supported because the flattened loop generates
+# scf.IfOp with else blocks, which the autoWS pass cannot handle yet.
+# ============================================================================
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_tutorial09_multi_epilogue_subtile():
+    """Test multi-copy epilogue buffers: 4 epilogue channels with 2 buffer copies."""
+    M, N, K = 8192, 8192, 8192
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
+    EPILOGUE_SUBTILE = 4
+    SMEM_ALLOC_ALGO = 1
+    num_stages = 2
+    num_warps = 4
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.use_early_tma_store_lowering = True
+
+        dtype = torch.float16
+        GROUP_SIZE_M = 8
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(
+            C,
+            C.shape,
+            C.stride(),
+            [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE],
+        )
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_tma_persistent_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            FLATTEN=False,
+            A_COL_MAJOR=False,
+            B_COL_MAJOR=False,
+            DATA_PARTITION_FACTOR=1,
+            SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        # Verify warp specialization actually ran (ttg.warp_return is only
+        # emitted by the WS code partition pass)
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_return" in ttgir, "Expected warp specialization to run"
+        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+
+        # Verify correctness
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

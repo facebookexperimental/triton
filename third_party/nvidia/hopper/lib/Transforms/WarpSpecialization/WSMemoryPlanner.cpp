@@ -3009,7 +3009,6 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               int smemAllocAlgo = 0, unsigned smemBudget = 0,
                               bool smemCircularReuse = false) {
 
-  // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectPostChannels(channelsOrigin, funcOp);
   SmallVector<Channel *> channels;
