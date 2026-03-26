@@ -168,10 +168,6 @@ def test_autows_addmm_tma_persistent(
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
 
-    # DATA_PARTITION_FACTOR == 2 crashes with PassManager::run failed
-    if DATA_PARTITION_FACTOR == 2:
-        pytest.skip("DATA_PARTITION_FACTOR == 2 causes PassManager::run failure")
-
     # Skip configurations that exceed hardware resource limits (shared memory or tensor memory)
     if BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
         pytest.skip("Out of resources: shared memory and/or tensor memory exceeded")
@@ -187,6 +183,9 @@ def test_autows_addmm_tma_persistent(
 
     if BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0 and (BLOCK_SIZE_K == 128 or num_stages == 3):
         pytest.skip("Out of resources: shared memory exceeded")
+
+    if DATA_PARTITION_FACTOR == 2 and BLOCK_SIZE_M == 256 and not FLATTEN and SMEM_ALLOC_ALGO == 0:
+        pytest.skip("Out of resources: shared memory exceeded with data partitioning")
 
     if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
         pytest.skip("Out of resources: shared memory exceeded")

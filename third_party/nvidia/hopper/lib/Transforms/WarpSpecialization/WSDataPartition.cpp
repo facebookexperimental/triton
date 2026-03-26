@@ -1770,23 +1770,60 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       // Compute the sliced source type.
       SmallVector<int64_t> slicedShape(srcShape);
       slicedShape[dim] = slicedSize;
-      auto slicedSrcType = RankedTensorType::get(
-          slicedShape, srcType.getElementType(), srcType.getEncoding());
 
-      // Create sliced source value. For splat constants (including values
-      // derived from splat constants through element-preserving ops like
-      // convert_layout, truncf, and split), create a new constant with the
-      // sliced shape. For other sources, bail out.
-      Value slicedSrc;
+      // Create sliced source values — one per partition.
+      SmallVector<Value> slicedSrcs;
       if (auto splatAttr = getEffectiveSplatAttr(src)) {
+        // Splat constants: create a new splat with the sliced shape.
         auto slicedValType = RankedTensorType::get(
             slicedShape, srcType.getElementType(), srcType.getEncoding());
         auto slicedValAttr = DenseElementsAttr::get(slicedValType, *splatAttr);
-        slicedSrc = builder.create<arith::ConstantOp>(descStoreOp.getLoc(),
-                                                      slicedValAttr);
-      }
+        Value splatConst = builder.create<arith::ConstantOp>(
+            descStoreOp.getLoc(), slicedValAttr);
+        for (int i = 0; i < partitionScheme.numPartitions; i++)
+          slicedSrcs.push_back(splatConst);
+      } else if (partitionScheme.numPartitions == 2) {
+        // Non-splat source with 2 partitions: use reshape + trans + split.
+        //
+        // For a source tensor<S0 x S1 x ... x f16> partitioned along dim:
+        //   1. Reshape: replace S[dim] with [2, S[dim]/2]
+        //      e.g. tensor<256x128> → tensor<2x128x128> (dim=0)
+        //   2. Trans: move the size-2 dimension to the last position
+        //      e.g. tensor<2x128x128> → tensor<128x128x2>
+        //   3. Split: split along the last dimension (size 2)
+        //      e.g. tensor<128x128x2> → tensor<128x128>, tensor<128x128>
+        auto loc = descStoreOp.getLoc();
 
-      if (!slicedSrc) {
+        // Build the reshaped shape: insert [2, S[dim]/2] at position dim.
+        SmallVector<int64_t> reshapedShape;
+        for (size_t d = 0; d < srcShape.size(); d++) {
+          if (d == (size_t)dim) {
+            reshapedShape.push_back(2);
+            reshapedShape.push_back(srcShape[d] / 2);
+          } else {
+            reshapedShape.push_back(srcShape[d]);
+          }
+        }
+
+        auto reshapeOp = builder.create<ReshapeOp>(loc, reshapedShape, src,
+                                                   /*allowReorder=*/false);
+
+        // Build trans order: move dim (the size-2 position) to last.
+        int rank = reshapedShape.size();
+        SmallVector<int32_t> transOrder;
+        for (int d = 0; d < rank; d++) {
+          if (d != dim)
+            transOrder.push_back(d);
+        }
+        transOrder.push_back(dim);
+
+        auto transOp =
+            builder.create<TransOp>(loc, reshapeOp.getResult(), transOrder);
+
+        auto splitOp = builder.create<SplitOp>(loc, transOp.getResult());
+        slicedSrcs.push_back(splitOp.getOutLHS());
+        slicedSrcs.push_back(splitOp.getOutRHS());
+      } else {
         LDBG("Cannot slice non-splat source of unpartitioned descriptor_store");
         return false;
       }
@@ -1800,11 +1837,99 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
           indices[dim] = builder.create<arith::AddIOp>(descStoreOp.getLoc(),
                                                        indices[dim], offset);
         }
-        builder.create<DescriptorStoreOp>(
-            descStoreOp.getLoc(), descStoreOp.getDesc(), slicedSrc, indices);
+        builder.create<DescriptorStoreOp>(descStoreOp.getLoc(),
+                                          descStoreOp.getDesc(), slicedSrcs[i],
+                                          indices);
       }
 
       descStoreOp.erase();
+    }
+  }
+
+  // Handle unpartitioned descriptor_load ops similarly. After updating the
+  // func arg type, any remaining full-sized load would have a type mismatch.
+  // Replace each with numPartitions sliced loads + join + trans + reshape to
+  // reconstruct the original full-sized tensor for downstream users.
+  for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
+    auto &entryBlock = funcOp.getBlocks().front();
+    auto bbArg = entryBlock.getArgument(argIndex);
+    auto descType = cast<TensorDescType>(bbArg.getType());
+    auto blockType = descType.getBlockType();
+    int64_t slicedSize =
+        blockType.getShape()[dim] / partitionScheme.numPartitions;
+
+    SmallVector<DescriptorLoadOp> unpartitionedLoads;
+    for (Operation *user : bbArg.getUsers()) {
+      if (auto descLoadOp = dyn_cast<DescriptorLoadOp>(user)) {
+        if (!partitionScheme.isPartitioned(descLoadOp)) {
+          auto resultType =
+              cast<RankedTensorType>(descLoadOp.getResult().getType());
+          if (resultType.getShape()[dim] == slicedSize)
+            continue;
+          unpartitionedLoads.push_back(descLoadOp);
+        }
+      }
+    }
+
+    for (auto descLoadOp : unpartitionedLoads) {
+      if (partitionScheme.numPartitions != 2) {
+        LDBG("Cannot reconstruct non-splat unpartitioned descriptor_load "
+             "with numPartitions != 2");
+        return false;
+      }
+      OpBuilder builder(descLoadOp);
+      auto loc = descLoadOp.getLoc();
+      auto resultType =
+          cast<RankedTensorType>(descLoadOp.getResult().getType());
+      SmallVector<int64_t> resultShape(resultType.getShape());
+
+      // Compute the sliced result type.
+      SmallVector<int64_t> slicedShape(resultShape);
+      slicedShape[dim] = slicedSize;
+      auto slicedResultType = RankedTensorType::get(
+          slicedShape, resultType.getElementType(), resultType.getEncoding());
+
+      // Create sliced loads.
+      SmallVector<Value> slicedLoads;
+      for (int i = 0; i < partitionScheme.numPartitions; i++) {
+        SmallVector<Value> indices(descLoadOp.getIndices());
+        if (i > 0) {
+          Value offset =
+              builder.create<arith::ConstantIntOp>(loc, i * slicedSize, 32);
+          indices[dim] =
+              builder.create<arith::AddIOp>(loc, indices[dim], offset);
+        }
+        auto slicedLoad = builder.create<DescriptorLoadOp>(
+            loc, slicedResultType, descLoadOp.getDesc(), indices);
+        slicedLoads.push_back(slicedLoad.getResult());
+      }
+
+      // Reconstruct the full tensor: join + trans + reshape.
+      // join: tensor<S0x...x(S[dim]/2)x...> x2 →
+      // tensor<S0x...x(S[dim]/2)x...x2>
+      auto joinOp = builder.create<JoinOp>(loc, slicedLoads[0], slicedLoads[1]);
+
+      // trans: move the last dim (size 2) to position dim.
+      int rank = resultShape.size() + 1; // after join, rank increased by 1
+      SmallVector<int32_t> transOrder;
+      for (int d = 0; d < rank; d++) {
+        if (d == dim)
+          transOrder.push_back(rank - 1); // insert the size-2 dim here
+        if (d < rank - 1)
+          transOrder.push_back(d);
+      }
+
+      auto transOp =
+          builder.create<TransOp>(loc, joinOp.getResult(), transOrder);
+
+      // reshape: merge the partition dim back.
+      // e.g. tensor<2x128x128> → tensor<256x128>
+      auto reshapeOp =
+          builder.create<ReshapeOp>(loc, resultShape, transOp.getResult(),
+                                    /*allowReorder=*/false);
+
+      descLoadOp.getResult().replaceAllUsesWith(reshapeOp.getResult());
+      descLoadOp.erase();
     }
   }
 
