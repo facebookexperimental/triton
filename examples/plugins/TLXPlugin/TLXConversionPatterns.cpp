@@ -22,6 +22,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -872,6 +874,27 @@ public:
           return true;
         });
 
+    // TLX addition: on AMD targets, rewrite ttng.init_barrier →
+    // amdg.init_barrier before the conversion, since the AMD backend
+    // marks the ttng dialect as illegal and has no lowering for it.
+    bool isAMD = target.find("hip:") == 0;
+    if (isAMD) {
+      OpBuilder builder(context);
+      mod.walk([&](triton::nvidia_gpu::InitBarrierOp op) {
+        builder.setInsertionPoint(op);
+        triton::amdgpu::InitBarrierOp::create(builder, op.getLoc(),
+                                               op.getAlloc(), op.getCount());
+        op.erase();
+      });
+    }
+
+    // Mark the TritonNvidiaGPU dialect as legal so that ttng ops
+    // (e.g. ttng.init_barrier on NVIDIA) pass through unchanged.
+    // On AMD, we also mark amdg legal for the rewritten ops.
+    convTarget.addLegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
+    if (isAMD)
+      convTarget.addLegalDialect<triton::amdgpu::TritonAMDGPUDialect>();
+
     // --- Rewrite patterns (from TritonToTritonGPUPass.cpp) ---
     RewritePatternSet patterns(context);
     populateArithPatternsAndLegality(typeConverter, patterns, convTarget);
@@ -914,13 +937,14 @@ createTLXConvertTritonToTritonGPUPass(int numWarps, int threadsPerWarp,
 // Plugin pass API
 // ===========================================================================
 
-// args layout: [passName, numWarps, threadsPerWarp, numCTAs, target]
+// args layout: [target, numWarps, threadsPerWarp, numCTAs]
+// (target is e.g. "hip:gfx950" or "cuda:90")
 static void addTLXPass(mlir::PassManager *pm,
                        const std::vector<std::string> &args) {
+  std::string target = args.size() > 0 ? args[0] : "";
   int numWarps = args.size() > 1 ? std::atoi(args[1].c_str()) : 4;
   int threadsPerWarp = args.size() > 2 ? std::atoi(args[2].c_str()) : 32;
   int numCTAs = args.size() > 3 ? std::atoi(args[3].c_str()) : 1;
-  std::string target = args.size() > 4 ? args[4] : "";
   pm->addPass(createTLXConvertTritonToTritonGPUPass(numWarps, threadsPerWarp,
                                                     numCTAs, target));
 }

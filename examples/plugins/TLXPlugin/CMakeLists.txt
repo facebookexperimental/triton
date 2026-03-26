@@ -5,6 +5,11 @@ set(TLX_PLUGIN_SOURCES
 
 add_library(TLXMemOpsPlugin SHARED ${TLX_PLUGIN_SOURCES})
 
+# AMD dialect headers for target-aware barrier lowering
+target_include_directories(TLXMemOpsPlugin PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/amd/include
+)
+
 add_dependencies(TLXMemOpsPlugin
   triton
 )
