@@ -19,7 +19,7 @@ import triton.language as tl
 _plugin_python_dir = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
                  "..", "..", "..", "..", "..",
-                 "examples", "plugins", "TLXPlugin", "python")
+                 "triton-tlx", "python")
 )
 if _plugin_python_dir not in sys.path:
     sys.path.insert(0, _plugin_python_dir)

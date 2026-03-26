@@ -17,8 +17,8 @@ set(TritonPluginsTestLib_SOURCES
 # Dialect Plugins
 add_subdirectory(DialectPlugins)
 
-# TLX Plugin (local_alloc custom op)
-add_subdirectory(TLXPlugin)
+# TLX Plugin (local_alloc custom op) — lives in the triton-tlx submodule
+add_subdirectory(${CMAKE_SOURCE_DIR}/triton-tlx ${CMAKE_BINARY_DIR}/triton-tlx)
 
 foreach( plugin ${TRITON_PLUGIN_PASSES} )
     add_library(${plugin} SHARED ${${plugin}_SOURCES})

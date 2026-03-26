@@ -1,0 +1,3 @@
+[submodule "triton-tlx"]
+	path = triton-tlx
+	url = https://github.com/crobeck/triton-tlx.git
