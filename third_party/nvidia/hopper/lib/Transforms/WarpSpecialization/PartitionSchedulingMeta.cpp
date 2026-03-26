@@ -963,6 +963,7 @@ static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
 struct ScheduleResult {
   PartitionSet schedule;
   Partition *epiloguePartition = nullptr;
+  bool createComputePartitions;
 };
 
 // Given a partitioning scheme, determine an initial schedule by performing a
@@ -976,7 +977,8 @@ getInitialSchedule(scf::ForOp mainLoop,
       succeeded(scheduleOr))
     // Deserialized schedule: epilogue partition is unknown, use null.
     return ScheduleResult{std::move(*scheduleOr),
-                          /*epiloguePartition=*/nullptr};
+                          /*epiloguePartition=*/nullptr,
+                          /*createComputePartitions=*/true};
 
   // Collect all loops (nested + main)
   SmallVector<scf::ForOp> loops{mainLoop.getOps<scf::ForOp>()};
@@ -1374,7 +1376,8 @@ getInitialSchedule(scf::ForOp mainLoop,
     postLoopPartition = sharedComputePartition;
   if (!postLoopPartition)
     postLoopPartition = defaultPartition;
-  return ScheduleResult{std::move(schedule), postLoopPartition};
+  return ScheduleResult{std::move(schedule), postLoopPartition,
+                        tmpl->getName() != "GEMM" || dataPartitionFactor > 1};
 }
 
 namespace {
@@ -1437,7 +1440,8 @@ namespace {
 // operation in a partition. This function propagates partitions by first
 // forming contiguous clusters from the unassigned operations and then deciding
 // what to do with the operations in that cluster.
-void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
+void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
+                         bool createComputePartitions) {
   OpClusters opClusters;
 
   for (Partition &partition : schedule.getPartitions()) {
@@ -1561,6 +1565,23 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
         for (Operation *op : cluster.ops)
           setPartition(op, existingComputation);
         continue;
+      }
+      // For GEMM with data partitioning, merge into the default partition
+      // instead of creating a separate computation partition.
+      // TODO: Fix issues with DataPartitioning.
+      if (!createComputePartitions) {
+        Partition *defaultPartition = nullptr;
+        for (Partition &p : schedule.getPartitions()) {
+          if (p.getType() == "default") {
+            defaultPartition = &p;
+            break;
+          }
+        }
+        if (defaultPartition) {
+          for (Operation *op : cluster.ops)
+            setPartition(op, defaultPartition);
+          continue;
+        }
       }
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
@@ -1704,7 +1725,7 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, mergeEpilogue)) {
       PartitionSet &schedule = result->schedule;
-      propagatePartitions(loop, schedule);
+      propagatePartitions(loop, schedule, result->createComputePartitions);
 
       // Schedule post-loop operations into the epilogue partition after
       // propagatePartitions completes. When mergeEpilogueIntoComputation is
