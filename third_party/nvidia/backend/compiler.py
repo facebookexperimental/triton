@@ -407,6 +407,14 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            # 2-CTA support: Transform B loads and insert cross-CTA sync.
+            # Transform2CTALoads only for ctas_per_cga kernels (splits B loads).
+            # Insert2CTASync for all cluster kernels (the pass itself skips TLX
+            # kernels via tlx.has_tlx_ops module attribute check).
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2):
+                if opt.ctas_per_cga is not None:
+                    nvidia.passes.hopper.add_2cta_transform_loads(pm)
+                nvidia.passes.hopper.add_insert_2cta_sync(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)

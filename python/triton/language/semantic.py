@@ -1730,9 +1730,11 @@ class TritonSemantic(Generic[TensorTy]):
         allow_tf32,
         max_num_imprecise_acc: int,
         out_dtype: tl.dtype,
+        two_ctas: bool = False,
     ) -> tl.tensor:
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
-         ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
+         ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype,
+                                     two_ctas)
 
         return tl.tensor(
             self.builder.create_dot(
@@ -1741,6 +1743,7 @@ class TritonSemantic(Generic[TensorTy]):
                 acc_handle,
                 input_precision,
                 max_num_imprecise_acc,
+                two_ctas,
             ),
             ret_ty,
         )
