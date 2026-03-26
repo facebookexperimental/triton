@@ -126,7 +126,7 @@ private:
   /// Resolve a barrier Value to (allocName, slotIndex) by tracing def-use
   /// chains through memdesc_index and warp_specialize captures.
   std::pair<std::string, int64_t> resolveBarrier(Value barrierVal,
-                                                  OperandRange captures);
+                                                 OperandRange captures);
 
   /// Evaluate an integer SSA value to a concrete int at a given loop
   /// iteration. Returns nullopt if the value cannot be resolved.
