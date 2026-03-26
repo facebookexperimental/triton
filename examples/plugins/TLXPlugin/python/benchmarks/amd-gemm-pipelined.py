@@ -10,8 +10,7 @@ import sys
 # Add the plugin Python package to the path.
 # Resolve to absolute path so it works regardless of cwd.
 _plugin_python_dir = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "examples", "plugins", "TLXPlugin", "python")
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
             )
 if _plugin_python_dir not in sys.path:
         sys.path.insert(0, _plugin_python_dir)
