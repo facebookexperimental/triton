@@ -113,7 +113,7 @@ public:
   virtual void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
                                              Value srcPtr, Value dstPtr,
                                              Value barrierPtr, Value ctaId,
-                                             Value size, Value pred) const {
+                                             Value size) const {
     llvm_unreachable(
         "copyBulkSharedToRemoteShared not supported on this target");
   }

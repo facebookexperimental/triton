@@ -30,8 +30,8 @@ public:
 
   void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
                                     Value srcPtr, Value dstPtr,
-                                    Value barrierPtr, Value ctaId, Value size,
-                                    Value pred) const override;
+                                    Value barrierPtr, Value ctaId,
+                                    Value size) const override;
 
   bool supportLdMatrix() const override { return computeCapability >= 75; }
   bool supportStMatrix() const override { return computeCapability >= 90; }

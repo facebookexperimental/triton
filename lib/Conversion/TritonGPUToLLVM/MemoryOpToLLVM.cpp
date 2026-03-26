@@ -378,13 +378,9 @@ public:
     Value sizeBytes =
         b.i32_val(numElems * llvmElemTy.getIntOrFloatBitWidth() / 8);
 
-    // Only thread 0 of each CTA issues the bulk copy.
-    Value tid = getThreadId(rewriter, loc);
-    Value pred = b.icmp_eq(tid, b.i32_val(0));
-
     targetInfo.copyBulkSharedToRemoteShared(rewriter, loc, srcPtr, dstPtr,
                                             barrierPtr, op.getCtaRank(),
-                                            sizeBytes, pred);
+                                            sizeBytes);
     rewriter.eraseOp(op);
     return success();
   }
