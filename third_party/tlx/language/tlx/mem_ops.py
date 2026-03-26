@@ -401,8 +401,8 @@ def async_remote_shmem_store(
 
 @tl.builtin
 def async_remote_shmem_copy(
-    src: tlx.buffered_tensor,
     dst: tlx.buffered_tensor,
+    src: tlx.buffered_tensor,
     remote_cta_rank: int | tl.constexpr,
     barrier: tlx.mbarrier,
     _semantic=None,
@@ -413,8 +413,8 @@ def async_remote_shmem_copy(
     Uses PTX: cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes
 
     Args:
-        src: The source buffer in local shared memory
         dst: The destination buffer in local shared memory (will be internally mapa'd to remote CTA)
+        src: The source buffer in local shared memory
         remote_cta_rank: The rank of the remote CTA within the cluster
         barrier: mbarrier in local shared memory whose address will be mapa'd to the remote CTA
     """

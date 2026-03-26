@@ -1636,8 +1636,8 @@ def test_async_remote_shmem_copy(device):
             tlx.fence("async_shared")
             # Copy local buffer to CTA 1
             tlx.async_remote_shmem_copy(
-                src=smem_buf[0],
                 dst=smem_buf[0],
+                src=smem_buf[0],
                 remote_cta_rank=1,
                 barrier=barriers[0],
             )
