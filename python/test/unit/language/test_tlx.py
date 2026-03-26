@@ -1633,8 +1633,7 @@ def test_async_remote_shmem_copy(device):
             offs = tl.arange(0, N)
             vals = tl.load(input_ptr + offs)
             tlx.local_store(smem_buf[0], vals)
-            # With num_warps=1 all stores are in the same warp, so they are
-            # visible to the subsequent cp.async.bulk by program order.
+            # Copy local buffer to CTA 1
             tlx.async_remote_shmem_copy(
                 src=smem_buf[0],
                 dst=smem_buf[0],
@@ -1650,8 +1649,8 @@ def test_async_remote_shmem_copy(device):
             offs = tl.arange(0, N)
             tl.store(output_ptr + offs, result)
 
-    N = 32
-    input_tensor = torch.arange(N, dtype=torch.float32, device=device)
+    N = 1024
+    input_tensor = torch.rand(N, dtype=torch.float32, device=device)
     output = torch.zeros(N, dtype=torch.float32, device=device)
 
     kernel = remote_copy_kernel[(2,)](
@@ -1659,7 +1658,10 @@ def test_async_remote_shmem_copy(device):
     )
 
     ttgir = kernel.asm["ttgir"]
+    ptx = kernel.asm["ptx"]
     assert ttgir.count("ttg.async_remote_shmem_copy") == 1
+    assert ptx.count("mapa.shared::cluster") == 2
+    assert ptx.count("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes") == 1
 
     torch.testing.assert_close(output, input_tensor)
 
