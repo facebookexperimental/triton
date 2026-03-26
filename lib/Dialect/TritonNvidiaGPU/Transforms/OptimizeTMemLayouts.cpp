@@ -99,7 +99,7 @@ public:
       return failure();
     int mDim = getShapePerCTA(tmemLoad.getSrc().getType())[0];
     // TODO: enable other M cases. (the layout is a bit more complex).
-    if (mDim != 128)
+    if (mDim != 128 && mDim != 256)
       return failure();
     int splitNSize = shape[2];
     if (splitNSize < 8)
@@ -169,7 +169,7 @@ public:
     // into multiple tmem_stores.
     int mDim = getShapePerCTA(storeOp.getDst().getType())[0];
     // TODO: enable other M cases. (the layout is a bit more complex).
-    if (mDim != 128)
+    if (mDim != 128 && mDim != 256)
       return failure();
     int splitNSize = shape[2];
     if (splitNSize < 8)
