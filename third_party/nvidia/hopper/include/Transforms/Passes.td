@@ -31,7 +31,10 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
              "Dump intermediate steps">,
     Option<"smemBudget", "smem-budget",
              "int32_t", /*default*/"0",
-             "SMEM budget in bytes (0 = auto-detect from target)">
+             "SMEM budget in bytes (0 = auto-detect from target)">,
+    Option<"useSubtiledRegionOperator", "use-subtiled-region-operator",
+             "bool", /*default*/"false",
+             "Enable subtiled region operator creation from split-tree patterns">
     ];
 }
 
@@ -237,6 +240,33 @@ def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir
            "If true, merge epilogue stores into the computation partition "
            "instead of creating a separate epilogue partition">
   ];
+}
+
+def NVGPUTestAddSubtileRegions : Pass<"nvgpu-test-add-subtile-regions", "mlir::ModuleOp"> {
+  let summary = "Generate SubtiledRegionOp from subtiling patterns";
+
+  let description = [{
+    This pass analyzes the IR for subtiling patterns available from the frontend
+    and wraps them into `ttng.subtiled_region` ops, giving the compiler a
+    structured representation to reason about per-tile operations and barrier
+    placement.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTestFuseSubtileRegions : Pass<"nvgpu-test-fuse-subtile-regions", "mlir::ModuleOp"> {
+  let summary = "Fuse adjacent SubtiledRegionOps for interleaved execution";
+
+  let description = [{
+    This pass fuses adjacent SubtiledRegionOps that have the same number of
+    tiles, compatible attributes, and empty barriers/teardown regions. The
+    fused op interleaves tile arguments from both sources so that lowering
+    produces interleaved per-tile code, improving locality and enabling
+    better barrier placement around the combined operation.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
 #endif // NV_TRANSFORMS_PASSES

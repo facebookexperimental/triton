@@ -337,7 +337,7 @@ class CUDABackend(BaseBackend):
             smem_budget = rt_driver.active.utils.get_device_properties(
                 rt_driver.active.get_current_device())["max_shared_mem"]
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS, dump_enabled,
-                                                     smem_budget)
+                                                     smem_budget, False)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
@@ -365,7 +365,8 @@ class CUDABackend(BaseBackend):
                 smem_budget = rt_driver.active.utils.get_device_properties(
                     rt_driver.active.get_current_device())["max_shared_mem"]
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
-                                                         dump_enabled, smem_budget)
+                                                         dump_enabled, smem_budget,
+                                                         knobs.nvidia.use_subtiled_region_operator)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
@@ -379,11 +380,15 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
+        if capability // 10 >= 10 and knobs.nvidia.use_subtiled_region_operator:
+            nvidia.passes.ttnvgpuir.add_subtiled_region_setup_push(pm)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
+        if capability // 10 >= 10 and knobs.nvidia.use_subtiled_region_operator:
+            nvidia.passes.ttnvgpuir.add_lower_subtiled_region(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
         passes.ttir.add_loop_aware_cse(pm)

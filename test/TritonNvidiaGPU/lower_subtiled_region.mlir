@@ -1,0 +1,263 @@
+// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-lower-subtiled-region | FileCheck %s
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+
+  // Test basic lowering: two tiles, no barriers.
+  // CHECK-LABEL: @basic_two_tiles
+  tt.func @basic_two_tiles() {
+    // Setup ops should be inlined:
+    // CHECK: %[[C0:.*]] = arith.constant 0 : i32
+    // CHECK: %[[C1:.*]] = arith.constant 1 : i32
+    // Tile 0 (arg0 = c0):
+    // CHECK: arith.index_cast %[[C0]]
+    // Tile 1 (arg0 = c1):
+    // CHECK: arith.index_cast %[[C1]]
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test lowering with arrive_barrier AFTER last tile.
+  // CHECK-LABEL: @arrive_after_last
+  tt.func @arrive_after_last(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %phase: i32,
+      %desc: !tt.tensordesc<tensor<128x128xf32, #blocked>>,
+      %row: i32) {
+    // Tile 0:
+    // CHECK: arith.addi
+    // CHECK-NOT: ttng.arrive_barrier
+    // Tile 1 (last):
+    // CHECK: arith.addi
+    // arrive_barrier emitted AFTER last "arith.addi":
+    // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 1
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        phases(%phase : i32)
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c128 = arith.constant 128 : i32
+        ttng.subtiled_region_yield %c0, %c128 : i32, i32
+      } tile(%arg0: i32) {
+        %off = arith.addi %arg0, %row : i32
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test lowering with wait_barrier BEFORE first tile.
+  // CHECK-LABEL: @wait_before_first
+  tt.func @wait_before_first(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %phase: i32) {
+    // wait_barrier emitted BEFORE first "arith.addi":
+    // CHECK: ttng.wait_barrier %{{.*}}, %{{.*}}
+    // CHECK-NEXT: arith.addi
+    // Tile 1: no wait_barrier
+    // CHECK: arith.addi
+    // CHECK-NOT: ttng.wait_barrier
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        phases(%phase : i32)
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier">
+        ]
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test with multiple block args per tile (tile-major setup order).
+  // CHECK-LABEL: @multi_arg_tiles
+  tt.func @multi_arg_tiles() {
+    // Setup outputs in tile-major order: c0, c10 (tile 0), c1, c20 (tile 1)
+    // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : i32
+    // CHECK-DAG: %[[C10:.*]] = arith.constant 10 : i32
+    // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : i32
+    // CHECK-DAG: %[[C20:.*]] = arith.constant 20 : i32
+    // Tile 0: addi c0, c10
+    // CHECK: arith.addi %[[C0]], %[[C10]]
+    // Tile 1: addi c1, c20
+    // CHECK: arith.addi %[[C1]], %[[C20]]
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c10 = arith.constant 10 : i32
+        %c1 = arith.constant 1 : i32
+        %c20 = arith.constant 20 : i32
+        ttng.subtiled_region_yield %c0, %c10, %c1, %c20 : i32, i32, i32, i32
+      } tile(%a: i32, %b: i32) {
+        %sum = arith.addi %a, %b : i32
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test with both wait_barrier BEFORE and arrive_barrier AFTER.
+  // CHECK-LABEL: @wait_and_arrive
+  tt.func @wait_and_arrive(
+      %bar_wait: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %bar_arrive: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %phase: i32) {
+    // wait_barrier BEFORE first "arith.muli":
+    // CHECK: ttng.wait_barrier %{{.*}}, %{{.*}}
+    // CHECK-NEXT: arith.muli
+    // Tile 1:
+    // CHECK: arith.muli
+    // arrive_barrier AFTER last "arith.muli":
+    // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 2
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar_wait, %bar_arrive : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        phases(%phase, %phase : i32, i32)
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier">,
+          #ttng.barrier_annotation<barrierIdx = 1, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier",
+              count = 2>
+        ]
+      setup {
+        %c3 = arith.constant 3 : i32
+        %c5 = arith.constant 5 : i32
+        ttng.subtiled_region_yield %c3, %c5 : i32, i32
+      } tile(%arg0: i32) {
+        %res = arith.muli %arg0, %arg0 : i32
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test with a single tile (degenerate case).
+  // CHECK-LABEL: @single_tile
+  tt.func @single_tile(
+      %bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>,
+      %phase: i32) {
+    // Both BEFORE and AFTER fire on the same (only) tile:
+    // CHECK: ttng.wait_barrier
+    // CHECK-NEXT: arith.addi
+    // CHECK-NEXT: ttng.arrive_barrier
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barriers(%bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>)
+        phases(%phase : i32)
+        barrier_annotations = [
+          #ttng.barrier_annotation<barrierIdx = 0, placement = before,
+              targetOpIdx = 0, barrierOpKind = "wait_barrier">,
+          #ttng.barrier_annotation<barrierIdx = 0, placement = after,
+              targetOpIdx = 0, barrierOpKind = "arrive_barrier">
+        ]
+      setup {
+        %c42 = arith.constant 42 : i32
+        ttng.subtiled_region_yield %c42 : i32
+      } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test capturing values from the outer scope.
+  // CHECK-LABEL: @capture_outer_value
+  // CHECK-SAME: %[[OUTER:arg0]]: i32
+  tt.func @capture_outer_value(%outer: i32) {
+    // CHECK: arith.constant 0 : i32
+    // Tile 0: addi c0, %outer
+    // CHECK: arith.addi %{{.*}}, %[[OUTER]]
+    // Tile 1: addi c1, %outer
+    // CHECK: arith.addi %{{.*}}, %[[OUTER]]
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %res = arith.addi %arg0, %outer : i32
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test no barriers, no phases.
+  // CHECK-LABEL: @no_barriers
+  tt.func @no_barriers() {
+    // CHECK: arith.constant 0 : i32
+    // CHECK: arith.constant 1 : i32
+    // CHECK: arith.index_cast
+    // CHECK: arith.index_cast
+    // CHECK-NOT: ttng.subtiled_region
+    ttng.subtiled_region
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %idx = arith.index_cast %arg0 : i32 to index
+        ttng.subtiled_region_yield
+      }
+    tt.return
+  }
+
+  // Test teardown region: 2 tiles, tile yields a value, teardown combines them.
+  // CHECK-LABEL: @teardown_join
+  tt.func @teardown_join(%t0: tensor<128x64xf32, #blocked>, %t1: tensor<128x64xf32, #blocked>) {
+    // Setup inlined:
+    // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : i32
+    // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : i32
+    // Tile 0 (arg0 = c0): addi c0, c0 => 0
+    // CHECK: %[[V0:.*]] = arith.addi %[[C0]], %[[C0]]
+    // Tile 1 (arg0 = c1): addi c1, c1 => 2
+    // CHECK: %[[V1:.*]] = arith.addi %[[C1]], %[[C1]]
+    // Teardown: addi of the two tile yields
+    // CHECK: %[[R:.*]] = arith.addi %[[V0]], %[[V1]]
+    // Result used:
+    // CHECK: arith.index_cast %[[R]]
+    // CHECK-NOT: ttng.subtiled_region
+    %result = ttng.subtiled_region
+        barrier_annotations = []
+      setup {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        ttng.subtiled_region_yield %c0, %c1 : i32, i32
+      } tile(%arg0: i32) {
+        %v = arith.addi %arg0, %arg0 : i32
+        ttng.subtiled_region_yield %v : i32
+      } teardown(%a: i32, %b: i32) {
+        %j = arith.addi %a, %b : i32
+        ttng.subtiled_region_yield %j : i32
+      } -> (i32)
+    %idx = arith.index_cast %result : i32 to index
+    tt.return
+  }
+}
