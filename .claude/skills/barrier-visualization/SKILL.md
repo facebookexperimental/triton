@@ -3,9 +3,12 @@ name: barrier-visualization
 description: >
   Produce a structured barrier report for AutoWS (automatic warp specialization) IR.
   Use when the user wants to visualize, audit, or debug barrier usage across
-  warp-specialized partitions. Covers mbarriers, named barriers, tcgen05 commit,
-  TMA-implicit arrives, Aref-based synchronization, and producer/consumer
-  barrier patterns.
+  warp-specialized partitions, or when debugging a GPU kernel hang (deadlock).
+  For hangs, first dump IR using the ir-debugging skill, then run this barrier
+  analysis to identify mismatched arrive/wait counts, missing backward barriers,
+  or other synchronization issues that cause deadlocks. Covers mbarriers, named
+  barriers, tcgen05 commit, TMA-implicit arrives, Aref-based synchronization,
+  and producer/consumer barrier patterns.
 ---
 
 # Barrier Visualization Report
