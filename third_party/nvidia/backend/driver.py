@@ -739,14 +739,19 @@ class CudaLauncher(object):
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
-        src = make_launcher(constants, signature, tensordesc_meta)
-        mod = compile_module_from_src(
-            src=src,
-            name="__triton_launcher",
-            library_dirs=library_dirs(),
-            include_dirs=include_dirs,
-            libraries=libraries,
-        )
+        if knobs.nvidia.use_no_compile_launcher:
+            from triton.backends.nvidia.ctypes_launcher import make_ctypes_launcher
+            launch_fn = make_ctypes_launcher(constants, signature, tensordesc_meta)
+        else:
+            src = make_launcher(constants, signature, tensordesc_meta)
+            mod = compile_module_from_src(
+                src=src,
+                name="__triton_launcher",
+                library_dirs=library_dirs(),
+                include_dirs=include_dirs,
+                libraries=libraries,
+            )
+            launch_fn = mod.launch
 
         # Distinguish between Triton's way and TLX's way by checking if ctas_per_cga
         # was explicitly set:
@@ -769,7 +774,7 @@ class CudaLauncher(object):
             # so launch_cluster can be False here.
             self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
             self.launch_cluster = metadata.launch_cluster
-        self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
+        self.launch = wrap_handle_tensordesc(launch_fn, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
