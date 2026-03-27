@@ -2128,33 +2128,16 @@ DenseMap<Channel *, Value> createBufferPost(
 //
 // Returns true if the replacement was performed, false if the MMA doesn't have
 // an inline A/B barrier (caller should fall back to creating a commit).
-static bool
-replaceCommitWithBarrierSync(OpBuilderWithAsyncTaskIds &builder,
-                             ttng::TCGen5MMAOp mmaOp, Value dBarrierAlloc,
-                             DenseSet<Operation *> &regionsWithChannels,
-                             ReuseConfig *config) {
-  // The MMA must have at least one inline completion barrier (from the A/B
-  // consumer_release channel processed earlier in program order).
-  auto barriers = mmaOp.getBarriers();
-  if (barriers.empty())
-    return false;
-
-  // The MMA's inline barrier is a MemDescIndexOp result (indexing into the
-  // barrier allocation). We need the underlying allocation (which lives at
-  // function scope, outside the loop) to create new index ops after the loop.
-  Value abBarrierView = barriers.front();
-  auto indexOp = abBarrierView.getDefiningOp<ttg::MemDescIndexOp>();
-  if (!indexOp)
-    return false;
-  Value abBarrierAlloc = indexOp.getSrc();
-
-  // Get A/B numBuffers from the alloc type (first dimension).
-  auto abAllocType = cast<ttg::MemDescType>(abBarrierAlloc.getType());
-  unsigned abNumBuffers = abAllocType.getShape()[0];
+static bool replaceCommitWithBarrierSync(
+    OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
+    Value dBarrierAlloc, int dReuseGroupIdx, Value abBarrierAlloc,
+    unsigned abNumBuffers, int abReuseGroupIdx,
+    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
 
   // Compute the final-iteration buffer index and phase for the A/B barrier.
   auto [abBufIdx, finalPhase] = getOutOfScopeBufferIdxAndPhase(
-      builder, mmaOp, abNumBuffers, regionsWithChannels, config, -1);
+      builder, mmaOp, abNumBuffers, regionsWithChannels, config,
+      abReuseGroupIdx);
 
   auto loc = mmaOp->getLoc();
 
@@ -2183,7 +2166,8 @@ replaceCommitWithBarrierSync(OpBuilderWithAsyncTaskIds &builder,
     dBufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
   } else {
     auto [idx, unused] = getOutOfScopeBufferIdxAndPhase(
-        builder, mmaOp, dNumBuffers, regionsWithChannels, config, -1);
+        builder, mmaOp, dNumBuffers, regionsWithChannels, config,
+        dReuseGroupIdx);
     dBufIdx = idx;
   }
 
@@ -2572,6 +2556,9 @@ void insertAsyncComm(
   };
 
   DenseMap<ttng::TCGen5MMAOp, ttng::WaitBarrierOp> tmemWaitBarriers;
+  // Maps each TCGen5MMAOp to the A/B channel where it is the consumer,
+  // so D-channel processing can look up the correct barrier and reuse group.
+  DenseMap<ttng::TCGen5MMAOp, Channel *> mmaAbChannelMap;
 
   // Postpone TMEM channels until all SMEM channels are processed.
   // TODO: Reorder the channels in channelsGroupedByConsumers in dependency
@@ -3116,11 +3103,41 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
-          // We need to place the commit after the for loop.
-          auto indexedBarrier = getBarrierForPipelineStage(
-              builder, *commChannel.producerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(mmaOp->getLoc(),
-                                                               indexedBarrier);
+          // Only attempt the barrier-sync replacement when there are
+          // multiple MMAs in the loop (data-partitioned case). With a
+          // single MMA the global tcgen05_commit is equivalent and simpler.
+          auto mmaOpCast = cast<ttng::TCGen5MMAOp>(mmaOp);
+          auto parentLoop =
+              nestedInsertionTarget->getParentOfType<scf::ForOp>();
+          unsigned mmaCount = 0;
+          if (parentLoop) {
+            parentLoop->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
+          }
+          auto abIt = mmaAbChannelMap.find(mmaOpCast);
+          bool replaced = false;
+          if (mmaCount > 1 && abIt != mmaAbChannelMap.end()) {
+            Channel *abChannel = abIt->second;
+            auto tokenIt = tokenMap.find(abChannel);
+            assert(tokenIt != tokenMap.end());
+            auto &abCommChannel = tokenIt->second;
+            // Get the consumer barrier allocation for this MMA's task.
+            SmallVector<AsyncTaskId> mmaTaskIds = getAsyncTaskIds(mmaOp);
+            assert(mmaTaskIds.size() == 1);
+            auto barrierIt = abCommChannel.consumerBarriers.find(mmaTaskIds[0]);
+            if (barrierIt != abCommChannel.consumerBarriers.end()) {
+              int abReuseGrp = channelInReuseGroup(abChannel, config);
+              replaced = replaceCommitWithBarrierSync(
+                  builder, mmaOpCast, *commChannel.producerBarrier, reuseGrp,
+                  barrierIt->second, abChannel->getNumBuffers(), abReuseGrp,
+                  regionsWithChannels, config);
+            }
+          }
+          if (!replaced) {
+            auto indexedBarrier = getBarrierForPipelineStage(
+                builder, *commChannel.producerBarrier, bufferIdx);
+            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+                mmaOp->getLoc(), indexedBarrier);
+          }
           builder.clearLoopScheduleInfo();
         }
         // Still call desyncTCGen5MMAOp to handle the consumer.
@@ -3173,6 +3190,12 @@ void insertAsyncComm(
         });
         auto iter = commChannel.consumerBarriers.find(consumerTaskId);
         Value consumerBarrier = iter->second;
+        // Record the A/B channel for this MMA so that D-channel processing
+        // can look up the correct barrier and reuse group index.
+        auto mmaOpCast = cast<ttng::TCGen5MMAOp>(mmaOp);
+        if (!mmaAbChannelMap.count(mmaOpCast)) {
+          mmaAbChannelMap[mmaOpCast] = masterChannel;
+        }
         // Use consumerBarrier as gen5 inline barrier.
         // Correctly set the insertion point for producerAcquire when there is a
         // tma/gen5 channel.
