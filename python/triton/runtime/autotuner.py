@@ -388,6 +388,10 @@ class Config:
         minRegAutoWS=None,
         maxRegAutoWS=None,
         pingpongAutoWS=None,
+        warps_gemm=None,
+        warps_load=None,
+        warps_computation=None,
+        warps_epilogue=None,
         num_buffers_warp_spec=0,
         num_consumer_groups=0,
         reg_dec_producer=0,
@@ -405,6 +409,10 @@ class Config:
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
+        self.warps_gemm = warps_gemm
+        self.warps_load = warps_load
+        self.warps_computation = warps_computation
+        self.warps_epilogue = warps_epilogue
         self.ctas_per_cga = ctas_per_cga
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
 
@@ -419,6 +427,10 @@ class Config:
         self.minRegAutoWS = state.get("minRegAutoWS", None)
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
+        self.warps_gemm = state.get("warps_gemm", None)
+        self.warps_load = state.get("warps_load", None)
+        self.warps_computation = state.get("warps_computation", None)
+        self.warps_epilogue = state.get("warps_epilogue", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
 
@@ -436,6 +448,10 @@ class Config:
                     ("minRegAutoWS", self.minRegAutoWS),
                     ("maxRegAutoWS", self.maxRegAutoWS),
                     ("pingpongAutoWS", self.pingpongAutoWS),
+                    ("warps_gemm", self.warps_gemm),
+                    ("warps_load", self.warps_load),
+                    ("warps_computation", self.warps_computation),
+                    ("warps_epilogue", self.warps_epilogue),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                 ) if v is not None
@@ -453,6 +469,10 @@ class Config:
         res.append(f"minRegAutoWS: {self.minRegAutoWS}")
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
+        res.append(f"warps_gemm: {self.warps_gemm}")
+        res.append(f"warps_load: {self.warps_load}")
+        res.append(f"warps_computation: {self.warps_computation}")
+        res.append(f"warps_epilogue: {self.warps_epilogue}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         return ", ".join(res)
