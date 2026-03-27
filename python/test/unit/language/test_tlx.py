@@ -1600,6 +1600,68 @@ def test_async_remote_shmem_store(num_ctas, device):
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_async_remote_shmem_copy(device):
+    """Test that async_remote_shmem_copy bulk-copies local SMEM to a remote CTA's SMEM."""
+
+    @triton.jit
+    def remote_copy_kernel(
+        input_ptr,
+        output_ptr,
+        N: tl.constexpr,
+    ):
+        # Each CTA allocates: a 1-slot shared memory buffer and 1 mbarrier.
+        smem_buf = tlx.local_alloc((N, ), tl.float32, 1)
+        barriers = tlx.alloc_barriers(num_barriers=1)
+
+        cta_rank = tlx.cluster_cta_rank()
+
+        # CTA 1 (receiver): initialize barrier to expect N float32 bytes.
+        # barrier_expect_bytes also counts as the mbarrier arrive, so no
+        # separate arrive is needed.
+        if cta_rank == 1:
+            tlx.barrier_expect_bytes(barriers[0], N * tlx.size_of(tl.float32))
+
+        # CTA 0 (sender): load from global memory into registers, store to
+        # local SMEM, then bulk-copy that SMEM to CTA 1's SMEM and signal
+        # CTA 1's mbarrier.
+        if cta_rank == 0:
+            offs = tl.arange(0, N)
+            vals = tl.load(input_ptr + offs)
+            tlx.local_store(smem_buf[0], vals)
+            tlx.fence("async_shared")
+            # Copy local buffer to CTA 1
+            tlx.async_remote_shmem_copy(
+                dst=smem_buf[0],
+                src=smem_buf[0],
+                remote_cta_rank=1,
+                barrier=barriers[0],
+            )
+
+        # CTA 1 (receiver): wait for the copy to complete, read SMEM, store
+        # to output.
+        if cta_rank == 1:
+            tlx.barrier_wait(barriers[0], phase=tl.constexpr(0))
+            result = tlx.local_load(smem_buf[0])
+            offs = tl.arange(0, N)
+            tl.store(output_ptr + offs, result)
+
+    N = 1024
+    input_tensor = torch.rand(N, dtype=torch.float32, device=device)
+    output = torch.zeros(N, dtype=torch.float32, device=device)
+
+    kernel = remote_copy_kernel[(2, )](input_tensor, output, N=N, num_warps=1, ctas_per_cga=(2, 1, 1))
+
+    ttgir = kernel.asm["ttgir"]
+    ptx = kernel.asm["ptx"]
+    assert ttgir.count("ttg.async_remote_shmem_copy") == 1
+    assert ptx.count("fence.proxy.async.shared::cta") == 1
+    assert ptx.count("mapa.shared::cluster") == 2
+    assert ptx.count("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes") == 1
+
+    torch.testing.assert_close(output, input_tensor)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_async_dot_blackwell_2cta_tma_ws(device):
     """

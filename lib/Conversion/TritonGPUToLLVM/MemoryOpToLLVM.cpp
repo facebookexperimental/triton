@@ -329,6 +329,65 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+struct AsyncRemoteShmemCopyOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemCopyOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::AsyncRemoteShmemCopyOp>::ConvertOpToLLVMPattern;
+
+  AsyncRemoteShmemCopyOpConversion(const LLVMTypeConverter &converter,
+                                   const TargetInfoBase &targetInfo,
+                                   PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<triton::gpu::AsyncRemoteShmemCopyOp>(converter,
+                                                                    benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::AsyncRemoteShmemCopyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto typeConverter = getTypeConverter();
+
+    // Get src SMEM base pointer.
+    auto srcTy = cast<MemDescType>(op.getSrc().getType());
+    auto llvmElemTy = typeConverter->convertType(srcTy.getElementType());
+    auto srcSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getSrc(), llvmElemTy, rewriter);
+    Value srcPtr = srcSmemObj.getBase();
+
+    // Get dst SMEM base pointer (will be mapa'd to remote CTA).
+    auto dstTy = cast<MemDescType>(op.getDst().getType());
+    auto dstLLVMElemTy = typeConverter->convertType(dstTy.getElementType());
+    auto dstSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getDst(), dstLLVMElemTy, rewriter);
+    Value dstPtr = dstSmemObj.getBase();
+
+    // Get barrier SMEM base pointer (will be mapa'd to remote CTA).
+    auto barrierTy = cast<MemDescType>(op.getBarrier().getType());
+    auto barrierLLVMElemTy =
+        typeConverter->convertType(barrierTy.getElementType());
+    auto barrierSmemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getBarrier(), barrierLLVMElemTy, rewriter);
+    Value barrierPtr = barrierSmemObj.getBase();
+
+    // Compute copy size in bytes from the src MemDesc shape and element type.
+    int64_t numElems = 1;
+    for (auto dim : srcTy.getShape())
+      numElems *= dim;
+    Value sizeBytes =
+        b.i32_val(numElems * llvmElemTy.getIntOrFloatBitWidth() / 8);
+
+    targetInfo.copyBulkSharedToRemoteShared(
+        rewriter, loc, srcPtr, dstPtr, barrierPtr, op.getCtaRank(), sizeBytes);
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 class LocalBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp> {
 public:
@@ -363,5 +422,7 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
                                              benefit);
   patterns.add<AsyncRemoteShmemStoreOpConversion>(typeConverter, targetInfo,
                                                   benefit);
+  patterns.add<AsyncRemoteShmemCopyOpConversion>(typeConverter, targetInfo,
+                                                 benefit);
   patterns.add<LocalBarrierOpConversion>(typeConverter, benefit);
 }

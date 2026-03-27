@@ -368,8 +368,10 @@ private:
         }
       });
       if (hasOpOfAnyTypeInForwardSlice<ttg::RemoteShmemStoreOp,
-                                       ttg::AsyncRemoteShmemStoreOp>(defOp)) {
-        // For RemoteShmemStoreOp and AsyncRemoteShmemStoreOp, ensure that the
+                                       ttg::AsyncRemoteShmemStoreOp,
+                                       ttg::AsyncRemoteShmemCopyOp>(defOp)) {
+        // For RemoteShmemStoreOp and
+        // AsyncRemoteShmemStoreOp/AsyncRemoteShmemCopyOp, ensure that the
         // liveness range of the value covers the entire function. This will
         // prevent reuse of shmem used by remote stores. This will remove the
         // need to add expensive cluster barriers before/after these ops to
