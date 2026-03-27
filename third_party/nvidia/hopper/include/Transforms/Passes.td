@@ -206,6 +206,45 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+def NVGPUAnnotateTMAStoreWaits : Pass<"nvgpu-annotate-tma-store-waits", "mlir::ModuleOp"> {
+  let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
+
+  let description = [{
+    This pass walks `scf.for` loops to find `ttng.async_tma_store_token_wait`
+    ops whose SMEM buffer has a `buffer.copy` attribute (set by the memory
+    planner).  For each such wait, it sets `can_rotate_by_buffer_count = K`
+    where K = buffer.copy - 1, indicating that the wait can be delayed by
+    up to K iterations because K+1 buffer slots are available.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTMAStoreTokenWaitReorder : Pass<"nvgpu-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
+  let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
+
+  let description = [{
+    When a `ttng.async_tma_store_token_wait` op carries the
+    `can_rotate_by_buffer_count` attribute (an integer K representing the
+    number of SMEM buffer copies), this pass uses the software pipeliner's
+    CoarseSchedule to reschedule the wait K positions forward in the
+    linearized pipeline order.
+
+    The pass deserializes the CoarseSchedule from the `scf.for` loop,
+    walks the linearized schedule from the defining TMA store to find the
+    K-th `local_store` to the same buffer, then assigns the wait to a new
+    cluster just before that K-th write's cluster.  This ensures the wait
+    is placed at the correct pipeline stage for buffer reuse without
+    physically moving ops in the IR.
+
+    If the loop has no SWP schedule (no stage/cluster attributes), the
+    pass creates a basic single-stage schedule for the entire loop before
+    attempting the reorder.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
   let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
 
