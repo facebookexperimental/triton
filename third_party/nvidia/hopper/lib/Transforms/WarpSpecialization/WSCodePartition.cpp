@@ -3123,7 +3123,9 @@ void insertAsyncComm(
           }
           auto abIt = mmaAbChannelMap.find(mmaOpCast);
           bool replaced = false;
-          if (mmaCount > 1 && abIt != mmaAbChannelMap.end()) {
+          bool safeCondition = mmaCount > 1 && abIt != mmaAbChannelMap.end();
+          // Disable due to a hang.
+          if (false && safeCondition) {
             Channel *abChannel = abIt->second;
             auto tokenIt = tokenMap.find(abChannel);
             assert(tokenIt != tokenMap.end());
