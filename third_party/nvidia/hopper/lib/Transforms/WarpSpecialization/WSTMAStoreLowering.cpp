@@ -89,10 +89,13 @@ struct NVGPUWSTMAStoreLoweringPass
 };
 
 // ---------------------------------------------------------------------------
-// Reschedule TMA store waits using the SWP CoarseSchedule
+// Annotate TMA store waits with can_rotate_by_buffer_count
 // ---------------------------------------------------------------------------
-#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITREORDER
+#define GEN_PASS_DEF_NVGPUANNOTATETMASTOREWAITS
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+static constexpr const char *kCanRotateByBufferCount =
+    "can_rotate_by_buffer_count";
 
 // Trace the token back to the defining AsyncTMACopyLocalToGlobalOp, handling
 // both direct definitions and loop-carried block arguments.
@@ -126,15 +129,115 @@ static Value getTMAStoreBuffer(ttng::TMAStoreTokenWaitOp waitOp) {
   return nullptr;
 }
 
-static constexpr const char *kCanRotateByBufferCount =
-    "can_rotate_by_buffer_count";
+void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
+  MLIRContext *ctx = funcOp.getContext();
+  funcOp.walk([&](scf::ForOp forOp) {
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+      if (!waitOp)
+        continue;
+
+      auto tmaStore = getDefiningTMAStore(waitOp);
+      if (!tmaStore)
+        continue;
+
+      Value buffer = tmaStore.getSrc();
+      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+      if (!allocOp)
+        continue;
+
+      auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
+      if (!bufferCopy)
+        continue;
+
+      // K = buffer.copy - 1: with N copies, iteration i and i+N share the
+      // same buffer slot. We can delay the wait by at most N-1 iterations.
+      int k = bufferCopy.getInt() - 1;
+      if (k <= 0)
+        continue;
+
+      waitOp->setAttr(kCanRotateByBufferCount,
+                      IntegerAttr::get(IntegerType::get(ctx, 32), k));
+    }
+  });
+}
+
+struct NVGPUAnnotateTMAStoreWaitsPass
+    : public impl::NVGPUAnnotateTMAStoreWaitsBase<
+          NVGPUAnnotateTMAStoreWaitsPass> {
+  void runOnOperation() override {
+    getOperation()->walk(
+        [&](triton::FuncOp funcOp) { doAnnotateTMAStoreWaits(funcOp); });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Validate TMA store annotations against channel reuse groups
+// ---------------------------------------------------------------------------
+
+void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
+  funcOp.walk([&](scf::ForOp forOp) {
+    // Collect all LocalAllocOps grouped by buffer.id in this loop.
+    DenseMap<int, SmallVector<Operation *>> reuseGroups;
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      auto allocOp = dyn_cast<ttg::LocalAllocOp>(&op);
+      if (!allocOp)
+        continue;
+      auto bufferId = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
+      if (!bufferId)
+        continue;
+      reuseGroups[bufferId.getInt()].push_back(allocOp);
+    }
+
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+      if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
+        continue;
+
+      auto tmaStore = getDefiningTMAStore(waitOp);
+      if (!tmaStore) {
+        waitOp->removeAttr(kCanRotateByBufferCount);
+        continue;
+      }
+
+      Value buffer = tmaStore.getSrc();
+      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+      if (!allocOp) {
+        waitOp->removeAttr(kCanRotateByBufferCount);
+        continue;
+      }
+
+      auto bufferId = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
+      if (!bufferId)
+        continue;
+
+      // If the buffer is in a reuse group (shares buffer.id with any other
+      // alloc), the rotation is unsafe — drop the annotation entirely.
+      auto it = reuseGroups.find(bufferId.getInt());
+      if (it != reuseGroups.end() && it->second.size() > 1) {
+        waitOp->removeAttr(kCanRotateByBufferCount);
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Reschedule TMA store waits using the SWP CoarseSchedule
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITREORDER
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
-    // Deserialize the SWP schedule. If there is no schedule, skip this loop.
+    // Deserialize the SWP schedule. If there is no schedule, create a basic
+    // single-stage schedule so the reorder logic can still work.
     tt::CoarseSchedule schedule;
-    if (failed(schedule.deSerialize(forOp)))
-      return;
+    if (failed(schedule.deSerialize(forOp))) {
+      schedule.setNumStages(1);
+      auto cluster = schedule.clusters.newAtBack();
+      for (auto &op : forOp.getBody()->without_terminator())
+        schedule.insert(&op, 0, cluster);
+    }
 
     // Collect annotated TMA store waits.
     SmallVector<ttng::TMAStoreTokenWaitOp> waits;

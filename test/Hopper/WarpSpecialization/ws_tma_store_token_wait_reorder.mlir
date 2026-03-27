@@ -89,10 +89,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-// No SWP schedule on the loop → pass is a no-op, attribute preserved.
-// CHECK-LABEL: no_schedule_no_op
+// No SWP schedule on the loop → pass creates a basic schedule and still
+// reorders. The wait gets placed before the 1st local_store (wrapping around).
+// CHECK-LABEL: no_schedule_creates_basic
+// CHECK: scf.for
+// CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK-NOT: can_rotate_by_buffer_count
+// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+  tt.func public @no_schedule_creates_basic(
+      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %src: tensor<128x64xf16>,
+      %lb: index, %ub: index, %step: index) {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c0 = arith.constant 0 : i32
+    scf.for %iv = %lb to %ub step %step {
+      ttg.local_store %src, %buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok {"can_rotate_by_buffer_count" = 1 : i32} : !ttg.async.token
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Outside a loop → pass doesn't touch it, attribute preserved.
+// CHECK-LABEL: outside_loop_no_op
 // CHECK: can_rotate_by_buffer_count
-  tt.func public @no_schedule_no_op(
+  tt.func public @outside_loop_no_op(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %i: i32) {
