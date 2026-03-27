@@ -3,6 +3,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -88,82 +89,127 @@ struct NVGPUWSTMAStoreLoweringPass
 };
 
 // ---------------------------------------------------------------------------
-// Reorder buffer_ordered TMAStoreTokenWaitOps based on SMEM buffer reuse
+// Reschedule TMA store waits using the SWP CoarseSchedule
 // ---------------------------------------------------------------------------
 #define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITREORDER
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-// For a TMAStoreTokenWaitOp, return the SMEM memdesc that the corresponding
-// TMA store reads from (i.e., the src operand of AsyncTMACopyLocalToGlobalOp).
-static Value getTMAStoreBuffer(ttng::TMAStoreTokenWaitOp waitOp) {
+// Trace the token back to the defining AsyncTMACopyLocalToGlobalOp, handling
+// both direct definitions and loop-carried block arguments.
+static ttng::AsyncTMACopyLocalToGlobalOp
+getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
   Value token = waitOp.getToken();
-  if (auto copyOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
-    return copyOp.getSrc();
+
+  // Direct case: token defined by AsyncTMACopyLocalToGlobalOp.
+  if (auto defOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>())
+    return defOp;
+
+  // Loop-carried case: token is a block argument of an scf.for body.
+  if (auto blockArg = dyn_cast<BlockArgument>(token)) {
+    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+    if (!forOp)
+      return nullptr;
+    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
+    return yieldedVal.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>();
   }
+
   return nullptr;
 }
 
-// Find the K-th write to `buffer` after `start` in the same block. With K
-// buffer copies the same index repeats every K writes, so we skip K-1 writes
-// and return the K-th. Returns nullptr if fewer than K writes exist.
-static Operation *findKthBufferWrite(Operation *start, Value buffer, int k) {
-  int count = 0;
-  for (auto it = std::next(start->getIterator()),
-            end = start->getBlock()->end();
-       it != end; ++it) {
-    // Only count ops that WRITE to the buffer (e.g., local_store).
-    // Reads (e.g., async_tma_copy_local_to_global) don't conflict.
-    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(&*it)) {
-      if (storeOp.getDst() == buffer) {
-        if (++count == k)
-          return &*it;
-      }
-    }
-  }
+// For a TMAStoreTokenWaitOp, return the SMEM memdesc that the corresponding
+// TMA store reads from (i.e., the src operand of AsyncTMACopyLocalToGlobalOp).
+static Value getTMAStoreBuffer(ttng::TMAStoreTokenWaitOp waitOp) {
+  if (auto tmaStore = getDefiningTMAStore(waitOp))
+    return tmaStore.getSrc();
   return nullptr;
+}
+
+static constexpr const char *kCanRotateByBufferCount =
+    "can_rotate_by_buffer_count";
+
+void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
+  funcOp.walk([&](scf::ForOp forOp) {
+    // Deserialize the SWP schedule. If there is no schedule, skip this loop.
+    tt::CoarseSchedule schedule;
+    if (failed(schedule.deSerialize(forOp)))
+      return;
+
+    // Collect annotated TMA store waits.
+    SmallVector<ttng::TMAStoreTokenWaitOp> waits;
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+      if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
+        continue;
+      waits.push_back(waitOp);
+    }
+    if (waits.empty())
+      return;
+
+    bool changed = false;
+    for (auto waitOp : waits) {
+      Value buffer = getTMAStoreBuffer(waitOp);
+      if (!buffer)
+        continue;
+
+      auto attr = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
+      if (!attr)
+        continue;
+      int k = attr.getInt();
+
+      // Find the defining TMA store op.
+      auto tmaStore = getDefiningTMAStore(waitOp);
+      if (!tmaStore)
+        continue;
+
+      // The defining op must be in the schedule for the LinearizedIterator.
+      if (!schedule.count(tmaStore))
+        continue;
+
+      // Walk the linearized schedule from the TMA store, counting local_store
+      // ops to the same buffer. Stop at the K-th one.
+      auto it = schedule.linearized(forOp, tmaStore);
+      int count = 0;
+      Operation *kthWrite = nullptr;
+      while (auto op = it.findNext([&](Operation *op) {
+        auto storeOp = dyn_cast<ttg::LocalStoreOp>(op);
+        return storeOp && storeOp.getDst() == buffer;
+      })) {
+        if (++count == k) {
+          kthWrite = *op;
+          break;
+        }
+      }
+
+      if (kthWrite) {
+        // Place the wait in a new cluster just before the K-th write's cluster
+        // at the same stage. The cluster ordering ensures the wait executes
+        // before the write within that pipeline time slot.
+        auto [targetStage, targetCluster] = schedule[kthWrite];
+        auto newCluster = schedule.clusters.newBefore(targetCluster);
+        schedule.insert(waitOp, targetStage, newCluster);
+      } else {
+        // Fallback: place at the last stage in a new cluster at the back.
+        auto lastCluster = schedule.clusters.newAtBack();
+        schedule.insert(waitOp, schedule.getNumStages() - 1, lastCluster);
+      }
+
+      waitOp->removeAttr(kCanRotateByBufferCount);
+      changed = true;
+    }
+
+    if (changed)
+      schedule.serialize(forOp);
+  });
 }
 
 struct NVGPUTMAStoreTokenWaitReorderPass
     : public impl::NVGPUTMAStoreTokenWaitReorderBase<
           NVGPUTMAStoreTokenWaitReorderPass> {
   void runOnOperation() override {
-    getOperation()->walk([&](Block *block) {
-      // Collect buffer_ordered waits in block order.
-      SmallVector<ttng::TMAStoreTokenWaitOp> waits;
-      for (auto &op : *block) {
-        auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
-        if (!waitOp || !waitOp->hasAttr("buffer_ordered"))
-          continue;
-        waits.push_back(waitOp);
-      }
-      if (waits.empty())
-        return;
-
-      for (auto waitOp : waits) {
-        Value buffer = getTMAStoreBuffer(waitOp);
-        if (!buffer)
-          continue;
-
-        // buffer_ordered = K means there are K buffer copies. The same index
-        // repeats every K uses, so we move the wait to just before the K-th
-        // subsequent use of the buffer (after K-1 intervening uses).
-        auto attr = waitOp->getAttrOfType<IntegerAttr>("buffer_ordered");
-        if (!attr)
-          continue;
-        int k = attr.getInt();
-
-        Operation *kthWrite = findKthBufferWrite(waitOp, buffer, k);
-        if (kthWrite) {
-          waitOp->moveBefore(kthWrite);
-        } else {
-          // Fewer than K subsequent uses — sink to just before the terminator.
-          waitOp->moveBefore(block->getTerminator());
-        }
-
-        // Remove the attribute after processing.
-        waitOp->removeAttr("buffer_ordered");
-      }
-    });
+    getOperation()->walk(
+        [&](triton::FuncOp funcOp) { doTMAStoreWaitReorder(funcOp); });
   }
 };
 

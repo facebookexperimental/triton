@@ -207,17 +207,24 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
 }
 
 def NVGPUTMAStoreTokenWaitReorder : Pass<"nvgpu-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
-  let summary = "Reorder buffer_ordered TMAStoreTokenWaitOps based on SMEM buffer reuse";
+  let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
 
   let description = [{
-    When a `ttng.async_tma_store_token_wait` op carries the `buffer_ordered`
-    attribute, this pass sinks it to just before the next use of the same SMEM
-    buffer (the memdesc read by the corresponding `async_tma_copy_local_to_global`).
-    If no subsequent use exists in the block, the wait is moved to just before
-    the block terminator.
+    When a `ttng.async_tma_store_token_wait` op carries the
+    `can_rotate_by_buffer_count` attribute (an integer K representing the
+    number of SMEM buffer copies), this pass uses the software pipeliner's
+    CoarseSchedule to reschedule the wait K positions forward in the
+    linearized pipeline order.
 
-    The `buffer_ordered` attribute is applied by upstream channel analysis when
-    it can prove that buffer reuse is the only ordering constraint on the wait.
+    The pass deserializes the CoarseSchedule from the `scf.for` loop,
+    walks the linearized schedule from the defining TMA store to find the
+    K-th `local_store` to the same buffer, then assigns the wait to a new
+    cluster just before that K-th write's cluster.  This ensures the wait
+    is placed at the correct pipeline stage for buffer reuse without
+    physically moving ops in the IR.
+
+    If the loop has no SWP schedule (no stage/cluster attributes), the
+    pass skips that loop.
   }];
 
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
