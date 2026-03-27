@@ -586,14 +586,18 @@ struct ConvertWarpSpecializeToLLVM
     // make sure all warps execute it. Note: we put this piece of code here to
     // make sure it's executed right after WS lowering, but it's not part of WS
     // lowering, so without WS ops this piece should still execute
-    if (tlx::tlxEnablePairedMMA(mod)) {
+    const SmallVector<int> clusterDims =
+        triton::gpu::TritonGPUDialect::getClusterDims(mod);
+    int clusterSize = 1;
+    for (int d : clusterDims)
+      clusterSize *= d;
+    if (clusterSize > 1) {
       for (LLVM::LLVMFuncOp kernel : kernels) {
         kernel.walk([&](LLVM::ReturnOp ret) {
           auto ctx = ret->getContext();
           auto loc = ret.getLoc();
           IRRewriter rewriter(kernel.getContext());
 
-          // for 2cta, this is needed
           // "When the current CTA issues the operation, the peer CTA should be
           // active and should not have exited."
           auto unitAttr = UnitAttr::get(ctx);
