@@ -172,23 +172,11 @@ struct NVGPUAnnotateTMAStoreWaitsPass
 };
 
 // ---------------------------------------------------------------------------
-// Validate TMA store annotations against channel reuse groups
+// Validate TMA store annotations (safety checks)
 // ---------------------------------------------------------------------------
 
 void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
-    // Collect all LocalAllocOps grouped by buffer.id in this loop.
-    DenseMap<int, SmallVector<Operation *>> reuseGroups;
-    for (auto &op : forOp.getBody()->without_terminator()) {
-      auto allocOp = dyn_cast<ttg::LocalAllocOp>(&op);
-      if (!allocOp)
-        continue;
-      auto bufferId = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
-      if (!bufferId)
-        continue;
-      reuseGroups[bufferId.getInt()].push_back(allocOp);
-    }
-
     for (auto &op : forOp.getBody()->without_terminator()) {
       auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
       if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
@@ -205,17 +193,6 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
       if (!allocOp) {
         waitOp->removeAttr(kCanRotateByBufferCount);
         continue;
-      }
-
-      auto bufferId = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
-      if (!bufferId)
-        continue;
-
-      // If the buffer is in a reuse group (shares buffer.id with any other
-      // alloc), the rotation is unsafe — drop the annotation entirely.
-      auto it = reuseGroups.find(bufferId.getInt());
-      if (it != reuseGroups.end() && it->second.size() > 1) {
-        waitOp->removeAttr(kCanRotateByBufferCount);
       }
     }
   });

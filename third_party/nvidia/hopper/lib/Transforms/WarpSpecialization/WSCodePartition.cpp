@@ -3352,8 +3352,13 @@ void insertAsyncComm(
       // Since lowering does phase^1, we pass phase^1 here so the double-XOR
       // yields the correct wait phase.
       if (earlyChannelForReuseSync) {
+        llvm::errs() << "DEBUG: earlyChannelForReuseSync set for late channel "
+                     << masterChannel->uniqID << " -> early channel "
+                     << earlyChannelForReuseSync->uniqID << "\n";
         auto earlyTokenIt = tokenMap.find(earlyChannelForReuseSync);
         if (earlyTokenIt != tokenMap.end()) {
+          llvm::errs()
+              << "DEBUG: found early token in tokenMap, inserting reuse sync\n";
           for (const auto &earlyToken : earlyTokenIt->second.tokens) {
             builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
             builder.setInsertionPoint(headProducer);
