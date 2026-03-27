@@ -235,6 +235,26 @@ qk_storage_alias.set_buffer_overlap(
    # Store to remote CTA's shared memory
    tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
    ```
+- `tlx.remote_shmem_copy(dst, src, remote_cta_rank)`
+
+  Store a local shared memory buffer into a buffer in the remote shared memory of a cluster asynchronously.
+
+  **Parameters:**
+  - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
+  - `src`: The source distributed tensor to store
+  - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
+  - `barrier`: mbarrier to signal when the store completes (will be internally mapped to the remote CTA)
+
+  **Example:**
+  ```python
+  # Allocate shared memory buffer
+  buffer0 = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+  buffer1 = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+  barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+
+  # Copy to remote CTA's shared memory
+  tlx.remote_shmem_store(buffer0[0], buffer1[0], remote_cta_rank=1, barrier=barrier[0])
+  ```
 
 - `desc_ptrs = tlx.allocate_tensor_descriptor(num)`
 

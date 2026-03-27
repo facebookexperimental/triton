@@ -437,6 +437,30 @@ def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
   }];
 }
 
+def TTG_AsyncRemoteShmemCopyOp : TTG_Op<"async_remote_shmem_copy"> {
+  let summary = "Copy a local shared memory buffer to remote shared memory with barrier completion";
+  let description = [{
+    Copy a local shared memory buffer to a buffer in the remote shared memory of a cluster CTA,
+    and notify an mbarrier in the remote CTA when the copy completes.
+    Uses PTX instruction: cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes
+
+    `$ctaRank` refers to the unique CTA id in a cluster across all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
+    will be 0~7.
+    `$barrier` is an mbarrier in local shared memory whose address will be mapa'd to the remote CTA's shared memory
+    to signal completion of the copy.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
+    I32:$ctaRank,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier
+  );
+  let hasVerifier = 0;
+  let assemblyFormat = [{
+    $src `,` `rank` $ctaRank `,` $dst `barrier` $barrier attr-dict `:` qualified(type($src)) `->` qualified(type($dst)) `barrier_ty` qualified(type($barrier))
+  }];
+}
+
 def TTG_PredicateStageOp: TTG_Op<"predicate_stage",
                                 [Pure, AllTypesMatch<["iv", "ub", "step"]>]> {
   let summary = "pipeliner stage predicate";

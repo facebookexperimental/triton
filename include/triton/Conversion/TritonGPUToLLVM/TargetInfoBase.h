@@ -106,6 +106,16 @@ public:
                                      Operation *llLoadOp) const {}
 
   virtual ~TargetInfoBase() {}
+
+  // Bulk-copy a local SMEM buffer to remote SMEM in a cluster CTA and signal
+  // the remote CTA's mbarrier on completion.
+  virtual void copyBulkSharedToRemoteShared(RewriterBase &rewriter,
+                                            Location loc, Value srcPtr,
+                                            Value dstPtr, Value barrierPtr,
+                                            Value ctaId, Value size) const {
+    llvm_unreachable(
+        "copyBulkSharedToRemoteShared not supported on this target");
+  }
 };
 } // namespace mlir::triton
 #endif // TRITON_CONVERSION_TRITONGPU_TO_LLVM_TARGETINFOBASE_H
