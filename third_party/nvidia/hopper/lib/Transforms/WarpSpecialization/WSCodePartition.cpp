@@ -2957,7 +2957,15 @@ void insertAsyncComm(
         bool allSingleCopy = llvm::all_of(group->channels, [](Channel *ch) {
           return ch->getNumBuffers() == 1;
         });
-        if (allSingleCopy) {
+        // All source ops must be in the same block to establish program order.
+        bool allSameBlock = true;
+        if (allSingleCopy && group->channels.size() > 1) {
+          auto *refBlock = group->channels.front()->getSrcOp()->getBlock();
+          allSameBlock = llvm::all_of(group->channels, [refBlock](Channel *ch) {
+            return ch->getSrcOp()->getBlock() == refBlock;
+          });
+        }
+        if (allSingleCopy && allSameBlock) {
           // Order channels by producer program order.
           SmallVector<Channel *> ordered(group->channels.begin(),
                                          group->channels.end());
