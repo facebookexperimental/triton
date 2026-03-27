@@ -389,6 +389,7 @@ class Config:
         reg_dec_producer=0,
         reg_inc_consumer=0,
         ctas_per_cga=None,
+        early_tma_store_lowering=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -401,6 +402,7 @@ class Config:
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
+        self.early_tma_store_lowering = early_tma_store_lowering
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -414,6 +416,7 @@ class Config:
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
+        self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
 
     def all_kwargs(self):
         return {
@@ -430,6 +433,7 @@ class Config:
                     ("maxRegAutoWS", self.maxRegAutoWS),
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
+                    ("early_tma_store_lowering", self.early_tma_store_lowering),
                 ) if v is not None
             },
         }
@@ -446,6 +450,7 @@ class Config:
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
+        res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
         return ", ".join(res)
 
     def __hash__(self):
