@@ -12,6 +12,12 @@ void peelLoopEpilogue(
     function_ref<Operation *(RewriterBase &, Operation *, bool)>
         processPeeledOp = nullptr);
 
+// Peel the single first iteration of the loop into a prologue.
+// The peeled iteration executes before the loop with iv = lowerBound.
+// The loop's lower bound is adjusted to lowerBound + step, and its
+// init args are replaced with the yielded values of the peeled iteration.
+void peelLoopPrologue(scf::ForOp forOp);
+
 } // namespace triton
 } // namespace mlir
 

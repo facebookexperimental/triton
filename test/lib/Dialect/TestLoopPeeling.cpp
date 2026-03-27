@@ -9,6 +9,10 @@ bool getPeelEpilogue(scf::ForOp forOp) {
   return forOp->hasAttr("__test_peel_epilogue");
 }
 
+bool getPeelPrologue(scf::ForOp forOp) {
+  return forOp->hasAttr("__test_peel_prologue");
+}
+
 struct TestLoopPeelingPass
     : public PassWrapper<TestLoopPeelingPass, OperationPass<ModuleOp>> {
 
@@ -24,6 +28,9 @@ struct TestLoopPeelingPass
     getOperation().walk([&](scf::ForOp forOp) {
       if (getPeelEpilogue(forOp)) {
         mlir::triton::peelLoopEpilogue(forOp);
+      }
+      if (getPeelPrologue(forOp)) {
+        mlir::triton::peelLoopPrologue(forOp);
       }
     });
   }

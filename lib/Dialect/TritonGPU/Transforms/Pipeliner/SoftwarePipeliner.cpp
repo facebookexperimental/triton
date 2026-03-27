@@ -60,6 +60,23 @@ static bool hasMMAv5WaitsInLastStage(scf::ForOp forOp,
   return hasMMAv5 && hasWaitInLastStage;
 }
 
+// Check if a loop is a load partition inner loop suitable for prologue
+// peeling. It must: (1) be inside a WarpSpecializeOp, (2) contain TMA loads
+// in its direct body, and (3) not contain nested scf.for loops.
+static bool isLoadPartitionInnerLoop(scf::ForOp forOp) {
+  if (!forOp->getParentOfType<triton::gpu::WarpSpecializeOp>())
+    return false;
+  bool hasTMALoad = false;
+  bool hasNestedLoop = false;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op))
+      hasTMALoad = true;
+    if (isa<scf::ForOp>(op))
+      hasNestedLoop = true;
+  }
+  return hasTMALoad && !hasNestedLoop;
+}
+
 static void expandLoops(ModuleOp moduleOp) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
@@ -105,8 +122,13 @@ static void expandLoops(ModuleOp moduleOp) {
     if (failed(schedule.deSerialize(forOp))) {
       continue;
     }
-    // Skip pipelining when we have a single stage.
+    // Skip pipelining when we have a single stage, but peel the first
+    // iteration for load partition inner loops to overlap initial loads
+    // with the MMA partition's prologue.
     if (metaWS && schedule.getNumStages() == 1) {
+      if (isLoadPartitionInnerLoop(forOp)) {
+        mlir::triton::peelLoopPrologue(forOp);
+      }
       continue;
     }
 
