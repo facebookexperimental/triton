@@ -1033,7 +1033,7 @@ configs_bwd_tlx = [
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
             "NUM_BUFFERS_KV": 1,
-            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_Q": 1,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
@@ -1044,7 +1044,7 @@ configs_bwd_tlx = [
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
         ctas_per_cga=(cta, 1, 1),
-    ) for uwb in [False] for cta in [2]
+    ) for uwb in [False] for cta in [1]
 ]
 
 
@@ -1131,7 +1131,6 @@ def _bwd_compute_inner_loop(
                 tlx.barrier_arrive(dp_empties[tmem_buf_id])
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(q_out_dtype)
-        # tl.device_print("dsT", dsT)
         # 2-CTA: exchange half of dS with peer, then overwrite ds_tiles
         # so it contains mixed dS: own half + peer's half.
         # CTA 0 sends dsT[:, 0:M/2], CTA 1 sends dsT[:, M/2:M].
@@ -1227,7 +1226,7 @@ def _attn_bwd_ws(
     NUM_CTAS: tl.constexpr = 1,
 ):
     # Kernel hangs if NUM_BUFFERS_Q != 2.
-    tl.static_assert(NUM_BUFFERS_Q == 2)
+    # tl.static_assert(NUM_BUFFERS_Q == 2)
     # Runtime error if NUM_BUFFERS_DO != 1
     tl.static_assert(NUM_BUFFERS_DO == 1)
 
@@ -1349,21 +1348,18 @@ def _attn_bwd_ws(
         kt_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
 
         # qt_tiles: [BLOCK_M1//NUM_CTAS, HEAD_DIM] — for dots 1,2 (transposed B, split along M)
-        # Reuses q_tiles storage (same total bytes: M*D/2*bufs == M/2*D*bufs).
+        # Single-buffered to save SMEM (no pipeline conflict since qt is consumed before reload).
         qt_tiles = tlx.local_alloc(
             (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
             tlx.dtype_of(desc_q),
             NUM_BUFFERS_Q,
-            reuse=q_tiles,
         )
 
         # dot_tiles: [BLOCK_M1//NUM_CTAS, HEAD_DIM] — for dots 1,2 (loaded row-major, transposed via local_trans)
-        # Reuses do_tiles storage.
         dot_tiles = tlx.local_alloc(
             (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
             tlx.dtype_of(desc_do),
             NUM_BUFFERS_DO,
-            reuse=do_tiles,
         )
 
         kt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
@@ -1677,28 +1673,9 @@ def _attn_bwd_ws(
                     # -----------------------------------------------------------
                     tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
                     for j in range(1, num_steps):
-                        q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-                        # Dot 1: qkT = tl.dot(k, qT)
-                        if USE_2CTA:
-                            tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
-                        else:
-                            tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
-                        tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
-                        if USE_2CTA:
-                            qT = tlx.local_trans(qt_tiles[q_buf_id])
-                        else:
-                            qT = tlx.local_trans(q_tiles[q_buf_id])
-                        tlx.async_dot(
-                            k_tiles[kv_buf_id],
-                            qT,
-                            qk_tiles[tmem_buf_id],
-                            use_acc=False,
-                            mBarriers=[qk_fulls[tmem_buf_id], qt_empties[q_buf_id]]
-                            if USE_2CTA else [qk_fulls[tmem_buf_id]],
-                            two_ctas=USE_2CTA,
-                        )
-
+                        # Dots 4,5 from previous iteration come first so that
+                        # Dot 5 frees q_empties before Load refills the buffer
+                        # (required for NUM_BUFFERS_Q=1).
                         prev_blk_idx = blk_idx - 1
                         q_buf_id_prev, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
                         tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
@@ -1734,6 +1711,28 @@ def _attn_bwd_ws(
                             dk_tiles[kv_buf_id],
                             use_acc=(j - 1) > 0,
                             mBarriers=[q_empties[q_buf_id_prev]],
+                            two_ctas=USE_2CTA,
+                        )
+
+                        q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
+                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+                        # Dot 1: qkT = tl.dot(k, qT)
+                        if USE_2CTA:
+                            tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
+                        else:
+                            tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
+                        tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
+                        if USE_2CTA:
+                            qT = tlx.local_trans(qt_tiles[q_buf_id])
+                        else:
+                            qT = tlx.local_trans(q_tiles[q_buf_id])
+                        tlx.async_dot(
+                            k_tiles[kv_buf_id],
+                            qT,
+                            qk_tiles[tmem_buf_id],
+                            use_acc=False,
+                            mBarriers=[qk_fulls[tmem_buf_id], qt_empties[q_buf_id]]
+                            if USE_2CTA else [qk_fulls[tmem_buf_id]],
                             two_ctas=USE_2CTA,
                         )
 
@@ -2178,7 +2177,7 @@ class _attention(torch.autograd.Function):
             )
 
         stage = 3 if ctx.causal else 1
-        EPILOGUE_SUBTILE = 4 if ctx.BWD_BLOCK_M1 == 128 and ctx.HEAD_DIM == 128 else 2
+        EPILOGUE_SUBTILE = 8 if ctx.BWD_BLOCK_M1 == 128 and ctx.HEAD_DIM == 128 else 2
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             M, delta,  #
