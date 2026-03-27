@@ -74,15 +74,22 @@ static std::optional<int64_t> extractConstantInt(mlir::Value v) {
 static TritonPluginResult
 createLocalAllocSmem(const char *handle, TritonOpBuilder &self,
                      std::vector<mlir::Value> &operands) {
-  if (operands.size() < 4) // result + type_carrier + at least 2 shape dims
+  // result + type_carrier + at least 2 shape dims + target_hint
+  if (operands.size() < 5)
     return TP_GENERIC_FAILURE;
 
   // Extract element type from the type-carrier value
   mlir::Type elemType = operands[1].getType();
 
-  // Extract full shape from remaining operands
+  // Last operand is target hint: 1 = AMD, 0 = NVIDIA
+  auto targetHintVal = extractConstantInt(operands.back());
+  if (!targetHintVal)
+    return TP_GENERIC_FAILURE;
+  bool isAMD = *targetHintVal == 1;
+
+  // Extract full shape from operands[2..N-1] (excluding last target hint)
   llvm::SmallVector<int64_t> fullShape;
-  for (unsigned i = 2; i < operands.size(); ++i) {
+  for (unsigned i = 2; i < operands.size() - 1; ++i) {
     auto dimVal = extractConstantInt(operands[i]);
     if (!dimVal)
       return TP_GENERIC_FAILURE;
@@ -96,18 +103,19 @@ createLocalAllocSmem(const char *handle, TritonOpBuilder &self,
   // Create default CGA layout (single CTA)
   auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(context, perBufferRank);
 
-  // Construct the shared memory encoding based on per-buffer rank
+  // Construct the shared memory encoding based on per-buffer rank and target
   mlir::Attribute encoding;
-  if (perBufferRank == 1) {
-    // 1D: SwizzledSharedEncoding with default params
+  if (perBufferRank == 1 || isAMD) {
+    // 1D or AMD: SwizzledSharedEncoding with default params.
+    // AMD always uses SwizzledShared; the correct encoding for dot operands
+    // is set later by the TLXInsertAndPropagateLayout pass.
     llvm::SmallVector<unsigned> order;
     for (int i = perBufferRank - 1; i >= 0; --i)
       order.push_back(static_cast<unsigned>(i));
     encoding = ttg::SwizzledSharedEncodingAttr::get(
         context, /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
   } else {
-    // 2D+: NVMMASharedEncoding using shape-based builder
-    // Extract per-buffer shape (skip the leading num dimension)
+    // NVIDIA 2D+: NVMMASharedEncoding using shape-based builder
     llvm::SmallVector<int64_t> perBufferShape(fullShape.begin() + 1,
                                               fullShape.end());
     llvm::SmallVector<unsigned> order;

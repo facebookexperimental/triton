@@ -88,13 +88,19 @@ def local_alloc(
     # Create i32 constants for each dimension of the full shape
     shape_values = [_semantic.builder.get_int32(int(dim)) for dim in full_shape]
 
-    # Call the composite custom op: tlx_local_alloc(type_carrier, *shape_dims)
-    # This creates the encoding attribute and LocalAllocOp internally.
-    args = [type_carrier] + shape_values
+    # Detect AMD target to select the correct SMEM encoding
+    arch = getattr(getattr(_semantic.builder, 'options', None), 'arch', '')
+    is_amd = isinstance(arch, str) and arch.startswith('gfx')
+
+    # Target hint: 1 = AMD (use SwizzledShared), 0 = NVIDIA (use NVMMAShared)
+    target_hint = _semantic.builder.get_int32(1 if is_amd else 0)
+
+    # Call the composite custom op: tlx_local_alloc(type_carrier, *shape_dims, target_hint)
+    args = [type_carrier] + shape_values + [target_hint]
     tensor_handle = _semantic.builder.tlx_local_alloc(args)
 
     # Construct the Python-level layout object for metadata tracking
-    if len(unwrapped_shape) == 1:
+    if len(unwrapped_shape) == 1 or is_amd:
         py_layout = tlx.swizzled_shared_layout_encoding.make_default(
             rank=len(unwrapped_shape)
         )

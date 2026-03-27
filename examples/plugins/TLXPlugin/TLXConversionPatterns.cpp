@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 // Includes from TritonToTritonGPUPass.cpp
 // ---------------------------------------------------------------------------
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -924,6 +925,85 @@ private:
   std::string target;
 };
 
+// ===========================================================================
+// TLXInsertAndPropagateLayout — combined InsertRequireLayout + PropagateLayout
+//
+// After accelerate_matmul assigns DotOperandEncodingAttr to dot inputs,
+// this pass finds LocalLoadOps feeding DotOps and updates their source
+// MemDesc encodings to match what the dots require, propagating backward
+// through the MemDesc def chain (MemDescIndexOp → LocalAllocOp).
+// ===========================================================================
+
+class TLXInsertAndPropagateLayout
+    : public PassWrapper<TLXInsertAndPropagateLayout,
+                          OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TLXInsertAndPropagateLayout)
+
+  StringRef getArgument() const override {
+    return "tlx-insert-and-propagate-layout";
+  }
+
+  StringRef getDescription() const override {
+    return "Updates MemDesc shared encodings to match DotOp operand "
+           "requirements (combined InsertRequireLayout + PropagateLayout)";
+  }
+
+  void propagateEncodingBackward(Value memDesc, Attribute targetEncoding,
+                                  DenseSet<Value> &visited) {
+    if (!visited.insert(memDesc).second)
+      return;
+
+    auto memDescType = dyn_cast<triton::gpu::MemDescType>(memDesc.getType());
+    if (!memDescType)
+      return;
+
+    auto newType = triton::gpu::MemDescType::get(
+        memDescType.getShape(), memDescType.getElementType(), targetEncoding,
+        memDescType.getMemorySpace(), memDescType.getMutableMemory());
+    memDesc.setType(newType);
+
+    if (auto defOp = memDesc.getDefiningOp()) {
+      for (auto operand : defOp->getOperands()) {
+        if (isa<triton::gpu::MemDescType>(operand.getType()))
+          propagateEncodingBackward(operand, targetEncoding, visited);
+      }
+    }
+  }
+
+  void runOnOperation() override {
+    ModuleOp mod = getOperation();
+
+    mod.walk([&](triton::DotOp dotOp) {
+      SetVector<Operation *> backwardSet;
+      BackwardSliceOptions options;
+      options.inclusive = false;
+      options.omitUsesFromAbove = false;
+      if (failed(
+              getBackwardSlice(dotOp.getOperation(), &backwardSet, options)))
+        return WalkResult::interrupt();
+
+      for (Operation *op : backwardSet) {
+        auto localLoadOp = dyn_cast<triton::gpu::LocalLoadOp>(op);
+        if (!localLoadOp)
+          continue;
+
+        bool incompatible = false;
+        auto encoding = getSharedEncIfAllUsersAreDotEnc(
+                            localLoadOp->getResult(0), incompatible)
+                            .value_or(nullptr);
+        if (!encoding)
+          continue;
+
+        DenseSet<Value> visited;
+        propagateEncodingBackward(localLoadOp->getOperand(0),
+                                  cast<Attribute>(encoding), visited);
+      }
+      return WalkResult::advance();
+    });
+  }
+};
+
 } // namespace
 
 static std::unique_ptr<Pass>
@@ -931,6 +1011,10 @@ createTLXConvertTritonToTritonGPUPass(int numWarps, int threadsPerWarp,
                                       int numCTAs, llvm::StringRef target) {
   return std::make_unique<TLXConvertTritonToTritonGPU>(numWarps, threadsPerWarp,
                                                        numCTAs, target);
+}
+
+static std::unique_ptr<Pass> createTLXInsertAndPropagateLayoutPass() {
+  return std::make_unique<TLXInsertAndPropagateLayout>();
 }
 
 // ===========================================================================
@@ -956,14 +1040,31 @@ static void registerTLXPass() {
   });
 }
 
+static void addTLXInsertAndPropagatePass(mlir::PassManager *pm,
+                                          const std::vector<std::string> &) {
+  pm->addPass(createTLXInsertAndPropagateLayoutPass());
+}
+
+static void registerTLXInsertAndPropagatePass() {
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createTLXInsertAndPropagateLayoutPass();
+  });
+}
+
 static const char *TLX_PASS_NAME = "tlx_convert_triton_to_tritongpu";
+static const char *TLX_LAYOUT_PASS_NAME = "tlx_insert_and_propagate_layout";
 
 static std::unordered_map<std::string, decltype(&addTLXPass)> passMap = {
     {TLX_PASS_NAME, addTLXPass},
+    {TLX_LAYOUT_PASS_NAME, addTLXInsertAndPropagatePass},
 };
 static std::unordered_map<std::string, decltype(&registerTLXPass)>
-    registryMap = {{TLX_PASS_NAME, registerTLXPass}};
-static std::vector<const char *> passNamesTable = {TLX_PASS_NAME};
+    registryMap = {
+        {TLX_PASS_NAME, registerTLXPass},
+        {TLX_LAYOUT_PASS_NAME, registerTLXInsertAndPropagatePass},
+};
+static std::vector<const char *> passNamesTable = {TLX_PASS_NAME,
+                                                    TLX_LAYOUT_PASS_NAME};
 
 TRITON_PLUGIN_API
 tritonEnumeratePluginPasses(uint32_t *passCount, const char **passNames) {
