@@ -359,7 +359,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
-        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -411,6 +410,7 @@ def test_tutorial09_matmul_tma_warp_specialize(
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
         )
 
         # Verify IR contains warp_specialize
@@ -503,7 +503,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
-        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -567,6 +566,7 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
         )
 
         # Verify IR contains expected ops
@@ -641,7 +641,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
-        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -689,6 +688,7 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
         )
 
         # Verify IR contains expected ops
@@ -724,7 +724,6 @@ def test_tutorial09_multi_epilogue_subtile():
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
-        triton.knobs.nvidia.use_early_tma_store_lowering = True
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -775,6 +774,7 @@ def test_tutorial09_multi_epilogue_subtile():
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
+            early_tma_store_lowering=True,
         )
 
         # Verify warp specialization actually ran (ttg.warp_return is only

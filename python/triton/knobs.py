@@ -544,7 +544,6 @@ class nvidia_knobs(base_knobs):
     # Force OAI SWP schedule even when using Meta's WS implementation.
     force_trunk_swp_schedule: env_bool = env_bool("TRITON_FORCE_TRUNK_SWP_SCHEDULE")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
-    use_early_tma_store_lowering: env_bool = env_bool("TRITON_USE_EARLY_TMA_STORE_LOWERING")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
 
 

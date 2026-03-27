@@ -82,8 +82,10 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 struct NVGPUWSTMAStoreLoweringPass
     : public impl::NVGPUWSTMAStoreLoweringBase<NVGPUWSTMAStoreLoweringPass> {
   void runOnOperation() override {
-    getOperation()->walk(
-        [&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
+    auto mod = getOperation();
+    if (!mod->hasAttr("ttg.early_tma_store_lowering"))
+      return;
+    mod->walk([&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
   }
 };
 
