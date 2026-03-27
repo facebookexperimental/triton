@@ -3103,10 +3103,19 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
           builder.setAsyncTaskIdsFromOp(mmaOp);
+          // Only attempt the barrier-sync replacement when there are
+          // multiple MMAs in the loop (data-partitioned case). With a
+          // single MMA the global tcgen05_commit is equivalent and simpler.
           auto mmaOpCast = cast<ttng::TCGen5MMAOp>(mmaOp);
+          auto *parentLoop =
+              nestedInsertionTarget->getParentOfType<scf::ForOp>();
+          unsigned mmaCount = 0;
+          if (parentLoop) {
+            parentLoop->walk([&](ttng::TCGen5MMAOp) { ++mmaCount; });
+          }
           auto abIt = mmaAbChannelMap.find(mmaOpCast);
           bool replaced = false;
-          if (abIt != mmaAbChannelMap.end()) {
+          if (mmaCount > 1 && abIt != mmaAbChannelMap.end()) {
             Channel *abChannel = abIt->second;
             auto tokenIt = tokenMap.find(abChannel);
             assert(tokenIt != tokenMap.end());
