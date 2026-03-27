@@ -1017,11 +1017,7 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
 configs_bwd_tlx = [
     triton.Config(
         {
-            # Note: BLOCK_M1 is removed from this autotuning step
-            # so that we can test alternative code paths based on
-            # BLOCK_M1.
-            # Not all EPILOGUE_SUBTILE are viable with all BLOCK_M1
-            # and H-DIM options, so we set those in the kernel as well.
+            "BLOCK_M1": bm1,
             "BLOCK_N1": 128,
             "BLOCK_M2": 128,
             "BLOCK_N2": 128,
@@ -1030,12 +1026,14 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
+            "EPILOGUE_SUBTILE": 4 if bm1 == 128 else 2,
+            "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": uwb,
         },
         num_warps=4,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for uwb in [False, True]
+    ) for bm1 in [64, 128] for uwb in [False, True]
 ]
 
 
@@ -1718,7 +1716,7 @@ def _attn_bwd_ws(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M):
+    def forward(ctx, q, k, v, sm_scale, causal):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
@@ -1796,10 +1794,6 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
-        # Store BLOCK_M1 for bwd so we can test divergent
-        # code paths.
-        ctx.BWD_BLOCK_M1 = BWD_BLOCK_M1
-        ctx.GROUP_SIZE_M = GROUP_SIZE_M
         return o
 
     @staticmethod
@@ -1891,7 +1885,6 @@ class _attention(torch.autograd.Function):
             )
 
         stage = 3 if ctx.causal else 1
-        EPILOGUE_SUBTILE = 4 if ctx.BWD_BLOCK_M1 == 128 and ctx.HEAD_DIM == 128 else 2
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             M, delta,  #
@@ -1901,17 +1894,14 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
-            BLOCK_M1=ctx.BWD_BLOCK_M1,  #
-            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,  #
-            GROUP_SIZE_M=ctx.GROUP_SIZE_M,  #
         )
 
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None
 
 
-def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1=0, GROUP_SIZE_M=0, config=None):
+def attention(q, k, v, sm_scale, causal, config=None):
     if config is None:
-        return _attention.apply(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M)
+        return _attention.apply(q, k, v, sm_scale, causal)
 
     # Non-autotuned path with explicit config
     HEAD_DIM_K = q.shape[-1]

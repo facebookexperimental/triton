@@ -386,7 +386,7 @@ def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE):
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, 64, 1, config=config)
+        tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
@@ -401,7 +401,7 @@ def test_blackwell_fa_ws_pipelined_persistent_warp_barrier(causal, RESCALE_OPT, 
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, 64, 1, config=config)
+        tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
@@ -432,8 +432,6 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
     fwd_config["RESCALE_OPT"] = RESCALE_OPT
     fwd_config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
-    BWD_BLOCK_M1 = 64
-    GROUP_SIZE_M = 1
 
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
@@ -511,7 +509,6 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_dv = TensorDescriptor(dv, shape=[Z * H * N_CTX, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
 
         BLK_SLICE_FACTOR = 2
-        EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
 
         def grid_persistent(meta):
             return (min(NUM_SMS, triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H), 1, 1)
@@ -537,9 +534,6 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
-            BLOCK_M1=BWD_BLOCK_M1,
-            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
         tri_dq = dq.to(q.dtype)

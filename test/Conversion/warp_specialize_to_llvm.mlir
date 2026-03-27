@@ -825,7 +825,7 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
 
 // -----
 
-module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32} {
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32, "ttg.cluster-dim-x" = 2 : i32} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 

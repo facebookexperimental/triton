@@ -197,10 +197,7 @@ struct ConvertTritonGPUToLLVM
 
     // Fold CTAId when there is only 1 CTA.
     int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
-    const SmallVector<int> clusterIds =
-        triton::gpu::TritonGPUDialect::getClusterDims(mod);
-    bool isClustered = ((clusterIds[0] * clusterIds[1] * clusterIds[2]) > 1);
-    if (numCTAs == 1 && !tlx::tlxEnablePairedMMA(mod) && !isClustered) {
+    if (numCTAs == 1 && !tlx::tlxIsClustered(mod)) {
       mod.walk([](triton::nvgpu::ClusterCTAIdOp id) {
         OpBuilder b(id);
         Value zero = LLVM::createConstantI32(id->getLoc(), b, 0);
@@ -302,10 +299,10 @@ private:
     return success();
   }
 
-  // If we're doing TLX 2cta paired MMA, insert cluster sync properly to
+  // If the kernel is clustered, insert cluster sync properly to
   // bootstrap remote bars
   LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
-    if (!tlx::tlxEnablePairedMMA(mod)) {
+    if (!tlx::tlxIsClustered(mod)) {
       return success();
     }
 

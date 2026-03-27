@@ -44,7 +44,7 @@ static Attribute getDummyLayoutFromType(Type type) {
 
 /// Compute the resolved layout for a dummy register layout.
 /// If tmemCompatible is true, creates a TMEM-compatible register layout using
-/// getDefaultLayoutForTmemLdSt. Otherwise, creates a default
+/// getTmemCompatibleLayout. Otherwise, creates a default
 /// BlockedEncodingAttr.
 ///
 static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
@@ -77,8 +77,15 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
                                              memSpace, /*mutableMemory=*/true);
     auto ctaLayout = ttg::CTALayoutAttr::get(ctx, {1, 1}, {1, 1}, {1, 0});
 
-    auto result =
-        ttng::getDefaultLayoutForTmemLdSt(memDescType, numWarps, ctaLayout);
+    // Create a temporary RankedTensorType with a blocked encoding for
+    // getTmemCompatibleLayout to use as a reference type.
+    SmallVector<unsigned> spt(rank, 1);
+    SmallVector<unsigned> order = {1, 0};
+    auto blockedEnc = ttg::BlockedEncodingAttr::get(
+        ctx, shape, spt, order, numWarps, threadsPerWarp, numCTAs);
+    auto tmpType = RankedTensorType::get(shape, elementType, blockedEnc);
+    auto result = ttng::getTmemCompatibleLayout(
+        tmemEncoding.getBlockM(), tmemEncoding.getBlockN(), tmpType, numWarps);
     return result;
   }
 

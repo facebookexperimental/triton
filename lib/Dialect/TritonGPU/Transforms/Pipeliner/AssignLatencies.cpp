@@ -192,6 +192,13 @@ public:
              !ttng::hasLoadsAfterMMA(mma, forOp))) {
           // MMA can be overlapped with itself
           mmaSelfLatency[mma] = 1;
+          // WS does not have this problem because the MMA is placed in
+          // a different partition than the MMA, so we can correctly set the
+          // latency.
+          if (isWarpSpecialized(forOp)) {
+            if (ttng::hasAccReadModifyWrite(mma, forOp))
+              opLatency.erase(&op); // can't pipeline the MMA
+          }
           // Only update the MMA latency if it wasn't set to 0 by the user.
           // TODO: Support values other than 0.
           if (!opLatency.count(&op)) {
@@ -219,7 +226,7 @@ public:
             // liverange overlap. WS does not have this problem because the MMA
             // is placed in a different partition than the MMA, so we can
             // correctly set the latency.
-            if (forOp->hasAttr(kWarpSpecializeAttrName)) {
+            if (isWarpSpecialized(forOp)) {
               if (ttng::hasAccReadModifyWrite(mma, forOp))
                 opLatency.erase(&op); // can't pipeline the MMA
               else
@@ -244,6 +251,17 @@ private:
     }
     return false;
   }
+
+  bool isWarpSpecialized(scf::ForOp forOp) {
+    scf::ForOp current = forOp;
+    do {
+      if (current->hasAttr(kWarpSpecializeAttrName)) {
+        return true;
+      }
+      current = current->getParentOfType<scf::ForOp>();
+    } while (current);
+    return false;
+  };
 };
 
 // Discover operations that should become async and assign latencies to them

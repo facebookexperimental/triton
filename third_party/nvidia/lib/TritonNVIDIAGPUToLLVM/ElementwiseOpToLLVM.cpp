@@ -700,7 +700,7 @@ struct FDivOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+    unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
     StringRef name;
     Type resultTy;
     if (32 == bitwidth) {
@@ -784,7 +784,7 @@ struct ExpOpConversionApprox
                                    Location loc) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // For non-FP32 input, call __nv_expf for higher-precision calculation
-    if (elemTy.getIntOrFloatBitWidth() != 32)
+    if (getIntOrFloatOrPtrBitWidth(elemTy) != 32)
       return {};
 
     const double log2e = 1.4426950408889634;
