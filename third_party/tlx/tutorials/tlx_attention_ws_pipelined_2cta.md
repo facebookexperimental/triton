@@ -102,8 +102,8 @@ BLOCK_N1=128, BLOCK_M1=128, HEAD_DIM=128, NUM_CTAS=2, fp16 (2 bytes).
 | `dot_tiles` | [BLOCK_M1/NUM_CTAS, HEAD_DIM] | [64, 128] | 1 | SMEM | 0 KB | reuse=do_tiles; **Dead code** |
 | `ds_tiles` | [BLOCK_N1, BLOCK_M1] | [256, 128] | 1 | SMEM | 64 KB | **Doubled** (own + peer dS) |
 | `ds_peer_tiles` | [BLOCK_N1, BLOCK_M1/2] | [128, 64] | 1 | SMEM | 16 KB | Peer's dS exchange buffer |
-| `qk_tiles` / `p_tiles` | [BLOCK_N1, BLOCK_M1] | [128, 128] | — | TMEM | — | S result → P |
-| `dp_tiles` / `dq_tiles` | [BLOCK_N1, BLOCK_M1] | [128, 128] | — | TMEM | — | dP → dQ |
+| `qk_tiles` / `p_tiles` | [BLOCK_N1, BLOCK_M1] | [128, 128] | — | TMEM | — | S→P reuse (S overwritten by P) |
+| `dp_tiles` / `dq_tiles` | [BLOCK_N1, BLOCK_M1] | [128, 128] | — | TMEM | — | dP→dQ reuse (dP overwritten by dQ) |
 | `dk_tiles` | [BLOCK_N1, HEAD_DIM] | [128, 128] | — | TMEM | — | dK accumulator |
 | `dv_tiles` | [BLOCK_N1, HEAD_DIM] | [128, 128] | — | TMEM | — | dV accumulator |
 | **SMEM Total** | | | | | **208 KB** | |
@@ -215,10 +215,36 @@ is dead after this point.
 16 KB staging buffer. Total = 48 KB. TLX doubles `ds_tiles` to
 `(tile_n*2, tile_m)` = 64 KB plus `ds_peer_tiles` = 16 KB. Total = 80 KB.
 
-## TMEM Layout (FA4 bwd, hdim=128, 2-CTA)
+## TMEM Layout (FA4 bwd, hdim=128)
 
-TMEM has **512 columns** (each column = 128 rows × 32 bits). The backward
-kernel fully packs all 512 columns with overlapping buffers:
+TMEM has **512 columns** (each column = 128 rows × 32 bits). The M-dimension
+of each MMA output maps to TMEM columns. The backward kernel fully packs
+all 512 columns with overlapping buffers.
+
+### 1-CTA TMEM layout
+
+```
+Column:  0                 128        256                384       512
+         |-----------------|----------|------------------|---------|
+         |      S/P        |    dV    |   dP/dS/dQ       |   dK    |
+         |     (128)       |  (128)   |     (128)        |  (128)  |
+         |_________________|__________|__________________|_________|
+```
+
+| Buffer | Offset | Columns | Overlaps with |
+|--------|--------|---------|---------------|
+| S      | 0      | 128     | P (same offset) |
+| P      | 0      | 128     | S (same offset) |
+| dV     | 128    | 128     | — |
+| dP     | 256    | 128     | dS, dQ (all same offset) |
+| dS     | 256    | 128     | dP, dQ (all same offset) |
+| dQ     | 256    | 128     | dP, dS (all same offset) |
+| dK     | 384    | 128     | — |
+
+In 1-CTA, dQ uses **128 columns** (full tile_m) and aliases dP/dS — all
+three are used at different phases so the overlap is safe.
+
+### 2-CTA TMEM layout
 
 ```
 Column:  0          64    128        256        384       512
@@ -232,16 +258,22 @@ Column:  0          64    128        256        384       512
 |--------|--------|---------|---------------|
 | S      | 0      | 128     | P (same offset) |
 | P      | 0      | 128     | S (same offset) |
-| dQ     | 64     | 64      | overlaps S/P range |
+| dQ     | 64     | 64      | overlaps S/P cols 64-127 |
 | dV     | 128    | 128     | — |
 | dP     | 256    | 128     | dS (same offset) |
 | dS     | 256    | 128     | dP (same offset) |
 | dK     | 384    | 128     | — |
 
-Overlaps are safe because the buffers are used at different phases:
+In 2-CTA, dQ uses only **64 columns** (tile_m/2) because the M-dimension
+is split across CTAs. This lets dQ fit in the S/P region (cols 64-127)
+instead of needing a separate 128-column slot. dQ no longer aliases dP/dS.
+
+### Why overlaps are safe (both modes)
+
 - **S → P**: S is computed, then overwritten with P = exp(S − LSE)
 - **dP → dS**: dP is computed, then dS = P × (dP − D) overwrites it
-- **dQ overlaps S/P**: dQ is computed after S/P are fully consumed
+- **dQ overlaps S/P** (2-CTA) or **dP/dS** (1-CTA): dQ is computed
+  after the overlapped buffers are fully consumed
 
 ## Constraints
 
