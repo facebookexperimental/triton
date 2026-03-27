@@ -22,7 +22,10 @@ Those tests cover manual warp specialization via TLX, which is a separate system
 pytest python/test/unit/language/test_tutorial09_warp_specialization.py
 
 # Addmm autoWS Python test
-pytest python/test/unit/language/test_addmm_warp_specialization.py
+pytest python/test/unit/language/test_autows_addmm.py
+
+# Flash Attention autoWS Python test
+pytest python/test/unit/language/test_autows_flash_attention.py
 
 # Additional autoWS tests
 pytest python/test/unit/language/test_warp_specialization.py

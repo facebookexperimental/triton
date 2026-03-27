@@ -134,6 +134,7 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
+    early_tma_store_lowering: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -288,6 +289,10 @@ class CUDABackend(BaseBackend):
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
 
+        # Add early TMA store lowering attribute
+        if opt.early_tma_store_lowering:
+            mod.set_attr("ttg.early_tma_store_lowering", ir.builder(mod.context).get_bool_attr(True))
+
         cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:
             cluster_info.clusterDimX = opt.cluster_dims[0]
@@ -331,8 +336,7 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            if knobs.nvidia.use_early_tma_store_lowering:
-                nvidia.passes.hopper.add_tma_store_lowering(pm)
+            nvidia.passes.hopper.add_tma_store_lowering(pm)
             from triton.runtime.driver import driver as rt_driver
             smem_budget = rt_driver.active.utils.get_device_properties(
                 rt_driver.active.get_current_device())["max_shared_mem"]
@@ -355,8 +359,7 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                if knobs.nvidia.use_early_tma_store_lowering:
-                    nvidia.passes.hopper.add_tma_store_lowering(pm)
+                nvidia.passes.hopper.add_tma_store_lowering(pm)
                 if knobs.nvidia.use_meta_partition:
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
