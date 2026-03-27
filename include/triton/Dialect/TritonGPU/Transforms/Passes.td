@@ -393,4 +393,32 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUBarrierDeadlockDetection : Pass<"tritongpu-barrier-deadlock-detection", "mlir::ModuleOp"> {
+  let summary = "Detect potential barrier deadlocks in warp-specialized kernels";
+
+  let description = [{
+    Extracts concrete barrier operation traces from `ttg.warp_specialize`
+    regions, unrolls `scf.for` loops, and generates Z3 constraints encoding
+    barrier semantics. SAT = deadlock witness, UNSAT = safe within the unroll
+    bound.
+
+    The pass outputs a standalone Python Z3 script that can be run with
+    `python3` to check for deadlocks. Optionally runs the solver automatically.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+
+  let options = [
+    Option<"outputPath", "output-path", "std::string", /*default=*/"\"\"",
+           "Path to write Z3 script (empty = stderr)">,
+    Option<"runSolver", "run-solver", "bool", /*default=*/"false",
+           "Run python3 on the generated Z3 script">,
+    Option<"unrollBound", "unroll-bound", "int", /*default=*/"0",
+           "Loop unrolling bound (0 = auto)">
+  ];
+}
+
 #endif
