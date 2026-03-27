@@ -152,9 +152,9 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
       if (!bufferCopy)
         continue;
 
-      // K = buffer.copy - 1: with N copies, iteration i and i+N share the
-      // same buffer slot. We can delay the wait by at most N-1 iterations.
-      int k = bufferCopy.getInt() - 1;
+      // K = buffer.copy: with N copies, the wait must complete before the
+      // K-th write to the same buffer overwrites the slot being read.
+      int k = bufferCopy.getInt();
       if (k <= 0)
         continue;
 

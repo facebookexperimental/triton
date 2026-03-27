@@ -3,10 +3,10 @@
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-// Triple-buffered (buffer.copy = 3). K = 3 - 1 = 2.
+// Triple-buffered (buffer.copy = 3). K = 3.
 // CHECK-LABEL: triple_buffer
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-SAME: can_rotate_by_buffer_count = 2
+// CHECK-SAME: can_rotate_by_buffer_count = 3
   tt.func public @triple_buffer(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -27,11 +27,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-// Single-buffered (buffer.copy = 1). K = 1 - 1 = 0 → no attribute.
-// CHECK-LABEL: single_buffer_no_annotate
+// Single-buffered (buffer.copy = 1). K = 1 → annotated.
+// CHECK-LABEL: single_buffer
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-NOT: can_rotate_by_buffer_count
-  tt.func public @single_buffer_no_annotate(
+// CHECK-SAME: can_rotate_by_buffer_count = 1
+  tt.func public @single_buffer(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
       %lb: index, %ub: index, %step: index) {
