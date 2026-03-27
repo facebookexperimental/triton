@@ -7,6 +7,227 @@ each CTA holds half the B operand and the MMA hardware combines them.
 Each CTA in a cluster processes a **different N-block** (consecutive rows of
 K/V), matching the 1-CTA behavior but sharing Q/dO loads via multicast.
 
+## Worked example: 2-CTA backward with real numbers
+
+`tile_m=2, tile_n=2, hdim=2, cta_group_size=2`.
+One `n_block_cta_group` covers `tile_n * 2 = 4` rows of K/V.
+
+### Input tensors
+
+```
+Q = [2  1]     dO = [1  3]
+    [4  3]          [2  1]
+
+K0 = [1  2]  (CTA 0, rows 0-1)     V0 = [3  1]
+     [3  4]                              [2  4]
+
+K1 = [5  6]  (CTA 1, rows 2-3)     V1 = [1  5]
+     [7  8]                              [4  2]
+
+LSE = [2, 3]     D = [1, 1]
+```
+
+### Dot 1: S.T = K @ Q.T (`two_ctas=True`)
+
+```
+Inputs:
+  A (per-CTA, each CTA has its own tile_n rows):
+    CTA 0: sK = [1  2]     CTA 1: sK = [5  6]
+                [3  4]                  [7  8]
+  B (multicast, split along tile_m — each CTA holds one column of Q.T):
+    Full Q.T = [2  4]
+               [1  3]
+    CTA 0 holds: [2]     CTA 1 holds: [4]
+                 [1]                   [3]
+    HW combines → full Q.T:
+      [2  4]
+      [1  3]
+
+CTA 0: S0 = Q @ K0.T = [ 4  10]
+                        [10  24]
+
+CTA 1: S1 = Q @ K1.T = [16  22]
+                        [38  52]
+```
+
+### Compute: P (assigned directly for clarity)
+
+In practice, `P = exp(S - LSE)` with `LSE = logsumexp(S)` so rows sum to 1.
+For this example we assign P directly:
+
+```
+CTA 0: P0 = [0.1  0.2]     CTA 1: P1 = [0.3  0.1]
+            [0.4  0.3]                  [0.2  0.5]
+```
+
+### Dot 2: dP.T = V @ dO.T (`two_ctas=True`)
+
+```
+Inputs:
+  A (per-CTA, each CTA has its own tile_n rows):
+    CTA 0: sV = [3  1]     CTA 1: sV = [1  5]
+                [2  4]                  [4  2]
+  B (multicast, split along tile_m — each CTA holds one column of dO.T):
+    Full dO.T = [1  2]
+                [3  1]
+    CTA 0 holds: [1]     CTA 1 holds: [2]
+                 [3]                   [1]
+    HW combines → full dO.T:
+      [1  2]
+      [3  1]
+
+CTA 0: dP0.T = V0 @ dO.T = [ 5  10]     →  dP0 = [ 5  10]
+                            [10  10]               [10  10]
+
+CTA 1: dP1.T = V1 @ dO.T = [11   8]     →  dP1 = [11   8]
+                            [ 8  14]               [ 8  14]
+```
+
+### Compute: dS = P * (dP - D), with D = [1, 1]
+
+```
+Inputs:
+  CTA 0: P0 = [0.1  0.2]   dP0 = [ 5  10]
+              [0.4  0.3]         [10  10]
+  CTA 1: P1 = [0.3  0.1]   dP1 = [11   8]
+              [0.2  0.5]         [ 8  14]
+
+CTA 0: dP0 - D = [ 4   9]
+                  [ 9   9]
+  dS0 = [0.4   1.8]
+        [3.6   2.7]
+
+CTA 1: dP1 - D = [10   7]
+                  [ 7  13]
+  dS1 = [3.0   0.7]
+        [1.4   6.5]
+```
+
+### Dot 3: dV += P.T @ dO (`two_ctas=True`)
+
+```
+Inputs:
+  A (TMEM, per-CTA):
+    CTA 0: P0.T = [0.1  0.4]     CTA 1: P1.T = [0.3  0.2]
+                  [0.2  0.3]                    [0.1  0.5]
+  B (multicast, split along hdim — each CTA holds one column of dO):
+    Full dO = [1  3]
+              [2  1]
+    CTA 0 holds: [1]     CTA 1 holds: [3]
+                 [2]                   [1]
+    HW combines → full dO:
+      [1  3]
+      [2  1]
+
+CTA 0: dV0 = P0.T @ dO = [0.9  0.7]
+                          [0.8  0.9]
+
+CTA 1: dV1 = P1.T @ dO = [0.7  1.1]
+                          [1.1  0.8]
+```
+
+### Dot 5: dK += dS.T @ Q (`two_ctas=True`)
+
+```
+Inputs:
+  A (TMEM, per-CTA):
+    CTA 0: dS0.T = [0.4  3.6]     CTA 1: dS1.T = [3.0  1.4]
+                   [1.8  2.7]                     [0.7  6.5]
+  B (multicast, split along hdim — each CTA holds one column of Q):
+    Full Q = [2  1]
+             [4  3]
+    CTA 0 holds: [2]     CTA 1 holds: [1]
+                 [4]                   [3]
+    HW combines → full Q:
+      [2  1]
+      [4  3]
+
+CTA 0: dK0 = dS0.T @ Q = [15.2  11.2]
+                          [14.4   9.9]
+
+CTA 1: dK1 = dS1.T @ Q = [11.6   7.2]
+                          [27.4  20.2]
+```
+
+### Dot 4: dQ = dS @ K (`two_ctas=True`, reduction spans both N-blocks)
+
+```
+Inputs:
+  A (SMEM, MMA reads from both CTAs — each CTA contributes tile_n rows):
+    CTA 0's sdS: dS0.T = [0.4  3.6]
+                          [1.8  2.7]
+    CTA 1's sdS: dS1.T = [3.0  1.4]
+                          [0.7  6.5]
+    HW reads both → combined A (2 rows, 4 cols):
+      [0.4  1.8  3.0  0.7]
+      [3.6  2.7  1.4  6.5]
+
+  B (SMEM, per-CTA — each CTA loads ALL 4 K rows, one hdim column):
+    Full K = [1  2]
+             [3  4]
+             [5  6]
+             [7  8]
+    CTA 0's sKt: [1]     CTA 1's sKt: [2]
+                 [3]                   [4]
+                 [5]                   [6]
+                 [7]                   [8]
+    HW combines → full K (4 rows, 2 cols):
+      [1  2]
+      [3  4]
+      [5  6]
+      [7  8]
+```
+
+The 2-CTA MMA computes one combined GEMM: `dQ = A @ B`:
+
+```
+dQ = [0.4  1.8  3.0  0.7] @ [1  2] = [25.7  31.6]
+     [3.6  2.7  1.4  6.5]   [3  4]   [64.2  78.4]
+                             [5  6]
+                             [7  8]
+```
+
+**Both CTAs compute the full dQ — output is redundant:**
+
+Both CTAs have the same A (sdS after exchange) and the hardware combines
+B (sKt) into the same full K. So both CTAs compute the identical full dQ
+`[[25.7, 31.6], [64.2, 78.4]]` in TMEM. This is redundant computation.
+
+Each CTA only **reads out and writes** half the hdim to global:
+```
+CTA 0 reads dQ[:,0] from TMEM → atomic-adds [25.7, 64.2] to global
+CTA 1 reads dQ[:,1] from TMEM → atomic-adds [31.6, 78.4] to global
+```
+
+The other half sits in TMEM unused. The atomic-add is needed to accumulate
+across N-block groups (outer loop iterations), not between CTAs — within
+one N-block group there is no overlap between CTA 0 and CTA 1's writes.
+
+### Key observations
+
+1. **Dots 1,2,3,5:** K/V are A operands (per-CTA, different N-block rows).
+   Q/dO are B operands (multicast, shared). Each CTA gets different results
+   because A differs.
+
+2. **Dot 4:** Both A (sdS, after exchange) and combined B (sKt → full K)
+   are the same for both CTAs. The computation is **redundant** — both CTAs
+   produce the identical full dQ. Each CTA only writes a different hdim
+   slice to global. This is a tradeoff: redundant compute for a single
+   large GEMM (tile_n*2 reduction) with better MMA utilization.
+
+3. **sK vs sKt — same data, different slicing:**
+   ```
+   sK  (A, dot 1):  own tile_n rows, full hdim
+   sKt (B, dot 4):  ALL tile_n*2 rows, half hdim
+   ```
+
+4. **DSMEM exchange** sends half of each CTA's dS to the peer so that
+   the 2-CTA MMA's A operand spans both N-blocks' dS.
+
+5. **Atomic-add for dQ:** needed to accumulate across outer loop iterations
+   (different N-block groups), not between CTAs. Within one N-block group,
+   CTA 0 and CTA 1 write to non-overlapping hdim slices.
+
 ## SMEM Analysis: TLX Does NOT Achieve FA4's Savings
 
 ### Problem Summary
@@ -68,20 +289,20 @@ Using tile_n=128, tile_m=128, hdim=128, fp16 (2 bytes per element).
 | sdO | (tile_m/2, hdim) | (64, 128) | 1 | 16 KB | **−16 KB** (halved B) |
 | sQt | (hdim/2, tile_m) | (64, 128) | 1 | 16 KB | **+16 KB** (new, separate layout for dK GEMM) |
 | sdOt | (hdim/2, tile_m) | (64, 128) | 1 | 16 KB | **+16 KB** (new, separate layout for dP GEMM) |
-| sKt | (tile_n, hdim/2) | (128, 64) | 1 | 16 KB | **+16 KB** (new, B-operand for dQ GEMM) |
+| sKt | (tile_n*2, hdim/2) | (256, 64) | 1 | 32 KB | **+32 KB** (new, B-operand for dQ GEMM, all rows both N-blocks) |
 | sdS | (tile_n, tile_m) | (128, 128) | 1 | 32 KB | same (M halved, K doubled → cancels) |
 | sdS_xchg | (tile_n, tile_m/2) | (128, 64) | — | 16 KB | **+16 KB** (new, DSMEM staging buffer) |
 | sdQaccum | (tile_m×dQ_reduce_ncol, stages) | (128×8, 4) f32 | — | 16 KB | **−16 KB** |
 | sLSE | (tile_m, Q_stage) | (128, 1) f32 | — | 0.5 KB | −0.5 KB |
 | sdPsum | (tile_m, dO_stage) | (128, 1) f32 | — | 0.5 KB | same |
 | Extra mbarriers | | | | ~0.1 KB | +0.1 KB (Qt, Kt, dS_cluster, dQaccum_empty) |
-| **Total** | | | | **~209 KB** | **~−16 KB** |
+| **Total** | | | | **~225 KB** | **~0 KB** |
 
 #### Net savings breakdown
 
 - **Saved**: sQ (−48 KB) + sdO (−16 KB) + sdQaccum (−16 KB) = **−80 KB**
-- **Added**: sQt (+16) + sdOt (+16) + sKt (+16) + sdS_xchg (+16) = **+64 KB**
-- **Net: ~16 KB savings**
+- **Added**: sQt (+16) + sdOt (+16) + sKt (+32) + sdS_xchg (+16) = **+80 KB**
+- **Net: ~0 KB savings**
 
 The SMEM savings are modest. The main benefit of 2-CTA is **doubling the
 MMA compute throughput** by having two CTAs cooperate on each GEMM
@@ -117,6 +338,70 @@ BLOCK_N1=128, BLOCK_M1=128, HEAD_DIM=128, NUM_CTAS=2, fp16 (2 bytes).
 | 3 | dV += P @ dO | p_tiles [N, M] (tmem) | do_tiles [M, D/2] → [M, D] | dv_tiles [N, D] |
 | 4 | dQ = dS^T @ K | dsT [M, N] | kt_tiles [N, D/2] → [N, D] | dq_tiles [M, D] |
 | 5 | dK += dS @ Q | ds_tiles [N, M] | q_tiles [M, D/2] → [M, D] | dk_tiles [N, D] |
+
+## How K is used differently in dot 1 vs dot 4 (2-CTA)
+
+In 2-CTA mode, both CTAs in a cluster share the same `n_block_cta_group`,
+which covers `tile_n * 2` rows of K. But K plays different roles in dot 1
+(A operand) vs dot 4 (B operand), so it's sliced differently.
+
+**Example:** `tile_n=2, hdim=4, cta_group_size=2`. One `n_block_cta_group`
+covers 4 rows of K:
+
+```
+K (global) = [ a b c d ]  row 0 ─┐ CTA 0's n_block
+             [ e f g h ]  row 1 ─┘
+             [ i j k l ]  row 2 ─┐ CTA 1's n_block
+             [ m n o p ]  row 3 ─┘
+```
+
+### Dot 1: S = K @ Q^T — K is A operand
+
+A is per-CTA (not combined by hardware). Each CTA loads its own `tile_n`
+rows, full hdim:
+
+```
+CTA 0's sK = [ a b c d ]    shape [2, 4]  — rows 0-1, full D
+             [ e f g h ]
+
+CTA 1's sK = [ i j k l ]    shape [2, 4]  — rows 2-3, full D
+             [ m n o p ]
+```
+
+### Dot 4: dQ = dS @ K — K is B operand (sKt)
+
+B is combined by hardware across CTAs. The full B has shape
+`[K_dim, N_dim] = [tile_n*2, hdim] = [4, 4]`. Split along N (hdim),
+each CTA loads **all 4 rows**, half the columns:
+
+```
+CTA 0's sKt = [ a b ]    shape [4, 2]  — ALL rows, cols 0-1
+              [ e f ]
+              [ i j ]
+              [ m n ]
+
+CTA 1's sKt = [ c d ]    shape [4, 2]  — ALL rows, cols 2-3
+              [ g h ]
+              [ k l ]
+              [ o p ]
+```
+
+Hardware combines along hdim → full `K [4, 4]`.
+
+### Summary
+
+```
+sK  (A, dot 1):  [tile_n, hdim]       — own rows, full D
+sKt (B, dot 4):  [tile_n*2, hdim/2]   — ALL rows, half D
+```
+
+Same K data, sliced differently. In 2-CTA UMMA: A is per-CTA (not combined),
+B is combined across CTAs (split along the output dimension). The "t" in `sKt`
+refers to the SMEM layout (different swizzle for the B operand), not a
+mathematical transpose — the math is still `dQ = dS @ K`.
+
+In FA4 code: `sKt` in 1-CTA is just a recast of `sK` (same bytes, line 1297).
+In 2-CTA, `sKt` is a separate buffer loaded via `tma_atom_Kt` (line 676).
 
 ## Tile Scheduling
 
