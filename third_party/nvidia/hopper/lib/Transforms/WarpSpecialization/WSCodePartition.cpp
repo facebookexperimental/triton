@@ -3107,7 +3107,7 @@ void insertAsyncComm(
           // multiple MMAs in the loop (data-partitioned case). With a
           // single MMA the global tcgen05_commit is equivalent and simpler.
           auto mmaOpCast = cast<ttng::TCGen5MMAOp>(mmaOp);
-          auto *parentLoop =
+          auto parentLoop =
               nestedInsertionTarget->getParentOfType<scf::ForOp>();
           unsigned mmaCount = 0;
           if (parentLoop) {
