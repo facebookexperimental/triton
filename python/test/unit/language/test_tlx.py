@@ -3628,6 +3628,45 @@ def test_descriptor_load_two_cta(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_prefetch_tensormap(device):
+    """Test that prefetch_tensormap emits prefetch.param.tensormap for a host-side descriptor."""
+
+    @triton.jit
+    def prefetch_tensormap_kernel(in_desc, out_desc, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        off_m = pid_m * BLOCK_SIZE_M
+        off_n = pid_n * BLOCK_SIZE_N
+
+        tlx.prefetch_tensormap(in_desc)
+        tlx.prefetch_tensormap(out_desc)
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
+
+        tlx.async_descriptor_load(in_desc, buffer, [off_m, off_n], bar)
+        tlx.barrier_wait(bar=bar, phase=0)
+        tlx.fence("async_shared")
+        tlx.async_descriptor_store(out_desc, buffer, [off_m, off_n])
+        tlx.async_descriptor_store_wait(0)
+
+    M, N = 128, 128
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 64, 64
+    x = torch.ones((M, N), dtype=torch.int16, device=device)
+    y = torch.empty_like(x)
+
+    in_desc = TensorDescriptor.from_tensor(x, [BLOCK_SIZE_M, BLOCK_SIZE_N])
+    out_desc = TensorDescriptor.from_tensor(y, [BLOCK_SIZE_M, BLOCK_SIZE_N])
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    kernel = prefetch_tensormap_kernel[grid](in_desc, out_desc, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
+    assert kernel.asm["ptx"].count("prefetch.param.tensormap") == 2
+    torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_local_gather(device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
