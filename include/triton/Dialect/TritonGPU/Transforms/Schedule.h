@@ -201,6 +201,14 @@ public:
 
     bool isEnd() const { return atEnd; }
 
+    /// Override the maximum number of stages the iterator will traverse.
+    /// By default this is the schedule's numStages.
+    void setMaxStages(int stages) { maxStages = stages; }
+
+    /// Return the current stage limit of the iterator, which reflects
+    /// the initial op's stage plus the number of wrap-arounds.
+    int currStage() const { return currStageLimit; }
+
     /// Advance the iterator to the next operation that satisfies the optional
     /// predicate. Returns the found operation, or std::nullopt if not found.
     /// The iterator position is updated to the found operation (or end).
