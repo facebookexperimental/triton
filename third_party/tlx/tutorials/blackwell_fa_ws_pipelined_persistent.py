@@ -1060,6 +1060,7 @@ def _bwd_compute_inner_loop(
     dp_fulls,
     dp_tiles,
     ds_tiles,
+    dsT_tiles,
     ds_fulls,
     M,
     D,
@@ -1077,7 +1078,6 @@ def _bwd_compute_inner_loop(
     REUSE_DP_FOR_DQ: tl.constexpr,
     # 2-CTA DSMEM exchange parameters
     USE_2CTA: tl.constexpr = False,
-    ds_peer_tiles=None,
     ds_peer_fulls=None,
     cluster_cta_rank=0,
 ):
@@ -1093,14 +1093,14 @@ def _bwd_compute_inner_loop(
         m = tl.load(M + offs_m)
 
         # wait for qkT = tl.dot(k, qT)
-        tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
-        qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
+        tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
+        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
         # 2-CTA: non-leader signals leader's qk_empties so leader knows
         # both CTAs finished reading before reusing TMEM.
         if USE_2CTA:
-            tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id), 1, remote_cta_rank=0)
+            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
         else:
-            tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
+            tlx.barrier_arrive(qk_empties[tmem_buf_id])
 
         pT = tl.math.exp2(qkT - m[None, :])
         if STAGE == 1:
@@ -1110,67 +1110,73 @@ def _bwd_compute_inner_loop(
         # ppT *= qk_scale
         ppT = pT
         ppT = ppT.to(do_out_dtype)
-        tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
+        tlx.local_store(p_tiles[tmem_buf_id], ppT)
         if USE_2CTA:
-            tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id), 1, remote_cta_rank=0)
+            tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
-            tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
+            tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
 
         # Wait for dpT = tl.dot(v, tl.trans(do))
-        tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
-        dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
+        tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
+        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         # We can only signal the arrive if DP is not shared with DQ.
         # Otherwise we need to wait for DQ to be done.
         if not REUSE_DP_FOR_DQ:
             if USE_2CTA:
-                tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id), 1, remote_cta_rank=0)
+                tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
             else:
-                tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
+                tlx.barrier_arrive(dp_empties[tmem_buf_id])
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(q_out_dtype)
-        tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
-        tlx.fence("async_shared")
+        # tl.device_print("dsT", dsT)
         # 2-CTA: exchange half of dS with peer, then overwrite ds_tiles
         # so it contains mixed dS: own half + peer's half.
         # CTA 0 sends dsT[:, 0:M/2], CTA 1 sends dsT[:, M/2:M].
         # After exchange, overwrite the peer's half in ds_tiles.
         if USE_2CTA:
             HALF_M: tl.constexpr = BLOCK_M1 // 2
-            # Send own half to peer (CTA 0 sends [:, 0:M/2], CTA 1 sends [:, M/2:M])
-            if cluster_cta_rank == 0:
-                ds_half = tlx.local_slice(tlx.local_view(ds_tiles, ds_buf_id), [0, 0], [BLOCK_N1, HALF_M])
-            else:
-                ds_half = tlx.local_slice(tlx.local_view(ds_tiles, ds_buf_id), [0, HALF_M], [BLOCK_N1, HALF_M])
+            dsTs = _split_n(dsT, 2)
             peer_rank = 1 - cluster_cta_rank
+            # CTA0 keeps first half, sends second half to peer
+            # CTA1 keeps second half, sends first half to peer
+            if cluster_cta_rank == 0:
+                own_half = dsTs[0]
+                send_half = dsTs[1]
+                own_slice = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, HALF_M])
+                remote_dst = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, HALF_M])
+            else:
+                own_half = dsTs[1]
+                send_half = dsTs[0]
+                own_slice = tlx.local_slice(ds_tiles[ds_buf_id], [0, HALF_M], [BLOCK_N1, HALF_M])
+                remote_dst = tlx.local_slice(ds_tiles[ds_buf_id], [0, HALF_M], [BLOCK_N1, HALF_M])
+            # Roundtrip send_half through SMEM to fix register layout
+            tlx.local_store(own_slice, send_half)
+            tlx.fence("async_shared")
+            send_data = tlx.local_load(own_slice)
+            # Overwrite staging with actual own_half
+            tlx.local_store(own_slice, own_half)
+            tlx.fence("async_shared")
+            # Send to peer's ds_tiles
             tlx.barrier_expect_bytes(
-                tlx.local_view(ds_peer_fulls, ds_buf_id),
+                ds_peer_fulls[ds_buf_id],
                 2 * BLOCK_N1 * HALF_M,
             )
             tlx.async_remote_shmem_store(
-                dst=tlx.local_view(ds_peer_tiles, ds_buf_id),
-                src=tlx.local_load(ds_half),
+                dst=remote_dst,
+                src=send_data,
                 remote_cta_rank=peer_rank,
-                barrier=tlx.local_view(ds_peer_fulls, ds_buf_id),
+                barrier=ds_peer_fulls[ds_buf_id],
             )
-            tlx.fence_async_shared()
             # Wait for peer's half to arrive
-            tlx.barrier_wait(tlx.local_view(ds_peer_fulls, ds_buf_id), ds_phase)
-            # Overwrite the peer's half in ds_tiles with received data
-            ds_peer_slice = tlx.local_view(ds_peer_tiles, ds_buf_id)
-            peer_data = tlx.local_load(ds_peer_slice)
-            if cluster_cta_rank == 0:
-                ds_target = tlx.local_slice(tlx.local_view(ds_tiles, ds_buf_id), [0, HALF_M], [BLOCK_N1, HALF_M])
-            else:
-                ds_target = tlx.local_slice(tlx.local_view(ds_tiles, ds_buf_id), [0, 0], [BLOCK_N1, HALF_M])
-            tlx.local_store(ds_target, peer_data)
-            tlx.fence_async_shared()
-        if USE_2CTA:
-            tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id), 1, remote_cta_rank=0)
+            tlx.barrier_wait(ds_peer_fulls[ds_buf_id], ds_phase)
+            tlx.barrier_arrive(ds_fulls[ds_buf_id], 1, remote_cta_rank=0)
         else:
-            tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+            tlx.local_store(ds_tiles[ds_buf_id], dsT)
+            tlx.fence("async_shared")
+            tlx.barrier_arrive(ds_fulls[ds_buf_id])
         curr_m += step_m
         blk_idx += 1
     return curr_m, blk_idx
@@ -1370,8 +1376,8 @@ def _attn_bwd_ws(
         # DSMEM exchange: each CTA sends half of its dsT to the peer CTA.
         # ds_peer_tiles receives the peer's half: [BLOCK_N1, BLOCK_M1 // NUM_CTAS].
         # Matches FA4's sdS_xchg layout (tile_n, tile_m // 2).
-        ds_peer_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1 // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
         ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
+        dsT_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS, tlx.storage_kind.tmem)
     else:
         cluster_cta_rank = 0
         is_leader = True
@@ -1482,6 +1488,7 @@ def _attn_bwd_ws(
                         dp_fulls,
                         dp_tiles,
                         ds_tiles,
+                        dsT_tiles if USE_2CTA else None,
                         ds_fulls,
                         M_updated,
                         D_updated,
@@ -1498,7 +1505,6 @@ def _attn_bwd_ws(
                         STAGE=4 - STAGE,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         USE_2CTA=USE_2CTA,
-                        ds_peer_tiles=ds_peer_tiles if USE_2CTA else None,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
                     )
@@ -1514,6 +1520,7 @@ def _attn_bwd_ws(
                         dp_fulls,
                         dp_tiles,
                         ds_tiles,
+                        dsT_tiles if USE_2CTA else None,
                         ds_fulls,
                         M_updated,
                         D_updated,
@@ -1530,7 +1537,6 @@ def _attn_bwd_ws(
                         STAGE=2,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         USE_2CTA=USE_2CTA,
-                        ds_peer_tiles=ds_peer_tiles if USE_2CTA else None,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
                     )
