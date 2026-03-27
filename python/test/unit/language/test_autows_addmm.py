@@ -190,9 +190,6 @@ def test_autows_addmm_tma_persistent(
     if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
         pytest.skip("Out of resources: shared memory exceeded")
 
-    if BLOCK_SIZE_M == 256 and not FLATTEN and EPILOGUE_SUBTILE == 4 and use_early_tma_store_lowering:
-        pytest.skip("Wrong results (NaN) with early TMA store lowering")
-
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True

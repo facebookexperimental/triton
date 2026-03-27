@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -94,6 +95,68 @@ struct NVGPUWSTMAStoreLoweringPass
 #define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITLOWERING
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
+// Count AsyncTMACopyLocalToGlobalOp ops in [from, to) within a block.
+static int countTMAStoresInRange(Block::iterator from, Block::iterator to) {
+  int count = 0;
+  for (auto it = from; it != to; ++it) {
+    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(&*it))
+      ++count;
+  }
+  return count;
+}
+
+// Compute the pendings value for a TMAStoreTokenWaitOp.
+// pendings = number of AsyncTMACopyLocalToGlobalOp ops issued after the token's
+// defining store and before this wait, in program execution order.
+static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
+  Value token = waitOp.getToken();
+
+  // Direct case: token defined by AsyncTMACopyLocalToGlobalOp in same block.
+  if (auto defOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
+    if (defOp->getBlock() == waitOp->getBlock()) {
+      // Count TMA stores strictly between def and wait.
+      return countTMAStoresInRange(std::next(defOp->getIterator()),
+                                   waitOp->getIterator());
+    }
+    return 0;
+  }
+
+  // Loop-carried case: token is a block argument of an scf.for body.
+  if (auto blockArg = dyn_cast<BlockArgument>(token)) {
+    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+    if (!forOp)
+      return 0;
+
+    // Block args for scf.for body are [iv, iter_arg0, iter_arg1, ...].
+    // The iter_arg index is blockArg.getArgNumber() - 1 (subtract the IV).
+    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+
+    // Find the corresponding yield operand.
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
+
+    // Trace the yielded value to its defining AsyncTMACopyLocalToGlobalOp.
+    auto defOp = yieldedVal.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>();
+    if (!defOp || defOp->getBlock() != forOp.getBody())
+      return 0;
+
+    Block *body = forOp.getBody();
+
+    // Stores after the def until end of loop body (excluding yield).
+    int storesAfterDef =
+        countTMAStoresInRange(std::next(defOp->getIterator()), body->end());
+
+    // Stores from start of loop body until the wait.
+    int storesBeforeWait =
+        countTMAStoresInRange(body->begin(), waitOp->getIterator());
+
+    return storesAfterDef + storesBeforeWait;
+  }
+
+  // Fallback: unknown pattern, drain all stores.
+  return 0;
+}
+
 struct NVGPUTMAStoreTokenWaitLoweringPass
     : public impl::NVGPUTMAStoreTokenWaitLoweringBase<
           NVGPUTMAStoreTokenWaitLoweringPass> {
@@ -104,7 +167,8 @@ struct NVGPUTMAStoreTokenWaitLoweringPass
     for (auto op : opsToLower) {
       OpBuilder builder(op);
       auto loc = op.getLoc();
-      builder.create<ttng::TMAStoreWaitOp>(loc, /*pendings=*/0);
+      int pendings = computePendings(op);
+      builder.create<ttng::TMAStoreWaitOp>(loc, pendings);
       for (auto barrier : op.getBarriers()) {
         builder.create<ttng::ArriveBarrierOp>(loc, barrier, /*count=*/1);
       }
