@@ -4,16 +4,16 @@
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Single-buffered (K=1). local_store and tma_copy at stage 0, wait starts at
-// stage 0. The LinearizedIterator wraps around and finds the 1st local_store
-// at (stage 0, cluster 0). The wait gets a new cluster (0) before the
-// local_store's cluster (bumped to 1).
+// stage 0. The iterator wraps once from tma_copy back to local_store, so
+// currStage = 1. The wait is placed at stage 1 in a new cluster before the
+// local_store's (split) cluster.
 // CHECK-LABEL: single_buffer_k1
 // CHECK: scf.for
 // CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 1 : i32}
   tt.func public @single_buffer_k1(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -35,16 +35,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Double-buffered (K=2). local_store at stage 0, tma_copy + wait at stage 1.
-// The LinearizedIterator wraps twice to find the 2nd local_store at
-// (stage 0, cluster 0). The wait moves to stage 0 in a new cluster (0)
-// before the local_store's cluster (bumped to 1).
+// The iterator wraps twice from tma_copy (stage 1) to find the 2nd
+// local_store, so currStage = 3. The wait is placed at stage 3 in a new
+// cluster before the local_store's (split) cluster.
 // CHECK-LABEL: double_buffer_k2
 // CHECK: scf.for
 // CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 3 : i32}
   tt.func public @double_buffer_k2(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,

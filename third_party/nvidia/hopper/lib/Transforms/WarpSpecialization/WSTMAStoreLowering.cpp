@@ -83,8 +83,10 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 struct NVGPUWSTMAStoreLoweringPass
     : public impl::NVGPUWSTMAStoreLoweringBase<NVGPUWSTMAStoreLoweringPass> {
   void runOnOperation() override {
-    getOperation()->walk(
-        [&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
+    auto mod = getOperation();
+    if (!mod->hasAttr("ttg.early_tma_store_lowering"))
+      return;
+    mod->walk([&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
   }
 };
 
@@ -216,11 +218,15 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         schedule.insert(&op, 0, cluster);
     }
 
-    // Collect annotated TMA store waits.
+    // Collect annotated TMA store waits that are direct children of this
+    // loop and whose defining TMA store is in the same loop.
     SmallVector<ttng::TMAStoreTokenWaitOp> waits;
     for (auto &op : forOp.getBody()->without_terminator()) {
       auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
       if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
+        continue;
+      auto tmaStore = getDefiningTMAStore(waitOp);
+      if (!tmaStore || tmaStore->getParentOp() != forOp)
         continue;
       waits.push_back(waitOp);
     }
@@ -248,31 +254,51 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         continue;
 
       // Walk the linearized schedule from the TMA store, counting local_store
-      // ops to the same buffer. Stop at the K-th one.
+      // ops to the same buffer. Stop at the K-th one. Increase maxStages so
+      // the iterator can traverse enough wraps to find all K writes.
       auto it = schedule.linearized(forOp, tmaStore);
+      it.setMaxStages(schedule.getNumStages() + k);
       int count = 0;
       Operation *kthWrite = nullptr;
-      while (auto op = it.findNext([&](Operation *op) {
+      int targetStage = 0;
+      while (!it.isEnd()) {
+        Operation *op = *it;
+        int stageAtOp = it.currStage();
+        ++it;
         auto storeOp = dyn_cast<ttg::LocalStoreOp>(op);
-        return storeOp && storeOp.getDst() == buffer;
-      })) {
-        if (++count == k) {
-          kthWrite = *op;
-          break;
+        if (storeOp && storeOp.getDst() == buffer) {
+          if (++count == k) {
+            kthWrite = op;
+            targetStage = stageAtOp;
+            break;
+          }
         }
       }
 
       if (kthWrite) {
-        // Place the wait in a new cluster just before the K-th write's cluster
-        // at the same stage. The cluster ordering ensures the wait executes
-        // before the write within that pipeline time slot.
-        auto [targetStage, targetCluster] = schedule[kthWrite];
-        auto newCluster = schedule.clusters.newBefore(targetCluster);
-        schedule.insert(waitOp, targetStage, newCluster);
+        // Look for an existing TMAStoreTokenWaitOp before kthWrite in the
+        // same block that is also in the schedule. If found, insert before
+        // that wait instead of before the store directly.
+        Operation *insertionTarget = kthWrite;
+        for (auto it = Block::reverse_iterator(kthWrite->getIterator());
+             it != kthWrite->getBlock()->rend(); ++it) {
+          if (isa<ttng::WaitBarrierOp>(&*it) && schedule.count(&*it)) {
+            insertionTarget = &*it;
+            break;
+          }
+        }
+
+        // Split the cluster at the insertion target: ops before it remain
+        // in the original cluster, the target and subsequent ops stay in
+        // the returned cluster.
+        auto targetCluster =
+            schedule.splitClusterBefore(insertionTarget, forOp);
+        // Insert a new cluster for our wait between the split halves.
+        auto waitCluster = schedule.clusters.newBefore(targetCluster);
+        schedule.insert(waitOp, targetStage, waitCluster);
       } else {
-        // Fallback: place at the last stage in a new cluster at the back.
-        auto lastCluster = schedule.clusters.newAtBack();
-        schedule.insert(waitOp, schedule.getNumStages() - 1, lastCluster);
+        // K-th write not found; leave the schedule unchanged for this wait.
+        continue;
       }
 
       waitOp->removeAttr(kCanRotateByBufferCount);

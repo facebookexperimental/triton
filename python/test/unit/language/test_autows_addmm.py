@@ -190,13 +190,9 @@ def test_autows_addmm_tma_persistent(
     if BLOCK_SIZE_M == 256 and FLATTEN and BLOCK_SIZE_K == 128 and num_stages == 3 and EPILOGUE_SUBTILE != 4:
         pytest.skip("Out of resources: shared memory exceeded")
 
-    if BLOCK_SIZE_M == 256 and not FLATTEN and EPILOGUE_SUBTILE == 4 and use_early_tma_store_lowering:
-        pytest.skip("Wrong results (NaN) with early TMA store lowering")
-
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
-        triton.knobs.nvidia.use_early_tma_store_lowering = use_early_tma_store_lowering
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -268,6 +264,7 @@ def test_autows_addmm_tma_persistent(
             SMEM_ALLOC_ALGO=SMEM_ALLOC_ALGO,
             num_stages=num_stages,
             num_warps=num_warps,
+            early_tma_store_lowering=use_early_tma_store_lowering,
         )
 
         # Verify IR contains expected ops
