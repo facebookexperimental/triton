@@ -1909,7 +1909,7 @@ class _attention(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None
 
 
-def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M, config=None):
+def attention(q, k, v, sm_scale, causal, BWD_BLOCK_M1=0, GROUP_SIZE_M=0, config=None):
     if config is None:
         return _attention.apply(q, k, v, sm_scale, causal, BWD_BLOCK_M1, GROUP_SIZE_M)
 

@@ -27,6 +27,43 @@ def _host_descriptor_pre_hook(nargs):
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
 
 
+configs = [
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": kv,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": grp_n,
+            "RESCALE_OPT": rescale_opt,
+            "USE_WHERE": where,  # used when RESCALE_OPT is True
+            "USE_WARP_BARRIER": uwb,
+        },
+        num_stages=1,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    )
+    for kv in [3, 6]
+    for grp_n in [1, 4]
+    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
+    for uwb in [False, True]
+]
+
+
+def prune_configs_by_hdim(configs, named_args, **kwargs):
+    HEAD_DIM = kwargs["HEAD_DIM"]
+    STAGE = kwargs["STAGE"]
+    target_kv_buffers = 6 if HEAD_DIM == 64 else 3
+    target_group_size_n = 4 if STAGE == 3 else 1
+    return [
+        conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
+        and conf.kwargs.get("GROUP_SIZE_N", 0) == target_group_size_n
+    ]
+
+
 @triton.jit
 def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
     bufIdx = accum_cnt % NUM_BUFFERS_KV
@@ -238,6 +275,11 @@ def _softmax_inner_loop(
     return m_i, l_i, accum_cnt_qk
 
 
+@triton.autotune(
+    configs=configs,
+    key=["N_CTX", "HEAD_DIM", "STAGE"],
+    prune_configs_by={"early_config_prune": prune_configs_by_hdim},
+)
 @triton.jit
 def _attn_fwd_clc(
     sm_scale,
@@ -876,48 +918,53 @@ def attention(q, k, v, sm_scale, causal, config=None):
     desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
     desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
 
-    if config is None:
-        config = {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
-            "NUM_BUFFERS_QK": 1,
-            "NUM_MMA_GROUPS": 2,
-            "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": 1,
-            "RESCALE_OPT": False,
-            "USE_WHERE": False,
-        }
-
-    # Apply pre_hook to set block shapes
-    nargs = {**config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o}
-    _host_descriptor_pre_hook(nargs)
-
     def alloc_fn(size: int, align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
 
     triton.set_allocator(alloc_fn)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    total_tiles = triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1]
-    grid = (total_tiles, 1, 1)
-    _attn_fwd_clc[grid](
-        sm_scale,
-        M,
-        q.shape[0],
-        q.shape[1],
-        desc_q,
-        desc_k,
-        desc_v,
-        desc_o,
-        N_CTX=q.shape[2],
-        HEAD_DIM=HEAD_DIM_K,
-        STAGE=stage,
-        NUM_SMS=NUM_SMS,
-        NUM_CLC_STAGES=1,
-        num_stages=1,
-        num_warps=4,
-        **config,
-    )
+
+    if config is None:
+        # Autotuned path
+        grid = lambda META: (triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1], )
+        _attn_fwd_clc[grid](
+            sm_scale,
+            M,
+            q.shape[0],
+            q.shape[1],
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            N_CTX=q.shape[2],
+            HEAD_DIM=HEAD_DIM_K,
+            STAGE=stage,
+            NUM_SMS=NUM_SMS,
+            NUM_CLC_STAGES=1,
+        )
+    else:
+        # Non-autotuned path with explicit config
+        nargs = {
+            **config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o
+        }
+        _host_descriptor_pre_hook(nargs)
+
+        grid = (triton.cdiv(q.shape[2], config["BLOCK_M"]) * q.shape[0] * q.shape[1], 1, 1)
+        _attn_fwd_clc.fn[grid](
+            sm_scale,
+            M,
+            q.shape[0],
+            q.shape[1],
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            N_CTX=q.shape[2],
+            HEAD_DIM=HEAD_DIM_K,
+            STAGE=stage,
+            NUM_SMS=NUM_SMS,
+            NUM_CLC_STAGES=1,
+            **config,
+        )
     return o
