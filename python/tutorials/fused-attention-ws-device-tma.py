@@ -1259,7 +1259,7 @@ class _attention_opt(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 128
             else:
                 extra_kern_args["maxnreg"] = 128
-        if True:  # persistent: forward non-persistent has some issues
+        if persistent:
             _attn_fwd_persist[grid_persist](
                 sm_scale,
                 M,  #
@@ -1475,18 +1475,30 @@ attention = _attention_opt.apply
 @pytest.mark.parametrize("Z", [8])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("N_CTX", [1024])  #, 2048])
-@pytest.mark.parametrize("HEAD_DIM", [128])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("baseVariant", ["ws_persistent"])
+@pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
 @pytest.mark.parametrize("provider", ["triton-fp16"])
 @pytest.mark.parametrize("SUBTILING", [False, True])
 @pytest.mark.parametrize("VECT_MUL", [0])  #, 1, 2, 3])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILING, VECT_MUL, FADD2_REDUCE,
+@pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, mode, baseVariant, provider, SUBTILING, VECT_MUL, FADD2_REDUCE, bwd_config_idx,
             dtype=torch.float16):
+    # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
+    if mode == "fwd" and bwd_config_idx > 0:
+        pytest.skip("bwd_config_idx only applies to bwd mode")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
+    if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
+        pytest.skip("bwd_config_idx of 1 does not work with hDim 64")
+    if mode == "bwd" and baseVariant == "ws_persistent":
+        _attn_bwd_persist.configs = [configs_bwd_persist[bwd_config_idx]]
+        _attn_bwd_persist.cache = {}
+    if mode == "bwd" and baseVariant == "ws":
+        _attn_bwd.configs = [configs_bwd_persist[bwd_config_idx]]
+        _attn_bwd.cache = {}
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -1552,8 +1564,8 @@ TORCH_HAS_FP8 = False
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [128]:  #64, 128]:
-    for baseVariant in ["ws", "ws_persistent"]:
+for HEAD_DIM in [64, 128]:
+    for baseVariant in ["ws_persistent"]:
         for mode in ["fwd", "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
