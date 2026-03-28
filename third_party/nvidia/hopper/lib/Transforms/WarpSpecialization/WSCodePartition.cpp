@@ -19,6 +19,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -3364,6 +3365,37 @@ void doBufferAllocation(triton::FuncOp &funcOp) {
   separateLocalAllocWithSrc(funcOp);
 }
 
+// Ensure all ops inside regions of partition-bearing ops have partition IDs.
+// This satisfies the partition verifier which requires ALL child ops of an op
+// with kPartitionAttrName to also have it.
+static void assignMissingPartitionIds(triton::FuncOp &funcOp) {
+  funcOp->walk([&](Operation *op) {
+    if (!op->hasAttr(ttg::kPartitionAttrName) || op->getNumRegions() == 0)
+      return;
+    auto parentIds = ttg::getPartitionIds(op);
+    if (!parentIds)
+      return;
+    for (auto &region : op->getRegions()) {
+      for (auto &block : region.getBlocks()) {
+        for (auto &childOp : block.getOperations()) {
+          if (isa<scf::YieldOp, tt::ReduceReturnOp>(childOp))
+            continue;
+          if (!childOp.hasAttr(ttg::kPartitionAttrName))
+            ttg::setPartition(&childOp, *parentIds);
+        }
+      }
+    }
+  });
+  // Remove partition attribute from non-ForOp region-bearing ops so the
+  // verifier can infer their partition sets from their children.
+  funcOp->walk([&](Operation *op) {
+    if (!isa<scf::ForOp>(op) && op->hasAttr(ttg::kPartitionAttrName) &&
+        op->getNumRegions() > 0) {
+      op->removeAttr(ttg::kPartitionAttrName);
+    }
+  });
+}
+
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -3461,6 +3493,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  assignMissingPartitionIds(funcOp);
 }
 
 void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
@@ -3666,6 +3699,7 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  assignMissingPartitionIds(funcOp);
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSCODEPARTITION

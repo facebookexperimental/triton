@@ -266,6 +266,12 @@ void createTMALoad(triton::nvws::DescriptorLoadOp op, PatternRewriter &rewriter,
   auto indices = translateTMAIndices(
       rewriter, op.getLoc(),
       op.getDesc().getType().getBlockType().getEncoding(), op.getIndices());
+  for (auto [newIdx, oldIdx] : llvm::zip(indices, op.getIndices())) {
+    if (newIdx != oldIdx) {
+      assignStageCluster(newIdx.getDefiningOp(), getPartitionIds(op),
+                         getStageCluster(op), rewriter);
+    }
+  }
   auto newLoadOp =
       triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp::create(
           rewriter, op.getLoc(), /*multicastTargets*/ Value(), op.getDesc(),
@@ -782,11 +788,15 @@ void combineArefs(scf::ForOp loop) {
 
   // Arefs whose get-enter ops share the same dominant consumer can be combined
   DominanceInfo domInfo(loop);
-  llvm::DenseMap<Operation *, SmallVector<ArefGetEnterOp>> liveBeforeGroups;
+  llvm::DenseMap<std::pair<Operation *, int>, SmallVector<ArefGetEnterOp>>
+      liveBeforeGroups;
   for (auto getEnterOp : getEnterOps) {
     if (auto liveBeforeOp =
             getDominantConsumer(getEnterOp, *loop.getBody(), domInfo)) {
-      liveBeforeGroups[liveBeforeOp].push_back(getEnterOp);
+      auto partitionIds = getPartitionIds(getEnterOp);
+      assert(partitionIds && partitionIds->size() == 1);
+      liveBeforeGroups[{liveBeforeOp, partitionIds->front()}].push_back(
+          getEnterOp);
     }
   }
 

@@ -388,7 +388,7 @@ static void logOpStillHasUsers(Operation *op) {
   LLVM_DEBUG({
     llvm::errs() << "Op still has users: " << op->getName();
     if (auto partitionAttr =
-            op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+            op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
       llvm::errs() << " (partition: " << partitionAttr << ")";
     }
     auto taskIds = getAsyncTaskIds(op);
@@ -422,7 +422,7 @@ static void logOpStillHasUsers(Operation *op) {
         // llvm::errs() << "  Full IR: ";
         // user->print(llvm::errs());
         if (auto userPartitionAttr =
-                user->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+                user->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
           llvm::errs() << " (partition: " << userPartitionAttr << ")";
         }
         auto userTaskIds = getAsyncTaskIds(user);

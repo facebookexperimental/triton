@@ -1691,6 +1691,55 @@ void PartitionSchedulingMeta::runOnOperation() {
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
+
+      // Assign partition IDs to all remaining ops inside the loop that don't
+      // have one yet. This mirrors upstream's assignRegionBodyPartition and
+      // assignRegionOpPartitions to satisfy the partition verifier which
+      // requires ALL ops inside a WS loop to have partition attributes.
+
+      // Step 1: For ops nested inside regions (e.g. tt.reduce body, scf.if
+      // body), inherit the partition from the nearest ancestor op that has one.
+      loop->walk([&](Operation *op) {
+        if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
+          return WalkResult::advance();
+
+        // Find the nearest ancestor in the loop body that has a partition.
+        Operation *ancestor = op->getParentOp();
+        while (ancestor && ancestor != loop.getOperation()) {
+          if (auto ids = getPartitionIds(ancestor)) {
+            setPartition(op, *ids);
+            break;
+          }
+          ancestor = ancestor->getParentOp();
+        }
+        return WalkResult::advance();
+      });
+
+      // Step 2: Remove partition attribute from non-ForOp ops that have
+      // regions (e.g. tt.reduce, scf.if). The partition verifier infers
+      // their partition sets from their children's partitions.
+      loop->walk([&](Operation *op) {
+        if (!isa<scf::ForOp>(op) && hasPartition(op) &&
+            op->getNumRegions() > 0) {
+          op->removeAttr(kPartitionAttrName);
+        }
+      });
+
+      // Step 3: Handle ops without results that still need partition
+      // assignments (e.g. llvm.intr.assume, debug intrinsics). These inherit
+      // from their parent operation.
+      loop.walk([&](Operation *op) {
+        if (op->getNumResults() > 0 || hasPartition(op))
+          return WalkResult::advance();
+        if (op->getNumRegions() > 0 ||
+            isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+          return WalkResult::advance();
+        auto parentOp = op->getParentOp();
+        if (auto parentPartitionIds = getPartitionIds(parentOp))
+          setPartition(op, *parentPartitionIds);
+        return WalkResult::advance();
+      });
+
       // Clean Broadcast/ExpandDims/ConvertLayout that were left with no users
       // after optimizeSchedule. We wait until after the schedule is serialized
       // to avoid invalidating pointers stored in the schedule.

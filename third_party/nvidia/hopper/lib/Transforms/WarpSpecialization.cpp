@@ -60,7 +60,7 @@ public:
     funcOp->walk([&](Operation *op) {
       if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
         enabled = true;
-      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName))
+      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(triton::gpu::kPartitionAttrName))
         enabled = true;
     });
     if (!enabled) {
