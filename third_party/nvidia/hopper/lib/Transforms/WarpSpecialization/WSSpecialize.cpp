@@ -326,7 +326,7 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   }
   if (createNewYield) {
     auto newYieldOp =
-        forBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
+        scf::YieldOp::create(forBuilder, yieldOp.getLoc(), newYieldOperands);
     setAsyncTaskIds(newYieldOp, {asyncTaskId});
   }
 
@@ -536,8 +536,8 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
   impB.setInsertionPoint(returnOp);
-  auto wsOp = impB.create<ttg::WarpSpecializeOp>(dummyTypes, partitionNumWarps,
-                                                 nTaskIds.size() - 1);
+  auto wsOp = ttg::WarpSpecializeOp::create(impB, dummyTypes, partitionNumWarps,
+                                            nTaskIds.size() - 1);
 
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.
@@ -565,7 +565,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
     SmallVector<Value> opnds;
-    taskBuilder.create<ttg::WarpYieldOp>(loc, opnds);
+    ttg::WarpYieldOp::create(taskBuilder, loc, opnds);
   }
 
   unsigned idx = 1;
@@ -611,7 +611,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     for (Operation *op : opList) {
       SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
     }
-    taskBuilder.create<ttg::WarpReturnOp>(loc);
+    ttg::WarpReturnOp::create(taskBuilder, loc);
   }
 
   // The capture set is the same for every partition region, so now find the

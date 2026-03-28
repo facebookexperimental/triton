@@ -35,7 +35,7 @@ static void convertOpTypes(Operation *op, const TypeConverter &typeConverter) {
     Type type = typeConverter.convertType(operand.getType());
     if (type != operand.getType()) {
       operand =
-          b.create<UnrealizedConversionCastOp>(type, operand).getResult(0);
+          UnrealizedConversionCastOp::create(b, type, operand).getResult(0);
     }
   }
   op->setOperands(operands);
@@ -45,7 +45,7 @@ static void convertOpTypes(Operation *op, const TypeConverter &typeConverter) {
     for (BlockArgument arg : llvm::to_vector(region.getArguments())) {
       Type type = typeConverter.convertType(arg.getType());
       BlockArgument newArg = region.addArgument(type, arg.getLoc());
-      auto cast = b.create<UnrealizedConversionCastOp>(arg.getType(), newArg);
+      auto cast = UnrealizedConversionCastOp::create(b, arg.getType(), newArg);
       arg.replaceAllUsesWith(cast.getResult(0));
       region.eraseArgument(0);
     }
@@ -65,7 +65,7 @@ static void convertOpTypes(Operation *op, const TypeConverter &typeConverter) {
   SmallVector<Value> results;
   for (auto [i, result, type] :
        llvm::enumerate(newOp->getResults(), op->getResultTypes())) {
-    auto cast = b.create<UnrealizedConversionCastOp>(type, result);
+    auto cast = UnrealizedConversionCastOp::create(b, type, result);
     op->getResult(i).replaceAllUsesWith(cast.getResult(0));
   }
   op->erase();
@@ -92,7 +92,8 @@ static void createBarrier(TritonLLVMIRRewriter &b, unsigned barIdx,
   if (numThreads == 32)
     LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
   else
-    b.create<NVVM::BarrierOp>(b.i32_val(barIdx), b.i32_val(numThreads));
+    NVVM::BarrierOp::create(b, b.getLoc(), b.i32_val(barIdx),
+                            b.i32_val(numThreads));
 }
 
 static void createAllBarrier(TritonLLVMIRRewriter &b, unsigned barIdx) {
@@ -190,7 +191,7 @@ static void createRegRealloc(TritonLLVMIRRewriter &b, int curRegs,
     return;
   auto action = adjRegs < curRegs ? NVVM::SetMaxRegisterAction::decrease
                                   : NVVM::SetMaxRegisterAction::increase;
-  b.create<NVVM::SetMaxRegisterOp>(adjRegs, action);
+  NVVM::SetMaxRegisterOp::create(b, b.getLoc(), adjRegs, action);
 }
 
 // Assign hardware barriers to each warp group and rewrite warp group barriers
@@ -371,7 +372,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   b.setInsertionPointToStart(header);
 
   // This is the absolute thread ID.
-  Value tid = b.create<NVVM::ThreadIdXOp>(i32_ty);
+  Value tid = NVVM::ThreadIdXOp::create(b, b.getLoc(), i32_ty);
   Value wid = b.udiv(tid, b.i32_val(threadsPerWarp));
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
@@ -380,13 +381,13 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     // Non default warps should just do a cluster arrive unconditionally
     PTXBuilder ptxBuilder;
     auto clusterArriveOp =
-        *ptxBuilder.create<>("@!$0 barrier.cluster.arrive.aligned;");
+        *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
     clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
                     /*onlyAttachMLIRArgs=*/true);
     auto voidTy = void_ty(ctx);
     ptxBuilder.launch(b, func.getLoc(), voidTy);
   }
-  b.create<LLVM::CondBrOp>(isDefault, entry, switchLoop);
+  LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
 
   // Forward arguments from the header into the old entry block.
   for (auto [arg, oldArg] :
@@ -461,7 +462,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   b.setInsertionPointToStart(defaultBlock);
   createAllBarrier(b, kSwitchLoopBarrierIdx);
   createAllBarrier(b, kSwitchLoopBarrierIdx);
-  auto latchBr = b.create<LLVM::BrOp>(switchLoop);
+  auto latchBr = LLVM::BrOp::create(b, b.getLoc(), switchLoop);
   disableLICM(latchBr);
 
   // Exit state.
@@ -475,9 +476,9 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   SmallVector<APInt> caseValues;
   for (int32_t state : partitionStates)
     caseValues.push_back(APInt(8, state));
-  b.create<LLVM::SwitchOp>(warpState, defaultBlock, ValueRange(), caseValues,
-                           partitionBlocks,
-                           SmallVector<ValueRange>(partitionBlocks.size()));
+  LLVM::SwitchOp::create(b, b.getLoc(), warpState, defaultBlock, ValueRange(),
+                         caseValues, partitionBlocks,
+                         SmallVector<ValueRange>(partitionBlocks.size()));
 
   // Now add synchronization around the default regions.
   for (auto [ws, stateMap] : llvm::zip(wsOps, warpToState)) {
@@ -511,7 +512,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     if (auto actRegs = ws.getActualRegisters())
       createRegRealloc(b, defRegs, actRegs->front());
     createAllBarrier(b, kSwitchLoopBarrierIdx);
-    b.create<LLVM::BrOp>(&ws.getDefaultRegion().front());
+    LLVM::BrOp::create(b, b.getLoc(), &ws.getDefaultRegion().front());
 
     ws.getDefaultRegion().walk([&, ws = ws](WarpYieldOp op) mutable {
       TritonLLVMIRRewriter b(op.getLoc(), op);
@@ -541,7 +542,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     createAllBarrier(b, kSwitchLoopBarrierIdx);
   });
   b.setInsertionPointToStart(switchExit);
-  b.create<LLVM::ReturnOp>(ValueRange());
+  LLVM::ReturnOp::create(b, b.getLoc(), ValueRange());
 
   return success();
 }

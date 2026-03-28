@@ -58,7 +58,8 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   if (enableSourceRemat) {
     addSourceMaterialization([](OpBuilder &builder, RankedTensorType tensorType,
                                 ValueRange inputs, Location loc) -> Value {
-      return builder.create<UnrealizedConversionCastOp>(loc, tensorType, inputs)
+      return UnrealizedConversionCastOp::create(builder, loc, tensorType,
+                                                inputs)
           .getResult(0);
     });
   }
@@ -69,7 +70,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   addTargetMaterialization([](OpBuilder &builder, RankedTensorType tensorType,
                               ValueRange inputs, Location loc) {
     auto cast =
-        builder.create<triton::gpu::ConvertLayoutOp>(loc, tensorType, inputs);
+        triton::gpu::ConvertLayoutOp::create(builder, loc, tensorType, inputs);
     return cast.getResult();
   });
 }
@@ -207,7 +208,8 @@ static LogicalResult convertGatherScatterIndices(Operation *op,
       getNewIndicesType(type, lookupThreadsPerWarp(b), lookupNumWarps(op));
   if (!newType)
     return failure();
-  Value index = b.create<ConvertLayoutOp>(op->getLoc(), newType, indices.get());
+  Value index =
+      ConvertLayoutOp::create(b, op->getLoc(), newType, indices.get());
   indices.set(index);
   return success();
 }

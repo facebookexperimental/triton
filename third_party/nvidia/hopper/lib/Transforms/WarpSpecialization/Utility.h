@@ -74,7 +74,7 @@ public:
 
   template <typename OpTy, typename... Args>
   OpTy createWithAsyncTaskIds(Args &&...args) {
-    OpTy op = OpBuilder::create<OpTy>(std::forward<Args>(args)...);
+    OpTy op = OpTy::create(*this, std::forward<Args>(args)...);
     if (!asyncTaskIds.empty())
       setAsyncTaskIds(op, asyncTaskIds);
     setOpLoopScheduleInfo(op);

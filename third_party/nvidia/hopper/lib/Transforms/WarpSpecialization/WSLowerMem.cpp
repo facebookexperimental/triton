@@ -164,8 +164,8 @@ Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
   auto viewDescType = triton::gpu::MemDescType::get(
       shape, allocDescType.getElementType(), allocDescType.getEncoding(),
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
-  return builder.create<triton::gpu::MemDescIndexOp>(alloc.getLoc(),
-                                                     viewDescType, alloc, idx);
+  return triton::gpu::MemDescIndexOp::create(builder, alloc.getLoc(),
+                                             viewDescType, alloc, idx);
 }
 
 // For the case where the value shared in (producer, consumer) is in smem.

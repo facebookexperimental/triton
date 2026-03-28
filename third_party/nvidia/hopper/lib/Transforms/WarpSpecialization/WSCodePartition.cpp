@@ -765,13 +765,13 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   Type singleBarrierMemDescType = ttg::MemDescType::get(
       {1}, builder.getI64Type(), barrierEncoding,
       barrierMemDescType.getMemorySpace(), /*mutableMemory=*/true);
-  Value barrierAlloc = builder.create<mlir::triton::gpu::LocalAllocOp>(
-      loc, barrierMemDescType, Value());
+  Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
+      builder, loc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
-    Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
-    Value barrierView = builder.create<ttg::MemDescIndexOp>(
-        loc, singleBarrierMemDescType, barrierAlloc, idx);
-    builder.create<ttng::InitBarrierOp>(funcOp->getLoc(), barrierView, 1);
+    Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
+    Value barrierView = ttg::MemDescIndexOp::create(
+        builder, loc, singleBarrierMemDescType, barrierAlloc, idx);
+    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView, 1);
   }
   return barrierAlloc;
 }
@@ -911,11 +911,11 @@ void createToken(
         }
         Value v;
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
-          v = builder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), channel->getNumBuffers(), tokenLoadType);
+          v = ttnvws::CreateTokenOp::create(builder, funcOp.getLoc(),
+                                            channel->getNumBuffers(), tokenLoadType);
         else
-          v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
-                                                    tokenLoadType);
+          v = ttnvws::CreateTokenOp::create(builder, funcOp.getLoc(), 1,
+                                            tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
@@ -1622,9 +1622,9 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return builder.create<ttng::TMEMAllocOp>(
-      oldTMemAllocOp.getLoc(), accMemDescType,
-      builder.getType<ttg::AsyncTokenType>(), /*src=*/Value());
+  return ttng::TMEMAllocOp::create(builder, oldTMemAllocOp.getLoc(),
+                                   accMemDescType,
+                                   builder.getType<ttg::AsyncTokenType>(), /*src=*/Value());
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,

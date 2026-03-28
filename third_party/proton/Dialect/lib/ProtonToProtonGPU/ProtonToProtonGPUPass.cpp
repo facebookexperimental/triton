@@ -90,28 +90,28 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
         auto profileMemArg = block.getArgument(argNum - 1);
 
         // Create a new segment for the worker warp.
-        Value newSegment = builder.create<gpu::SegmentAllocOp>(
-            loc, segment.getType(), bufferArg);
+        Value newSegment = gpu::SegmentAllocOp::create(
+            builder, loc, segment.getType(), bufferArg);
 
         // Restore warp-level context before profiling.
-        builder.create<gpu::RestoreCtxOp>(loc, newSegment, profileMemArg);
+        gpu::RestoreCtxOp::create(builder, loc, newSegment, profileMemArg);
 
         // Replace all proton::RecordOp.
         partition.walk([&](proton::RecordOp record) {
           builder.setInsertionPoint(record);
 
           Value counter =
-              builder.create<gpu::ReadCounterOp>(loc, clkType, metricType);
+              gpu::ReadCounterOp::create(builder, loc, clkType, metricType);
           int scopeId = scopeInfo.getOpScopeId(record);
-          builder.create<gpu::CircularStoreOp>(loc, newSegment, counter,
-                                               record.getIsStart(), scopeId);
+          gpu::CircularStoreOp::create(builder, loc, newSegment, counter,
+                                       record.getIsStart(), scopeId);
           record.erase();
         });
 
         // Save warp-level context after profiling.
         partition.walk([&](triton::gpu::WarpReturnOp ret) {
           builder.setInsertionPoint(ret);
-          builder.create<gpu::SaveCtxOp>(loc, newSegment, profileMemArg);
+          gpu::SaveCtxOp::create(builder, loc, newSegment, profileMemArg);
         });
       }
     }
@@ -124,10 +124,10 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
   func->walk([&](proton::RecordOp record) {
     builder.setInsertionPoint(record);
     Value counter =
-        builder.create<gpu::ReadCounterOp>(loc, clkType, metricType);
+        gpu::ReadCounterOp::create(builder, loc, clkType, metricType);
     int scopeId = scopeInfo.getOpScopeId(record);
-    builder.create<gpu::CircularStoreOp>(loc, segment, counter,
-                                         record.getIsStart(), scopeId);
+    gpu::CircularStoreOp::create(builder, loc, segment, counter,
+                                 record.getIsStart(), scopeId);
     record.erase();
   });
 
@@ -317,7 +317,7 @@ public:
 
     if (hasOperator<Operation, triton::gpu::WarpSpecializeOp>(
             func.getOperation()))
-      builder.create<gpu::InitCtxOp>(loc, profileMem);
+      gpu::InitCtxOp::create(builder, loc, profileMem);
     instrumentWarpSpecializeOps(func, buffer, profileMem);
 
     if (failed(replaceProtonRecordOp(builder, func, segment, metricType,
@@ -326,8 +326,8 @@ public:
 
     func.walk([&](triton::ReturnOp ret) {
       builder.setInsertionPoint(ret);
-      builder.create<mlir::gpu::BarrierOp>(loc);
-      builder.create<gpu::FinalizeOp>(loc, segment, profileMem);
+      mlir::gpu::BarrierOp::create(builder, loc);
+      gpu::FinalizeOp::create(builder, loc, segment, profileMem);
     });
 
     return success();

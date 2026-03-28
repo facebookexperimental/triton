@@ -123,7 +123,7 @@ Value createCachePolicy(triton::EvictionPolicy opEvict,
 
   if (hasL2EvictPolicy && hardwareSupport) {
     auto &policy =
-        ptxBuilder.create<>("createpolicy.fractional")
+        ptxBuilder.create("createpolicy.fractional")
             ->o("L2::evict_first",
                 opEvict == triton::EvictionPolicy::EVICT_FIRST)
             .o("L2::evict_last", opEvict == triton::EvictionPolicy::EVICT_LAST)
@@ -314,7 +314,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         for (size_t ii = 0; ii < nWords; ++ii) {
           // PTX doesn't support mov.u8, so we need to use mov.u16
           PTXInstr &mov =
-              ptxBuilder.create<>("mov")->o("u" + std::to_string(movWidth));
+              ptxBuilder.create("mov")->o("u" + std::to_string(movWidth));
 
           size_t size = width / valueElemNBits;
 
@@ -351,7 +351,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
           createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
 
       // Define the instruction opcode
-      auto &ld = ptxBuilder.create<>("ld")
+      auto &ld = ptxBuilder.create("ld")
                      ->o("volatile", op.getIsVolatile())
                      .global()
                      .o("ca", op.getCache() == triton::CacheModifier::CA)
@@ -538,7 +538,7 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
           createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
 
       auto &ptxStoreInstr =
-          ptxBuilder.create<>("st")
+          ptxBuilder.create("st")
               ->global()
               .o("wb", op.getCache() == triton::CacheModifier::WB)
               .o("cg", op.getCache() == triton::CacheModifier::CG)
@@ -577,8 +577,8 @@ void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
   if (numCTAs == 1) {
     b.barrier();
   } else {
-    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
-    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
+    triton::nvidia_gpu::ClusterArriveOp::create(rewriter, loc, false);
+    triton::nvidia_gpu::ClusterWaitOp::create(rewriter, loc);
   }
 }
 
@@ -643,7 +643,7 @@ struct AtomicCASOpConversion
       auto *ptrOpr = ptxBuilderAtomicCAS.newAddrOperand(casPtr, "l");
       auto *cmpOpr = ptxBuilderAtomicCAS.newOperand(casCmp, tyId);
       auto *valOpr = ptxBuilderAtomicCAS.newOperand(casVal, tyId);
-      auto &atom = *ptxBuilderAtomicCAS.create<PTXInstr>("atom");
+      auto &atom = *ptxBuilderAtomicCAS.create("atom");
       auto sTy = "b" + std::to_string(valueElemNBits);
       std::string semStr;
       llvm::raw_string_ostream os(semStr);
@@ -669,7 +669,7 @@ struct AtomicCASOpConversion
         PTXBuilder ptxBuilderStore;
         auto *dstOprStore = ptxBuilderStore.newAddrOperand(atomPtr, "r");
         auto *valOprStore = ptxBuilderStore.newOperand(old, tyId);
-        auto &st = *ptxBuilderStore.create<PTXInstr>("st");
+        auto &st = *ptxBuilderStore.create("st");
         st.shared().o(sTy);
         st(dstOprStore, valOprStore).maybePredicate(threadPred);
         auto ASMReturnTy = void_ty(ctx);
@@ -852,8 +852,8 @@ public:
       if (doPTXLDPromotion) {
         Type convertedValueTy =
             getTypeConverter()->convertType(getElementTypeOrSelf(op.getType()));
-        auto loadAcquireOp = rewriter.create<triton::nvgpu::LoadAcquireOp>(
-            op.getLoc(), convertedValueTy, rmwPtr, pred,
+        auto loadAcquireOp = triton::nvgpu::LoadAcquireOp::create(
+            rewriter, op.getLoc(), convertedValueTy, rmwPtr, pred,
             op.getSem() == triton::MemSemantic::ACQUIRE
                 ? triton::nvgpu::MemSemantic::ACQUIRE
                 : triton::nvgpu::MemSemantic::RELAXED,
@@ -902,23 +902,22 @@ public:
                             ? nullptr
                             : LLVM::getSharedMemoryBase(
                                   loc, rewriter, targetInfo, op.getOperation());
-        rewriter.create<LLVM::CondBrOp>(loc, pred, atomicBlock, endBlock,
-                                        undefVal);
+        LLVM::CondBrOp::create(rewriter, loc, pred, atomicBlock, endBlock,
+                               undefVal);
 
         // Codegen the atomic-rmw instruction(s)
         rewriter.setInsertionPointToEnd(atomicBlock);
-        Value atom = rewriter
-                         .create<LLVM::AtomicRMWOp>(
-                             loc, *llvmAtomicBinOp, rmwPtr, valElements[i],
-                             *llvmAtomicMemOrdering, StringRef("device"))
-                         .getResult();
+        Value atom =
+            LLVM::AtomicRMWOp::create(rewriter, loc, *llvmAtomicBinOp, rmwPtr,
+                                      valElements[i], *llvmAtomicMemOrdering,
+                                      StringRef("device"))
+                .getResult();
         // Handle the 2 bf16 case
         if (packed == 2 && valueElemNBits == 16) {
-          Value atom2 = rewriter
-                            .create<LLVM::AtomicRMWOp>(
-                                loc, *llvmAtomicBinOp, ptrElements[i + 1],
-                                valElements[i + 1], *llvmAtomicMemOrdering,
-                                StringRef("device"))
+          Value atom2 = LLVM::AtomicRMWOp::create(
+                            rewriter, loc, *llvmAtomicBinOp, ptrElements[i + 1],
+                            valElements[i + 1], *llvmAtomicMemOrdering,
+                            StringRef("device"))
                             .getResult();
           auto vecTy = vec_ty(valueElemTy, vec);
           auto tmp =
@@ -928,7 +927,7 @@ public:
 
         if (tensorTy) {
           // Return from predicated block
-          rewriter.create<LLVM::BrOp>(loc, atom, endBlock);
+          LLVM::BrOp::create(rewriter, loc, atom, endBlock);
 
           // Recover values from predicated block
           rewriter.setInsertionPointToStart(endBlock);
@@ -947,7 +946,7 @@ public:
           }
         } else {
           if (!doesAtomicNeedMEM) {
-            rewriter.create<LLVM::BrOp>(loc, atom, endBlock);
+            LLVM::BrOp::create(rewriter, loc, atom, endBlock);
             rewriter.eraseOp(op);
             // if type isn't a tensor and there is no need to write to SMEM then
             // we are done here
@@ -959,7 +958,7 @@ public:
           // Note: there is no need to use the BlockArgument here because
           //       the value is recovered from SMEM in the !tensorTy case
           b.store(atom, atomPtr);
-          rewriter.create<LLVM::BrOp>(loc, atom, endBlock);
+          LLVM::BrOp::create(rewriter, loc, atom, endBlock);
 
           // Recover values from predicated block (from SMEM)
           rewriter.setInsertionPointToStart(endBlock);
@@ -1009,7 +1008,7 @@ public:
       }
 
       auto scope = stringifyMemSyncScope(op.getScope()).str();
-      auto &atom = ptxBuilderAtomicRMW.create<>("atom")->global().o(scope);
+      auto &atom = ptxBuilderAtomicRMW.create("atom")->global().o(scope);
       auto rmwOp = stringifyRMWOp(atomicRmwAttr).str();
       auto sBits = std::to_string(valueElemNBits);
       switch (atomicRmwAttr) {
@@ -1218,7 +1217,7 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto structTy =
         LLVM::LLVMStructType::getLiteral(ctx, ArrayRef<Type>{ptrTy, i1_ty});
     for (int i = 0; i < srcElems.size(); i++) {
-      Value packedArr = rewriter.create<LLVM::UndefOp>(loc, structTy);
+      Value packedArr = LLVM::UndefOp::create(rewriter, loc, structTy);
       packedArr = b.insert_val(packedArr, srcElems[i], 0);
       auto maskElem = llMask ? maskElems[i] : b.false_val();
       packedArr = b.insert_val(packedArr, maskElem, 1);
@@ -1322,9 +1321,9 @@ struct AsyncCopyGlobalToLocalOpConversion
         warpId, rewriter, targetInfo, maxVec, emitCpAsync);
 
     // Drop the result token.
-    Value zero = rewriter.create<LLVM::ConstantOp>(
-        op.getLoc(), IntegerType::get(op.getContext(), 32),
-        rewriter.getI32IntegerAttr(0));
+    Value zero = LLVM::ConstantOp::create(rewriter, op.getLoc(),
+                                          IntegerType::get(op.getContext(), 32),
+                                          rewriter.getI32IntegerAttr(0));
     rewriter.replaceOp(op, zero);
     return success();
   }
@@ -1410,7 +1409,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto mod = op->getParentOfType<ModuleOp>();
     int numWarps = ttg::lookupNumWarps(op);
     int warpSize = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
-    Value warpID = rewriter.create<nvgpu::WarpIdOp>(loc);
+    Value warpID = nvgpu::WarpIdOp::create(rewriter, loc);
     Value pred = adaptor.getPred();
     // Select just one thread for the TMA copy. This also helps the compiler to
     // figure out that the op is uniform.
@@ -1436,7 +1435,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto kBlock = str_attr("block");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
     auto zero = b.i32_val(0);
-    auto ctaId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
+    auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
 
     // The bounding box inner dimension must be less than or equal to the
     // swizzle size.
@@ -1500,7 +1499,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       }
       tmaInst += ";";
 
-      auto &tma = *ptxBuilderTMA.create<>(tmaInst);
+      auto &tma = *ptxBuilderTMA.create(tmaInst);
       tma(operands, /*onlyAttachMLIRArgs=*/true);
       ptxBuilderTMA.launch(rewriter, loc, voidTy);
     }
@@ -1644,7 +1643,7 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
   auto mod = op->getParentOfType<ModuleOp>();
   int numWarps = ttg::lookupNumWarps(op);
   int warpSize = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
-  Value warpID = rewriter.create<nvgpu::WarpIdOp>(loc);
+  Value warpID = nvgpu::WarpIdOp::create(rewriter, loc);
   auto shapePerCTA = ttg::getShapePerCTA(srcTy);
   int elementsPerCTA = product(shapePerCTA);
 
@@ -1661,7 +1660,7 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
   auto kBlock = str_attr("block");
   auto numCopies = msgToOffset.getInDimSize(kMsg);
   auto zero = b.i32_val(0);
-  auto ctaId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
+  auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
 
   for (int copyIdx = 0; copyIdx < numCopies; copyIdx += numWarps) {
     int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
@@ -1694,14 +1693,14 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
     // Add L2 cache policy operand if specified
     if (l2PolicyReg)
       operands.push_back(ptxBuilderTMA.newOperand(l2PolicyReg, "l"));
-    auto &tma = *ptxBuilderTMA.create<>(tmaInst);
+    auto &tma = *ptxBuilderTMA.create(tmaInst);
     tma(operands, /*onlyAttachMLIRArgs=*/true);
     ptxBuilderTMA.launch(rewriter, loc, voidTy);
   }
 
   // TODO: Separate the syncronizations operations into separate TTGIR ops to
   // be able to schedule them at the high level.
-  rewriter.create<NVVM::CpAsyncBulkCommitGroupOp>(loc);
+  NVVM::CpAsyncBulkCommitGroupOp::create(rewriter, loc);
 
   rewriter.eraseOp(op);
   return success();
@@ -1898,8 +1897,8 @@ static LogicalResult iterateGatherScatterIndices(
   if (freeVars[kLane] != (threadsPerWarp - 1))
     return op->emitError("x offsets must be broadcasted across each warp");
 
-  Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
-  Value blockId = rewriter.create<nvgpu::ClusterCTAIdOp>(loc);
+  Value warpId = nvgpu::WarpIdOp::create(rewriter, loc);
+  Value blockId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
 
   // Mask out warps with redundant x offsets.
   pred = b.and_(pred,
@@ -1981,7 +1980,7 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
       operands.push_back(ptxBuilder.newOperand(xOffset, "r"));
     operands.push_back(ptxBuilder.newOperand(barrierMemObj.getBase(), "r"));
 
-    auto &tma = *ptxBuilder.create<>(tmaInst);
+    auto &tma = *ptxBuilder.create(tmaInst);
     tma(operands, /*attachOnlyMLIRArgs=*/true);
     ptxBuilder.launch(rewriter, loc, voidTy);
   };
@@ -2032,7 +2031,7 @@ LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
       operands.push_back(ptxBuilder.newOperand(xOffset, "r"));
     operands.push_back(ptxBuilder.newOperand(shMemPtr, "r"));
 
-    auto &tma = *ptxBuilder.create<>(tmaInst);
+    auto &tma = *ptxBuilder.create(tmaInst);
     tma(operands, /*attachOnlyMLIRArgs=*/true);
     ptxBuilder.launch(rewriter, loc, voidTy);
   };
@@ -2045,7 +2044,7 @@ LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
 
   // TODO: Separate the syncronizations operations into separate TTGIR ops to
   // be able to schedule them at the high level.
-  rewriter.create<NVVM::CpAsyncBulkCommitGroupOp>(loc);
+  NVVM::CpAsyncBulkCommitGroupOp::create(rewriter, loc);
 
   rewriter.eraseOp(op);
   return success();
@@ -2066,8 +2065,8 @@ struct AsyncCopyMbarrierArriveOpConversion
         typeConverter->convertType(op.getBarrier().getType().getElementType()),
         rewriter);
     TritonLLVMOpBuilder b(loc, rewriter);
-    rewriter.create<NVVM::CpAsyncMBarrierArriveSharedOp>(
-        loc, barrierMemObj.getBase(), noinc);
+    NVVM::CpAsyncMBarrierArriveSharedOp::create(rewriter, loc,
+                                                barrierMemObj.getBase(), noinc);
     op->erase();
     return success();
   }
@@ -2083,7 +2082,7 @@ struct AsyncWaitOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto num = op->getAttrOfType<IntegerAttr>("num");
-    rewriter.create<NVVM::CpAsyncWaitGroupOp>(loc, num);
+    NVVM::CpAsyncWaitGroupOp::create(rewriter, loc, num);
 
     // Drop the result token.
     TritonLLVMOpBuilder b(loc, rewriter);
@@ -2101,7 +2100,7 @@ struct AsyncCommitGroupOpConversion
   matchAndRewrite(triton::gpu::AsyncCommitGroupOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    rewriter.create<NVVM::CpAsyncCommitGroupOp>(loc);
+    NVVM::CpAsyncCommitGroupOp::create(rewriter, loc);
 
     // Drop the result token.
     TritonLLVMOpBuilder b(loc, rewriter);

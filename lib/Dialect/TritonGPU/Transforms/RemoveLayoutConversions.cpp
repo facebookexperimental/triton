@@ -599,8 +599,8 @@ Value LayoutPropagation::getValueAs(Value value, Attribute encoding) {
     OpBuilder rewriter(value.getContext());
     rewriter.setInsertionPointAfterValue(rewrittenValue);
     auto tmpType = tensorType.cloneWithEncoding(encoding);
-    Value converted = rewriter.create<ConvertLayoutOp>(value.getLoc(), tmpType,
-                                                       rewrittenValue);
+    Value converted = ConvertLayoutOp::create(rewriter, value.getLoc(), tmpType,
+                                              rewrittenValue);
     // TODO: we could cache the conversion.
     return converted;
   }
@@ -656,9 +656,9 @@ Operation *LayoutPropagation::rewriteForOp(scf::ForOp forOp) {
           getValueAs(operand, *layouts[result].encodings.begin());
     operands.push_back(convertedOperand);
   }
-  auto newForOp = rewriter.create<scf::ForOp>(
-      forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
-      forOp.getStep(), operands);
+  auto newForOp =
+      scf::ForOp::create(rewriter, forOp.getLoc(), forOp.getLowerBound(),
+                         forOp.getUpperBound(), forOp.getStep(), operands);
   newForOp->setAttrs(forOp->getAttrs());
   newForOp.getBody()->getOperations().splice(
       newForOp.getBody()->getOperations().begin(),
@@ -707,7 +707,7 @@ Operation *LayoutPropagation::rewriteWhileOp(scf::WhileOp whileOp) {
   }
 
   auto newWhileOp =
-      rewriter.create<scf::WhileOp>(whileOp.getLoc(), returnTypes, operands);
+      scf::WhileOp::create(rewriter, whileOp.getLoc(), returnTypes, operands);
   SmallVector<Type> argsTypesBefore;
   for (Value operand : operands)
     argsTypesBefore.push_back(operand.getType());
@@ -754,8 +754,8 @@ Operation *LayoutPropagation::rewriteIfOp(scf::IfOp ifOp) {
     Attribute encoding = *(it->second.encodings.begin());
     newResultTypes[i] = origType.cloneWithEncoding(encoding);
   }
-  auto newIfOp = rewriter.create<scf::IfOp>(ifOp.getLoc(), newResultTypes,
-                                            ifOp.getCondition(), true, true);
+  auto newIfOp = scf::IfOp::create(rewriter, ifOp.getLoc(), newResultTypes,
+                                   ifOp.getCondition(), true, true);
   newIfOp.getThenRegion().takeBody(ifOp.getThenRegion());
   newIfOp.getElseRegion().takeBody(ifOp.getElseRegion());
   for (auto [oldResult, newResult] :
@@ -849,7 +849,7 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
     Value src = getValueAs(convertOp.getSrc(), srcEncoding);
     auto tensorType = cast<RankedTensorType>(op->getResult(0).getType());
     auto newType = tensorType.cloneWithEncoding(encoding);
-    auto cvt = rewriter.create<ConvertLayoutOp>(op->getLoc(), newType, src);
+    auto cvt = ConvertLayoutOp::create(rewriter, op->getLoc(), newType, src);
     map(op->getResult(0), cvt.getResult());
     return cvt.getOperation();
   }
@@ -857,8 +857,8 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
     Operation *newOp = rewriter.clone(*op);
     auto tensorType = cast<RankedTensorType>(op->getResult(0).getType());
     auto newType = tensorType.cloneWithEncoding(encoding);
-    auto cvt = rewriter.create<ConvertLayoutOp>(op->getLoc(), newType,
-                                                newOp->getResult(0));
+    auto cvt = ConvertLayoutOp::create(rewriter, op->getLoc(), newType,
+                                       newOp->getResult(0));
     map(op->getResult(0), cvt.getResult());
     return cvt.getOperation();
   }
@@ -1049,7 +1049,7 @@ void LayoutRematerialization::rewriteSlice(SetVector<Value> &slice,
       for (int operandIdx : operandsToRewrite) {
         yieldOperands.push_back(mapping.lookup(yieldOp.getOperand(operandIdx)));
       }
-      builder.create<scf::YieldOp>(op->getLoc(), yieldOperands);
+      scf::YieldOp::create(builder, op->getLoc(), yieldOperands);
       op->erase();
       continue;
     }
@@ -1057,8 +1057,8 @@ void LayoutRematerialization::rewriteSlice(SetVector<Value> &slice,
       Operation *newOp = builder.clone(*op);
       auto tensorType = cast<RankedTensorType>(op->getResult(0).getType());
       auto newType = tensorType.cloneWithEncoding(layout[op->getResult(0)]);
-      auto cvt = builder.create<ConvertLayoutOp>(op->getLoc(), newType,
-                                                 newOp->getResult(0));
+      auto cvt = ConvertLayoutOp::create(builder, op->getLoc(), newType,
+                                         newOp->getResult(0));
       mapping.map(op->getResult(0), cvt.getResult());
       addRematValue(op->getResult(0), layout[op->getResult(0)],
                     cvt.getResult());
@@ -1496,8 +1496,8 @@ void LayoutRematerialization::hoistConvertDotOperand(
     if (!type)
       continue;
     auto newType = type.cloneWithEncoding(layout[loadOp->getResult(0)]);
-    auto newConvertOp = builder.create<ConvertLayoutOp>(
-        convertOp.getLoc(), newType, loadOp->getResult(0));
+    auto newConvertOp = ConvertLayoutOp::create(builder, convertOp.getLoc(),
+                                                newType, loadOp->getResult(0));
     mapping.map(loadOp->getResult(0), newConvertOp.getResult());
   }
 
@@ -1598,8 +1598,8 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   auto tensorType =
       cast<RankedTensorType>(extOrBroadcastOp->getOperand(0).getType());
   auto newType = tensorType.cloneWithEncoding(srcEncoding);
-  auto newConvertOp = builder.create<ConvertLayoutOp>(
-      convertOp.getLoc(), newType, extOrBroadcastOp->getOperand(0));
+  auto newConvertOp = ConvertLayoutOp::create(
+      builder, convertOp.getLoc(), newType, extOrBroadcastOp->getOperand(0));
   Operation *newExtOrBroadcast = builder.clone(*extOrBroadcastOp);
   newExtOrBroadcast->setOperand(0, newConvertOp.getResult());
   auto oldExtOrBroadcastType =
@@ -1712,7 +1712,7 @@ void LayoutRematerialization::hoistConvertIntoConditionals(
   auto hoistRemat = [&](OpBuilder &b, Value v, Attribute encoding) {
     auto tensorType = cast<RankedTensorType>(v.getType());
     auto newType = tensorType.cloneWithEncoding(encoding);
-    Value newCvt = b.create<ConvertLayoutOp>(convertOp.getLoc(), newType, v);
+    Value newCvt = ConvertLayoutOp::create(b, convertOp.getLoc(), newType, v);
 
     mapping.map(v, newCvt);
     slice.remove(v);

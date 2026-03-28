@@ -274,7 +274,7 @@ static void createGen5MMA(ConversionPatternRewriter &rewriter, Location loc,
   auto *bOp = ptxBuilder.newOperand(b, "l");
   auto *instDescOp = ptxBuilder.newOperand(instDescriptor, "r");
   auto *useInitAccOp = ptxBuilder.newOperand(useInitAcc, "b");
-  auto &mmaOp = *ptxBuilder.create<PTXInstr>(opcode);
+  auto &mmaOp = *ptxBuilder.create(opcode);
   mmaOp({accOp, aOp, bOp, instDescOp, useInitAccOp}).predicate(pred);
   ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
 }
@@ -310,7 +310,7 @@ static void createScaledGen5MMA(ConversionPatternRewriter &rewriter,
   auto *scaleAOp = ptxBuilder.newAddrOperand(scaleA, "r");
   auto *scaleBOp = ptxBuilder.newAddrOperand(scaleB, "r");
   auto *useInitAccOp = ptxBuilder.newOperand(useInitAcc, "b");
-  auto &mmaOp = *ptxBuilder.create<PTXInstr>(opcode);
+  auto &mmaOp = *ptxBuilder.create(opcode);
   mmaOp({accOp, aOp, bOp, instDescOp, scaleAOp, scaleBOp, useInitAccOp})
       .predicate(pred);
   ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
@@ -346,7 +346,7 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
   } else {
     opcode = "@$0 tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$1];";
   }
-  auto &barrierOp = *ptxBuilder.create<PTXInstr>(opcode);
+  auto &barrierOp = *ptxBuilder.create(opcode);
   barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
   ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
 }
@@ -403,7 +403,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
   // detect that tid.x == 0 is true only for 1 thread.
-  Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
+  Value warpId = nvgpu::WarpIdOp::create(rewriter, loc);
   Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(0));
   if (twoCTAs) {
     // - In TLX 2cta mode, we'll have explicit remote barrier arrival in kernel,
@@ -415,8 +415,8 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
     if (!tlxPairedMMA) {
       // TODO: we have to sync the two CTAs because we currently don't use
       // remove barriers for the copies.
-      rewriter.create<ttng::ClusterArriveOp>(loc, false);
-      rewriter.create<ttng::ClusterWaitOp>(loc);
+      ttng::ClusterArriveOp::create(rewriter, loc, false);
+      ttng::ClusterWaitOp::create(rewriter, loc);
     }
 
     Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
@@ -432,7 +432,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
   auto *mmaBlock = rewriter.createBlock(curBlock->getParent(),
                                         std::next(Region::iterator(curBlock)));
   rewriter.setInsertionPointToEnd(curBlock);
-  rewriter.create<LLVM::CondBrOp>(loc, pred, mmaBlock, endBlock);
+  LLVM::CondBrOp::create(rewriter, loc, pred, mmaBlock, endBlock);
   // Emit the rest in mmaBlock
   rewriter.setInsertionPointToEnd(mmaBlock);
 
@@ -517,7 +517,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
         LLVM::getSharedMemoryObjectFromStruct(loc, barrier, i64_ty, rewriter);
     createMMACommit(rewriter, loc, smemObj.getBase(), commitPred, twoCTAs);
   }
-  rewriter.create<LLVM::BrOp>(loc, endBlock);
+  LLVM::BrOp::create(rewriter, loc, endBlock);
 }
 
 void convertDot(const LLVMTypeConverter &typeConverter,
