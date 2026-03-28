@@ -281,8 +281,8 @@ def _pick_sum_dtype(in_dtype, dtype):
 
 @core._tensor_member_fn
 @jit
-@core._add_reduction_docstr("sum", dtype_arg="dtype")
-def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None):
+@core._add_reduction_docstr("sum", dtype_arg="dtype", reduction_ordering_arg="reduction_ordering")
+def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
     # Pick a default dtype for the reduction if one was not specified.
     out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
 
@@ -298,7 +298,7 @@ def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None):
     # https://fb.workplace.com/groups/1405155842844877/posts/24616028937997573/?comment_id=24616575671276233&reply_comment_id=24617223141211486
     # Facebook. end
 
-    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims)
+    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
 
 
 @jit
