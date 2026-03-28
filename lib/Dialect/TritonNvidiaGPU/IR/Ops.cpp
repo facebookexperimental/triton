@@ -30,6 +30,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.cpp.inc"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -712,29 +713,31 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   if (isa<triton::tlx::DummyRegisterLayoutAttr>(type.getEncoding()))
     return success();
 
-  auto enc = dyn_cast<DistributedEncodingTrait>(type.getEncoding());
-  if (!enc) {
-    return op->emitOpError(regName)
-           << " does not have an distributed encoding";
-  }
+  if (isDistributedLayoutTMemCompatible(op, type, memdesc))
+    return success();
+
+  // isDistributedLayoutTMemCompatible has a coverage gap for
+  // getTmemLoadLayoutSplitLongM layouts. Fall back to checking if the current
+  // layout matches any of the compatible layouts enumerated by
+  // getTmemCompatibleLayouts.
   SmallVector<DistributedEncodingTrait> layouts =
       getTmemCompatibleLayouts(op, type, memdesc);
-  if (layouts.empty()) {
-    return op->emitOpError(regName)
-           << " does not have any TMEM compatible layouts";
+  auto encoding = dyn_cast<triton::gpu::LayoutEncodingTrait>(type.getEncoding());
+  if (encoding) {
+    for (auto &layout : layouts) {
+      if (triton::gpu::areLayoutsEquivalent(
+              type.getShape(), encoding,
+              cast<triton::gpu::LayoutEncodingTrait>(layout)))
+        return success();
+    }
   }
-  if (llvm::none_of(layouts, [&](DistributedEncodingTrait layout) {
-        return areLayoutsEquivalent(type.getShape(),
-                                    cast<LayoutEncodingTrait>(layout),
-                                    cast<LayoutEncodingTrait>(enc));
-      })) {
-    InFlightDiagnostic diag = op->emitOpError(regName)
-                              << " layout is not TMEM compatible";
-    for (Attribute layout : layouts)
-      diag.attachNote() << "potential TMEM layout: " << layout;
-    return diag;
-  }
-  return success();
+
+  // If it failed, give the user a hint
+  InFlightDiagnostic diag = op->emitOpError(regName);
+  diag.attachNote() << "Got: " << type.getEncoding();
+  for (Attribute layout : layouts)
+    diag.attachNote() << "potential TMEM layout: " << layout;
+  return diag;
 }
 
 LogicalResult TMEMStoreOp::verify() {

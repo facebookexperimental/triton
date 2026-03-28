@@ -84,9 +84,10 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
     auto blockedEnc = ttg::BlockedEncodingAttr::get(
         ctx, shape, spt, order, numWarps, threadsPerWarp, numCTAs);
     auto tmpType = RankedTensorType::get(shape, elementType, blockedEnc);
-    auto result = ttng::getTmemCompatibleLayout(
-        tmemEncoding.getBlockM(), tmemEncoding.getBlockN(), tmpType, numWarps);
-    return result;
+    auto compatibleLayouts = ttng::getTmemCompatibleLayouts(
+        contextOp, tmpType, memDescType);
+    assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+    return compatibleLayouts.front();
   }
 
   // Default: create a standard blocked encoding

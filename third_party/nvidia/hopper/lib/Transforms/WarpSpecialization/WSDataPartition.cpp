@@ -976,8 +976,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // The source op is already sliced at this point, so srcTy, type, tmem is
     // sliced. We use getTmemCompatibleLayout to get a block layout that is for
     // the sliced tmem here.
-    Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
-        tmem.getBlockM(), tmem.getBlockN(), oldRetType, numWarps);
+    auto newDistributedEncoding =
+        nvidia_gpu::getDefaultLayoutForTmemLdSt(type, numWarps, CTALayout);
 
     // oldRetType is the desired output, we slice it and convert from the
     // compatible layout to the sliced desired output.
@@ -1038,8 +1038,10 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // The source op is already sliced at this point, so srcTy, type, tmem is
     // sliced. We use getTmemCompatibleLayout to get a block layout that is
     // for the sliced tmem here.
-    auto newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
-        tmem.getBlockM(), tmem.getBlockN(), oldSrcType, numWarps);
+    auto compatibleLayouts = nvidia_gpu::getTmemCompatibleLayouts(
+        op, oldSrcType, type);
+    assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+    auto newDistributedEncoding = compatibleLayouts.front();
     // oldRetType is the desired output, we slice it and convert from the
     // compatible layout to the sliced desired output.
     SmallVector<int64_t> shape{oldSrcType.getShape().begin(),
@@ -1095,8 +1097,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                       accEncoding, retType.getMemorySpace(),
                                       retType.getMutableMemory());
 
-      Attribute newDistributedEncoding = nvidia_gpu::getTmemCompatibleLayout(
-          accEncoding.getBlockM(), accEncoding.getBlockN(), srcTy, numWarps);
+      auto newDistributedEncoding =
+          nvidia_gpu::getDefaultLayoutForTmemLdSt(retType, numWarps, CTALayout);
       auto newAccType = RankedTensorType::get(
           srcTy.getShape(), srcTy.getElementType(), newDistributedEncoding);
       auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(

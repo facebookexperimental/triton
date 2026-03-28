@@ -89,9 +89,10 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
   auto newLayout = oldLayout;
   if (!layoutTmemCompatible) {
     auto tmemEnc = cast<ttng::TensorMemoryEncodingAttr>(tmemDesc.getEncoding());
-    newLayout =
-        ttng::getTmemCompatibleLayout(
-        tmemEnc.getBlockM(), tmemEnc.getBlockN(), expandType, numWarps);
+    auto compatibleLayouts = ttng::getTmemCompatibleLayouts(
+        expandDims, expandType, tmemDesc);
+    assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+    newLayout = compatibleLayouts.front();
   }
   mlir::Operation *src = expandDims;
   if (newLayout != oldLayout) {
@@ -117,9 +118,10 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto oldExpandType = getExpandedInput().getType();
   auto allocDesc = dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
   auto tmemEnc = cast<ttng::TensorMemoryEncodingAttr>(allocDesc.getEncoding());
-  auto newDistributedEncoding =
-      ttng::getTmemCompatibleLayout(
-          tmemEnc.getBlockM(), tmemEnc.getBlockN(), oldExpandType, numWarps);
+  auto compatibleLayouts = ttng::getTmemCompatibleLayouts(
+      allocOp, oldExpandType, allocDesc);
+  assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+  auto newDistributedEncoding = compatibleLayouts.front();
   auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
   // Generate the load
   auto originTaskIds = builder.getAsyncTaskIds();

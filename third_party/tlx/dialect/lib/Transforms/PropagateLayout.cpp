@@ -154,9 +154,11 @@ public:
         return WalkResult::advance();
 
       auto srcTy = cast<RankedTensorType>(requireOp.getResult().getType());
-      int numWarps = ttg::lookupNumWarps(storeOp);
-      auto newEncoding = ttg::LinearEncodingAttr::get(
-          srcTy.getContext(), ttg::getScaleTMEMStoreLinearLayout(srcTy, numWarps));
+      auto compatibleLayouts = ttng::getTmemCompatibleLayouts(
+          storeOp, srcTy, memTy);
+      assert(!compatibleLayouts.empty() &&
+             "No TMEM-compatible layout found for scales");
+      auto newEncoding = compatibleLayouts.front();
       auto newType = RankedTensorType::get(srcTy.getShape(),
                                            srcTy.getElementType(), newEncoding);
       requireOp->getResult(0).setType(newType);
