@@ -351,7 +351,7 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
     %result, %token = ttng.tmem_alloc  : () -> (!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %c0_i32 = arith.constant 0 : i32
     // CHECK: ttg.memdesc_index
-    %mem_179 = ttg.memdesc_index %result[%c0_i32] {tmem.start_buffer = 0 : i32} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+    %mem_179 = ttg.memdesc_index %result[%c0_i32] {tmem.start_buffer = 0 : i32} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK: ttng.tmem_subslice
     // CHECK: ttg.memdesc_reinterpret
     %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
