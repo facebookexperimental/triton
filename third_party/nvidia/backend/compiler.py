@@ -435,6 +435,8 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+        if knobs.nvidia.analyze_ttgir_barrier:
+            nvidia.passes.ttnvgpuir.add_barrier_analysis(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)

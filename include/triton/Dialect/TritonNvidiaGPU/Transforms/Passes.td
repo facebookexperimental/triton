@@ -191,4 +191,32 @@ def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-to
   }];
 }
 
+def TritonBarrierAnalysisPass : Pass<"triton-barrier-analysis", "mlir::ModuleOp"> {
+  let summary = "Analyze barrier placement in warp-specialized regions";
+
+  let description = [{
+    Walks the IR after shared/tensor memory allocation, collects all mbarrier
+    allocations and their usages (wait/arrive ops), pairs them into
+    full/empty barrier pairs, and associates them with memory channels
+    (SMEM/TMEM buffers) using NameLoc prefix matching.
+
+    Produces a structured report useful for correctness verification,
+    performance analysis, and debugging of warp specialization.
+
+    Controlled by TRITON_DUMP_BARRIER_ANALYSIS environment variable or
+    the dump-table pass option.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"dumpTable", "dump-table",
+           "bool", /*default*/"false",
+           "Dump barrier analysis table to stderr">
+  ];
+}
+
 #endif
