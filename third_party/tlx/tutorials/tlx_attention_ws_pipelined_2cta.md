@@ -1,13 +1,15 @@
-# 2-CTA Backward Kernel — TLX vs FA4 Comparison
+# TLX 2-CTA Backward Kernel Design
 
 ## Overview
 
-The TLX 2-CTA backward kernel uses `two_ctas=True` on `async_dot` so that
-each CTA holds half the B operand and the MMA hardware combines them.
-Each CTA in a cluster processes a **different N-block** (consecutive rows of
-K/V), matching the 1-CTA behavior but sharing Q/dO loads via multicast.
+Each CTA in a cluster processes a **different N-block** (consecutive rows
+of K/V). Q/dO are shared via multicast (same M-block for both CTAs). All
+5 dot products use `two_ctas=True`.
 
-## Worked example: 2-CTA backward with real numbers
+In 2-CTA MMA: A is per-CTA, B is split across CTAs and combined by
+hardware. The output is split across CTAs along the M dimension.
+
+## Worked example with real numbers
 
 `tile_m=2, tile_n=2, hdim=2, cta_group_size=2`.
 One `n_block_cta_group` covers `tile_n * 2 = 4` rows of K/V.
@@ -23,8 +25,6 @@ K0 = [1  2]  (CTA 0, rows 0-1)     V0 = [3  1]
 
 K1 = [5  6]  (CTA 1, rows 2-3)     V1 = [1  5]
      [7  8]                              [4  2]
-
-LSE = [2, 3]     D = [1, 1]
 ```
 
 ### Dot 1: S.T = K @ Q.T (`two_ctas=True`)
@@ -151,16 +151,28 @@ CTA 1: dK1 = dS1.T @ Q = [11.6   7.2]
 
 ### Dot 4: dQ = dS @ K (`two_ctas=True`, reduction spans both N-blocks)
 
+Dot 4 needs dS from **both** CTAs as the A operand. Before dot 4, each
+CTA's sdS only has its own dS. The DSMEM exchange rearranges M-columns
+so each CTA's sdS has the data needed for its query rows.
+
+**Before exchange** — each CTA has its own dS in transposed form:
+```
+CTA 0's sdS: dS0.T = [0.4  3.6]     CTA 1's sdS: dS1.T = [3.0  1.4]
+                      [1.8  2.7]                           [0.7  6.5]
+```
+
+**After DSMEM exchange** — each CTA's sdS has the dS values for its
+query rows, spanning both N-blocks:
+```
+CTA 0's A row: [0.4  1.8  3.0  0.7]   (query row 0: dS0[0,:] then dS1[0,:])
+CTA 1's A row: [3.6  2.7  1.4  6.5]   (query row 1: dS0[1,:] then dS1[1,:])
+```
+
 ```
 Inputs:
-  A (SMEM, MMA reads from both CTAs — each CTA contributes tile_n rows):
-    CTA 0's sdS: dS0.T = [0.4  3.6]
-                          [1.8  2.7]
-    CTA 1's sdS: dS1.T = [3.0  1.4]
-                          [0.7  6.5]
-    HW reads both → combined A (2 rows, 4 cols):
-      [0.4  1.8  3.0  0.7]
-      [3.6  2.7  1.4  6.5]
+  A (SMEM, after DSMEM exchange):
+    CTA 0's row: [0.4  1.8  3.0  0.7]
+    CTA 1's row: [3.6  2.7  1.4  6.5]
 
   B (SMEM, per-CTA — each CTA loads ALL 4 K rows, one hdim column):
     Full K = [1  2]
@@ -187,33 +199,28 @@ dQ = [0.4  1.8  3.0  0.7] @ [1  2] = [25.7  31.6]
                              [7  8]
 ```
 
-**Both CTAs compute the full dQ — output is redundant:**
+**Output split along M (query rows):**
 
-Both CTAs have the same A (sdS after exchange) and the hardware combines
-B (sKt) into the same full K. So both CTAs compute the identical full dQ
-`[[25.7, 31.6], [64.2, 78.4]]` in TMEM. This is redundant computation.
-
-Each CTA only **reads out and writes** half the hdim to global:
+Each CTA computes its own query row:
 ```
-CTA 0 reads dQ[:,0] from TMEM → atomic-adds [25.7, 64.2] to global
-CTA 1 reads dQ[:,1] from TMEM → atomic-adds [31.6, 78.4] to global
+CTA 0 computes dQ[0,:] = [25.7, 31.6] → TMA reduce-add to global
+CTA 1 computes dQ[1,:] = [64.2, 78.4] → TMA reduce-add to global
 ```
 
-The other half sits in TMEM unused. The atomic-add is needed to accumulate
-across N-block groups (outer loop iterations), not between CTAs — within
-one N-block group there is no overlap between CTA 0 and CTA 1's writes.
+The TMA reduce-add accumulates across outer loop iterations (different
+N-block groups contributing partial dQ for the same M-block).
 
 ### Key observations
 
 1. **Dots 1,2,3,5:** K/V are A operands (per-CTA, different N-block rows).
-   Q/dO are B operands (multicast, shared). Each CTA gets different results
-   because A differs.
+   Q/dO are B operands (multicast, shared). The 2-CTA MMA splits the
+   output along M — each CTA gets its own tile_n rows (matching its
+   N-block). No redundancy.
 
-2. **Dot 4:** Both A (sdS, after exchange) and combined B (sKt → full K)
-   are the same for both CTAs. The computation is **redundant** — both CTAs
-   produce the identical full dQ. Each CTA only writes a different hdim
-   slice to global. This is a tradeoff: redundant compute for a single
-   large GEMM (tile_n*2 reduction) with better MMA utilization.
+2. **Dot 4:** Same M-split mechanism. Each CTA produces tile_m/2 query
+   rows of dQ with full hdim. The reduction dimension is tile_n*2
+   (spanning both N-blocks). Requires DSMEM exchange of dS and a
+   separate sKt buffer with all tile_n*2 K rows.
 
 3. **sK vs sKt — same data, different slicing:**
    ```
@@ -224,129 +231,17 @@ one N-block group there is no overlap between CTA 0 and CTA 1's writes.
 4. **DSMEM exchange** sends half of each CTA's dS to the peer so that
    the 2-CTA MMA's A operand spans both N-blocks' dS.
 
-5. **Atomic-add for dQ:** needed to accumulate across outer loop iterations
-   (different N-block groups), not between CTAs. Within one N-block group,
-   CTA 0 and CTA 1 write to non-overlapping hdim slices.
+5. **TMA reduce-add for dQ:** accumulates partial dQ across outer loop
+   iterations (different N-block groups). Within one N-block group,
+   CTA 0 and CTA 1 write non-overlapping query row ranges.
 
-## SMEM Analysis: TLX Does NOT Achieve FA4's Savings
+## How K is used differently in dot 1 vs dot 4
 
-### Problem Summary
+Both CTAs share the same `n_block_cta_group`, which covers `tile_n * 2`
+rows of K. K plays different roles in dot 1 (A) vs dot 4 (B), so it's
+sliced differently.
 
-The current TLX implementation doesn't get the SMEM savings that FA4's
-CUTLASS version gets:
-
-1. **k_tiles / v_tiles: [BLOCK_N, HEAD_DIM] — full size, not halved.**
-   These are A operands in dots 1,2 but B operands in dots 4,5. In FA4,
-   all B operands are halved by the 2-CTA hardware split.
-
-2. **ds_tiles: [BLOCK_N * 2, BLOCK_M] — doubled.** Stores the full dS from
-   both CTAs (own + peer). FA4 avoids this by keeping sdS at the same size
-   and using a small `sdS_xchg = (tile_n, tile_m/2)` staging buffer for the
-   DSMEM exchange.
-
-3. **kt_tiles, qt_tiles, dot_tiles: allocated but unused — dead code.**
-
-4. **q_tiles / do_tiles: halved — this is correct.**
-
-**Net result:** the halving of Q and dO is eaten up (and then some) by the
-doubled dS. K and V aren't halved at all. No net SMEM savings, possibly
-a regression.
-
-### FA4's Approach (for reference)
-
-Using tile_n=128, tile_m=128, hdim=128, fp16 (2 bytes per element).
-
-**Key design choices:**
-- B operands (Q, Qt, dO, dOt, Kt) are halved by the 2-CTA hardware split
-- A operands (K, V) stay the same size — each CTA owns its tile_n rows
-- sdS stays the same total size (M halved by A-operand split, K doubled
-  to span both CTAs → cancels out)
-- Only a small `sdS_xchg = (tile_n, tile_m/2)` staging buffer is added
-  for the DSMEM cross-CTA dS exchange
-- Q_stage drops from 2 (1-CTA) to 1 (2-CTA)
-
-#### 1-CTA SMEM layout (Q_stage=2)
-
-| Buffer | Symbolic shape | Concrete shape | Stages | Size | Notes |
-|--------|---------------|----------------|--------|------|-------|
-| sQ | (tile_m, hdim) | (128, 128) | 2 | 64 KB | B-operand; sQt aliases via recast |
-| sK | (tile_n, hdim) | (128, 128) | 1 | 32 KB | A-operand |
-| sV | (tile_n, hdim) | (128, 128) | 1 | 32 KB | A-operand |
-| sdO | (tile_m, hdim) | (128, 128) | 1 | 32 KB | B-operand; sdOt aliases via recast |
-| sdS | (tile_n, tile_m) | (128, 128) | 1 | 32 KB | sdSt aliases via recast |
-| sdQaccum | (tile_m×dQ_reduce_ncol, stages) | (128×32, 2) f32 | — | 32 KB | |
-| sLSE | (tile_m, Q_stage) | (128, 2) f32 | — | 1 KB | |
-| sdPsum | (tile_m, dO_stage) | (128, 1) f32 | — | 0.5 KB | |
-| **Total** | | | | **~225 KB** | |
-
-#### 2-CTA SMEM layout (Q_stage=1, hdim≤128)
-
-| Buffer | Symbolic shape | Concrete shape | Stages | Size | Δ vs 1-CTA |
-|--------|---------------|----------------|--------|------|------------|
-| sQ | (tile_m/2, hdim) | (64, 128) | 1 | 16 KB | **−48 KB** (halved B + 1 stage) |
-| sK | (tile_n, hdim) | (128, 128) | 1 | 32 KB | same |
-| sV | (tile_n, hdim) | (128, 128) | 1 | 32 KB | same |
-| sdO | (tile_m/2, hdim) | (64, 128) | 1 | 16 KB | **−16 KB** (halved B) |
-| sQt | (hdim/2, tile_m) | (64, 128) | 1 | 16 KB | **+16 KB** (new, separate layout for dK GEMM) |
-| sdOt | (hdim/2, tile_m) | (64, 128) | 1 | 16 KB | **+16 KB** (new, separate layout for dP GEMM) |
-| sKt | (tile_n*2, hdim/2) | (256, 64) | 1 | 32 KB | **+32 KB** (new, B-operand for dQ GEMM, all rows both N-blocks) |
-| sdS | (tile_n, tile_m) | (128, 128) | 1 | 32 KB | same (M halved, K doubled → cancels) |
-| sdS_xchg | (tile_n, tile_m/2) | (128, 64) | — | 16 KB | **+16 KB** (new, DSMEM staging buffer) |
-| sdQaccum | (tile_m×dQ_reduce_ncol, stages) | (128×8, 4) f32 | — | 16 KB | **−16 KB** |
-| sLSE | (tile_m, Q_stage) | (128, 1) f32 | — | 0.5 KB | −0.5 KB |
-| sdPsum | (tile_m, dO_stage) | (128, 1) f32 | — | 0.5 KB | same |
-| Extra mbarriers | | | | ~0.1 KB | +0.1 KB (Qt, Kt, dS_cluster, dQaccum_empty) |
-| **Total** | | | | **~225 KB** | **~0 KB** |
-
-#### Net savings breakdown
-
-- **Saved**: sQ (−48 KB) + sdO (−16 KB) + sdQaccum (−16 KB) = **−80 KB**
-- **Added**: sQt (+16) + sdOt (+16) + sKt (+32) + sdS_xchg (+16) = **+80 KB**
-- **Net: ~0 KB savings**
-
-The SMEM savings are modest. The main benefit of 2-CTA is **doubling the
-MMA compute throughput** by having two CTAs cooperate on each GEMM
-instruction, not SMEM reduction.
-
-## Buffer Layout (current TLX, per CTA)
-
-BLOCK_N1=128, BLOCK_M1=128, HEAD_DIM=128, NUM_CTAS=2, fp16 (2 bytes).
-
-| Buffer | Symbolic shape | Concrete shape | Bufs | Storage | Size | Notes |
-|--------|---------------|----------------|------|---------|------|-------|
-| `k_tiles` | [BLOCK_N1, HEAD_DIM] | [128, 128] | 1 | SMEM | 32 KB | **Not halved** (A operand) |
-| `v_tiles` | [BLOCK_N1, HEAD_DIM] | [128, 128] | 1 | SMEM | 32 KB | **Not halved** (A operand) |
-| `q_tiles` | [BLOCK_M1, HEAD_DIM/NUM_CTAS] | [128, 64] | 2 | SMEM | 32 KB | Correctly halved (B operand for dots 3,5) |
-| `do_tiles` | [BLOCK_M1, HEAD_DIM/NUM_CTAS] | [128, 64] | 1 | SMEM | 16 KB | Correctly halved (B operand for dot 3) |
-| `kt_tiles` | [BLOCK_N1, HEAD_DIM/NUM_CTAS] | [128, 64] | 1 | SMEM | 16 KB | **Dead code** |
-| `qt_tiles` | [BLOCK_M1/NUM_CTAS, HEAD_DIM] | [64, 128] | 2 | SMEM | 0 KB | reuse=q_tiles; **Dead code** |
-| `dot_tiles` | [BLOCK_M1/NUM_CTAS, HEAD_DIM] | [64, 128] | 1 | SMEM | 0 KB | reuse=do_tiles; **Dead code** |
-| `ds_tiles` | [BLOCK_N1, BLOCK_M1] | [256, 128] | 1 | SMEM | 64 KB | **Doubled** (own + peer dS) |
-| `ds_peer_tiles` | [BLOCK_N1, BLOCK_M1/2] | [128, 64] | 1 | SMEM | 16 KB | Peer's dS exchange buffer |
-| `qk_tiles` / `p_tiles` | [BLOCK_N1, BLOCK_M1] | [128, 128] | — | TMEM | — | S→P reuse (S overwritten by P) |
-| `dp_tiles` / `dq_tiles` | [BLOCK_N1, BLOCK_M1] | [128, 128] | — | TMEM | — | dP→dQ reuse (dP overwritten by dQ) |
-| `dk_tiles` | [BLOCK_N1, HEAD_DIM] | [128, 128] | — | TMEM | — | dK accumulator |
-| `dv_tiles` | [BLOCK_N1, HEAD_DIM] | [128, 128] | — | TMEM | — | dV accumulator |
-| **SMEM Total** | | | | | **208 KB** | |
-
-## Dot Products (all use `two_ctas=True`)
-
-| Dot | Operation | A (local) | B (per CTA, combined by HW) | Result |
-|-----|-----------|-----------|----------------------------|--------|
-| 1 | qkT = K @ Q^T | k_tiles [N, D] | qt_tiles [D, M/2] → [D, M] | qk_tiles [N, M] |
-| 2 | dpT = V @ dO^T | v_tiles [N, D] | dot_tiles [D, M/2] → [D, M] | dp_tiles [N, M] |
-| 3 | dV += P @ dO | p_tiles [N, M] (tmem) | do_tiles [M, D/2] → [M, D] | dv_tiles [N, D] |
-| 4 | dQ = dS^T @ K | dsT [M, N] | kt_tiles [N, D/2] → [N, D] | dq_tiles [M, D] |
-| 5 | dK += dS @ Q | ds_tiles [N, M] | q_tiles [M, D/2] → [M, D] | dk_tiles [N, D] |
-
-## How K is used differently in dot 1 vs dot 4 (2-CTA)
-
-In 2-CTA mode, both CTAs in a cluster share the same `n_block_cta_group`,
-which covers `tile_n * 2` rows of K. But K plays different roles in dot 1
-(A operand) vs dot 4 (B operand), so it's sliced differently.
-
-**Example:** `tile_n=2, hdim=4, cta_group_size=2`. One `n_block_cta_group`
-covers 4 rows of K:
+**Example:** `tile_n=2, hdim=4, cta_group_size=2`:
 
 ```
 K (global) = [ a b c d ]  row 0 ─┐ CTA 0's n_block
@@ -355,158 +250,166 @@ K (global) = [ a b c d ]  row 0 ─┐ CTA 0's n_block
              [ m n o p ]  row 3 ─┘
 ```
 
-### Dot 1: S = K @ Q^T — K is A operand
-
-A is per-CTA (not combined by hardware). Each CTA loads its own `tile_n`
-rows, full hdim:
-
+**Dot 1 (A operand):** each CTA loads own tile_n rows, full hdim:
 ```
-CTA 0's sK = [ a b c d ]    shape [2, 4]  — rows 0-1, full D
-             [ e f g h ]
-
-CTA 1's sK = [ i j k l ]    shape [2, 4]  — rows 2-3, full D
-             [ m n o p ]
+CTA 0: sK  = [ a b c d ]     CTA 1: sK  = [ i j k l ]
+             [ e f g h ]                   [ m n o p ]
 ```
 
-### Dot 4: dQ = dS @ K — K is B operand (sKt)
-
-B is combined by hardware across CTAs. The full B has shape
-`[K_dim, N_dim] = [tile_n*2, hdim] = [4, 4]`. Split along N (hdim),
-each CTA loads **all 4 rows**, half the columns:
-
+**Dot 4 (B operand):** each CTA loads ALL tile_n*2 rows, half hdim:
 ```
-CTA 0's sKt = [ a b ]    shape [4, 2]  — ALL rows, cols 0-1
-              [ e f ]
-              [ i j ]
-              [ m n ]
-
-CTA 1's sKt = [ c d ]    shape [4, 2]  — ALL rows, cols 2-3
-              [ g h ]
-              [ k l ]
-              [ o p ]
+CTA 0: sKt = [ a b ]         CTA 1: sKt = [ c d ]
+             [ e f ]                       [ g h ]
+             [ i j ]                       [ k l ]
+             [ m n ]                       [ o p ]
 ```
 
-Hardware combines along hdim → full `K [4, 4]`.
+## TLX design: tile scheduling
 
-### Summary
-
-```
-sK  (A, dot 1):  [tile_n, hdim]       — own rows, full D
-sKt (B, dot 4):  [tile_n*2, hdim/2]   — ALL rows, half D
-```
-
-Same K data, sliced differently. In 2-CTA UMMA: A is per-CTA (not combined),
-B is combined across CTAs (split along the output dimension). The "t" in `sKt`
-refers to the SMEM layout (different swizzle for the B operand), not a
-mathematical transpose — the math is still `dQ = dS @ K`.
-
-In FA4 code: `sKt` in 1-CTA is just a recast of `sK` (same bytes, line 1297).
-In 2-CTA, `sKt` is a separate buffer loaded via `tma_atom_Kt` (line 676).
-
-## Tile Scheduling
-
-- `n_tile_num = cdiv(N_CTX, BLOCK_N1 * NUM_CTAS)` — each cluster handles 2 consecutive N-blocks.
-- `start_n = pid * NUM_CTAS + cluster_cta_rank` — CTA 0 gets even N-blocks, CTA 1 gets odd.
-
-## DSMEM Exchange
-
-After the compute warpgroup produces `dsT [BLOCK_N, BLOCK_M]`, each CTA
-sends half of it to the peer via `async_remote_shmem_store`:
-- CTA 0 sends `dsT[:, 0:M/2]`, CTA 1 sends `dsT[:, M/2:M]`
-- Peer receives it in `ds_peer_tiles`
-- Then overwrites the peer's half in `ds_tiles` with received data
-
-This doubles `ds_tiles` to `[BLOCK_N * 2, BLOCK_M]` (own + peer), unlike
-FA4 which keeps sdS at the same size and uses a small staging buffer.
-
-### FA4's DSMEM Exchange (for comparison)
-
-FA4 avoids doubling the sdS buffer by using a small staging buffer
-(`sdS_xchg`) and writing the peer's data directly into sdS via DSMEM.
-
-**Why the exchange is needed:** The dQ GEMM (`dQ = dS @ K`) has a
-reduction dimension spanning both CTAs (`tile_n * 2`). Each CTA only
-computes its own dS in TMEM, but the dQ GEMM needs dS from both CTAs
-as the A-operand in SMEM. The dK GEMM (`dK = dS^T @ Q`) reads dS from
-TMEM (local only, no exchange needed).
-
-**How it works:** The dS tile `(tile_n, tile_m)` is processed in 2
-sub-tile stages (tile_m split into two halves). One stage is the
-"exchange stage" (sent to peer), the other stays local.
-
-```
-exchange_stage = cta_rank_in_cluster ^ 1
-  CTA0 (rank=0): exchange_stage = 1  (sends its stage 1)
-  CTA1 (rank=1): exchange_stage = 0  (sends its stage 0)
+Each CTA gets a different N-block:
+```python
+n_tile_num = tl.cdiv(N_CTX, BLOCK_N1 * NUM_CTAS)
+start_n = tile_n_idx * NUM_CTAS + cluster_cta_rank
+start_block_n = start_n * BLOCK_N1  # different per CTA
 ```
 
-**Step-by-step with a 4×4 example** (tile_n=4, tile_m=4, stage 0 = cols 0-1,
-stage 1 = cols 2-3):
+## TLX design: loads
 
-CTA0 computes dS₀:
+**Per-CTA (no multicast):** K, V — each CTA loads from its own
+`start_block_n`. Kt — each CTA loads ALL `tile_n*2` K rows, half hdim.
+
+**Multicast (`two_ctas=True`):** Q, Qt, dO, dOt — both CTAs share the
+same M-block.
+
+## TLX design: DSMEM exchange
+
+After compute produces dS, exchange M-column halves with peer via
+`async_remote_shmem_store`. This makes the 2-CTA MMA's A operand span
+both N-blocks' dS for dot 4.
+
+## TLX design: dQ write-out
+
+Each CTA writes its tile_m/2 query rows to global via TMA reduce-add.
+No double-counting — CTAs write non-overlapping row ranges. The
+reduce-add accumulates across N-block groups.
+
+## TLX design: SMEM budget
+
+| Buffer | Shape | Bufs | Size | Notes |
+|--------|-------|------|------|-------|
+| `k_tiles` | [N, D] | 1 | 32 KB | A for dot 1, per-CTA |
+| `v_tiles` | [N, D] | 1 | 32 KB | A for dot 2, per-CTA |
+| `q_tiles` | [M, D/2] | 2 | 32 KB | B for dots 3,5 (multicast, D-halved) |
+| `qt_tiles` | [M/2, D] | 2 | 32 KB | B for dots 1,2 (multicast, M-halved) |
+| `do_tiles` | [M, D/2] | 1 | 16 KB | B for dot 3 (multicast, D-halved) |
+| `dot_tiles` | [M/2, D] | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
+| `kt_tiles` | [N*2, D/2] | 1 | 32 KB | B for dot 4, all K rows |
+| `ds_tiles` | [N, M] | 1 | 32 KB | A for dot 4, after exchange |
+| `ds_xchg_tiles` | [N, M/2] | 1 | 16 KB | DSMEM staging |
+| epilogue staging | | | ~8 KB | Hidden SMEM for TMA stores |
+| **Total** | | | **~248 KB** | Over 228 KB limit |
+
+**SMEM pressure:** 248 KB exceeds Blackwell's 228 KB. Options:
+- Reuse `q_tiles`/`qt_tiles` (same total bytes: M*D/2*2 = M/2*D*2 = 32 KB)
+- Reuse `do_tiles`/`dot_tiles` (same logic, 16 KB)
+- With both reuses: 248 - 32 - 16 = **200 KB** — fits
+
+## TLX design: TMEM layout
+
+TLX uses `tlx.local_alloc(..., tlx.storage_kind.tmem)` for TMEM buffers.
+In 2-CTA mode, the output M dimension is split across CTAs. For dots 1,2,3,5
+where M = `cta_group_size * tile_n` = 256, each CTA gets 128 TMEM columns.
+For dot 4 where M = `tile_m` = 128, each CTA gets 64 TMEM columns.
+
+| Buffer | TMEM columns | Per-CTA shape | Overlaps with | Notes |
+|--------|-------------|---------------|---------------|-------|
+| `qk_tiles` (S) | 128 | (tile_n, tile_m) | `p_tiles`, `dq_tiles` (reuse) | Dot 1 output |
+| `p_tiles` (P) | 128 | (tile_n, tile_m) | `qk_tiles`, `dq_tiles` (reuse) | P = softmax(S) overwrites S |
+| `dp_tiles` (dP) | 128 | (tile_n, tile_m) | — | Dot 2 output |
+| `dq_tiles` (dQ) | 128 | (tile_m, tile_hdim) | `qk_tiles`/`p_tiles` (reuse) | Dot 4 output. Reuses S/P after they are consumed |
+| `dv_tiles` (dV) | 128 | (tile_n, tile_hdim) | — | Dot 3 accumulator |
+| `dk_tiles` (dK) | 128 | (tile_n, tile_hdim) | — | Dot 5 accumulator |
+
+Overlaps:
+- **S → P**: P = softmax(S) overwrites S in-place
+- **S/P → dQ**: dQ reuses S/P's TMEM after P is consumed by dot 3 (dV)
+  and dS computation. dQ is computed last (dot 4), so S/P is dead by then.
+
 ```
-  stage 0        stage 1
-  a  b            c  d
-  e  f            g  h
-  i  j            k  l
-  m  n            o  p
+Column:  0                 128        256                384       512
+         |-----------------|----------|------------------|---------|
+         |    S/P/dQ       |    dV    |     dP/dS        |   dK    |
+         |     (128)       |  (128)   |     (128)        |  (128)  |
+         |_________________|__________|__________________|_________|
 ```
 
-CTA1 computes dS₁:
+dQ reuses S/P's 128 columns. dP is separate (not shared with dQ) since
+dP may still be needed when dQ is computed (dS is derived from dP).
+
+Total: 512 TMEM columns fully packed with overlaps.
+
+## TLX design: data flow (per N-block group)
+
 ```
-  stage 0        stage 1
-  A  B            C  D
-  E  F            G  H
-  I  J            K  L
-  M  N            O  P
-```
+Load (per-CTA): K → k_tiles, V → v_tiles, Kt → kt_tiles
+Load (multicast): LSE, dPsum
 
-**During dS computation (registers → SMEM):**
-- Non-exchange stage → written directly to `sdS`
-- Exchange stage → held in registers, then written to `sdS_xchg`
+Per M-block (inner loop):
+  Load (multicast): Q → q_tiles/qt_tiles, dO → do_tiles/dot_tiles
 
-**DSMEM copy:**
-- CTA0 sends `sdS_xchg` (stage 1: `c d / g h / k l / o p`)
-  → peer CTA1's `sdS[stage 0]`
-- CTA1 sends `sdS_xchg` (stage 0: `A B / E F / I J / M N`)
-  → peer CTA0's `sdS[stage 1]`
+  MMA dot 1: S.T = K @ Q.T         → TMEM S (per-CTA, different)
+  Compute:   P = exp(S - LSE)       → TMEM P
+  MMA dot 2: dP.T = V @ dO.T       → TMEM dP (per-CTA, different)
+  MMA dot 3: dV += P.T @ dO         → TMEM dV (per-CTA, different)
+  Compute:   dS = P * (dP - D)      → TMEM dS, then copy to sdS
+  DSMEM exchange: swap M-halves of sdS with peer
+  MMA dot 5: dK += dS.T @ Q         → TMEM dK (per-CTA, uses dS from TMEM)
+  MMA dot 4: dQ = dS @ K            → TMEM dQ (128 cols allocated, tile_m/2 rows meaningful)
+  Reduce:    dQ TMEM → sdQaccum → TMA reduce-add to global
+             (each CTA writes different query row range)
 
-**After exchange — each CTA's sdS (tile_n × tile_m = 4×4):**
-
-CTA0's sdS:
-```
-  stage 0 (own)   stage 1 (from CTA1)
-  a  b              A  B
-  e  f              E  F
-  i  j              I  J
-  m  n              M  N
+Epilogue: store dK, dV via TMA (each CTA to its own N-block)
 ```
 
-CTA1's sdS:
-```
-  stage 0 (from CTA0)  stage 1 (own)
-  c  d                   C  D
-  g  h                   G  H
-  k  l                   K  L
-  o  p                   O  P
-```
+---
 
-Each CTA now has its own dS half plus the peer's half in `sdS` — ready
-for the dQ GEMM's reduction over `tile_n * 2`. The `sdS_xchg` buffer
-is dead after this point.
+## Appendix: FA4 reference
 
-**Key advantage over TLX:** FA4's `sdS` stays at `(tile_n, tile_m)` =
-32 KB (same as 1-CTA), plus a small `sdS_xchg = (tile_n, tile_m/2)` =
-16 KB staging buffer. Total = 48 KB. TLX doubles `ds_tiles` to
-`(tile_n*2, tile_m)` = 64 KB plus `ds_peer_tiles` = 16 KB. Total = 80 KB.
+### FA4 code pointers for dot 4 (dQ = dS @ K)
 
-## TMEM Layout (FA4 bwd, hdim=128)
+| What | Line | Code |
+|------|------|------|
+| MMA tiler | 107 | `mma_tiler_dsk = (tile_m, tile_hdim, tile_n * cta_group_size)` |
+| TiledMma | 310-317 | `tiled_mma_dQ = make_trivial_tiled_mma(..., cta_group)` |
+| sKt layout | 392-398 | `sKt_layout = make_smem_layout_b(tiled_mma_dQ, mma_tiler_dsk, ...)` |
+| TMA atom (B) | 673-683 | `tma_atom_Kt = make_tiled_tma_atom_B(...)` — 2-CTA only |
+| Kt load | 1880-1892 | `gKt = local_tile(mKt_cur, ..., (0, n_block_cta_group))` |
+| sKt in 1-CTA | 1297 | `sKt = recast_ptr(sK.iterator, sKt_layout)` — recast of sK |
+| sKt in 2-CTA | 1295 | `sKt = storage.sKt.get_tensor(...)` — separate buffer |
+| A fragment | 2255 | `tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)` |
+| B fragment | 2256 | `tdQrK = tiled_mma_dQ.make_fragment_B(sKt)` |
+| GEMM call | 2298-2306 | `gemm_w_idx(..., num_unroll_groups=2)` — different from other dots |
+| TMEM alloc | 196-199 | `tmem_dQ_offset = tmem_S_offset + tile_hdim // 2` = 64 cols |
+| dQ reduce | 3549 | `tile_hdim // cta_group_size` hdim per CTA in reduce |
+| stage_offset | 3451 | `expected_reduce_stages * cta_rank_in_cluster` |
 
-TMEM has **512 columns** (each column = 128 rows × 32 bits). The M-dimension
-of each MMA output maps to TMEM columns. The backward kernel fully packs
-all 512 columns with overlapping buffers.
+### FA4 1-CTA SMEM layout
 
-### 1-CTA TMEM layout
+tile_n=128, tile_m=128, hdim=128, Q_stage=2, fp16.
+
+| Buffer | Shape | Stages | Size | Notes |
+|--------|-------|--------|------|-------|
+| sQ | (tile_m, hdim) | 2 | 64 KB | B-operand; sQt aliases via recast |
+| sK | (tile_n, hdim) | 1 | 32 KB | A-operand; sKt aliases via recast |
+| sV | (tile_n, hdim) | 1 | 32 KB | A-operand |
+| sdO | (tile_m, hdim) | 1 | 32 KB | B-operand; sdOt aliases via recast |
+| sdS | (tile_n, tile_m) | 1 | 32 KB | A for dot 4; sdSt aliases via recast |
+| sdQaccum | (tile_m*32, 2) f32 | — | 32 KB | |
+| sLSE | (tile_m, 2) f32 | — | 1 KB | |
+| sdPsum | (tile_m, 1) f32 | — | 0.5 KB | |
+| **Total** | | | **~225 KB** | |
+
+### FA4 1-CTA TMEM layout
 
 ```
 Column:  0                 128        256                384       512
@@ -516,20 +419,32 @@ Column:  0                 128        256                384       512
          |_________________|__________|__________________|_________|
 ```
 
-| Buffer | Offset | Columns | Overlaps with |
-|--------|--------|---------|---------------|
-| S      | 0      | 128     | P (same offset) |
-| P      | 0      | 128     | S (same offset) |
-| dV     | 128    | 128     | — |
-| dP     | 256    | 128     | dS, dQ (all same offset) |
-| dS     | 256    | 128     | dP, dQ (all same offset) |
-| dQ     | 256    | 128     | dP, dS (all same offset) |
-| dK     | 384    | 128     | — |
+### FA4 2-CTA SMEM layout
 
-In 1-CTA, dQ uses **128 columns** (full tile_m) and aliases dP/dS — all
-three are used at different phases so the overlap is safe.
+| Buffer | Shape per CTA | Concrete | Stages | Size | Notes |
+|--------|--------------|----------|--------|------|-------|
+| sQ | (tile_m, hdim/2) | (128, 64) | 1 | 16 KB | B for dots 1,5 (multicast, D-halved) |
+| sK | (tile_n, hdim) | (128, 128) | 1 | 32 KB | A for dot 1 (per-CTA, own N-block) |
+| sV | (tile_n, hdim) | (128, 128) | 1 | 32 KB | A for dot 2 (per-CTA, own N-block) |
+| sdO | (tile_m, hdim/2) | (128, 64) | 1 | 16 KB | B for dots 2,3 (multicast, D-halved) |
+| sQt | (tile_m/2, hdim) | (64, 128) | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
+| sdOt | (tile_m/2, hdim) | (64, 128) | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
+| sKt | (tile_n*2, hdim/2) | (256, 64) | 1 | 32 KB | B for dot 4 (all K rows, D-halved) |
+| sdS | (tile_n, tile_m) | (128, 128) | 1 | 32 KB | A for dot 4 (MMA reads from both CTAs) |
+| sdS_xchg | (tile_n, tile_m/2) | (128, 64) | 1 | 16 KB | DSMEM staging buffer |
+| sdQaccum | (tile_m*8, 4) | — | — | 16 KB | dQ reduce-add staging (f32) |
+| sLSE | (tile_m, 1) | (128, 1) | — | 0.5 KB | |
+| sdPsum | (tile_m, 1) | (128, 1) | — | 0.5 KB | |
+| **Total** | | | | **~225 KB** | |
 
-### 2-CTA TMEM layout
+### FA4 2-CTA TMEM layout
+
+Each CTA allocates 512 TMEM columns. Each column holds 128 elements × 32 bits.
+The M dimension of each MMA output maps to TMEM columns. In 2-CTA, the M
+dimension is split across CTAs (each CTA gets M/cta_group_size columns).
+
+For dots 1,2,3,5: M = `cta_group_size * tile_n` = 256, per-CTA = 128 columns.
+For dot 4: M = `tile_m` = 128, per-CTA = 64 columns.
 
 ```
 Column:  0          64    128        256        384       512
@@ -539,44 +454,16 @@ Column:  0          64    128        256        384       512
          |__________|______|__________|__________|_________|
 ```
 
-| Buffer | Offset | Columns | Overlaps with |
-|--------|--------|---------|---------------|
-| S      | 0      | 128     | P (same offset) |
-| P      | 0      | 128     | S (same offset) |
-| dQ     | 64     | 64      | overlaps S/P cols 64-127 |
-| dV     | 128    | 128     | — |
-| dP     | 256    | 128     | dS (same offset) |
-| dS     | 256    | 128     | dP (same offset) |
-| dK     | 384    | 128     | — |
+| Buffer | Offset | Columns | Per-CTA shape | Notes |
+|--------|--------|---------|---------------|-------|
+| S/P | 0 | 128 | (tile_n, tile_m) | M/2 = tile_n per CTA |
+| dQ | 64 | 64 | (tile_m/2, tile_hdim) | M/2 = tile_m/2 per CTA. Overlaps S/P cols 64-127 |
+| dV | 128 | 128 | (tile_n, tile_hdimv) | M/2 = tile_n per CTA |
+| dP/dS | 256 | 128 | (tile_n, tile_m) | M/2 = tile_n per CTA |
+| dK | 384 | 128 | (tile_n, tile_hdim) | M/2 = tile_n per CTA |
 
-In 2-CTA, dQ uses only **64 columns** (tile_m/2) because the M-dimension
-is split across CTAs. This lets dQ fit in the S/P region (cols 64-127)
-instead of needing a separate 128-column slot. dQ no longer aliases dP/dS.
+### FA4 dot 4: different PTX instruction
 
-### Why overlaps are safe (both modes)
-
-- **S → P**: S is computed, then overwritten with P = exp(S − LSE)
-- **dP → dS**: dP is computed, then dS = P × (dP − D) overwrites it
-- **dQ overlaps S/P** (2-CTA) or **dP/dS** (1-CTA): dQ is computed
-  after the overlapped buffers are fully consumed
-
-## Constraints
-
-- **Non-causal only** (STAGE=1): Causal gives different `num_steps` per CTA.
-- **BLOCK_M1=128**: Required by pair-CTA MMA.
-- **REUSE_DP_FOR_DQ=True** when BLOCK_M1=128 and HEAD_DIM=128.
-
-## TMA Descriptors
-
-| Descriptor | Block Shape | Used For |
-|------------|------------|----------|
-| `desc_k` | [BLOCK_N1, HEAD_DIM] | Loading K (full — not halved) |
-| `desc_v` | [BLOCK_N1, HEAD_DIM] | Loading V (full — not halved) |
-| `desc_q` | [BLOCK_M1, HEAD_DIM // NUM_CTAS] | Loading Q (D-split) |
-| `desc_do` | [BLOCK_M1, HEAD_DIM // NUM_CTAS] | Loading dO (D-split) |
-| `desc_kt` | [BLOCK_N1, HEAD_DIM // NUM_CTAS] | Loading K (D-split for dot 4) |
-| `desc_qt` | [BLOCK_M1 // NUM_CTAS, HEAD_DIM] | Loading Q (M-split for dots 1,2) |
-| `desc_dot` | [BLOCK_M1 // NUM_CTAS, HEAD_DIM] | Loading dO (M-split for dots 1,2) |
-| `desc_dq` | [BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE] | Atomic-add dQ |
-| `desc_dk` | [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE] | Store dK |
-| `desc_dv` | [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE] | Store dV |
+Dot 4 uses `gemm_w_idx` with `num_unroll_groups=2`, while dots 1,2,3,5
+use `gemm_ptx_w_idx` with `cta_group=cta_group_size`. This may affect
+how the output is distributed across CTAs.
