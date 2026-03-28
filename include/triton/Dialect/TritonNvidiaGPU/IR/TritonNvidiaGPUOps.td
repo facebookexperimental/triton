@@ -37,6 +37,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td" // ReturnLike
 
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
 def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
@@ -1042,6 +1043,81 @@ def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   let assemblyFormat = [{
     $desc_ptr attr-dict `:` qualified(type($desc_ptr))
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// SubtiledRegionOp
+//===----------------------------------------------------------------------===//
+
+def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
+    RecursiveMemoryEffects,
+    AttrSizedOperandSegments
+]> {
+  let summary = "Encapsulates a subtiling pattern for epilogue operations";
+
+  let description = [{
+    The `ttng.subtiled_region` operation explicitly represents a subtiling
+    pattern where a large tile is split into subtiles processed sequentially.
+    This gives the compiler a structured way to reason about per-tile operations
+    and barrier placement.
+
+    The op has two or three regions:
+    - `setupRegion`: computes subtile values (e.g. tmem_subslice + tmem_load,
+      constants). Terminated by `subtiled_region_yield`. The yielded values
+      are distributed to tiles in tile-major order: the first `numTileArgs`
+      values go to tile 0, the next chunk to tile 1, etc.
+      `numTiles = numSetupOutputs / numTileArgs`.
+    - `tileRegion`: per-tile body that is replicated during lowering. Block
+      arguments come from sequential chunks of setup outputs.
+      Terminated by `subtiled_region_yield`. May yield values for teardown.
+    - `teardownRegion` (optional): receives yielded values from all tile
+      replications and combines them (e.g. via `tt.join`). Block arguments
+      correspond to tile yield values in tile-major order:
+      arg[tile_idx * N + yield_pos]. Terminated by `subtiled_region_yield`;
+      its yield produces the op results.
+
+    `barrierAnnotations` describes where to insert barrier operations during
+    lowering, relative to the first or last tile.
+  }];
+
+  let arguments = (ins
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I32>:$barrierPhases,
+    ArrayAttr:$barrierAnnotations
+  );
+
+  let results = (outs Variadic<AnyType>:$results);
+
+  let regions = (region
+    SizedRegion<1>:$setupRegion,
+    SizedRegion<1>:$tileRegion,
+    AnyRegion:$teardownRegion
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// SubtiledRegionYieldOp
+//===----------------------------------------------------------------------===//
+
+def TTNG_SubtiledRegionYieldOp : TTNG_Op<"subtiled_region_yield", [
+    Pure, Terminator, ReturnLike,
+    ParentOneOf<["SubtiledRegionOp"]>
+]> {
+  let summary = "Yield values from a region of subtiled_region";
+
+  let description = [{
+    Terminates the setup, tile, or teardown region of a `subtiled_region` op.
+    In the setup region, yielded values are referenced by tile mappings.
+    In the tile region, yielded values are collected across tile replications
+    and passed to teardown block args in tile-major order.
+    In the teardown region, yielded values become the op's results.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$results);
+  let assemblyFormat = "($results^ `:` type($results))? attr-dict";
 }
 
 #endif

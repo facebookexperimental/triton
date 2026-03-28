@@ -182,6 +182,23 @@ def TritonNvidiaGPUInterleaveTMemPass : Pass<"triton-nvidia-interleave-tmem", "m
   }];
 }
 
+def TritonNvidiaGPULowerSubtiledRegionPass
+    : Pass<"triton-nvidia-gpu-lower-subtiled-region", "mlir::ModuleOp"> {
+  let summary = "Lower subtiled_region ops into flat IR with barriers";
+
+  let description = [{
+    This pass lowers `ttng.subtiled_region` ops by:
+    1. Inlining the setup region ops before the op
+    2. Replicating the tile region for each tile in the tile mappings
+    3. Inserting barrier operations (wait_barrier / arrive_barrier) at
+       the positions specified by barrier annotations
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-tokens", "mlir::ModuleOp"> {
   let summary = "remove TMEM tokens";
 
