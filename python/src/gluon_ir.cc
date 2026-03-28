@@ -399,8 +399,8 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self, unsigned opIdx, std::vector<int64_t> &shape,
               std::vector<unsigned> &warpsPerCTA) -> py::object {
              auto ctx = self.getContext();
-             auto ll = ttg::chooseScaledWmmaScaleLayout(ctx, opIdx,
-                                                        warpsPerCTA, shape);
+             auto ll = ttg::chooseScaledWmmaScaleLayout(ctx, opIdx, warpsPerCTA,
+                                                        shape);
              auto attr = ttg::LinearEncodingAttr::get(ctx, ll);
              return layoutToGluon(attr);
            })
