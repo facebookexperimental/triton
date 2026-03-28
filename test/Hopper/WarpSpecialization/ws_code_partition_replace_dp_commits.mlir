@@ -4,11 +4,8 @@
 // tt.data_partition_factor = 2, producing two tc_gen5_mma ops in the inner
 // k-loop.
 //
-// With multiple MMAs in the loop, the pass replaces tc_gen5_commit with
-// wait_barrier + arrive_barrier for per-MMA completion tracking. The first
-// MMA's D-channel uses a tc_gen5_commit (no A/B channel info available yet),
-// while the second MMA's D-channel is replaced with wait+arrive on its
-// A/B consumer_release barrier.
+// With multiple MMAs in the loop, each MMA gets a plain tc_gen5_commit
+// with raw barrier allocs for D-channel completion tracking.
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent
 // CHECK: ttg.warp_specialize
@@ -23,12 +20,11 @@
 // The k-loop ends:
 // CHECK: scf.yield
 //
-// After the inner k-loop: first MMA gets a tc_gen5_commit, second MMA gets
-// wait_barrier + arrive_barrier replacement for per-MMA completion tracking.
+// After the inner k-loop: each MMA gets a plain tc_gen5_commit with raw
+// barrier allocs for D-channel completion tracking.
 //
 // CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
-// CHECK: ttng.wait_barrier
-// CHECK: ttng.arrive_barrier
+// CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
 // CHECK: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
 //
 // Outer loop yield:
