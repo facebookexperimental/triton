@@ -394,9 +394,9 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
         BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
         HEAD_DIM=HEAD_DIM,
         STAGE=stage,
-        BLOCK_M1=BWD_BLOCK_M1,
-        EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-        GROUP_SIZE_M=GROUP_SIZE_M,
+        #BLOCK_M1=BWD_BLOCK_M1,
+        #EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+        #GROUP_SIZE_M=GROUP_SIZE_M,
     )
 
     return dq, dk, dv
