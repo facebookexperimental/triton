@@ -334,23 +334,19 @@ class CUDABackend(BaseBackend):
         if opt.maxRegAutoWS is not None:
             mod.set_attr("ttg.max_reg_auto_ws", ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS))
 
-        cluster_info = nvidia.ClusterInfo()
         if opt.cluster_dims is not None:
-            cluster_info.clusterDimX = opt.cluster_dims[0]
-            cluster_info.clusterDimY = opt.cluster_dims[1]
-            cluster_info.clusterDimZ = opt.cluster_dims[2]
             # Set cluster_info attributes on the module
             mod.set_attr(
                 "ttg.cluster-dim-x",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimX),
+                ir.builder(mod.context).get_int32_attr(opt.cluster_dims[0]),
             )
             mod.set_attr(
                 "ttg.cluster-dim-y",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimY),
+                ir.builder(mod.context).get_int32_attr(opt.cluster_dims[1]),
             )
             mod.set_attr(
                 "ttg.cluster-dim-z",
-                ir.builder(mod.context).get_int32_attr(cluster_info.clusterDimZ),
+                ir.builder(mod.context).get_int32_attr(opt.cluster_dims[2]),
             )
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
@@ -362,7 +358,7 @@ class CUDABackend(BaseBackend):
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
-        nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)
+        nvidia.passes.ttnvgpuir.add_plan_cta(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
@@ -441,7 +437,9 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod, 'make_ttgir')
-        metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
+        # num_ctas == 16 is non-portable. Does work for H100 and B200 tho
+        metadata["cluster_dims"] = tuple(opt.cluster_dims) if opt.cluster_dims is not None else (opt.num_ctas, 1, 1)
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
@@ -465,6 +463,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         pm.run(mod, 'gluon_to_ttgir')
+        # num_ctas == 16 is non-portable. Does work for H100 and B200 tho
         metadata["cluster_dims"] = (options.num_ctas, 1, 1)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
