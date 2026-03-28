@@ -916,12 +916,25 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 }
 
 // Schedule post-loop operations (operations outside and after the loop) into
-// the epilogue partition. This recursively schedules operations that consume
-// loop results and their transitive users.
+// the appropriate partition. Epilogue store ops and their transitive users
+// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
+// ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
+// to the default partition. This prevents TMEM ops from landing in the epilogue,
+// which would force it to use 4 warps (TMEM lane coverage hardware constraint).
+// When no default partition exists (e.g., bwd), all ops fall back to epilogue.
 static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
                                 Partition *epiloguePartition) {
   if (!epiloguePartition)
     return;
+
+  // Find the default partition for non-store post-loop ops.
+  Partition *defaultPartition = nullptr;
+  for (Partition &p : schedule.getPartitions()) {
+    if (p.getType() == "default") {
+      defaultPartition = &p;
+      break;
+    }
+  }
 
   SmallVector<OpOperand *> uses;
 
@@ -945,10 +958,34 @@ static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
     if (loop->isAncestor(user))
       continue;
 
-    // Schedule this post-loop operation to the epilogue partition
-    // (skip if already scheduled, e.g. categorized as an epilogue store).
-    if (!hasPartition(user))
-      tryScheduleOp(epiloguePartition, user);
+    // Schedule this post-loop operation.
+    if (!hasPartition(user)) {
+      // Check if any operand comes from an op already in the epilogue
+      // partition. This captures transitive users of epilogue stores
+      // (e.g., TMAStoreTokenWaitOp after AsyncTMACopyLocalToGlobalOp).
+      bool hasEpilogueInput = llvm::any_of(user->getOperands(), [&](Value v) {
+        if (auto *defOp = v.getDefiningOp()) {
+          auto ids = getPartitionIds(defOp);
+          return ids &&
+                 llvm::is_contained(*ids, epiloguePartition->getIndex());
+        }
+        return false;
+      });
+
+      if (isEpilogueStoreOp(user) || hasEpilogueInput) {
+        // Epilogue store ops and users of epilogue-scheduled ops go to the
+        // epilogue partition.
+        tryScheduleOp(epiloguePartition, user);
+      } else if (defaultPartition) {
+        // Non-store post-loop ops (tmem_load, arithmetic) go to the default
+        // partition, keeping the epilogue lightweight.
+        tryScheduleOp(defaultPartition, user);
+      } else {
+        // Fallback when no default partition exists (e.g., bwd with
+        // reduction): schedule to epilogue to preserve existing behavior.
+        tryScheduleOp(epiloguePartition, user);
+      }
+    }
 
     // Add all users of this operation to process transitively, even if the
     // op was already scheduled. This ensures ops reachable only through
