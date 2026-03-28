@@ -36,6 +36,7 @@
 // CHECK-DAG: tlx.tmem_store(
 // CHECK-DAG: tlx.local_trans(
 // CHECK-DAG: tlx.subslice(
+// CHECK-DAG: tlx.local_view(
 
 // Verify warp specialization uses Python-like async_tasks syntax
 // CHECK-DAG: with tlx.async_tasks():
