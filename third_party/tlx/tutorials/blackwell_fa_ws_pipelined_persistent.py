@@ -1044,7 +1044,7 @@ configs_bwd_tlx = [
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
         ctas_per_cga=(cta, 1, 1),
-    ) for uwb in [False] for cta in [1]
+    ) for uwb in [False] for cta in [2]
 ]
 
 
@@ -1079,6 +1079,7 @@ def _bwd_compute_inner_loop(
     # 2-CTA DSMEM exchange parameters
     USE_2CTA: tl.constexpr = False,
     ds_peer_fulls=None,
+    dsT_fulls=None,
     cluster_cta_rank=0,
 ):
     start_block_n = start_n * BLOCK_N1
@@ -1136,6 +1137,10 @@ def _bwd_compute_inner_loop(
         # CTA 0 sends dsT[:, 0:M/2], CTA 1 sends dsT[:, M/2:M].
         # After exchange, overwrite the peer's half in ds_tiles.
         if USE_2CTA:
+            # Store pre-exchange dS to TMEM for Dot 5 (dK += dS @ Q).
+            # Dot 5 needs the original per-CTA dS, not the exchanged version.
+            tlx.local_store(dsT_tiles[ds_buf_id], dsT)
+            tlx.barrier_arrive(dsT_fulls[ds_buf_id], 1, remote_cta_rank=0)
             HALF_M: tl.constexpr = BLOCK_M1 // 2
             dsTs = _split_n(dsT, 2)
             peer_rank = 1 - cluster_cta_rank
@@ -1373,7 +1378,9 @@ def _attn_bwd_ws(
         # ds_peer_tiles receives the peer's half: [BLOCK_N1, BLOCK_M1 // NUM_CTAS].
         # Matches FA4's sdS_xchg layout (tile_n, tile_m // 2).
         ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
-        dsT_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS, tlx.storage_kind.tmem)
+        dsT_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS, tlx.storage_kind.tmem,
+                                    reuse=dp_tiles)
+        dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)
     else:
         cluster_cta_rank = 0
         is_leader = True
@@ -1502,6 +1509,7 @@ def _attn_bwd_ws(
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         USE_2CTA=USE_2CTA,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
+                        dsT_fulls=dsT_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
                     )
                 if STAGE & 2:
@@ -1534,6 +1542,7 @@ def _attn_bwd_ws(
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         USE_2CTA=USE_2CTA,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
+                        dsT_fulls=dsT_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
                     )
 
@@ -1681,6 +1690,30 @@ def _attn_bwd_ws(
                         tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                         ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
+                        # Dot 5 before Dot 4: in 2-CTA, dsT_tiles reuses dp_tiles
+                        # (which dq_tiles also reuses). Must read dS before dQ overwrites it.
+
+                        # Dot 5: dk += tl.dot(dsT, q)
+                        if USE_2CTA:
+                            # Use pre-exchange dS from TMEM (not post-exchange SMEM)
+                            tlx.barrier_wait(dsT_fulls[ds_buf_id_prev], ds_phase_prev)
+                            tlx.async_dot(
+                                dsT_tiles[ds_buf_id_prev],
+                                q_tiles[q_buf_id_prev],
+                                dk_tiles[kv_buf_id],
+                                use_acc=(j - 1) > 0,
+                                mBarriers=[q_empties[q_buf_id_prev]],
+                                two_ctas=True,
+                            )
+                        else:
+                            tlx.async_dot(
+                                ds_tiles[ds_buf_id_prev],
+                                q_tiles[q_buf_id_prev],
+                                dk_tiles[kv_buf_id],
+                                use_acc=(j - 1) > 0,
+                                mBarriers=[q_empties[q_buf_id_prev]],
+                            )
+
                         # Dot 4: dq = tl.dot(tl.trans(dsT), k)
                         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
                         tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
@@ -1703,16 +1736,6 @@ def _attn_bwd_ws(
                                 use_acc=False,
                                 mBarriers=[dq_fulls[tmem_buf_id_prev]],
                             )
-
-                        # Dot 5: dk += tl.dot(dsT, q)
-                        tlx.async_dot(
-                            ds_tiles[ds_buf_id_prev],
-                            q_tiles[q_buf_id_prev],
-                            dk_tiles[kv_buf_id],
-                            use_acc=(j - 1) > 0,
-                            mBarriers=[q_empties[q_buf_id_prev]],
-                            two_ctas=USE_2CTA,
-                        )
 
                         q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
@@ -1779,17 +1802,30 @@ def _attn_bwd_ws(
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                     ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
                     # Epilog dot 5: dk += tl.dot(dsT, q)
-                    tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
-                    tlx.async_dot(
-                        ds_tiles[ds_buf_id],
-                        q_tiles[q_buf_id],
-                        dk_tiles[kv_buf_id],
-                        use_acc=num_steps > 1,
-                        mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
-                        two_ctas=USE_2CTA,
-                    )
+                    if USE_2CTA:
+                        # Use pre-exchange dS from TMEM
+                        tlx.barrier_wait(dsT_fulls[ds_buf_id], ds_phase)
+                        tlx.async_dot(
+                            dsT_tiles[ds_buf_id],
+                            q_tiles[q_buf_id],
+                            dk_tiles[kv_buf_id],
+                            use_acc=num_steps > 1,
+                            mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
+                            two_ctas=True,
+                        )
+                    else:
+                        tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
+                        tlx.async_dot(
+                            ds_tiles[ds_buf_id],
+                            q_tiles[q_buf_id],
+                            dk_tiles[kv_buf_id],
+                            use_acc=num_steps > 1,
+                            mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
+                        )
 
                     # Epilog dot 4: dq = tl.dot(tl.trans(dsT), k)
+                    if USE_2CTA:
+                        tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
                     tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
                     dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
                     if USE_2CTA:
