@@ -378,6 +378,9 @@ def async_remote_shmem_store(
     Store a distributed tensor into a buffer into the remote shared memory of a cluster asynchronously.
     Signals the provided mbarrier when the store completes.
 
+    NOTE: this will increase the lifetime of
+    the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
+
     Args:
         dst: The destination buffer in local shared memory (will be internally mapped to remote CTA)
         src: The source tensor to store
@@ -410,6 +413,10 @@ def async_remote_shmem_copy(
     """
     Copy a local shared memory buffer to the remote shared memory of a cluster CTA.
     Notifies the remote CTA's mbarrier (via mapa) when the copy completes.
+
+    NOTE: this will increase the lifetime of
+    the SMEM buffers involved to entire program, and potentially increase SMEM pressure.
+
     Uses PTX: cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes
 
     Args:
