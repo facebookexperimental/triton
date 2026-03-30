@@ -421,8 +421,8 @@ static void logOpStillHasUsers(Operation *op) {
         llvm::errs() << "  User: " << user->getName();
         // llvm::errs() << "  Full IR: ";
         // user->print(llvm::errs());
-        if (auto userPartitionAttr =
-                user->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
+        if (auto userPartitionAttr = user->getAttrOfType<DenseI32ArrayAttr>(
+                ttg::kPartitionAttrName)) {
           llvm::errs() << " (partition: " << userPartitionAttr << ")";
         }
         auto userTaskIds = getAsyncTaskIds(user);

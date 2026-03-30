@@ -154,8 +154,8 @@ public:
         return WalkResult::advance();
 
       auto srcTy = cast<RankedTensorType>(requireOp.getResult().getType());
-      auto compatibleLayouts = ttng::getTmemCompatibleLayouts(
-          storeOp, srcTy, memTy);
+      auto compatibleLayouts =
+          ttng::getTmemCompatibleLayouts(storeOp, srcTy, memTy);
       assert(!compatibleLayouts.empty() &&
              "No TMEM-compatible layout found for scales");
       auto newEncoding = compatibleLayouts.front();

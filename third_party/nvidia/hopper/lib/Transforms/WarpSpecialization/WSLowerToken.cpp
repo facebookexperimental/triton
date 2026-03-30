@@ -196,13 +196,13 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     // Helper function for extracting one index from bufferFullArray.
     auto extractBufferFull = [&](Location loc, Value idx) -> Value {
       return ttg::MemDescIndexOp::create(builder, loc, singleBarrierMemDescType,
-                                                 bufferFullArray, idx);
+                                         bufferFullArray, idx);
     };
 
     // Helper function for extracting one index from bufferEmptyArray.
     auto extractBufferEmpty = [&](Location loc, Value idx) -> Value {
       return ttg::MemDescIndexOp::create(builder, loc, singleBarrierMemDescType,
-                                                 bufferEmptyArray, idx);
+                                         bufferEmptyArray, idx);
     };
     auto handleOneUser = [&](Operation *user) -> bool {
       // Here builder is at the user, make sure usage of values outside of

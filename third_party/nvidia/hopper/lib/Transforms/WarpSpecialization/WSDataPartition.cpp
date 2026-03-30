@@ -1038,8 +1038,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // The source op is already sliced at this point, so srcTy, type, tmem is
     // sliced. We use getTmemCompatibleLayout to get a block layout that is
     // for the sliced tmem here.
-    auto compatibleLayouts = nvidia_gpu::getTmemCompatibleLayouts(
-        op, oldSrcType, type);
+    auto compatibleLayouts =
+        nvidia_gpu::getTmemCompatibleLayouts(op, oldSrcType, type);
     assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
     auto newDistributedEncoding = compatibleLayouts.front();
     // oldRetType is the desired output, we slice it and convert from the
