@@ -3372,16 +3372,16 @@ static void assignMissingPartitionIds(triton::FuncOp &funcOp) {
   funcOp->walk([&](Operation *op) {
     if (!op->hasAttr(ttg::kPartitionAttrName) || op->getNumRegions() == 0)
       return;
-    auto parentIds = ttg::getPartitionIds(op);
-    if (!parentIds)
+    if (!ttg::hasPartition(op))
       return;
+    auto parentIds = ttg::getPartitionIds(op);
     for (auto &region : op->getRegions()) {
       for (auto &block : region.getBlocks()) {
         for (auto &childOp : block.getOperations()) {
           if (isa<scf::YieldOp, tt::ReduceReturnOp>(childOp))
             continue;
           if (!childOp.hasAttr(ttg::kPartitionAttrName))
-            ttg::setPartition(&childOp, *parentIds);
+            ttg::setPartition(&childOp, parentIds);
         }
       }
     }

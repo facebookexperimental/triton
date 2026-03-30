@@ -113,17 +113,12 @@ public:
   // Utility to be used when the op is known to belong to one partition
   Partition *getPartition(Operation *op);
 
-  // Check if the operation belongs to all partitions
-  bool isInRootPartition(Operation *op);
-
 private:
   // WarpSpecialization tag
   int tag;
   // Partitions are numbered [0, N).
   SmallVector<std::unique_ptr<Partition>> partitions;
 };
-
-bool hasPartition(Operation *op);
 
 // Annotate the op with the partition index or indices, and add the op
 // to the partitions it belongs to.
@@ -136,8 +131,6 @@ void setPartition(Operation *op, ArrayRef<int> partitionIds);
 void setPartition(Operation *op, const SetVector<int> &partitionIds);
 void setPartitionOutputs(Operation *op,
                          ArrayRef<SetVector<int>> partitionOutputsIds);
-SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op);
-SetVector<int> getPartitionIds(OpOperand *use);
 
 } // namespace mlir::triton::gpu
 

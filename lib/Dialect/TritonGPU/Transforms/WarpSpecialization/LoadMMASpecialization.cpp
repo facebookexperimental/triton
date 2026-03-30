@@ -59,14 +59,11 @@ struct PipelinedMMA {
 } // namespace
 
 bool samePartition(Operation *op1, Operation *op2) {
-  auto part1 = getPartitionIds(op1);
-  auto part2 = getPartitionIds(op2);
-
-  if (!part1 || !part2) {
+  if (!hasPartition(op1) || !hasPartition(op2)) {
     return false;
   }
 
-  return *part1 == *part2;
+  return getPartitionIds(op1) == getPartitionIds(op2);
 }
 
 static std::pair<SmallVector<PipelinedLoad>, SmallVector<PipelinedMMA>>
@@ -674,7 +671,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     if (!defOp || loop.isDefinedOutsideOfLoop(operand))
       continue;
 
-    if (partitions.isInRootPartition(defOp)) {
+    if (!hasPartition(defOp) || getPartitionIds(defOp).size() == partitions.getNumPartitions()) {
       // If the MMA operand is coming from outside the loop, move the alloc out.
       auto allocOp = dyn_cast<LocalAllocOp>(defOp);
       if (allocOp && loop.isDefinedOutsideOfLoop(allocOp.getSrc()))

@@ -867,8 +867,7 @@ static bool hasDefPartition(scf::ForOp loop, Operation *op,
     Operation *op = worklist.pop_back_val();
     if (!seen.insert(op).second)
       continue;
-    auto partitionIds = getPartitionIds(op);
-    if (partitionIds)
+    if (hasPartition(op))
       return true;
     iterateDefs(loop, op,
                 [&](OpResult def) { worklist.push_back(def.getDefiningOp()); });
@@ -1190,13 +1189,11 @@ getInitialSchedule(scf::ForOp mainLoop,
 
         // Duplicate the op if necessary to ensure MMA partition is only user
         if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-              auto ids = getPartitionIds(user);
-              return ids && ids->contains(mmaPartition->getIndex());
+              return hasPartition(user) && getPartitionIds(user).contains(mmaPartition->getIndex());
             })) {
           Operation *newOp = OpBuilder(op).clone(*op);
           op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-            auto ids = getPartitionIds(use.getOwner());
-            return ids && ids->contains(mmaPartition->getIndex());
+            return hasPartition(use.getOwner()) && getPartitionIds(use.getOwner()).contains(mmaPartition->getIndex());
           });
           op = newOp;
         }
@@ -1473,10 +1470,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     // Look at the definitions directly feeding into this operation.
     iterateDefs(loop, op, [&](OpResult def) {
       Operation *defOp = def.getDefiningOp();
-      if (auto partitionIds = getPartitionIds(defOp)) {
+      if (hasPartition(defOp)) {
         // The input originates from an operation already assigned to a
         // partition. Add this as a def partition.
-        for (auto id : *partitionIds) {
+        for (auto id : getPartitionIds(defOp)) {
           cluster->defPartitions.insert(schedule.getPartition(id));
         }
       } else {
@@ -1500,10 +1497,10 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
     });
     // Check the users of the operation.
     iterateUsers(loop, op, [&](Operation *user) {
-      if (auto partitionIds = getPartitionIds(user)) {
+      if (hasPartition(user)) {
         // If the user is already assigned to a partition, add that partition as
         // one of the sink partitions.
-        for (auto id : *partitionIds) {
+        for (auto id : getPartitionIds(user)) {
           cluster->sinkPartitions.insert(schedule.getPartition(id));
         }
         return;
@@ -1604,10 +1601,12 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule) {
 void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   // Helper to get partition for an op, returning null if unscheduled.
   auto getPartition = [&](Operation *op) -> Partition * {
-    auto ids = getPartitionIds(op);
-    if (!ids || ids->size() != 1)
+    if (!hasPartition(op))
       return nullptr;
-    return schedule.getPartition(static_cast<unsigned>((*ids)[0]));
+    auto ids = getPartitionIds(op);
+    if (ids.size() != 1)
+      return nullptr;
+    return schedule.getPartition(static_cast<unsigned>(ids[0]));
   };
 
   // Walk everything in reverse so that operations are visited before their
@@ -1706,8 +1705,8 @@ void PartitionSchedulingMeta::runOnOperation() {
         // Find the nearest ancestor in the loop body that has a partition.
         Operation *ancestor = op->getParentOp();
         while (ancestor && ancestor != loop.getOperation()) {
-          if (auto ids = getPartitionIds(ancestor)) {
-            setPartition(op, *ids);
+          if (hasPartition(ancestor)) {
+            setPartition(op, getPartitionIds(ancestor));
             break;
           }
           ancestor = ancestor->getParentOp();
@@ -1735,8 +1734,8 @@ void PartitionSchedulingMeta::runOnOperation() {
             isa<scf::YieldOp, triton::ReduceReturnOp>(op))
           return WalkResult::advance();
         auto parentOp = op->getParentOp();
-        if (auto parentPartitionIds = getPartitionIds(parentOp))
-          setPartition(op, *parentPartitionIds);
+        if (hasPartition(parentOp))
+          setPartition(op, getPartitionIds(parentOp));
         return WalkResult::advance();
       });
 
