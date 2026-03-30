@@ -3662,7 +3662,9 @@ def test_prefetch_tensormap(device):
     out_desc = TensorDescriptor.from_tensor(y, [BLOCK_SIZE_M, BLOCK_SIZE_N])
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     kernel = prefetch_tensormap_kernel[grid](in_desc, out_desc, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N)
-    assert kernel.asm["ptx"].count("prefetch.param.tensormap") == 2
+    # Make sure we're using generic address, not .param space
+    assert kernel.asm["ptx"].count("prefetch.tensormap") == 2
+    assert kernel.asm["ptx"].count("prefetch.param.tensormap") == 0
     torch.testing.assert_close(x, y)
 
 
