@@ -913,7 +913,8 @@ void createToken(
         Value v;
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
           v = ttnvws::CreateTokenOp::create(builder, funcOp.getLoc(),
-                                            channel->getNumBuffers(), tokenLoadType);
+                                            channel->getNumBuffers(),
+                                            tokenLoadType);
         else
           v = ttnvws::CreateTokenOp::create(builder, funcOp.getLoc(), 1,
                                             tokenLoadType);
@@ -1623,9 +1624,9 @@ static ttng::TMEMAllocOp createTMemAllocPost(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return ttng::TMEMAllocOp::create(builder, oldTMemAllocOp.getLoc(),
-                                   accMemDescType,
-                                   builder.getType<ttg::AsyncTokenType>(), /*src=*/Value());
+  return ttng::TMEMAllocOp::create(
+      builder, oldTMemAllocOp.getLoc(), accMemDescType,
+      builder.getType<ttg::AsyncTokenType>(), /*src=*/Value());
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,

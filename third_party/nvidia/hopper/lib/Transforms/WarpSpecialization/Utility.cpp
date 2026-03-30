@@ -21,8 +21,8 @@ SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
           asyncTaskIds[asyncTaskIds.size() - 1] != asyncTaskId)
         asyncTaskIds.push_back(asyncTaskId);
     }
-  } else if (auto attr =
-                 op->getAttrOfType<DenseI32ArrayAttr>(tt::gpu::kPartitionAttrName)) {
+  } else if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
+                 tt::gpu::kPartitionAttrName)) {
     for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
       asyncTaskIds.push_back(asyncTaskId);
     }

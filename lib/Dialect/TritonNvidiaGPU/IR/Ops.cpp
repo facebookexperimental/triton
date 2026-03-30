@@ -722,7 +722,8 @@ static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
   // getTmemCompatibleLayouts.
   SmallVector<DistributedEncodingTrait> layouts =
       getTmemCompatibleLayouts(op, type, memdesc);
-  auto encoding = dyn_cast<triton::gpu::LayoutEncodingTrait>(type.getEncoding());
+  auto encoding =
+      dyn_cast<triton::gpu::LayoutEncodingTrait>(type.getEncoding());
   if (encoding) {
     for (auto &layout : layouts) {
       if (triton::gpu::areLayoutsEquivalent(
