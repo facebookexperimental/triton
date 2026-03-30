@@ -850,7 +850,7 @@ def async_descriptor_prefetch_tensor(
 
 
 @tl.builtin
-def prefetch(pointer, level="L2", mask=None, _semantic=None):
+def prefetch(pointer, level="L2", mask=None, tensormap=False, _semantic=None):
     """
     Issue a non-blocking prefetch hint for pointer-based scattered/gather loads.
 
@@ -864,7 +864,13 @@ def prefetch(pointer, level="L2", mask=None, _semantic=None):
                ``"L2"`` (default) prefetches into L2 only.
         mask: Optional boolean tensor. Only elements where mask is True are
               prefetched.
+        tensormap: If True, ignore `level` and `mask`, and issue a prefetch for
+              the TMA descriptor (tensormap) in `pointer`. This is a perf hint to warm
+              up the descriptor for following TMA accesses
     """
+    if tensormap:
+        _semantic.builder.create_prefetch_tensormap(pointer.handle)
+        return
     assert level in ("L1", "L2"), f"level must be 'L1' or 'L2', got '{level}'"
     if level == "L1":
         cache = _semantic._str_to_load_cache_modifier(".ca")
@@ -872,23 +878,6 @@ def prefetch(pointer, level="L2", mask=None, _semantic=None):
         cache = _semantic._str_to_load_cache_modifier(".cg")
     mask_handle = mask.handle if mask is not None else None
     _semantic.builder.create_prefetch(pointer.handle, mask_handle, cache)
-
-
-@tl.builtin
-def prefetch_tensormap(
-    desc: tl.tensor_descriptor,
-    _semantic=None,
-) -> None:
-    """
-    Prefetch a host side TMA tensor map descriptor object into cache.
-
-    This is a
-    performance hint that warms the cache for a subsequent TMA operation
-    that references the same descriptor.
-
-    :param desc: Tensor descriptor, must be initialized on the host side
-    """
-    _semantic.builder.create_prefetch_tensormap(desc.handle)
 
 
 @tl.builtin

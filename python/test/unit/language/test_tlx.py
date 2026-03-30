@@ -3638,8 +3638,8 @@ def test_prefetch_tensormap(device):
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
 
-        tlx.prefetch_tensormap(in_desc)
-        tlx.prefetch_tensormap(out_desc)
+        tlx.prefetch(in_desc, tensormap=True)
+        tlx.prefetch(out_desc, tensormap=True)
 
         buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
@@ -3699,8 +3699,8 @@ def test_prefetch_tensormap(device):
             strides=[N, 1],
             block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
         )
-        tlx.prefetch_tensormap(desc_in)
-        tlx.prefetch_tensormap(desc_out)
+        tlx.prefetch(desc_in, tensormap=True)
+        tlx.prefetch(desc_out, tensormap=True)
 
         buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.int16, tl.constexpr(1))
         buffer = tlx.local_view(buffers, 0)
