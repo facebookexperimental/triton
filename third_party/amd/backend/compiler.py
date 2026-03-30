@@ -34,7 +34,6 @@ class HIPOptions:
     num_stages: int = 2
     num_ctas: int = 1
     extern_libs: dict = None
-    cluster_dims: tuple = (1, 1, 1)
     debug: bool = False
     sanitize_overflow: bool = False
     arch: str = None
@@ -139,9 +138,6 @@ class HIPBackend(BaseBackend):
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
-            metadata.cluster_dims[0],
-            metadata.cluster_dims[1],
-            metadata.cluster_dims[2],
         )
 
     def get_codegen_implementation(self, options):

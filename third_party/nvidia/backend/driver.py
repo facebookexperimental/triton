@@ -1,5 +1,4 @@
 import functools
-import operator
 import os
 import subprocess
 import triton
@@ -319,7 +318,7 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   return cuLaunchKernelExHandle;
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int preferredClusterDimX, int preferredClusterDimY, int preferredClusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{", " + arg_decls if len(arg_decls) > 0 else ""}) {{
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_cluster, int launch_pdl, int preferredClusterDimX, int preferredClusterDimY, int preferredClusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{", " + arg_decls if len(arg_decls) > 0 else ""}) {{
   void *params[] = {{ {", ".join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
     // 5 attributes that we can currently pass maximum
@@ -329,15 +328,9 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       cuLaunchKernelExHandle = getLaunchKernelExHandle();
     }}
     CUlaunchConfig config;
-    config.gridDimX = gridX;
+    config.gridDimX = gridX * num_ctas;
     config.gridDimY = gridY;
     config.gridDimZ = gridZ;
-
-    if (num_ctas != 1) {{
-      config.gridDimX *= clusterDimX;
-      config.gridDimY *= clusterDimY;
-      config.gridDimZ *= clusterDimZ;
-    }}
 
     config.blockDimX = 32 * num_warps;
     config.blockDimY = 1;
@@ -363,9 +356,9 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
     if (launch_cluster !=0 || num_ctas != 1 || preferredClusterDimX > 0) {{
       CUlaunchAttribute clusterAttr = {{}};
       clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-      clusterAttr.value.clusterDim.x = clusterDimX;
-      clusterAttr.value.clusterDim.y = clusterDimY;
-      clusterAttr.value.clusterDim.z = clusterDimZ;
+      clusterAttr.value.clusterDim.x = num_ctas;
+      clusterAttr.value.clusterDim.y = 1;
+      clusterAttr.value.clusterDim.z = 1;
       launchAttr[num_attrs] = clusterAttr;
       ++num_attrs;
 
@@ -388,6 +381,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
     }}
     #endif
 
+    // num_ctas == 16 is non-portable. Does work for H100 and B200 tho
     config.numAttrs = num_attrs;
     if (num_ctas == 16) {{
       CUDA_CHECK(cuFuncSetAttribute(
@@ -559,8 +553,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     return NULL;
   }}
 
-  int num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ, preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ;
-  if (!PyArg_ParseTuple(kernel_metadata, \"iiiiiiiii\", &num_warps, &num_ctas, &shared_memory, &clusterDimX, &clusterDimY, &clusterDimZ, &preferredClusterDimX, &preferredClusterDimY, &preferredClusterDimZ)) {{
+  int num_warps, num_ctas, shared_memory, preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ;
+  if (!PyArg_ParseTuple(kernel_metadata, \"iiiiii\", &num_warps, &num_ctas, &shared_memory, &preferredClusterDimX, &preferredClusterDimY, &preferredClusterDimZ)) {{
     PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
     return NULL;
   }}
@@ -596,7 +590,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {newline.join(tma_decls)}
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{", " + ", ".join(internal_args_list) if len(internal_args_list) > 0 else ""});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_cluster, launch_pdl, preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{", " + ", ".join(internal_args_list) if len(internal_args_list) > 0 else ""});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -762,15 +756,12 @@ class CudaLauncher(object):
 
         # Distinguish between Triton's way and TLX's way by checking if ctas_per_cga
         # was explicitly set:
-        # - Triton's way: Uses num_ctas > 1 with cluster_dims = (1,1,1). Grid is multiplied
-        #   by num_ctas to get total CTAs.
-        # - TLX's way (CUDA native): Uses ctas_per_cga to set non-trivial cluster_dims.
+        # - Triton's way: Uses num_ctas > 1. Grid is multiplied by num_ctas to get total CTAs.
+        # - TLX's way (CUDA native): Uses ctas_per_cga to set cluster shape.
         #   Grid equals total CTAs, and ctas_per_cga regroups them into clusters.
         # When ctas_per_cga is set, num_ctas must be 1 to prevent multiplicative behavior.
         if getattr(metadata, "ctas_per_cga", None) is not None:
             # TLX/CUDA way: ctas_per_cga defines cluster shape, num_ctas must be 1
-            assert tuple(metadata.ctas_per_cga) == tuple(metadata.cluster_dims), (
-                f"ctas_per_cga ({metadata.ctas_per_cga}) must equal cluster_dims ({metadata.cluster_dims})")
             self.num_ctas = 1
             # When using ctas_per_cga, always enable cluster launch.
             # Use True since the C code checks "launch_cluster != 0".
@@ -779,7 +770,7 @@ class CudaLauncher(object):
             # Triton's way: use num_ctas for multiplicative cluster semantics.
             # Note: cluster launch is enabled by "num_ctas != 1" in the C code,
             # so launch_cluster can be False here.
-            self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
+            self.num_ctas = metadata.num_ctas
             self.launch_cluster = metadata.launch_cluster
         self.launch = wrap_handle_tensordesc(launch_fn, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size

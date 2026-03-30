@@ -262,9 +262,6 @@ class CUDABackend(BaseBackend):
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
-            metadata.cluster_dims[0],
-            metadata.cluster_dims[1],
-            metadata.cluster_dims[2],
             preferred[0],
             preferred[1],
             preferred[2],
@@ -437,8 +434,6 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod, 'make_ttgir')
-        # num_ctas == 16 is non-portable. Does work for H100 and B200 tho
-        metadata["cluster_dims"] = tuple(opt.cluster_dims) if opt.cluster_dims is not None else (opt.num_ctas, 1, 1)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
@@ -463,8 +458,6 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         pm.run(mod, 'gluon_to_ttgir')
-        # num_ctas == 16 is non-portable. Does work for H100 and B200 tho
-        metadata["cluster_dims"] = (options.num_ctas, 1, 1)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
