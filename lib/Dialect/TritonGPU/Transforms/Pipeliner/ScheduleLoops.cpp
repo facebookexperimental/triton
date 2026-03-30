@@ -214,8 +214,7 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
           // data flow back to the parent scf.if's results so the BFS can
           // continue to downstream users (e.g. the next MMA op).
           if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
-            if (auto ifOp =
-                    dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+            if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
               if (!seenOps.count(ifOp))
                 users.push_back(ifOp);
             }
