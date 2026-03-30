@@ -212,7 +212,10 @@ def test_record(method, fresh_knobs, tmp_path: pathlib.Path):
         clock_loc = suffix.split(",")[0].split()[0]
         break
     assert clock_loc is not None
-    loc_line = next((line for line in llir_lines if clock_loc in line and "DILocation" in line), None)
+    loc_line = next(
+        (line for line in llir_lines if clock_loc in line and "DILocation" in line),
+        None,
+    )
     assert loc_line is not None
     assert "line: " in loc_line and "line: 0" not in loc_line
 

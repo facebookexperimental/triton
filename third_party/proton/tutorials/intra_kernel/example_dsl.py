@@ -65,6 +65,12 @@ def config_helper(description: str):
         default=False,
         help="Use global memory as the internal buffer during profiling (default: False).",
     )
+    parser.add_argument(
+        "--gmem_buffer",
+        action="store_true",
+        default=False,
+        help="Use global memory as the internal buffer during profiling (default: False).",
+    )
 
     args = parser.parse_args()
 
@@ -74,6 +80,11 @@ def config_helper(description: str):
     # `clock_32` provides lower overhead per record, `time_shift`` post-processes to reduce noise
     if args.increase_accuracy:
         opts = "clock32,time_shift"
+
+    if args.gmem_buffer:
+        buf = "global"
+    else:
+        buf = "shared"
 
     if args.gmem_buffer:
         buf = "global"
