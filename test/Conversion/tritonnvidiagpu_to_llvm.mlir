@@ -172,7 +172,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: prefetch_tensormap
-  // CHECK: "prefetch.param.tensormap [ $0
+  // CHECK: "prefetch.tensormap [ $0
   // CHECK: return
   tt.func @prefetch_tensormap(%desc_ptr: !tt.tensordesc<tensor<128x128xf32>>) {
     ttng.prefetch_tensormap %desc_ptr : !tt.tensordesc<tensor<128x128xf32>>
