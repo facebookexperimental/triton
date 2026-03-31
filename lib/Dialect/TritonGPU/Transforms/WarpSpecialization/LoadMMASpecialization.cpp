@@ -671,7 +671,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     if (!defOp || loop.isDefinedOutsideOfLoop(operand))
       continue;
 
-    if (!hasPartition(defOp) || getPartitionIds(defOp).size() == partitions.getNumPartitions()) {
+    if (!hasPartition(defOp) ||
+        getPartitionIds(defOp).size() == partitions.getNumPartitions()) {
       // If the MMA operand is coming from outside the loop, move the alloc out.
       auto allocOp = dyn_cast<LocalAllocOp>(defOp);
       if (allocOp && loop.isDefinedOutsideOfLoop(allocOp.getSrc()))

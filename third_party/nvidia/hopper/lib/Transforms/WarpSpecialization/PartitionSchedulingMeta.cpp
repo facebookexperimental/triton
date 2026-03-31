@@ -1189,11 +1189,14 @@ getInitialSchedule(scf::ForOp mainLoop,
 
         // Duplicate the op if necessary to ensure MMA partition is only user
         if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-              return hasPartition(user) && getPartitionIds(user).contains(mmaPartition->getIndex());
+              return hasPartition(user) &&
+                     getPartitionIds(user).contains(mmaPartition->getIndex());
             })) {
           Operation *newOp = OpBuilder(op).clone(*op);
           op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-            return hasPartition(use.getOwner()) && getPartitionIds(use.getOwner()).contains(mmaPartition->getIndex());
+            return hasPartition(use.getOwner()) &&
+                   getPartitionIds(use.getOwner())
+                       .contains(mmaPartition->getIndex());
           });
           op = newOp;
         }
