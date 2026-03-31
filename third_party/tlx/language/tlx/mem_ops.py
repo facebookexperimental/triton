@@ -888,7 +888,7 @@ def async_descriptor_prefetch_tensor(
 
 
 @tl.builtin
-def prefetch(pointer, level="L2", mask=None, _semantic=None):
+def prefetch(pointer, level="L2", mask=None, tensormap=False, _semantic=None):
     """
     Issue a non-blocking prefetch hint for pointer-based scattered/gather loads.
 
@@ -902,7 +902,13 @@ def prefetch(pointer, level="L2", mask=None, _semantic=None):
                ``"L2"`` (default) prefetches into L2 only.
         mask: Optional boolean tensor. Only elements where mask is True are
               prefetched.
+        tensormap: If True, ignore `level` and `mask`, and issue a prefetch for
+              the TMA descriptor (tensormap) in `pointer`. This is a perf hint to warm
+              up the descriptor for following TMA accesses
     """
+    if tensormap:
+        _semantic.builder.create_prefetch_tensormap(pointer.handle)
+        return
     assert level in ("L1", "L2"), f"level must be 'L1' or 'L2', got '{level}'"
     if level == "L1":
         cache = _semantic._str_to_load_cache_modifier(".ca")

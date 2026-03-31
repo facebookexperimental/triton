@@ -532,6 +532,25 @@ Binary wheels are available for CPython 3.10-3.14.
 
     Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
 
+### Memory Fences
+
+- `tlx.fence(scope)` issues a memory fence. The `scope` argument is required:
+
+  | Scope | PTX | Description |
+  |-------|-----|-------------|
+  | `"gpu"` | `fence.acq_rel.gpu` | Device-scope fence. Orders prior global/shared memory writes to be visible to all GPU threads. |
+  | `"sys"` | `fence.acq_rel.sys` | System-scope fence. Like `"gpu"` but also visible to the host CPU. |
+  | `"async_shared"` | `fence.proxy.async.shared::cta` | Proxy fence for async shared memory. Required between `local_store` and a subsequent TMA store (`async_descriptor_store`) to the same shared memory. |
+
+  Example:
+  ```python
+  tlx.local_store(smem_buf, data)
+  tlx.fence("async_shared")
+  tlx.async_descriptor_store(desc, smem_buf, offsets)
+  ```
+
+
+
 ### Cluster Launch Control (CLC)
 
 CLC (Cluster Launch Control) is a Blackwell-specific feature that enables **dynamic persistent kernel** execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.
@@ -871,6 +890,32 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     ```
         ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
     ```
+
+- `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
+  Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
+
+  | Level | PTX | Description |
+  |-------|-----|-------------|
+  | `"L1"` | `prefetch.global.L1` | Prefetch into L1 and L2 cache |
+  | `"L2"` | `prefetch.global.L2` | Prefetch into L2 cache only (default) |
+
+  Example:
+  ```python
+  offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+  mask = offsets < n_elements
+  tlx.prefetch(input_ptr + offsets, level="L2", mask=mask)
+  x = tl.load(input_ptr + offsets, mask=mask)
+
+  ...
+  # desc_in can be host side descriptor or device side like this:
+  desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+  tlx.prefetch(desc_in, tensormap=True)
+  ```
 
 ## Kernels Implemented with TLX
 
