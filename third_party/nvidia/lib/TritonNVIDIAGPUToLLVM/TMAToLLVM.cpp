@@ -1,4 +1,5 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/TypeUtilities.h"
 
 #include "PatternTritonGPUOpToLLVM.h"
@@ -314,12 +315,45 @@ struct ReinterpretTensorDescOpConversion
   }
 };
 
+struct PrefetchTensormapOpConversion
+    : public ConvertOpToLLVMPattern<ttng::PrefetchTensormapOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ttng::PrefetchTensormapOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    // Host side TMA desc comes as a kernel param, in .param space
+    // Device side TMA desc gets initialized in SMEM and copied to GMEM
+    // We use Generic Address state space here to support both
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx, 0);
+    Value addr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy,
+                                                        adaptor.getDesc());
+    // Note: not lowering to NVVM::PrefetchOp as it seems to have a bug where
+    // if I don't set `$in_param_space` (leading to prefetch.param.tensormap)
+    // it's emitting both `prefetch.tensormap` and `prefetch.param.tensormap` at
+    // the same time
+    PTXBuilder ptxBuilder;
+    auto *descAddrOpr = ptxBuilder.newAddrOperand(addr, "l");
+    auto &prefetch = *ptxBuilder.create<>("prefetch.tensormap");
+    prefetch(descAddrOpr);
+
+    auto voidTy = void_ty(op->getContext());
+    ptxBuilder.launch(rewriter, loc, voidTy);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateTMAToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<TensormapCreateOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<TensormapFenceproxyAcquireOpConversion,
-               ReinterpretTensorDescOpConversion>(typeConverter, benefit);
+  patterns
+      .add<TensormapFenceproxyAcquireOpConversion,
+           PrefetchTensormapOpConversion, ReinterpretTensorDescOpConversion>(
+          typeConverter, benefit);
 }

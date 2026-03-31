@@ -898,10 +898,11 @@ def prefetch(pointer, level="L2", mask=None, tensormap=False, _semantic=None):
         mask: Optional boolean tensor. Only elements where mask is True are
               prefetched.
         tensormap: If True, ignore `level` and `mask`, and issue a prefetch for
-              the TMA descriptor (tensormap) in `pointer`.
+              the TMA descriptor (tensormap) in `pointer`. This is a perf hint to warm
+              up the descriptor for following TMA accesses
     """
     if tensormap:
-        raise NotImplementedError("tensormap prefetch not available on this branch")
+        _semantic.builder.create_prefetch_tensormap(pointer.handle)
         return
     assert level in ("L1", "L2"), f"level must be 'L1' or 'L2', got '{level}'"
     if level == "L1":

@@ -1076,4 +1076,22 @@ def TTNG_TensormapFenceproxyAcquireOp: TTNG_Op<
   }];
 }
 
+def TTNG_PrefetchTensormapOp: TTNG_Op<
+  "prefetch_tensormap",
+  [MemoryEffects<[MemWrite<GlobalMemory>]>]
+> {
+  let summary = "Prefetch a tensormap descriptor object into cache";
+
+  let description = [{
+    Prefetches a TMA tensor map descriptor into cache. This is a
+    performance hint that warms the cache for a subsequent TMA operation
+    that references the same descriptor.
+  }];
+
+  let arguments = (ins Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc);
+  let assemblyFormat = [{
+    $desc attr-dict `:` qualified(type($desc))
+  }];
+}
+
 #endif
