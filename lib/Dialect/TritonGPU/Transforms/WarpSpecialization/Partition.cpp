@@ -65,7 +65,8 @@ void Partition::iterateOutputs(
         // The user is outside the loop, so it's a post-loop operation.
         // Use the operation directly.
         owner = use.getOwner();
-        if (!hasPartition(owner) || !getPartitionIds(owner).contains(getIndex())) {
+        if (!hasPartition(owner) ||
+            !getPartitionIds(owner).contains(getIndex())) {
           callback(owner, use);
         }
         continue;
