@@ -1701,13 +1701,14 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       // Step 1: For ops nested inside regions (e.g. tt.reduce body, scf.if
       // body), inherit the partition from the nearest ancestor op that has one.
+      Operation *loopOp = loop.getOperation();
       loop->walk([&](Operation *op) {
         if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
           return WalkResult::advance();
 
         // Find the nearest ancestor in the loop body that has a partition.
         Operation *ancestor = op->getParentOp();
-        while (ancestor && ancestor != loop.getOperation()) {
+        while (ancestor && ancestor != loopOp) {
           if (hasPartition(ancestor)) {
             setPartition(op, getPartitionIds(ancestor));
             break;
