@@ -2054,10 +2054,20 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       // Merge extra computation partitions into the main computation
       // partitions. After propagatePartitions, there may be extra computation
-      // partitions (e.g., for QK tmem_load ops) that should be merged with
-      // their downstream computation partition (e.g., where exp2/truncf are).
-      // This ensures the same partition structure as FA (2 computation
-      // partitions, not 4).
+      // partitions (e.g., for QK tmem_load ops in flex attention) that should
+      // be merged with their downstream computation partition (e.g., where
+      // exp2/truncf are). This ensures the correct partition structure (2
+      // computation partitions, not 4).
+      //
+      // The extra partitions arise because the backward slice analysis can't
+      // cross scf.if region boundaries: QK tmem_load and mulf(QK*scale) feed
+      // into scf.if yield operands, but getBackwardSlice stops at the scf.if
+      // op without entering its regions. So these ops aren't categorized as
+      // DataPartition and end up in separate partitions created by
+      // propagatePartitions. After splitDataPartitionedIfOps splits the
+      // scf.if, these ops' users are yield ops inside the new scf.if regions.
+      // The merge must look through scf.if region boundaries (yield op →
+      // parent scf.if → partition) to find the correct merge target.
       {
         SmallVector<Partition *> computePartitions;
         for (Partition &p : schedule.getPartitions()) {
@@ -2065,34 +2075,39 @@ void PartitionSchedulingMeta::runOnOperation() {
             computePartitions.push_back(&p);
         }
         if (computePartitions.size() > 2) {
-          // Keep the two largest computation partitions. Merge smaller ones
-          // into the partition that their ops' users are in.
           llvm::sort(computePartitions, [](Partition *a, Partition *b) {
             return a->getOps().size() > b->getOps().size();
           });
-          // The first two are the main computation partitions.
           DenseSet<unsigned> mainPartIds;
           for (unsigned i = 0; i < 2 && i < computePartitions.size(); i++)
             mainPartIds.insert(computePartitions[i]->getIndex());
-          // Merge smaller computation partitions.
           for (unsigned i = 2; i < computePartitions.size(); i++) {
             Partition *smallPart = computePartitions[i];
-            // Find which main partition this should merge into by checking
-            // where the ops' users are.
             Partition *mergeTo = nullptr;
             for (Operation *op : smallPart->getOps()) {
               for (Operation *user : op->getUsers()) {
                 auto ids = getPartitionIds(user);
-                if (!ids) continue;
+                // When the user is inside an scf.if region (e.g., a yield
+                // op), it has no partition attribute. Look at the parent
+                // scf.if's partition instead.
+                if (!ids) {
+                  if (auto parentIf = user->getParentOfType<scf::IfOp>()) {
+                    ids = getPartitionIds(parentIf);
+                  }
+                }
+                if (!ids)
+                  continue;
                 for (int id : *ids) {
                   if (mainPartIds.contains(id)) {
                     mergeTo = schedule.getPartition(id);
                     break;
                   }
                 }
-                if (mergeTo) break;
+                if (mergeTo)
+                  break;
               }
-              if (mergeTo) break;
+              if (mergeTo)
+                break;
             }
             if (mergeTo) {
               for (Operation *op : smallPart->getOps())
@@ -2103,6 +2118,39 @@ void PartitionSchedulingMeta::runOnOperation() {
       }
 
       schedule.serialize(loop);
+
+      // Compact serialized partition arrays: remove trailing entries for
+      // partitions that no longer have any ops (after merge above). The merge
+      // reassigns ops from small partitions to main ones, but the PartitionSet
+      // still has the now-empty partitions. Truncate the serialized arrays to
+      // exclude them.
+      {
+        unsigned maxUsedIdx = 0;
+        bool hasAnyPartition = false;
+        loop.walk([&](Operation *op) {
+          if (auto ids = getPartitionIds(op)) {
+            hasAnyPartition = true;
+            for (int id : *ids)
+              maxUsedIdx = std::max(maxUsedIdx, (unsigned)id);
+          }
+        });
+        if (hasAnyPartition) {
+          unsigned neededSize = maxUsedIdx + 1;
+          auto typesAttr =
+              loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
+          auto stagesAttr =
+              loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
+          if (typesAttr && neededSize < typesAttr.size()) {
+            Builder b(loop.getContext());
+            loop->setAttr(
+                kPartitionTypesAttrName,
+                b.getArrayAttr(typesAttr.getValue().take_front(neededSize)));
+            loop->setAttr(
+                kPartitionStagesAttrName,
+                b.getArrayAttr(stagesAttr.getValue().take_front(neededSize)));
+          }
+        }
+      }
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));

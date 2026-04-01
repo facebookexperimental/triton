@@ -21,6 +21,7 @@ Phase 3: Schedule anchor ops        (loads, epilogue stores, MMAs)
 Phase 4: Propagate users            (load users, correction, reductions)
 Phase 5: Create computation partitions (per-MMA user scheduling)
 Post:    propagatePartitions + schedulePostLoopOps + optimizeSchedule
+         + splitDataPartitionedIfOps + mergeExtraComputationPartitions
 ```
 
 ## Phase 1: Operation Categorization (`OpCategorizer`)
@@ -113,29 +114,26 @@ MMA users that aren't already scheduled create computation partitions:
 - **`dpFactor == 1` (bwd)**: All MMA users share a single computation
   partition to avoid creating too many partitions.
 
-### DataPartition Pre-Assignment (flex attention path)
+### DataPartition Pre-Assignment
 
-When `dpFactor > 1` and **no `defaultPartition` exists** (i.e., no epilogue
-stores and no correction ops detected), Phase 4's load user propagation is
-skipped entirely. Without pre-claimed shared ops, Phase 5's greedy
-`scheduleUsers` absorbs ALL computation ops into the first MMA's partition —
-even ops belonging to the other data partition — because control flow merge
-points (e.g., `scf.if` for masking) create shared dependencies between the
-two data partitions.
+When `dpFactor > 1`, the pass pre-assigns `DataPartition`-categorized ops to
+their respective computation partitions BEFORE `scheduleUsers` runs. This
+prevents Phase 5's greedy `scheduleUsers` from absorbing all computation ops
+into the first MMA's partition.
 
-To handle this, when `dpFactor > 1 && !defaultPartition`, the pass
-**pre-assigns** `DataPartition`-categorized ops to their respective
-computation partitions using the `OpCategorizer`'s `dpId` before
-`scheduleUsers` runs. Each MMA's pre-assigned partition is then passed as
-`targetPart` to `scheduleUsers`, so any remaining unscheduled ops get added
-to the correct partition.
+The pre-assignment creates one computation partition per `dpId` and schedules
+each exclusive op into its partition. Shared ops (those appearing in multiple
+MMA backward slices, e.g., `scf.if` for masking) are pre-assigned to the
+`defaultPartition` when it exists, preventing `propagatePartitions` from
+forming cross-partition clusters that would collapse the split.
 
-This path is only activated when `defaultPartition` is absent. When
-`defaultPartition` exists (e.g., FA with epilogue stores), the original
-Phase 4 → Phase 5 flow handles the split correctly. Changing the partition
-creation order for the FA path would break downstream passes
-(`NVGPUWarpSpecialization`) that depend on the existing partition index
-assignment.
+**Backward slice limitation with `scf.if`**: `getBackwardSlice` stops at
+`scf.if` ops without entering their regions. For flex attention, QK
+`tmem_load` and `mulf(QK*scale)` feed into `scf.if` yield operands but are
+NOT in PV MMA's backward slice. These ops are not categorized as
+`DataPartition` and are handled later by the merge step in post-processing
+(see [Merge Extra Computation Partitions](#merge-extra-computation-partitions)).
+This does not affect FA which has no `scf.if`.
 
 #### Why `defaultPartition` is absent for flex attention
 
@@ -200,17 +198,86 @@ so the epilogue only contains a TMA store and can use 1 warp.
 Clones `BroadcastOp` and `ExpandDimsOp` into each partition that has users of
 them, reducing cross-partition data transfer.
 
+### `splitDataPartitionedIfOps`
+
+When `dpFactor > 1`, the `scf.if` used for masking in flex attention yields
+results for both data partitions. After partition assignment, the two results
+feed different computation partitions. This step splits such multi-result
+`scf.if` ops into separate per-partition `scf.if` ops, each yielding only the
+results consumed by one computation partition. This ensures each `scf.if` has a
+single partition assignment, which downstream passes require.
+
+The split creates new `scf.if` ops grouped by consumer partition:
+```
+// Before: one scf.if with results feeding partitions 3 and 4
+%r:2 = scf.if %cond -> (T, T) {
+  yield %a, %b
+} else {
+  yield %c, %d
+}
+use(%r#0) {partition = [3]}
+use(%r#1) {partition = [4]}
+
+// After: two scf.if ops, one per partition
+%r0 = scf.if %cond -> (T) { yield %a } else { yield %c } {partition = [3]}
+%r1 = scf.if %cond -> (T) { yield %b } else { yield %d } {partition = [4]}
+use(%r0) {partition = [3]}
+use(%r1) {partition = [4]}
+```
+
+### Merge Extra Computation Partitions
+
+After `propagatePartitions` and `splitDataPartitionedIfOps`, flex attention may
+have more computation partitions than expected (e.g., 4 instead of 2). This
+happens because the backward slice analysis cannot cross `scf.if` region
+boundaries:
+
+1. `getBackwardSlice` stops at `scf.if` ops without entering their regions.
+2. QK `tmem_load` and `mulf(QK*scale)` feed into `scf.if` yield operands, so
+   they are NOT in PV MMA's backward slice.
+3. These ops are not categorized as `DataPartition` and are not pre-assigned.
+4. `propagatePartitions` creates new computation partitions for them.
+
+The merge step fixes this by finding the two largest computation partitions
+(the "main" ones) and merging smaller ones into them. To find the correct
+merge target, it checks each small partition op's users. If a user is inside
+an `scf.if` region (e.g., a `scf.yield` op with no partition attribute), the
+merge looks at the parent `scf::IfOp`'s partition instead. This traces through
+the region boundary created by `splitDataPartitionedIfOps`.
+
+After merging, a compaction step removes trailing empty partition entries from
+the serialized `partition.types` and `partition.stages` arrays by finding the
+highest partition index still referenced by any op.
+
+This issue does not affect FA because FA has no `scf.if` — the QK `tmem_load`
+and `mulf(QK*scale)` are directly in PV MMA's backward slice and are correctly
+categorized as `DataPartition` ops during Phase 1.
+
 ## Partition Type Summary
 
 For FA forward with `dpFactor=2`:
 ```
-partition 0: default    — correction ops, load users (shared computation)
-partition 1: gemm       — MMA operations + mem desc views
-partition 2: load       — TMA loads + associated allocs
-partition 3: epilogue   — descriptor stores (+ post-loop ops)
+partition 0: default     — correction ops, load users (shared computation)
+partition 1: gemm        — MMA operations + mem desc views
+partition 2: load        — TMA loads + associated allocs
+partition 3: epilogue    — descriptor stores (+ post-loop ops)
 partition 4: computation — MMA user group 0
 partition 5: computation — MMA user group 1
 ```
+
+For flex attention forward with `dpFactor=2` (no epilogue stores, `scf.if`
+masking):
+```
+partition 0: default     — correction ops, load users, sparse indexing
+partition 1: gemm        — MMA operations + mem desc views
+partition 2: load        — TMA loads + associated allocs
+partition 3: computation — MMA user group 0 (includes QK tmem_load + scale)
+partition 4: computation — MMA user group 1 (includes QK tmem_load + scale)
+```
+
+Key difference: flex uses pointer-based `tt.store` (not `DescriptorStoreOp`),
+so no epilogue partition is created. The global stores fall into the default
+partition via `schedulePostLoopOps`.
 
 ## Debug
 
