@@ -304,6 +304,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
   // case at all from TCGen5MMAScaledOp::getBlockM?
   size_t CTASplitM;
   size_t CTASplitN;
+  bool twoCTAs = false;
   if (auto ttgLayout = mlir::dyn_cast<ttg::LayoutEncodingTrait>(encoding)) {
     ArrayRef<unsigned> CTASplitNum =
         ttg::getCTALayout(encoding).getCTASplitNum();
@@ -314,11 +315,12 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
                      encoding)) {
     CTASplitM = tmemLayout.getCTASplitM();
     CTASplitN = tmemLayout.getCTASplitN();
+    twoCTAs = tmemLayout.getTwoCTAs();
   } else {
     assert(false && "Unsupported encoding");
   }
   auto outputEncoding = ttng::TensorMemoryEncodingAttr::get(
-      context, blockM, blockN, colStride, CTASplitM, CTASplitN);
+      context, blockM, blockN, colStride, CTASplitM, CTASplitN, twoCTAs);
   if (highShape > 0) {
     llvm::SmallVector<int64_t> shapeVec{highShape, blockM, blockN};
     llvm::ArrayRef<int64_t> shape(shapeVec);

@@ -71,7 +71,7 @@ static Attribute resolveRegisterLayout(DummyRegisterLayoutAttr dummyLayout,
     unsigned colStride = 32 / bitwidth;
     auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
         ctx, shape[0], shape[1], colStride, /*CTASplitM=*/1,
-        /*CTASplitN=*/1);
+        /*CTASplitN=*/1, /*twoCTAs=*/false);
     auto memSpace = ttng::TensorMemorySpaceAttr::get(ctx);
     auto memDescType = ttg::MemDescType::get(shape, elementType, tmemEncoding,
                                              memSpace, /*mutableMemory=*/true);

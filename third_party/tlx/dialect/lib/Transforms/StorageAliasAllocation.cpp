@@ -152,7 +152,8 @@ LogicalResult materializeStorageAliasAllocations(
       auto memorySpace = ttng::TensorMemorySpaceAttr::get(m.getContext());
       auto tmemEncoding = ttng::TensorMemoryEncodingAttr::get(
           m.getContext(), blockM, blockN,
-          /*colStride=*/1, /*CTASplitM=*/1, /*CTASplitN=*/1);
+          /*colStride=*/1, /*CTASplitM=*/1, /*CTASplitN=*/1,
+          /*twoCTAs=*/false);
       auto memDescType =
           ttg::MemDescType::get(tmemShape, tmemElemType, tmemEncoding,
                                 memorySpace, /*mutableMemory=*/true);

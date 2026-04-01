@@ -1490,7 +1490,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     unsigned colStride = 32 / elemBitWidth;
     auto encoding = ttng::TensorMemoryEncodingAttr::get(
         context, blockM, bufferShape[1], colStride, /*CTASplitM=*/1,
-        /*CTASplitN=*/1);
+        /*CTASplitN=*/1, /*twoCTAs=*/false);
     Type memdescType =
         ttg::MemDescType::get(bufferShape, elemType, encoding,
                               tensorMemorySpace, /*mutableMemory*/ true);
