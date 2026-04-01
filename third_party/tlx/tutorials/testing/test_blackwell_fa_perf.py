@@ -33,7 +33,7 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 """
 
 
-def create_benchmark(versions):
+def create_benchmark(versions, mode="fwd"):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
 
@@ -45,7 +45,7 @@ def create_benchmark(versions):
             line_vals=line_vals,
             line_names=line_names,
             ylabel="TFLOPS",
-            plot_name="flash-attention-performance-fp16",
+            plot_name=f"flash-attention-{mode}-performance-fp16",
             args={"BATCH": 4, "H": 32, "HEAD_DIM": 128, "causal": True},
         ))
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
@@ -54,13 +54,23 @@ def create_benchmark(versions):
         v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
         sm_scale = 1.3
         quantiles = [0.5, 0.2, 0.8]
-        if provider == ref_lib.lower():
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal),
-                quantiles=quantiles,
-                warmup=500,
-                rep=500,
-            )
+
+        if mode == "bwd":
+            # Pre-run forward to get output for backward
+            if provider == ref_lib.lower():
+                o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+            elif provider in ATTENTION_METHODS:
+                attention = ATTENTION_METHODS[provider]
+                if provider == "ws_pipelined_persistent":
+                    o = attention(q, k, v, sm_scale, causal, 64, 1)
+                elif provider == "ws":
+                    o = attention(q, k, v, sm_scale)
+                else:
+                    o = attention(q, k, v, sm_scale, causal)
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        elif provider == ref_lib.lower():
+            fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
         elif provider in ATTENTION_METHODS:
             attention = ATTENTION_METHODS[provider]
             if provider == "ws_pipelined_persistent":
@@ -69,15 +79,17 @@ def create_benchmark(versions):
                 fn = lambda: attention(q, k, v, sm_scale)
             else:
                 fn = lambda: attention(q, k, v, sm_scale, causal)
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                fn,
-                quantiles=quantiles,
-                warmup=500,
-                rep=500,
-            )
+
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            fn,
+            quantiles=quantiles,
+            warmup=500,
+            rep=500,
+        )
 
         flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-        total_flops = 2 * flops_per_matmul
+        # fwd: 2 matmuls (QK, PV). bwd: 5 matmuls (dQK, dPV, dV, dK, dQ) = 2.5x fwd
+        total_flops = 2 * flops_per_matmul if mode == "fwd" else 5 * flops_per_matmul
         perf = lambda ms: total_flops * 1e-12 / (ms * 1e-3)
         return perf(ms), perf(max_ms), perf(min_ms)
 
@@ -92,12 +104,19 @@ if __name__ == "__main__":
         choices=list(ATTENTION_METHODS.keys()),
         help=f"Run only the specified version. Choices: {list(ATTENTION_METHODS.keys())}",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="fwd",
+        choices=["fwd", "bwd"],
+        help="Benchmark forward or backward pass (default: fwd)",
+    )
     args = parser.parse_args()
 
     if is_blackwell():
-        versions = [args.version] if args.version else list(ATTENTION_METHODS.keys())
-        print(f"Running benchmarks for: {versions}")
-        benchmark = create_benchmark(versions)
+        versions = args.version if args.version else list(ATTENTION_METHODS.keys())
+        print(f"Running {args.mode} benchmarks for: {versions}")
+        benchmark = create_benchmark(versions, mode=args.mode)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no Blackwell GPU found.")
