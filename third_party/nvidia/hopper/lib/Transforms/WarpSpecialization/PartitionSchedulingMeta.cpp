@@ -256,8 +256,15 @@ public:
       defaultPartition = nullptr; // No separate default for bwd
     } else {
       reductionPartition = nullptr;
-      // Default partition: needed when we have correction or epilogue.
-      bool needDefault = options.hasCorrection || options.hasEpilogue;
+      // Default partition: needed when we have correction, epilogue, or
+      // multiple data partitions. With dpFactor > 1, a default partition
+      // is required so that Phase 4 (load user propagation) pre-claims
+      // shared/correction ops before Phase 5 creates per-MMA computation
+      // partitions. Without it, the first MMA's scheduleUsers greedily
+      // absorbs all computation ops into a single partition, preventing
+      // the split needed for TMEM column reuse across data partitions.
+      bool needDefault = options.hasCorrection || options.hasEpilogue ||
+                         options.numDataPartitions > 1;
       if (needDefault) {
         defaultPartition = schedule.addPartition(0);
         defaultPartition->setType("default");
@@ -919,9 +926,10 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 // the appropriate partition. Epilogue store ops and their transitive users
 // (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
-// to the default partition. This prevents TMEM ops from landing in the epilogue,
-// which would force it to use 4 warps (TMEM lane coverage hardware constraint).
-// When no default partition exists (e.g., bwd), all ops fall back to epilogue.
+// to the default partition. This prevents TMEM ops from landing in the
+// epilogue, which would force it to use 4 warps (TMEM lane coverage hardware
+// constraint). When no default partition exists (e.g., bwd), all ops fall back
+// to epilogue.
 static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
                                 Partition *epiloguePartition) {
   if (!epiloguePartition)
@@ -966,8 +974,7 @@ static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
       bool hasEpilogueInput = llvm::any_of(user->getOperands(), [&](Value v) {
         if (auto *defOp = v.getDefiningOp()) {
           auto ids = getPartitionIds(defOp);
-          return ids &&
-                 llvm::is_contained(*ids, epiloguePartition->getIndex());
+          return ids && llvm::is_contained(*ids, epiloguePartition->getIndex());
         }
         return false;
       });
@@ -1375,12 +1382,44 @@ getInitialSchedule(scf::ForOp mainLoop,
     sharedComputePartition = nullptr; // lazy-created on first use
   }
 
+  // When dpFactor > 1 and there is no defaultPartition, pre-assign
+  // DataPartition-categorized ops to their respective computation partitions
+  // BEFORE scheduleUsers runs. Without a defaultPartition, Phase 4 (load user
+  // propagation) is skipped, so shared/correction ops are not pre-claimed.
+  // This causes the first MMA's scheduleUsers to greedily absorb all
+  // computation ops into a single partition (e.g., when an scf.if merges both
+  // partitions' values). The categorizer already knows which ops belong to
+  // which data partition via backward slice analysis.
+  //
+  // When defaultPartition exists (e.g., FA with epilogue stores), the original
+  // Phase 4 → Phase 5 flow works correctly — skip pre-assignment to avoid
+  // changing the partition creation order that downstream passes expect.
+  DenseMap<unsigned, Partition *> dpIdToPartition;
+  DenseMap<Operation *, Partition *> mmaToPreassignedPartition;
+  if (dataPartitionFactor > 1 && !defaultPartition) {
+    auto dpOps = categorizer.getOpsInCategory(OpCategory::DataPartition);
+    for (const auto &catOp : dpOps) {
+      unsigned dpId = catOp.dataPartitionId;
+      Partition *&part = dpIdToPartition[dpId];
+      if (!part) {
+        part = schedule.addPartition(0);
+        part->setType("computation");
+      }
+      tryScheduleOp(part, catOp.op);
+      if (catOp.parentMMA)
+        mmaToPreassignedPartition[catOp.parentMMA] = part;
+    }
+  }
+
   for (auto mmaOp : llvm::reverse(mmas)) {
     if (mmaOp->getParentOfType<scf::ForOp>() == loops[0]) {
       Partition *targetPart = nullptr;
       if (dataPartitionFactor > 1) {
-        // fwd: each MMA group gets its own dynamic partition
-        targetPart = nullptr;
+        // Check if this MMA has a pre-assigned partition (flex path).
+        auto it = mmaToPreassignedPartition.find(mmaOp.getOperation());
+        if (it != mmaToPreassignedPartition.end())
+          targetPart = it->second;
+        // Otherwise nullptr → scheduleUsers creates a new partition (FA path).
       } else {
         // bwd: all MMA users share one partition
         targetPart = sharedComputePartition;
@@ -1389,6 +1428,8 @@ getInitialSchedule(scf::ForOp mainLoop,
                                 targetPart, mmaOp);
       if (dataPartitionFactor <= 1 && !sharedComputePartition)
         sharedComputePartition = part;
+      if (!part)
+        part = targetPart;
       mmaToPartition[mmaOp.getOperation()] = part;
       inFirstLoop.push_back(mmaOp.getOperation());
     }

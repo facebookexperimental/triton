@@ -113,6 +113,62 @@ MMA users that aren't already scheduled create computation partitions:
 - **`dpFactor == 1` (bwd)**: All MMA users share a single computation
   partition to avoid creating too many partitions.
 
+### DataPartition Pre-Assignment (flex attention path)
+
+When `dpFactor > 1` and **no `defaultPartition` exists** (i.e., no epilogue
+stores and no correction ops detected), Phase 4's load user propagation is
+skipped entirely. Without pre-claimed shared ops, Phase 5's greedy
+`scheduleUsers` absorbs ALL computation ops into the first MMA's partition —
+even ops belonging to the other data partition — because control flow merge
+points (e.g., `scf.if` for masking) create shared dependencies between the
+two data partitions.
+
+To handle this, when `dpFactor > 1 && !defaultPartition`, the pass
+**pre-assigns** `DataPartition`-categorized ops to their respective
+computation partitions using the `OpCategorizer`'s `dpId` before
+`scheduleUsers` runs. Each MMA's pre-assigned partition is then passed as
+`targetPart` to `scheduleUsers`, so any remaining unscheduled ops get added
+to the correct partition.
+
+This path is only activated when `defaultPartition` is absent. When
+`defaultPartition` exists (e.g., FA with epilogue stores), the original
+Phase 4 → Phase 5 flow handles the split correctly. Changing the partition
+creation order for the FA path would break downstream passes
+(`NVGPUWarpSpecialization`) that depend on the existing partition index
+assignment.
+
+#### Why `defaultPartition` is absent for flex attention
+
+The `defaultPartition` is created when
+`hasCorrection || hasEpilogue || numDataPartitions > 1`. For flex attention:
+
+1. **`hasCorrection = false`**: The correction ops (accumulator rescaling)
+   are categorized as `DataPartition` by `categorizeDataPartitionOps` (which
+   runs first) before `categorizeCorrectionOps` can claim them. The secondary
+   detection in `selectTemplate` also misses them because the PV MMA token
+   is only yielded (no non-yield users in the current iteration).
+
+2. **`hasEpilogue = false`**: Flex attention uses pointer-based `tt.store`
+   ops, not `DescriptorStoreOp`/`AsyncTMACopyLocalToGlobalOp`.
+
+3. **`numDataPartitions > 1`**: This condition was added to ensure a
+   `defaultPartition` is created for multi-data-partition kernels even
+   without epilogue stores. This enables Phase 4 load user propagation,
+   which pre-claims shared ops and prevents Phase 5 collapse.
+
+#### Impact on TMEM allocation
+
+Without the data partition split, both alpha stores and both bf16 accumulator
+stores land on the same `async_task_id` (e.g., task 4). The downstream
+memory planner's `alongDependencyChain` check requires the alpha producer's
+task to match the QK consumer's task for TMEM column reuse. When both alphas
+are on the same task, they both funnel into one QK's TMEM slot (e.g., `qk_1`
+at task 4), overfilling it (128/128 columns), leaving no room.
+
+With the split, alpha_0 lands on one computation partition (matching `qk_0`'s
+consumer task) and alpha_1 on another (matching `qk_1`'s consumer task). Each
+QK slot gets one alpha + one bf16 buffer, keeping `maxColOffset` manageable.
+
 ## Post-Processing
 
 ### `propagatePartitions`
