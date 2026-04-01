@@ -525,7 +525,7 @@ struct TensorMemoryAllocOpConversion
 };
 
 static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
-                         Value barrier, Value pred, bool tlxTwoCTAs) {
+                         Value barrier, Value pred, bool twoCTAs) {
   PTXBuilder ptxBuilder;
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   SmallVector<PTXBuilder::Operand *> ptxOperands;
@@ -534,7 +534,7 @@ static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
   auto *barrierOperand = ptxBuilder.newOperand(barrier, "l");
   ptxOperands.push_back(barrierOperand);
   std::string opcode;
-  if (tlxTwoCTAs) {
+  if (twoCTAs) {
     // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
     // be broadcasted into CTAid 0 and 1
     // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
@@ -561,7 +561,7 @@ static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
 
 static void createTcgen05Cp(ConversionPatternRewriter &rewriter, Location loc,
                             Value tmem_address, Value src_desc, Value pred,
-                            TMemCopyAtom atom, bool useTwoCTAs = false) {
+                            TMemCopyAtom atom, bool twoCTAs) {
   PTXBuilder ptxBuilder;
   auto dst = ptxBuilder.newAddrOperand(tmem_address, "r");
   auto src = ptxBuilder.newOperand(src_desc, "l");
@@ -573,10 +573,9 @@ static void createTcgen05Cp(ConversionPatternRewriter &rewriter, Location loc,
   } else if (atom.multicast == 3) {
     warp = ".warpx4";
   }
-  std::string ctaGroup = useTwoCTAs ? "cta_group::2" : "cta_group::1";
-  std::string opcode = "tcgen05.cp." + ctaGroup + warp + "." +
-                       std::to_string(atom.nRow) + "x" +
-                       std::to_string(atom.bCol) + "b";
+  std::string opcode =
+      "tcgen05.cp.cta_group::" + std::to_string(twoCTAs ? 2 : 1) + warp + "." +
+      std::to_string(atom.nRow) + "x" + std::to_string(atom.bCol) + "b";
   auto &op = *ptxBuilder.create(opcode);
   op({dst, src}).predicate(pred);
   ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
@@ -637,6 +636,7 @@ static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
   auto loader = DotOpMmaSmemLoader::build(loc, rewriter, cvtWarp, bitwidth,
                                           smemBase, instrShape, 0, 5);
   assert(!loader.getDescriptor().transposed);
+  bool twoCTAs = useTwoCTAs || getModuleTwoCTAs(op);
   // Check correct lbo/sbo along the multicast
   auto strideRow = cvt.getBasis(kRow, llvm::Log2_32(8), kOffset);
   if ((atom.multicast & 1) == 0) {
@@ -653,14 +653,14 @@ static void copySharedToTmem(ConversionPatternRewriter &rewriter, Location loc,
     auto tmemAddr =
         b.or_(b.ptrtoint(i32_ty, baseDst), b.i32_val(col * bitwidth / 32),
               /*disjoint=*/true);
-    createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom);
+    createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom, twoCTAs);
   }
 }
 
 static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
                        const TypeConverter *typeConverter,
                        triton::nvidia_gpu::TMEMCopyOp op, Value src, Value dst,
-                       Value pred, bool useTwoCTAs) {
+                       Value pred, bool twoCTAs) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MemDescType srcTy = op.getSrc().getType();
   MemDescType dstTy = op.getDst().getType();
@@ -698,7 +698,7 @@ static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
         auto smemAddr = b.gep(elemPtrTy, llvmElementTy, baseSrc, smemOffset);
         smemDesc = createBlockedScalesSMEMDescriptor(rewriter, loc, smemAddr);
         createTcgen05Cp(rewriter, loc, tmemAddr, smemDesc, pred,
-                        TMemCopyAtomWarp4, useTwoCTAs);
+                        TMemCopyAtomWarp4, twoCTAs);
       }
     }
   };
@@ -758,8 +758,8 @@ struct TensorMemoryCopyOpConversion
     Location loc = op->getLoc();
     Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
 
-    bool tlxTwoCTAs = tlx::tlxEnablePairedMMA(op);
-    if (tlxTwoCTAs) {
+    bool twoCTAs = getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
+    if (twoCTAs) {
       // In 2cta mode, only one thread from the two CTAs should issue the
       // inst:https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-issue-granularity
       auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -769,16 +769,16 @@ struct TensorMemoryCopyOpConversion
     if (isa<TensorMemoryScalesEncodingAttr>(
             op.getDst().getType().getEncoding())) {
       copyScales(rewriter, loc, typeConverter, op, adaptor.getSrc(),
-                 adaptor.getDst(), pred, tlxTwoCTAs);
+                 adaptor.getDst(), pred, twoCTAs);
     } else {
       copySharedToTmem(rewriter, loc, typeConverter, op, adaptor.getSrc(),
-                       adaptor.getDst(), pred, tlxTwoCTAs);
+                       adaptor.getDst(), pred, twoCTAs);
     }
 
     if (op.getBarrier()) {
       auto barrier = LLVM::getSharedMemoryObjectFromStruct(
           op.getLoc(), adaptor.getBarrier(), i64_ty, rewriter);
-      createCommit(rewriter, loc, barrier.getBase(), pred, tlxTwoCTAs);
+      createCommit(rewriter, loc, barrier.getBase(), pred, twoCTAs);
     }
 
     rewriter.eraseOp(op);

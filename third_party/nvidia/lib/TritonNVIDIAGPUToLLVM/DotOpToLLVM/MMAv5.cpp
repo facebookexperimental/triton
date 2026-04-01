@@ -268,17 +268,14 @@ static void createScaledGen5MMA(ConversionPatternRewriter &rewriter,
                                 bool aInTmem, mxfpKind mxfpInstKind,
                                 bool twoCTAs) {
   PTXBuilder ptxBuilder;
-  std::string ctaGroup = std::to_string(twoCTAs ? 2 : 1);
-  std::string opcode;
+  std::string opcode =
+      "tcgen05.mma.cta_group::" + std::to_string(twoCTAs ? 2 : 1) + ".kind::";
   if (mxfpInstKind == mxfpKind::mxf8f6f4) {
-    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
-             ".kind::mxf8f6f4.block_scale.scale_vec::1X";
+    opcode += "mxf8f6f4.block_scale.scale_vec::1X";
   } else if (mxfpInstKind == mxfpKind::mxf4) {
-    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
-             ".kind::mxf4.block_scale.scale_vec::2X";
+    opcode += "mxf4.block_scale.scale_vec::2X";
   } else if (mxfpInstKind == mxfpKind::mxf4nvf4) {
-    opcode = "tcgen05.mma.cta_group::" + ctaGroup +
-             ".kind::mxf4nvf4.block_scale.scale_vec::4X";
+    opcode += "mxf4nvf4.block_scale.scale_vec::4X";
   } else {
     assert(0 && "Unsupported mxfp kind.");
   }
@@ -325,7 +322,9 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
              "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
              "cluster.multicast::cluster.b64 [$1], $2;";
   } else {
-    opcode = "@$0 tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$1];";
+    opcode =
+        "@$0 tcgen05.commit.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
+        ".mbarrier::arrive::one.b64 [$1];";
   }
   auto &barrierOp = *ptxBuilder.create(opcode);
   barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
@@ -509,7 +508,8 @@ void convertDot(const LLVMTypeConverter &typeConverter,
   MemDescType bTensorTy = op.getB().getType();
   MemDescType dTensorTy = op.getD().getType();
   auto dLayout = cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
-  bool twoCTAs = op.getTwoCtas();
+  bool twoCTAs = ttng::getModuleTwoCTAs(op);
+  assert(twoCTAs == op.getTwoCtas());
 
   DotConversion dot;
 
@@ -618,6 +618,8 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
   Value baseD = tb.ptrtoint(i32_ty, adaptor.getD());
   Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());
   Value baseScaleB = tb.ptrtoint(i32_ty, adaptor.getBScale());
+  bool twoCTAs = ttng::getModuleTwoCTAs(op);
+  assert(twoCTAs == op.getTwoCtas());
 
   int numRows = 128;
   int colSizeInBits = 32;
@@ -658,13 +660,13 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
         mxfpInstKind);
     createScaledGen5MMA(rewriter, loc, op, a, b, accAddress, scaleA, scaleB,
                         pred, instDescriptor, useInitAcc, desc.aInTmem,
-                        mxfpInstKind, op.getTwoCtas());
+                        mxfpInstKind, twoCTAs);
   };
 
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), op.getTwoCtas(),
+                 adaptor.getBarrierPreds(), twoCTAs,
                  tlx::tlxEnablePairedMMA(op), opKindIsMXFP4, dot);
 }
 
@@ -723,7 +725,7 @@ struct TCGen5CommitOpConversion
       pred = b.and_(adaptor.getPred(), pred);
 
     createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred,
-                    op.getTwoCtas() || tlx::tlxEnablePairedMMA(op));
+                    ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op));
     rewriter.eraseOp(op);
     return success();
   }

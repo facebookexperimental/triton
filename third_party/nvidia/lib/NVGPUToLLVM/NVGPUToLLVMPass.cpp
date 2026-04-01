@@ -597,16 +597,7 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
 
-  int numCTAs;
-  if (tlx::tlxEnablePairedMMA(mod)) {
-    // TLX attr takes precedence
-    numCTAs = 2;
-  } else {
-    numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
-  }
-  // Assume that 2CTAs is used if we have two CTAs this is pessimistic but
-  // should be fine for now.
-  bool useTwoCTAs = numCTAs == 2;
+  bool useTwoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || tlx::tlxEnablePairedMMA(mod);
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
