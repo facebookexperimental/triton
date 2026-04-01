@@ -1079,6 +1079,8 @@ def _bwd_compute_inner_loop(
     dp_tiles,
     ds_tiles,
     ds_fulls,
+    dsT_tmem_tiles,
+    dsT_tmem_fulls,
     sM_tiles,
     sD_tiles,
     m_fulls,
@@ -1172,9 +1174,19 @@ def _bwd_compute_inner_loop(
             ))
             dsT = pT * (dpT - Di[None, :])
             dsT = dsT.to(q_out_dtype)
+            # Store dsT to SMEM (for dq dot, which needs transposed view).
             tlx.local_store(
                 tlx.local_slice(
                     ds_tiles[ds_buf_id],
+                    [0, slice_id * SLICE_M],
+                    [BLOCK_N1, SLICE_M],
+                ),
+                dsT,
+            )
+            # Store dsT to TMEM (for dk dot, faster MMA read path).
+            tlx.local_store(
+                tlx.local_slice(
+                    dsT_tmem_tiles[ds_buf_id],
                     [0, slice_id * SLICE_M],
                     [BLOCK_N1, SLICE_M],
                 ),
@@ -1186,6 +1198,7 @@ def _bwd_compute_inner_loop(
                     tlx.barrier_arrive(dp_empties[tmem_buf_id])
                 tlx.fence("async_shared")
                 tlx.barrier_arrive(ds_fulls[ds_buf_id])
+                tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
 
         curr_m += step_m
         blk_idx += 1
@@ -1291,6 +1304,7 @@ def _attn_bwd_ws(
     m_fulls = tlx.alloc_barriers(num_barriers=M_STAGE)
     d_fulls = tlx.alloc_barriers(num_barriers=D_STAGE)
     ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
 
     # allocate tmem buffers
     qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem)
@@ -1301,11 +1315,24 @@ def _attn_bwd_ws(
         tlx.storage_kind.tmem,
         reuse=qk_tiles,
     )
+    # dP, dS (TMEM for dk dot), and dQ share TMEM via storage alias.
+    # dP and dS occupy the same offset (sequential lifetime: dpT consumed
+    # before dsT written). dQ occupies a distinct offset (it may overlap
+    # with dsT in the mma pipeline).
+    dp_dq_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     dp_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tl.float32,
         NUM_BUFFERS_TMEM,
         tlx.storage_kind.tmem,
+        reuse=dp_dq_storage_alias,
+    )
+    dsT_tmem_tiles = tlx.local_alloc(
+        (BLOCK_N1, BLOCK_M1),
+        tlx.dtype_of(desc_q),
+        NUM_BUFFERS_DS,
+        tlx.storage_kind.tmem,
+        reuse=dp_dq_storage_alias,
     )
 
     dv_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
@@ -1337,18 +1364,25 @@ def _attn_bwd_ws(
     else:
         dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
-    # Establish the barriers and allocations we will use if we need to
-    # share TMEM for dq and dp. For barriers we cannot modify the definition
-    # of dp_empties because we can only signal the arrive if the barrier
+    # dQ uses the same storage alias group as dP/dS — all three share
+    # the same TMEM slot (like FA4: dP/dS/dQ at columns 256-384).
+    # Lifecycle within one block: dpT → dsT → dq (sequential, no overlap).
     if REUSE_DP_FOR_DQ:
         dq_tiles = tlx.local_alloc(
             (BLOCK_M1, HEAD_DIM),
             tl.float32,
             NUM_BUFFERS_TMEM,
             tlx.storage_kind.tmem,
-            reuse=dp_tiles,
+            reuse=dp_dq_storage_alias,
         )
         dp_empties = dq_empties
+        dp_dq_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                dp_tiles,
+                dsT_tmem_tiles,
+                dq_tiles,
+                group_type=tlx.reuse_group_type.shared,
+            ))
     else:
         dq_tiles = tlx.local_alloc(
             (BLOCK_M1, HEAD_DIM),
@@ -1406,6 +1440,8 @@ def _attn_bwd_ws(
                         dp_tiles,
                         ds_tiles,
                         ds_fulls,
+                        dsT_tmem_tiles,
+                        dsT_tmem_fulls,
                         sM_tiles,
                         sD_tiles,
                         m_fulls,
@@ -1439,6 +1475,8 @@ def _attn_bwd_ws(
                         dp_tiles,
                         ds_tiles,
                         ds_fulls,
+                        dsT_tmem_tiles,
+                        dsT_tmem_fulls,
                         sM_tiles,
                         sD_tiles,
                         m_fulls,
@@ -1665,6 +1703,20 @@ def _attn_bwd_ws(
                     tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                     ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
+                    # Compute dk += tl.dot(dsT, tl.trans(qT)) from previous iteration
+                    # Read dsT from TMEM (faster MMA read path than SMEM).
+                    # dk must read dsT_tmem BEFORE dq writes dq_tiles (same TMEM slot).
+                    tlx.barrier_wait(dsT_tmem_fulls[ds_buf_id_prev], ds_phase_prev)
+                    tlx.async_dot(
+                        dsT_tmem_tiles[ds_buf_id_prev],
+                        q_tiles[q_buf_id_prev],
+                        dk_tiles[kv_buf_id],
+                        use_acc=(j - 1) > 0,
+                        mBarriers=[
+                            q_empties[q_buf_id_prev],
+                        ],
+                    )
+
                     # Compute dq = tl.dot(tl.trans(dsT), k) from previous iteration
                     tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
                     tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
@@ -1676,17 +1728,6 @@ def _attn_bwd_ws(
                         use_acc=False,
                         mBarriers=[
                             dq_fulls[tmem_buf_id_prev],
-                        ],
-                    )
-
-                    # Compute dk += tl.dot(dsT, tl.trans(qT)) from previous iteration
-                    tlx.async_dot(
-                        ds_tiles[ds_buf_id_prev],
-                        q_tiles[q_buf_id_prev],
-                        dk_tiles[kv_buf_id],
-                        use_acc=(j - 1) > 0,
-                        mBarriers=[
-                            q_empties[q_buf_id_prev],
                         ],
                     )
 
@@ -1726,9 +1767,10 @@ def _attn_bwd_ws(
                 tmem_buf_id, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                 ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
                 # Compute dk += tl.dot(dsT, tl.trans(qT))
-                tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
+                # Read dsT from TMEM (faster MMA read path than SMEM).
+                tlx.barrier_wait(dsT_tmem_fulls[ds_buf_id], ds_phase)
                 tlx.async_dot(
-                    ds_tiles[ds_buf_id],
+                    dsT_tmem_tiles[ds_buf_id],
                     q_tiles[q_buf_id],
                     dk_tiles[kv_buf_id],
                     use_acc=num_steps > 1,
@@ -1736,6 +1778,7 @@ def _attn_bwd_ws(
                 )
 
                 # Compute dq = tl.dot(tl.trans(dsT), k)
+                tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
                 tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
                 dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
                 tlx.async_dot(
