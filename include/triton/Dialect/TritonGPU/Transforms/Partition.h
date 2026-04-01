@@ -131,6 +131,7 @@ void setPartition(Operation *op, ArrayRef<int> partitionIds);
 void setPartition(Operation *op, const SetVector<int> &partitionIds);
 void setPartitionOutputs(Operation *op,
                          ArrayRef<SetVector<int>> partitionOutputsIds);
+void setWarpSpecializeTag(Operation *op, int tag);
 
 } // namespace mlir::triton::gpu
 
