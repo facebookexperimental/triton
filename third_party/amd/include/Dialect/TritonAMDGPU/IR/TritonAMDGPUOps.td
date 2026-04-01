@@ -766,7 +766,7 @@ def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[Mem
 // AsyncTDMCopyGlobalToLocalOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local"> {
+def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local", [AttrSizedOperandSegments]> {
   let summary = "Copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -776,20 +776,29 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local">
     copied depends on the global memory pointed to by `desc`. Set `pred` to
     false will disable the copy. This operation does not support shared memory
     swizzling.
+    The operation can also take an optional 64bit LDS barrier address, in which case
+    it sends an "LDS atomic arrive" to signal its completion.
   }];
 
   let arguments = (ins
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$indices,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-    I1:$pred
+    I1:$pred,
+    Optional<TTG_MemDescType>:$barrier
   );
 
   let results = (outs TTG_AsyncToken:$token);
 
+  let builders = [
+    OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$result, "Value":$pred), [{
+      return build($_builder, $_state, desc, indices, result, pred, /*barrier=*/static_cast<mlir::Value>(nullptr));
+    }]>
+  ];
+
   let assemblyFormat = [{
-    $desc `[` $indices `]` `into` $result `,` $pred
-    attr-dict `:` qualified(type($desc)) `->` qualified(type($result))
+    $desc `[` $indices `]` `into` $result `,` $pred (`,` `barrier` `=` $barrier^)?
+    attr-dict `:` qualified(type($desc)) (`,` qualified(type($barrier))^)? `->` qualified(type($result))
   }];
 
   let hasVerifier = 1;
@@ -883,4 +892,46 @@ def MemoryCounterWaitOp : TT_AMDGPU_Op<"memory_counter_wait"> {
     oilist( `load` `(` $load `)` | `store` `(` $store `)` | `ds` `(` $ds `)` ) attr-dict
   }];
 }
+
+//===----------------------------------------------------------------------===//
+// WaitBarrierOp
+//===----------------------------------------------------------------------===//
+
+def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier"> {
+  let summary = "wait until the mbarrier phase completes.";
+
+  let description = [{
+    Blocks the program progress until the mbarrier object in `alloc` completes
+    its current phase.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+    I32:$phase
+  );
+
+  let assemblyFormat = [{
+    $alloc `,` $phase attr-dict `:` qualified(type($alloc))
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// AsyncCopyMbarrierArriveOp
+//===----------------------------------------------------------------------===//
+
+def AsyncCopyMbarrierArriveOp : TT_AMDGPU_Op<"async_copy_mbarrier_arrive"> {
+  let summary = "arrive on mbarrier once all previously issued copies are completed";
+  let description = [{
+    Performs the "async arrive" operation by decrementing pending account by 1 when all previous async load to LDS (particularly, not TDM) have completed.
+    The instruction itself is asynchronous; it returns immediately. Decrements the barrier pending count. The update value for decrementing is fixed at 1.
+    If the pending count becomes zero, the phase changes (is decremented in a wraparound manner) and the pending count is reloaded with the init count value.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$barrier
+  );
+  let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
+  let hasVerifier = 1;
+}
+
 #endif

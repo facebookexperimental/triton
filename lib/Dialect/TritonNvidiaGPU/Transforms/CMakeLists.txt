@@ -14,7 +14,6 @@ add_triton_library(TritonNvidiaGPUTransforms
   TMALowering.cpp
   TMAStoreBufferReuse.cpp
   TMAUtilities.cpp
-  Utility.cpp
 
   DEPENDS
   TritonNvidiaGPUTransformsIncGen
