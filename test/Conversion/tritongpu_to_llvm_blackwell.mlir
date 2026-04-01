@@ -7,7 +7,7 @@
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: @tc_gen5_mma
-  // CHECK: %[[WID:.+]] = nvgpu.warp_id
+  // CHECK: %[[WID:.+]] = nvg.warp_id
   // CHECK: %[[C0:.+]] = llvm.mlir.constant(0 : i32) : i32
   // CHECK: %[[P0:.+]] = llvm.icmp "eq" %[[WID]], %[[C0]] : i32
   // CHECK: %[[P1:.+]] = llvm.and %{{.*}}, %[[P0]]  : i1
@@ -126,7 +126,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32} {
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tensor_memory_ld
-  // CHECK: nvgpu.tensor_memory_base
+  // CHECK: nvg.tensor_memory_base
   // CHECK: tcgen05.st.sync.aligned.32x32b.x128.b32
   // CHECK: nvvm.tcgen05.wait <store>
   // CHECK: tcgen05.ld.sync.aligned.32x32b.x128.b32
@@ -176,9 +176,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, unpacked = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tensor_memory_ld_m64
-  // CHECK: nvgpu.tensor_memory_base
-  // CHECK: tcgen05.st.sync.aligned.16x32bx2.x64.b32
-  // CHECK: tcgen05.st.sync.aligned.16x32bx2.x64.b32
+  // CHECK: nvg.tensor_memory_base
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x128.b32
   // CHECK: nvvm.tcgen05.wait <store>
   // CHECK: tcgen05.ld.sync.aligned.16x32bx2.x64.b32
   // CHECK: tcgen05.ld.sync.aligned.16x32bx2.x64.b32
@@ -198,7 +197,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tensor_memory_unpack_f16
-  // CHECK: nvgpu.tensor_memory_base
+  // CHECK: nvg.tensor_memory_base
   // CHECK: tcgen05.st.sync.aligned.32x32b.x64.unpack::16b.b32
   // CHECK: nvvm.tcgen05.wait <store>
   // CHECK: tcgen05.ld.sync.aligned.32x32b.x64.pack::16b.b32
@@ -221,7 +220,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @tc_gen5_mma_block_scale
   // CHECK: %[[TMEM_BASE:.+]] = llvm.ptrtoint %arg2 : !llvm.ptr<3> to i32
-  // CHECK: %[[WID:.+]] = nvgpu.warp_id
+  // CHECK: %[[WID:.+]] = nvg.warp_id
   // CHECK: %[[C0:.+]] = llvm.mlir.constant(0 : i32) : i32
   // CHECK: %[[P0:.+]] = llvm.icmp "eq" %[[WID]], %[[C0]] : i32
   // CHECK: %[[P1:.+]] = llvm.and %{{.*}}, %[[P0]]  : i1
@@ -383,13 +382,10 @@ tt.func public @tmem_copy_2d_slice(%src: !ttg.memdesc<256x16xi8, #shared, #ttg.s
 
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttng.two-ctas" = true} {
 
-tt.func public @tmem_copy_2d_2cta(%src: !ttg.memdesc<256x16xi8, #shared, #ttg.shared_memory>,
-                             %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>) {
-  %c0_i32 = arith.constant 0 : i32
-  %bar_alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
-  %barrier = ttg.memdesc_index %bar_alloc[%c0_i32] : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
-  ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
-  // CHECK: %[[CTAID:.+]] = nvgpu.cluster_id
+tt.func public @tmem_copy_2d_2cta(%src: !ttg.memdesc<128x32xi8, #shared, #ttg.shared_memory>,
+                             %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>,
+		                         %barrier: !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory>) {
+  // CHECK: %[[CTAID:.+]] = nvg.cluster_id
   // CHECK: %[[TWO:.+]] = llvm.mlir.constant(2 : i32) : i32
   // CHECK: llvm.urem %[[CTAID]], %[[TWO]]
   // CHECK-COUNT-8: tcgen05.cp.cta_group::2.warpx4.32x128b
@@ -919,7 +915,7 @@ tt.func private @load_store_16x32bx1_broadcast(%arg0: !ttg.memdesc<64x1xf32, #tm
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tensor_memory_st
-  // CHECK: nvgpu.tensor_memory_base
+  // CHECK: nvg.tensor_memory_base
   // CHECK: tcgen05.st.sync.aligned.32x32b.x128.b32
   // CHECK: nvvm.tcgen05.wait <store>
   tt.func public @tensor_memory_st(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %arg2: !tt.ptr<f16>) {
@@ -936,10 +932,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
   // CHECK-LABEL: @not_fold_cta_id_2cta
-  // CHECK: nvgpu.cluster_id
+  // CHECK: nvg.cluster_id
   tt.func public @not_fold_cta_id_2cta(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
-    %1 = nvgpu.cluster_id
+    %1 = nvg.cluster_id
     %2 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<32x!tt.ptr<i32>, #blocked>
     %3 = tt.addptr %2, %0 : tensor<32x!tt.ptr<i32>, #blocked>, tensor<32xi32, #blocked>
     %4 = tt.splat %1 : i32 -> tensor<32xi32, #blocked>
@@ -953,10 +949,10 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @fold_cta_id_1cta
-  // CHECK-NOT: nvgpu.cluster_id
+  // CHECK-NOT: nvg.cluster_id
   tt.func public @fold_cta_id_1cta(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
-    %1 = nvgpu.cluster_id
+    %1 = nvg.cluster_id
     %2 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<32x!tt.ptr<i32>, #blocked>
     %3 = tt.addptr %2, %0 : tensor<32x!tt.ptr<i32>, #blocked>, tensor<32xi32, #blocked>
     %4 = tt.splat %1 : i32 -> tensor<32xi32, #blocked>
@@ -970,10 +966,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @not_fold_cta_id_cluster_grid
-  // CHECK: nvgpu.cluster_id
+  // CHECK: nvg.cluster_id
   tt.func public @not_fold_cta_id_cluster_grid(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
-    %1 = nvgpu.cluster_id
+    %1 = nvg.cluster_id
     %2 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<32x!tt.ptr<i32>, #blocked>
     %3 = tt.addptr %2, %0 : tensor<32x!tt.ptr<i32>, #blocked>, tensor<32xi32, #blocked>
     %4 = tt.splat %1 : i32 -> tensor<32xi32, #blocked>
