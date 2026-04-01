@@ -112,6 +112,26 @@ def _fma_f32x2(a, b, c):
 
 
 @triton.jit
+def _sub_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            sub.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
@@ -1142,7 +1162,7 @@ def _bwd_compute_inner_loop(
             if slice_id == NUM_COMPUTE_SLICES - 1:
                 tlx.barrier_arrive(qk_empties[tmem_buf_id])
 
-            pT = tl.math.exp2(qkT - m[None, :])
+            pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
             if STAGE == 1:
                 mask = offs_m[None, :] >= offs_n[:, None]
                 pT = tl.where(mask, pT, 0.0)
@@ -1172,7 +1192,7 @@ def _bwd_compute_inner_loop(
                 [0, slice_id * SLICE_M],
                 [BLOCK_N1, SLICE_M],
             ))
-            dsT = pT * (dpT - Di[None, :])
+            dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
             dsT = dsT.to(q_out_dtype)
             # Store dsT to SMEM (for dq dot, which needs transposed view).
             tlx.local_store(
