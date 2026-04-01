@@ -1008,7 +1008,7 @@ tt.func @padded_shared_layout_multi_tier() {
 tt.func public @no_remote_shmem_store_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: tensor<1xf32>) {
   // expected-remark @below {{offset = 0, size = 8}}
   %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
-  %1 = nvgpu.cluster_id
+  %1 = nvg.cluster_id
   %c1_i32 = arith.constant 1 : i32
   %c1_i32_0 = arith.constant 1 : i32
   %2 = arith.xori %1, %c1_i32_0 : i32
