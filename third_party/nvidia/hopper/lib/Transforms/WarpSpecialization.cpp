@@ -93,6 +93,8 @@ public:
 
     // FIXME: skip warpspec if there is else block. Need to improve
     // CodePartitioning to correctly handle channels in else block.
+    // Relaxed for now to allow experimentation with flex attention kernels
+    // that have if/else for IS_DIVISIBLE checks.
     bool hasElse = false;
     funcOp->walk([&](scf::IfOp ifOp) {
       if (ifOp.elseBlock()) {
@@ -103,9 +105,7 @@ public:
       }
     });
     if (hasElse) {
-      LDBG("Warp specialization does not support else blocks. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      LDBG("Warning: else blocks detected, proceeding anyway (relaxed check).");
     }
 
     OpBuilder builder(funcOp);

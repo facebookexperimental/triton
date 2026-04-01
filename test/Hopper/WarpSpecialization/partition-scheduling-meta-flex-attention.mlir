@@ -1,14 +1,18 @@
 // RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
 
 // Tests that flex attention (dpFactor=2, no epilogue stores, scf.if masking)
-// gets two separate computation partitions. Without the fix, the pass collapses
-// all computation ops into a single partition because:
-// 1. No epilogue stores → hasEpilogue=false → no defaultPartition
+// gets two separate computation partitions with symmetric split.
+// Without the fix, the pass collapses all computation ops into a single
+// partition because:
+// 1. No epilogue stores → hasEpilogue=false → no defaultPartition created
 // 2. Without defaultPartition, Phase 4 load user propagation is skipped
 // 3. Phase 5's greedy scheduleUsers absorbs all ops through the scf.if merge
+// 4. Shared ops (scf.if) form cross-partition clusters in propagatePartitions
 //
-// The fix pre-assigns DataPartition ops using OpCategorizer's dpId when
-// dpFactor > 1 && !defaultPartition, ensuring symmetric partition split.
+// The fix:
+// 1. Creates defaultPartition when numDataPartitions > 1
+// 2. Pre-assigns DataPartition ops to separate computation partitions
+// 3. Pre-assigns shared MMA backward-slice ops to the default partition
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -25,14 +29,45 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @flex_attention_data_partition_split
 //
-// Verify: the two QK tmem_loads inside the loop go to different computation
-// partitions (4 and 3, or similar — the key is they're different).
-// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[P1:[0-9]+]]>
-// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[P2:[0-9]+]]>
+// --- Anchor ops: loads → load partition, MMAs → gemm partition ---
+// CHECK: tt.descriptor_load {{.*}} ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}} ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM]]>
 //
-// Verify partition types include "default" and two "computation" partitions.
-// Before the fix, flex attention (no epilogue stores) had no "default" partition,
-// and all computation collapsed into a single partition.
+// --- QK tmem_loads go to two DIFFERENT computation partitions ---
+// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_A:[0-9]+]]>
+// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_B:[0-9]+]]>
+//
+// --- maxnumf (m_ij) ops split symmetrically: one per computation partition ---
+// CHECK: arith.maxnumf {{.*}} ttg.partition = array<i32: [[COMP_C:[0-9]+]]>
+// CHECK: arith.maxnumf {{.*}} ttg.partition = array<i32: [[COMP_D:[0-9]+]]>
+//
+// --- exp2 (alpha) ops split across the same two computation partitions ---
+// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_C]]>
+// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_D]]>
+//
+// --- exp2 (p) ops split across the same two computation partitions ---
+// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_C]]>
+// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_D]]>
+//
+// --- Correction/rescale ops (acc tmem_load, tmem_store) go to default (partition 0) ---
+// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 0>
+// CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 0>
+// CHECK: ttng.tmem_store {{.*}} ttg.partition = array<i32: 0>
+// CHECK: ttng.tmem_store {{.*}} ttg.partition = array<i32: 0>
+//
+// --- truncf (p → bf16) and tmem_alloc split across the two computation partitions ---
+// CHECK: arith.truncf {{.*}} ttg.partition = array<i32: [[COMP_C]]>
+// CHECK: arith.truncf {{.*}} ttg.partition = array<i32: [[COMP_D]]>
+// CHECK: ttng.tmem_alloc {{.*}} ttg.partition = array<i32: [[COMP_C]]>
+// CHECK: ttng.tmem_alloc {{.*}} ttg.partition = array<i32: [[COMP_D]]>
+//
+// --- PV MMAs go to gemm partition ---
+// CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM]]>
+//
+// --- Partition types: default + gemm + load + two computation partitions ---
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types =
 // CHECK-SAME: "default"
@@ -40,6 +75,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-SAME: "load"
 // CHECK-SAME: "computation"
 // CHECK-SAME: "computation"
+//
+// --- Post-loop ops go to default partition (partition 0) ---
+// CHECK: tmem_load {{.*}}ttg.partition = array<i32: 0>
+// CHECK: tmem_load {{.*}}ttg.partition = array<i32: 0>
+// CHECK: tt.store {{.*}}ttg.partition = array<i32: 0>
 
 tt.func public @flex_attention_data_partition_split(
   %Q: !tt.ptr<bf16> {tt.divisibility = 16 : i32},

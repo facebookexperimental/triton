@@ -426,6 +426,9 @@ public:
   /// Get all MMAs.
   ArrayRef<ttng::MMAv5OpInterface> getMMAs() const { return mmas; }
 
+  /// Get the shared ops (ops appearing in multiple MMA backward slices).
+  const DenseSet<Operation *> &getSharedOps() const { return sharedOps; }
+
   /// Pretty-print all categorized ops grouped by category.
   void printCategorizedOps(llvm::raw_ostream &os) const {
     os << "=== OpCategorizer Results ===\n";
@@ -1396,7 +1399,9 @@ getInitialSchedule(scf::ForOp mainLoop,
   // changing the partition creation order that downstream passes expect.
   DenseMap<unsigned, Partition *> dpIdToPartition;
   DenseMap<Operation *, Partition *> mmaToPreassignedPartition;
-  if (dataPartitionFactor > 1 && !defaultPartition) {
+  if (dataPartitionFactor > 1) {
+    // Pre-assign exclusive DataPartition ops to per-dpId computation
+    // partitions.
     auto dpOps = categorizer.getOpsInCategory(OpCategory::DataPartition);
     for (const auto &catOp : dpOps) {
       unsigned dpId = catOp.dataPartitionId;
@@ -1409,6 +1414,17 @@ getInitialSchedule(scf::ForOp mainLoop,
       if (catOp.parentMMA)
         mmaToPreassignedPartition[catOp.parentMMA] = part;
     }
+    // Pre-assign shared ops (ops appearing in multiple MMA backward slices,
+    // e.g., scf.if for masking) to the default partition. Without this,
+    // propagatePartitions forms clusters around the unscheduled scf.if with
+    // multiple sink partitions (one per data partition), collapsing them
+    // into a single partition.
+    if (defaultPartition) {
+      for (Operation *sharedOp : categorizer.getSharedOps()) {
+        if (!isa<arith::ConstantOp>(sharedOp))
+          tryScheduleOp(defaultPartition, sharedOp);
+      }
+    }
   }
 
   for (auto mmaOp : llvm::reverse(mmas)) {
@@ -1417,8 +1433,38 @@ getInitialSchedule(scf::ForOp mainLoop,
       if (dataPartitionFactor > 1) {
         // Check if this MMA has a pre-assigned partition (flex path).
         auto it = mmaToPreassignedPartition.find(mmaOp.getOperation());
-        if (it != mmaToPreassignedPartition.end())
+        if (it != mmaToPreassignedPartition.end()) {
           targetPart = it->second;
+        } else {
+          // This MMA (e.g., a QK MMA) has no pre-assigned partition, but
+          // its users may already be pre-assigned to a computation partition
+          // (e.g., tmem_load and mulf(QK*scale) are DataPartition ops).
+          // Use that existing partition to avoid creating extra computation
+          // partitions that inflate TMEM channel count.
+          for (OpOperand &use : mmaOp->getUses()) {
+            Operation *user = use.getOwner();
+            if (auto ids = getPartitionIds(user)) {
+              for (int id : *ids) {
+                Partition *p = schedule.getPartition(id);
+                if (p && p->getType() == "computation") {
+                  targetPart = p;
+                  break;
+                }
+              }
+            }
+            if (targetPart)
+              break;
+          }
+          // If we found a pre-assigned computation partition, skip
+          // scheduleUsers entirely — all MMA users are already pre-assigned
+          // and calling scheduleUsers would create extra partitions from
+          // unscheduled transitive users (yield ops, loop-carried args).
+          if (targetPart) {
+            mmaToPartition[mmaOp.getOperation()] = targetPart;
+            inFirstLoop.push_back(mmaOp.getOperation());
+            continue;
+          }
+        }
         // Otherwise nullptr → scheduleUsers creates a new partition (FA path).
       } else {
         // bwd: all MMA users share one partition
@@ -1663,6 +1709,17 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
           continue;
         }
       }
+      // For data-partitioned kernels: if a single computation partition is
+      // in the sinks, assign the cluster there instead of creating extra
+      // computation partitions. This prevents partition inflation (e.g., 4
+      // computation partitions instead of 2) when intermediate ops between
+      // the gemm and computation partitions form a cluster.
+      if (cluster.sinkPartitions.size() == 1 &&
+          cluster.sinkPartitions.front()->getType() == "computation") {
+        for (Operation *op : cluster.ops)
+          setPartition(op, cluster.sinkPartitions.front());
+        continue;
+      }
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
       for (Operation *op : cluster.ops)
@@ -1768,11 +1825,186 @@ void optimizeSchedule(scf::ForOp loop, PartitionSet &schedule) {
   });
 }
 
-} // namespace
+/// Split scf.if ops whose results feed different computation partitions
+/// into separate per-partition scf.if ops. This is needed for data-partitioned
+/// kernels (like flex attention) where an scf.if for masking returns both
+/// data partitions' results as a tuple. Without splitting, the downstream
+/// WSCodePartition pass creates channels from the single scf.if producer
+/// to consumers in different tasks, violating the "channels sharing the same
+/// producer must be in the same task" invariant.
+///
+/// Before:
+///   %r:2 = scf.if %cond -> (T, T) {
+///     yield %a, %b          // %a for dp0, %b for dp1
+///   } else {
+///     yield %c, %d          // %c for dp0, %d for dp1
+///   } {ttg.partition = [0]}  // default partition
+///   use(%r#0) {ttg.partition = [3]}  // computation partition dp0
+///   use(%r#1) {ttg.partition = [4]}  // computation partition dp1
+///
+/// After:
+///   %r0 = scf.if %cond -> (T) {
+///     yield %a
+///   } else {
+///     yield %c
+///   } {ttg.partition = [3]}  // dp0 computation partition
+///   %r1 = scf.if %cond -> (T) {
+///     yield %b
+///   } else {
+///     yield %d
+///   } {ttg.partition = [4]}  // dp1 computation partition
+///   use(%r0) {ttg.partition = [3]}
+///   use(%r1) {ttg.partition = [4]}
+void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
+  SmallVector<scf::IfOp> ifsToSplit;
 
-//===----------------------------------------------------------------------===//
-// Pass Definition
-//===----------------------------------------------------------------------===//
+  loop.walk([&](scf::IfOp ifOp) {
+    if (ifOp.getNumResults() < 2)
+      return;
+
+    // Check if results feed different partitions.
+    DenseSet<int> resultPartitions;
+    bool hasDifferentPartitions = false;
+    for (OpResult result : ifOp.getResults()) {
+      for (Operation *user : result.getUsers()) {
+        auto ids = getPartitionIds(user);
+        if (ids) {
+          for (int id : *ids)
+            resultPartitions.insert(id);
+        }
+      }
+    }
+    // Only split if results feed more than one computation partition.
+    unsigned computationCount = 0;
+    for (Partition &p : schedule.getPartitions()) {
+      if (p.getType() == "computation" &&
+          resultPartitions.contains(p.getIndex()))
+        computationCount++;
+    }
+    if (computationCount >= 2)
+      ifsToSplit.push_back(ifOp);
+  });
+
+  for (scf::IfOp ifOp : ifsToSplit) {
+    unsigned numResults = ifOp.getNumResults();
+    OpBuilder builder(ifOp);
+
+    // For each result, determine which computation partition its users belong
+    // to, then find which yield operands in the then/else blocks map to it.
+    // Group results by their consumer partition.
+    DenseMap<int, SmallVector<unsigned>> partitionToResultIndices;
+    for (unsigned i = 0; i < numResults; i++) {
+      int partId = -1;
+      for (Operation *user : ifOp.getResult(i).getUsers()) {
+        auto ids = getPartitionIds(user);
+        if (ids && !ids->empty()) {
+          // Find a computation partition among the user's partitions.
+          for (int id : *ids) {
+            Partition *p = schedule.getPartition(id);
+            if (p && p->getType() == "computation") {
+              partId = id;
+              break;
+            }
+          }
+        }
+        if (partId >= 0)
+          break;
+      }
+      if (partId >= 0)
+        partitionToResultIndices[partId].push_back(i);
+    }
+
+    // Only split if we have at least 2 groups.
+    if (partitionToResultIndices.size() < 2)
+      continue;
+
+    // Create one scf.if per partition group.
+    for (auto &[partId, resultIndices] : partitionToResultIndices) {
+      auto *origThenBlock = ifOp.thenBlock();
+      auto *origElseBlock = ifOp.elseBlock();
+      auto *origThenYield = origThenBlock->getTerminator();
+      auto *origElseYield =
+          origElseBlock ? origElseBlock->getTerminator() : nullptr;
+
+      // Collect needed ops for the else block via backward reachability.
+      DenseSet<Operation *> neededElseOps;
+      if (origElseBlock) {
+        for (unsigned idx : resultIndices) {
+          SmallVector<Operation *> worklist;
+          if (auto *def = origElseYield->getOperand(idx).getDefiningOp())
+            worklist.push_back(def);
+          while (!worklist.empty()) {
+            Operation *curr = worklist.pop_back_val();
+            if (!curr || curr->getBlock() != origElseBlock)
+              continue;
+            if (!neededElseOps.insert(curr).second)
+              continue;
+            for (Value operand : curr->getOperands())
+              if (auto *def = operand.getDefiningOp())
+                worklist.push_back(def);
+          }
+        }
+      }
+
+      // Build result types for this split.
+      SmallVector<Type> splitResultTypes;
+      for (unsigned idx : resultIndices)
+        splitResultTypes.push_back(ifOp.getResult(idx).getType());
+
+      // Use the callback-based builder to populate then/else blocks.
+      auto thenBuilder = [&](OpBuilder &b, Location loc) {
+        IRMapping mapping;
+        for (Operation &op : origThenBlock->without_terminator()) {
+          bool needed = false;
+          for (unsigned idx : resultIndices) {
+            if (origThenYield->getOperand(idx).getDefiningOp() == &op)
+              needed = true;
+          }
+          if (needed)
+            b.clone(op, mapping);
+        }
+        SmallVector<Value> yieldVals;
+        for (unsigned idx : resultIndices)
+          yieldVals.push_back(
+              mapping.lookupOrDefault(origThenYield->getOperand(idx)));
+        b.create<scf::YieldOp>(loc, yieldVals);
+      };
+
+      auto elseBuilder = [&](OpBuilder &b, Location loc) {
+        IRMapping mapping;
+        for (Operation &op : origElseBlock->without_terminator()) {
+          if (neededElseOps.contains(&op))
+            b.clone(op, mapping);
+        }
+        SmallVector<Value> yieldVals;
+        for (unsigned idx : resultIndices)
+          yieldVals.push_back(
+              mapping.lookupOrDefault(origElseYield->getOperand(idx)));
+        b.create<scf::YieldOp>(loc, yieldVals);
+      };
+
+      auto newIf = builder.create<scf::IfOp>(
+          ifOp.getLoc(), ifOp.getCondition(), thenBuilder,
+          origElseBlock
+              ? elseBuilder
+              : static_cast<function_ref<void(OpBuilder &, Location)>>(
+                    nullptr));
+
+      // Assign the new scf.if to this computation partition.
+      setPartition(newIf, schedule.getPartition(partId));
+
+      // Replace uses of the original results with the new scf.if results.
+      for (unsigned i = 0; i < resultIndices.size(); i++) {
+        ifOp.getResult(resultIndices[i]).replaceAllUsesWith(newIf.getResult(i));
+      }
+    }
+
+    // Erase the original scf.if (all uses should be replaced).
+    ifOp.erase();
+  }
+}
+
+} // namespace
 
 namespace mlir {
 #define GEN_PASS_DEF_NVGPUPARTITIONSCHEDULINGMETA
@@ -1814,6 +2046,62 @@ void PartitionSchedulingMeta::runOnOperation() {
       schedulePostLoopOps(loop, schedule, result->epiloguePartition);
 
       optimizeSchedule(loop, schedule);
+
+      // Split scf.if ops whose results feed different computation partitions.
+      // This must run after all partition assignments are finalized (after
+      // propagatePartitions + optimizeSchedule) but before serialization.
+      splitDataPartitionedIfOps(loop, schedule);
+
+      // Merge extra computation partitions into the main computation
+      // partitions. After propagatePartitions, there may be extra computation
+      // partitions (e.g., for QK tmem_load ops) that should be merged with
+      // their downstream computation partition (e.g., where exp2/truncf are).
+      // This ensures the same partition structure as FA (2 computation
+      // partitions, not 4).
+      {
+        SmallVector<Partition *> computePartitions;
+        for (Partition &p : schedule.getPartitions()) {
+          if (p.getType() == "computation")
+            computePartitions.push_back(&p);
+        }
+        if (computePartitions.size() > 2) {
+          // Keep the two largest computation partitions. Merge smaller ones
+          // into the partition that their ops' users are in.
+          llvm::sort(computePartitions, [](Partition *a, Partition *b) {
+            return a->getOps().size() > b->getOps().size();
+          });
+          // The first two are the main computation partitions.
+          DenseSet<unsigned> mainPartIds;
+          for (unsigned i = 0; i < 2 && i < computePartitions.size(); i++)
+            mainPartIds.insert(computePartitions[i]->getIndex());
+          // Merge smaller computation partitions.
+          for (unsigned i = 2; i < computePartitions.size(); i++) {
+            Partition *smallPart = computePartitions[i];
+            // Find which main partition this should merge into by checking
+            // where the ops' users are.
+            Partition *mergeTo = nullptr;
+            for (Operation *op : smallPart->getOps()) {
+              for (Operation *user : op->getUsers()) {
+                auto ids = getPartitionIds(user);
+                if (!ids) continue;
+                for (int id : *ids) {
+                  if (mainPartIds.contains(id)) {
+                    mergeTo = schedule.getPartition(id);
+                    break;
+                  }
+                }
+                if (mergeTo) break;
+              }
+              if (mergeTo) break;
+            }
+            if (mergeTo) {
+              for (Operation *op : smallPart->getOps())
+                setPartition(op, mergeTo);
+            }
+          }
+        }
+      }
+
       schedule.serialize(loop);
       loop->setAttr(
           kWarpSpecializeTagAttrName,
