@@ -2,7 +2,7 @@ from typing import Sequence, List, TypeVar, Tuple, Callable
 import math
 from triton.language.semantic import TritonSemantic
 from . import _core as ttgl
-from ._layouts import AutoLayout, DistributedLayout, DistributedLinearLayout, SliceLayout, SharedLayout
+from ._layouts import AutoLayout, DistributedLayout, DistributedLinearLayout, SliceLayout, SharedLayout, CoalescedLayout
 from triton._C.libtriton.gluon_ir import GluonOpBuilder, compute_tmem_reg_layout
 from triton.compiler.code_generator import flatten_values_to_ir, unflatten_ir_values
 
@@ -146,11 +146,11 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         )
         layout = input.type.layout
         _check(
-            isinstance(layout, (SliceLayout, AutoLayout)),
+            isinstance(layout, (SliceLayout, AutoLayout, CoalescedLayout)),
             lambda: f"expected expand_dims input to have a SliceLayout, but got: {layout}",
         )
         _check(
-            isinstance(layout, AutoLayout) or layout.dim == axis,
+            isinstance(layout, (AutoLayout, CoalescedLayout)) or layout.dim == axis,
             lambda: f"expected expand_dims input layout to be sliced in axis {axis} but got {layout.dim}",
         )
 
