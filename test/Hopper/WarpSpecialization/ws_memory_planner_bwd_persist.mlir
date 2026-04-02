@@ -65,12 +65,12 @@
 // CODE-PART: ttng.tc_gen5_mma
 // CODE-PART: scf.yield
 //
-// After the inner k-loop: tc_gen5_commit ops use raw 1x1xi64 barrier allocs.
+// After the inner k-loop: tc_gen5_commit ops use raw 1xi64 barrier allocs.
 // Previously these were replaced with wait_barrier+arrive_barrier (deadlock).
-// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
-// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
-// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
-// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
+// CODE-PART: ttng.tc_gen5_commit {{%[a-z0-9_]+}} {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64
 //
 // No arrive_barrier ops replacing commits (regression indicator):
 // CODE-PART-NOT: ttng.arrive_barrier

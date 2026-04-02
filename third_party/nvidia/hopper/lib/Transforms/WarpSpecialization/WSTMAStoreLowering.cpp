@@ -91,13 +91,14 @@ struct NVGPUWSTMAStoreLoweringPass
 };
 
 // ---------------------------------------------------------------------------
-// Annotate TMA store waits with can_rotate_by_buffer_count
+
+nnotate TMA store waits with can_rotate_by_buffer_count
 // ---------------------------------------------------------------------------
 #define GEN_PASS_DEF_NVGPUANNOTATETMASTOREWAITS
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-static constexpr const char *kCanRotateByBufferCount =
-    "can_rotate_by_buffer_count";
+    static constexpr const char *kCanRotateByBufferCount =
+        "can_rotate_by_buffer_count";
 
 // Trace the token back to the defining AsyncTMACopyLocalToGlobalOp, handling
 // both direct definitions and loop-carried block arguments.

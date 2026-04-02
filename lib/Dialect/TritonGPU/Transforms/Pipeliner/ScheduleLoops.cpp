@@ -208,9 +208,19 @@ computeDotChain(ttng::MMAv5OpInterface dotOp,
     auto addUsers = [&](Operation *op) {
       for (mlir::Value result : op->getResults()) {
         for (auto user : result.getUsers()) {
-          if (user && !isa<scf::YieldOp>(user) && !seenOps.count(user)) {
-            users.push_back(user);
+          if (!user || seenOps.count(user))
+            continue;
+          // When a value flows into an scf.if via scf.yield, follow the
+          // data flow back to the parent scf.if's results so the BFS can
+          // continue to downstream users (e.g. the next MMA op).
+          if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+            if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+              if (!seenOps.count(ifOp))
+                users.push_back(ifOp);
+            }
+            continue;
           }
+          users.push_back(user);
         }
       }
     };
