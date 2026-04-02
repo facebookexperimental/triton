@@ -1041,7 +1041,6 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     BLOCK_M1 = nargs["BLOCK_M1"]
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
-    EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
     DQ_REDUCE_NCOL = nargs["DQ_REDUCE_NCOL"]
 
     # Reset dq accumulator to zeros before each autotuner warmup run.
@@ -1054,8 +1053,8 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_dq"].block_shape = [BLOCK_M1, DQ_REDUCE_NCOL]
-    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
-    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // 2]
+    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // 2]
     nargs["desc_m"].block_shape = [BLOCK_M1]
     nargs["desc_delta"].block_shape = [BLOCK_M1]
 
@@ -1074,7 +1073,7 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_TMEM": 1,
             "EPILOGUE_SUBTILE": 4 if bm1 == 128 else 2,
             "NUM_COMPUTE_SLICES": 2,
-            "DQ_REDUCE_STAGES": 1 if bm1 == 128 else 2,
+            "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": uwb,
@@ -1304,6 +1303,18 @@ def _attn_bwd_ws(
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
+    # SMEM staging buffers for dKV epilogue TMA stores.
+    # Use HEAD_DIM // 2 = 64 columns (= 128 bytes for bf16), matching the
+    # swizzle-128 minimum width.  NUM_BUFFERS_KV stages so stage[i] aliases
+    # the corresponding tiles[i].
+    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
+    #   the dpT dot — precedes dv_fulls).
+    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
+    #   so the compute task must wait on k_mma_done before writing sdk).
+    DKV_STORE_NCOL: tl.constexpr = HEAD_DIM // 2
+    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
+    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
+
     # SMEM buffers for M and D (loaded by load task, consumed by compute task).
     # Stages match Q and dO pipelines respectively for synchronized double-buffering.
     M_STAGE: tl.constexpr = NUM_BUFFERS_Q  # = 2
@@ -1313,7 +1324,12 @@ def _attn_bwd_ws(
 
     # allocate barriers for smem buffers
     # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
-    # k_empties gates K SMEM reuse: signaled after last dq dot reads K in epilog.
+    # k_mma_done: signaled by MMA task after dq dot (last k_tiles read).
+    # k_empties: signaled by compute task after dKV staging stores complete
+    #            AND k_mma_done is received.  Gates both k_tiles and v_tiles
+    #            (v_tiles aliased by sdv_store_buf) since V load follows K
+    #            load in the load task.
+    k_mma_done = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
@@ -1519,32 +1535,47 @@ def _attn_bwd_ws(
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
 
                 tlx.barrier_wait(dv_fulls[kv_buf_id], kv_phase)
-                slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                DKV_STORE_ITERS: tl.constexpr = HEAD_DIM // DKV_STORE_NCOL
+                for slice_id in tl.static_range(DKV_STORE_ITERS):
                     dv_slice = tlx.local_slice(
                         dv_tiles[kv_buf_id],
-                        [0, slice_id * slice_size],
-                        [BLOCK_N1, slice_size],
+                        [0, slice_id * DKV_STORE_NCOL],
+                        [BLOCK_N1, DKV_STORE_NCOL],
                     )
                     dv = tlx.local_load(dv_slice)
-                    desc_dv.store(
-                        [(off_bh + start_block_n).to(tl.int32), slice_id * slice_size],
-                        dv.to(tlx.dtype_of(desc_dv)),
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.local_store(sdv_store_buf[kv_buf_id], dv.to(tlx.dtype_of(desc_dv)))
+                    tlx.fence("async_shared")
+                    tlx.async_descriptor_store(
+                        desc_dv,
+                        sdv_store_buf[kv_buf_id],
+                        [(off_bh + start_block_n).to(tl.int32), slice_id * DKV_STORE_NCOL],
                     )
                 tlx.barrier_arrive(dv_empties[kv_buf_id])
                 tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                # Wait for MMA's dq dot (last k_tiles read) before writing
+                # sdk_store_buf which aliases k_tiles.
+                tlx.barrier_wait(k_mma_done[kv_buf_id], kv_phase)
+                for slice_id in tl.static_range(DKV_STORE_ITERS):
                     dk_slice = tlx.local_slice(
                         dk_tiles[kv_buf_id],
-                        [0, slice_id * slice_size],
-                        [BLOCK_N1, slice_size],
+                        [0, slice_id * DKV_STORE_NCOL],
+                        [BLOCK_N1, DKV_STORE_NCOL],
                     )
                     dk = tlx.local_load(dk_slice)
                     dk *= sm_scale
-                    desc_dk.store(
-                        [(off_bh + start_block_n).to(tl.int32), slice_id * slice_size],
-                        dk.to(tlx.dtype_of(desc_dk)),
+                    tlx.async_descriptor_store_wait(0)
+                    tlx.local_store(sdk_store_buf[kv_buf_id], dk.to(tlx.dtype_of(desc_dk)))
+                    tlx.fence("async_shared")
+                    tlx.async_descriptor_store(
+                        desc_dk,
+                        sdk_store_buf[kv_buf_id],
+                        [(off_bh + start_block_n).to(tl.int32), slice_id * DKV_STORE_NCOL],
                     )
+                tlx.async_descriptor_store_wait(0)
+                # All staging stores done + MMA done reading k_tiles →
+                # safe for load task to refill both k_tiles and v_tiles.
+                tlx.barrier_arrive(k_empties[kv_buf_id])
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
@@ -1808,7 +1839,7 @@ def _attn_bwd_ws(
                         dq_fulls[tmem_buf_id],
                     ],
                 )
-                tlx.tcgen05_commit(k_empties[kv_buf_id])
+                tlx.tcgen05_commit(k_mma_done[kv_buf_id])
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
