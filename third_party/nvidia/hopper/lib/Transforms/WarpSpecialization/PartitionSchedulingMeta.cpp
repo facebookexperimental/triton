@@ -1546,13 +1546,12 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   }
 
   // Assign remaining unscheduled inner-loop ops using their dpId.
-  // After Phase 5, some ops may still be unscheduled (e.g., l_ij reduce,
-  // tmem_alloc p, l_i*alpha, l_i+l_ij). These ops have dpIds from the
-  // opToDpId map but aren't reached by scheduleUsers because they're
-  // downstream of correction ops (already scheduled in Phase 4) via use
-  // chains that scheduleUsers skips. Assign them to their dpId's
-  // computation partition.
-  if (dataPartitionFactor > 1 && !dpIdToPartition.empty()) {
+  // Only applied when there's no default partition (Hopper with all merges).
+  // For FA/flex (which have a correction/default partition), unscheduled ops
+  // are handled by propagatePartitions, which assigns them consistently
+  // with the downstream WSCodePartition pass's channel assumptions.
+  if (dataPartitionFactor > 1 && !dpIdToPartition.empty() &&
+      !defaultPartition) {
     scf::ForOp innermostLoop = loops[0];
     for (Operation &op : innermostLoop.getOps()) {
       if (hasPartition(&op))
