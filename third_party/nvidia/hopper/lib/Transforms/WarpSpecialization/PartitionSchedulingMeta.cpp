@@ -51,6 +51,9 @@ enum class OpCategory {
   Default        // Everything else
 };
 
+/// Sentinel value for ops shared across multiple data partition groups.
+static constexpr unsigned SHARED_DPID = UINT_MAX;
+
 /// Get a string representation of an OpCategory.
 static llvm::StringRef toString(OpCategory category) {
   switch (category) {
@@ -79,6 +82,10 @@ static llvm::StringRef toString(OpCategory category) {
 //===----------------------------------------------------------------------===//
 
 /// Collect backward slice for an MMA operation.
+/// Enhanced to enter scf.if regions: when an scf.if op is in the slice,
+/// follow yield operands in the then/else blocks backward. This captures
+/// ops like tmem_load QK and mulf(QK*scale) in flex attention that feed
+/// into scf.if yield operands but are missed by standard getBackwardSlice.
 static SetVector<Operation *>
 collectMMABackwardSlice(scf::ForOp loop, ttng::MMAv5OpInterface mmaOp) {
   SetVector<Operation *> slice;
@@ -91,6 +98,32 @@ collectMMABackwardSlice(scf::ForOp loop, ttng::MMAv5OpInterface mmaOp) {
   for (Value operand : mmaOp->getOperands()) {
     (void)getBackwardSlice(operand, &slice, options);
   }
+
+  // Enter scf.if regions: follow yield operands backward until fixpoint.
+  // getBackwardSlice adds scf.if ops to the slice but does NOT enter their
+  // regions. We iterate until no new ops are discovered.
+  DenseSet<Operation *> visitedIfs;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *op : llvm::to_vector(slice)) {
+      auto ifOp = dyn_cast<scf::IfOp>(op);
+      if (!ifOp || !visitedIfs.insert(ifOp).second)
+        continue;
+      for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+        if (region->empty())
+          continue;
+        auto *yieldOp = region->front().getTerminator();
+        for (Value operand : yieldOp->getOperands()) {
+          unsigned prevSize = slice.size();
+          (void)getBackwardSlice(operand, &slice, options);
+          if (slice.size() > prevSize)
+            changed = true;
+        }
+      }
+    }
+  }
+
   return slice;
 }
 
@@ -406,8 +439,8 @@ public:
     categorizeMMAs();
     categorizeEpilogueStores();
     categorizeTMAReductions();
+    categorizeCorrectionOps(); // Before DataPartition to prevent stealing
     categorizeDataPartitionOps();
-    categorizeCorrectionOps();
   }
 
   /// Get operations in a specific category.
@@ -428,6 +461,13 @@ public:
 
   /// Get the shared ops (ops appearing in multiple MMA backward slices).
   const DenseSet<Operation *> &getSharedOps() const { return sharedOps; }
+
+  /// Get the dpId for an op. Returns SHARED_DPID if the op is shared across
+  /// groups, or 0 if the op has no dpId assigned.
+  unsigned getDpId(Operation *op) const {
+    auto it = opToDpId.find(op);
+    return it != opToDpId.end() ? it->second : 0;
+  }
 
   /// Pretty-print all categorized ops grouped by category.
   void printCategorizedOps(llvm::raw_ostream &os) const {
@@ -573,6 +613,132 @@ private:
                             << groupsWithExclusiveOps.size()
                             << " independent groups (dpFactor="
                             << dataPartitionFactor << ")\n");
+
+    // Build opToDpId map for ALL ops reachable from MMAs.
+    // This is the single source of truth for data partition ID assignment.
+    if (dataPartitionFactor > 1) {
+      // Normalize group IDs to contiguous 0..dpFactor-1 range.
+      DenseMap<unsigned, unsigned> rootToGroupId;
+      unsigned nextGroupId = 0;
+      for (unsigned i = 0; i < n; ++i) {
+        unsigned root = find(i);
+        if (!rootToGroupId.count(root))
+          rootToGroupId[root] = nextGroupId++;
+      }
+
+      // Assign dpId to MMAs themselves.
+      for (unsigned i = 0; i < n; ++i) {
+        unsigned groupId = rootToGroupId[find(i)];
+        opToDpId[loopMmas[i].getOperation()] = groupId;
+      }
+
+      // Assign dpId to all backward slice ops.
+      for (unsigned i = 0; i < n; ++i) {
+        unsigned groupId = rootToGroupId[find(i)];
+        for (Operation *op : mmaToSlice[loopMmas[i].getOperation()]) {
+          auto it = opToDpId.find(op);
+          if (it == opToDpId.end()) {
+            opToDpId[op] = groupId;
+          } else if (it->second != groupId) {
+            it->second = SHARED_DPID;
+          }
+        }
+      }
+
+      // Assign dpId to pre-loop ops: follow MMA operands backward across
+      // the loop boundary. Ops defined outside the innermost loop that
+      // feed exclusively into one MMA group get that group's dpId.
+      for (unsigned i = 0; i < n; ++i) {
+        unsigned groupId = rootToGroupId[find(i)];
+        Operation *mmaOp = loopMmas[i].getOperation();
+        SmallVector<Operation *> worklist;
+        for (Value operand : mmaOp->getOperands()) {
+          if (auto *defOp = operand.getDefiningOp()) {
+            if (!innermostLoop->isAncestor(defOp))
+              worklist.push_back(defOp);
+          }
+        }
+        // Also follow pre-loop ops from the backward slice.
+        for (Operation *op : mmaToSlice[mmaOp]) {
+          for (Value operand : op->getOperands()) {
+            if (auto *defOp = operand.getDefiningOp()) {
+              if (!innermostLoop->isAncestor(defOp) &&
+                  mainLoop->isAncestor(defOp))
+                worklist.push_back(defOp);
+            }
+          }
+        }
+        DenseSet<Operation *> visited;
+        while (!worklist.empty()) {
+          Operation *op = worklist.pop_back_val();
+          if (!visited.insert(op).second)
+            continue;
+          auto it = opToDpId.find(op);
+          if (it == opToDpId.end()) {
+            opToDpId[op] = groupId;
+          } else if (it->second != groupId) {
+            it->second = SHARED_DPID;
+          }
+          for (Value operand : op->getOperands()) {
+            if (auto *defOp = operand.getDefiningOp()) {
+              if (mainLoop->isAncestor(defOp) &&
+                  !innermostLoop->isAncestor(defOp))
+                worklist.push_back(defOp);
+            }
+          }
+        }
+      }
+
+      // Assign dpId to post-loop ops: follow loop results forward.
+      // Each loop result traces back to a specific MMA group's yield.
+      auto yieldOp = innermostLoop.getBody()->getTerminator();
+      for (unsigned argIdx = 0; argIdx < innermostLoop.getNumResults();
+           ++argIdx) {
+        Value yieldVal = yieldOp->getOperand(argIdx);
+        Operation *yieldDef = yieldVal.getDefiningOp();
+        if (!yieldDef)
+          continue;
+        auto it = opToDpId.find(yieldDef);
+        if (it == opToDpId.end())
+          continue;
+        unsigned yieldDpId = it->second;
+        if (yieldDpId == SHARED_DPID)
+          continue;
+        // Follow the loop result to post-loop consumers.
+        Value loopResult = innermostLoop.getResult(argIdx);
+        SmallVector<Operation *> postWorklist;
+        for (Operation *user : loopResult.getUsers())
+          postWorklist.push_back(user);
+        DenseSet<Operation *> postVisited;
+        while (!postWorklist.empty()) {
+          Operation *op = postWorklist.pop_back_val();
+          if (!postVisited.insert(op).second)
+            continue;
+          if (innermostLoop->isAncestor(op))
+            continue;
+          auto pit = opToDpId.find(op);
+          if (pit == opToDpId.end()) {
+            opToDpId[op] = yieldDpId;
+          } else if (pit->second != yieldDpId) {
+            pit->second = SHARED_DPID;
+          }
+          for (Value result : op->getResults())
+            for (Operation *user : result.getUsers())
+              postWorklist.push_back(user);
+        }
+      }
+
+      LLVM_DEBUG({
+        llvm::dbgs() << "[data-partition] opToDpId map (" << opToDpId.size()
+                     << " entries):\n";
+        unsigned sharedCount = 0;
+        for (auto &[op, dpId] : opToDpId) {
+          if (dpId == SHARED_DPID)
+            sharedCount++;
+        }
+        llvm::dbgs() << "  shared ops: " << sharedCount << "\n";
+      });
+    }
   }
 
   void categorizeLoads() {
@@ -588,7 +754,8 @@ private:
 
   void categorizeMMAs() {
     for (auto mmaOp : mmas) {
-      addCategorizedOp(mmaOp, OpCategory::MMA, 0, mmaOp);
+      unsigned dpId = getDpId(mmaOp);
+      addCategorizedOp(mmaOp, OpCategory::MMA, dpId, mmaOp);
 
       // Categorize memory descriptor views feeding into MMA
       SmallVector<Operation *> worklist;
@@ -602,7 +769,7 @@ private:
           continue;
         if (opCategories.contains(op))
           continue;
-        addCategorizedOp(op, OpCategory::MemDescView, 0, mmaOp);
+        addCategorizedOp(op, OpCategory::MemDescView, getDpId(op), mmaOp);
         if (Operation *defOp = op->getOperand(0).getDefiningOp())
           worklist.push_back(defOp);
       }
@@ -639,22 +806,23 @@ private:
     if (dataPartitionFactor <= 1)
       return;
 
-    // Map exclusive ops to their MMA's partition ID
-    unsigned partitionId = 0;
+    // Map exclusive ops to their MMA group's dpId using opToDpId.
     for (auto &[mma, slice] : mmaToSlice) {
       for (Operation *op : slice) {
         if (!sharedOps.contains(op) && !opCategories.contains(op) &&
             !isa<arith::ConstantOp>(op)) {
-          addCategorizedOp(op, OpCategory::DataPartition, partitionId, mma);
+          unsigned dpId = getDpId(op);
+          if (dpId != SHARED_DPID)
+            addCategorizedOp(op, OpCategory::DataPartition, dpId, mma);
         }
       }
-      partitionId++;
     }
   }
 
   void categorizeCorrectionOps() {
     for (auto mmaOp : mmas) {
       scf::ForOp loop = mmaOp->getParentOfType<scf::ForOp>();
+      unsigned dpId = getDpId(mmaOp);
       for (OpOperand &use : mmaOp->getUses()) {
         if (use.getOwner() != loop.getBody()->getTerminator())
           continue;
@@ -663,7 +831,7 @@ private:
              loop.getRegionIterArg(use.getOperandNumber()).getUses()) {
           Operation *user = iterUse.getOwner();
           if (!opCategories.contains(user)) {
-            addCategorizedOp(user, OpCategory::Correction);
+            addCategorizedOp(user, OpCategory::Correction, dpId, mmaOp);
           }
         }
         break;
@@ -695,6 +863,12 @@ private:
   void addCategorizedOp(Operation *op, OpCategory cat,
                         unsigned dataPartitionId = 0,
                         Operation *parentMMA = nullptr) {
+    // If no explicit dpId provided, look up from opToDpId map.
+    if (dataPartitionId == 0) {
+      auto it = opToDpId.find(op);
+      if (it != opToDpId.end() && it->second != SHARED_DPID)
+        dataPartitionId = it->second;
+    }
     opCategories[op] = CategorizedOp{op, cat, dataPartitionId, parentMMA};
   }
 
@@ -704,6 +878,7 @@ private:
   DenseMap<Operation *, CategorizedOp> opCategories;
   DenseMap<Operation *, SetVector<Operation *>> mmaToSlice;
   DenseSet<Operation *> sharedOps;
+  DenseMap<Operation *, unsigned> opToDpId;
   unsigned dataPartitionFactor = 1;
 };
 
