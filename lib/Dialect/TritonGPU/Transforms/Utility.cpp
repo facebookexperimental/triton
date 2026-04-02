@@ -1616,9 +1616,13 @@ void replaceUsesAndPropagateType(
       newVal = builder.create<ttg::MemDescTransOp>(trans.getLoc(), val,
                                                    trans.getOrder());
     } else if (auto reshape = dyn_cast<ttg::MemDescReshapeOp>(user)) {
-      auto shape = reshape.getType().getShape();
+      ttg::MemDescType oldType = reshape.getType();
+      bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
+      auto newDstType = ttg::MemDescType::get(
+          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
       newVal =
-          builder.create<ttg::MemDescReshapeOp>(reshape.getLoc(), val, shape);
+          builder.create<ttg::MemDescReshapeOp>(reshape.getLoc(), newDstType, val);
     }
     assert(newVal && "unhandled memdesc view");
     newVal.getDefiningOp()->setAttrs(user->getAttrs());
