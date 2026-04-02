@@ -1120,7 +1120,6 @@ def _bwd_compute_inner_loop(
     M_STAGE: tl.constexpr,
     D_STAGE: tl.constexpr,
 ):
-    SLICE_M: tl.constexpr = BLOCK_M1 // NUM_COMPUTE_SLICES
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
     lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE)
@@ -1137,85 +1136,45 @@ def _bwd_compute_inner_loop(
 
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
-        # Process each M1 slice to reduce peak register pressure.
-        # Only one qkT slice is live at a time. Storing ppT (f16) to
-        # p_tiles (which aliases qk_tiles via reuse) is safe because
-        # f16 slice N occupies fewer bytes than f32 slice N, so it
-        # cannot corrupt f32 data at slice N+1.
-        for slice_id in tl.static_range(NUM_COMPUTE_SLICES):
-            offs_m = curr_m + slice_id * SLICE_M + tl.arange(0, SLICE_M)
-            # Load only the needed slice from SMEM to reduce register pressure.
-            m = tlx.local_load(tlx.local_slice(sM_tiles[m_buf_id], [slice_id * SLICE_M], [SLICE_M]))
+        # --- Phase 1: Read S from TMEM and compute pT. ---
+        # S and P alias the same TMEM (p_tiles reuse=qk_tiles), so all
+        # compute warps must finish reading S before any warp writes P.
+        # Load the full tile at once (no slicing) to keep pT in registers
+        # across the barrier.
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+        m = tlx.local_load(sM_tiles[m_buf_id])
+        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+        tlx.barrier_arrive(qk_empties[tmem_buf_id])
 
-            qkT = tlx.local_load(tlx.local_slice(
-                qk_tiles[tmem_buf_id],
-                [0, slice_id * SLICE_M],
-                [BLOCK_N1, SLICE_M],
-            ))
+        pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
+        if STAGE == 1:
+            mask = offs_m[None, :] >= offs_n[:, None]
+            pT = tl.where(mask, pT, 0.0)
 
-            # Release qk_tiles as soon as the last slice is loaded.
-            if slice_id == NUM_COMPUTE_SLICES - 1:
-                tlx.barrier_arrive(qk_empties[tmem_buf_id])
+        # Compute sync: ensure all warps finished reading S from TMEM
+        # before any warp writes P (which aliases S) below.
+        # bar.sync (named_barrier_wait) = atomic arrive-and-wait.
+        # 8 compute warps × 32 threads = 256.
+        tlx.named_barrier_wait(15, 256)
 
-            pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
-            if STAGE == 1:
-                mask = offs_m[None, :] >= offs_n[:, None]
-                pT = tl.where(mask, pT, 0.0)
+        # --- Phase 2: Store P to TMEM. ---
+        ppT = pT.to(do_out_dtype)
+        tlx.local_store(p_tiles[tmem_buf_id], ppT)
+        tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
-            ppT = pT.to(do_out_dtype)
-            tlx.local_store(
-                tlx.local_slice(
-                    p_tiles[tmem_buf_id],
-                    [0, slice_id * SLICE_M],
-                    [BLOCK_N1, SLICE_M],
-                ),
-                ppT,
-            )
-
-            # Signal p_fulls after the last ppT slice is stored, so the
-            # mma task can start dv += ppT @ do while we compute dsT.
-            if slice_id == NUM_COMPUTE_SLICES - 1:
-                tlx.barrier_arrive(p_fulls[tmem_buf_id])
-
-            # Defer dpT wait until after first slice's pT/ppT computation,
-            # so the mma task has time to produce dpT concurrently.
-            if slice_id == 0:
-                tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-
-            dpT = tlx.local_load(tlx.local_slice(
-                dp_tiles[tmem_buf_id],
-                [0, slice_id * SLICE_M],
-                [BLOCK_N1, SLICE_M],
-            ))
-            # Load Di late so it can reuse m's registers (m is dead after exp2).
-            Di = tlx.local_load(tlx.local_slice(sD_tiles[d_buf_id], [slice_id * SLICE_M], [SLICE_M]))
-            dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
-            dsT = dsT.to(q_out_dtype)
-            # Store dsT to SMEM (for dq dot, which needs transposed view).
-            tlx.local_store(
-                tlx.local_slice(
-                    ds_tiles[ds_buf_id],
-                    [0, slice_id * SLICE_M],
-                    [BLOCK_N1, SLICE_M],
-                ),
-                dsT,
-            )
-            # Store dsT to TMEM (for dk dot, faster MMA read path).
-            tlx.local_store(
-                tlx.local_slice(
-                    dsT_tmem_tiles[ds_buf_id],
-                    [0, slice_id * SLICE_M],
-                    [BLOCK_N1, SLICE_M],
-                ),
-                dsT,
-            )
-
-            if slice_id == NUM_COMPUTE_SLICES - 1:
-                if not REUSE_DP_FOR_DQ:
-                    tlx.barrier_arrive(dp_empties[tmem_buf_id])
-                tlx.fence("async_shared")
-                tlx.barrier_arrive(ds_fulls[ds_buf_id])
-                tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
+        # --- Phase 3: Compute dS = pT * (dpT - Di). ---
+        tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
+        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+        Di = tlx.local_load(sD_tiles[d_buf_id])
+        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+        dsT = dsT.to(q_out_dtype)
+        tlx.local_store(ds_tiles[ds_buf_id], dsT)
+        tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
+        if not REUSE_DP_FOR_DQ:
+            tlx.barrier_arrive(dp_empties[tmem_buf_id])
+        tlx.fence("async_shared")
+        tlx.barrier_arrive(ds_fulls[ds_buf_id])
+        tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
 
         curr_m += step_m
         blk_idx += 1
