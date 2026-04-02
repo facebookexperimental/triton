@@ -198,7 +198,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %l_i0_115 = arith.addf %l_i0_113, %l_ij_94 {loop.cluster = 1 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 4>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>
         %offsetkv_y_116 = arith.addi %offset_y_58, %c128_i32 {loop.cluster = 5 : i32, loop.stage = 1 : i32} : i32
         scf.yield %offsetkv_y_116, %true, %l_i0_114, %m_ij_80, %qk_73, %acc_111, %l_i0_115, %m_ij_81, %qk_75, %acc_112 : i32, i1, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>, !ttg.async.token, !ttg.async.token, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked1}>>, !ttg.async.token, !ttg.async.token
-      } {tt.data_partition_factor = 2 : i32, tt.disallow_acc_multi_buffer, tt.scheduled_max_stage = 2 : i32, ttg.partition = array<i32: 0>}
+      } {tt.data_partition_factor = 2 : i32, tt.disallow_acc_multi_buffer, tt.scheduled_max_stage = 2 : i32}
       %acc_37, %acc_38 = ttng.tmem_load %acc[%offsetkv_y#5] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #blocked>
       %acc_39, %acc_40 = ttng.tmem_load %acc_33[%offsetkv_y#9] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #blocked>
       %offsetkv_y_41 = ttg.convert_layout %acc_37 {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked1>

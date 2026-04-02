@@ -40,6 +40,29 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
                         AsyncTaskId asyncTaskId);
 
+/// Check if any result of `op` is transitively needed by an operation
+/// with the given asyncTaskId. This handles the case where an op doesn't
+/// have the target asyncTaskId but produces values consumed (directly or
+/// through a chain of ops) by ops that do.
+static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId) {
+  SmallVector<Operation *> worklist;
+  DenseSet<Operation *> visited;
+  worklist.push_back(op);
+  visited.insert(op);
+  while (!worklist.empty()) {
+    Operation *curr = worklist.pop_back_val();
+    for (auto result : curr->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        if (hasAsyncTaskId(user, asyncTaskId))
+          return true;
+        if (visited.insert(user).second)
+          worklist.push_back(user);
+      }
+    }
+  }
+  return false;
+}
+
 unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
                       unsigned requestedRegisters) {
   assert(asyncTaskId != 0 && "producer group should not request registers");
@@ -346,8 +369,14 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   auto taskIds = getAsyncTaskIds(op);
   // yieldOp are sometimes implict, meaning they do not necessarily have a task
   // id, but they should be shared by all async tasks.
-  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op))
-    return nullptr;
+  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op)) {
+    // Before skipping, check if any result is transitively needed by an op
+    // with the target asyncTaskId. This handles ops (e.g. MemDescIndexOp)
+    // that weren't assigned the right task IDs but produce values consumed
+    // by ops in this partition.
+    if (!isNeededByTask(op, asyncTaskId))
+      return nullptr;
+  }
 
   if (op->getNumRegions() == 0) {
     Operation *newOp = builder.clone(*op, mapping);
@@ -711,8 +740,17 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
         });
       }
     }
-    if (hasUse)
+    if (hasUse) {
       logOpStillHasUsers(op);
+      // The op has been cloned into partition regions but still has users
+      // outside the WS regions (e.g. a MemDescIndexOp at the function level
+      // that wasn't given asyncTaskIds). Keep the op alive by removing its
+      // async_task_id so it stays at the function level as a shared value.
+      op->removeAttr("async_task_id");
+      if (op->hasAttr(ttg::kPartitionAttrName))
+        op->removeAttr(ttg::kPartitionAttrName);
+      continue;
+    }
 
     op->erase();
   }

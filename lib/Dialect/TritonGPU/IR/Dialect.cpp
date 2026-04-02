@@ -3799,8 +3799,11 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
     }
   }
 
-  // Verify that op partitions include partitions of all child ops
-  if (attr.getName() == kPartitionAttrName && op->getNumRegions() != 0) {
+  // Verify that op partitions include partitions of all child ops.
+  // Skip for ReduceOp and MapElementwiseOp whose regions contain function-like
+  // bodies where individual ops don't need partition annotations.
+  if (attr.getName() == kPartitionAttrName && op->getNumRegions() != 0 &&
+      !isa<triton::ReduceOp, triton::MapElementwiseOp>(op)) {
     SetVector<int> expectedIds;
     for (auto &region : op->getRegions()) {
       for (auto &block : region.getBlocks()) {

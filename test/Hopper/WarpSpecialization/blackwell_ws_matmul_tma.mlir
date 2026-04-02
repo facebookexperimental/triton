@@ -154,7 +154,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %accumulator_40 = ttg.memdesc_trans %accumulator_39 {loop.cluster = 0 : i32, loop.stage = 2 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared6, #smem4> -> !ttg.memdesc<128x128xf16, #shared7, #smem4>
         %accumulator_41 = ttng.tc_gen5_mma %a_38, %accumulator_40, %accumulator[%accumulator_37], %arg21, %true {loop.cluster = 0 : i32, loop.stage = 2 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared6, #smem4>, !ttg.memdesc<128x128xf16, #shared7, #smem4>, !ttg.memdesc<128x128xf32, #tmem4, #ttng.tensor_memory, mutable>
         scf.yield %true, %accumulator_41 : i1, !ttg.async.token
-      } {tt.scheduled_max_stage = 2 : i32, ttg.partition = array<i32: 4>}
+      } {tt.scheduled_max_stage = 2 : i32}
       // Epilogue: compute next tile coordinates
       %tile_id_c_23 = arith.addi %tile_id_c_16, %c148_i32 : i32
       %group_id_24 = arith.divsi %tile_id_c_23, %num_pid_in_group : i32

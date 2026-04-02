@@ -480,6 +480,8 @@ class CompiledKernel:
         from collections import namedtuple
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
         metadata = json.loads(metadata_path.read_text())
+        if metadata.get('ctas_per_cga') is not None:
+            metadata['ctas_per_cga'] = tuple(metadata['ctas_per_cga'])
         if metadata.get('preferred_ctas_per_cga') is not None:
             metadata['preferred_ctas_per_cga'] = tuple(metadata['preferred_ctas_per_cga'])
         # JSON serialization dumps the target as a dict. Restore it to a GPUTarget.
