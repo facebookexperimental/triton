@@ -1053,8 +1053,9 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_dq"].block_shape = [BLOCK_M1, DQ_REDUCE_NCOL]
-    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // 2]
-    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // 2]
+    DKV_STORE_NCOL = nargs["DKV_STORE_NCOL"]
+    nargs["desc_dv"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
+    nargs["desc_dk"].block_shape = [BLOCK_N1, DKV_STORE_NCOL]
     nargs["desc_m"].block_shape = [BLOCK_M1]
     nargs["desc_delta"].block_shape = [BLOCK_M1]
 
@@ -1064,24 +1065,23 @@ configs_bwd_tlx = [
         {
             "BLOCK_M1": bm1,
             "BLOCK_N1": 128,
-            "BLOCK_M2": 128,
-            "BLOCK_N2": 128,
             "NUM_BUFFERS_KV": 1,
             "NUM_BUFFERS_Q": 2,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "EPILOGUE_SUBTILE": 4 if bm1 == 128 else 2,
+            "DKV_STORE_NCOL": 64,
             "NUM_COMPUTE_SLICES": 2,
+            "NUM_COMPUTE_WARPS": nw,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": True,
         },
-        num_warps=8,
+        num_warps=nw,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64, 128]
+    ) for bm1 in [64, 128] for nw in [8]
 ]
 
 
@@ -1115,6 +1115,7 @@ def _bwd_compute_inner_loop(
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     NUM_COMPUTE_SLICES: tl.constexpr,
+    NUM_COMPUTE_WARPS: tl.constexpr,
     STAGE: tl.constexpr,
     REUSE_DP_FOR_DQ: tl.constexpr,
     M_STAGE: tl.constexpr,
@@ -1155,7 +1156,7 @@ def _bwd_compute_inner_loop(
         # before any warp writes P (which aliases S) below.
         # bar.sync (named_barrier_wait) = atomic arrive-and-wait.
         # 8 compute warps × 32 threads = 256.
-        tlx.named_barrier_wait(15, 256)
+        tlx.named_barrier_wait(15, NUM_COMPUTE_WARPS * 32)
 
         # --- Phase 2: Store P to TMEM. ---
         ppT = pT.to(do_out_dtype)
@@ -1204,8 +1205,6 @@ def _attn_bwd_ws(
     N_CTX,  #
     BLOCK_M1: tl.constexpr,  #
     BLOCK_N1: tl.constexpr,  #
-    BLOCK_M2: tl.constexpr,  #
-    BLOCK_N2: tl.constexpr,  #
     BLK_SLICE_FACTOR: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
     NUM_BUFFERS_KV: tl.constexpr,
@@ -1213,10 +1212,11 @@ def _attn_bwd_ws(
     NUM_BUFFERS_DO: tl.constexpr,
     NUM_BUFFERS_DS: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
-    EPILOGUE_SUBTILE: tl.constexpr,
     NUM_COMPUTE_SLICES: tl.constexpr,
+    NUM_COMPUTE_WARPS: tl.constexpr,
     DQ_REDUCE_STAGES: tl.constexpr,
     DQ_REDUCE_NCOL: tl.constexpr,
+    DKV_STORE_NCOL: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
@@ -1262,15 +1262,10 @@ def _attn_bwd_ws(
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
-    # SMEM staging buffers for dKV epilogue TMA stores.
-    # Use HEAD_DIM // 2 = 64 columns (= 128 bytes for bf16), matching the
-    # swizzle-128 minimum width.  NUM_BUFFERS_KV stages so stage[i] aliases
-    # the corresponding tiles[i].
     # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
     #   the dpT dot — precedes dv_fulls).
     # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
     #   so the compute task must wait on k_mma_done before writing sdk).
-    DKV_STORE_NCOL: tl.constexpr = HEAD_DIM // 2
     sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
     sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
 
@@ -1358,7 +1353,7 @@ def _attn_bwd_ws(
         dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
     # dQ uses the same storage alias group as dP/dS — all three share
-    # the same TMEM slot (like FA4: dP/dS/dQ at columns 256-384).
+    # the same TMEM slot.
     # Lifecycle within one block: dpT → dsT → dq (sequential, no overlap).
     if REUSE_DP_FOR_DQ:
         dq_tiles = tlx.local_alloc(
@@ -1450,6 +1445,7 @@ def _attn_bwd_ws(
                         BLOCK_M1,
                         BLOCK_N1,
                         NUM_COMPUTE_SLICES,
+                        NUM_COMPUTE_WARPS=NUM_COMPUTE_WARPS,
                         STAGE=4 - STAGE,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
@@ -1485,6 +1481,7 @@ def _attn_bwd_ws(
                         BLOCK_M1,
                         BLOCK_N1,
                         NUM_COMPUTE_SLICES,
+                        NUM_COMPUTE_WARPS=NUM_COMPUTE_WARPS,
                         STAGE=2,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
