@@ -44,6 +44,7 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
+void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -251,6 +252,14 @@ public:
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                       "doLoopSchedule\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doTMAStoreWaitReorder(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doTMAStoreWaitReorder\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }
