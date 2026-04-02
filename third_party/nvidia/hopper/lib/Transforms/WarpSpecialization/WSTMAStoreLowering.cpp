@@ -92,13 +92,13 @@ struct NVGPUWSTMAStoreLoweringPass
 
 // ---------------------------------------------------------------------------
 
-nnotate TMA store waits with can_rotate_by_buffer_count
+// Annotate TMA store waits with can_rotate_by_buffer_count
 // ---------------------------------------------------------------------------
 #define GEN_PASS_DEF_NVGPUANNOTATETMASTOREWAITS
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
-    static constexpr const char *kCanRotateByBufferCount =
-        "can_rotate_by_buffer_count";
+static constexpr const char *kCanRotateByBufferCount =
+    "can_rotate_by_buffer_count";
 
 // Trace the token back to the defining AsyncTMACopyLocalToGlobalOp, handling
 // both direct definitions and loop-carried block arguments.
@@ -270,6 +270,7 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       ++it;
 
       Operation *insertionTarget = nullptr;
+      int targetStage = 0;
 
       // Find the first AsyncTMACopyLocalToGlobalOp to the same buffer at or
       // after the K-th wrap. This is where the buffer slot gets reused.
@@ -282,6 +283,7 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op);
         if (copyOp && isSameBaseBuffer(copyOp.getSrc(), buffer)) {
           insertionTarget = op;
+          targetStage = stageAtOp;
           break;
         }
       }
@@ -297,13 +299,6 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
             break;
           }
         }
-
-        // Use the insertion target's actual stage from the existing schedule.
-        // This avoids increasing the pipeline depth — the wait is simply
-        // reordered before the next store to the same buffer within the
-        // current schedule, rather than being placed at a future stage that
-        // would force the pipeliner to create deeper prologue/epilogue.
-        int targetStage = schedule[insertionTarget].first;
 
         // Split the cluster at the insertion target: ops before it remain
         // in the original cluster, the target and subsequent ops stay in
