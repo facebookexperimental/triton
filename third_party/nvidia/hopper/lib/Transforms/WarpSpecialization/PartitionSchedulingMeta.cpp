@@ -1425,16 +1425,29 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     // Pre-assign exclusive DataPartition ops to per-dpId computation
     // partitions.
     auto dpOps = categorizer.getOpsInCategory(OpCategory::DataPartition);
+
+    // Collect which dpIds actually have ops.
+    DenseSet<unsigned> usedDpIds;
+    for (const auto &catOp : dpOps)
+      usedDpIds.insert(catOp.dataPartitionId);
+
+    // Pre-create computation partitions in reverse dpId order to match
+    // the original partition creation order.
+    SmallVector<unsigned> sortedDpIds(usedDpIds.begin(), usedDpIds.end());
+    llvm::sort(sortedDpIds, std::greater<unsigned>());
+    for (unsigned dpId : sortedDpIds) {
+      dpIdToPartition[dpId] = schedule.addPartition(0);
+      dpIdToPartition[dpId]->setType("computation");
+    }
+
     for (const auto &catOp : dpOps) {
       unsigned dpId = catOp.dataPartitionId;
-      Partition *&part = dpIdToPartition[dpId];
-      if (!part) {
-        part = schedule.addPartition(0);
-        part->setType("computation");
+      auto it = dpIdToPartition.find(dpId);
+      if (it != dpIdToPartition.end()) {
+        tryScheduleOp(it->second, catOp.op);
+        if (catOp.parentMMA)
+          mmaToPreassignedPartition[catOp.parentMMA] = it->second;
       }
-      tryScheduleOp(part, catOp.op);
-      if (catOp.parentMMA)
-        mmaToPreassignedPartition[catOp.parentMMA] = part;
     }
     // Pre-assign shared ops (ops appearing in multiple MMA backward slices,
     // e.g., scf.if for masking) to the default partition. Without this,
@@ -1546,12 +1559,9 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   }
 
   // Assign remaining unscheduled inner-loop ops using their dpId.
-  // Only applied when there's no default partition (Hopper with all merges).
-  // For FA/flex (which have a correction/default partition), unscheduled ops
-  // are handled by propagatePartitions, which assigns them consistently
-  // with the downstream WSCodePartition pass's channel assumptions.
-  if (dataPartitionFactor > 1 && !dpIdToPartition.empty() &&
-      !defaultPartition) {
+  // Only assign to computation partitions that already exist in
+  // dpIdToPartition (don't create new ones).
+  if (dataPartitionFactor > 1 && !dpIdToPartition.empty()) {
     scf::ForOp innermostLoop = loops[0];
     for (Operation &op : innermostLoop.getOps()) {
       if (hasPartition(&op))
