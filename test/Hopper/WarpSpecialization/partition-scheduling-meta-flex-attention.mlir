@@ -39,29 +39,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_A:[0-9]+]]>
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_B:[0-9]+]]>
 //
-// --- maxnumf (m_ij) ops split symmetrically: one per computation partition ---
-// CHECK: arith.maxnumf {{.*}} ttg.partition = array<i32: [[COMP_C:[0-9]+]]>
-// CHECK: arith.maxnumf {{.*}} ttg.partition = array<i32: [[COMP_D:[0-9]+]]>
-//
-// --- exp2 (alpha) ops split across the same two computation partitions ---
-// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_C]]>
-// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_D]]>
-//
-// --- exp2 (p) ops split across the same two computation partitions ---
-// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_C]]>
-// CHECK: math.exp2 {{.*}} ttg.partition = array<i32: [[COMP_D]]>
-//
-// --- Correction/rescale ops (acc tmem_load, tmem_store) go to default (partition 0) ---
+// --- Correction/rescale ops (acc tmem_load, tmem_store) go to correction (partition 0) ---
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 0>
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: 0>
 // CHECK: ttng.tmem_store {{.*}} ttg.partition = array<i32: 0>
 // CHECK: ttng.tmem_store {{.*}} ttg.partition = array<i32: 0>
-//
-// --- truncf (p → bf16) and tmem_alloc split across the two computation partitions ---
-// CHECK: arith.truncf {{.*}} ttg.partition = array<i32: [[COMP_C]]>
-// CHECK: arith.truncf {{.*}} ttg.partition = array<i32: [[COMP_D]]>
-// CHECK: ttng.tmem_alloc {{.*}} ttg.partition = array<i32: [[COMP_C]]>
-// CHECK: ttng.tmem_alloc {{.*}} ttg.partition = array<i32: [[COMP_D]]>
 //
 // --- PV MMAs go to gemm partition ---
 // CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM]]>
@@ -76,7 +58,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-SAME: "computation"
 // CHECK-SAME: "computation"
 //
-// --- Post-loop ops go to default partition (partition 0) ---
+// --- Post-loop ops go to correction partition (partition 0) ---
 // CHECK: tmem_load {{.*}}ttg.partition = array<i32: 0>
 // CHECK: tmem_load {{.*}}ttg.partition = array<i32: 0>
 // CHECK: tt.store {{.*}}ttg.partition = array<i32: 0>

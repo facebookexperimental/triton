@@ -1545,6 +1545,29 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
+  // Assign remaining unscheduled inner-loop ops using their dpId.
+  // After Phase 5, some ops may still be unscheduled (e.g., l_ij reduce,
+  // tmem_alloc p, l_i*alpha, l_i+l_ij). These ops have dpIds from the
+  // opToDpId map but aren't reached by scheduleUsers because they're
+  // downstream of correction ops (already scheduled in Phase 4) via use
+  // chains that scheduleUsers skips. Assign them to their dpId's
+  // computation partition.
+  if (dataPartitionFactor > 1 && !dpIdToPartition.empty()) {
+    scf::ForOp innermostLoop = loops[0];
+    for (Operation &op : innermostLoop.getOps()) {
+      if (hasPartition(&op))
+        continue;
+      if (isa<arith::ConstantOp>(op))
+        continue;
+      unsigned dpId = categorizer.getDpId(&op);
+      if (dpId != SHARED_DPID) {
+        auto it = dpIdToPartition.find(dpId);
+        if (it != dpIdToPartition.end())
+          tryScheduleOp(it->second, &op);
+      }
+    }
+  }
+
   // When epilogue is merged into computation, post-loop ops should be
   // assigned to the computation partition (not the default partition).
   // For bwd (dpFactor<=1), sharedComputePartition is the single computation
