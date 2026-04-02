@@ -181,9 +181,11 @@ void init_triton_tlx_ir(py::module &&m) {
                return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
                    context, shape, order, CTALayout, elemType, fp4Padded));
              } else {
+               // For 1D tensors, transposed is meaningless — set to false so
+               // that isTMACompatibleEncoding accepts the encoding.
+               bool transposed = order.size() > 1 ? (order[0] == 0) : false;
                return mlir::cast<Attribute>(ttg::NVMMASharedEncodingAttr::get(
-                   context, /*swizzlingByteWidth=*/0,
-                   /*transposed=*/order[0] == 0,
+                   context, /*swizzlingByteWidth=*/0, transposed,
                    elemType.getIntOrFloatBitWidth(), fp4Padded, CTALayout));
              }
            })
