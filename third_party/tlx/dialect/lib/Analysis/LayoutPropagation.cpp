@@ -87,8 +87,9 @@ void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
     if (auto warpSpecializePartitionsOp =
             op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
       auto warpSpecializeOp = warpSpecializePartitionsOp.getParentOp();
-      auto blockArgumentLattice = getLatticeElement(
-          warpSpecializeOp.getPartitionOp().getExplicitCaptures()[arg.getArgNumber()]);
+      auto blockArgumentLattice =
+          getLatticeElement(warpSpecializeOp.getPartitionOp()
+                                .getExplicitCaptures()[arg.getArgNumber()]);
       ChangeResult changed = blockArgumentLattice->meet(resultEncoding);
       propagateIfChanged(blockArgumentLattice, changed);
       // Propagate to all the partition regions
@@ -118,18 +119,38 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     auto resultLattice = results[0];
     LayoutEncoding resultLayoutEncoding = resultLattice->getValue();
     if (!resultLayoutEncoding.isUninitialized()) {
-      if (auto mmaEncoding = dyn_cast<ttg::NVMMASharedEncodingAttr>(
-              resultLattice->getValue().getLayoutEncoding())) {
-        SmallVector<unsigned, 4> newOrder;
-        llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
-                        [](int32_t x) { return static_cast<unsigned>(x); });
-        auto newMmaEncoding = ttg::NVMMASharedEncodingAttr::get(
+      Attribute resultEnc = resultLattice->getValue().getLayoutEncoding();
+      SmallVector<unsigned, 4> newOrder;
+      llvm::transform(memDescTransOp.getOrder(), std::back_inserter(newOrder),
+                      [](int32_t x) { return static_cast<unsigned>(x); });
+      Attribute srcEncoding;
+      if (auto mmaEncoding =
+              dyn_cast<ttg::NVMMASharedEncodingAttr>(resultEnc)) {
+        srcEncoding = ttg::NVMMASharedEncodingAttr::get(
             mmaEncoding.getContext(),
             memDescTransOp.getSrc().getType().getShape(), newOrder,
             mmaEncoding.getCGALayout(),
             memDescTransOp.getSrc().getType().getElementType(),
             mmaEncoding.getFp4Padded());
-        const auto updatedResultLayoutEncoding = LayoutEncoding(newMmaEncoding);
+      } else if (auto swizzledEncoding =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(resultEnc)) {
+        // Compute inverse permutation and apply it to the encoding order.
+        auto transOrder = memDescTransOp.getOrder();
+        unsigned rank = transOrder.size();
+        SmallVector<unsigned> invOrder(rank);
+        for (unsigned i = 0; i < rank; ++i)
+          invOrder[transOrder[i]] = i;
+        auto encOrder = swizzledEncoding.getOrder();
+        SmallVector<unsigned> permutedOrder(rank);
+        for (unsigned i = 0; i < rank; ++i)
+          permutedOrder[i] = invOrder[encOrder[i]];
+        srcEncoding = ttg::SwizzledSharedEncodingAttr::get(
+            swizzledEncoding.getContext(), swizzledEncoding.getVec(),
+            swizzledEncoding.getPerPhase(), swizzledEncoding.getMaxPhase(),
+            permutedOrder, swizzledEncoding.getCGALayout());
+      }
+      if (srcEncoding) {
+        const auto updatedResultLayoutEncoding = LayoutEncoding(srcEncoding);
         auto operandLattice = operands[0];
         ChangeResult changed =
             operandLattice->meet(updatedResultLayoutEncoding);
@@ -204,7 +225,8 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
       auto ctx = srcType.getContext();
 
       // Build unswizzled NVMMASharedEncodingAttr with default CTA layout
-      auto ctaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, srcType.getRank());
+      auto ctaLayout =
+          ttg::CGAEncodingAttr::get1CTALayout(ctx, srcType.getRank());
       auto unswizzledEncoding = ttg::NVMMASharedEncodingAttr::get(
           ctx,
           /*swizzlingByteWidth=*/0,
@@ -253,7 +275,6 @@ void LayoutBackwardPropagation::visitCallOperand(OpOperand &operand) {
 void LayoutBackwardPropagation::setToExitState(LayoutEncodingLattice *lattice) {
 }
 
-
 //===----------------------------------------------------------------------===//
 // LayoutForwardPropagation
 //===----------------------------------------------------------------------===//
@@ -283,7 +304,8 @@ LogicalResult LayoutForwardPropagation::visitOperation(
             operandLayoutEncoding.getLayoutEncoding());
         auto newEncoding = ttng::TensorMemoryEncodingAttr::get(
             op->getContext(), dstEncoding.getBlockM(), dstEncoding.getBlockN(),
-            encoding.getColStride(), encoding.getCGALayout(), encoding.getTwoCTAs());
+            encoding.getColStride(), encoding.getCGALayout(),
+            encoding.getTwoCTAs());
         operandLayoutEncoding = LayoutEncoding(newEncoding);
       }
     }
@@ -349,6 +371,4 @@ LogicalResult LayoutForwardPropagation::visitRegion(Operation *op) {
 void LayoutForwardPropagation::setToEntryState(LayoutEncodingLattice *lattice) {
 }
 
-
 } // namespace mlir::triton::tlx
-
