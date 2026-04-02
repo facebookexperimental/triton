@@ -26,7 +26,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- Partition types: default + gemm + load + epilogue + two computation ---
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types =
-// CHECK-SAME: "default"
+// CHECK-SAME: "correction"
 // CHECK-SAME: "gemm"
 // CHECK-SAME: "load"
 // CHECK-SAME: "epilogue"

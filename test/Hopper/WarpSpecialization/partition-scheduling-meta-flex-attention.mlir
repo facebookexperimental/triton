@@ -67,10 +67,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM]]>
 // CHECK: ttng.tc_gen5_mma {{.*}} ttg.partition = array<i32: [[GEMM]]>
 //
-// --- Partition types: default + gemm + load + two computation partitions ---
+// --- Partition types: correction + gemm + load + two computation partitions ---
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types =
-// CHECK-SAME: "default"
+// CHECK-SAME: "correction"
 // CHECK-SAME: "gemm"
 // CHECK-SAME: "load"
 // CHECK-SAME: "computation"

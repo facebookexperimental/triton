@@ -16,7 +16,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @data_partitioned_gemm_uses_gemm_template
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue"]
+// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"]
 tt.func public @data_partitioned_gemm_uses_gemm_template(
   %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
   %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
