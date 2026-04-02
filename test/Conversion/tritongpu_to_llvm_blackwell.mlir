@@ -386,14 +386,17 @@ tt.func public @tmem_copy_2d_slice(%src: !ttg.memdesc<128x32xi8, #shared2, #ttg.
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttng.two-ctas" = true} {
 
 tt.func public @tmem_copy_2d_2cta(%src: !ttg.memdesc<128x32xi8, #shared, #ttg.shared_memory>,
-                             %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>,
-		                         %barrier: !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory>) {
+                             %dst: !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>) {
+  %c0_i32 = arith.constant 0 : i32
+  %bar_alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  %barrier = ttg.memdesc_index %bar_alloc[%c0_i32] : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
+  ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
   // CHECK: %[[CTAID:.+]] = nvg.cluster_id
   // CHECK: %[[TWO:.+]] = llvm.mlir.constant(2 : i32) : i32
   // CHECK: llvm.urem %[[CTAID]], %[[TWO]]
   // CHECK-COUNT-8: tcgen05.cp.cta_group::2.warpx4.32x128b
   // CHECK: tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
-  ttng.tmem_copy %src, %dst, %barrier : !ttg.memdesc<128x32xi8, #shared, #ttg.shared_memory>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory>
+  ttng.tmem_copy %src, %dst, %barrier : !ttg.memdesc<128x32xi8, #shared, #ttg.shared_memory>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
   tt.return
 }
 

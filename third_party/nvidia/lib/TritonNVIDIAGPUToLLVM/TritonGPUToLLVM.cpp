@@ -303,6 +303,93 @@ private:
     return success();
   }
 
+  // Return the operand or result Value of a given op if the Value is used for
+  // cross CTA mbarrier arrival. This function assumes the kernel has cluster
+  // size larger than 1.
+  std::optional<SetVector<Value>> getRemoteBarrier(Operation *op) {
+    if (auto mapaOp = llvm::dyn_cast<ttng::MapToRemoteBufferOp>(op)) {
+      // plain cross CTA mbarrier arrive and cross CTA DSMEM store/copy need
+      // mapa to map mbarrier addr explicitly
+      llvm::SetVector<Value> bars;
+      bars.insert(mapaOp.getResult());
+      return bars;
+    } else if (auto tmaLoadOp =
+                   llvm::dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+      // If it's a TMA load with multicast, the mbar signal is multicasted too
+      if (tmaLoadOp.getMulticastTargets()) {
+        llvm::SetVector<Value> bars;
+        bars.insert(tmaLoadOp.getBarrier());
+        return bars;
+      }
+    } else if (auto asyncCLCTryCancelOp =
+                   llvm::dyn_cast<ttng::AsyncCLCTryCancelOp>(op)) {
+      // If it's AsyncCLCTryCancelOp, the signal will be broadcasted to other
+      // CTAs only when .multicast::cluster::all is specified, which is true now
+      // no matter what cluster size is. Since we're assuming cluster size > 1,
+      // we should consider the barrier here as remote barrier.
+      llvm::SetVector<Value> bars;
+      bars.insert(asyncCLCTryCancelOp.getMbarAlloc());
+      return bars;
+    } else if (auto tcgen5CommitOp = llvm::dyn_cast<ttng::TCGen5CommitOp>(op)) {
+      // As of now, there're only three sources to have a tcgen05.commit
+      // instruction:
+      // 1. Front end supplied a TCGen5CommitOp directly
+      // 2. When lowering gen5 TMEMCopy to llvm, compiler inserts inline ptx
+      // 3. When lowering gen5 MMA to llvm, compiler inserts inline ptx
+      // And the eventual tcgen05.commit has .multicast::cluster to broadcast
+      // mbar signals to multiple CTAs only under 2cta mode.
+      // https://github.com/facebookexperimental/triton/blob/70d488dc45ca7e75432b0352cb9dd07b602a82cf/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv5.cpp#L327
+      // Although it's valid
+      // to have .multicast::cluster for 1cta mode too, there's currently no
+      // support for it.
+
+      // Cases 1 and 2 will read module attribute for 2cta mode, case 3 will
+      // read module attr or op arg for 2cta mode, which are equivalent since
+      // all tcgen05 ops have to be consistent with module attr on this.
+
+      // Case 1: explicit TCGen5CommitOp from front end or earlier passes
+      if (tcgen5CommitOp.getTwoCtas()) {
+        llvm::SetVector<Value> bars;
+        bars.insert(tcgen5CommitOp.getBarrier());
+        return bars;
+      }
+    } else if (auto tmemCopyOp = llvm::dyn_cast<ttng::TMEMCopyOp>(op)) {
+      // case 2 for gen5 commit: a commit inline ptx is generated for a tmem cp
+      // op if it has a barrier arg. If the mod is in 2cta mode, the commit op
+      // can multicast bar signals.
+      if (auto bar = tmemCopyOp.getBarrier()) {
+        if (tlx::tlxEnablePairedMMA(op)) {
+          llvm::SetVector<Value> bars;
+          bars.insert(bar);
+          return bars;
+        }
+      }
+    } else if (llvm::isa<ttng::MMAv5OpInterface>(op)) {
+      // case 3 for gen5 commit: a commit inline ptx will be generated for each
+      // barrier on the gen5 MMA op. If the mod is in 2cta mode, the commit op
+      // can multicast bar signals.
+      if (tlx::tlxEnablePairedMMA(op)) {
+        llvm::SetVector<Value> bars;
+        // TODO: move getBarriers() into MMAv5OpInterface to simplify this
+        if (auto mma = llvm::dyn_cast<ttng::TCGen5MMAOp>(op)) {
+          for (auto bar : mma.getBarriers()) {
+            bars.insert(bar);
+          }
+        } else {
+          // "assert" it's a scaled MMA op so that we crash explicitly if new
+          // MMAv5OpInterface is added
+          auto scaledMMA = llvm::cast<ttng::TCGen5MMAScaledOp>(op);
+          for (auto bar : scaledMMA.getBarriers()) {
+            bars.insert(bar);
+          }
+        }
+        return bars;
+      }
+    }
+
+    return std::nullopt;
+  }
+
   // If the kernel is clustered, insert cluster sync properly to
   // bootstrap remote bars
   LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
@@ -310,24 +397,29 @@ private:
       return success();
     }
 
-    bool hasMapaOp = false;
+    bool hasRemoteBar = false;
     SetVector<Operation *> barAllocOps;
-    // Find all bar alloc op in the back slice of mapa ops
-    mod.walk([&](ttng::MapToRemoteBufferOp mapaOp) {
-      hasMapaOp = true;
+    // Find all bar alloc op in the back slice of a remote bar
+    mod.walk([&](Operation *op) {
       SetVector<Operation *> ops;
-      getBackwardSliceWithWS(mapaOp.getResult(), &ops);
+      auto remoteBar = getRemoteBarrier(op);
+      if (remoteBar.has_value()) {
+        hasRemoteBar = true;
+        for (auto bar : remoteBar.value()) {
+          getBackwardSliceWithWS(bar, &ops);
 
-      for (auto op : ops) {
-        if (isa<ttg::LocalAllocOp>(op)) {
-          barAllocOps.insert(op);
+          for (auto opInSlice : ops) {
+            if (isa<ttg::LocalAllocOp>(opInSlice)) {
+              barAllocOps.insert(opInSlice);
+            }
+          }
         }
       }
     });
 
-    // If there's no mapa, it's not possible to access remote barrier so
+    // If there's no remote barrier,
     // skipping
-    if (!hasMapaOp) {
+    if (!hasRemoteBar) {
       return success();
     }
 
