@@ -257,12 +257,9 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       if (!schedule.count(tmaStore))
         continue;
 
-      Value buffer = tmaStore.getSrc();
-
-      // Walk the linearized schedule from the TMA store, advancing K wraps.
-      // Each wrap represents one full iteration of the loop, so the K-th wrap
-      // is where the buffer slot will be reused. The wait must be placed
-      // before that point.
+      // Walk the linearized schedule from the TMA store, counting K
+      // AsyncTMACopyLocalToGlobalOp ops. The wait must be placed before
+      // the K-th copy to ensure the buffer slot is not overwritten.
       auto it = schedule.linearized(forOp, tmaStore);
       it.setMaxStages(schedule.getNumStages() + k);
 
@@ -271,20 +268,19 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
 
       Operation *insertionTarget = nullptr;
       int targetStage = 0;
+      int copyCount = 0;
 
-      // Find the first AsyncTMACopyLocalToGlobalOp to the same buffer at or
-      // after the K-th wrap. This is where the buffer slot gets reused.
       while (!it.isEnd()) {
         Operation *op = *it;
         int stageAtOp = it.currStage();
         ++it;
-        if (stageAtOp < k)
-          continue;
-        auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op);
-        if (copyOp && isSameBaseBuffer(copyOp.getSrc(), buffer)) {
-          insertionTarget = op;
-          targetStage = stageAtOp;
-          break;
+        if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+          ++copyCount;
+          if (copyCount == k) {
+            insertionTarget = op;
+            targetStage = stageAtOp;
+            break;
+          }
         }
       }
 
