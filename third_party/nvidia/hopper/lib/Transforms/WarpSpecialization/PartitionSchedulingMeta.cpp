@@ -1561,14 +1561,65 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // Assign remaining unscheduled inner-loop ops using their dpId.
   // Only assign to computation partitions that already exist in
   // dpIdToPartition (don't create new ones).
+  // For ops not in opToDpId (e.g., l_i update chain: l_i*alpha, l_i+l_ij),
+  // trace through operands to find the dpId from an operand that IS in
+  // opToDpId.
   if (dataPartitionFactor > 1 && !dpIdToPartition.empty()) {
+    // Helper to find dpId by tracing operands.
+    auto findDpIdFromOperands = [&](Operation *op) -> unsigned {
+      unsigned dpId = categorizer.getDpId(op);
+      if (dpId != 0 && dpId != SHARED_DPID)
+        return dpId;
+      // Trace through operands to find a non-zero dpId.
+      SmallVector<Operation *> worklist;
+      DenseSet<Operation *> visited;
+      for (Value operand : op->getOperands()) {
+        if (auto *defOp = operand.getDefiningOp())
+          worklist.push_back(defOp);
+      }
+      while (!worklist.empty()) {
+        Operation *curr = worklist.pop_back_val();
+        if (!visited.insert(curr).second)
+          continue;
+        unsigned currDpId = categorizer.getDpId(curr);
+        if (currDpId != 0 && currDpId != SHARED_DPID)
+          return currDpId;
+        // Also check if the op has a partition assignment that maps to
+        // a computation partition.
+        if (auto ids = getPartitionIds(curr)) {
+          for (int id : *ids) {
+            Partition *p = schedule.getPartition(id);
+            if (p && p->getType() == "computation") {
+              // Find which dpId maps to this partition.
+              for (auto &[did, part] : dpIdToPartition) {
+                if (part == p)
+                  return did;
+              }
+            }
+          }
+        }
+        for (Value operand : curr->getOperands()) {
+          if (auto *defOp = operand.getDefiningOp())
+            worklist.push_back(defOp);
+        }
+      }
+      return dpId; // fallback to original (may be 0)
+    };
+
     scf::ForOp innermostLoop = loops[0];
     for (Operation &op : innermostLoop.getOps()) {
       if (hasPartition(&op))
         continue;
-      if (isa<arith::ConstantOp>(op))
+      if (isa<arith::ConstantOp, scf::YieldOp>(&op))
         continue;
-      unsigned dpId = categorizer.getDpId(&op);
+      // Skip loop counter increment ops (scalar integer arithmetic that
+      // feeds the yield). These are loop-control ops, not data-partition
+      // computation ops.
+      if (op.getNumResults() == 1 &&
+          op.getResult(0).getType().isIntOrIndex() &&
+          !isa<RankedTensorType>(op.getResult(0).getType()))
+        continue;
+      unsigned dpId = findDpIdFromOperands(&op);
       if (dpId != SHARED_DPID) {
         auto it = dpIdToPartition.find(dpId);
         if (it != dpIdToPartition.end())
