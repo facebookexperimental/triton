@@ -123,12 +123,19 @@ getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
   return nullptr;
 }
 
-// For a TMAStoreTokenWaitOp, return the SMEM memdesc that the corresponding
-// TMA store reads from (i.e., the src operand of AsyncTMACopyLocalToGlobalOp).
-static Value getTMAStoreBuffer(ttng::TMAStoreTokenWaitOp waitOp) {
-  if (auto tmaStore = getDefiningTMAStore(waitOp))
-    return tmaStore.getSrc();
-  return nullptr;
+// Trace through memdesc_index ops to find the base memdesc value.
+// This handles the post-partition case where multi-buffered allocs are
+// accessed via memdesc_index of a block argument.
+static Value getBaseMemDesc(Value v) {
+  while (auto indexOp = v.getDefiningOp<ttg::MemDescIndexOp>())
+    v = indexOp.getSrc();
+  return v;
+}
+
+// Check if two buffer values refer to the same underlying memdesc,
+// looking through memdesc_index/subview ops.
+static bool isSameBaseBuffer(Value a, Value b) {
+  return getBaseMemDesc(a) == getBaseMemDesc(b);
 }
 
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
@@ -235,10 +242,6 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
 
     bool changed = false;
     for (auto waitOp : waits) {
-      Value buffer = getTMAStoreBuffer(waitOp);
-      if (!buffer)
-        continue;
-
       auto attr = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
       if (!attr)
         continue;
@@ -253,40 +256,53 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       if (!schedule.count(tmaStore))
         continue;
 
-      // Walk the linearized schedule from the TMA store, counting local_store
-      // ops to the same buffer. Stop at the K-th one. Increase maxStages so
-      // the iterator can traverse enough wraps to find all K writes.
+      Value buffer = tmaStore.getSrc();
+
+      // Walk the linearized schedule from the TMA store, advancing K wraps.
+      // Each wrap represents one full iteration of the loop, so the K-th wrap
+      // is where the buffer slot will be reused. The wait must be placed
+      // before that point.
       auto it = schedule.linearized(forOp, tmaStore);
       it.setMaxStages(schedule.getNumStages() + k);
-      int count = 0;
-      Operation *kthWrite = nullptr;
-      int targetStage = 0;
+
+      // Skip past the starting TMA store itself.
+      ++it;
+
+      Operation *insertionTarget = nullptr;
+
+      // Find the first AsyncTMACopyLocalToGlobalOp to the same buffer at or
+      // after the K-th wrap. This is where the buffer slot gets reused.
       while (!it.isEnd()) {
         Operation *op = *it;
         int stageAtOp = it.currStage();
         ++it;
-        auto storeOp = dyn_cast<ttg::LocalStoreOp>(op);
-        if (storeOp && storeOp.getDst() == buffer) {
-          if (++count == k) {
-            kthWrite = op;
-            targetStage = stageAtOp;
-            break;
-          }
+        if (stageAtOp < k)
+          continue;
+        auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op);
+        if (copyOp && isSameBaseBuffer(copyOp.getSrc(), buffer)) {
+          insertionTarget = op;
+          break;
         }
       }
 
-      if (kthWrite) {
-        // Look for an existing TMAStoreTokenWaitOp before kthWrite in the
-        // same block that is also in the schedule. If found, insert before
-        // that wait instead of before the store directly.
-        Operation *insertionTarget = kthWrite;
-        for (auto it = Block::reverse_iterator(kthWrite->getIterator());
-             it != kthWrite->getBlock()->rend(); ++it) {
-          if (isa<ttng::WaitBarrierOp>(&*it) && schedule.count(&*it)) {
-            insertionTarget = &*it;
+      if (insertionTarget) {
+        // Look for a WaitBarrierOp before the insertion target in the same
+        // block. If found, insert before the barrier wait instead.
+        for (auto revIt =
+                 Block::reverse_iterator(insertionTarget->getIterator());
+             revIt != insertionTarget->getBlock()->rend(); ++revIt) {
+          if (isa<ttng::WaitBarrierOp>(&*revIt) && schedule.count(&*revIt)) {
+            insertionTarget = &*revIt;
             break;
           }
         }
+
+        // Use the insertion target's actual stage from the existing schedule.
+        // This avoids increasing the pipeline depth — the wait is simply
+        // reordered before the next store to the same buffer within the
+        // current schedule, rather than being placed at a future stage that
+        // would force the pipeliner to create deeper prologue/epilogue.
+        int targetStage = schedule[insertionTarget].first;
 
         // Split the cluster at the insertion target: ops before it remain
         // in the original cluster, the target and subsequent ops stay in
@@ -297,7 +313,7 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         auto waitCluster = schedule.clusters.newBefore(targetCluster);
         schedule.insert(waitOp, targetStage, waitCluster);
       } else {
-        // K-th write not found; leave the schedule unchanged for this wait.
+        // Target not found; leave the schedule unchanged for this wait.
         continue;
       }
 

@@ -225,18 +225,18 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    doCodePartitionPost(funcOp, numStages);
-    if (dumpIntermediateSteps) {
-      llvm::dbgs()
-          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
-
     doValidateTMAStoreAnnotations(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
                       "doValidateTMAStoreAnnotations\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doCodePartitionPost(funcOp, numStages);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs()
+          << "// -----// WarpSpec internal IR Dump After: doCodePartition\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }

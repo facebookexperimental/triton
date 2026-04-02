@@ -3,17 +3,16 @@
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-// Single-buffered (K=1). local_store and tma_copy at stage 0, wait starts at
-// stage 0. The iterator wraps once from tma_copy back to local_store, so
-// currStage = 1. The wait is placed at stage 1 in a new cluster before the
-// local_store's (split) cluster.
+// Single-buffered (K=1). The iterator wraps once from the tma_copy back to
+// find the same tma_copy. The wait is reordered before the tma_copy at the
+// tma_copy's actual stage (0), without increasing the pipeline depth.
 // CHECK-LABEL: single_buffer_k1
 // CHECK: scf.for
-// CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_store {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 0 : i32}
   tt.func public @single_buffer_k1(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -34,17 +33,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-// Double-buffered (K=2). local_store at stage 0, tma_copy + wait at stage 1.
-// The iterator wraps twice from tma_copy (stage 1) to find the 2nd
-// local_store, so currStage = 3. The wait is placed at stage 3 in a new
-// cluster before the local_store's (split) cluster.
+// Double-buffered (K=2). The tma_copy is at stage 1. The iterator wraps once
+// back to find the same tma_copy. The wait is reordered before the tma_copy
+// at the tma_copy's actual stage (1), without increasing the pipeline depth.
 // CHECK-LABEL: double_buffer_k2
 // CHECK: scf.for
-// CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_store {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 3 : i32}
+// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 1 : i32}
   tt.func public @double_buffer_k2(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -90,15 +88,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // No SWP schedule on the loop → pass creates a basic schedule and still
-// reorders. The wait gets placed before the 1st local_store (wrapping around),
-// so currStage = 1.
+// reorders. The wait is placed before the tma_copy at its actual stage (0).
 // CHECK-LABEL: no_schedule_creates_basic
 // CHECK: scf.for
-// CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_store {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 0 : i32}
   tt.func public @no_schedule_creates_basic(
       %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
       %src: tensor<128x64xf16>,
@@ -110,6 +107,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %tok {"can_rotate_by_buffer_count" = 1 : i32} : !ttg.async.token
     }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Cross-partition case: after code partitioning the local_store ops are in a
+// different partition. The loop body only has memdesc_index + tma_copy + wait.
+// The reorder still works because it matches on AsyncTMACopyLocalToGlobalOp
+// (not local_store) and uses isSameBaseBuffer to trace through memdesc_index.
+// CHECK-LABEL: cross_partition_memdesc_index
+// CHECK: scf.for
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK-NOT: can_rotate_by_buffer_count
+// CHECK-SAME: {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+  tt.func public @cross_partition_memdesc_index(
+      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %multibuf: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
+      %lb: index, %ub: index, %step: index) {
+    %c0 = arith.constant 0 : i32
+    scf.for %iv = %lb to %ub step %step {
+      %slot = ttg.memdesc_index %multibuf[%c0] {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %slot {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok {"can_rotate_by_buffer_count" = 1 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !ttg.async.token
+    } {"tt.scheduled_max_stage" = 1 : i32}
     tt.return
   }
 }
