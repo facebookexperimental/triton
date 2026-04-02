@@ -1074,7 +1074,7 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_TMEM": 1,
             "EPILOGUE_SUBTILE": 4 if bm1 == 128 else 2,
             "NUM_COMPUTE_SLICES": 2,
-            "DQ_REDUCE_STAGES": 2,
+            "DQ_REDUCE_STAGES": 1 if bm1 == 128 else 2,
             "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": uwb,
@@ -1082,7 +1082,7 @@ configs_bwd_tlx = [
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64, 128] for uwb in [False, True]
+    ) for bm1 in [128] for uwb in [True]
 ]
 
 
@@ -1138,10 +1138,6 @@ def _bwd_compute_inner_loop(
 
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
-        # Load M and D from SMEM, then split into per-slice sub-tensors.
-        m_slices = _split_n(tlx.local_load(sM_tiles[m_buf_id]).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
-        Di_slices = _split_n(tlx.local_load(sD_tiles[d_buf_id]).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
-
         # Process each M1 slice to reduce peak register pressure.
         # Only one qkT slice is live at a time. Storing ppT (f16) to
         # p_tiles (which aliases qk_tiles via reuse) is safe because
@@ -1149,8 +1145,8 @@ def _bwd_compute_inner_loop(
         # cannot corrupt f32 data at slice N+1.
         for slice_id in tl.static_range(NUM_COMPUTE_SLICES):
             offs_m = curr_m + slice_id * SLICE_M + tl.arange(0, SLICE_M)
-            m = tl.reshape(m_slices[slice_id], [SLICE_M])
-            Di = tl.reshape(Di_slices[slice_id], [SLICE_M])
+            # Load only the needed slice from SMEM to reduce register pressure.
+            m = tlx.local_load(tlx.local_slice(sM_tiles[m_buf_id], [slice_id * SLICE_M], [SLICE_M]))
 
             qkT = tlx.local_load(tlx.local_slice(
                 qk_tiles[tmem_buf_id],
@@ -1192,6 +1188,8 @@ def _bwd_compute_inner_loop(
                 [0, slice_id * SLICE_M],
                 [BLOCK_N1, SLICE_M],
             ))
+            # Load Di late so it can reuse m's registers (m is dead after exp2).
+            Di = tlx.local_load(tlx.local_slice(sD_tiles[d_buf_id], [slice_id * SLICE_M], [SLICE_M]))
             dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
             dsT = dsT.to(q_out_dtype)
             # Store dsT to SMEM (for dq dot, which needs transposed view).
