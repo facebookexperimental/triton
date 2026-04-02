@@ -1314,9 +1314,9 @@ def _attn_bwd_ws(
     sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
 
     # allocate barriers for smem buffers
-    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
+    # k_empties gates K SMEM reuse: signaled after last dq dot reads K in epilog.
     k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
@@ -1641,8 +1641,8 @@ def _attn_bwd_ws(
                 )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
-                tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
-                tlx.barrier_wait(v_fulls[kv_buf_id], kv_phase)
+                # K readiness guaranteed by q_fulls (bundled in prologue).
+                # V readiness guaranteed by do_fulls (bundled in prologue).
 
                 # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
                 tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
@@ -1837,23 +1837,22 @@ def _attn_bwd_ws(
                     STAGE,
                 )
                 start_block_n = start_n * BLOCK_N1
-                # Load K
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
+
+                # Load K+Q bundled on q_fulls (prologue: first m_block includes K)
+                curr_m = start_m
+                step_m = BLOCK_M1
+                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                 tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM)
+                tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
+                tlx.barrier_expect_bytes(
+                    q_fulls[q_buf_id], K_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_k,
                     k_tiles[kv_buf_id],
                     [(off_bh + start_block_n).to(tl.int32), 0],
-                    k_fulls[kv_buf_id],
+                    q_fulls[q_buf_id],
                 )
-
-                # Load Q
-                curr_m = start_m
-                step_m = BLOCK_M1
-                q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
-                tlx.barrier_expect_bytes(q_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_q,
                     q_tiles[q_buf_id],
@@ -1871,20 +1870,18 @@ def _attn_bwd_ws(
                     m_fulls[m_buf_id],
                 )
 
-                # Note: No need for v_empties because k is finished after v.
-                # Load V
-                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM)
+                # Load V+dO bundled on do_fulls (prologue: first m_block includes V)
+                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
+                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
+                tlx.barrier_expect_bytes(
+                    do_fulls[do_buf_id],
+                    V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM + DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_v,
                     v_tiles[kv_buf_id],
                     [(off_bh + start_block_n).to(tl.int32), 0],
-                    v_fulls[kv_buf_id],
+                    do_fulls[do_buf_id],
                 )
-
-                # Load dO
-                do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-                tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
-                tlx.barrier_expect_bytes(do_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
                 tlx.async_descriptor_load(
                     desc_do,
                     do_tiles[do_buf_id],
