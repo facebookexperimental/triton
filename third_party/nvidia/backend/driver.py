@@ -352,15 +352,18 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       ++num_attrs;
     }}
 
-    // preferred cluster dimension requires cluster dimension to also be set
     if (launch_cluster !=0 || num_ctas != 1 || preferredClusterDimX > 0) {{
-      CUlaunchAttribute clusterAttr = {{}};
-      clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-      clusterAttr.value.clusterDim.x = num_ctas;
-      clusterAttr.value.clusterDim.y = 1;
-      clusterAttr.value.clusterDim.z = 1;
-      launchAttr[num_attrs] = clusterAttr;
-      ++num_attrs;
+      // Only set CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for Triton's num_ctas path.
+      // For ctas_per_cga path (num_ctas == 1), PTX's .reqnctapercluster handles it.
+      if (num_ctas > 1) {{
+        CUlaunchAttribute clusterAttr = {{}};
+        clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        clusterAttr.value.clusterDim.x = num_ctas;
+        clusterAttr.value.clusterDim.y = 1;
+        clusterAttr.value.clusterDim.z = 1;
+        launchAttr[num_attrs] = clusterAttr;
+        ++num_attrs;
+      }}
 
       CUlaunchAttribute clusterSchedulingAttr = {{}};
       clusterSchedulingAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;

@@ -387,9 +387,6 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             num_warps,
             num_ctas,
             shared_memory,
-            clusterDimX,
-            clusterDimY,
-            clusterDimZ,
             _preferredClusterDimX,
             _preferredClusterDimY,
             _preferredClusterDimZ,
@@ -433,14 +430,9 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
         launch_attrs = (CUlaunchAttribute * 4)()
         num_attrs = 0
 
-        actual_gridX = gridX
+        actual_gridX = gridX * num_ctas
         actual_gridY = gridY
         actual_gridZ = gridZ
-
-        if num_ctas != 1:
-            actual_gridX *= clusterDimX
-            actual_gridY *= clusterDimY
-            actual_gridZ *= clusterDimZ
 
         if launch_pdl:
             launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION)
@@ -453,11 +445,14 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             num_attrs += 1
 
         if launch_cluster or num_ctas != 1:
-            launch_attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
-            launch_attrs[num_attrs].value.clusterDim.x = clusterDimX
-            launch_attrs[num_attrs].value.clusterDim.y = clusterDimY
-            launch_attrs[num_attrs].value.clusterDim.z = clusterDimZ
-            num_attrs += 1
+            # Only set CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for Triton's num_ctas path.
+            # For ctas_per_cga path (num_ctas == 1), PTX's .reqnctapercluster handles it.
+            if num_ctas > 1:
+                launch_attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                launch_attrs[num_attrs].value.clusterDim.x = num_ctas
+                launch_attrs[num_attrs].value.clusterDim.y = 1
+                launch_attrs[num_attrs].value.clusterDim.z = 1
+                num_attrs += 1
 
             launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE)
             launch_attrs[num_attrs].value.clusterSchedulingPolicyPreference = (CU_CLUSTER_SCHEDULING_POLICY_SPREAD)
