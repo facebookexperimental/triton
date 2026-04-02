@@ -1076,12 +1076,12 @@ configs_bwd_tlx = [
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
-            "USE_WARP_BARRIER": uwb,
+            "USE_WARP_BARRIER": True,
         },
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [128] for uwb in [True]
+    ) for bm1 in [64, 128]
 ]
 
 
