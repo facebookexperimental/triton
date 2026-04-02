@@ -1621,8 +1621,8 @@ void replaceUsesAndPropagateType(
       auto newDstType = ttg::MemDescType::get(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
           oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
-      newVal =
-          builder.create<ttg::MemDescReshapeOp>(reshape.getLoc(), newDstType, val);
+      newVal = builder.create<ttg::MemDescReshapeOp>(reshape.getLoc(),
+                                                     newDstType, val);
     }
     assert(newVal && "unhandled memdesc view");
     newVal.getDefiningOp()->setAttrs(user->getAttrs());
