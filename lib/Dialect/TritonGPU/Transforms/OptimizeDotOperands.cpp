@@ -165,6 +165,13 @@ public:
             getContext(), allocOp.getLoc(), allocType, srcShape, innerTy)))
       return failure();
 
+    // Only apply this optimization when the inferred encoding preserves the
+    // original encoding type (e.g. NVMMAShared). If inference fell back to
+    // SharedLinearEncodingAttr, the resulting 3D allocation can be
+    // significantly larger than the original 2D one, causing OOR errors.
+    if (isa<SharedLinearEncodingAttr>(innerTy.getEncoding()))
+      return failure();
+
     auto newAlloc = rewriter.create<LocalAllocOp>(allocOp.getLoc(), innerTy,
                                                   reshapeOp.getSrc());
     rewriter.replaceOpWithNewOp<MemDescReshapeOp>(allocOp, allocOp.getType(),

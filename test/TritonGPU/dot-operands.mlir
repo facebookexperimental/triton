@@ -276,3 +276,28 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
     tt.return %a: !ttg.memdesc<128x64xf16, #shared, #smem>
   }
 }
+
+// -----
+
+// Verify that ReshapeMemDesc does NOT fire when the reshape changes the
+// innermost dimension (e.g. 128x2x64 -> 128x128, inner dim 64 != 128).
+// Encoding inference falls back to SharedLinearEncodingAttr in this case,
+// and creating a 3D local_alloc with that encoding would bloat SMEM
+// allocation, potentially causing OOR errors.
+#blocked = #ttg.blocked<{sizePerThread = [1, 2, 64], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [1, 0, 2]}>
+#linear = #ttg.linear<{register = [[0, 64], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @reshape_memdesc_inner_dim_change
+  tt.func @reshape_memdesc_inner_dim_change(%arg: tensor<128x2x64xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #shared, #smem> {
+    // The reshape changes the inner dim (64 -> 128), so the pattern must NOT
+    // fire. We should see tt.reshape + local_alloc, NOT local_alloc + memdesc_reshape.
+    // CHECK: tt.reshape
+    // CHECK-NEXT: ttg.local_alloc
+    // CHECK-NOT: ttg.memdesc_reshape
+    %r = tt.reshape %arg : tensor<128x2x64xbf16, #blocked> -> tensor<128x128xbf16, #linear>
+    %a = ttg.local_alloc %r : (tensor<128x128xbf16, #linear>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
+    tt.return %a: !ttg.memdesc<128x128xbf16, #shared, #smem>
+  }
+}
