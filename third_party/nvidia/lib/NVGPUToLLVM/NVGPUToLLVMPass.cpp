@@ -597,7 +597,8 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func) {
     return LLVM::UndefOp::create(rewriter, loc, ptr_ty(ctx, 6));
   }
 
-  bool useTwoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) || tlx::tlxEnablePairedMMA(mod);
+  bool useTwoCTAs = mlir::triton::nvidia_gpu::getModuleTwoCTAs(mod) ||
+                    tlx::tlxEnablePairedMMA(mod);
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));

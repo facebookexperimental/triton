@@ -874,11 +874,10 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self, Value memDesc, Value phase) {
              self.create<ttag::WaitBarrierOp>(memDesc, phase);
            })
-      .def("create_lds_barrier_arrive",
-           [](GluonOpBuilder &self, Value memDesc, int count,
-              int expectedCount) {
-             self.create<ttag::ArriveBarrierOp>(memDesc, count, expectedCount);
-           });
+      .def("create_lds_barrier_arrive", [](GluonOpBuilder &self, Value memDesc,
+                                           int count, int expectedCount) {
+        self.create<ttag::ArriveBarrierOp>(memDesc, count, expectedCount);
+      });
 
   m.def(
       "compute_tmem_reg_layout",

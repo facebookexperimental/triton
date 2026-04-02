@@ -69,8 +69,8 @@ struct ArriveBarrierOpConversion
     // NOTE: The LLVM intrisic expects an i64_ty for count (update value)
     // But count cannot be more than 32bits according to ISA docs.
     LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, "llvm.amdgcn.ds.atomic.barrier.arrive.rtn.b64",
-        i64_ty, {smemObj.getBase(), b.i64_val(count)});
+        rewriter, loc, "llvm.amdgcn.ds.atomic.barrier.arrive.rtn.b64", i64_ty,
+        {smemObj.getBase(), b.i64_val(count)});
     rewriter.eraseOp(op);
     return success();
   }
