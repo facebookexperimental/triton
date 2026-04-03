@@ -633,3 +633,77 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
     )
 
     torch.testing.assert_close(output, ref_out)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for cluster sync")
+def test_explicit_cluster_sync_ws(device):
+    """Test that explicit cluster_barrier() in WS mode sets the
+    tlx.explicit_cluster_sync module attribute and suppresses heuristic
+    cluster sync insertion.  The kernel uses two CTAs in a cluster with
+    warp specialization: the default task does a remote barrier arrive
+    to signal CTA 1, and a partition task waits on the barrier.
+    """
+
+    @triton.jit
+    def explicit_cluster_sync_ws_kernel(
+        x_ptr,
+        y_ptr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+        cta_rank = tlx.cluster_cta_rank()
+
+        # Explicit cluster sync placed by user – compiler must not auto-insert
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                # This has to be inside default task, because at WS entry there'd be task syncs
+                tlx.cluster_barrier()
+
+                # CTA 0 arrives on remote barrier in CTA 1
+                if cta_rank == 0:
+                    tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)
+
+            with tlx.async_task(num_warps=2):
+                # This has to be in async task because trunk path belongs to default task
+                tlx.cluster_barrier()
+                offsets = tl.arange(0, BLOCK_SIZE) + cta_rank * BLOCK_SIZE
+                data = tl.load(x_ptr + offsets)
+                # CTA 1 waits for the remote arrive from CTA 0
+                if cta_rank == 1:
+                    tlx.barrier_wait(bars[0], phase=0)
+                tl.store(y_ptr + offsets, data)
+            with tlx.async_task(num_warps=2):
+                # idle warps also have to participate in cluster wide sync
+                tlx.cluster_barrier()
+
+    BLOCK_SIZE = 128
+    x = torch.arange(BLOCK_SIZE * 2, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+
+    kernel = explicit_cluster_sync_ws_kernel[(2, )](
+        x,
+        y,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        ctas_per_cga=(2, 1, 1),
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    # The Fixup pass should have detected the user cluster_barrier and set this
+    assert "tlx.explicit_cluster_sync = true" in ttgir, (
+        f"Expected tlx.explicit_cluster_sync module attr in TTGIR:\n{ttgir}")
+    # User placed exactly one cluster arrive+wait pair for each task (from cluster_barrier)
+    assert ttgir.count("ttng.cluster_arrive") == 3, (f"Expected exactly 3 cluster_arrive in TTGIR:\n{ttgir}")
+    assert ttgir.count("ttng.cluster_wait") == 3, (f"Expected exactly 3 cluster_wait in TTGIR:\n{ttgir}")
+
+    ptx = kernel.asm["ptx"]
+    # The user's cluster_barrier should produce exactly one
+    # barrier.cluster.arrive.aligned and one barrier.cluster.wait.aligned
+    # No extra heuristic ones should be inserted
+    assert ptx.count("barrier.cluster.arrive.aligned") == 3, (
+        f"Expected exactly 3 barrier.cluster.arrive.aligned in PTX:\n{ptx}")
+    assert ptx.count("barrier.cluster.wait.aligned") == 3, (
+        f"Expected exactly 3 barrier.cluster.wait.aligned in PTX:\n{ptx}")
+
+    # --- Check correctness ---
+    torch.testing.assert_close(y, x)

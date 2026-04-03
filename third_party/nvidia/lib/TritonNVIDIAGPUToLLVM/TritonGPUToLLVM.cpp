@@ -397,6 +397,12 @@ private:
       return success();
     }
 
+    // If the kernel is in explicit(manual) cluster sync mode, users will be
+    // responsible for inserting cluster sync correctly from front end.
+    if (tlx::tlxExplicitClusterSync(mod)) {
+      return success();
+    }
+
     bool hasRemoteBar = false;
     SetVector<Operation *> barAllocOps;
     // Find all bar alloc op in the back slice of a remote bar
