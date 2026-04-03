@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
+// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue separate-epilogue-store" | FileCheck %s
 
 // Tests that flash attention forward (dpFactor=2, with epilogue descriptor
 // stores) gets the correct 6-partition layout:
@@ -101,12 +101,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation", "computation"]
+// CHECK-SAME: ttg.partition.types = ["correction", "gemm", "load", "epilogue_store", "computation", "computation"]
 //
-// --- Post-loop: acc tmem_load → correction partition ---
+// --- Post-loop: acc tmem_load, normalize → correction partition (via mergeEpilogue) ---
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
-// --- Post-loop: normalize acc → correction partition ---
 // CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
@@ -117,9 +116,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[CORR]]>
-// --- Post-loop: descriptor_store → epilogue partition ---
-// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
-// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// --- Post-loop: descriptor_store → epilogue_store partition ---
+// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL_STORE:[0-9]+]]>
+// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
 
 tt.func public @fa_forward_data_partition_split(
   %Q: !tt.ptr<bf16> {tt.divisibility = 16 : i32},

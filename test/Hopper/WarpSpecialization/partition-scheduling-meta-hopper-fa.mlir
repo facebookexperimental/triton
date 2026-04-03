@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-correction merge-epilogue-into-computation" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-correction merge-epilogue" | FileCheck %s
 
 // Tests that Hopper FA forward (dpFactor=2, warp_group_dot, mergeCorrection +
 // mergeEpilogue) gets 3 partitions: load + computation×2.

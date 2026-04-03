@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
+// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue-to-computation" | FileCheck %s
 
 // Tests that the full FA BWD persistent kernel (bwd.part.prior) gets the correct
 // 4-partition layout: reduction + gemm + load + computation.
@@ -13,10 +13,10 @@
 
 // CHECK-LABEL: @_attn_bwd_persist
 //
-// --- Pre-loop: address computation → reduction/computation partitions ---
+// --- Pre-loop: address computation → reduction partition ---
 // CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED:[0-9]+]]>
-// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
-// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]]>
+// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.remsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]]>
@@ -24,17 +24,17 @@
 // CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: tt.addptr {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: tt.addptr {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: tt.addptr {{.*}}ttg.partition = array<i32: [[RED]]>
+// CHECK: tt.addptr {{.*}}ttg.partition = array<i32: [[RED]]>
+// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
 // CHECK: arith.trunci {{.*}}ttg.partition = array<i32: [[COMP]]>
 // --- Pre-loop: K, V descriptor_load → load partition ---
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
-// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[RED]]>
+// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[RED]]>
 // --- Pre-loop: dq tmem_alloc, dk/dv init → reduction partition ---
 // CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[RED]]>
@@ -102,7 +102,7 @@
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: tt.descriptor_reduce {{.*}}ttg.partition = array<i32: [[RED]]>
 //
-// --- Post-loop: dv tmem_load, reshape/split → computation partition ---
+// --- Post-loop: dv tmem_load, reshape/split → computation partition (via mergeEpilogueToComputation) ---
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[COMP]]>
@@ -113,7 +113,7 @@
 // CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.split {{.*}}ttg.partition = array<i32: [[COMP]]>
-// --- Post-loop: dv truncf, convert, descriptor_store (×4) → computation partition ---
+// --- Post-loop: dv truncf, convert, descriptor_store (×4) → computation partition (via mergeEpilogueToComputation) ---
 // CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[COMP]]>
@@ -126,7 +126,7 @@
 // CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[COMP]]>
-// --- Post-loop: dk tmem_load, reshape/split → computation partition ---
+// --- Post-loop: dk tmem_load, reshape/split → computation partition (via mergeEpilogueToComputation) ---
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[COMP]]>
@@ -137,7 +137,7 @@
 // CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: tt.split {{.*}}ttg.partition = array<i32: [[COMP]]>
-// --- Post-loop: dk mulf, truncf, convert, descriptor_store (×4) → computation partition ---
+// --- Post-loop: dk mulf, truncf, convert, descriptor_store (×4) → computation partition (via mergeEpilogueToComputation) ---
 // CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>

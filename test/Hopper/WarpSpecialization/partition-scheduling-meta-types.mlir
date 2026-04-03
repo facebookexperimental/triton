@@ -29,10 +29,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"]
+// CHECK-SAME: ttg.partition.types = ["gemm", "load", "computation"]
 //
-// --- Post-loop: use → default partition ---
-// CHECK: "use"{{.*}}ttg.partition = array<i32: 0>
+// --- Post-loop: use → no partition annotation (unregistered dialect op) ---
 tt.func public @simple_gemm_partition_types(
   %A_shared: !ttg.memdesc<128x64xf16, #shared, #smem>,
   %B_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,

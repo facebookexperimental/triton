@@ -21,9 +21,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @post_loop_tmem_load_not_in_epilogue
 //
-// --- Pre-loop: acc inits → default partition ---
-// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
-// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
+// --- Pre-loop: acc inits → epilogue partition (no default partition) ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[EPIL]]>
 //
 // --- In-loop: loads → load partition ---
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
@@ -41,21 +41,21 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"]
+// CHECK-SAME: ttg.partition.types = ["gemm", "load", "epilogue", "computation"]
 //
-// --- Post-loop: tmem_load → default (NOT epilogue) ---
+// --- Post-loop: tmem_load → epilogue ---
 // CHECK: ttng.tmem_load
-// CHECK-SAME: ttg.partition = array<i32: 0>
-// --- Post-loop: truncf → default (NOT epilogue) ---
+// CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
+// --- Post-loop: truncf → epilogue ---
 // CHECK: arith.truncf
-// CHECK-SAME: ttg.partition = array<i32: 0>
-// --- Post-loop: local_alloc → default ---
-// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
+// CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
+// --- Post-loop: local_alloc → epilogue ---
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // --- Post-loop: TMA store → epilogue partition ---
 // CHECK: ttng.async_tma_copy_local_to_global
-// CHECK-SAME: ttg.partition = array<i32: 3>
+// CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
 // CHECK: ttng.async_tma_store_token_wait
-// CHECK-SAME: ttg.partition = array<i32: 3>
+// CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
 tt.func public @post_loop_tmem_load_not_in_epilogue(
   %A_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
   %B_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,

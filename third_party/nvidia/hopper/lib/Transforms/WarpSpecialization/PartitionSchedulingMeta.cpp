@@ -232,10 +232,11 @@ static std::string prettyOp(Operation *op) {
 
 /// Tuning knobs for partition scheduling.
 struct SchedulingOptions {
-  bool mergeCorrection = false;       // correction → computation[dpId]
-  bool mergeEpilogue = false;         // non-store epilogue ops → see routing
-  bool mergeReduction = false;        // reduction → computation[dpId]
-  bool separateEpilogueStore = false; // descriptor_store → own 1-warp partition
+  bool mergeCorrection = false;
+  bool mergeEpilogue = false;
+  bool mergeEpilogueToComputation = false;
+  bool mergeReduction = false;
+  bool separateEpilogueStore = false;
 };
 
 /// Holds all partition pointers created by createPartitionLayout.
@@ -246,21 +247,19 @@ struct PartitionLayout {
   Partition *loadPartition = nullptr;
   Partition *epiloguePartition = nullptr;
   Partition *epilogueStorePartition = nullptr;
-  Partition *defaultPartition = nullptr; // uncategorized ops
+  Partition *defaultPartition = nullptr; // computed alias
   SmallVector<Partition *, 2> computationPartitions;
 
-  /// Get the partition for post-loop epilogue-like ops (non-store).
-  /// When mergeEpilogue is true, routes to correction or reduction if they
-  /// exist, otherwise to computation (handled by caller with dpId).
-  Partition *getEpilogueTarget() const {
-    if (correctionPartition)
-      return correctionPartition;
-    if (reductionPartition)
-      return reductionPartition;
-    return nullptr; // caller should use computation[dpId]
+  /// Fallback: correction -> reduction -> epilogue -> first computation.
+  Partition *getDefaultPartition() const {
+    if (correctionPartition) return correctionPartition;
+    if (reductionPartition) return reductionPartition;
+    if (epiloguePartition) return epiloguePartition;
+    if (!computationPartitions.empty()) return computationPartitions.back();
+    return nullptr;
   }
 
-  /// Whether this layout has a separate gemm partition (MMAv5 present).
+  /// Get the opToDpId map (for schedulePostLoopOps).
   bool hasGemm() const { return gemmPartition != nullptr; }
 };
 
@@ -329,6 +328,8 @@ public:
     auto it = opToDpId.find(op);
     return it != opToDpId.end() ? it->second : 0;
   }
+
+  const DenseMap<Operation *, unsigned> &getOpToDpIdMap() const { return opToDpId; }
 
   /// Pretty-print all categorized ops grouped by category.
   void printCategorizedOps(llvm::raw_ostream &os) const {
@@ -764,15 +765,6 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
                           << ", hasEpilogue=" << hasEpilogue
                           << ", hasMMAv5=" << hasMMAv5 << "\n");
 
-  // Default/uncategorized partition — create FIRST when it will be the
-  // primary partition (no correction/reduction exists). This ensures
-  // it gets index 0 for GEMM cases where it serves as the default
-  // warp group in tt.warp_specialize.
-  if (!hasCorrection && !hasReduction) {
-    layout.defaultPartition = schedule.addPartition(0);
-    layout.defaultPartition->setType("default");
-  }
-
   // Correction partition: needed when we have correction ops and not merging.
   if (hasCorrection && !options.mergeCorrection) {
     layout.correctionPartition = schedule.addPartition(0);
@@ -796,23 +788,20 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   layout.loadPartition->setType("load");
 
   // Epilogue partition: for non-store epilogue ops when not merging.
-  if (hasEpilogue && !options.mergeEpilogue) {
+  if (hasEpilogue && !options.mergeEpilogue &&
+      !options.mergeEpilogueToComputation) {
     layout.epiloguePartition = schedule.addPartition(0);
     layout.epiloguePartition->setType("epilogue");
   }
 
-  // Epilogue store partition: dedicated 1-warp partition for descriptor stores.
+  // Epilogue store partition: dedicated 1-warp partition for epilogue stores.
   if (options.separateEpilogueStore && hasEpilogue) {
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
   }
 
-  // Set default partition alias when correction or reduction serves as default.
-  if (hasCorrection || hasReduction) {
-    layout.defaultPartition = layout.correctionPartition
-                                  ? layout.correctionPartition
-                                  : layout.reductionPartition;
-  }
+  // Set default partition alias using fallback chain.
+  layout.defaultPartition = layout.getDefaultPartition();
 
   LLVM_DEBUG({
     llvm::dbgs() << "[partition-layout] Created partitions:";
@@ -950,87 +939,116 @@ static Partition *scheduleUsers(scf::ForOp loop, PartitionSet &schedule,
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
 // epilogue, which would force it to use 4 warps (TMEM lane coverage hardware
-// constraint). When no default partition exists (e.g., bwd), all ops fall back
-// to epilogue.
-static void schedulePostLoopOps(scf::ForOp loop, PartitionSet &schedule,
-                                Partition *epiloguePartition) {
-  if (!epiloguePartition)
-    return;
 
-  // Find the default partition for non-store post-loop ops.
-  Partition *defaultPartition = nullptr;
-  for (Partition &p : schedule.getPartitions()) {
-    if (p.getType() == "default") {
-      defaultPartition = &p;
-      break;
+static void schedulePostLoopOps(
+    scf::ForOp loop, PartitionSet &schedule, const PartitionLayout &layout,
+    const SchedulingOptions &options,
+    const DenseMap<Operation *, unsigned> &opToDpId,
+    const DenseMap<unsigned, Partition *> &dpIdToPartition) {
+  auto findDpId = [&](Operation *op) -> unsigned {
+    auto it = opToDpId.find(op);
+    if (it != opToDpId.end())
+      return it->second;
+    for (Value operand : op->getOperands()) {
+      if (auto *defOp = operand.getDefiningOp()) {
+        auto defIt = opToDpId.find(defOp);
+        if (defIt != opToDpId.end())
+          return defIt->second;
+      }
     }
-  }
+    return SHARED_DPID;
+  };
+
+  auto getEpilogueTarget = [&](Operation *op) -> Partition * {
+    if (options.mergeEpilogueToComputation) {
+      unsigned dpId = findDpId(op);
+      if (dpId != SHARED_DPID) {
+        auto it = dpIdToPartition.find(dpId);
+        if (it != dpIdToPartition.end())
+          return it->second;
+      }
+      if (!dpIdToPartition.empty())
+        return dpIdToPartition.begin()->second;
+    }
+    if (options.mergeEpilogue) {
+      if (layout.correctionPartition)
+        return layout.correctionPartition;
+      if (layout.reductionPartition)
+        return layout.reductionPartition;
+      if (!dpIdToPartition.empty())
+        return dpIdToPartition.begin()->second;
+    }
+    if (layout.epiloguePartition)
+      return layout.epiloguePartition;
+    return layout.defaultPartition;
+  };
+
+  auto getStoreTarget = [&](Operation *op) -> Partition * {
+    if (layout.epilogueStorePartition)
+      return layout.epilogueStorePartition;
+    return getEpilogueTarget(op);
+  };
 
   SmallVector<OpOperand *> uses;
-
-  // Collect all uses of the loop's results.
-  for (OpResult result : loop.getResults()) {
+  // For persistent kernels, seed from nested inner loop results.
+  for (auto &op : loop.getOps())
+    if (auto innerLoop = dyn_cast<scf::ForOp>(op))
+      for (OpResult result : innerLoop.getResults())
+        for (OpOperand &use : result.getUses())
+          uses.push_back(&use);
+  for (OpResult result : loop.getResults())
     for (OpOperand &use : result.getUses())
       uses.push_back(&use);
-  }
 
-  // Recursively schedule all post-loop users.
   DenseSet<Operation *> visited;
   while (!uses.empty()) {
     OpOperand *use = uses.pop_back_val();
     Operation *user = use->getOwner();
-
-    // Skip if already visited.
     if (!visited.insert(user).second)
       continue;
+    // Skip ops inside nested inner loops. Ops directly in the ws-loop
+    // body (post-inner-loop) or outside the ws-loop are processed.
+    if (auto parentLoop = user->getParentOfType<scf::ForOp>())
+      if (parentLoop != loop)
+        continue;
 
-    // Only schedule operations that are outside the loop.
-    if (loop->isAncestor(user))
-      continue;
-
-    // Schedule this post-loop operation.
-    if (!hasPartition(user)) {
-      // Check if any operand comes from an op already in the epilogue
-      // partition. This captures transitive users of epilogue stores
-      // (e.g., TMAStoreTokenWaitOp after AsyncTMACopyLocalToGlobalOp).
-      bool hasEpilogueInput = llvm::any_of(user->getOperands(), [&](Value v) {
-        if (auto *defOp = v.getDefiningOp()) {
-          auto ids = getPartitionIds(defOp);
-          return ids && llvm::is_contained(*ids, epiloguePartition->getIndex());
-        }
-        return false;
-      });
-
-      if (isEpilogueStoreOp(user) || hasEpilogueInput) {
-        // Epilogue store ops and users of epilogue-scheduled ops go to the
-        // epilogue partition.
-        tryScheduleOp(epiloguePartition, user);
-      } else if (defaultPartition) {
-        // Non-store post-loop ops (tmem_load, arithmetic) go to the default
-        // partition, keeping the epilogue lightweight.
-        tryScheduleOp(defaultPartition, user);
+    { // Schedule post-loop op (override earlier phase assignments)
+      Partition *target = nullptr;
+      if (isEpilogueStoreOp(user)) {
+        target = getStoreTarget(user);
       } else {
-        // Fallback when no default partition exists (e.g., bwd with
-        // reduction): schedule to epilogue to preserve existing behavior.
-        tryScheduleOp(epiloguePartition, user);
+        bool hasStoreInput = false;
+        if (layout.epilogueStorePartition) {
+          hasStoreInput = llvm::any_of(user->getOperands(), [&](Value v) {
+            if (auto *defOp = v.getDefiningOp()) {
+              auto ids = getPartitionIds(defOp);
+              return ids && llvm::is_contained(
+                                *ids, layout.epilogueStorePartition->getIndex());
+            }
+            return false;
+          });
+        }
+        if (hasStoreInput)
+          target = layout.epilogueStorePartition;
+        else
+          target = getEpilogueTarget(user);
       }
+      if (target)
+        setPartition(user, target);
     }
 
-    // Add all users of this operation to process transitively, even if the
-    // op was already scheduled. This ensures ops reachable only through
-    // already-scheduled ops (e.g. TMAStoreTokenWaitOp reachable through
-    // AsyncTMACopyLocalToGlobalOp) still get visited and scheduled.
     for (OpResult result : user->getResults())
       for (OpOperand &nextUse : result.getUses())
         uses.push_back(&nextUse);
   }
 }
-
-// Result of getInitialSchedule, including the schedule and the epilogue
-// partition pointer (may be null if merged into computation).
+// Result of getInitialSchedule.
 struct ScheduleResult {
   PartitionSet schedule;
-  Partition *epiloguePartition = nullptr;
+  PartitionLayout layout;
+  SchedulingOptions options;
+  DenseMap<Operation *, unsigned> opToDpId;
+  DenseMap<unsigned, Partition *> dpIdToPartition;
   bool createComputePartitions;
 };
 
@@ -1042,9 +1060,10 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // Check for an existing schedule.
   if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
       succeeded(scheduleOr))
-    // Deserialized schedule: epilogue partition is unknown, use null.
-    return ScheduleResult{std::move(*scheduleOr),
-                          /*epiloguePartition=*/nullptr,
+    // Deserialized schedule: layout/options unknown, use defaults.
+    return ScheduleResult{std::move(*scheduleOr), PartitionLayout{}, schedOpts,
+                          DenseMap<Operation *, unsigned>(),
+                          DenseMap<unsigned, Partition *>(),
                           /*createComputePartitions=*/true};
 
   // Collect all loops (nested + main)
@@ -1546,6 +1565,22 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
+  // For dpFactor<=1 (BWD), populate dpIdToPartition so
+  // schedulePostLoopOps can route via mergeEpilogueToComputation.
+  if (dataPartitionFactor <= 1 && dpIdToPartition.empty()) {
+    if (sharedComputePartition) {
+      dpIdToPartition[0] = sharedComputePartition;
+    } else {
+      // Fallback: find any computation partition in the schedule.
+      for (Partition &p : schedule.getPartitions()) {
+        if (p.getType() == "computation") {
+          dpIdToPartition[0] = &p;
+          break;
+        }
+      }
+    }
+  }
+
   // For causal attention with 3 loops, match MMAs in second loop to first
   // loop
   unsigned Idx = 0;
@@ -1627,33 +1662,20 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     }
   }
 
-  // When epilogue is merged into computation, post-loop ops should be
-  // assigned to the computation partition (not the default partition).
-  // For bwd (dpFactor<=1), sharedComputePartition is the single computation
-  // partition. For fwd (dpFactor>1), fall back to defaultPartition since
-  // there are multiple per-group computation partitions.
-  Partition *postLoopPartition = epiloguePartition;
-  if (!postLoopPartition)
-    postLoopPartition = sharedComputePartition;
-  if (!postLoopPartition)
-    postLoopPartition = defaultPartition;
-  // When no default/epilogue/sharedCompute exists (Hopper with all merges),
-  // use the first computation partition as fallback for post-loop ops.
-  if (!postLoopPartition && !dpIdToPartition.empty())
-    postLoopPartition = dpIdToPartition.begin()->second;
+  // Pre-schedule post-loop ops before propagatePartitions claims them.
+  schedulePostLoopOps(mainLoop, schedule, layout, schedOpts,
+                      categorizer.getOpToDpIdMap(), dpIdToPartition);
 
-  // Determine whether computation partitions should be created by
-  // propagatePartitions. For simple GEMM (no data partitioning, no
-  // correction), computation partitions are not needed. Also disable when
-  // all categories are merged (Hopper with mergeCorrection+mergeEpilogue)
-  // since computation partitions are already pre-created from DataPartition
-  // ops and we don't want propagatePartitions creating extra ones.
+  // Update defaultPartition after computation partitions are created.
+  layout.defaultPartition = layout.getDefaultPartition();
+
   bool createComputePartitions =
       (layout.correctionPartition != nullptr ||
        layout.reductionPartition != nullptr || dataPartitionFactor > 1) &&
-      defaultPartition != nullptr;
+      layout.defaultPartition != nullptr;
 
-  return ScheduleResult{std::move(schedule), postLoopPartition,
+  return ScheduleResult{std::move(schedule), layout, schedOpts,
+                        categorizer.getOpToDpIdMap(), std::move(dpIdToPartition),
                         createComputePartitions};
 }
 
@@ -2193,25 +2215,20 @@ void PartitionSchedulingMeta::runOnOperation() {
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     // Build SchedulingOptions from pass options and per-loop attributes.
     SchedulingOptions schedOpts;
-    schedOpts.mergeEpilogue = mergeEpilogueIntoComputation;
+    schedOpts.mergeEpilogue = mergeEpilogue;
+    schedOpts.mergeEpilogueToComputation = mergeEpilogueToComputation;
     schedOpts.mergeCorrection = mergeCorrection;
     schedOpts.mergeReduction = mergeReduction;
     schedOpts.separateEpilogueStore = separateEpilogueStore;
 
-    // Check for per-loop tt.merge_epilogue attribute, overriding pass option.
+    // Per-loop tt.merge_epilogue attribute overrides mergeEpilogueToComputation.
     if (auto attr = loop->getAttrOfType<BoolAttr>("tt.merge_epilogue"))
-      schedOpts.mergeEpilogue = attr.getValue();
+      schedOpts.mergeEpilogueToComputation = attr.getValue();
 
     if (std::optional<ScheduleResult> result =
             getInitialSchedule(loop, schedOpts)) {
       PartitionSet &schedule = result->schedule;
       propagatePartitions(loop, schedule, result->createComputePartitions);
-
-      // Schedule post-loop operations into the epilogue partition after
-      // propagatePartitions completes. When mergeEpilogueIntoComputation is
-      // true, epiloguePartition is null and post-loop ops are handled by
-      // propagation instead.
-      schedulePostLoopOps(loop, schedule, result->epiloguePartition);
 
       optimizeSchedule(loop, schedule);
 
