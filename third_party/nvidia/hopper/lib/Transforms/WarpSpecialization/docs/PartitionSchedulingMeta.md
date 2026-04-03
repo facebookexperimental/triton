@@ -17,7 +17,7 @@ Phase 1: Categorize operations         (OpCategorizer + collectMMABackwardSlices
 Phase 2: Create partition layout       (createPartitionLayout with tuning knobs)
 Phase 3: Schedule anchor ops           (loads, epilogue stores, MMAs)
 Phase 4: Propagate users               (load users, correction, reductions)
-Phase 5: Create computation partitions (per-MMA user scheduling)
+Phase 5: Create computation partitions (per-MMA user scheduling + dpId assignment)
 Post:    propagatePartitions + schedulePostLoopOps + optimizeSchedule
          + splitDataPartitionedIfOps
 ```
@@ -34,6 +34,8 @@ in `Passes.td`:
 | `mergeReduction` | `--merge-reduction` | false | Reduction ops → computation[dpId] |
 | `separateEpilogueStore` | `--separate-epilogue-store` | false | DescriptorStore → own 1-warp partition |
 
+Per-loop `tt.merge_epilogue` attribute overrides the `mergeEpilogue` pass option.
+
 **`mergeEpilogue` routing**: When true, non-store epilogue ops go to the
 correction partition (if it exists), else the reduction partition, else
 computation[dpId].
@@ -43,8 +45,8 @@ computation[dpId].
 | Case | Knobs | Partitions |
 |------|-------|------------|
 | Blackwell FA fwd | default | correction, gemm, load, epilogue, comp×2 |
+| Blackwell FA bwd | default (merge_epilogue=true) | reduction, gemm, load, computation |
 | Blackwell flex fwd | default (no epilogue) | correction, gemm, load, comp×2 |
-| Blackwell FA bwd | default | reduction, gemm, load, epilogue, comp |
 | Hopper FA fwd | mergeCorrection + mergeEpilogue | load, comp×2 |
 | Simple GEMM | default | default, gemm, load, epilogue |
 
@@ -118,6 +120,8 @@ which auto-resolves the dpId when not explicitly provided.
    non-shared, non-constant op count. This becomes `dataPartitionFactor`.
 
 For FA forward with `data_partition_factor=2`, this yields `dpFactor=2`.
+For FA backward, MMAs are data-dependent (QK feeds PV via the same accumulator),
+so all MMAs group together → `dpFactor=1`.
 
 ## Phase 2: Partition Layout (`createPartitionLayout`)
 
@@ -140,7 +144,8 @@ created gets index 0, which becomes the "default" warp group in
 5. **Load** — always.
 6. **Epilogue** — when `!mergeEpilogue && hasEpilogue`.
 7. **Epilogue store** — when `separateEpilogueStore && hasEpilogue`. Gets 1 warp.
-8. **Computation** — created dynamically in Phase 5 per data partition.
+8. **Computation** — pre-created in Phase 5 per data partition (reverse dpId
+   order for consistent partition index assignment).
 
 When correction or reduction exists, it serves as the default partition (shared
 ops, load users route there). When merged (`mergeCorrection=true`), no
@@ -161,19 +166,38 @@ correction partition is created and those ops go to computation[dpId].
 ### Phase 4: Propagate Users
 
 1. **Load users** → default/correction partition.
-2. **Correction ops** → correction partition (+ `scheduleUsers` for transitive users).
+2. **Correction ops** → correction partition (+ `scheduleUsers` for transitive
+   users).
 3. **TMA reduction ops** → reduction partition (+ backward slice producers).
 
 ### Phase 5: Computation Partitions
 
-Pre-assigns `DataPartition`-categorized ops to per-dpId computation partitions,
-then iterates over MMAs:
+Pre-creates computation partitions for each dpId that has `DataPartition`-
+categorized ops (in reverse dpId order to match legacy partition index ordering).
+Then iterates over MMAs:
 
 - **Pre-assigned MMAs** (PV MMAs): Use the pre-assigned computation partition.
-- **Non-pre-assigned MMAs** (QK MMAs): Look up dpId from `opToDpId` to find the
-  correct existing computation partition. This prevents creating extra partitions.
+- **Non-pre-assigned MMAs** (QK MMAs): First check user partitions, then look up
+  dpId from `opToDpId` to find the correct existing computation partition. This
+  prevents creating extra partitions.
 - **Non-MMAv5** (Hopper): MMA ops themselves are scheduled into the computation
   partition (not gemm, since no gemm partition exists).
+
+### dpId-Based Inner-Loop Assignment
+
+After Phase 5, some inner-loop ops may remain unscheduled (e.g., `l_ij` reduce,
+`tmem_alloc` p, `l_i*alpha`, `l_i+l_ij`). These ops have dpIds but aren't
+reached by `scheduleUsers` because they're downstream of correction ops
+(already scheduled in Phase 4) whose use chains `scheduleUsers` skips.
+
+For each unscheduled inner-loop op with a tensor result:
+1. Look up dpId from `opToDpId`.
+2. If no entry, **trace through operands** to find the dpId from an operand
+   that IS in `opToDpId` or already assigned to a computation partition.
+3. Assign to the corresponding `dpIdToPartition` computation partition.
+
+Scalar integer ops (loop counters) and `scf.yield` are excluded from this
+assignment since they are loop-control ops, not data-partition computation ops.
 
 ## Post-Processing
 
@@ -181,14 +205,20 @@ then iterates over MMAs:
 
 Handles unscheduled ops by forming clusters and assigning them based on their
 def-use relationships to already-scheduled partitions. When
-`createComputePartitions=false` (Hopper with all merges), unscheduled clusters
-merge into existing computation partitions instead of creating new ones.
+`createComputePartitions=false` (Hopper with all merges, or no default
+partition), unscheduled clusters merge into existing default or computation
+partitions instead of creating new ones.
 
 ### `schedulePostLoopOps`
 
 Schedules post-loop operations. Epilogue store ops go to the epilogue partition.
-Non-store post-loop ops go to the default partition. When no default or epilogue
-exists (Hopper with all merges), falls back to the first computation partition.
+Non-store post-loop ops go to the default partition.
+
+The `postLoopPartition` fallback order is:
+1. `epiloguePartition` (when it exists)
+2. `sharedComputePartition` (BWD with `merge_epilogue=true`, dpFactor=1)
+3. `defaultPartition` (correction/reduction)
+4. First `dpIdToPartition` entry (Hopper with all merges, last resort)
 
 ### `optimizeSchedule`
 
@@ -208,8 +238,16 @@ partition 0: correction  — correction ops, load users (shared computation)
 partition 1: gemm        — MMA operations + mem desc views
 partition 2: load        — TMA loads + associated allocs
 partition 3: epilogue    — descriptor stores (+ post-loop ops)
-partition 4: computation — MMA user group 0
-partition 5: computation — MMA user group 1
+partition 4: computation — MMA user group 1 (PV_1 chain)
+partition 5: computation — MMA user group 0 (PV_0 chain)
+```
+
+For FA backward with `dpFactor=1`, `merge_epilogue=true` (Blackwell):
+```
+partition 0: reduction   — TMA reduction ops, pre-loop tmem_stores
+partition 1: gemm        — MMA operations + mem desc views
+partition 2: load        — TMA loads + associated allocs
+partition 3: computation — all MMA users (single shared partition)
 ```
 
 For flex attention forward with `dpFactor=2` (Blackwell):
