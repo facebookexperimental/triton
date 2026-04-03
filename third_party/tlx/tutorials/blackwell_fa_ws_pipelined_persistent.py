@@ -1072,16 +1072,15 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_TMEM": 1,
             "DKV_STORE_NCOL": 64,
             "NUM_COMPUTE_SLICES": 2,
-            "NUM_COMPUTE_WARPS": nw,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": True,
         },
-        num_warps=nw,
+        num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64, 128] for nw in [8]
+    ) for bm1 in [64, 128]
 ]
 
 
@@ -1115,7 +1114,6 @@ def _bwd_compute_inner_loop(
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     NUM_COMPUTE_SLICES: tl.constexpr,
-    NUM_COMPUTE_WARPS: tl.constexpr,
     STAGE: tl.constexpr,
     REUSE_DP_FOR_DQ: tl.constexpr,
     M_STAGE: tl.constexpr,
@@ -1137,11 +1135,10 @@ def _bwd_compute_inner_loop(
 
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
-        # --- Phase 1: Read S from TMEM and compute pT. ---
-        # S and P alias the same TMEM (p_tiles reuse=qk_tiles), so all
-        # compute warps must finish reading S before any warp writes P.
-        # Load the full tile at once (no slicing) to keep pT in registers
-        # across the barrier.
+        # Read S from TMEM and compute pT.
+        # S and P alias the same TMEM (p_tiles reuse=qk_tiles).  The
+        # Triton compiler inserts the necessary sync between the S read
+        # and P write automatically.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tlx.local_load(sM_tiles[m_buf_id])
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
@@ -1152,13 +1149,7 @@ def _bwd_compute_inner_loop(
             mask = offs_m[None, :] >= offs_n[:, None]
             pT = tl.where(mask, pT, 0.0)
 
-        # Compute sync: ensure all warps finished reading S from TMEM
-        # before any warp writes P (which aliases S) below.
-        # bar.sync (named_barrier_wait) = atomic arrive-and-wait.
-        # 8 compute warps × 32 threads = 256.
-        tlx.named_barrier_wait(15, NUM_COMPUTE_WARPS * 32)
-
-        # --- Phase 2: Store P to TMEM. ---
+        # Store P to TMEM. ---
         ppT = pT.to(do_out_dtype)
         tlx.local_store(p_tiles[tmem_buf_id], ppT)
         tlx.barrier_arrive(p_fulls[tmem_buf_id])
@@ -1213,7 +1204,6 @@ def _attn_bwd_ws(
     NUM_BUFFERS_DS: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
     NUM_COMPUTE_SLICES: tl.constexpr,
-    NUM_COMPUTE_WARPS: tl.constexpr,
     DQ_REDUCE_STAGES: tl.constexpr,
     DQ_REDUCE_NCOL: tl.constexpr,
     DKV_STORE_NCOL: tl.constexpr,
@@ -1445,7 +1435,6 @@ def _attn_bwd_ws(
                         BLOCK_M1,
                         BLOCK_N1,
                         NUM_COMPUTE_SLICES,
-                        NUM_COMPUTE_WARPS=NUM_COMPUTE_WARPS,
                         STAGE=4 - STAGE,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
@@ -1481,7 +1470,6 @@ def _attn_bwd_ws(
                         BLOCK_M1,
                         BLOCK_N1,
                         NUM_COMPUTE_SLICES,
-                        NUM_COMPUTE_WARPS=NUM_COMPUTE_WARPS,
                         STAGE=2,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
