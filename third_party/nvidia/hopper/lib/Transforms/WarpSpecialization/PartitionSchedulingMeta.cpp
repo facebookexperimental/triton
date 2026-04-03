@@ -1615,8 +1615,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       // Skip loop counter increment ops (scalar integer arithmetic that
       // feeds the yield). These are loop-control ops, not data-partition
       // computation ops.
-      if (op.getNumResults() == 1 &&
-          op.getResult(0).getType().isIntOrIndex() &&
+      if (op.getNumResults() == 1 && op.getResult(0).getType().isIntOrIndex() &&
           !isa<RankedTensorType>(op.getResult(0).getType()))
         continue;
       unsigned dpId = findDpIdFromOperands(&op);
@@ -1638,7 +1637,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     postLoopPartition = sharedComputePartition;
   if (!postLoopPartition)
     postLoopPartition = defaultPartition;
-  // When all partitions are merged (Hopper with mergeCorrection+mergeEpilogue),
+  // When no default/epilogue/sharedCompute exists (Hopper with all merges),
   // use the first computation partition as fallback for post-loop ops.
   if (!postLoopPartition && !dpIdToPartition.empty())
     postLoopPartition = dpIdToPartition.begin()->second;
