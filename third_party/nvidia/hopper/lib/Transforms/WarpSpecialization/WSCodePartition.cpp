@@ -1827,17 +1827,6 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
           isPost);
       buffer = res.first;
       newProducer = res.second;
-    } else if (!isa<RankedTensorType>(srcValue.getType()) &&
-               !isa<ttg::MemDescType>(srcValue.getType())) {
-      // Scalar types (i32, f32, etc.) crossing partition boundaries are
-      // forwarded via registers — no buffer allocation needed. Skip this
-      // channel and let the value be passed directly through the
-      // WarpSpecializeOp's operands.
-      LLVM_DEBUG({
-        LDBG("Skipping buffer creation for scalar channel ["
-             << channel->uniqID << "] — register forwarding");
-      });
-      continue;
     } else {
       llvm_unreachable("Unexpected result type");
     }
