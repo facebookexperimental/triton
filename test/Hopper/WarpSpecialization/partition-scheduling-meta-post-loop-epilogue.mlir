@@ -20,19 +20,41 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @post_loop_tmem_load_not_in_epilogue
-// Verify UnifiedFA template is selected (has epilogue partition)
-// CHECK: ttg.partition.types = ["default", "gemm", "load", "epilogue",
 //
-// Post-loop tmem_load should be in partition 0 (default), NOT partition 3 (epilogue)
+// --- Pre-loop: acc inits → default partition ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
+//
+// --- In-loop: loads → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- In-loop: memdesc_trans and MMAs → gemm partition ---
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// --- In-loop: correction ops → computation partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[COMP]]>
+//
+// --- Partition types ---
+// CHECK: tt.warp_specialize
+// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"]
+//
+// --- Post-loop: tmem_load → default (NOT epilogue) ---
 // CHECK: ttng.tmem_load
 // CHECK-SAME: ttg.partition = array<i32: 0>
-//
-// Post-loop truncf should be in partition 0 (default), NOT partition 3 (epilogue)
+// --- Post-loop: truncf → default (NOT epilogue) ---
 // CHECK: arith.truncf
 // CHECK-SAME: ttg.partition = array<i32: 0>
-//
-// Post-loop TMA store should be in partition 3 (epilogue)
+// --- Post-loop: local_alloc → default ---
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
+// --- Post-loop: TMA store → epilogue partition ---
 // CHECK: ttng.async_tma_copy_local_to_global
+// CHECK-SAME: ttg.partition = array<i32: 3>
+// CHECK: ttng.async_tma_store_token_wait
 // CHECK-SAME: ttg.partition = array<i32: 3>
 tt.func public @post_loop_tmem_load_not_in_epilogue(
   %A_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,

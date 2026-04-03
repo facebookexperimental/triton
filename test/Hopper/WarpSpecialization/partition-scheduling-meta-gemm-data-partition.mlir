@@ -15,8 +15,40 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @data_partitioned_gemm_uses_gemm_template
+//
+// --- Pre-loop: acc inits → default partition ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
+//
+// --- Inner k-loop: all descriptor_loads and local_allocs → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- Inner k-loop: memdesc_trans and both MMAs → gemm partition ---
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+//
+// --- Epilogue: tmem_load, truncf, local_alloc → default partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: 0>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
+// --- Epilogue: TMA store → epilogue partition ---
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
+// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// --- Second half: tmem_load, truncf, local_alloc → default; TMA store → epilogue ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: 0>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL]]>
+//
+// --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"]
+// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue"]
 tt.func public @data_partitioned_gemm_uses_gemm_template(
   %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
   %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,

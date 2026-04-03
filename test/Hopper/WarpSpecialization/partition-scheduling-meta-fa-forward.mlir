@@ -23,17 +23,101 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @fa_forward_data_partition_split
 //
-// --- Partition types: default + gemm + load + epilogue + two computation ---
-// CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types =
-// CHECK-SAME: "correction"
-// CHECK-SAME: "gemm"
-// CHECK-SAME: "load"
-// CHECK-SAME: "epilogue"
-// CHECK-SAME: "computation"
-// CHECK-SAME: "computation"
+// --- Pre-loop: Q descriptor_loads and local_allocs → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- Pre-loop: acc init → correction partition ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR:[0-9]+]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR]]>
 //
-// --- Post-loop epilogue: descriptor_store → epilogue partition ---
+// --- In-loop: K, V descriptor_loads → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- In-loop: QK MMAs → gemm partition ---
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// --- In-loop: QK tmem_loads → computation partitions ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP0:[0-9]+]]>
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP1:[0-9]+]]>
+// --- In-loop: softmax m_ij reduction → computation partitions ---
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP0]]>
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.maxnumf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.maxnumf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: QK scaling and softmax → computation partitions ---
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: alpha = exp2(m_i - new_m) → computation partitions ---
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: l_ij = sum(p) → computation partitions ---
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP0]]>
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: rescale acc → correction partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR]]>
+// --- In-loop: p → bf16 → tmem → computation partitions ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: PV MMAs → gemm partition ---
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// --- In-loop: l_i update → computation partitions ---
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.addf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.addf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+//
+// --- Partition types ---
+// CHECK: tt.warp_specialize
+// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation", "computation"]
+//
+// --- Post-loop: acc tmem_load → correction partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// --- Post-loop: normalize acc → correction partition ---
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.divf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.divf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[CORR]]>
+// --- Post-loop: descriptor_store → epilogue partition ---
 // CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
 // CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL]]>
 
