@@ -17,6 +17,39 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @persistent_gemm_no_computation_partition
+//
+// --- Pre-loop: acc init → default partition ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 0>
+//
+// --- Inner k-loop: loads → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- Inner k-loop: memdesc_trans and MMA → gemm partition ---
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+//
+// --- Epilogue: tmem_load, reshape, trans, split → default partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: 0>
+// CHECK: tt.reshape {{.*}}ttg.partition = array<i32: 0>
+// CHECK: tt.trans {{.*}}ttg.partition = array<i32: 0>
+// CHECK: tt.split {{.*}}ttg.partition = array<i32: 0>
+// --- Epilogue: truncf, convert_layout, local_alloc → default partition ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
+// --- Epilogue: TMA store → epilogue partition ---
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
+// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// --- Second half: truncf, convert_layout, local_alloc → default; TMA store → epilogue ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
+// CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL]]>
+//
+// --- Partition types ---
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue"]
 tt.func public @persistent_gemm_no_computation_partition(

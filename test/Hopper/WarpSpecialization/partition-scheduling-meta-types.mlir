@@ -14,11 +14,25 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Test: Verify partition types attribute is serialized
-// The partition scheduling pass should add ttg.partition.types attribute to the ForOp
+// Test: Verify partition types attribute is serialized and all tensor ops get partition IDs
 // CHECK-LABEL: @simple_gemm_partition_types
-// CHECK: scf.for
-// CHECK: ttg.partition.types
+//
+// --- In-loop: descriptor_load and local_alloc → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- In-loop: memdesc_trans and MMA → gemm partition ---
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// --- In-loop: tmem_load and addf → computation partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
+// CHECK: arith.addf {{.*}}ttg.partition = array<i32: [[COMP]]>
+//
+// --- Partition types ---
+// CHECK: tt.warp_specialize
+// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"]
+//
+// --- Post-loop: use → default partition ---
+// CHECK: "use"{{.*}}ttg.partition = array<i32: 0>
 tt.func public @simple_gemm_partition_types(
   %A_shared: !ttg.memdesc<128x64xf16, #shared, #smem>,
   %B_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,

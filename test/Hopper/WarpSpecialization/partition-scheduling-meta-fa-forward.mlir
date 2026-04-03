@@ -1,0 +1,324 @@
+// RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
+
+// Tests that flash attention forward (dpFactor=2, with epilogue descriptor
+// stores) gets the correct 6-partition layout:
+//   default (correction), gemm, load, epilogue, computation, computation
+//
+// Key differences from flex attention:
+// - FA uses DescriptorStoreOp for output → creates an epilogue partition
+// - Correction ops (acc rescaling) go to the default partition
+// - No scf.if masking (no IfOp splitting needed)
+// - Global stores (descriptor_store) are post-loop epilogue ops
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+
+// CHECK-LABEL: @fa_forward_data_partition_split
+//
+// --- Pre-loop: Q descriptor_loads and local_allocs → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- Pre-loop: acc init → correction partition ---
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR:[0-9]+]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR]]>
+//
+// --- In-loop: K, V descriptor_loads → load partition ---
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
+// --- In-loop: QK MMAs → gemm partition ---
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// --- In-loop: QK tmem_loads → computation partitions ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP0:[0-9]+]]>
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP1:[0-9]+]]>
+// --- In-loop: softmax m_ij reduction → computation partitions ---
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP0]]>
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.maxnumf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.maxnumf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: QK scaling and softmax → computation partitions ---
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: alpha = exp2(m_i - new_m) → computation partitions ---
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.subf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: math.exp2 {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: l_ij = sum(p) → computation partitions ---
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP0]]>
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: rescale acc → correction partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[CORR]]>
+// --- In-loop: p → bf16 → tmem → computation partitions ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: PV MMAs → gemm partition ---
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
+// --- In-loop: l_i update → computation partitions ---
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.mulf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+// CHECK: arith.addf {{.*}}ttg.partition = array<i32: [[COMP0]]>
+// CHECK: arith.addf {{.*}}ttg.partition = array<i32: [[COMP1]]>
+//
+// --- Partition types ---
+// CHECK: tt.warp_specialize
+// CHECK-SAME: ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation", "computation"]
+//
+// --- Post-loop: acc tmem_load → correction partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
+// --- Post-loop: normalize acc → correction partition ---
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.expand_dims {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: tt.broadcast {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.divf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.divf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[CORR]]>
+// --- Post-loop: descriptor_store → epilogue partition ---
+// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL:[0-9]+]]>
+// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: [[EPIL]]>
+
+tt.func public @fa_forward_data_partition_split(
+  %Q: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+  %K: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+  %V: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+  %Out: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+  %stride_qm: i32 {tt.divisibility = 16 : i32},
+  %stride_kn: i32 {tt.divisibility = 16 : i32},
+  %stride_vn: i32 {tt.divisibility = 16 : i32},
+  %stride_om: i32 {tt.divisibility = 16 : i32},
+  %Q_LEN: i32 {tt.divisibility = 16 : i32},
+  %KV_LEN: i32 {tt.divisibility = 16 : i32},
+  %SM_SCALE: f32
+) {
+  %true = arith.constant true
+  %false = arith.constant false
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %c128_i32 = arith.constant 128 : i32
+  %c1_i64 = arith.constant 1 : i64
+  %cst_neg_inf = arith.constant dense<0xFF800000> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+  %cst_one = arith.constant dense<1.000000e+00> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+  %cst_zero_2d = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+  %cst_scale = arith.constant dense<1.44269502> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+  %cst_scale_2d = arith.constant dense<1.44269502> : tensor<128x128xf32, #blocked>
+  %n_iters = arith.constant 8 : i32
+
+  // Q descriptor and loads for two data partitions
+  %desc_q_stride = arith.extsi %stride_qm : i32 to i64
+  %desc_q = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%desc_q_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+  %desc_q_2 = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%desc_q_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+  %q_0_data = tt.descriptor_load %desc_q[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+  %q_1_data = tt.descriptor_load %desc_q_2[%c128_i32, %c0_i32] : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+  %q_0 = ttg.local_alloc %q_0_data : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
+  %q_1 = ttg.local_alloc %q_1_data : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
+
+  // K/V descriptors
+  %desc_k_stride = arith.extsi %stride_kn : i32 to i64
+  %desc_k = tt.make_tensor_descriptor %K, [%KV_LEN, %c128_i32], [%desc_k_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+  %desc_v_stride = arith.extsi %stride_vn : i32 to i64
+  %desc_v = tt.make_tensor_descriptor %V, [%KV_LEN, %c128_i32], [%desc_v_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+
+  // Output descriptor (TMA store — creates epilogue partition)
+  %desc_o_stride = arith.extsi %stride_om : i32 to i64
+  %desc_o = tt.make_tensor_descriptor %Out, [%Q_LEN, %c128_i32], [%desc_o_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+  %desc_o_2 = tt.make_tensor_descriptor %Out, [%Q_LEN, %c128_i32], [%desc_o_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+
+  // QK and ACC TMEM allocations
+  %qk_0, %qk_0_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+  %qk_1, %qk_1_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+  %acc_0, %acc_0_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+  %acc_1, %acc_1_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+  // Init accumulators
+  %acc_0_init = ttng.tmem_store %cst_zero_2d, %acc_0[%acc_0_tok], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %acc_1_init = ttng.tmem_store %cst_zero_2d, %acc_1[%acc_1_tok], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+
+  // Main attention loop
+  %loop:8 = scf.for %i = %c0_i32 to %n_iters step %c1_i32
+      iter_args(
+        %l_i_0 = %cst_one, %m_i_0 = %cst_neg_inf,
+        %qk_tok_0 = %qk_0_tok, %acc_tok_0 = %acc_0_init,
+        %l_i_1 = %cst_one, %m_i_1 = %cst_neg_inf,
+        %qk_tok_1 = %qk_1_tok, %acc_tok_1 = %acc_1_init
+      ) -> (
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        !ttg.async.token, !ttg.async.token,
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        !ttg.async.token, !ttg.async.token
+      ) : i32 {
+
+    // Load K and V
+    %kv_offset = arith.muli %i, %c128_i32 {loop.cluster = 5 : i32, loop.stage = 0 : i32} : i32
+    %k_data = tt.descriptor_load %desc_k[%kv_offset, %c0_i32] {loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+    %v_data = tt.descriptor_load %desc_v[%kv_offset, %c0_i32] {loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+    %k_smem = ttg.local_alloc %k_data {loop.cluster = 0 : i32, loop.stage = 1 : i32} : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
+    %k_trans = ttg.memdesc_trans %k_smem {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem> -> !ttg.memdesc<128x128xbf16, #shared1, #smem>
+    %v_smem = ttg.local_alloc %v_data {loop.cluster = 3 : i32, loop.stage = 1 : i32} : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
+
+    // QK MMA for both data partitions
+    %qk_mma_0 = ttng.tc_gen5_mma %q_0, %k_trans, %qk_0[%qk_tok_0], %false, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %qk_mma_1 = ttng.tc_gen5_mma %q_1, %k_trans, %qk_1[%qk_tok_1], %false, %true {loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+
+    // Load QK results
+    %qk_val_0, %qk_val_0_tok = ttng.tmem_load %qk_0[%qk_mma_0] {loop.cluster = 3 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %qk_val_1, %qk_val_1_tok = ttng.tmem_load %qk_1[%qk_mma_1] {loop.cluster = 1 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+
+    // Reduce for m_ij
+    %m_ij_0 = "tt.reduce"(%qk_val_0) <{axis = 1 : i32}> ({
+    ^bb0(%a0: f32, %b0: f32):
+      %max0 = arith.maxnumf %a0, %b0 : f32
+      tt.reduce.return %max0 : f32
+    }) {loop.cluster = 3 : i32, loop.stage = 1 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %m_ij_1 = "tt.reduce"(%qk_val_1) <{axis = 1 : i32}> ({
+    ^bb0(%a1: f32, %b1: f32):
+      %max1 = arith.maxnumf %a1, %b1 : f32
+      tt.reduce.return %max1 : f32
+    }) {loop.cluster = 1 : i32, loop.stage = 2 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // Scale m_ij
+    %m_ij_scaled_0 = arith.mulf %m_ij_0, %cst_scale {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %m_ij_scaled_1 = arith.mulf %m_ij_1, %cst_scale {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // new_m = max(m_i, m_ij)
+    %new_m_0 = arith.maxnumf %m_i_0, %m_ij_scaled_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %new_m_1 = arith.maxnumf %m_i_1, %m_ij_scaled_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // Scale QK
+    %scores_0 = arith.mulf %qk_val_0, %cst_scale_2d {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
+    %scores_1 = arith.mulf %qk_val_1, %cst_scale_2d {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked>
+
+    // p = exp2(scores - m)
+    %m_bcast_0 = tt.expand_dims %new_m_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf32, #blocked>
+    %m_bcast2d_0 = tt.broadcast %m_bcast_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
+    %m_bcast_1 = tt.expand_dims %new_m_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf32, #blocked>
+    %m_bcast2d_1 = tt.broadcast %m_bcast_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
+    %p_sub_0 = arith.subf %scores_0, %m_bcast2d_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
+    %p_sub_1 = arith.subf %scores_1, %m_bcast2d_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked>
+    %p_0 = math.exp2 %p_sub_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
+    %p_1 = math.exp2 %p_sub_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked>
+
+    // alpha = exp2(m_i - new_m)
+    %alpha_0 = arith.subf %m_i_0, %new_m_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %alpha_1 = arith.subf %m_i_1, %new_m_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %alpha_exp_0 = math.exp2 %alpha_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %alpha_exp_1 = math.exp2 %alpha_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // l_ij = sum(p)
+    %l_ij_0 = "tt.reduce"(%p_0) <{axis = 1 : i32}> ({
+    ^bb0(%a2: f32, %b2: f32):
+      %s0 = arith.addf %a2, %b2 : f32
+      tt.reduce.return %s0 : f32
+    }) {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %l_ij_1 = "tt.reduce"(%p_1) <{axis = 1 : i32}> ({
+    ^bb0(%a3: f32, %b3: f32):
+      %s1 = arith.addf %a3, %b3 : f32
+      tt.reduce.return %s1 : f32
+    }) {loop.cluster = 1 : i32, loop.stage = 2 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    // Rescale acc: acc_old * alpha
+    %acc_old_0, %acc_old_0_tok = ttng.tmem_load %acc_0[%acc_tok_0] {loop.cluster = 3 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %acc_old_1, %acc_old_1_tok = ttng.tmem_load %acc_1[%acc_tok_1] {loop.cluster = 1 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %alpha_1d_0 = tt.expand_dims %alpha_exp_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf32, #blocked>
+    %alpha_2d_0 = tt.broadcast %alpha_1d_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
+    %alpha_1d_1 = tt.expand_dims %alpha_exp_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf32, #blocked>
+    %alpha_2d_1 = tt.broadcast %alpha_1d_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
+    %acc_scaled_0 = arith.mulf %acc_old_0, %alpha_2d_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
+    %acc_scaled_1 = arith.mulf %acc_old_1, %alpha_2d_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked>
+    %acc_store_0 = ttng.tmem_store %acc_scaled_0, %acc_0[%acc_old_0_tok], %true {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %acc_store_1 = ttng.tmem_store %acc_scaled_1, %acc_1[%acc_old_1_tok], %true {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+
+    // p → bf16 → tmem for PV MMA
+    %p_bf16_0 = arith.truncf %p_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
+    %p_bf16_1 = arith.truncf %p_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
+    %p_tmem_0 = ttng.tmem_alloc %p_bf16_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>
+    %p_tmem_1 = ttng.tmem_alloc %p_bf16_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>
+
+    // PV MMA
+    %pv_0 = ttng.tc_gen5_mma %p_tmem_0, %v_smem, %acc_0[%acc_store_0], %true, %true {loop.cluster = 3 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %pv_1 = ttng.tc_gen5_mma %p_tmem_1, %v_smem, %acc_1[%acc_store_1], %true, %true {loop.cluster = 1 : i32, loop.stage = 2 : i32, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+
+    // l_i update
+    %l_scaled_0 = arith.mulf %l_i_0, %alpha_exp_0 {loop.cluster = 0 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %l_scaled_1 = arith.mulf %l_i_1, %alpha_exp_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %new_l_0 = arith.addf %l_scaled_0, %l_ij_0 {loop.cluster = 0 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %new_l_1 = arith.addf %l_scaled_1, %l_ij_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+
+    scf.yield %new_l_0, %new_m_0, %qk_val_0_tok, %pv_0,
+              %new_l_1, %new_m_1, %qk_val_1_tok, %pv_1
+      : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        !ttg.async.token, !ttg.async.token,
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>,
+        !ttg.async.token, !ttg.async.token
+  } {tt.data_partition_factor = 2 : i32, tt.warp_specialize}
+
+  // Post-loop: normalize acc and write with descriptor_store (epilogue)
+  %final_acc_0, %fa0_tok = ttng.tmem_load %acc_0[%loop#3] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+  %final_acc_1, %fa1_tok = ttng.tmem_load %acc_1[%loop#7] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+  %l_bcast_0 = tt.expand_dims %loop#0 {axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf32, #blocked>
+  %l_bcast2d_0 = tt.broadcast %l_bcast_0 : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
+  %l_bcast_1 = tt.expand_dims %loop#4 {axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf32, #blocked>
+  %l_bcast2d_1 = tt.broadcast %l_bcast_1 : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
+  %acc_norm_0 = arith.divf %final_acc_0, %l_bcast2d_0 : tensor<128x128xf32, #blocked>
+  %acc_norm_1 = arith.divf %final_acc_1, %l_bcast2d_1 : tensor<128x128xf32, #blocked>
+  %out_bf16_0 = arith.truncf %acc_norm_0 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
+  %out_bf16_1 = arith.truncf %acc_norm_1 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
+  %out_conv_0 = ttg.convert_layout %out_bf16_0 : tensor<128x128xbf16, #blocked> -> tensor<128x128xbf16, #blocked1>
+  %out_conv_1 = ttg.convert_layout %out_bf16_1 : tensor<128x128xbf16, #blocked> -> tensor<128x128xbf16, #blocked1>
+
+  // Descriptor stores — this is the KEY difference from flex attention.
+  // These create an epilogue partition.
+  tt.descriptor_store %desc_o[%c0_i32, %c0_i32], %out_conv_0 : !tt.tensordesc<tensor<128x128xbf16, #shared>>, tensor<128x128xbf16, #blocked1>
+  tt.descriptor_store %desc_o_2[%c128_i32, %c0_i32], %out_conv_1 : !tt.tensordesc<tensor<128x128xbf16, #shared>>, tensor<128x128xbf16, #blocked1>
+
+  tt.return
+}
+
+}
