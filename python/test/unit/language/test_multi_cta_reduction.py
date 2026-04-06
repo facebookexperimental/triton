@@ -113,7 +113,7 @@ def test_multi_cta_generates_cluster_ops():
     )
     ttgir = compiled.asm.get("ttgir", "")
     #After transformation, should see cluster CTA rank op and loop partitioning
-    assert "cluster_id" in ttgir.lower() or "nvgpu.cluster_id" in ttgir, \
+    assert "cluster_id" in ttgir.lower() or "nvg.cluster_id" in ttgir, \
         f"Expected cluster id op in TTGIR for multi-CTA:\n{ttgir[:3000]}"
     assert "arith.divui" in ttgir, \
         f"Expected arith.divui (loop partitioning) in TTGIR for multi-CTA:\n{ttgir[:3000]}"
@@ -177,7 +177,7 @@ def test_multi_cta_2d_block_generates_cluster_ops():
         options={"num_warps": 4, "cluster_dims": (1, 4, 1)},
     )
     ttgir = compiled.asm.get("ttgir", "")
-    assert "cluster_id" in ttgir.lower() or "nvgpu.cluster_id" in ttgir, \
+    assert "cluster_id" in ttgir.lower() or "nvg.cluster_id" in ttgir, \
         f"Expected cluster id op in TTGIR for 2D multi-CTA block:\n{ttgir[:3000]}"
     assert "arith.divui" in ttgir, \
         f"Expected arith.divui (loop partitioning) in TTGIR for 2D multi-CTA block:\n{ttgir[:3000]}"
@@ -301,7 +301,7 @@ def test_multi_cta_additive_kernel_accepted():
     )
     ttgir = compiled.asm.get("ttgir", "")
     assert "tt.multi_cta" not in ttgir, "tt.multi_cta should be consumed by the pass"
-    assert "cluster_id" in ttgir.lower() or "nvgpu.cluster_id" in ttgir
+    assert "cluster_id" in ttgir.lower() or "nvg.cluster_id" in ttgir
 
 
 if __name__ == "__main__":

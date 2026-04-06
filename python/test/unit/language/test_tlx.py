@@ -739,7 +739,7 @@ def test_custer_cta_rank(device):
     kernel = test_cta_0_kernel[(1, )](output, tensor_size, tensor_size, num_warps=1)
 
     ttgir = kernel.asm["ttgir"]
-    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("nvg.cluster_id") == 1
 
     torch.cuda.synchronize()
     expected_output = torch.zeros(tensor_size, dtype=torch.int32, device=device)
@@ -1435,7 +1435,7 @@ def run_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
         f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
-    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("nvg.cluster_id") == 1
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
@@ -1789,7 +1789,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         f"expecting num_ctas (not used in tlx) to be 1 but got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
-    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("nvg.cluster_id") == 1
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
 
     ptx = kernel.asm["ptx"]
@@ -2035,7 +2035,7 @@ def test_async_dot_scaled_2cta(device):
         f"expecting num_ctas to be 1 when using ctas_per_cga, got {kernel.metadata.num_ctas}")
 
     ttgir = kernel.asm["ttgir"]
-    assert ttgir.count("nvgpu.cluster_id") == 1
+    assert ttgir.count("nvg.cluster_id") == 1
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
     assert ttgir.count("ttng.tc_gen5_mma_scaled") >= 1
 
