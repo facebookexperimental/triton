@@ -24,7 +24,8 @@ from ..runtime.jit import (
     ConstexprFunction,
     JITFunction,
 )
-from .._utils import find_paths_if, get_iterable_path, set_iterable_path
+from ..language.core import _unwrap_if_constexpr, base_value, base_type
+from .._utils import find_paths_if, get_iterable_path, set_iterable_path, is_namedtuple
 
 from .errors import CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct
 
@@ -87,12 +88,8 @@ def _check_fn_args(node, fn, args):
                 )
 
 
-def _is_namedtuple(val):
-    return isinstance(val, type) and issubclass(val, tuple) and hasattr(val, "_fields")
-
-
 def _apply_to_tuple_values(value, fn):
-    if _is_namedtuple(type(value)):
+    if is_namedtuple(type(value)):
         fields = value._fields
     elif isinstance(value, language.tuple):
         fields = value.type.fields
@@ -444,7 +441,7 @@ class CodeGenerator(ast.NodeVisitor):
                     getattr(val, "__module__", "").startswith("triton.language"),  #
                     getattr(val, "__module__", "").startswith("triton.experimental.gluon.language"),  #
                     isinstance(val, language.dtype),  #
-                    _is_namedtuple(val),
+                    is_namedtuple(val),
                     self._is_constexpr_global(name),  #
                     # Allow accesses to globals while visiting an ast.arg
                     # because you should be able to do
