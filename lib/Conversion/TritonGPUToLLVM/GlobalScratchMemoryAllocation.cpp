@@ -61,6 +61,10 @@ static void allocateGMem(Operation *parentOp,
                   builder.getI32IntegerAttr(offset));
       offset += nbytes;
       largestAlignment = std::max(largestAlignment, align);
+    } else if (isa<triton::gpu::GlobalScratchAllocOp>(op)) {
+      // Zero-sized allocs still need an offset for LLVM lowering.
+      op->setAttr("ttg.global_scratch_memory_offset",
+                  builder.getI32IntegerAttr(offset));
     }
   });
   int32_t totalMemorySize = roundUp(offset, largestAlignment);

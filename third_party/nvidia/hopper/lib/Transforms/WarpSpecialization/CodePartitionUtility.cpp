@@ -2408,6 +2408,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         }
         int producerTaskId = producerTaskIds.front();
         if (needsChannel(producerTaskId, consumerIds)) {
+          auto iter = std::remove(consumerIds.begin(), consumerIds.end(),
+                                  producerTaskId);
+          consumerIds.erase(iter, consumerIds.end());
           if (!firstProducer)
             firstProducer = currentProds.front();
           lastConsumer = &op;
@@ -2443,6 +2446,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
         auto producerTaskId = producerTaskIds.front();
         auto consumerIds = getAsyncTaskIds(&op);
         if (needsChannel(producerTaskId, consumerIds)) {
+          auto iter = std::remove(consumerIds.begin(), consumerIds.end(),
+                                  producerTaskId);
+          consumerIds.erase(iter, consumerIds.end());
           if (!firstProducer)
             firstProducer = currentProds.front();
           lastConsumer = &op;
@@ -2531,6 +2537,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::TCGen5MMAOp mmaOp,
       auto producerTaskId = producerTaskIds.front();
       auto consumerIds = getAsyncTaskIds(user);
       if (needsChannel(producerTaskId, consumerIds)) {
+        auto iter = std::remove(consumerIds.begin(), consumerIds.end(),
+                                producerTaskId);
+        consumerIds.erase(iter, consumerIds.end());
         if (!firstProducer)
           firstProducer = currentProds.front();
         lastConsumer = user;
@@ -2743,7 +2752,8 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
     if (dyn_cast<ttng::TMEMAllocOp>(op)) {
       createChannelPost(op, dom, channels);
     } else if (dyn_cast<ttg::LocalAllocOp>(op)) {
-      createChannelPost(op, dom, channels);
+      if (!op->hasAttr("tma_store_buffer"))
+        createChannelPost(op, dom, channels);
     }
   });
   LLVM_DEBUG({

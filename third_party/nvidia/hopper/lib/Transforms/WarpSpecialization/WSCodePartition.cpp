@@ -4399,6 +4399,25 @@ public:
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.
+    // Fixup: ensure scf.yield is the last op in each for-loop body.
+    // Earlier code partition steps may leave ops after the yield.
+    funcOp.walk([&](scf::ForOp forOp) {
+      Block *body = forOp.getBody();
+      Operation *yieldTerm = nullptr;
+      for (Operation &op : *body) {
+        if (op.hasTrait<OpTrait::IsTerminator>()) {
+          yieldTerm = &op;
+          break;
+        }
+      }
+      if (yieldTerm) {
+        for (auto it = std::next(Block::iterator(yieldTerm)), e = body->end();
+             it != e;) {
+          Operation *misplaced = &*it++;
+          misplaced->moveBefore(yieldTerm);
+        }
+      }
+    });
     funcOp.walk([&](scf::ForOp forOp) {
       auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
       unsigned numIterArgs = forOp.getNumRegionIterArgs();

@@ -52,7 +52,9 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
         sharedMemorySpace, /*mutableMemory=*/true);
 
     // Allocate SMEM and copy register data into it in one step.
+    // Mark as TMA store staging buffer so collectPostChannels skips it.
     auto alloc = builder.create<ttg::LocalAllocOp>(loc, memDescType, src);
+    alloc->setAttr("tma_store_buffer", builder.getUnitAttr());
 
     // Translate indices for TMA.
     auto indices = ttng::translateTMAIndices(

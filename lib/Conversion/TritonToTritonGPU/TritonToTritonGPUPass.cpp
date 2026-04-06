@@ -635,6 +635,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::AssertOp>,
       GenericOpPattern<triton::AtomicCASOp>,
       GenericOpPattern<triton::AtomicRMWOp>,
+      GenericOpPattern<triton::MakeTensorDescOp>,
       GenericOpPattern<triton::DescriptorLoadOp>,
       GenericOpPattern<triton::DescriptorStoreOp>,
       GenericOpPattern<triton::DescriptorReduceOp>,
@@ -920,7 +921,23 @@ public:
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
     if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return signalPassFailure();
+      return signalPassFailure();
+
+    // Fixup: dialect conversion materializations (e.g., ConvertLayoutOp) can
+    // end up after scf.yield when complex epilogues with tt.descriptor_store
+    // create encoding mismatches. Move any misplaced ops before the terminator.
+    op.walk([&](Block *block) {
+      if (block->empty() || !block->back().hasTrait<OpTrait::IsTerminator>())
+        return;
+      Operation *terminator = block->getTerminator();
+      SmallVector<Operation *> misplaced;
+      for (auto it = std::next(Block::iterator(terminator)), e = block->end();
+           it != e;) {
+        misplaced.push_back(&*it++);
+      }
+      for (Operation *misplacedOp : misplaced)
+        misplacedOp->moveBefore(terminator);
+    });
   }
 
   void runOnOperation() override {
