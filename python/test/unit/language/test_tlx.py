@@ -687,6 +687,60 @@ def test_tmem_subslice(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
     torch.testing.assert_close(x, ref_out)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(256, 128)])
+def test_tmem_subslice_256(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
+    """Test TMEM subslicing with BLOCK_M=256 (multi M-block).
+
+    Verifies that subslicing a 256x128 TMEM tensor into 256x64 halves
+    produces correct data. This exercises the linear layout fix for
+    blockM=128 where the second M-block's physical column offset must
+    account for the original blockN, not the subsliced width.
+    """
+
+    @triton.jit
+    def tmem_subslice_256_kernel(
+        x_ptr,
+        stride_m,
+        stride_n,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        offs_m = tl.arange(0, BLOCK_SIZE_M)
+        offs_n1 = tl.arange(0, BLOCK_SIZE_N // 2)
+        offs_n2 = tl.arange(BLOCK_SIZE_N // 2, BLOCK_SIZE_N)
+        x_ptr_offsets1 = x_ptr + (offs_m[:, None] * stride_m + offs_n1[None, :] * stride_n)
+        x_ptr_offsets2 = x_ptr + (offs_m[:, None] * stride_m + offs_n2[None, :] * stride_n)
+
+        # Store a known pattern: each element = row + col
+        offs_m_f = offs_m.to(tl.float32)
+        offs_n_f = tl.arange(0, BLOCK_SIZE_N).to(tl.float32)
+        a = offs_m_f[:, None] + offs_n_f[None, :]
+
+        buffers = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        buffer1 = tlx.local_view(buffers, 0)
+        tlx.local_store(buffer1, a)
+
+        subslice1 = tlx.subslice(buffer1, 0, BLOCK_SIZE_N // 2)
+        subslice2 = tlx.subslice(buffer1, BLOCK_SIZE_N // 2, BLOCK_SIZE_N // 2)
+
+        b1 = tlx.local_load(subslice1)
+        b2 = tlx.local_load(subslice2)
+        tl.store(x_ptr_offsets1, b1)
+        tl.store(x_ptr_offsets2, b2)
+
+    x = torch.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=torch.float32, device=device)
+    grid = lambda meta: (1, )
+    tmem_subslice_256_kernel[grid](x, x.stride(0), x.stride(1), BLOCK_SIZE_M, BLOCK_SIZE_N,
+                                   num_warps=8)
+
+    # Expected: element (r, c) = r + c
+    rows = torch.arange(BLOCK_SIZE_M, dtype=torch.float32, device=device).unsqueeze(1)
+    cols = torch.arange(BLOCK_SIZE_N, dtype=torch.float32, device=device).unsqueeze(0)
+    ref_out = rows + cols
+    torch.testing.assert_close(x, ref_out)
+
+
 def test_thread_id(device):
 
     @triton.jit

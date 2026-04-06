@@ -1213,6 +1213,17 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
   } else {
     tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
             LinearLayout::identity1D(blockN, kCol, dims[1]);
+    // Pad kCol to preserve physical M-block column stride after subslicing.
+    auto encodingBlockN = encoding.getBlockN();
+    if (encodingBlockN > blockN) {
+      auto bases = tile.getBases();
+      auto gap = encodingBlockN / blockN;
+      while (gap > 1) {
+        bases[kCol].push_back({0, 0});
+        gap /= 2;
+      }
+      tile = LinearLayout(bases, dims);
+    }
   }
   auto repsM = shape[0] / tile.getOutDimSize(dims[0]);
   auto repsN = shape[1] / tile.getOutDimSize(dims[1]);
