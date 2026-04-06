@@ -137,7 +137,7 @@ def addmm_kernel_tma_persistent_ws(
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128, 256])
 @pytest.mark.parametrize("BLOCK_SIZE_K", [64, 128])
 @pytest.mark.parametrize("num_stages", [2, 3])
-@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("FLATTEN", [True, False])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
 @pytest.mark.parametrize("A_col_major", [False, True])
@@ -167,6 +167,9 @@ def test_autows_addmm_tma_persistent(
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
+
+    if num_warps != 4 and DATA_PARTITION_FACTOR > 1:
+        pytest.skip("DATA_PARTITION_FACTOR > 1 requires num_warps == 4")
 
     # Skip configurations that exceed hardware resource limits (shared memory or tensor memory)
     if BLOCK_SIZE_M == 256 and BLOCK_SIZE_N == 256:
