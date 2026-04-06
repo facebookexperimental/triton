@@ -551,16 +551,12 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   // Instead of a new IfOp for each task, we create one partitionRegion.
   auto nTaskIds = getNestedAsyncTaskIds(funcOp);
+  int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
   SmallVector<int32_t> partitionNumWarps;
   for (AsyncTaskId asyncTaskId : nTaskIds) {
     if (asyncTaskId == 0)
       continue;
-    // HACK: hardcode 1,2,3 with 1 warp
-    // TODO: check TritonGPUAllocateWarpGroups
-    if (asyncTaskId == 1 || asyncTaskId == 2 || asyncTaskId == 3)
-      partitionNumWarps.push_back(4);
-    else
-      partitionNumWarps.push_back(4);
+    partitionNumWarps.push_back(numWarps);
   }
   ArrayRef<Type> dummyTypes;
   ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
