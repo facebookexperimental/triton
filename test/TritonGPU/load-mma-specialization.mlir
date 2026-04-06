@@ -64,8 +64,7 @@
 #fp4_padded_shared =                                                           \
     #ttg.nvmma_shared <                                                        \
     {swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8,        \
-    fp4Padded = true,                                                          \
-    CTAsPerCGA = [1, 1, 1], CTASplitNum = [1, 1, 1], CTAOrder = [2, 1, 0] }>
+    fp4Padded = true }>
 
 module attributes{"ttg.num-warps" = 4 :i32, ttg.target = "cuda:100"} {
 

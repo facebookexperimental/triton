@@ -223,7 +223,7 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
     }
 
     // Create a 1D CTA layout with no cluster splitting.
-    auto ctaLayout1d = ttg::CTALayoutAttr::get(
+    auto ctaLayout1d = ttg::CTAEncodingAttr::fromSplitParams(
         context, /*CTAsPerCGA=*/{1}, /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
     auto smemEncoding1d = ttg::SwizzledSharedEncodingAttr::get(
         context, /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1,
@@ -243,7 +243,7 @@ static LogicalResult transformMultiCTALoop(scf::ForOp forOp,
         RankedTensorType::get({resultSize}, elemType, exchange1dEnc);
 
     // a) Allocate DSM buffer: [numCTAs x resultSize] rank-2 in shared memory.
-    auto ctaLayout2d = ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1, 1},
+    auto ctaLayout2d = ttg::CTAEncodingAttr::fromSplitParams(context, /*CTAsPerCGA=*/{1, 1},
                                                /*CTASplitNum=*/{1, 1},
                                                /*CTAOrder=*/{1, 0});
     auto smemEncoding2d = ttg::SwizzledSharedEncodingAttr::get(

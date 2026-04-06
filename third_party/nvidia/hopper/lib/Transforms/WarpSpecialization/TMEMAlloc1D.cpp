@@ -56,7 +56,7 @@ void TMEM1DAllocator::TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
       auto retCTAsPerCGA = {argCTALayout.getCTAsPerCGA()[0], axis};
       auto retCTASplitNum = {argCTALayout.getCTASplitNum()[0], axis};
       auto retCTAOrder = {axis, argCTALayout.getCTAOrder()[0]};
-      auto retCTALayout = triton::gpu::CTALayoutAttr::get(
+      auto retCTALayout = triton::gpu::CTAEncodingAttr::fromSplitParams(
           context, retCTAsPerCGA, retCTASplitNum, retCTAOrder);
       blockedEnc = triton::gpu::BlockedEncodingAttr::get(
           context, retSizePerThread, retThreadsPerWarp, retWarpsPerCTA,

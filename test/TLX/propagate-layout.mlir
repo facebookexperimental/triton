@@ -5,7 +5,7 @@
 // Test that TMEMCopyOp propagates unswizzled layout constraint to the source
 // shared memory when the destination lattice has TensorMemoryScalesEncodingAttr.
 
-#shared_swizzled = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1, 1, 1, 1], CTASplitNum = [1, 1, 1, 1, 1], CTAOrder = [4, 3, 2, 1, 0]}>
+#shared_swizzled = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 // CHECK-DAG: #[[$SHARED_UNSWIZZLED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0,
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory
@@ -242,7 +242,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // the 3D shape is preserved and memdesc_index ops produce 2D views with scales encoding.
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
-#shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, CTAsPerCGA = [1, 1, 1, 1, 1], CTASplitNum = [1, 1, 1, 1, 1], CTAOrder = [4, 3, 2, 1, 0]}>
+#shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory
 #tmem_acc = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
