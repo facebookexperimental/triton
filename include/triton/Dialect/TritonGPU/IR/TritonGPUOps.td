@@ -88,6 +88,9 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     This is analogue to tt.load except the data are copied to local memory pointed
     to by the memory descriptor instead of a distributed tensor. The rest of the
     operands are the same as tt.load.
+    Contiguity is the maximum number of elements that can be loaded in a single vector with
+    the given layout and mask.
+    This allows op to use async_copy_global_to_local even if the alignment cannot be proven based on IR.
 
     When useBulk is true, src may be a scalar pointer (!tt.ptr) and mask/other
     must be absent.  When useBulk is false, src must be a ranked tensor of
@@ -104,20 +107,30 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
     DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
-    DefaultValuedAttr<BoolAttr, "false">:$useBulk
+    DefaultValuedAttr<BoolAttr, "false">:$useBulk,
+    DefaultValuedAttr<I32Attr, "1">:$contiguity
   );
 
   let results = (outs TTG_AsyncToken:$token);
 
   let builders = [
-    // Backward-compatible builder without bulkSize/barrier/useBulk
+    // Backward-compatible builder without bulkSize/barrier/useBulk/contiguity
     OpBuilder<(ins "Value":$src, "Value":$result, "Value":$mask, "Value":$other,
                    "triton::CacheModifier":$cache, "triton::EvictionPolicy":$evict,
                    "bool":$isVolatile),
               [{
                 build($_builder, $_state, src, result, mask, other,
                       /*bulkSize=*/Value(), /*barrier=*/Value(), cache, evict,
-                      isVolatile, /*useBulk=*/false);
+                      isVolatile, /*useBulk=*/false, /*contiguity=*/1);
+              }]>,
+    // Backward-compatible builder without bulkSize/barrier/useBulk but with contiguity
+    OpBuilder<(ins "Value":$src, "Value":$result, "Value":$mask, "Value":$other,
+                   "triton::CacheModifier":$cache, "triton::EvictionPolicy":$evict,
+                   "bool":$isVolatile, "int":$contiguity),
+              [{
+                build($_builder, $_state, src, result, mask, other,
+                      /*bulkSize=*/Value(), /*barrier=*/Value(), cache, evict,
+                      isVolatile, /*useBulk=*/false, contiguity);
               }]>
   ];
 
