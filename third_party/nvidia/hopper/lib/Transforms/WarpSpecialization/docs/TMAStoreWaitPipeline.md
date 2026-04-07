@@ -40,7 +40,7 @@ store:
 1. Get the `LocalAllocOp` that produces the buffer.
 2. Read the `buffer.copy` attribute (set earlier by the memory planner),
    which records how many physical copies of this buffer exist.
-3. If `buffer.copy = K` (and K > 0), set `can_rotate_by_buffer_count = K`
+3. If `buffer.copy = K`, set `can_rotate_by_buffer_count = K`
    on the wait op.
 
 The attribute means: "K buffer copies exist, so this wait can be delayed
@@ -84,7 +84,8 @@ For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:
 2. **Linearize from the defining TMA store**: use
    `schedule.linearized(forOp, tmaStore)` to get an iterator that walks
    ops in pipeline-unrolled order (wrapping across stages up to
-   `numStages + K`).
+   `numStages + K`). Note: That we may only increase by 1 stage (we move
+   by K TMA stores, not necessarily K pipeline stages).
 
 3. **Count K copies**: walk the linearized schedule, counting
    `AsyncTMACopyLocalToGlobalOp` ops. Stop at the K-th copy — this is the
