@@ -820,3 +820,75 @@ def test_higher_order_kernel(device, fresh_triton_cache, capsys):
 Compiling with fn_a
 Compiling with fn_a after modification
 """)
+
+
+def test_fast_path_multi_kernel(device, fresh_triton_cache):
+    """Test that the fast path cache works when alternating between multiple kernels
+    with different signatures and specializations."""
+
+    @triton.jit
+    def add_kernel(X, Y, OUT, N: tl.constexpr):
+        offs = tl.arange(0, N)
+        x = tl.load(X + offs)
+        y = tl.load(Y + offs)
+        tl.store(OUT + offs, x + y)
+
+    @triton.jit
+    def scale_kernel(X, OUT, scale, N: tl.constexpr):
+        offs = tl.arange(0, N)
+        x = tl.load(X + offs)
+        tl.store(OUT + offs, x * scale)
+
+    @triton.jit
+    def fill_kernel(OUT, val, N: tl.constexpr):
+        offs = tl.arange(0, N)
+        tl.store(OUT + offs, val)
+
+    N = 128
+
+    x_f32 = torch.ones(N, dtype=torch.float32, device=device)
+    y_f32 = torch.full((N,), 2.0, dtype=torch.float32, device=device)
+    out_f32 = torch.empty(N, dtype=torch.float32, device=device)
+
+    x_f16 = torch.ones(N, dtype=torch.float16, device=device)
+    y_f16 = torch.full((N,), 3.0, dtype=torch.float16, device=device)
+    out_f16 = torch.empty(N, dtype=torch.float16, device=device)
+
+    # First pass: populate caches for all kernel/dtype combinations
+    add_kernel[(1,)](x_f32, y_f32, out_f32, N=N)
+    torch.testing.assert_close(out_f32, x_f32 + y_f32)
+
+    add_kernel[(1,)](x_f16, y_f16, out_f16, N=N)
+    torch.testing.assert_close(out_f16, x_f16 + y_f16)
+
+    scale_kernel[(1,)](x_f32, out_f32, 5.0, N=N)
+    torch.testing.assert_close(out_f32, x_f32 * 5.0)
+
+    scale_kernel[(1,)](x_f16, out_f16, 3.0, N=N)
+    torch.testing.assert_close(out_f16, x_f16 * 3.0)
+
+    fill_kernel[(1,)](out_f32, 7.0, N=N)
+    torch.testing.assert_close(out_f32, torch.full((N,), 7.0, dtype=torch.float32, device=device))
+
+    # Second pass: alternate between all kernels and dtypes — exercises
+    # fast path last-used hits and dict fallback across different signatures
+    for _ in range(5):
+        add_kernel[(1,)](x_f32, y_f32, out_f32, N=N)
+        torch.testing.assert_close(out_f32, x_f32 + y_f32)
+
+        scale_kernel[(1,)](x_f16, out_f16, 3.0, N=N)
+        torch.testing.assert_close(out_f16, x_f16 * 3.0)
+
+        fill_kernel[(1,)](out_f32, 7.0, N=N)
+        torch.testing.assert_close(out_f32, torch.full((N,), 7.0, dtype=torch.float32, device=device))
+
+        add_kernel[(1,)](x_f16, y_f16, out_f16, N=N)
+        torch.testing.assert_close(out_f16, x_f16 + y_f16)
+
+        scale_kernel[(1,)](x_f32, out_f32, 5.0, N=N)
+        torch.testing.assert_close(out_f32, x_f32 * 5.0)
+
+    # Verify each kernel cached the expected number of specializations
+    assert len(add_kernel._fast_path_cache) == 2    # f32 and f16
+    assert len(scale_kernel._fast_path_cache) == 2   # f32 and f16
+    assert len(fill_kernel._fast_path_cache) == 1    # f32 only
