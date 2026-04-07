@@ -144,6 +144,10 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
       if (!bufferCopy)
         continue;
 
+      int k = bufferCopy.getInt();
+      if (k <= 0)
+        continue;
+
       waitOp->setAttr(kCanRotateByBufferCount,
                       IntegerAttr::get(IntegerType::get(ctx, 32), k));
     }
