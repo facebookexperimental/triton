@@ -3559,7 +3559,7 @@ def test_dot(
     if "int" not in in_dtype and "float8" not in in_dtype:
         x *= 0.1
         y *= 0.1
-    if in_dtype == "float32" and input_precision == "tf32":
+    if in_dtype == "float32" and input_precision in ["tf32", "bf16x3", "bf16x6"]:
         x = (x.view("uint32") & np.uint32(0xFFFFE000)).view("float32")
         y = (y.view("uint32") & np.uint32(0xFFFFE000)).view("float32")
         w = (w.view("uint32") & np.uint32(0xFFFFE000)).view("float32")
