@@ -449,6 +449,10 @@ class HIPBackend(BaseBackend):
             amd.add_scalarize_packed_fops_llvm_pass(fns[0])
 
         # Get some metadata
+        total_num_warps = src.get_int_attr("ttg.total-num-warps")
+        if total_num_warps is not None and total_num_warps != metadata["num_warps"]:
+            metadata["num_warps_base"] = metadata["num_warps"]
+            metadata["num_warps"] = total_num_warps
         metadata["shared"] = src.get_int_attr("ttg.shared")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
