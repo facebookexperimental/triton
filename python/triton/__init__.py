@@ -1,5 +1,5 @@
 """isort:skip_file"""
-__version__ = '3.5.0+fb.beta'
+__version__ = '3.6.0+fb.beta'
 
 # ---------------------------------------
 # Note: import order is significant here.
