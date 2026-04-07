@@ -126,17 +126,6 @@ def unflatten_ir_values(handles: List[ir.value], types: List[base_type]):
 _condition_types = {bool, int, type(None)}  # Python types accepted for conditionals inside kernels
 
 
-def _clone_triton_value(val):
-    handles = []
-    val._flatten_ir(handles)
-    clone, _ = val.type._unflatten_ir(handles, 0)
-    return clone
-
-
-def _clone_scope(scope):
-    return {name: _clone_triton_value(val) if _is_triton_value(val) else val for name, val in scope.items()}
-
-
 class enter_sub_region:
 
     def __init__(self, generator):
