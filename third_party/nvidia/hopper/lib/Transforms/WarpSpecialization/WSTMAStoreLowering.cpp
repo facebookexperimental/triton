@@ -124,21 +124,6 @@ getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
   return nullptr;
 }
 
-// Trace through memdesc_index ops to find the base memdesc value.
-// This handles the post-partition case where multi-buffered allocs are
-// accessed via memdesc_index of a block argument.
-static Value getBaseMemDesc(Value v) {
-  while (auto indexOp = v.getDefiningOp<ttg::MemDescIndexOp>())
-    v = indexOp.getSrc();
-  return v;
-}
-
-// Check if two buffer values refer to the same underlying memdesc,
-// looking through memdesc_index/subview ops.
-static bool isSameBaseBuffer(Value a, Value b) {
-  return getBaseMemDesc(a) == getBaseMemDesc(b);
-}
-
 void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
   MLIRContext *ctx = funcOp.getContext();
   funcOp.walk([&](scf::ForOp forOp) {
@@ -158,12 +143,6 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
 
       auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
       if (!bufferCopy)
-        continue;
-
-      // K = buffer.copy: with N copies, the wait must complete before the
-      // K-th write to the same buffer overwrites the slot being read.
-      int k = bufferCopy.getInt();
-      if (k <= 0)
         continue;
 
       waitOp->setAttr(kCanRotateByBufferCount,
