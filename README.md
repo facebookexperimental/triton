@@ -142,6 +142,7 @@ def inspect_stages(_self, stages, options, language, capability):
     # inspect or modify add_stages here
 triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
 ```
+Examples of how to use this for out of tree plugin passes is [here](lib/Plugins/README.md)
 
 Binary wheels are available for CPython 3.10-3.14.
 
