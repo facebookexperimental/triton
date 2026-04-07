@@ -6,7 +6,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 
 namespace tt = mlir::triton;
@@ -94,7 +93,7 @@ struct NVGPUWSTMAStoreLoweringPass
 
 // Annotate TMA store waits with can_rotate_by_buffer_count
 // ---------------------------------------------------------------------------
-#define GEN_PASS_DEF_NVGPUANNOTATETMASTOREWAITS
+#define GEN_PASS_DEF_NVGPUTESTANNOTATETMASTOREWAITS
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 static constexpr const char *kCanRotateByBufferCount =
@@ -151,9 +150,9 @@ void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
   });
 }
 
-struct NVGPUAnnotateTMAStoreWaitsPass
-    : public impl::NVGPUAnnotateTMAStoreWaitsBase<
-          NVGPUAnnotateTMAStoreWaitsPass> {
+struct NVGPUTestAnnotateTMAStoreWaitsPass
+    : public impl::NVGPUTestAnnotateTMAStoreWaitsBase<
+          NVGPUTestAnnotateTMAStoreWaitsPass> {
   void runOnOperation() override {
     getOperation()->walk(
         [&](triton::FuncOp funcOp) { doAnnotateTMAStoreWaits(funcOp); });
@@ -190,7 +189,7 @@ void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
 // ---------------------------------------------------------------------------
 // Reschedule TMA store waits using the SWP CoarseSchedule
 // ---------------------------------------------------------------------------
-#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITREORDER
+#define GEN_PASS_DEF_NVGPUTESTTMASTORETOKENWAITREORDER
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
@@ -297,9 +296,9 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   });
 }
 
-struct NVGPUTMAStoreTokenWaitReorderPass
-    : public impl::NVGPUTMAStoreTokenWaitReorderBase<
-          NVGPUTMAStoreTokenWaitReorderPass> {
+struct NVGPUTestTMAStoreTokenWaitReorderPass
+    : public impl::NVGPUTestTMAStoreTokenWaitReorderBase<
+          NVGPUTestTMAStoreTokenWaitReorderPass> {
   void runOnOperation() override {
     getOperation()->walk(
         [&](triton::FuncOp funcOp) { doTMAStoreWaitReorder(funcOp); });

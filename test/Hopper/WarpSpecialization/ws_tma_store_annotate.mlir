@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-annotate-tma-store-waits | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-annotate-tma-store-waits | FileCheck %s
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory

@@ -30,7 +30,7 @@ the monolithic pipeline.
 
 ## Step 1: `doAnnotateTMAStoreWaits`
 
-**Pass**: `nvgpu-annotate-tma-store-waits` (`NVGPUAnnotateTMAStoreWaitsPass`)
+**Test pass**: `nvgpu-test-annotate-tma-store-waits` (`NVGPUTestAnnotateTMAStoreWaitsPass`)
 
 This pass walks `scf.for` loops and inspects every `TMAStoreTokenWaitOp`.
 For each wait, it traces the token back to the defining
@@ -67,7 +67,7 @@ and reordering that might invalidate assumptions.
 
 ## Step 3: `doTMAStoreWaitReorder`
 
-**Pass**: `nvgpu-tma-store-token-wait-reorder` (`NVGPUTMAStoreTokenWaitReorderPass`)
+**Test pass**: `nvgpu-test-tma-store-token-wait-reorder` (`NVGPUTestTMAStoreTokenWaitReorderPass`)
 
 This pass runs **after** `scheduleLoops` has assigned pipeline stages and
 clusters to every op. It uses the SWP `CoarseSchedule` to move waits

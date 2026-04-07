@@ -206,7 +206,7 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUAnnotateTMAStoreWaits : Pass<"nvgpu-annotate-tma-store-waits", "mlir::ModuleOp"> {
+def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits", "mlir::ModuleOp"> {
   let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
 
   let description = [{
@@ -220,7 +220,7 @@ def NVGPUAnnotateTMAStoreWaits : Pass<"nvgpu-annotate-tma-store-waits", "mlir::M
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUTMAStoreTokenWaitReorder : Pass<"nvgpu-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
+def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
   let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
 
   let description = [{

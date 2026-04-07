@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-reorder | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-tma-store-token-wait-reorder | FileCheck %s
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
