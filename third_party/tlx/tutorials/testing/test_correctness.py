@@ -111,6 +111,7 @@ class Gemm:
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": False,
+            "NUM_CTAS": 1,
         },
         "blackwell_gemm_ws_warp_barrier": {
             "BLOCK_SIZE_M": 128,
@@ -146,6 +147,7 @@ class Gemm:
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": False,
             "USE_WARP_BARRIER": True,
+            "NUM_CTAS": 1,
         },
     }
 
