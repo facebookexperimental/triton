@@ -366,7 +366,7 @@ private:
       if (remoteBar.has_value()) {
         hasRemoteBar = true;
         for (auto bar : remoteBar.value()) {
-          getBackwardSliceWithWS(bar, &ops);
+          ttng::getBackwardSliceWithWS(bar, &ops);
 
           for (auto opInSlice : ops) {
             if (isa<ttg::LocalAllocOp>(opInSlice)) {
