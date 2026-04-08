@@ -292,6 +292,28 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     atomicRMWOp.getMaskMutable().assign(mask);
     return op;
   }
+  // Ops without a built-in pred operand: wrap in scf.if.
+  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::TMAStoreTokenWaitOp>(op)) {
+    rewriter.setInsertionPoint(op);
+    bool hasResults = op->getNumResults() > 0;
+    auto ifOp =
+        rewriter.create<scf::IfOp>(op->getLoc(), op->getResultTypes(), pred,
+                                   /*withElseRegion=*/hasResults);
+    rewriter.setInsertionPointToStart(ifOp.thenBlock());
+    auto *clonedOp = rewriter.clone(*op);
+    if (hasResults) {
+      rewriter.create<scf::YieldOp>(op->getLoc(), clonedOp->getResults());
+      rewriter.setInsertionPointToStart(ifOp.elseBlock());
+      SmallVector<Value> poisonResults;
+      for (auto result : op->getResults())
+        poisonResults.push_back(rewriter.create<mlir::ub::PoisonOp>(
+            op->getLoc(), result.getType()));
+      rewriter.create<scf::YieldOp>(op->getLoc(), poisonResults);
+    }
+    op->replaceAllUsesWith(ifOp->getResults());
+    rewriter.eraseOp(op);
+    return ifOp;
+  }
   if (!op->isRegistered()) {
     // Skip ops from unregistered dialects to make writing lit tests easier.
     return op;

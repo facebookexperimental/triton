@@ -45,6 +45,8 @@ void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
 void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
                     int capability);
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
+void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
+void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -211,6 +213,22 @@ public:
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doMemoryPlanner\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doAnnotateTMAStoreWaits(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doAnnotateTMAStoreWaits\n";
+      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
+      llvm::dbgs() << "\n\n\n";
+    }
+
+    doValidateTMAStoreAnnotations(funcOp);
+    if (dumpIntermediateSteps) {
+      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
+                      "doValidateTMAStoreAnnotations\n";
       moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
       llvm::dbgs() << "\n\n\n";
     }

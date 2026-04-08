@@ -6,7 +6,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
 
 namespace tt = mlir::triton;
@@ -91,10 +90,14 @@ struct NVGPUWSTMAStoreLoweringPass
 };
 
 // ---------------------------------------------------------------------------
-// Reschedule TMA store waits using the SWP CoarseSchedule
+
+// Annotate TMA store waits with can_rotate_by_buffer_count
 // ---------------------------------------------------------------------------
-#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITREORDER
+#define GEN_PASS_DEF_NVGPUTESTANNOTATETMASTOREWAITS
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+static constexpr const char *kCanRotateByBufferCount =
+    "can_rotate_by_buffer_count";
 
 // Trace the token back to the defining AsyncTMACopyLocalToGlobalOp, handling
 // both direct definitions and loop-carried block arguments.
@@ -120,23 +123,90 @@ getDefiningTMAStore(ttng::TMAStoreTokenWaitOp waitOp) {
   return nullptr;
 }
 
-// For a TMAStoreTokenWaitOp, return the SMEM memdesc that the corresponding
-// TMA store reads from (i.e., the src operand of AsyncTMACopyLocalToGlobalOp).
-static Value getTMAStoreBuffer(ttng::TMAStoreTokenWaitOp waitOp) {
-  if (auto tmaStore = getDefiningTMAStore(waitOp))
-    return tmaStore.getSrc();
-  return nullptr;
+void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
+  MLIRContext *ctx = funcOp.getContext();
+  funcOp.walk([&](scf::ForOp forOp) {
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+      if (!waitOp)
+        continue;
+
+      auto tmaStore = getDefiningTMAStore(waitOp);
+      if (!tmaStore)
+        continue;
+
+      Value buffer = tmaStore.getSrc();
+      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+      if (!allocOp)
+        continue;
+
+      auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
+      if (!bufferCopy)
+        continue;
+
+      int k = bufferCopy.getInt();
+      if (k <= 0)
+        continue;
+
+      waitOp->setAttr(kCanRotateByBufferCount,
+                      IntegerAttr::get(IntegerType::get(ctx, 32), k));
+    }
+  });
 }
 
-static constexpr const char *kCanRotateByBufferCount =
-    "can_rotate_by_buffer_count";
+struct NVGPUTestAnnotateTMAStoreWaitsPass
+    : public impl::NVGPUTestAnnotateTMAStoreWaitsBase<
+          NVGPUTestAnnotateTMAStoreWaitsPass> {
+  void runOnOperation() override {
+    getOperation()->walk(
+        [&](triton::FuncOp funcOp) { doAnnotateTMAStoreWaits(funcOp); });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Validate TMA store annotations (safety checks)
+// ---------------------------------------------------------------------------
+
+void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
+  funcOp.walk([&](scf::ForOp forOp) {
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+      if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
+        continue;
+
+      auto tmaStore = getDefiningTMAStore(waitOp);
+      if (!tmaStore) {
+        waitOp->removeAttr(kCanRotateByBufferCount);
+        continue;
+      }
+
+      Value buffer = tmaStore.getSrc();
+      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+      if (!allocOp) {
+        waitOp->removeAttr(kCanRotateByBufferCount);
+        continue;
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Reschedule TMA store waits using the SWP CoarseSchedule
+// ---------------------------------------------------------------------------
+#define GEN_PASS_DEF_NVGPUTESTTMASTORETOKENWAITREORDER
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
 
 void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
-    // Deserialize the SWP schedule. If there is no schedule, skip this loop.
+    // Deserialize the SWP schedule. If there is no schedule, create a basic
+    // single-stage schedule so the reorder logic can still work.
     tt::CoarseSchedule schedule;
-    if (failed(schedule.deSerialize(forOp)))
-      return;
+    if (failed(schedule.deSerialize(forOp))) {
+      schedule.setNumStages(1);
+      auto cluster = schedule.clusters.newAtBack();
+      for (auto &op : forOp.getBody()->without_terminator())
+        schedule.insert(&op, 0, cluster);
+    }
 
     // Collect annotated TMA store waits that are direct children of this
     // loop and whose defining TMA store is in the same loop.
@@ -155,10 +225,6 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
 
     bool changed = false;
     for (auto waitOp : waits) {
-      Value buffer = getTMAStoreBuffer(waitOp);
-      if (!buffer)
-        continue;
-
       auto attr = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
       if (!attr)
         continue;
@@ -173,37 +239,41 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
       if (!schedule.count(tmaStore))
         continue;
 
-      // Walk the linearized schedule from the TMA store, counting local_store
-      // ops to the same buffer. Stop at the K-th one. Increase maxStages so
-      // the iterator can traverse enough wraps to find all K writes.
+      // Walk the linearized schedule from the TMA store, counting K
+      // AsyncTMACopyLocalToGlobalOp ops. The wait must be placed before
+      // the K-th copy to ensure the buffer slot is not overwritten.
       auto it = schedule.linearized(forOp, tmaStore);
       it.setMaxStages(schedule.getNumStages() + k);
-      int count = 0;
-      Operation *kthWrite = nullptr;
+
+      // Skip past the starting TMA store itself.
+      ++it;
+
+      Operation *insertionTarget = nullptr;
       int targetStage = 0;
+      int copyCount = 0;
+
       while (!it.isEnd()) {
         Operation *op = *it;
         int stageAtOp = it.currStage();
         ++it;
-        auto storeOp = dyn_cast<ttg::LocalStoreOp>(op);
-        if (storeOp && storeOp.getDst() == buffer) {
-          if (++count == k) {
-            kthWrite = op;
+        if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+          ++copyCount;
+          if (copyCount == k) {
+            insertionTarget = op;
             targetStage = stageAtOp;
             break;
           }
         }
       }
 
-      if (kthWrite) {
-        // Look for an existing TMAStoreTokenWaitOp before kthWrite in the
-        // same block that is also in the schedule. If found, insert before
-        // that wait instead of before the store directly.
-        Operation *insertionTarget = kthWrite;
-        for (auto it = Block::reverse_iterator(kthWrite->getIterator());
-             it != kthWrite->getBlock()->rend(); ++it) {
-          if (isa<ttng::WaitBarrierOp>(&*it) && schedule.count(&*it)) {
-            insertionTarget = &*it;
+      if (insertionTarget) {
+        // Look for a WaitBarrierOp before the insertion target in the same
+        // block. If found, insert before the barrier wait instead.
+        for (auto revIt =
+                 Block::reverse_iterator(insertionTarget->getIterator());
+             revIt != insertionTarget->getBlock()->rend(); ++revIt) {
+          if (isa<ttng::WaitBarrierOp>(&*revIt) && schedule.count(&*revIt)) {
+            insertionTarget = &*revIt;
             break;
           }
         }
@@ -217,7 +287,7 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         auto waitCluster = schedule.clusters.newBefore(targetCluster);
         schedule.insert(waitOp, targetStage, waitCluster);
       } else {
-        // K-th write not found; leave the schedule unchanged for this wait.
+        // Target not found; leave the schedule unchanged for this wait.
         continue;
       }
 
@@ -230,9 +300,9 @@ void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
   });
 }
 
-struct NVGPUTMAStoreTokenWaitReorderPass
-    : public impl::NVGPUTMAStoreTokenWaitReorderBase<
-          NVGPUTMAStoreTokenWaitReorderPass> {
+struct NVGPUTestTMAStoreTokenWaitReorderPass
+    : public impl::NVGPUTestTMAStoreTokenWaitReorderBase<
+          NVGPUTestTMAStoreTokenWaitReorderPass> {
   void runOnOperation() override {
     getOperation()->walk(
         [&](triton::FuncOp funcOp) { doTMAStoreWaitReorder(funcOp); });

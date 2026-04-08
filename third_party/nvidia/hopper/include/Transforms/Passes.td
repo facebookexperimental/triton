@@ -206,7 +206,21 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
-def NVGPUTMAStoreTokenWaitReorder : Pass<"nvgpu-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
+def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits", "mlir::ModuleOp"> {
+  let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
+
+  let description = [{
+    This pass walks `scf.for` loops to find `ttng.async_tma_store_token_wait`
+    ops whose SMEM buffer has a `buffer.copy` attribute (set by the memory
+    planner).  For each such wait, it sets `can_rotate_by_buffer_count = K`
+    where K = buffer.copy - 1, indicating that the wait can be delayed by
+    up to K iterations because K+1 buffer slots are available.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
   let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
 
   let description = [{
@@ -224,7 +238,8 @@ def NVGPUTMAStoreTokenWaitReorder : Pass<"nvgpu-tma-store-token-wait-reorder", "
     physically moving ops in the IR.
 
     If the loop has no SWP schedule (no stage/cluster attributes), the
-    pass skips that loop.
+    pass creates a basic single-stage schedule for the entire loop before
+    attempting the reorder.
   }];
 
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];

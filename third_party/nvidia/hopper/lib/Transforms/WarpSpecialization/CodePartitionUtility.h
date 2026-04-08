@@ -324,7 +324,17 @@ bool verifyReuseGroup2(ReuseGroup *group);
 // Returns {earlyChannel, lateChannel}.
 std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
 
-// Given ordered channels {early, late} in a 2-buffer reuse group, determine
+// Verify that a reuse group with N channels (N >= 2) is well-formed:
+// - At least 2 channels, each with a single copy (getNumBuffers() == 1).
+// - All producers are in the same block (so program order gives a total order).
+bool verifyReuseGroupN(ReuseGroup *group);
+
+// For a verified N-channel reuse group, order channels by program order of
+// their producer ops (getSrcOp()). Returns a sorted vector where channels[0]
+// is earliest and channels[N-1] is latest in program order.
+SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
+
+// Given ordered channels {early, late} in a reuse group, determine
 // whether we need to explicitly move late's producer_acquire to before early's
 // producer.
 // Returns false when late's consumer and early's producer are in the same

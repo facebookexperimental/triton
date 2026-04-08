@@ -47,6 +47,9 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
 | `WSTMAStoreLowering.cpp` | `doTMAStoreLowering` | Pre-pass lowering of `tt.descriptor_store` for WS visibility |
+| `WSTMAStoreLowering.cpp` | `doAnnotateTMAStoreWaits` | Annotate TMA store waits with multi-buffer rotation count |
+| `WSTMAStoreLowering.cpp` | `doValidateTMAStoreAnnotations` | Safety check: strip invalid annotations |
+| `WSTMAStoreLowering.cpp` | `doTMAStoreWaitReorder` | Reschedule TMA store waits using SWP CoarseSchedule |
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
 | `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |
@@ -92,3 +95,4 @@ an earlier partition scheduling pass (`PartitionSchedulingMeta`).
 - [Ping-Pong Scheduling](PingPongScheduling.md) — named barrier insertion for expensive ops
 - [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
+- [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits

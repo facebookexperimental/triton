@@ -360,9 +360,10 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     stage = 3 if causal else 1
-    BWD_BLOCK_M1 = 64  # 128 or 64
-    EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
-    GROUP_SIZE_M = 1
+
+    # BWD_BLOCK_M1 = 64  # 128 or 64
+    # EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
+    # GROUP_SIZE_M = 1
 
     def grid_persistent(meta):
         return (
@@ -394,9 +395,9 @@ def run_tlx_bwd(q, k, v, o, M, do, sm_scale, causal):
         BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
         HEAD_DIM=HEAD_DIM,
         STAGE=stage,
-        #BLOCK_M1=BWD_BLOCK_M1,
-        #EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-        #GROUP_SIZE_M=GROUP_SIZE_M,
+        # BLOCK_M1=BWD_BLOCK_M1,
+        # EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+        # GROUP_SIZE_M=GROUP_SIZE_M,
     )
 
     return dq, dk, dv
@@ -600,9 +601,9 @@ if __name__ == "__main__":
 
     configs = [
         # (Z,  H,  N_CTX, HEAD_DIM, causal, baseVariant)
-        #(8,  16, 1024,  64,  False, "ws"),
-        #(8,  16, 1024,  128, False, "ws"),
-        #(8, 16, 1024, 64, False, "ws_persistent"), # data race
+        # (8,  16, 1024,  64,  False, "ws"),
+        # (8,  16, 1024,  128, False, "ws"),
+        # (8, 16, 1024, 64, False, "ws_persistent"), # data race
         (8, 16, 1024, 128, False, "ws_persistent"),  # works
     ]
 

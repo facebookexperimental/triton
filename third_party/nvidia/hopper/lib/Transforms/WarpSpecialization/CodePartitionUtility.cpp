@@ -695,6 +695,17 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
                                      << chA->uniqID << ": " << hasBtoA);
   if (!hasAtoB && !hasBtoA) {
+    // Fallback: check if producers are ordered in program order within
+    // the same block. Covers epilogue subtile stores that share a buffer
+    // but have producer/consumer in different partitions.
+    auto *srcA = chA->getSrcOp();
+    auto *srcB = chB->getSrcOp();
+    if (srcA && srcB && srcA->getBlock() == srcB->getBlock() &&
+        (appearsBefore(srcA, srcB) || appearsBefore(srcB, srcA))) {
+      llvm::errs() << "DEBUG verifyReuseGroup2: fallback accepted, producers "
+                      "in same block\n";
+      return true;
+    }
     LDBG("verifyReuseGroup2: no dependency chain between channels");
     return false;
   }
@@ -710,9 +721,58 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
   // producer. If A.consumer -> B.producer dependency exists, A is early.
   if (hasDependencyChain(chA, chB))
     return {chA, chB};
-  assert(hasDependencyChain(chB, chA) &&
-         "No dependency chain found in either direction");
+  if (hasDependencyChain(chB, chA))
+    return {chB, chA};
+  // Fallback: order by producer program order.
+  if (appearsBefore(chA->getSrcOp(), chB->getSrcOp()))
+    return {chA, chB};
   return {chB, chA};
+}
+
+bool verifyReuseGroupN(ReuseGroup *group) {
+  if (group->channels.size() < 2) {
+    LDBG("verifyReuseGroupN: need at least 2 channels, got "
+         << group->channels.size());
+    return false;
+  }
+  // All channels must have single-copy buffers and producers in the same block.
+  Block *commonBlock = nullptr;
+  for (auto *ch : group->channels) {
+    if (ch->getNumBuffers() != 1) {
+      LDBG("verifyReuseGroupN: channel " << ch->uniqID
+                                         << " has numBuffers != 1");
+      return false;
+    }
+    auto *producer = ch->getSrcOp();
+    if (!producer) {
+      LDBG("verifyReuseGroupN: channel " << ch->uniqID << " has no producer");
+      return false;
+    }
+    if (!commonBlock) {
+      commonBlock = producer->getBlock();
+    } else if (producer->getBlock() != commonBlock) {
+      LDBG("verifyReuseGroupN: producers are in different blocks");
+      return false;
+    }
+  }
+  return true;
+}
+
+SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group) {
+  SmallVector<Channel *> ordered(group->channels.begin(),
+                                 group->channels.end());
+  // Sort by program order of producer ops. All producers are in the same
+  // block (verified by verifyReuseGroupN), so appearsBefore gives a total
+  // order.
+  llvm::sort(ordered, [](Channel *a, Channel *b) {
+    return appearsBefore(a->getSrcOp(), b->getSrcOp());
+  });
+  LLVM_DEBUG({
+    LDBG("orderReuseGroupN: ordered " << ordered.size() << " channels:");
+    for (unsigned i = 0; i < ordered.size(); i++)
+      LDBG("  [" << i << "] channel " << ordered[i]->uniqID);
+  });
+  return ordered;
 }
 
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {

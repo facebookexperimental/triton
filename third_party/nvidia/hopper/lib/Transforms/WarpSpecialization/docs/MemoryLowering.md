@@ -128,6 +128,11 @@ A separate pass (`NVGPUTMAStoreTokenWaitLoweringPass`) lowers the abstract
 - `ArriveBarrierOp`: signals the associated barrier that the SMEM buffer
   is now free
 
+Before lowering, additional passes annotate and reorder the waits to
+maximize overlap with computation. See
+[TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) for the full
+annotation → validation → reorder → lowering sequence.
+
 ## 1D TMEM Allocation
 
 **File**: `TMEMAlloc1D.cpp`
